@@ -1,7 +1,7 @@
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -67,6 +67,13 @@ fn printable(s: &str, max: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn opaque_bytes(s: &str, max: usize) -> Result<(), &'static str> {
+    if s.is_empty() || s.len() > max || s.chars().any(char::is_control) {
+        return Err("empty, too long, or contains control characters");
+    }
+    Ok(())
+}
+
 checked_str!(
     /// Opaque board key chosen by the host (`project:p_123`, `seat:sol`).
     BoardId, "board id", |s| printable(&s, 256));
@@ -81,7 +88,168 @@ checked_str!(
     Assignee, "assignee", |s| printable(&s, 128));
 checked_str!(
     /// Client-chosen key that makes a create or patch safe to retry.
-    IdemKey, "idempotency key", |s| printable(&s, 256));
+    IdemKey, "idempotency key", |s| opaque_bytes(&s, 256));
+
+/// Canonical Kanban / Org-todo workflow states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Lane {
+    Idea,
+    Todo,
+    Doing,
+    Review,
+    Blocked,
+    Done,
+}
+
+impl Lane {
+    pub const ALL: [Lane; 6] = [Lane::Idea, Lane::Todo, Lane::Doing, Lane::Review, Lane::Blocked, Lane::Done];
+    pub const DEFAULT_BOARD: [Lane; 4] = [Lane::Todo, Lane::Doing, Lane::Review, Lane::Done];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Lane::Idea => "idea",
+            Lane::Todo => "todo",
+            Lane::Doing => "doing",
+            Lane::Review => "review",
+            Lane::Blocked => "blocked",
+            Lane::Done => "done",
+        }
+    }
+
+    pub const fn org_keyword(self) -> &'static str {
+        match self {
+            Lane::Idea => "IDEA",
+            Lane::Todo => "TODO",
+            Lane::Doing => "STRT",
+            Lane::Review => "WAIT",
+            Lane::Blocked => "BLKD",
+            Lane::Done => "DONE",
+        }
+    }
+
+    pub fn from_org_keyword(keyword: &str) -> Option<Self> {
+        match keyword {
+            "IDEA" => Some(Lane::Idea),
+            "TODO" => Some(Lane::Todo),
+            "STRT" => Some(Lane::Doing),
+            "WAIT" => Some(Lane::Review),
+            "BLKD" => Some(Lane::Blocked),
+            "DONE" => Some(Lane::Done),
+            _ => None,
+        }
+    }
+
+    pub fn from_lane_name(name: &LaneName) -> Option<Self> {
+        match name.as_str() {
+            "idea" => Some(Lane::Idea),
+            "todo" => Some(Lane::Todo),
+            "doing" => Some(Lane::Doing),
+            "review" => Some(Lane::Review),
+            "blocked" => Some(Lane::Blocked),
+            "done" => Some(Lane::Done),
+            _ => None,
+        }
+    }
+
+    pub fn lane_name(self) -> LaneName {
+        LaneName(self.as_str().to_owned())
+    }
+
+    pub const fn is_done(self) -> bool {
+        matches!(self, Lane::Done)
+    }
+
+    pub fn all_lane_names() -> Vec<LaneName> {
+        Self::ALL.into_iter().map(Self::lane_name).collect()
+    }
+
+    pub fn default_board_lanes() -> Vec<LaneName> {
+        Self::DEFAULT_BOARD.into_iter().map(Self::lane_name).collect()
+    }
+}
+
+impl From<Lane> for LaneName {
+    fn from(lane: Lane) -> Self {
+        lane.lane_name()
+    }
+}
+
+impl TryFrom<&LaneName> for Lane {
+    type Error = InvalidValue;
+
+    fn try_from(value: &LaneName) -> Result<Self, Self::Error> {
+        Self::from_lane_name(value).ok_or_else(|| InvalidValue {
+            what: "canonical lane".into(),
+            reason: format!("unknown canonical lane `{value}`"),
+        })
+    }
+}
+
+impl fmt::Display for Lane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Org-mode priority cookies (`[#A]`, `[#B]`, `[#C]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum OrgPriority {
+    A,
+    B,
+    C,
+}
+
+impl OrgPriority {
+    pub const fn letter(self) -> char {
+        match self {
+            OrgPriority::A => 'A',
+            OrgPriority::B => 'B',
+            OrgPriority::C => 'C',
+        }
+    }
+
+    pub const fn cookie(self) -> &'static str {
+        match self {
+            OrgPriority::A => "[#A]",
+            OrgPriority::B => "[#B]",
+            OrgPriority::C => "[#C]",
+        }
+    }
+
+    pub fn parse_cookie(token: &str) -> Option<Self> {
+        match token {
+            "[#A]" => Some(OrgPriority::A),
+            "[#B]" => Some(OrgPriority::B),
+            "[#C]" => Some(OrgPriority::C),
+            _ => None,
+        }
+    }
+
+    pub const fn from_priority(priority: Priority) -> Option<Self> {
+        match priority {
+            Priority::Blocking | Priority::High => Some(OrgPriority::A),
+            Priority::Normal => None,
+            Priority::Low => Some(OrgPriority::C),
+        }
+    }
+}
+
+impl From<OrgPriority> for Priority {
+    fn from(priority: OrgPriority) -> Self {
+        match priority {
+            OrgPriority::A => Priority::High,
+            OrgPriority::B => Priority::Normal,
+            OrgPriority::C => Priority::Low,
+        }
+    }
+}
+
+impl fmt::Display for OrgPriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.cookie())
+    }
+}
 
 /// Per-board card number, assigned by the board in creation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
@@ -116,6 +284,54 @@ pub enum Priority {
 pub struct ExternalLink {
     pub namespace: String,
     pub key: String,
+}
+
+impl ExternalLink {
+    pub fn new(namespace: impl Into<String>, key: impl Into<String>) -> Result<Self, InvalidValue> {
+        let namespace = namespace.into();
+        let key = key.into();
+        if namespace.is_empty() || namespace.chars().any(char::is_control) {
+            return Err(InvalidValue { what: "external link namespace".into(), reason: "empty or contains control characters".into() });
+        }
+        if key.is_empty() || key.chars().any(char::is_control) {
+            return Err(InvalidValue { what: "external link key".into(), reason: "empty or contains control characters".into() });
+        }
+        Ok(Self { namespace, key })
+    }
+
+    /// Parses opaque URIs such as `rex://room/general#4`, `letter://sha256`, or `wave:auth-v2/verifier`.
+    pub fn parse_uri(raw: &str) -> Result<Self, InvalidValue> {
+        if raw.is_empty() || raw.chars().any(char::is_control) {
+            return Err(InvalidValue { what: "external link".into(), reason: "empty or contains control characters".into() });
+        }
+        let Some((scheme, rest)) = raw.split_once(':') else {
+            return Err(InvalidValue { what: "external link".into(), reason: "missing scheme separator `:`".into() });
+        };
+        let valid_scheme = !scheme.is_empty()
+            && scheme.as_bytes()[0].is_ascii_alphabetic()
+            && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_'));
+        if !valid_scheme {
+            return Err(InvalidValue { what: "external link".into(), reason: "invalid URI scheme".into() });
+        }
+        if rest.is_empty() || rest == "//" {
+            return Err(InvalidValue { what: "external link".into(), reason: "empty URI target".into() });
+        }
+        Ok(Self { namespace: scheme.to_owned(), key: rest.to_owned() })
+    }
+
+    pub fn to_uri(&self) -> String {
+        format!("{}:{}", self.namespace, self.key)
+    }
+
+    pub fn scheme(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl fmt::Display for ExternalLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.key)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -158,6 +374,20 @@ pub struct CardPatch {
     pub links_add: Vec<Link>,
 }
 
+impl CardPatch {
+    pub fn is_noop(&self) -> bool {
+        self.title.is_none()
+            && self.lane.is_none()
+            && self.position.is_none()
+            && self.assignee.is_none()
+            && self.priority.is_none()
+            && self.due_ms.is_none()
+            && self.labels_add.is_empty()
+            && self.labels_remove.is_empty()
+            && self.links_add.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Card {
     pub no: CardNo,
@@ -171,6 +401,86 @@ pub struct Card {
     pub links: Vec<Link>,
 }
 
+/// Full Org-backed task representation preserving body notes and unknown `:PROPERTIES:` keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCard {
+    pub id: Option<CardNo>,
+    pub revision: Option<CardRevision>,
+    pub lane: LaneName,
+    pub priority: Option<OrgPriority>,
+    pub blocking: bool,
+    pub title: Title,
+    pub tags: Vec<String>,
+    pub assignee: Option<Assignee>,
+    pub due_ms: Option<u64>,
+    pub links: Vec<Link>,
+    pub properties: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl TaskCard {
+    pub fn new(lane: Lane, title: Title) -> Self {
+        Self {
+            id: None,
+            revision: None,
+            lane: lane.lane_name(),
+            priority: None,
+            blocking: false,
+            title,
+            tags: Vec::new(),
+            assignee: None,
+            due_ms: None,
+            links: Vec::new(),
+            properties: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    pub fn canonical_lane(&self) -> Option<Lane> {
+        Lane::from_lane_name(&self.lane)
+    }
+
+    pub fn effective_priority(&self) -> Priority {
+        if self.blocking {
+            Priority::Blocking
+        } else {
+            self.priority.map_or(Priority::Normal, Priority::from)
+        }
+    }
+
+    pub fn to_card(&self, fallback_no: CardNo) -> Card {
+        Card {
+            no: self.id.unwrap_or(fallback_no),
+            revision: self.revision.unwrap_or(CardRevision(1)),
+            title: self.title.clone(),
+            lane: self.lane.clone(),
+            assignee: self.assignee.clone(),
+            priority: self.effective_priority(),
+            due_ms: self.due_ms,
+            labels: self.tags.clone(),
+            links: self.links.clone(),
+        }
+    }
+}
+
+impl From<&Card> for TaskCard {
+    fn from(card: &Card) -> Self {
+        Self {
+            id: Some(card.no),
+            revision: Some(card.revision),
+            lane: card.lane.clone(),
+            priority: OrgPriority::from_priority(card.priority),
+            blocking: card.priority == Priority::Blocking,
+            title: card.title.clone(),
+            tags: card.labels.clone(),
+            assignee: card.assignee.clone(),
+            due_ms: card.due_ms,
+            links: card.links.clone(),
+            properties: Vec::new(),
+            body: String::new(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BoardEnsure {
@@ -218,8 +528,7 @@ pub struct BoardFilter {
     pub lane: Option<LaneName>,
 }
 
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BoardInfo {
     pub board: BoardId,
     pub lanes: Vec<LaneName>,
@@ -234,20 +543,19 @@ pub struct CardRef {
     pub revision: CardRevision,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LaneCards {
     pub lane: LaneName,
     pub cards: Vec<Card>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BoardSnapshot {
     pub board: BoardId,
     pub head: u64,
     /// Lanes in display order, each with cards in display order.
     pub lanes: Vec<LaneCards>,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -272,6 +580,16 @@ pub enum KanbanError {
     MissingTitle,
 }
 
+fn dedup_vec<T: PartialEq + Clone>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut out = Vec::new();
+    for item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// One board's state, folded from its events.
 #[derive(Clone, Debug, Default)]
 pub struct BoardState {
@@ -284,26 +602,484 @@ pub struct BoardState {
 }
 
 impl BoardState {
+    pub fn open(board: BoardId, lanes: Vec<LaneName>) -> Self {
+        let mut state = Self::default();
+        state.evolve(&BoardEvent::Opened { board, lanes });
+        state
+    }
+
+    pub fn decide_ensure(&self, cmd: &BoardEnsure) -> Result<Vec<BoardEvent>, KanbanError> {
+        if let Some(existing) = &self.board {
+            if existing != &cmd.board {
+                return Err(KanbanError::NoSuchBoard(cmd.board.clone()));
+            }
+            return Ok(Vec::new());
+        }
+        let lanes = match &cmd.lanes {
+            Some(requested) => {
+                let unique = dedup_vec(requested.iter().cloned());
+                if unique.is_empty() {
+                    Lane::default_board_lanes()
+                } else {
+                    unique
+                }
+            }
+            None => Lane::default_board_lanes(),
+        };
+        Ok(vec![BoardEvent::Opened { board: cmd.board.clone(), lanes }])
+    }
+
     /// Policy for `CardUpsert`: CAS against `expected`, then emit
     /// `CardCreated` or `CardPatched`.
     pub fn decide_upsert(&self, cmd: &CardUpsert) -> Result<Vec<BoardEvent>, KanbanError> {
-        let _ = cmd;
-        todo!("BoardState::decide_upsert")
+        match cmd.card {
+            None => {
+                if let Some(existing) = &self.board
+                    && existing != &cmd.board
+                {
+                    return Err(KanbanError::NoSuchBoard(cmd.board.clone()));
+                }
+                if let Some(expected) = cmd.expected
+                    && expected != CardRevision(0)
+                {
+                    return Err(KanbanError::RevisionConflict {
+                        card: CardNo(0),
+                        expected,
+                        actual: CardRevision(0),
+                    });
+                }
+                let Some(title) = cmd.patch.title.clone() else {
+                    return Err(KanbanError::MissingTitle);
+                };
+
+                let mut events = Vec::new();
+                let effective_lanes = if self.board.is_some() {
+                    self.lanes.clone()
+                } else {
+                    let lanes = Lane::default_board_lanes();
+                    events.push(BoardEvent::Opened { board: cmd.board.clone(), lanes: lanes.clone() });
+                    lanes
+                };
+
+                let lane = match &cmd.patch.lane {
+                    Some(lane) => {
+                        if !effective_lanes.contains(lane) {
+                            return Err(KanbanError::NoSuchLane(lane.clone()));
+                        }
+                        lane.clone()
+                    }
+                    None => effective_lanes
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| KanbanError::NoSuchLane(Lane::Todo.lane_name()))?,
+                };
+
+                let next_no = CardNo(self.max_card_no().saturating_add(1));
+                let assignee = match &cmd.patch.assignee {
+                    Some(Assign::To { who }) => Some(who.clone()),
+                    Some(Assign::Clear) | None => None,
+                };
+                let mut labels = dedup_vec(cmd.patch.labels_add.iter().cloned());
+                if !cmd.patch.labels_remove.is_empty() {
+                    labels.retain(|l| !cmd.patch.labels_remove.contains(l));
+                }
+                let links = dedup_vec(cmd.patch.links_add.iter().cloned());
+
+                let card = Card {
+                    no: next_no,
+                    revision: CardRevision(1),
+                    title,
+                    lane: lane.clone(),
+                    assignee,
+                    priority: cmd.patch.priority.unwrap_or(Priority::Normal),
+                    due_ms: cmd.patch.due_ms,
+                    labels,
+                    links,
+                };
+                let existing_in_lane = self.order.get(&lane).map_or(0, Vec::len);
+                events.push(BoardEvent::CardCreated { card });
+                if let Some(pos) = cmd.patch.position
+                    && (pos as usize) < existing_in_lane
+                {
+                    events.push(BoardEvent::CardPatched {
+                        no: next_no,
+                        revision: CardRevision(1),
+                        patch: CardPatch { position: Some(pos), ..CardPatch::default() },
+                    });
+                }
+                Ok(events)
+            }
+            Some(no) => {
+                if self.board.as_ref() != Some(&cmd.board) {
+                    return Err(KanbanError::NoSuchBoard(cmd.board.clone()));
+                }
+                let Some(card) = self.cards.get(&no) else {
+                    return Err(KanbanError::NoSuchCard(no));
+                };
+                if let Some(expected) = cmd.expected
+                    && expected != card.revision
+                {
+                    return Err(KanbanError::RevisionConflict {
+                        card: no,
+                        expected,
+                        actual: card.revision,
+                    });
+                }
+                if let Some(lane) = &cmd.patch.lane
+                    && !self.lanes.contains(lane)
+                {
+                    return Err(KanbanError::NoSuchLane(lane.clone()));
+                }
+                if cmd.patch.is_noop() {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![BoardEvent::CardPatched {
+                    no,
+                    revision: card.revision.next(),
+                    patch: cmd.patch.clone(),
+                }])
+            }
+        }
     }
 
     pub fn decide_archive(&self, cmd: &CardArchive) -> Result<Vec<BoardEvent>, KanbanError> {
-        let _ = cmd;
-        todo!("BoardState::decide_archive")
+        if self.board.as_ref() != Some(&cmd.board) {
+            return Err(KanbanError::NoSuchBoard(cmd.board.clone()));
+        }
+        let Some(card) = self.cards.get(&cmd.card) else {
+            if cmd.expected.is_none() && self.archived.contains(&cmd.card) {
+                return Ok(Vec::new());
+            }
+            return Err(KanbanError::NoSuchCard(cmd.card));
+        };
+        if let Some(expected) = cmd.expected
+            && expected != card.revision
+        {
+            return Err(KanbanError::RevisionConflict {
+                card: cmd.card,
+                expected,
+                actual: card.revision,
+            });
+        }
+        Ok(vec![BoardEvent::CardArchived {
+            no: cmd.card,
+            revision: card.revision.next(),
+        }])
     }
 
     /// Total fold of one event.
     pub fn evolve(&mut self, event: &BoardEvent) {
-        let _ = event;
-        todo!("BoardState::evolve")
+        match event {
+            BoardEvent::Opened { board, lanes } => {
+                self.board = Some(board.clone());
+                self.lanes = dedup_vec(lanes.iter().cloned());
+                for lane in &self.lanes {
+                    self.order.entry(lane.clone()).or_default();
+                }
+            }
+            BoardEvent::CardCreated { card } => {
+                if !self.lanes.contains(&card.lane) {
+                    self.lanes.push(card.lane.clone());
+                }
+                for list in self.order.values_mut() {
+                    list.retain(|&c| c != card.no);
+                }
+                self.order.entry(card.lane.clone()).or_default().push(card.no);
+                self.cards.insert(card.no, card.clone());
+            }
+            BoardEvent::CardPatched { no, revision, patch } => {
+                let Some(card) = self.cards.get_mut(no) else { return };
+                let old_lane = card.lane.clone();
+                card.revision = *revision;
+                if let Some(title) = &patch.title {
+                    card.title = title.clone();
+                }
+                if let Some(assign) = &patch.assignee {
+                    card.assignee = match assign {
+                        Assign::To { who } => Some(who.clone()),
+                        Assign::Clear => None,
+                    };
+                }
+                if let Some(priority) = patch.priority {
+                    card.priority = priority;
+                }
+                if let Some(due_ms) = patch.due_ms {
+                    card.due_ms = Some(due_ms);
+                }
+                if !patch.labels_remove.is_empty() {
+                    card.labels.retain(|l| !patch.labels_remove.contains(l));
+                }
+                for label in &patch.labels_add {
+                    if !card.labels.contains(label) {
+                        card.labels.push(label.clone());
+                    }
+                }
+                for link in &patch.links_add {
+                    if !card.links.contains(link) {
+                        card.links.push(link.clone());
+                    }
+                }
+
+                let target_lane = patch.lane.clone().unwrap_or_else(|| old_lane.clone());
+                let lane_changed = target_lane != old_lane;
+                if lane_changed {
+                    if !self.lanes.contains(&target_lane) {
+                        self.lanes.push(target_lane.clone());
+                    }
+                    card.lane = target_lane.clone();
+                }
+                if lane_changed || patch.position.is_some() {
+                    if let Some(old_list) = self.order.get_mut(&old_lane) {
+                        old_list.retain(|&c| c != *no);
+                    }
+                    let list = self.order.entry(target_lane).or_default();
+                    list.retain(|&c| c != *no);
+                    match patch.position {
+                        Some(pos) => {
+                            let idx = (pos as usize).min(list.len());
+                            list.insert(idx, *no);
+                        }
+                        None => list.push(*no),
+                    }
+                }
+            }
+            BoardEvent::CardArchived { no, .. } => {
+                if let Some(card) = self.cards.remove(no)
+                    && let Some(list) = self.order.get_mut(&card.lane)
+                {
+                    list.retain(|&c| c != *no);
+                }
+                if !self.archived.contains(no) {
+                    self.archived.push(*no);
+                }
+            }
+        }
     }
 
     pub fn snapshot(&self, head: u64, filter: Option<&BoardFilter>) -> Option<BoardSnapshot> {
-        let _ = (head, filter);
-        todo!("BoardState::snapshot")
+        let board = self.board.clone()?;
+        let mut lanes = Vec::new();
+        for lane in &self.lanes {
+            if let Some(f) = filter
+                && let Some(wanted_lane) = &f.lane
+                && wanted_lane != lane
+            {
+                continue;
+            }
+            let mut cards = Vec::new();
+            if let Some(order) = self.order.get(lane) {
+                for no in order {
+                    let Some(card) = self.cards.get(no) else { continue };
+                    if let Some(f) = filter {
+                        if let Some(who) = &f.assignee
+                            && card.assignee.as_ref() != Some(who)
+                        {
+                            continue;
+                        }
+                        if let Some(label) = &f.label
+                            && !card.labels.contains(label)
+                        {
+                            continue;
+                        }
+                    }
+                    cards.push(card.clone());
+                }
+            }
+            lanes.push(LaneCards { lane: lane.clone(), cards });
+        }
+        Some(BoardSnapshot { board, head, lanes })
     }
+
+    fn max_card_no(&self) -> u32 {
+        let live_max = self.cards.keys().next_back().map_or(0, |c| c.0);
+        let arch_max = self.archived.iter().map(|c| c.0).max().unwrap_or(0);
+        live_max.max(arch_max)
+    }
+}
+
+/// Standalone embeddable in-memory Kanban engine with per-board event logs and `IdemKey` deduplication.
+#[derive(Clone, Debug, Default)]
+pub struct KanbanEngine {
+    boards: BTreeMap<BoardId, ManagedBoard>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ManagedBoard {
+    state: BoardState,
+    events: Vec<BoardEvent>,
+    idem_receipts: BTreeMap<IdemKey, CardRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum KanbanOrgSyncError {
+    #[error(transparent)]
+    Kanban(#[from] KanbanError),
+    #[error(transparent)]
+    Org(#[from] crate::org::OrgError),
+    #[error(transparent)]
+    Invalid(#[from] InvalidValue),
+}
+
+impl KanbanEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ensure_board(&mut self, cmd: BoardEnsure) -> Result<BoardInfo, KanbanError> {
+        let entry = self.boards.entry(cmd.board.clone()).or_default();
+        let events = entry.state.decide_ensure(&cmd)?;
+        entry.apply(events);
+        Ok(BoardInfo {
+            board: cmd.board,
+            lanes: entry.state.lanes.clone(),
+            head: entry.events.len() as u64,
+        })
+    }
+
+    pub fn upsert_card(&mut self, cmd: CardUpsert) -> Result<CardRef, KanbanError> {
+        if let Some(key) = &cmd.idem
+            && let Some(existing) = self.boards.get(&cmd.board).and_then(|b| b.idem_receipts.get(key))
+        {
+            return Ok(existing.clone());
+        }
+        if cmd.card.is_some() && !self.boards.contains_key(&cmd.board) {
+            return Err(KanbanError::NoSuchBoard(cmd.board));
+        }
+        let entry = self.boards.entry(cmd.board.clone()).or_default();
+        let events = entry.state.decide_upsert(&cmd)?;
+        let receipt = receipt_from_events_or_state(&cmd, &events, &entry.state);
+        entry.apply(events);
+        let receipt = receipt.unwrap_or_else(|| {
+            let no = cmd.card.expect("card validated");
+            CardRef { board: cmd.board.clone(), no, revision: entry.state.cards[&no].revision }
+        });
+        if let Some(key) = cmd.idem {
+            entry.idem_receipts.insert(key, receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    pub fn move_card(
+        &mut self,
+        board: BoardId,
+        card: CardNo,
+        expected: Option<CardRevision>,
+        lane: LaneName,
+        position: Option<u32>,
+        links_add: Vec<Link>,
+    ) -> Result<CardRef, KanbanError> {
+        self.upsert_card(CardUpsert {
+            board,
+            card: Some(card),
+            expected,
+            patch: CardPatch { lane: Some(lane), position, links_add, ..CardPatch::default() },
+            idem: None,
+        })
+    }
+
+    pub fn archive_card(&mut self, cmd: CardArchive) -> Result<(), KanbanError> {
+        let Some(entry) = self.boards.get_mut(&cmd.board) else {
+            return Err(KanbanError::NoSuchBoard(cmd.board));
+        };
+        let events = entry.state.decide_archive(&cmd)?;
+        entry.apply(events);
+        Ok(())
+    }
+
+    pub fn view_board(&self, cmd: BoardView) -> Result<BoardSnapshot, KanbanError> {
+        let Some(entry) = self.boards.get(&cmd.board) else {
+            return Err(KanbanError::NoSuchBoard(cmd.board));
+        };
+        entry
+            .state
+            .snapshot(entry.events.len() as u64, cmd.filter.as_ref())
+            .ok_or(KanbanError::NoSuchBoard(cmd.board))
+    }
+
+    pub fn export_org(&self, board: &BoardId) -> Result<String, KanbanError> {
+        let snap = self.view_board(BoardView { board: board.clone(), filter: None })?;
+        Ok(crate::org::render(&snap))
+    }
+
+    pub fn import_org(&mut self, fallback_board: BoardId, text: &str) -> Result<BoardSnapshot, KanbanOrgSyncError> {
+        let doc = crate::org::parse_document(text)?;
+        let board = match &doc.title {
+            Some(raw) if !raw.is_empty() => BoardId::parse(raw.clone())?,
+            _ => fallback_board,
+        };
+        let mut needed_lanes = Lane::all_lane_names();
+        let mut seen: BTreeSet<LaneName> = needed_lanes.iter().cloned().collect();
+        for task in &doc.tasks {
+            if seen.insert(task.lane.clone()) {
+                needed_lanes.push(task.lane.clone());
+            }
+        }
+        self.ensure_board(BoardEnsure { board: board.clone(), lanes: Some(needed_lanes) })?;
+        let mut per_lane_pos: BTreeMap<LaneName, u32> = BTreeMap::new();
+        for task in &doc.tasks {
+            let pos = per_lane_pos.entry(task.lane.clone()).or_insert(0);
+            let current_pos = *pos;
+            *pos += 1;
+            let existing = task.id.filter(|id| {
+                self.boards.get(&board).is_some_and(|b| b.state.cards.contains_key(id))
+            });
+            let priority = task.effective_priority();
+            let assignee = match &task.assignee {
+                Some(who) => Some(Assign::To { who: who.clone() }),
+                None => Some(Assign::Clear),
+            };
+            let labels_remove = existing
+                .and_then(|id| self.boards.get(&board)?.state.cards.get(&id))
+                .map(|c| c.labels.iter().filter(|l| !task.tags.contains(l)).cloned().collect())
+                .unwrap_or_default();
+            self.upsert_card(CardUpsert {
+                board: board.clone(),
+                card: existing,
+                expected: if existing.is_some() { task.revision } else { None },
+                patch: CardPatch {
+                    title: Some(task.title.clone()),
+                    lane: Some(task.lane.clone()),
+                    position: Some(current_pos),
+                    assignee,
+                    priority: Some(priority),
+                    due_ms: task.due_ms,
+                    labels_add: task.tags.clone(),
+                    labels_remove,
+                    links_add: task.links.clone(),
+                },
+                idem: None,
+            })?;
+        }
+        Ok(self.view_board(BoardView { board, filter: None })?)
+    }
+
+    pub fn events(&self, board: &BoardId) -> Option<&[BoardEvent]> {
+        self.boards.get(board).map(|b| b.events.as_slice())
+    }
+}
+
+impl ManagedBoard {
+    fn apply(&mut self, events: Vec<BoardEvent>) {
+        for event in events {
+            self.state.evolve(&event);
+            self.events.push(event);
+        }
+    }
+}
+
+fn receipt_from_events_or_state(cmd: &CardUpsert, events: &[BoardEvent], state: &BoardState) -> Option<CardRef> {
+    for event in events.iter().rev() {
+        match event {
+            BoardEvent::CardCreated { card } => {
+                return Some(CardRef { board: cmd.board.clone(), no: card.no, revision: card.revision });
+            }
+            BoardEvent::CardPatched { no, revision, .. } => {
+                return Some(CardRef { board: cmd.board.clone(), no: *no, revision: *revision });
+            }
+            BoardEvent::Opened { .. } | BoardEvent::CardArchived { .. } => {}
+        }
+    }
+    let no = cmd.card?;
+    let card = state.cards.get(&no)?;
+    Some(CardRef { board: cmd.board.clone(), no, revision: card.revision })
 }
