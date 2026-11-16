@@ -1,0 +1,21 @@
+[package]
+name = "rex-wave-runtime"
+description = "Actor runtime: Decider trait, per-stream actors, registries, live hub, router, read side, reactors, LocalClient."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rex-wave-api.workspace = true
+rex-wave-store.workspace = true
+tokio.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

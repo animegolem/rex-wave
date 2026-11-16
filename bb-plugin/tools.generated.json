@@ -1,0 +1,3466 @@
+[
+  {
+    "description": "Create-or-fetch a #channel or DM (idempotent: rooms are named, not numbered).",
+    "inputSchema": {
+      "$defs": {
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomOrigin": {
+          "description": "Why a room exists (drives sidebar placement and wave-room policy).",
+          "oneOf": [
+            {
+              "properties": {
+                "origin": {
+                  "const": "manual",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`#wave-<slug>`: created by the wave conductor, members = roster.",
+              "properties": {
+                "origin": {
+                  "const": "wave",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "wave"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoomOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`Wave` origin may only be set by `System{WaveConductor}` (decider policy)."
+        },
+        "room": {
+          "$ref": "#/$defs/RoomRef"
+        },
+        "topic": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "room"
+      ],
+      "title": "RoomEnsure",
+      "type": "object"
+    },
+    "name": "room_ensure"
+  },
+  {
+    "description": "Post to a #channel or DM. @handles and @all are resolved against room members.",
+    "inputSchema": {
+      "$defs": {
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Seq": {
+          "description": "Per-stream monotonically increasing position. `Seq(0)` means \"before the first entry\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "body": {
+          "maxLength": 65536,
+          "minLength": 1,
+          "type": "string"
+        },
+        "idem": {
+          "default": null,
+          "description": "idempotency key",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Seq"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "room": {
+          "$ref": "#/$defs/RoomRef"
+        }
+      },
+      "required": [
+        "room",
+        "body"
+      ],
+      "title": "RoomPost",
+      "type": "object"
+    },
+    "name": "room_post"
+  },
+  {
+    "description": "Add a member (self, or others if you own the room).",
+    "inputSchema": {
+      "$defs": {
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "handle": {
+          "default": null,
+          "description": "Handle to be addressable by in this room; defaults to seat/role name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "member": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`None` = join yourself."
+        },
+        "room": {
+          "$ref": "#/$defs/RoomRef"
+        }
+      },
+      "required": [
+        "room"
+      ],
+      "title": "RoomJoin",
+      "type": "object"
+    },
+    "name": "room_join"
+  },
+  {
+    "description": "Leave a room.",
+    "inputSchema": {
+      "$defs": {
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "room": {
+          "$ref": "#/$defs/RoomRef"
+        }
+      },
+      "required": [
+        "room"
+      ],
+      "title": "RoomLeave",
+      "type": "object"
+    },
+    "name": "room_leave"
+  },
+  {
+    "description": "Add a worker (any BB provider/model) to a running wave.",
+    "inputSchema": {
+      "$defs": {
+        "AgentSpec": {
+          "description": "Which BB provider/model runs a worker. Any provider BB has configured.",
+          "properties": {
+            "model": {
+              "default": null,
+              "description": "model",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "permission": {
+              "$ref": "#/$defs/PermissionMode"
+            },
+            "provider": {
+              "description": "provider",
+              "type": "string"
+            },
+            "reasoning": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "service_tier": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace": {
+              "$ref": "#/$defs/Workspace"
+            }
+          },
+          "required": [
+            "provider",
+            "permission",
+            "workspace"
+          ],
+          "type": "object"
+        },
+        "BaseBranch": {
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "default",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "named",
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "name"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PermissionMode": {
+          "enum": [
+            "accept-edits",
+            "auto",
+            "full"
+          ],
+          "type": "string"
+        },
+        "WorkerSpec": {
+          "properties": {
+            "agent": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentSpec"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Overrides `WaveSpec::defaults` when present."
+            },
+            "brief": {
+              "description": "The worker's brief: posted to `#wave-<slug>` as an @mention and sent as the spawn prompt.",
+              "maxLength": 65536,
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "description": "role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "brief"
+          ],
+          "type": "object"
+        },
+        "Workspace": {
+          "description": "Where a worker's BB thread runs. Maps 1:1 onto verified BB spawn shapes\n(#17): `ManagedWorktree` -> `{type:\"host\", workspace:{type:\"managed-worktree\", baseBranch}}`,\n`ProjectDefault` -> `{type:\"project-default\"}`,\n`ExistingPath` -> `{type:\"provider\", environmentProviderId:\"git-worktree\", inputs:{kind:\"existing\", path}}`.",
+          "oneOf": [
+            {
+              "properties": {
+                "base": {
+                  "$ref": "#/$defs/BaseBranch"
+                },
+                "workspace": {
+                  "const": "managed_worktree",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "workspace",
+                "base"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "workspace": {
+                  "const": "project_default",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "workspace": {
+                  "const": "existing_path",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "workspace",
+                "path"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "wave": {
+          "description": "wave slug",
+          "type": "string"
+        },
+        "worker": {
+          "$ref": "#/$defs/WorkerSpec"
+        }
+      },
+      "required": [
+        "wave",
+        "worker"
+      ],
+      "title": "WaveAddWorker",
+      "type": "object"
+    },
+    "name": "wave_add_worker"
+  },
+  {
+    "description": "Stop, then archive, a worker's BB thread.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "reason": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "role",
+          "type": "string"
+        },
+        "wave": {
+          "description": "wave slug",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wave",
+        "role"
+      ],
+      "title": "WaveRetireWorker",
+      "type": "object"
+    },
+    "name": "wave_retire_worker"
+  },
+  {
+    "description": "Send to one worker's BB thread with a BB delivery mode (auto, start, steer, steer-if-active, queue-if-active).",
+    "inputSchema": {
+      "$defs": {
+        "SteerDeliveryMode": {
+          "description": "How a `wave_tell` reaches the thread. Mirrors BB `ThreadSendArgs[\"mode\"]`.",
+          "oneOf": [
+            {
+              "const": "auto",
+              "description": "Wake if idle, queue if active. The doorbell default.",
+              "type": "string"
+            },
+            {
+              "const": "start",
+              "description": "Start a new turn; fails if one is running.",
+              "type": "string"
+            },
+            {
+              "const": "steer",
+              "description": "Interrupt the running turn.",
+              "type": "string"
+            },
+            {
+              "const": "steer-if-active",
+              "description": "Add to the running turn, or start one if idle.",
+              "type": "string"
+            },
+            {
+              "const": "queue-if-active",
+              "description": "Wait behind the running turn, or start one if idle.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "body": {
+          "maxLength": 65536,
+          "minLength": 1,
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/SteerDeliveryMode"
+        },
+        "role": {
+          "description": "role",
+          "type": "string"
+        },
+        "wave": {
+          "description": "wave slug",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wave",
+        "role",
+        "body",
+        "mode"
+      ],
+      "title": "WaveTell",
+      "type": "object"
+    },
+    "name": "wave_tell"
+  },
+  {
+    "description": "Close a wave with an outcome; retires remaining workers.",
+    "inputSchema": {
+      "$defs": {
+        "WaveOutcome": {
+          "oneOf": [
+            {
+              "properties": {
+                "outcome": {
+                  "const": "completed",
+                  "type": "string"
+                },
+                "summary": {
+                  "maxLength": 65536,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "summary"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "cancelled",
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "failed",
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/WaveOutcome"
+        },
+        "wave": {
+          "description": "wave slug",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wave",
+        "outcome"
+      ],
+      "title": "WaveFinish",
+      "type": "object"
+    },
+    "name": "wave_finish"
+  },
+  {
+    "description": "Current wave roster and worker phases.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "wave": {
+          "description": "wave slug",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wave"
+      ],
+      "title": "WaveView",
+      "type": "object"
+    },
+    "name": "wave_view"
+  },
+  {
+    "description": "Create-or-fetch a kanban board (project or personal).",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "board": {
+          "description": "board id",
+          "type": "string"
+        },
+        "lanes": {
+          "default": null,
+          "description": "Only used on first creation; default `todo, doing, review, done`.",
+          "items": {
+            "description": "lane",
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "board"
+      ],
+      "title": "BoardEnsure",
+      "type": "object"
+    },
+    "name": "board_ensure"
+  },
+  {
+    "description": "Create a card (no `card`) or patch one; pass `expected` to fail instead of overwriting a concurrent edit.",
+    "inputSchema": {
+      "$defs": {
+        "Assign": {
+          "oneOf": [
+            {
+              "properties": {
+                "assign": {
+                  "const": "to",
+                  "type": "string"
+                },
+                "who": {
+                  "description": "assignee",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "assign",
+                "who"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "assign": {
+                  "const": "clear",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "assign"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "CardNo": {
+          "description": "Per-board card number, assigned by the board in creation order.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "CardPatch": {
+          "description": "A sparse patch. `None` leaves a field unchanged.",
+          "properties": {
+            "assignee": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Assign"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "due_ms": {
+              "default": null,
+              "description": "Unix milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "labels_add": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels_remove": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "lane": {
+              "default": null,
+              "description": "lane",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "links_add": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/Link"
+              },
+              "type": "array"
+            },
+            "position": {
+              "default": null,
+              "description": "Position within the lane (0 = top). Applied after `lane`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "priority": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Priority"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "title": {
+              "default": null,
+              "description": "title",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "CardRevision": {
+          "description": "Bumped on every change to one card. A patch or archive that names an\n`expected` revision fails with [`KanbanError::RevisionConflict`] instead\nof overwriting a concurrent edit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ExternalLink": {
+          "description": "A reference into some other system. The board stores it and never\ndereferences it; the host decides what `namespace` means.",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "namespace",
+            "key"
+          ],
+          "type": "object"
+        },
+        "Link": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ExternalLink",
+              "properties": {
+                "link": {
+                  "const": "external",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "link"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "An org-mode heading (org-todo panel): file plus outline path.",
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "link": {
+                  "const": "org",
+                  "type": "string"
+                },
+                "outline": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "link",
+                "file",
+                "outline"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Priority": {
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            "blocking"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Create a card (`card: None`, `patch.title` required) or patch one.",
+      "properties": {
+        "board": {
+          "description": "board id",
+          "type": "string"
+        },
+        "card": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CardNo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CardRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "idem": {
+          "default": null,
+          "description": "idempotency key",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "patch": {
+          "$ref": "#/$defs/CardPatch"
+        }
+      },
+      "required": [
+        "board",
+        "patch"
+      ],
+      "title": "CardUpsert",
+      "type": "object"
+    },
+    "name": "card_upsert"
+  },
+  {
+    "description": "Archive a card.",
+    "inputSchema": {
+      "$defs": {
+        "CardNo": {
+          "description": "Per-board card number, assigned by the board in creation order.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "CardRevision": {
+          "description": "Bumped on every change to one card. A patch or archive that names an\n`expected` revision fails with [`KanbanError::RevisionConflict`] instead\nof overwriting a concurrent edit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "board": {
+          "description": "board id",
+          "type": "string"
+        },
+        "card": {
+          "$ref": "#/$defs/CardNo"
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CardRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "board",
+        "card"
+      ],
+      "title": "CardArchive",
+      "type": "object"
+    },
+    "name": "card_archive"
+  },
+  {
+    "description": "Lanes and live cards of one board.",
+    "inputSchema": {
+      "$defs": {
+        "BoardFilter": {
+          "properties": {
+            "assignee": {
+              "default": null,
+              "description": "assignee",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lane": {
+              "default": null,
+              "description": "lane",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "board": {
+          "description": "board id",
+          "type": "string"
+        },
+        "filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BoardFilter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "board"
+      ],
+      "title": "BoardView",
+      "type": "object"
+    },
+    "name": "board_view"
+  },
+  {
+    "description": "Your ranked notifications.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "include_done": {
+          "default": false,
+          "type": "boolean"
+        },
+        "limit": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "title": "InboxList",
+      "type": "object"
+    },
+    "name": "inbox_list"
+  },
+  {
+    "description": "Mark notifications seen / done / dismissed.",
+    "inputSchema": {
+      "$defs": {
+        "NotificationId": {
+          "description": "Per-inbox notification number.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "NotifyState": {
+          "enum": [
+            "unread",
+            "seen",
+            "done",
+            "dismissed"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "ids": {
+          "items": {
+            "$ref": "#/$defs/NotificationId"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/NotifyState"
+        }
+      },
+      "required": [
+        "ids",
+        "state"
+      ],
+      "title": "InboxAck",
+      "type": "object"
+    },
+    "name": "inbox_ack"
+  },
+  {
+    "description": "Advance your read cursor in a room.",
+    "inputSchema": {
+      "$defs": {
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Seq": {
+          "description": "Per-stream monotonically increasing position. `Seq(0)` means \"before the first entry\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "room": {
+          "$ref": "#/$defs/RoomId"
+        },
+        "upto": {
+          "$ref": "#/$defs/Seq"
+        }
+      },
+      "required": [
+        "room",
+        "upto"
+      ],
+      "title": "InboxMarkRead",
+      "type": "object"
+    },
+    "name": "inbox_mark_read"
+  },
+  {
+    "description": "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).",
+    "inputSchema": {
+      "$defs": {
+        "LetterPriority": {
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            "blocking"
+          ],
+          "type": "string"
+        },
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SeqRange": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "priority": {
+          "$ref": "#/$defs/LetterPriority"
+        },
+        "range": {
+          "$ref": "#/$defs/SeqRange"
+        },
+        "room": {
+          "$ref": "#/$defs/RoomId"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "to": {
+          "items": {
+            "description": "seat",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "room",
+        "range",
+        "to",
+        "subject",
+        "topic",
+        "priority"
+      ],
+      "title": "MailPromote",
+      "type": "object"
+    },
+    "name": "promote_to_letter"
+  },
+  {
+    "description": "ACK a sandbox letter by its exact sha256.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "MailAck",
+      "type": "object"
+    },
+    "name": "mail_ack"
+  },
+  {
+    "description": "Page one stream after a seq.",
+    "inputSchema": {
+      "$defs": {
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Seq": {
+          "description": "Per-stream monotonically increasing position. `Seq(0)` means \"before the first entry\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "StreamId": {
+          "description": "The identity of one single-writer log. Also the actor address.",
+          "oneOf": [
+            {
+              "properties": {
+                "room": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "stream": {
+                  "const": "room",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "stream": {
+                  "const": "wave",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "wave"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "board": {
+                  "description": "board id",
+                  "type": "string"
+                },
+                "stream": {
+                  "const": "board",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "board"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One inbox per principal: notifications + read cursors. The only owner\nof \"what has X seen\", so unread = room head (room) - cursor (inbox),\nmerged at the read boundary (per separate-before-serializing-shared-state).",
+              "properties": {
+                "owner": {
+                  "$ref": "#/$defs/Principal"
+                },
+                "stream": {
+                  "const": "inbox",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "owner"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The mail bridge's promotion / ack ledger (sandbox only).",
+              "properties": {
+                "stream": {
+                  "const": "mail",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/Seq",
+          "default": 0
+        },
+        "limit": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stream": {
+          "$ref": "#/$defs/StreamId"
+        }
+      },
+      "required": [
+        "stream"
+      ],
+      "title": "Read",
+      "type": "object"
+    },
+    "name": "read"
+  },
+  {
+    "description": "Block until an interest matches after a cursor; returns the full catch-up slice.",
+    "inputSchema": {
+      "$defs": {
+        "Cursor": {
+          "description": "A multi-stream resume position. Missing streams mean `Seq::ORIGIN`.",
+          "properties": {
+            "from_head": {
+              "default": false,
+              "description": "Streams not listed start at their head at subscribe time instead of origin.",
+              "type": "boolean"
+            },
+            "positions": {
+              "items": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "$ref": "#/$defs/StreamId"
+                  },
+                  {
+                    "$ref": "#/$defs/Seq"
+                  }
+                ],
+                "type": "array"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "positions"
+          ],
+          "type": "object"
+        },
+        "Interest": {
+          "description": "What a watcher wants. Resolved server-side against the session principal.",
+          "oneOf": [
+            {
+              "description": "Exactly these streams.",
+              "properties": {
+                "interest": {
+                  "const": "streams",
+                  "type": "string"
+                },
+                "streams": {
+                  "items": {
+                    "$ref": "#/$defs/StreamId"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "interest",
+                "streams"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One room by reference (DM refs resolve with the session principal).",
+              "properties": {
+                "interest": {
+                  "const": "room",
+                  "type": "string"
+                },
+                "room": {
+                  "$ref": "#/$defs/RoomRef"
+                }
+              },
+              "required": [
+                "interest",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Only entries that @mention me (or @all) in rooms I belong to, plus DMs to me.\nThis is `channel_wait(mentions_only: true)`.",
+              "properties": {
+                "interest": {
+                  "const": "mentions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "My inbox stream (notifications), for the TUI `Inbox` node and OSC 7501.",
+              "properties": {
+                "interest": {
+                  "const": "my_inbox",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Everything under one BB project: its rooms, waves, and board.",
+              "properties": {
+                "interest": {
+                  "const": "project",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Live BB thread events of one wave agent (BB-owned; proxied, not journaled).\nOpened when the TUI focuses an agent node and dropped on blur.",
+              "properties": {
+                "interest": {
+                  "const": "agent",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Operator only: all journaled streams (debug, GUI dashboards).",
+              "properties": {
+                "interest": {
+                  "const": "everything",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The left-pane tree: a `Frame::Sidebar` now and after every change that\naffects it. Bursts of changes coalesce into one frame.",
+              "properties": {
+                "interest": {
+                  "const": "sidebar",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The right-pane stage. One per session: opening a new one ends the old\none, and its frames arrive wrapped in `Frame::Stage` with the new\ngeneration.",
+              "properties": {
+                "interest": {
+                  "const": "stage",
+                  "type": "string"
+                },
+                "target": {
+                  "$ref": "#/$defs/StageTarget"
+                }
+              },
+              "required": [
+                "interest",
+                "target"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Seq": {
+          "description": "Per-stream monotonically increasing position. `Seq(0)` means \"before the first entry\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "StageTarget": {
+          "description": "What the focused sidebar node shows on the stage.",
+          "oneOf": [
+            {
+              "description": "Notifications and BB approval cards.",
+              "properties": {
+                "target": {
+                  "const": "inbox",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "board": {
+                  "description": "board id",
+                  "type": "string"
+                },
+                "target": {
+                  "const": "kanban",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target",
+                "board"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A project `#channel`, a `#wave-<slug>` room, a global channel, or a DM.",
+              "properties": {
+                "room": {
+                  "$ref": "#/$defs/RoomRef"
+                },
+                "target": {
+                  "const": "room",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One wave agent's context window and BB thread.",
+              "properties": {
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "target": {
+                  "const": "agent",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamId": {
+          "description": "The identity of one single-writer log. Also the actor address.",
+          "oneOf": [
+            {
+              "properties": {
+                "room": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "stream": {
+                  "const": "room",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "stream": {
+                  "const": "wave",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "wave"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "board": {
+                  "description": "board id",
+                  "type": "string"
+                },
+                "stream": {
+                  "const": "board",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "board"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One inbox per principal: notifications + read cursors. The only owner\nof \"what has X seen\", so unread = room head (room) - cursor (inbox),\nmerged at the read boundary (per separate-before-serializing-shared-state).",
+              "properties": {
+                "owner": {
+                  "$ref": "#/$defs/Principal"
+                },
+                "stream": {
+                  "const": "inbox",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "owner"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The mail bridge's promotion / ack ledger (sandbox only).",
+              "properties": {
+                "stream": {
+                  "const": "mail",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "mail_bridge",
+            "wake_bell"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "`channel_wait`. Returns as soon as `interest` matches anything after\n`after`, with the *whole* catch-up slice (never just the trigger), or an\nempty page at `timeout_ms`.",
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "interest": {
+          "$ref": "#/$defs/Interest"
+        },
+        "timeout_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "interest",
+        "after"
+      ],
+      "title": "Wait",
+      "type": "object"
+    },
+    "name": "wait"
+  },
+  {
+    "description": "Sidebar tree: inbox and kanban badges, projects > rooms > wave agents, channels, DMs.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Sidebar",
+      "type": "object"
+    },
+    "name": "sidebar"
+  },
+  {
+    "description": "One wave agent's BB thread events and context usage (BB-owned, proxied).",
+    "inputSchema": {
+      "$defs": {
+        "BbSeq": {
+          "description": "BB's own per-thread event sequence (foreign cursor; never mixed with [`Seq`]).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BbSeq"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "limit": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "role",
+          "type": "string"
+        },
+        "wave": {
+          "description": "wave slug",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wave",
+        "role"
+      ],
+      "title": "ThreadPage",
+      "type": "object"
+    },
+    "name": "thread_page"
+  },
+  {
+    "description": "Code Mode: run JS in a fresh capped QuickJS sandbox with a frozen `rex` global exposing every tool.",
+    "inputSchema": {
+      "properties": {
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "name": "run_code"
+  }
+]

@@ -1,0 +1,16 @@
+[package]
+name = "rex-wave-board"
+description = "Kanban / org-todo decider. Depends on rex-kanban, rex-wave-api, and rex-wave-runtime, never on rooms/waves/notify/mail."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rex-kanban.workspace = true
+rex-wave-api.workspace = true
+rex-wave-runtime.workspace = true
+
+[lints]
+workspace = true

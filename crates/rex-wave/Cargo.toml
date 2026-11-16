@@ -1,0 +1,32 @@
+[package]
+name = "rex-wave"
+description = "The single binary: daemon (composition root), tui, mcp, and CLI verbs — all thin clients of the same api::Client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rex-wave"
+path = "src/main.rs"
+
+[dependencies]
+rex-wave-api.workspace = true
+rex-wave-store.workspace = true
+rex-wave-runtime.workspace = true
+rex-wave-rooms.workspace = true
+rex-wave-board.workspace = true
+rex-wave-waves.workspace = true
+rex-wave-notify.workspace = true
+rex-wave-mailbridge.workspace = true
+rex-wave-bb.workspace = true
+rex-wave-transport.workspace = true
+rex-wave-mcp.workspace = true
+rex-wave-tui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

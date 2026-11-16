@@ -1,0 +1,16 @@
+[package]
+name = "rex-wave-waves"
+description = "Wave actor (roster + worker state machine), the AgentHost port, and the WaveConductor reactor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rex-wave-api.workspace = true
+rex-wave-runtime.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

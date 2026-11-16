@@ -1,0 +1,15 @@
+[package]
+name = "rex-wave-notify"
+description = "Inbox actor (per-principal notifications + read cursors) and the Herald reactor (pure classify + rank)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rex-wave-api.workspace = true
+rex-wave-runtime.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "rex-wave-store"
+description = "Append-only per-stream journal on SQLite WAL. Single writer per stream, enforced by an unclonable StreamWriter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rex-wave-api.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

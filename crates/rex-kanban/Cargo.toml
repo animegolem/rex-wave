@@ -1,0 +1,19 @@
+[package]
+name = "rex-kanban"
+description = "Standalone kanban / org-todo model: boards, cards, CardRevision CAS, and the .org codec. Depends on no rex-wave crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
