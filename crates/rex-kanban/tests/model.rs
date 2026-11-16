@@ -305,7 +305,7 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
 }
 
 #[test]
-fn standalone_engine_handles_idem_moves_links_and_org_sync() {
+fn standalone_engine_handles_idem_moves_and_links() {
     let mut engine = KanbanEngine::new();
     let board = BoardId::parse("seat:sol").unwrap();
 
@@ -359,17 +359,11 @@ fn standalone_engine_handles_idem_moves_links_and_org_sync() {
         .unwrap();
     assert_eq!(replay, r1, "idempotent retry returns original creation receipt");
 
-    let exported = engine.export_org(&board).unwrap();
-    let mut imported_engine = KanbanEngine::new();
-    let imported_snap = imported_engine
-        .import_org(BoardId::parse("seat:fallback").unwrap(), &exported)
+    let snap = engine
+        .view_board(BoardView { board: board.clone(), filter: None })
         .unwrap();
-    assert_eq!(imported_snap.board, board);
-    let blkd_lane = imported_snap
-        .lanes
-        .iter()
-        .find(|l| l.lane == Lane::Blocked.lane_name())
-        .unwrap();
-    assert_eq!(blkd_lane.cards.len(), 1);
-    assert_eq!(blkd_lane.cards[0].links.len(), 2);
+    let org_rendered = org::render(&snap);
+    let parsed_cards = org::parse(&org_rendered).unwrap();
+    assert_eq!(parsed_cards.len(), 1);
+    assert_eq!(parsed_cards[0].links.len(), 2);
 }

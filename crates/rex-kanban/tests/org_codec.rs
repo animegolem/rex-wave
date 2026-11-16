@@ -28,7 +28,7 @@ Second paragraph with *bold* emphasis and a sub-outline:
 :REV: 4
 :ASSIGNEE: @auth-v2/author-jwt
 :DUE_MS: 1763280000000
-:LINKS: rex://room/general#42 letter://deadbeefcafe0123 wave:auth-v2/verifier
+:LINKS: rex://room/general#42 letter://deadbeefcafe0123 wave:auth-v2/verifier https://example.com/a%2Fb
 :CATEGORY: security
 :END:
 Ensure refresh tokens rotate atomically.
@@ -52,7 +52,7 @@ Waiting on BB review thread.
 :ID: 5
 :REV: 3
 :PRIORITY: blocking
-:LINKS: org+heading:docs/ops.org::Infra/Credentials%2FKeys
+:LINKS: org+heading:docs/ops.org::Infra/Credentials\\x2FKeys
 :TICKET: OPS-99
 :END:
 
@@ -81,7 +81,12 @@ Waiting on BB review thread.
     assert!(doc.tasks[0].body.contains("** Sub-bullet inside card body"));
 
     assert_eq!(doc.tasks[1].canonical_lane(), Some(Lane::Todo));
-    assert_eq!(doc.tasks[1].links.len(), 3);
+    assert_eq!(doc.tasks[1].links.len(), 4);
+    assert_eq!(
+        doc.tasks[1].links[3],
+        Link::External(ExternalLink::parse_uri("https://example.com/a%2Fb").unwrap()),
+        "percent-escaped URI targets stay opaque and match ExternalLink::parse_uri"
+    );
     assert_eq!(doc.tasks[2].canonical_lane(), Some(Lane::Doing));
     assert_eq!(doc.tasks[3].canonical_lane(), Some(Lane::Review));
     assert_eq!(doc.tasks[4].canonical_lane(), Some(Lane::Blocked));

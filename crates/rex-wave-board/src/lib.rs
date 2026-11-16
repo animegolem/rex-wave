@@ -4,7 +4,6 @@ use rex_kanban::{KanbanError, Lane};
 use rex_wave_api::board::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
-use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Board;
 
@@ -51,96 +50,6 @@ pub fn task_move(
         },
         idem,
     }
-}
-
-/// Export a live board snapshot to canonical Org-mode text through `Client`.
-pub async fn export_org<C: Client>(
-    client: &C,
-    board: BoardId,
-    filter: Option<BoardFilter>,
-) -> Result<String, ApiError> {
-    let snapshot = client.call(BoardView { board, filter }).await?;
-    Ok(rex_kanban::org::render(&snapshot))
-}
-
-/// Import an Org-mode document into a board through `Client`, preserving
-/// lane order, priorities, tags, assignees, links, and `CardRevision` CAS.
-pub async fn import_org<C: Client>(
-    client: &C,
-    fallback_board: BoardId,
-    text: &str,
-) -> Result<BoardSnapshot, ApiError> {
-    let doc = rex_kanban::org::parse_document(text).map_err(|e| {
-        ApiError::Invalid(InvalidId {
-            what: "org document".into(),
-            reason: e.to_string(),
-        })
-    })?;
-    let board = match &doc.title {
-        Some(raw) if !raw.is_empty() => BoardId::parse(raw.clone()).map_err(|e| {
-            ApiError::Invalid(InvalidId { what: e.what, reason: e.reason })
-        })?,
-        _ => fallback_board,
-    };
-
-    let mut needed_lanes = Lane::all_lane_names();
-    let mut seen: BTreeSet<LaneName> = needed_lanes.iter().cloned().collect();
-    for task in &doc.tasks {
-        if seen.insert(task.lane.clone()) {
-            needed_lanes.push(task.lane.clone());
-        }
-    }
-    client
-        .call(BoardEnsure { board: board.clone(), lanes: Some(needed_lanes) })
-        .await?;
-
-    let before = client
-        .call(BoardView { board: board.clone(), filter: None })
-        .await?;
-    let mut existing_cards: BTreeMap<CardNo, Card> = BTreeMap::new();
-    for lane in before.lanes {
-        for card in lane.cards {
-            existing_cards.insert(card.no, card);
-        }
-    }
-
-    let mut per_lane_pos: BTreeMap<LaneName, u32> = BTreeMap::new();
-    for task in &doc.tasks {
-        let pos = per_lane_pos.entry(task.lane.clone()).or_insert(0);
-        let current_pos = *pos;
-        *pos += 1;
-
-        let target_card = task.id.filter(|id| existing_cards.contains_key(id));
-        let labels_remove = target_card
-            .and_then(|id| existing_cards.get(&id))
-            .map(|c| c.labels.iter().filter(|l| !task.tags.contains(l)).cloned().collect())
-            .unwrap_or_default();
-        let assignee = match &task.assignee {
-            Some(who) => Some(Assign::To { who: who.clone() }),
-            None => Some(Assign::Clear),
-        };
-        client
-            .call(CardUpsert {
-                board: board.clone(),
-                card: target_card,
-                expected: if target_card.is_some() { task.revision } else { None },
-                patch: CardPatch {
-                    title: Some(task.title.clone()),
-                    lane: Some(task.lane.clone()),
-                    position: Some(current_pos),
-                    assignee,
-                    priority: Some(task.effective_priority()),
-                    due_ms: task.due_ms,
-                    labels_add: task.tags.clone(),
-                    labels_remove,
-                    links_add: task.links.clone(),
-                },
-                idem: None,
-            })
-            .await?;
-    }
-
-    client.call(BoardView { board, filter: None }).await
 }
 
 fn map_kanban_error(err: KanbanError) -> ApiError {

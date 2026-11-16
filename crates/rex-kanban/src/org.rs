@@ -503,25 +503,23 @@ fn encode_link_token(link: &Link) -> String {
     match link {
         Link::External(ext) => {
             let ns = if ext.namespace == "org+heading" {
-                "org%2Bheading".to_owned()
+                "org\\x2Bheading".to_owned()
             } else {
-                percent_encode(&ext.namespace, |b| {
-                    b <= b' ' || b == 0x7f || b == b'%' || b == b':'
-                })
+                backslash_escape(&ext.namespace, |b| b <= b' ' || b == 0x7f || b == b':')
             };
-            let key = percent_encode(&ext.key, |b| b <= b' ' || b == 0x7f || b == b'%');
+            let key = backslash_escape(&ext.key, |b| b <= b' ' || b == 0x7f);
             format!("{ns}:{key}")
         }
         Link::Org { file, outline } => {
-            let encoded_file = percent_encode(&file.to_string_lossy(), |b| {
-                b <= b' ' || b == 0x7f || b == b'%' || b == b':'
+            let encoded_file = backslash_escape(&file.to_string_lossy(), |b| {
+                b <= b' ' || b == 0x7f || b == b':'
             });
             if outline.is_empty() {
                 format!("{ORG_LINK_PREFIX}{encoded_file}")
             } else {
                 let joined = outline
                     .iter()
-                    .map(|seg| percent_encode(seg, |b| b <= b' ' || b == 0x7f || b == b'%' || b == b'/'))
+                    .map(|seg| backslash_escape(seg, |b| b <= b' ' || b == 0x7f || b == b'/'))
                     .collect::<Vec<_>>()
                     .join("/");
                 format!("{ORG_LINK_PREFIX}{encoded_file}::{joined}")
@@ -536,13 +534,13 @@ fn decode_link_token(token: &str, line: usize) -> Result<Link, OrgError> {
             Some((f, o)) => {
                 let segments = o
                     .split('/')
-                    .map(|seg| percent_decode(seg, line))
+                    .map(|seg| backslash_unescape(seg, line))
                     .collect::<Result<Vec<_>, _>>()?;
                 (f, segments)
             }
             None => (rest, Vec::new()),
         };
-        let decoded_file = percent_decode(file_raw, line)?;
+        let decoded_file = backslash_unescape(file_raw, line)?;
         if decoded_file.is_empty() {
             return Err(OrgError::Property {
                 line,
@@ -552,14 +550,14 @@ fn decode_link_token(token: &str, line: usize) -> Result<Link, OrgError> {
         return Ok(Link::Org { file: PathBuf::from(decoded_file), outline });
     }
 
-    let Some((raw_ns, raw_key)) = token.split_once(':') else {
+    let Some((raw_ns, raw_key)) = split_unescaped_colon(token) else {
         return Err(OrgError::Property {
             line,
             reason: format!("malformed link `{token}` (expected scheme:target)"),
         });
     };
-    let namespace = percent_decode(raw_ns, line)?;
-    let key = percent_decode(raw_key, line)?;
+    let namespace = backslash_unescape(raw_ns, line)?;
+    let key = backslash_unescape(raw_key, line)?;
     if namespace.is_empty() || key.is_empty() || key == "//" {
         return Err(OrgError::Property {
             line,
@@ -573,11 +571,29 @@ fn decode_link_token(token: &str, line: usize) -> Result<Link, OrgError> {
     Ok(Link::External(ext))
 }
 
-fn percent_encode(input: &str, should_escape: impl Fn(u8) -> bool) -> String {
+fn split_unescaped_colon(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b':' {
+            return Some((&s[..i], &s[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn backslash_escape(input: &str, should_escape: impl Fn(u8) -> bool) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
-        if ch.is_ascii() && should_escape(ch as u8) {
-            let _ = write!(out, "%{:02X}", ch as u8);
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else if ch.is_ascii() && should_escape(ch as u8) {
+            let _ = write!(out, "\\x{:02X}", ch as u8);
         } else {
             out.push(ch);
         }
@@ -585,36 +601,53 @@ fn percent_encode(input: &str, should_escape: impl Fn(u8) -> bool) -> String {
     out
 }
 
-fn percent_decode(input: &str, line: usize) -> Result<String, OrgError> {
+fn backslash_unescape(input: &str, line: usize) -> Result<String, OrgError> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 >= bytes.len() {
                 return Err(OrgError::Property {
                     line,
-                    reason: format!("truncated percent escape in `{input}`"),
+                    reason: format!("dangling escape in `{input}`"),
                 });
             }
-            let hi = hex_val(bytes[i + 1]).ok_or_else(|| OrgError::Property {
+            if bytes[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            if bytes[i + 1] == b'x' {
+                if i + 3 >= bytes.len() {
+                    return Err(OrgError::Property {
+                        line,
+                        reason: format!("truncated hex escape in `{input}`"),
+                    });
+                }
+                let hi = hex_val(bytes[i + 2]).ok_or_else(|| OrgError::Property {
+                    line,
+                    reason: format!("invalid hex escape in `{input}`"),
+                })?;
+                let lo = hex_val(bytes[i + 3]).ok_or_else(|| OrgError::Property {
+                    line,
+                    reason: format!("invalid hex escape in `{input}`"),
+                })?;
+                out.push((hi << 4) | lo);
+                i += 4;
+                continue;
+            }
+            return Err(OrgError::Property {
                 line,
-                reason: format!("invalid percent escape in `{input}`"),
-            })?;
-            let lo = hex_val(bytes[i + 2]).ok_or_else(|| OrgError::Property {
-                line,
-                reason: format!("invalid percent escape in `{input}`"),
-            })?;
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+                reason: format!("unknown escape in `{input}`"),
+            });
         }
+        out.push(bytes[i]);
+        i += 1;
     }
     String::from_utf8(out).map_err(|_| OrgError::Property {
         line,
-        reason: format!("non-utf8 percent escape in `{input}`"),
+        reason: format!("non-utf8 escape in `{input}`"),
     })
 }
 

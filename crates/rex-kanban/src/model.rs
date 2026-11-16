@@ -1,7 +1,7 @@
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -910,16 +910,6 @@ struct ManagedBoard {
     idem_receipts: BTreeMap<IdemKey, CardRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum KanbanOrgSyncError {
-    #[error(transparent)]
-    Kanban(#[from] KanbanError),
-    #[error(transparent)]
-    Org(#[from] crate::org::OrgError),
-    #[error(transparent)]
-    Invalid(#[from] InvalidValue),
-}
-
 impl KanbanEngine {
     pub fn new() -> Self {
         Self::default()
@@ -994,63 +984,6 @@ impl KanbanEngine {
             .state
             .snapshot(entry.events.len() as u64, cmd.filter.as_ref())
             .ok_or(KanbanError::NoSuchBoard(cmd.board))
-    }
-
-    pub fn export_org(&self, board: &BoardId) -> Result<String, KanbanError> {
-        let snap = self.view_board(BoardView { board: board.clone(), filter: None })?;
-        Ok(crate::org::render(&snap))
-    }
-
-    pub fn import_org(&mut self, fallback_board: BoardId, text: &str) -> Result<BoardSnapshot, KanbanOrgSyncError> {
-        let doc = crate::org::parse_document(text)?;
-        let board = match &doc.title {
-            Some(raw) if !raw.is_empty() => BoardId::parse(raw.clone())?,
-            _ => fallback_board,
-        };
-        let mut needed_lanes = Lane::all_lane_names();
-        let mut seen: BTreeSet<LaneName> = needed_lanes.iter().cloned().collect();
-        for task in &doc.tasks {
-            if seen.insert(task.lane.clone()) {
-                needed_lanes.push(task.lane.clone());
-            }
-        }
-        self.ensure_board(BoardEnsure { board: board.clone(), lanes: Some(needed_lanes) })?;
-        let mut per_lane_pos: BTreeMap<LaneName, u32> = BTreeMap::new();
-        for task in &doc.tasks {
-            let pos = per_lane_pos.entry(task.lane.clone()).or_insert(0);
-            let current_pos = *pos;
-            *pos += 1;
-            let existing = task.id.filter(|id| {
-                self.boards.get(&board).is_some_and(|b| b.state.cards.contains_key(id))
-            });
-            let priority = task.effective_priority();
-            let assignee = match &task.assignee {
-                Some(who) => Some(Assign::To { who: who.clone() }),
-                None => Some(Assign::Clear),
-            };
-            let labels_remove = existing
-                .and_then(|id| self.boards.get(&board)?.state.cards.get(&id))
-                .map(|c| c.labels.iter().filter(|l| !task.tags.contains(l)).cloned().collect())
-                .unwrap_or_default();
-            self.upsert_card(CardUpsert {
-                board: board.clone(),
-                card: existing,
-                expected: if existing.is_some() { task.revision } else { None },
-                patch: CardPatch {
-                    title: Some(task.title.clone()),
-                    lane: Some(task.lane.clone()),
-                    position: Some(current_pos),
-                    assignee,
-                    priority: Some(priority),
-                    due_ms: task.due_ms,
-                    labels_add: task.tags.clone(),
-                    labels_remove,
-                    links_add: task.links.clone(),
-                },
-                idem: None,
-            })?;
-        }
-        Ok(self.view_board(BoardView { board, filter: None })?)
     }
 
     pub fn events(&self, board: &BoardId) -> Option<&[BoardEvent]> {

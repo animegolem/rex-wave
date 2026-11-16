@@ -4,7 +4,7 @@ use rex_wave_api::board::*;
 use rex_wave_api::read::Sidebar;
 use rex_wave_api::stage::StageTarget;
 use rex_wave_api::*;
-use rex_wave_board::{Board, default_lanes, export_org, import_org, task_move};
+use rex_wave_board::{Board, default_lanes, task_move};
 use rex_wave_runtime::*;
 use rex_wave_store::Journal;
 use std::path::Path;
@@ -276,25 +276,13 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
         assert!(matches!(frame, Frame::Stage { generation: FocusGeneration(1), .. }));
     }
 
-    let org_text = export_org(&sol, personal.clone(), None).await.unwrap();
+    let snap = sol
+        .call(BoardView { board: personal.clone(), filter: None })
+        .await
+        .unwrap();
+    let org_text = rex_kanban::org::render(&snap);
     assert!(org_text.contains("#+TITLE: seat:sol"));
     assert!(org_text.contains("* TODO [#A] Implicitly open personal board :personal:"));
     assert!(org_text.contains(":LINKS: wave:pr2/owner"));
-
-    let edited = org_text.replace("* TODO [#A]", "* DONE [#A]");
-    let synced = import_org(&sol, personal.clone(), &edited).await.unwrap();
-    let done_cards = &synced
-        .lanes
-        .iter()
-        .find(|l| l.lane == Lane::Done.lane_name())
-        .unwrap()
-        .cards;
-    assert_eq!(done_cards.len(), 1);
-    assert_eq!(done_cards[0].revision, CardRevision(2));
-
-    let stale_conflict = import_org(&sol, personal, &edited).await.unwrap_err();
-    assert!(
-        matches!(stale_conflict, ApiError::Conflict { .. }),
-        "re-importing org text with stale :REV: 1 fails CAS against revision 2"
-    );
+    assert_eq!(rex_kanban::org::parse(&org_text).unwrap(), snap.lanes[0].cards);
 }
