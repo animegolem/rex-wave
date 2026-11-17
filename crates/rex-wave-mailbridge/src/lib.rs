@@ -179,6 +179,14 @@ impl SandboxRoot {
         let lex = lexical_normalize(path)?;
         check_not_production(&lex, path, &forbidden)?;
 
+        // Judge a symlink by where it points, so the verdict is the same
+        // whether or not its target exists on this machine.
+        if let Ok(target) = fs::read_link(path) {
+            let base = lex.parent().unwrap_or(Path::new("/"));
+            let pointed = lexical_normalize(&base.join(target))?;
+            check_not_production(&pointed, path, &forbidden)?;
+        }
+
         let mut ancestor = lex.as_path();
         while let Some(parent) = ancestor.parent() {
             if let Ok(canon_anc) = fs::canonicalize(ancestor) {
