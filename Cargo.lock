@@ -1399,10 +1399,14 @@ dependencies = [
 name = "rex-wave-mcp"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
  "rex-wave-api",
+ "rex-wave-runtime",
+ "rex-wave-store",
  "rquickjs",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]
