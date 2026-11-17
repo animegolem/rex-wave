@@ -73,15 +73,29 @@ pub fn args_schema(tool: &ToolMeta) -> Value {
 pub struct McpServer<C: Client> {
     pub(crate) client: C,
     budget: codemode::Budget,
+    pub(crate) http_token: Option<String>,
 }
 
 impl<C: Client> McpServer<C> {
     pub fn new(client: C) -> Self {
-        McpServer { client, budget: codemode::Budget::default() }
+        McpServer {
+            client,
+            budget: codemode::Budget::default(),
+            http_token: None,
+        }
     }
 
     pub fn with_budget(client: C, budget: codemode::Budget) -> Self {
-        McpServer { client, budget }
+        McpServer {
+            client,
+            budget,
+            http_token: None,
+        }
+    }
+
+    pub fn with_http_token(mut self, token: impl Into<String>) -> Self {
+        self.http_token = Some(token.into());
+        self
     }
 
     /// Tools visible to this session: audience-filtered `TOOLS` plus `run_code`.
@@ -158,7 +172,7 @@ impl<C: Client + Clone + 'static> McpServer<C> {
     /// Serve MCP `2025-11-25` over any async duplex stream (newline JSON-RPC or `Content-Length` frames).
     pub async fn serve_stream<R, W>(self, reader: R, writer: W) -> io::Result<()>
     where
-        R: AsyncRead + Unpin + Send,
+        R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         rpc::serve_stream(Arc::new(self), reader, writer).await
@@ -171,6 +185,12 @@ impl<C: Client + Clone + 'static> McpServer<C> {
 
     /// Serve MCP `2025-11-25` HTTP JSON-RPC over an already-bound loopback listener.
     pub async fn serve_http_listener(self, listener: TcpListener) -> io::Result<()> {
+        if !listener.local_addr()?.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MCP HTTP server requires a loopback bind address",
+            ));
+        }
         rpc::serve_http_listener(Arc::new(self), listener).await
     }
 
@@ -259,9 +279,11 @@ pub(crate) fn unwrap_wire_reply(expected_tool: &str, reply: WireReply) -> Result
 
 fn run_code_descriptor(allowed: &[&'static ToolMeta], budget: &codemode::Budget) -> ToolDescriptor {
     let default_ms = budget.deadline.as_millis().min(u128::from(MAX_RUN_CODE_TIMEOUT_MS)) as u64;
+    let heap_kib = budget.heap_bytes >> 10;
+    let stack_kib = budget.stack_bytes >> 10;
     let ts_signatures = render_typescript_summary(allowed);
     let description = format!(
-        "Execute an isolated QuickJS async script with top-level `await` and `return` (8 MiB heap cap, 512 KiB stack cap, <=30s deadline). Frozen `globalThis.rex` exposes `whoami()` plus audience-filtered commands in both `snake_case` and `camelCase`:\n\n```ts\n{ts_signatures}\n```"
+        "Execute an isolated QuickJS async script with top-level `await` and `return` ({heap_kib} KiB heap cap, {stack_kib} KiB stack cap, <=30s deadline). Frozen `globalThis.rex` exposes `whoami()` plus audience-filtered commands in both `snake_case` and `camelCase`:\n\n```ts\n{ts_signatures}\n```"
     );
     ToolDescriptor {
         name: RUN_CODE_TOOL.to_owned(),

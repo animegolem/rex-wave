@@ -4,6 +4,7 @@ use rex_wave_api::{ApiError, Client};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -29,15 +30,40 @@ enum FrameInput {
     ParseError(String),
 }
 
+enum ParsedRpc {
+    Notification { method: String, params: Option<Value> },
+    Request { id: Value, method: String, params: Value },
+    Invalid(Value),
+}
+
 pub(crate) async fn serve_stream<C, R, W>(server: Arc<McpServer<C>>, reader: R, mut writer: W) -> io::Result<()>
 where
     C: Client + Clone + 'static,
-    R: AsyncRead + Unpin + Send,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let frame_mode = Arc::new(AtomicU8::new(FORMAT_LINE));
     let writer_mode = frame_mode.clone();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (in_tx, mut in_rx) = mpsc::channel::<io::Result<(FrameInput, u8)>>(32);
+
+    let reader_task = tokio::spawn(async move {
+        let mut buf_reader = BufReader::new(reader);
+        loop {
+            match read_next_frame(&mut buf_reader).await {
+                Ok(Some(item)) => {
+                    if in_tx.send(Ok(item)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = in_tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -46,7 +72,6 @@ where
         Ok::<(), io::Error>(())
     });
 
-    let mut buf_reader = BufReader::new(reader);
     let mut subscriptions: HashMap<String, AbortHandle> = HashMap::new();
     let mut in_flight_ids: HashMap<String, AbortHandle> = HashMap::new();
     let mut rpc_tasks: JoinSet<(Option<String>, tokio::task::Id)> = JoinSet::new();
@@ -61,16 +86,16 @@ where
                     in_flight_ids.remove(&req_key);
                 }
             }
-            incoming = read_next_frame(&mut buf_reader) => {
+            incoming = in_rx.recv() => {
                 match incoming {
-                    Ok(Some((frame, mode))) => {
+                    Some(Ok((frame, mode))) => {
                         frame_mode.store(mode, Ordering::Relaxed);
                         match frame {
                             FrameInput::ParseError(detail) => {
                                 let _ = out_tx.send(rpc_error(Value::Null, PARSE_ERROR, format!("parse error: {detail}")));
                             }
                             FrameInput::Json(payload) => {
-                                dispatch_stream_payload(
+                                dispatch_single_stream_msg(
                                     &server,
                                     payload,
                                     &out_tx,
@@ -82,13 +107,14 @@ where
                             }
                         }
                     }
-                    Ok(None) => break Ok(()),
-                    Err(err) => break Err(err),
+                    Some(Err(err)) => break Err(err),
+                    None => break Ok(()),
                 }
             }
         }
     };
 
+    reader_task.abort();
     while let Some(done) = rpc_tasks.join_next().await {
         if let Ok((Some(req_key), task_id)) = done
             && in_flight_ids.get(&req_key).is_some_and(|h| h.id() == task_id)
@@ -137,7 +163,12 @@ where
     let method = parts.next().unwrap_or_default();
 
     let mut content_length: usize = 0;
+    let mut content_type: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut authorization: Option<String> = None;
     let mut saw_blank = false;
+
     for _ in 0..MAX_HEADER_LINES {
         let mut hdr = Vec::new();
         let hn = read_bounded_line(&mut reader, &mut hdr).await?;
@@ -151,15 +182,24 @@ where
             saw_blank = true;
             break;
         }
-        if let Some((name, val)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = val
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if content_length > MAX_FRAME_BYTES {
-                return write_http_response(&mut writer_half, "413 Payload Too Large", "text/plain", b"payload exceeds 16 MiB").await;
+        if let Some((name, val)) = line.split_once(':') {
+            let key = name.trim();
+            let value = val.trim();
+            if key.eq_ignore_ascii_case("content-length") {
+                content_length = value
+                    .parse::<usize>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if content_length > MAX_FRAME_BYTES {
+                    return write_http_response(&mut writer_half, "413 Payload Too Large", "text/plain", b"payload exceeds 16 MiB").await;
+                }
+            } else if key.eq_ignore_ascii_case("content-type") {
+                content_type = Some(value.to_owned());
+            } else if key.eq_ignore_ascii_case("origin") {
+                origin = Some(value.to_owned());
+            } else if key.eq_ignore_ascii_case("host") {
+                host = Some(value.to_owned());
+            } else if key.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.to_owned());
             }
         }
     }
@@ -167,8 +207,31 @@ where
         return write_http_response(&mut writer_half, "431 Request Header Fields Too Large", "text/plain", b"too many headers").await;
     }
 
+    if let Some(ref orig) = origin
+        && !is_loopback_origin(orig)
+    {
+        return write_http_response(&mut writer_half, "403 Forbidden", "text/plain", b"forbidden Origin").await;
+    }
+    if let Some(ref h) = host
+        && !is_loopback_host(h)
+    {
+        return write_http_response(&mut writer_half, "403 Forbidden", "text/plain", b"forbidden Host").await;
+    }
+    if let Some(ref expected) = server.http_token {
+        let ok = authorization
+            .as_deref()
+            .and_then(strip_bearer)
+            .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()));
+        if !ok {
+            return write_http_response(&mut writer_half, "401 Unauthorized", "text/plain", b"bearer token required").await;
+        }
+    }
+
     if method != "POST" {
         return write_http_response(&mut writer_half, "405 Method Not Allowed", "text/plain", b"POST required").await;
+    }
+    if !content_type.as_deref().is_some_and(is_json_content_type) {
+        return write_http_response(&mut writer_half, "415 Unsupported Media Type", "text/plain", b"application/json required").await;
     }
 
     let mut body = vec![0u8; content_length];
@@ -192,6 +255,72 @@ where
     }
 }
 
+fn is_json_content_type(ct: &str) -> bool {
+    let media = ct.split(';').next().unwrap_or_default().trim();
+    media.eq_ignore_ascii_case("application/json")
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let trimmed = origin.trim();
+    let authority = if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
+        &trimmed[7..]
+    } else if trimmed.len() > 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
+        &trimmed[8..]
+    } else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    is_loopback_host(authority)
+}
+
+fn is_loopback_host(authority: &str) -> bool {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((ipv6_str, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_ok = tail.is_empty()
+            || tail
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok_and(|n| n > 0));
+        return port_ok && ipv6_str.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
+    }
+    let (host, port_ok) = match trimmed.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().is_ok_and(|n| n > 0)),
+        None => (trimmed, true),
+    };
+    if !port_ok {
+        return false;
+    }
+    host.eq_ignore_ascii_case("localhost") || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn strip_bearer(header: &str) -> Option<&str> {
+    let (scheme, token) = header.trim().split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        let t = token.trim();
+        if !t.is_empty() { Some(t) } else { None }
+    } else {
+        None
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn write_http_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     status: &str,
@@ -209,47 +338,9 @@ async fn write_http_response<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-async fn dispatch_stream_payload<C>(
-    server: &Arc<McpServer<C>>,
-    payload: Value,
-    out_tx: &mpsc::UnboundedSender<Value>,
-    subscriptions: &mut HashMap<String, AbortHandle>,
-    in_flight_ids: &mut HashMap<String, AbortHandle>,
-    rpc_tasks: &mut JoinSet<(Option<String>, tokio::task::Id)>,
-) where
-    C: Client + Clone + 'static,
-{
-    match payload {
-        Value::Array(items) => {
-            if items.is_empty() {
-                let _ = out_tx.send(rpc_error(Value::Null, INVALID_REQUEST, "empty JSON-RPC batch"));
-                return;
-            }
-            let mut batch_out = Vec::new();
-            for item in items {
-                if let Some(resp) = handle_batch_item(server, item, out_tx, subscriptions, in_flight_ids).await {
-                    batch_out.push(resp);
-                }
-            }
-            if !batch_out.is_empty() {
-                let _ = out_tx.send(Value::Array(batch_out));
-            }
-        }
-        single => {
-            dispatch_single_stream_msg(server, single, out_tx, subscriptions, in_flight_ids, rpc_tasks).await;
-        }
-    }
-}
-
-enum ParsedRpc {
-    Notification { method: String, params: Option<Value> },
-    Request { id: Value, method: String, params: Value },
-    Invalid(Value),
-}
-
 fn parse_rpc_message(msg: Value) -> ParsedRpc {
     let Value::Object(mut obj) = msg else {
-        return ParsedRpc::Invalid(rpc_error(Value::Null, INVALID_REQUEST, "JSON-RPC message must be an object"));
+        return ParsedRpc::Invalid(rpc_error(Value::Null, INVALID_REQUEST, "JSON-RPC message must be a single object"));
     };
     let id_opt = obj.remove("id");
     let has_id = id_opt.is_some();
@@ -268,30 +359,6 @@ fn parse_rpc_message(msg: Value) -> ParsedRpc {
         None | Some(Value::Null) => ParsedRpc::Request { id, method, params: json!({}) },
         Some(v @ Value::Object(_)) => ParsedRpc::Request { id, method, params: v },
         Some(_) => ParsedRpc::Invalid(rpc_error(id, INVALID_PARAMS, "MCP request params must be a JSON object")),
-    }
-}
-
-async fn handle_batch_item<C>(
-    server: &Arc<McpServer<C>>,
-    msg: Value,
-    out_tx: &mpsc::UnboundedSender<Value>,
-    subscriptions: &mut HashMap<String, AbortHandle>,
-    in_flight_ids: &mut HashMap<String, AbortHandle>,
-) -> Option<Value>
-where
-    C: Client + Clone + 'static,
-{
-    match parse_rpc_message(msg) {
-        ParsedRpc::Invalid(err) => Some(err),
-        ParsedRpc::Notification { method, params } => {
-            if let Some(p) = &params {
-                handle_notification(&method, p, in_flight_ids);
-            }
-            None
-        }
-        ParsedRpc::Request { id, method, params } => {
-            Some(execute_request_inline(server, id, &method, params, Some((out_tx, subscriptions))).await)
-        }
     }
 }
 
@@ -345,30 +412,12 @@ async fn handle_stateless_payload<C>(server: &Arc<McpServer<C>>, payload: Value)
 where
     C: Client + Clone + 'static,
 {
-    match payload {
-        Value::Array(items) => {
-            if items.is_empty() {
-                return Some(rpc_error(Value::Null, INVALID_REQUEST, "empty JSON-RPC batch"));
-            }
-            let mut responses = Vec::new();
-            for item in items {
-                match parse_rpc_message(item) {
-                    ParsedRpc::Invalid(err) => responses.push(err),
-                    ParsedRpc::Notification { .. } => {}
-                    ParsedRpc::Request { id, method, params } => {
-                        responses.push(execute_request_inline(server, id, &method, params, None).await);
-                    }
-                }
-            }
-            if responses.is_empty() { None } else { Some(Value::Array(responses)) }
+    match parse_rpc_message(payload) {
+        ParsedRpc::Invalid(err) => Some(err),
+        ParsedRpc::Notification { .. } => None,
+        ParsedRpc::Request { id, method, params } => {
+            Some(execute_request_inline(server, id, &method, params, None).await)
         }
-        single => match parse_rpc_message(single) {
-            ParsedRpc::Invalid(err) => Some(err),
-            ParsedRpc::Notification { .. } => None,
-            ParsedRpc::Request { id, method, params } => {
-                Some(execute_request_inline(server, id, &method, params, None).await)
-            }
-        },
     }
 }
 

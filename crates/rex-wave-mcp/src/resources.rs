@@ -2,11 +2,13 @@ use futures_core::Stream;
 use rex_wave_api::room::{RoomId, RoomRef, RoomScope};
 use rex_wave_api::*;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 pub(crate) const SIDEBAR_URI: &str = "rex://sidebar";
-const DEFAULT_ROOM_READ_LIMIT: u32 = 200;
+const DEFAULT_ROOM_READ_LIMIT: usize = 200;
+const ROOM_SCAN_BATCH: u32 = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResourceTarget {
@@ -187,13 +189,7 @@ pub(crate) async fn read_resource<C: Client>(client: &C, uri: &str) -> Result<Va
         }
         ResourceTarget::Room(room_ref) => {
             let room = room_ref.resolve(client.me()).map_err(ApiError::from)?;
-            let page = client
-                .call(read::Read {
-                    stream: StreamId::Room { room },
-                    after: Seq::ORIGIN,
-                    limit: Some(DEFAULT_ROOM_READ_LIMIT),
-                })
-                .await?;
+            let page = read_room_tail(client, StreamId::Room { room }).await?;
             serde_json::to_string(&page).map_err(|e| ApiError::Internal(e.to_string()))?
         }
     };
@@ -263,6 +259,41 @@ pub(crate) async fn subscribe_resource<C: Client>(
             Ok(handle.abort_handle())
         }
     }
+}
+
+async fn read_room_tail<C: Client>(client: &C, stream: StreamId) -> Result<read::Page, ApiError> {
+    let mut after = Seq::ORIGIN;
+    let mut tail = VecDeque::with_capacity(DEFAULT_ROOM_READ_LIMIT);
+    let mut cursor;
+
+    loop {
+        let page = client
+            .call(read::Read {
+                stream: stream.clone(),
+                after,
+                limit: Some(ROOM_SCAN_BATCH),
+            })
+            .await?;
+        cursor = page.cursor;
+        let count = page.entries.len();
+        let last_seq = page.entries.last().map_or(after, |e| e.seq);
+        for env in page.entries {
+            if tail.len() == DEFAULT_ROOM_READ_LIMIT {
+                tail.pop_front();
+            }
+            tail.push_back(env);
+        }
+        if count < ROOM_SCAN_BATCH as usize || last_seq <= after {
+            break;
+        }
+        after = last_seq;
+    }
+
+    Ok(read::Page {
+        entries: tail.into_iter().collect(),
+        cursor,
+        timed_out: false,
+    })
 }
 
 fn room_descriptor(uri: String, name: String, description: &str) -> Value {

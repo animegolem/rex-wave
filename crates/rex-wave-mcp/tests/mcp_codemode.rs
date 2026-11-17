@@ -870,6 +870,22 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     .await
     .expect_err("exceeding max_host_calls must abort script");
     assert_eq!(capped, CodeError::HostCallBudget);
+
+    let log_flood = run_code(
+        &sol,
+        r#"
+            const big = "x".repeat(16384);
+            for (let i = 0; i < 600; i++) {
+                console.log(big);
+            }
+            return "done";
+        "#,
+        Budget::default(),
+    )
+    .await
+    .expect("bounded console.log flood");
+    assert_eq!(log_flood.logs.len(), 256);
+    assert_eq!(log_flood.logs[0].len(), 4096);
 }
 
 #[tokio::test]
@@ -1186,14 +1202,32 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let non_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     let bind_err = McpServer::new(sol.clone()).serve_http(non_loopback).await.unwrap_err();
     assert_eq!(bind_err.kind(), std::io::ErrorKind::InvalidInput);
+    let unspec_listener = TcpListener::bind(non_loopback).await.unwrap();
+    let listener_err = McpServer::new(sol.clone())
+        .serve_http_listener(unspec_listener)
+        .await
+        .unwrap_err();
+    assert_eq!(listener_err.kind(), std::io::ErrorKind::InvalidInput);
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let http_task = tokio::spawn(async move { McpServer::new(sol).serve_http_listener(listener).await });
+    let http_task = tokio::spawn(async move {
+        McpServer::new(sol)
+            .with_http_token("cap-sol-token")
+            .serve_http_listener(listener)
+            .await
+    });
 
-    let mut conn = TcpStream::connect(addr).await.unwrap();
+    async fn raw_http(addr: SocketAddr, raw: &str) -> String {
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_all(raw.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        conn.read_to_end(&mut resp).await.unwrap();
+        String::from_utf8(resp).unwrap()
+    }
+
     let body_bytes = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1201,19 +1235,190 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
         "params": {}
     }))
     .unwrap();
-    let http_req = format!(
-        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body_bytes.len()
-    );
-    conn.write_all(http_req.as_bytes()).await.unwrap();
-    conn.write_all(&body_bytes).await.unwrap();
-    let mut http_resp = Vec::new();
-    conn.read_to_end(&mut http_resp).await.unwrap();
-    let http_str = std::str::from_utf8(&http_resp).unwrap();
-    assert!(http_str.starts_with("HTTP/1.1 200 OK\r\n"));
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+    let bad_origin = raw_http(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            body_bytes.len()
+        ),
+    )
+    .await;
+    assert!(bad_origin.starts_with("HTTP/1.1 403 Forbidden\r\n"), "got: {bad_origin}");
+
+    let bad_host = raw_http(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            body_bytes.len()
+        ),
+    )
+    .await;
+    assert!(bad_host.starts_with("HTTP/1.1 403 Forbidden\r\n"), "got: {bad_host}");
+
+    let missing_auth = raw_http(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            body_bytes.len()
+        ),
+    )
+    .await;
+    assert!(missing_auth.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "got: {missing_auth}");
+
+    let bad_ct = raw_http(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body_str}",
+            body_bytes.len()
+        ),
+    )
+    .await;
+    assert!(bad_ct.starts_with("HTTP/1.1 415 Unsupported Media Type\r\n"), "got: {bad_ct}");
+
+    let http_str = raw_http(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://localhost:3000\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body_str}",
+            addr.port(),
+            body_bytes.len()
+        ),
+    )
+    .await;
+    assert!(http_str.starts_with("HTTP/1.1 200 OK\r\n"), "got: {http_str}");
     let (_, json_body) = http_str.split_once("\r\n\r\n").unwrap();
     let parsed_http: Value = serde_json::from_str(json_body).unwrap();
     assert_eq!(parsed_http["result"]["protocolVersion"], PROTOCOL_VERSION);
 
     http_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_completion() {
+    let harness = TestHarness::new();
+    let sol = harness.client(seat_principal("sol"));
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_io);
+    let (cli_r, mut cli_w) = tokio::io::split(client_io);
+    let mut cli_lines = BufReader::new(cli_r).lines();
+
+    let server_task = tokio::spawn(async move { McpServer::new(sol).serve_stream(srv_r, srv_w).await });
+
+    let slow_call = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "wait",
+            "arguments": {
+                "interest": { "interest": "mentions" },
+                "after": { "positions": [], "from_head": true },
+                "timeout_ms": 35
+            }
+        }
+    }))
+    .unwrap();
+    cli_w.write_all(&slow_call).await.unwrap();
+    cli_w.write_all(b"\n").await.unwrap();
+    cli_w.flush().await.unwrap();
+
+    let large_body = "a".repeat(48 * 1024);
+    let second_call = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "room_post",
+            "arguments": {
+                "room": { "ref": "channel", "scope": { "scope": "global" }, "name": "general" },
+                "body": large_body
+            }
+        }
+    }))
+    .unwrap();
+    let split_at = 24 * 1024;
+    cli_w.write_all(&second_call[..split_at]).await.unwrap();
+    cli_w.flush().await.unwrap();
+
+    let first_line = tokio::time::timeout(Duration::from_secs(2), cli_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let first_resp: Value = serde_json::from_str(&first_line).unwrap();
+    assert_eq!(first_resp["id"], 1);
+
+    cli_w.write_all(&second_call[split_at..]).await.unwrap();
+    cli_w.write_all(b"\n").await.unwrap();
+    cli_w.flush().await.unwrap();
+
+    let second_line = tokio::time::timeout(Duration::from_secs(2), cli_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let second_resp: Value = serde_json::from_str(&second_line).unwrap();
+    assert_eq!(second_resp["id"], 2, "partial frame must survive concurrent rpc_tasks completion: {second_resp}");
+    assert_eq!(second_resp["result"]["isError"], false);
+
+    cli_w.shutdown().await.unwrap();
+    drop(cli_w);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn resources_read_returns_latest_200_entries_for_long_rooms() {
+    let harness = TestHarness::new();
+    let sol = harness.client(seat_principal("sol"));
+    let room = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("busy").unwrap(),
+    };
+    for i in 1..=210u32 {
+        sol.call(RoomPost {
+            room: room.clone(),
+            body: Body::parse(format!("entry-{i}")).unwrap(),
+            reply_to: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_io);
+    let (cli_r, mut cli_w) = tokio::io::split(client_io);
+    let mut cli_lines = BufReader::new(cli_r).lines();
+
+    let server_task = tokio::spawn(async move { McpServer::new(sol).serve_stream(srv_r, srv_w).await });
+
+    let req = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": { "uri": "rex://room/channel/busy" }
+    }))
+    .unwrap();
+    cli_w.write_all(&req).await.unwrap();
+    cli_w.write_all(b"\n").await.unwrap();
+    cli_w.flush().await.unwrap();
+
+    let resp_line = tokio::time::timeout(Duration::from_secs(2), cli_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let resp: Value = serde_json::from_str(&resp_line).unwrap();
+    let page: Value = serde_json::from_str(resp["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 200);
+    assert_eq!(entries.first().unwrap()["seq"], json!(12));
+    assert_eq!(entries.last().unwrap()["seq"], json!(211));
+    assert_eq!(entries.last().unwrap()["event"]["event"]["body"], json!("entry-210"));
+
+    cli_w.shutdown().await.unwrap();
+    drop(cli_w);
+    server_task.await.unwrap().unwrap();
 }

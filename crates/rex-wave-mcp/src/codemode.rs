@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -318,17 +318,7 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
     let value: Value = serde_json::from_str(&raw_json).map_err(|e| CodeError::Thrown(format!("invalid return JSON: {e}")))?;
 
     let mut logs = Vec::new();
-    while let Ok(mut line) = log_rx.try_recv() {
-        if logs.len() >= MAX_LOG_LINES {
-            break;
-        }
-        if line.len() > MAX_LOG_LINE_BYTES {
-            let mut end = MAX_LOG_LINE_BYTES;
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
-        }
+    while let Ok(line) = log_rx.try_recv() {
         logs.push(line);
     }
 
@@ -369,7 +359,18 @@ fn install_bindings<'js>(
             }
         }),
     )?;
-    let log_fn = Function::new(ctx.clone(), move |line: String| {
+    let logged_lines = Arc::new(AtomicUsize::new(0));
+    let log_fn = Function::new(ctx.clone(), move |mut line: String| {
+        if logged_lines.fetch_add(1, Ordering::Relaxed) >= MAX_LOG_LINES {
+            return;
+        }
+        if line.len() > MAX_LOG_LINE_BYTES {
+            let mut end = MAX_LOG_LINE_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+        }
         let _ = log_tx.send(line);
     })?;
     globals.set("__rex_host_call", host_fn)?;
