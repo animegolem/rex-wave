@@ -267,7 +267,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
     up({ t: "thread_events", thread_id: thread.id, sequence });
   });
 
-  const tools = (catalog as ToolCatalogEntry[]).filter((t) => t.name !== "run_code");
+  const tools = catalog as ToolCatalogEntry[];
   for (const tool of tools) {
     bb.agents.registerTool({
       name: `rex_${tool.name}`,
@@ -321,7 +321,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
         `You are @${meta.role} in wave ${JSON.stringify(meta.waveId)} (room #wave-${meta.waveId}, ` +
         `roomId ${JSON.stringify(meta.roomId)}, project ${JSON.stringify(context.project.id)}), ` +
         `running on ${context.provider.id}/${context.provider.model}. ` +
-        `Coordinate through rex_room_post and rex_wait (pass the last seq you read). ` +
+        `Coordinate through rex_room_post, rex_wait (pass the last seq you read), and rex_run_code. ` +
         `@mention a peer to wake it.`,
     };
   });

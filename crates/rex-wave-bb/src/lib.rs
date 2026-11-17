@@ -20,6 +20,7 @@ use rex_wave_runtime::{
 use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1169,10 +1170,123 @@ impl Reactor for BridgeWaveWatcher {
     }
 }
 
+struct WaitFlightGuard {
+    active: Arc<AtomicUsize>,
+    aborted: Arc<AtomicBool>,
+    completed: bool,
+}
+
+impl Drop for WaitFlightGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        if !self.completed {
+            self.aborted.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WorkerToolClient {
+    bridge: Arc<BbBridge>,
+    backend: Arc<dyn ErasedBackend>,
+    me: Principal,
+    wave: WaveSlug,
+    role: RoleName,
+    active_waits: Arc<AtomicUsize>,
+    aborted_wait: Arc<AtomicBool>,
+}
+
+impl Client for WorkerToolClient {
+    fn me(&self) -> &Principal {
+        &self.me
+    }
+
+    fn call_wire(
+        &self,
+        cmd: WireCommand,
+    ) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
+        let bridge = self.bridge.clone();
+        let backend = self.backend.clone();
+        let me = self.me.clone();
+        let wave = self.wave.clone();
+        let role = self.role.clone();
+        let active_waits = self.active_waits.clone();
+        let aborted_wait = self.aborted_wait.clone();
+        async move {
+            let parked_scope = match &cmd {
+                WireCommand::Wait(w) => Some(parked_room_and_since(&me, w)),
+                _ => None,
+            };
+            let mut wait_guard = None;
+            if let Some((room, since)) = &parked_scope {
+                active_waits.fetch_add(1, Ordering::Relaxed);
+                wait_guard = Some(WaitFlightGuard {
+                    active: active_waits.clone(),
+                    aborted: aborted_wait,
+                    completed: false,
+                });
+                bridge
+                    .call_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Activity {
+                            activity: Activity::Parked {
+                                room: room.clone(),
+                                since: *since,
+                            },
+                        },
+                    )
+                    .await;
+            }
+
+            let outcome = backend.call_as(me, cmd).await;
+
+            if let Some(mut guard) = wait_guard {
+                guard.completed = true;
+                drop(guard);
+                if active_waits.load(Ordering::Relaxed) == 0
+                    && let Ok(rec) = bridge.lookup_worker(&wave, &role).await
+                    && matches!(rec.activity, Activity::Parked { .. })
+                {
+                    bridge
+                        .call_wave_observe(
+                            wave,
+                            role,
+                            Observation::Activity {
+                                activity: Activity::Working,
+                            },
+                        )
+                        .await;
+                }
+            }
+            outcome
+        }
+    }
+
+    fn watch(
+        &self,
+        _interest: Interest,
+        _from: Cursor,
+    ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
+        async {
+            Err(ApiError::Unavailable {
+                family: Family::Read,
+            })
+        }
+    }
+}
+
+pub type CodeRunner = Arc<
+    dyn Fn(WorkerToolClient, serde_json::Value) -> BoxFut<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
+
 pub struct BbBridge {
     cfg: BridgeConfig,
     owner: mpsc::UnboundedSender<OwnerMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
+    code_runner: Option<CodeRunner>,
 }
 
 impl BbBridge {
@@ -1181,6 +1295,16 @@ impl BbBridge {
             cfg,
             owner: BridgeOwner::spawn(),
             backend: OnceLock::new(),
+            code_runner: None,
+        })
+    }
+
+    pub fn with_code_runner(cfg: BridgeConfig, code_runner: CodeRunner) -> Arc<Self> {
+        Arc::new(BbBridge {
+            cfg,
+            owner: BridgeOwner::spawn(),
+            backend: OnceLock::new(),
+            code_runner: Some(code_runner),
         })
     }
 
@@ -1592,7 +1716,7 @@ impl BbBridge {
     }
 
     async fn on_tool_call(
-        &self,
+        self: &Arc<Self>,
         call_id: String,
         thread_raw: String,
         meta: Option<protocol::WaveMeta>,
@@ -1619,6 +1743,48 @@ impl BbBridge {
             return;
         };
 
+        let active_waits = Arc::new(AtomicUsize::new(0));
+        let aborted_wait = Arc::new(AtomicBool::new(false));
+        let worker_client = WorkerToolClient {
+            bridge: self.clone(),
+            backend,
+            me: Principal::Worker {
+                wave: wave.clone(),
+                role: role.clone(),
+            },
+            wave: wave.clone(),
+            role: role.clone(),
+            active_waits: active_waits.clone(),
+            aborted_wait: aborted_wait.clone(),
+        };
+
+        if tool == "run_code" {
+            let Some(runner) = self.code_runner.as_ref() else {
+                send_reply(false, "run_code runner is not configured".into()).await;
+                return;
+            };
+            let res = (runner)(worker_client, args).await;
+            if aborted_wait.load(Ordering::Relaxed)
+                && active_waits.load(Ordering::Relaxed) == 0
+                && let Ok(rec) = self.lookup_worker(&wave, &role).await
+                && matches!(rec.activity, Activity::Parked { .. })
+            {
+                self.call_wave_observe(
+                    wave,
+                    role,
+                    Observation::Activity {
+                        activity: Activity::Working,
+                    },
+                )
+                .await;
+            }
+            match res {
+                Ok(text) => send_reply(true, text).await,
+                Err(err) => send_reply(false, err).await,
+            }
+            return;
+        }
+
         let wire_json = serde_json::json!({ "cmd": tool, "args": args });
         let cmd: WireCommand = match serde_json::from_value(wire_json) {
             Ok(c) => c,
@@ -1628,46 +1794,7 @@ impl BbBridge {
             }
         };
 
-        let worker_principal = Principal::Worker {
-            wave: wave.clone(),
-            role: role.clone(),
-        };
-        let parked_scope = match &cmd {
-            WireCommand::Wait(w) => Some(parked_room_and_since(&worker_principal, w)),
-            _ => None,
-        };
-
-        if let Some((room, since)) = &parked_scope {
-            self.call_wave_observe(
-                wave.clone(),
-                role.clone(),
-                Observation::Activity {
-                    activity: Activity::Parked {
-                        room: room.clone(),
-                        since: *since,
-                    },
-                },
-            )
-            .await;
-        }
-
-        let outcome = backend.call_as(worker_principal, cmd).await;
-
-        if parked_scope.is_some()
-            && let Ok(rec) = self.lookup_worker(&wave, &role).await
-            && matches!(rec.activity, Activity::Parked { .. })
-        {
-            self.call_wave_observe(
-                wave,
-                role,
-                Observation::Activity {
-                    activity: Activity::Working,
-                },
-            )
-            .await;
-        }
-
-        match outcome {
+        match worker_client.call_wire(cmd).await {
             Ok(reply) => {
                 let val = serde_json::to_value(&reply).unwrap_or(serde_json::Value::Null);
                 let payload = val.get("value").unwrap_or(&val);
