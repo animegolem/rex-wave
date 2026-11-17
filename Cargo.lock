@@ -1463,6 +1463,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "crossterm",
+ "futures-core",
  "ratatui",
  "rex-wave-api",
  "tokio",
