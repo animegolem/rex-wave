@@ -1263,16 +1263,10 @@ impl Client for WorkerToolClient {
         }
     }
 
-    fn watch(
-        &self,
-        _interest: Interest,
-        _from: Cursor,
-    ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
-        async {
-            Err(ApiError::Unavailable {
-                family: Family::Read,
-            })
-        }
+    async fn watch(&self, _interest: Interest, _from: Cursor) -> Result<FrameStream, ApiError> {
+        Err(ApiError::Unavailable {
+            family: Family::Read,
+        })
     }
 }
 

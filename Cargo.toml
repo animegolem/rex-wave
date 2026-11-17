@@ -59,3 +59,9 @@ rex-wave-tui = { path = "crates/rex-wave-tui" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Event and command enums carry their payloads inline on purpose; boxing them
+# would add an allocation per message.
+large_enum_variant = "allow"
+type_complexity = "allow"

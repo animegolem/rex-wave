@@ -90,8 +90,10 @@ async fn sidebar_org_tree_skips_divider_folds_and_falls_back_on_rebuild() {
     );
     assert_eq!(model.sidebar.cursor, wave_room_key);
 
-    let mut empty = SidebarTreeSnapshot::default();
-    empty.inbox = overview.inbox;
+    let empty = SidebarTreeSnapshot {
+        inbox: overview.inbox,
+        ..Default::default()
+    };
     let _ = update(
         &mut model,
         Msg::Frame {

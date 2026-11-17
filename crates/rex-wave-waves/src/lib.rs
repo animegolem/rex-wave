@@ -1841,16 +1841,10 @@ mod tests {
             }
         }
 
-        fn watch(
-            &self,
-            _interest: Interest,
-            _from: Cursor,
-        ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
-            async {
-                Err::<FrameStream, ApiError>(ApiError::Unavailable {
-                    family: Family::Read,
-                })
-            }
+        async fn watch(&self, _interest: Interest, _from: Cursor) -> Result<FrameStream, ApiError> {
+            Err::<FrameStream, ApiError>(ApiError::Unavailable {
+                family: Family::Read,
+            })
         }
     }
 

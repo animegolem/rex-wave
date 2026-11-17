@@ -213,7 +213,7 @@ impl ReadSide {
                             }
                         }
                         Some(Err(e)) => {
-                            let _ = tx.send(Err(e));
+                            let _ = tx.send(Err(e)).await;
                             break;
                         }
                         None => break,

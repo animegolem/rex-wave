@@ -620,7 +620,7 @@ fn render_inbox(
         };
 
         let vis_start_row = (vp_top - virtual_top).max(0) as usize;
-        let vis_end_row = ((vp_bottom - virtual_top).min(CARD_H)).max(0) as usize;
+        let vis_end_row = (vp_bottom - virtual_top).clamp(0, CARD_H) as usize;
         if vis_end_row <= vis_start_row {
             continue;
         }
@@ -713,7 +713,12 @@ fn render_inbox(
         };
 
         let card_lines = [line0, line1, line2, line3];
-        for r in vis_start_row..vis_end_row {
+        for (r, card_line) in card_lines
+            .iter()
+            .enumerate()
+            .take(vis_end_row)
+            .skip(vis_start_row)
+        {
             let screen_y = (virtual_top + r as i32) as u16;
             let row_rect = Rect::new(card_x, screen_y, card_w, 1);
             for cx in card_x..card_x + card_w {
@@ -721,7 +726,7 @@ fn render_inbox(
                     cell.set_bg(Color::Reset);
                 }
             }
-            Paragraph::new(card_lines[r].clone()).render(row_rect, buf);
+            Paragraph::new(card_line.clone()).render(row_rect, buf);
             if r == 2 {
                 for &(off_x, w, a_idx) in &button_hit_offsets {
                     hits.push(
