@@ -165,8 +165,12 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
         const rows = await bb.sdk.threads.events.list({
           threadId: msg.thread_id,
           afterSeq: msg.after_seq === null ? undefined : String(msg.after_seq),
+          beforeSeq:
+            msg.before_seq === undefined || msg.before_seq === null
+              ? undefined
+              : String(msg.before_seq),
           limit: String(msg.limit),
-          order: "asc",
+          order: msg.order ?? "asc",
         });
         return reply(msg.req_id, rows);
       }
@@ -233,6 +237,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
   bb.events.on("thread.idle", forward("idle"));
   bb.events.on("thread.failed", forward("failed"));
   bb.events.on("thread.archived", forward("archived"));
+  bb.events.on("thread.deleted", forward("archived"));
 
   bb.events.on("turn.failed", async (ev) => {
     const resolved = await waveMetaByThreadId(ev.threadId);

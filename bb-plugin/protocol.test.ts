@@ -172,7 +172,16 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
           return { archivedThreadIds: [threadId] };
         },
         events: {
-          async list({ afterSeq }: { afterSeq?: string }) {
+          async list({
+            afterSeq,
+            beforeSeq,
+            order,
+          }: {
+            afterSeq?: string;
+            beforeSeq?: string;
+            order?: "asc" | "desc";
+          }) {
+            if (order === "desc" && beforeSeq === "9") return [{ seq: 7 }];
             if (afterSeq === "5") return [{ seq: 8 }];
             return [];
           },
@@ -305,4 +314,24 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
     "get:th_spawned_1:idle",
     "archive:th_spawned_1",
   ]);
+
+  await session.onMessage!(
+    socket,
+    JSON.stringify({
+      t: "events_page",
+      req_id: 10,
+      thread_id: "th_spawned_1",
+      after_seq: null,
+      before_seq: 9,
+      limit: 1,
+      order: "desc",
+    } satisfies Down),
+  );
+  const descRes = sentUp.find((m) => m.t === "result" && m.req_id === 10);
+  assert.deepEqual(descRes, { t: "result", req_id: 10, ok: true, value: [{ seq: 7 }] });
+
+  for (const fn of listeners.get("thread.deleted") ?? []) {
+    await fn({ thread: threadRecords.get("th_spawned_1") });
+  }
+  assert.ok(sentUp.some((m) => m.t === "thread" && m.signal === "archived" && m.thread_id === "th_spawned_1"));
 });

@@ -92,6 +92,13 @@ mod protocol {
         pub room_id: String,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum EventsOrder {
+        Asc,
+        Desc,
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "t", rename_all = "snake_case")]
     pub enum Down {
@@ -123,7 +130,11 @@ mod protocol {
             req_id: ReqId,
             thread_id: String,
             after_seq: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            before_seq: Option<u64>,
             limit: u32,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            order: Option<EventsOrder>,
         },
         ThreadContext {
             req_id: ReqId,
@@ -182,13 +193,17 @@ mod protocol {
                 Down::EventsPage {
                     thread_id,
                     after_seq,
+                    before_seq,
                     limit,
+                    order,
                     ..
                 } => Down::EventsPage {
                     req_id: id,
                     thread_id,
                     after_seq,
+                    before_seq,
                     limit,
+                    order,
                 },
                 Down::ThreadContext { thread_id, .. } => Down::ThreadContext {
                     req_id: id,
@@ -672,6 +687,23 @@ fn extract_user_content(content: Option<&serde_json::Value>) -> String {
     parts.join("\n")
 }
 
+fn activity_from_row(row: &serde_json::Value) -> Option<Activity> {
+    match row.get("type").and_then(|v| v.as_str()) {
+        Some("turn/started" | "client/turn/start") => Some(Activity::Working),
+        Some("turn/completed") => Some(Activity::Idle),
+        Some("system/error" | "provider/error") => {
+            let msg = row
+                .get("data")
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("BB error")
+                .to_owned();
+            Some(Activity::Errored { error: msg })
+        }
+        _ => None,
+    }
+}
+
 pub trait BridgeBackend: Send + Sync + 'static {
     type C: Client + Clone + 'static;
     fn client(&self, me: Principal) -> Self::C;
@@ -760,7 +792,7 @@ enum OwnerMsg {
         reply: oneshot::Sender<Option<TrackedWorker>>,
     },
     ListLiveWorkers {
-        reply: oneshot::Sender<Vec<(WaveSlug, RoleName, BbThreadId, Option<u64>)>>,
+        reply: oneshot::Sender<Vec<(WaveSlug, RoleName, BbThreadId, Activity, Option<u64>)>>,
     },
     AdvanceSeq {
         thread: BbThreadId,
@@ -942,7 +974,13 @@ impl BridgeOwner {
                         if rec.live
                             && let Some(th) = &rec.thread
                         {
-                            list.push((w.clone(), r.clone(), th.clone(), rec.last_seq));
+                            list.push((
+                                w.clone(),
+                                r.clone(),
+                                th.clone(),
+                                rec.activity.clone(),
+                                rec.last_seq,
+                            ));
                         }
                     }
                     let _ = reply.send(list);
@@ -1642,6 +1680,29 @@ impl BbBridge {
         }
     }
 
+    async fn authoritative_activity(&self, wave: &WaveSlug, role: &RoleName) -> Option<Activity> {
+        let backend = self.backend.get()?;
+        let me = Principal::System {
+            part: SystemPart::BbBridge,
+        };
+        let WireReply::WaveView(snap) = backend
+            .call_as(me, WireCommand::WaveView(WaveView { wave: wave.clone() }))
+            .await
+            .ok()?
+        else {
+            return None;
+        };
+        snap.workers.into_iter().find_map(|(r, _, phase)| {
+            if &r == role
+                && let WorkerPhase::Live { activity, .. } = phase
+            {
+                Some(activity)
+            } else {
+                None
+            }
+        })
+    }
+
     async fn reconcile_live_workers(&self) {
         let (tx, rx) = oneshot::channel();
         if self
@@ -1652,51 +1713,80 @@ impl BbBridge {
             return;
         }
         let Ok(workers) = rx.await else { return };
-        for (wave, role, thread, mut cursor_seq) in workers {
+        for (wave, role, thread, tracked_activity, mut cursor_seq) in workers {
             let mut derived_activity: Option<Activity> = None;
-            loop {
-                let Ok(rows_val) = self
-                    .rpc(protocol::Down::EventsPage {
-                        req_id: 0,
-                        thread_id: thread.to_string(),
-                        after_seq: cursor_seq,
-                        limit: 200,
-                    })
-                    .await
-                else {
-                    break;
-                };
-                let Some(rows) = rows_val.as_array() else {
-                    break;
-                };
-                if rows.is_empty() {
-                    break;
-                }
-                let count = rows.len();
-                let prev = cursor_seq;
-                for row in rows {
-                    if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
-                        cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+            if cursor_seq.is_none() {
+                let mut before_seq: Option<u64> = None;
+                'desc: loop {
+                    let Ok(rows_val) = self
+                        .rpc(protocol::Down::EventsPage {
+                            req_id: 0,
+                            thread_id: thread.to_string(),
+                            after_seq: None,
+                            before_seq,
+                            limit: 200,
+                            order: Some(protocol::EventsOrder::Desc),
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+                    let Some(rows) = rows_val.as_array() else {
+                        break;
+                    };
+                    if rows.is_empty() {
+                        break;
                     }
-                    match row.get("type").and_then(|v| v.as_str()) {
-                        Some("turn/started" | "client/turn/start") => {
-                            derived_activity = Some(Activity::Working)
+                    let count = rows.len();
+                    let prev_before = before_seq;
+                    for row in rows {
+                        if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                            cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                            before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
                         }
-                        Some("turn/completed") => derived_activity = Some(Activity::Idle),
-                        Some("system/error" | "provider/error") => {
-                            let msg = row
-                                .get("data")
-                                .and_then(|d| d.get("message"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("BB error")
-                                .to_owned();
-                            derived_activity = Some(Activity::Errored { error: msg });
+                        if let Some(act) = activity_from_row(row) {
+                            derived_activity = Some(act);
+                            break 'desc;
                         }
-                        _ => {}
+                    }
+                    if count < 200 || before_seq == prev_before {
+                        break;
                     }
                 }
-                if count < 200 || cursor_seq == prev {
-                    break;
+            } else {
+                loop {
+                    let Ok(rows_val) = self
+                        .rpc(protocol::Down::EventsPage {
+                            req_id: 0,
+                            thread_id: thread.to_string(),
+                            after_seq: cursor_seq,
+                            before_seq: None,
+                            limit: 200,
+                            order: None,
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+                    let Some(rows) = rows_val.as_array() else {
+                        break;
+                    };
+                    if rows.is_empty() {
+                        break;
+                    }
+                    let count = rows.len();
+                    let prev = cursor_seq;
+                    for row in rows {
+                        if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                            cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                        }
+                        if let Some(act) = activity_from_row(row) {
+                            derived_activity = Some(act);
+                        }
+                    }
+                    if count < 200 || cursor_seq == prev {
+                        break;
+                    }
                 }
             }
             if let Some(seq) = cursor_seq {
@@ -1704,6 +1794,17 @@ impl BbBridge {
                     thread: thread.clone(),
                     seq,
                 });
+            }
+            let current_activity = self
+                .authoritative_activity(&wave, &role)
+                .await
+                .unwrap_or(tracked_activity);
+            if matches!(
+                current_activity,
+                Activity::Blocked { .. } | Activity::Parked { .. }
+            ) && matches!(derived_activity, Some(Activity::Working))
+            {
+                derived_activity = None;
             }
             if let Some(activity) = derived_activity {
                 self.call_wave_observe(wave, role, Observation::Activity { activity })
@@ -1713,39 +1814,29 @@ impl BbBridge {
     }
 
     async fn seed_tail_seq(&self, thread: &BbThreadId) -> Option<u64> {
-        let mut cursor: Option<u64> = None;
-        loop {
-            let rows_val = self
-                .rpc(protocol::Down::EventsPage {
-                    req_id: 0,
-                    thread_id: thread.to_string(),
-                    after_seq: cursor,
-                    limit: 200,
-                })
-                .await
-                .ok()?;
-            let rows = rows_val.as_array()?;
-            if rows.is_empty() {
-                break;
-            }
-            let count = rows.len();
-            let prev = cursor;
-            for row in rows {
-                if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
-                    cursor = Some(cursor.map_or(s, |c| c.max(s)));
-                }
-            }
-            if count < 200 || cursor == prev {
-                break;
-            }
-        }
-        if let Some(seq) = cursor {
+        let rows_val = self
+            .rpc(protocol::Down::EventsPage {
+                req_id: 0,
+                thread_id: thread.to_string(),
+                after_seq: None,
+                before_seq: None,
+                limit: 1,
+                order: Some(protocol::EventsOrder::Desc),
+            })
+            .await
+            .ok()?;
+        let seq = rows_val
+            .as_array()?
+            .first()
+            .and_then(|r| r.get("seq"))
+            .and_then(|v| v.as_u64());
+        if let Some(seq) = seq {
             let _ = self.owner.send(OwnerMsg::AdvanceSeq {
                 thread: thread.clone(),
                 seq,
             });
         }
-        cursor
+        seq
     }
 
     async fn lookup_worker(
@@ -1874,7 +1965,9 @@ impl BbBridge {
                                     req_id: 0,
                                     thread_id: thread.to_string(),
                                     after_seq: cursor_seq,
+                                    before_seq: None,
                                     limit: 200,
+                                    order: None,
                                 },
                                 started: rpc_tx,
                             }).is_err() {
@@ -2058,7 +2151,9 @@ impl AgentFeed for BbBridge {
                     req_id: 0,
                     thread_id: thread.to_string(),
                     after_seq: after.map(|s| s.0),
+                    before_seq: None,
                     limit,
+                    order: None,
                 })
                 .await
                 .map_err(|e| ApiError::Transport(e.to_string()))?;
@@ -2189,6 +2284,18 @@ mod tests {
                 }
             }
             writer_task.await.unwrap();
+
+            let (frag_tcp, _) = listener.accept().await.unwrap();
+            let frag_conn = ws::WsConn::accept(frag_tcp, token).await.unwrap();
+            let (mut frag_reader, _frag_writer) = frag_conn.into_split();
+            assert!(matches!(
+                frag_reader.recv().await.unwrap(),
+                Some(ws::WsInbound::Ping(ref p)) if p == b"hb"
+            ));
+            assert!(matches!(
+                frag_reader.recv().await.unwrap(),
+                Some(ws::WsInbound::Text(ref t)) if t == "hello world"
+            ));
         });
 
         let mut raw_bad = TcpStream::connect(addr).await.unwrap();
@@ -2226,6 +2333,32 @@ mod tests {
             }
         }
         send_task.await.unwrap();
+
+        let mut raw_frag = TcpStream::connect(addr).await.unwrap();
+        raw_frag
+            .write_all(
+                b"GET /bridge HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
+                  x-bb-plugin-token: tok_x_bb_check\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut hs_buf = vec![0u8; 256];
+        let hs_n = raw_frag.read(&mut hs_buf).await.unwrap();
+        assert!(
+            std::str::from_utf8(&hs_buf[..hs_n])
+                .unwrap()
+                .starts_with("HTTP/1.1 101")
+        );
+        // Fragment 1 (`fin=0, opcode=1`, unmasked for loopback reader): "hello "
+        // Interleaved Ping (`fin=1, opcode=9`): "hb"
+        // Continuation (`fin=1, opcode=0`): "world"
+        let frames: &[u8] = &[
+            0x01, 0x06, b'h', b'e', b'l', b'l', b'o', b' ', 0x89, 0x02, b'h', b'b', 0x80, 0x05,
+            b'w', b'o', b'r', b'l', b'd',
+        ];
+        raw_frag.write_all(frames).await.unwrap();
+
         server.await.unwrap();
     }
 
@@ -2722,6 +2855,7 @@ mod tests {
         watched: BTreeSet<String>,
         tool_results: Vec<(String, bool, String)>,
         events_by_thread: HashMap<String, Vec<serde_json::Value>>,
+        events_page_calls: Vec<(Option<u64>, Option<u64>, u32, Option<protocol::EventsOrder>)>,
     }
 
     #[tokio::test]
@@ -2852,16 +2986,31 @@ mod tests {
                                     let reply = protocol::Up::Result { req_id, ok: true, value: serde_json::Value::Null };
                                     ws_writer.send_text(&serde_json::to_string(&reply).unwrap()).await.unwrap();
                                 }
-                                protocol::Down::EventsPage { req_id, thread_id, after_seq, limit } => {
-                                    let rows: Vec<serde_json::Value> = st
+                                protocol::Down::EventsPage {
+                                    req_id,
+                                    thread_id,
+                                    after_seq,
+                                    before_seq,
+                                    limit,
+                                    order,
+                                } => {
+                                    st.events_page_calls.push((after_seq, before_seq, limit, order));
+                                    let mut rows: Vec<serde_json::Value> = st
                                         .events_by_thread
                                         .get(&thread_id)
                                         .cloned()
                                         .unwrap_or_default()
                                         .into_iter()
-                                        .filter(|r| after_seq.is_none_or(|a| r["seq"].as_u64().unwrap_or(0) > a))
-                                        .take(limit as usize)
+                                        .filter(|r| {
+                                            let s = r["seq"].as_u64().unwrap_or(0);
+                                            after_seq.is_none_or(|a| s > a)
+                                                && before_seq.is_none_or(|b| s < b)
+                                        })
                                         .collect();
+                                    if matches!(order, Some(protocol::EventsOrder::Desc)) {
+                                        rows.reverse();
+                                    }
+                                    rows.truncate(limit as usize);
                                     let reply = protocol::Up::Result {
                                         req_id,
                                         ok: true,
@@ -3141,17 +3290,124 @@ mod tests {
             "Parked worker woke via ReadSide with zero doorbell sends"
         );
 
+        push_up_tx
+            .send(protocol::Up::Interaction {
+                thread_id: "th_auth_verifier".into(),
+                meta: None,
+                interaction: serde_json::json!({
+                    "id": "int_perm_2",
+                    "payload": {
+                        "kind": "approval",
+                        "reason": "Run check"
+                    }
+                }),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+                if matches!(
+                    &snap.workers[0].2,
+                    WorkerPhase::Live {
+                        activity: Activity::Blocked { interaction },
+                        ..
+                    } if interaction.id.as_str() == "int_perm_2"
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker entered Blocked state on int_perm_2");
+
         {
             let mut st = ledger.lock().await;
+            st.events_page_calls.clear();
             let list = st.events_by_thread.get_mut("th_auth_verifier").unwrap();
-            for seq in 3..=250u64 {
+            for seq in 3..=249u64 {
                 list.push(serde_json::json!({
                     "seq": seq,
                     "createdAt": 1000 + seq,
-                    "type": if seq == 250 { "turn/completed" } else { "turn/started" },
+                    "type": "turn/started",
                     "data": {}
                 }));
             }
+        }
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerRequested {
+                role: role.clone(),
+                agent: AgentSpec {
+                    provider: ProviderId::parse("codex").unwrap(),
+                    model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                brief: Body::parse("verify").unwrap(),
+                attempt: 1,
+            },
+        );
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: BbThreadId::parse("th_auth_verifier").unwrap(),
+                },
+            },
+        );
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Activity {
+                    activity: Activity::Blocked {
+                        interaction: PendingInteraction {
+                            id: BbInteractionId::parse("int_perm_2").unwrap(),
+                            kind: InteractionKind::Permission,
+                            summary: "Run check".into(),
+                        },
+                    },
+                },
+            },
+        );
+        bridge.reconcile_live_workers().await;
+        {
+            let calls = &ledger.lock().await.events_page_calls;
+            assert_eq!(
+                calls.len(),
+                1,
+                "cold reconcile used a single descending tail query instead of scanning 249 rows"
+            );
+            assert_eq!(calls[0].3, Some(protocol::EventsOrder::Desc));
+        }
+        let still_blocked = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+        assert!(
+            matches!(
+                &still_blocked.workers[0].2,
+                WorkerPhase::Live {
+                    activity: Activity::Blocked { interaction },
+                    ..
+                } if interaction.id.as_str() == "int_perm_2"
+            ),
+            "trailing turn/started during reconcile must never overwrite Blocked"
+        );
+
+        {
+            let mut st = ledger.lock().await;
+            st.events_by_thread
+                .get_mut("th_auth_verifier")
+                .unwrap()
+                .push(serde_json::json!({
+                    "seq": 250,
+                    "createdAt": 1250,
+                    "type": "turn/completed",
+                    "data": {}
+                }));
         }
         reload_tx.send(()).unwrap();
 
@@ -3171,7 +3427,7 @@ mod tests {
             }
         })
         .await
-        .expect("reconnect paged >200 events to tail and reconciled worker to Idle");
+        .expect("reconnect cleared Blocked to Idle once turn/completed arrived");
 
         op.call(RoomPost {
             room: RoomRef::Id {

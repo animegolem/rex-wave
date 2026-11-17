@@ -157,6 +157,8 @@ pub(crate) struct WsReader<R> {
     reader: R,
     read_buf: Vec<u8>,
     read_pos: usize,
+    frag_buf: Vec<u8>,
+    frag_active: bool,
 }
 
 pub(crate) struct WsWriter<W> {
@@ -289,6 +291,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
                 reader,
                 read_buf: self.leftover,
                 read_pos: 0,
+                frag_buf: Vec::new(),
+                frag_active: false,
             },
             WsWriter {
                 writer,
@@ -301,12 +305,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
 
 impl<R: AsyncRead + Unpin> WsReader<R> {
     pub(crate) async fn recv(&mut self) -> Result<Option<WsInbound>, HostError> {
-        let mut message = Vec::new();
-        let mut fragmenting = false;
-
         loop {
             let mut hdr = [0u8; 2];
             if !self.read_exact_or_eof(&mut hdr).await? {
+                if self.frag_active {
+                    return Err(HostError::Unreachable(
+                        "unexpected EOF during fragmented websocket message".into(),
+                    ));
+                }
                 return Ok(None);
             }
             let fin = (hdr[0] & 0x80) != 0;
@@ -364,30 +370,29 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
                 }
                 0x9 => return Ok(Some(WsInbound::Ping(payload))),
                 0xA => {}
-                0x1 | 0x2 => {
-                    if fin && !fragmenting {
+                0x1 | 0x2 if !self.frag_active => {
+                    if fin {
                         return String::from_utf8(payload)
                             .map(|s| Some(WsInbound::Text(s)))
                             .map_err(|_| {
                                 HostError::Unreachable("non-UTF8 websocket frame".into())
                             });
                     }
-                    fragmenting = true;
-                    message.extend_from_slice(&payload);
-                    if fin {
-                        return String::from_utf8(message)
-                            .map(|s| Some(WsInbound::Text(s)))
-                            .map_err(|_| {
-                                HostError::Unreachable(
-                                    "non-UTF8 fragmented websocket message".into(),
-                                )
-                            });
-                    }
+                    self.frag_active = true;
+                    self.frag_buf.clear();
+                    self.frag_buf.extend_from_slice(&payload);
                 }
-                0x0 if fragmenting => {
-                    message.extend_from_slice(&payload);
+                0x0 if self.frag_active => {
+                    if self.frag_buf.len().saturating_add(payload.len()) > MAX_FRAME_BYTES {
+                        return Err(HostError::Unreachable(format!(
+                            "fragmented message exceeds {MAX_FRAME_BYTES} bytes"
+                        )));
+                    }
+                    self.frag_buf.extend_from_slice(&payload);
                     if fin {
-                        return String::from_utf8(message)
+                        self.frag_active = false;
+                        let bytes = std::mem::take(&mut self.frag_buf);
+                        return String::from_utf8(bytes)
                             .map(|s| Some(WsInbound::Text(s)))
                             .map_err(|_| {
                                 HostError::Unreachable(

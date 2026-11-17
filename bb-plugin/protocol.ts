@@ -75,7 +75,9 @@ export type Down =
       req_id: number;
       thread_id: string;
       after_seq: number | null;
+      before_seq?: number | null;
       limit: number;
+      order?: "asc" | "desc";
     }
   | { t: "thread_context"; req_id: number; thread_id: string }
   | { t: "watch_thread"; thread_id: string; after_seq?: number | null }

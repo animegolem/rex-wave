@@ -23,6 +23,7 @@ pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
 }
 
 pub const MAX_SPAWN_ATTEMPTS: u32 = 3;
+pub const MAX_RETIRE_ATTEMPTS: u32 = 3;
 
 pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase, String> {
     match (phase, obs) {
@@ -592,6 +593,7 @@ pub struct WaveConductor<H: AgentHost> {
     opened_rooms: BTreeSet<RoomId>,
     opened_boards: BTreeSet<BoardId>,
     room_members: BTreeMap<RoomId, BTreeSet<Principal>>,
+    retire_attempts: BTreeMap<BbThreadId, u32>,
     seen: Cursor,
     caught_up: bool,
     needs_reconcile: bool,
@@ -614,6 +616,7 @@ impl<H: AgentHost> WaveConductor<H> {
             opened_rooms: BTreeSet::new(),
             opened_boards: BTreeSet::new(),
             room_members: BTreeMap::new(),
+            retire_attempts: BTreeMap::new(),
             seen: Cursor::default(),
             caught_up: false,
             needs_reconcile: false,
@@ -624,6 +627,19 @@ impl<H: AgentHost> WaveConductor<H> {
     fn fold(&mut self, env: &Envelope) {
         match (&env.stream, &env.event) {
             (StreamId::Wave { wave }, Event::Wave(ev)) => {
+                if let WaveEvent::WorkerObserved {
+                    role,
+                    observation: Observation::Archived,
+                } = ev
+                    && let Some(WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread }) =
+                        self.view
+                            .get(wave)
+                            .and_then(|st| st.workers.get(role))
+                            .map(|r| &r.phase)
+                {
+                    let th = thread.clone();
+                    self.retire_attempts.remove(&th);
+                }
                 let st = self.view.entry(wave.clone()).or_default();
                 Waves::evolve(
                     st,
@@ -685,10 +701,17 @@ impl<H: AgentHost> WaveConductor<H> {
                     return Ok(());
                 }
                 let was_dirty = self.needs_reconcile;
+                let is_retire_event = matches!(
+                    (&env.stream, &env.event),
+                    (
+                        StreamId::Wave { .. },
+                        Event::Wave(WaveEvent::WorkerRetiring { .. })
+                    )
+                );
                 let live_res = self.apply_live(&env, client).await;
-                if live_res.is_err() {
+                if live_res.is_err() && !is_retire_event {
                     self.needs_reconcile = true;
-                } else if was_dirty {
+                } else if live_res.is_ok() && was_dirty {
                     self.reconcile(client).await?;
                 }
                 live_res
@@ -699,13 +722,16 @@ impl<H: AgentHost> WaveConductor<H> {
 
     async fn reconcile<C: Client>(&mut self, client: &C) -> Result<(), ApiError> {
         let mut first_err: Option<ApiError> = None;
-        let record_err = |slot: &mut Option<ApiError>, res: Result<(), ApiError>| {
-            if let Err(e) = res
-                && slot.is_none()
-            {
-                *slot = Some(e);
-            }
-        };
+        let mut any_retryable = false;
+        let record_retryable =
+            |slot: &mut Option<ApiError>, retryable: &mut bool, res: Result<(), ApiError>| {
+                if let Err(e) = res {
+                    *retryable = true;
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
+            };
 
         let slugs: Vec<WaveSlug> = self.view.keys().cloned().collect();
         for wave in slugs {
@@ -724,21 +750,24 @@ impl<H: AgentHost> WaveConductor<H> {
 
             if matches!(st.status, Some(WaveStatus::Running)) {
                 if !self.opened_rooms.contains(&room) {
-                    record_err(
+                    record_retryable(
                         &mut first_err,
+                        &mut any_retryable,
                         self.ensure_wave_room(client, &wave, &room, &spec.goal)
                             .await,
                     );
                 }
                 if !self.opened_boards.contains(&board) {
-                    record_err(
+                    record_retryable(
                         &mut first_err,
+                        &mut any_retryable,
                         self.ensure_project_board(client, &board).await,
                     );
                 }
                 if let Some(opener) = &st.opener {
-                    record_err(
+                    record_retryable(
                         &mut first_err,
+                        &mut any_retryable,
                         self.ensure_member(client, &room, opener.clone(), None)
                             .await,
                     );
@@ -749,18 +778,23 @@ impl<H: AgentHost> WaveConductor<H> {
                         role: role.clone(),
                     };
                     let handle = Handle::parse(role.as_str()).ok();
-                    record_err(
+                    record_retryable(
                         &mut first_err,
+                        &mut any_retryable,
                         self.ensure_member(client, &room, member, handle).await,
                     );
                 }
             }
 
             for (role, rec) in &st.workers {
-                let step = match &rec.phase {
+                match &rec.phase {
                     WorkerPhase::Requested { attempt } => {
-                        self.spawn_worker(client, spec, &room, role, rec, *attempt)
-                            .await
+                        record_retryable(
+                            &mut first_err,
+                            &mut any_retryable,
+                            self.spawn_worker(client, spec, &room, role, rec, *attempt)
+                                .await,
+                        );
                     }
                     WorkerPhase::Live {
                         thread,
@@ -769,23 +803,36 @@ impl<H: AgentHost> WaveConductor<H> {
                         if let Some((resolved_id, resolution)) = &rec.resolved_interaction
                             && resolved_id == &interaction.id
                         {
-                            map_host_action(
-                                self.host.resolve(thread, resolved_id, resolution).await,
-                            )
-                        } else {
-                            Ok(())
+                            record_retryable(
+                                &mut first_err,
+                                &mut any_retryable,
+                                map_host_action(
+                                    self.host.resolve(thread, resolved_id, resolution).await,
+                                ),
+                            );
                         }
                     }
                     WorkerPhase::Retiring { thread } => {
-                        self.retire_worker(client, &wave, role, thread).await
+                        if self.retire_attempts.get(thread).copied().unwrap_or(0)
+                            < MAX_RETIRE_ATTEMPTS
+                            && let Err(e) = self.retire_worker(client, &wave, role, thread).await
+                        {
+                            if self.retire_attempts.get(thread).copied().unwrap_or(0)
+                                < MAX_RETIRE_ATTEMPTS
+                            {
+                                any_retryable = true;
+                            }
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
                     }
-                    _ => Ok(()),
-                };
-                record_err(&mut first_err, step);
+                    _ => {}
+                }
             }
         }
 
-        self.needs_reconcile = first_err.is_some();
+        self.needs_reconcile = any_retryable;
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1016,9 +1063,29 @@ impl<H: AgentHost> WaveConductor<H> {
         thread: &BbThreadId,
     ) -> Result<(), ApiError> {
         if let Err(e) = self.host.retire(thread).await {
-            self.needs_reconcile = true;
+            let attempts = self.retire_attempts.entry(thread.clone()).or_insert(0);
+            *attempts += 1;
+            let attempt = *attempts;
+            if attempt < MAX_RETIRE_ATTEMPTS {
+                self.needs_reconcile = true;
+            } else if let Some(room) = self.view.get(wave).and_then(|st| st.room.clone()) {
+                let idem =
+                    IdemKey::parse(format!("wave:{wave}:retire-failed:{role}:{thread}")).ok();
+                let body = bounded_body(format!(
+                    "retire failed for @{role} ({thread}) after {attempt} attempts ({e})"
+                ));
+                let _ = client
+                    .call(RoomPost {
+                        room: RoomRef::Id { id: room },
+                        body,
+                        reply_to: None,
+                        idem,
+                    })
+                    .await;
+            }
             return Err(ApiError::Transport(e.to_string()));
         }
+        self.retire_attempts.remove(thread);
         client
             .call(WaveObserve {
                 wave: wave.clone(),
@@ -1485,6 +1552,7 @@ mod tests {
         calls: Arc<Mutex<Vec<HostCall>>>,
         unreachable_role: Arc<Mutex<Option<String>>>,
         reject_retire: Arc<Mutex<bool>>,
+        retire_attempts: Arc<Mutex<u32>>,
     }
 
     impl AgentHost for FakeHost {
@@ -1531,6 +1599,7 @@ mod tests {
         }
 
         async fn retire(&self, thread: &BbThreadId) -> Result<(), HostError> {
+            *self.retire_attempts.lock().unwrap() += 1;
             if *self.reject_retire.lock().unwrap() {
                 return Err(HostError::Rejected("thread remained stopping".into()));
             }
@@ -2277,7 +2346,9 @@ mod tests {
 
         *host.reject_retire.lock().unwrap() = false;
         block_on(op.call(RoomPost {
-            room: RoomRef::Id { id: started.room },
+            room: RoomRef::Id {
+                id: started.room.clone(),
+            },
             body: Body::parse("trigger dirty reconcile").unwrap(),
             reply_to: None,
             idem: None,
@@ -2285,7 +2356,7 @@ mod tests {
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
-        let snap3 = block_on(op.call(WaveView { wave })).unwrap();
+        let snap3 = block_on(op.call(WaveView { wave: wave.clone() })).unwrap();
         let author_p3 = &snap3
             .workers
             .iter()
@@ -2305,6 +2376,42 @@ mod tests {
         assert!(
             matches!(verifier_p3, WorkerPhase::Retired { thread: Some(_) }),
             "dirty reconcile completed retire"
+        );
+
+        *host.retire_attempts.lock().unwrap() = 0;
+        *host.reject_retire.lock().unwrap() = true;
+        block_on(op.call(WaveRetireWorker {
+            wave,
+            role: RoleName::parse("author").unwrap(),
+            reason: None,
+        }))
+        .unwrap();
+        drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
+        for n in 1..=4 {
+            block_on(op.call(RoomPost {
+                room: RoomRef::Id {
+                    id: started.room.clone(),
+                },
+                body: Body::parse(format!("chat frame {n}")).unwrap(),
+                reply_to: None,
+                idem: None,
+            }))
+            .unwrap();
+            drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
+        }
+        assert_eq!(
+            *host.retire_attempts.lock().unwrap(),
+            MAX_RETIRE_ATTEMPTS,
+            "stuck retire stops retrying after MAX_RETIRE_ATTEMPTS so chat frames do not stall"
+        );
+        let failure_idem =
+            IdemKey::parse("wave:auth-v2:retire-failed:author:th_auth-v2_author_1").unwrap();
+        assert!(
+            bus.lock()
+                .unwrap()
+                .room_posts
+                .contains_key(&(started.room, failure_idem)),
+            "exhausted retire posts diagnostic notice to wave room"
         );
     }
 }
