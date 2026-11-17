@@ -12,5 +12,11 @@ rex-kanban.workspace = true
 rex-wave-api.workspace = true
 rex-wave-runtime.workspace = true
 
+[dev-dependencies]
+futures-util.workspace = true
+rex-wave-store.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
 [lints]
 workspace = true
