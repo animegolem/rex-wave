@@ -7,8 +7,9 @@ use crate::{
         CARD_APPROVAL_IMAGE, CONTEXT_BAR_IMAGE, CellPx, DIACRITICS, GraphicsMode, KittyCompositor,
         ProgramState, TermOut, clip, encode, program_status, render_backdrop,
     },
+    load_stage_target, poll_watch_slot,
     sidebar::NodeKey,
-    stage::{CONTEXT_BAR_COLS, StageTarget, plan_for, target_for},
+    stage::CONTEXT_BAR_COLS,
     update, view,
 };
 use ratatui::{
@@ -572,6 +573,26 @@ impl DemoClient {
             sidebar_tx: Arc::new(sidebar_tx),
         }
     }
+
+    pub fn seed_room_posts(&self, room: &RoomId, total: u64) {
+        let mut st = self.inner.lock().expect("demo lock");
+        let list = st.rooms.entry(room.clone()).or_default();
+        list.clear();
+        for seq in 1..=total {
+            list.push(Envelope {
+                stream: StreamId::Room { room: room.clone() },
+                seq: Seq(seq),
+                at: UnixMs(1_700_000_000 + seq),
+                by: self.me.clone(),
+                event: Event::Room(RoomEvent::Posted {
+                    body: Body::parse(format!("message #{seq}")).expect("body"),
+                    mentions: Mentions::default(),
+                    reply_to: None,
+                    idem: None,
+                }),
+            });
+        }
+    }
 }
 
 impl DemoState {
@@ -789,6 +810,7 @@ impl Client for DemoClient {
                     WireReply::CardArchive(Ack)
                 }
                 WireCommand::Read(r) => {
+                    let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
                     let entries = match &r.stream {
                         StreamId::Room { room } => st
                             .rooms
@@ -797,6 +819,7 @@ impl Client for DemoClient {
                             .unwrap_or_default()
                             .into_iter()
                             .filter(|e| e.seq > r.after)
+                            .take(limit)
                             .collect(),
                         _ => Vec::new(),
                     };
@@ -1122,7 +1145,7 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
     let osc_initial = program_status(&model.sidebar_snapshot);
     assert_eq!(osc_initial.state, ProgramState::Blocked);
 
-    retarget_sync(client, &mut model, StageTarget::Inbox).await?;
+    retarget_sync(client, &mut model, NodeKey::Inbox).await?;
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
     let mut hits = HitMap::default();
@@ -1192,13 +1215,15 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
         inbox_view.scroll = 0;
     }
 
-    let agent_target = StageTarget::Agent {
+    let inbox_gen = model.active_generation;
+    assert!(inbox_gen.0 >= 1);
+    let agent_key = NodeKey::Agent {
         wave: WaveSlug::parse("auth-v2").expect("wave"),
         role: RoleName::parse("author-jwt").expect("role"),
     };
-    retarget_sync(client, &mut model, agent_target).await?;
+    retarget_sync(client, &mut model, agent_key).await?;
     let stale = Frame::Stage {
-        generation: FocusGeneration(0),
+        generation: inbox_gen,
         inner: Box::new(Frame::Agent {
             wave: WaveSlug::parse("auth-v2").expect("wave"),
             role: RoleName::parse("author-jwt").expect("role"),
@@ -1242,7 +1267,7 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
     }
     assert_eq!(placeholder_cells, CONTEXT_BAR_COLS as usize);
 
-    retarget_sync(client, &mut model, StageTarget::Kanban { board: None }).await?;
+    retarget_sync(client, &mut model, NodeKey::Kanban).await?;
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .expect("draw");
 
@@ -1252,11 +1277,11 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
         },
         name: ChannelName::parse("wave-auth-v2").expect("chan"),
     };
-    retarget_sync(client, &mut model, StageTarget::Room { room: wave_room }).await?;
+    retarget_sync(client, &mut model, NodeKey::Room(wave_room)).await?;
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .expect("draw");
 
-    retarget_sync(client, &mut model, StageTarget::Inbox).await?;
+    retarget_sync(client, &mut model, NodeKey::Inbox).await?;
     let effects = update(&mut model, Msg::Action(Action::Accelerator('a')));
     for eff in effects {
         if let Effect::Call { tag, cmd } = eff {
@@ -1325,14 +1350,13 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
     let warm_p95_us = layout_us[190] + diff_us[190];
 
     model.graphics = GraphicsMode::CellsOnly;
-    model.sidebar.cursor = NodeKey::Room(RoomId::Channel {
+    let preview_key = NodeKey::Room(RoomId::Channel {
         scope: RoomScope::Project {
             project: BbProjectId::parse("p_123").expect("project"),
         },
         name: ChannelName::parse("wave-auth-v2").expect("chan"),
     });
-    let preview_target = target_for(&model.sidebar.cursor);
-    retarget_sync(client, &mut model, preview_target).await?;
+    retarget_sync(client, &mut model, preview_key).await?;
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .expect("draw");
     let ansi_preview = buffer_to_ansi(term.backend().buffer());
@@ -1370,48 +1394,33 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
     })
 }
 
-async fn retarget_sync<C: Client>(
-    client: &C,
-    model: &mut Model,
-    target: StageTarget,
-) -> io::Result<()> {
-    let plan = plan_for(&target, &model.sidebar_snapshot, &model.me);
-    model.active_target = target.clone();
-    model.stage = match &target {
-        StageTarget::Summary { key } => crate::stage::Stage::Summary(key.clone()),
-        other => crate::stage::Stage::Loading(other.clone()),
-    };
-    if let Some((interest, cursor)) = plan.watch {
-        let mut stream = client
-            .watch(interest, cursor)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        if let Some(Ok(first)) = poll_once_stream(&mut stream).await {
-            let _ = update(
-                model,
-                Msg::Frame {
-                    watch: WatchSlot::Stage,
-                    frame: first,
-                },
-            );
+async fn retarget_sync<C: Client>(client: &C, model: &mut Model, key: NodeKey) -> io::Result<()> {
+    let effects = update(model, Msg::Action(Action::Activate(key)));
+    let mut retargeted = None;
+    for eff in effects {
+        if let Effect::Retarget(t) = eff {
+            retargeted = Some(t);
         }
     }
-    if let Some(cmd) = plan.initial {
-        let res = client.call_wire(cmd).await;
-        let seq = model.stage_req_seq;
+    let target = retargeted.unwrap_or_else(|| model.active_target.clone());
+    let seq = model.stage_req_seq;
+    let (initial_res, watch_res) =
+        load_stage_target(client, &model.sidebar_snapshot, &target).await;
+    let mut slot = watch_res.map_err(|e| io::Error::other(e.to_string()))?;
+    if slot.is_some() {
+        let first_msg = poll_watch_slot(&mut slot, WatchSlot::Stage).await;
+        let _ = update(model, first_msg);
+    }
+    if let Some(result) = initial_res {
         let _ = update(
             model,
             Msg::Reply {
                 tag: ReplyTag::StageInitial(seq),
-                result: res,
+                result,
             },
         );
     }
     Ok(())
-}
-
-async fn poll_once_stream(stream: &mut FrameStream) -> Option<Result<Frame, ApiError>> {
-    std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
 }
 
 fn buffer_to_ansi(buf: &Buffer) -> String {

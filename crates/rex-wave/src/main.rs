@@ -79,6 +79,7 @@ pub enum Cmd {
         since: u64,
         #[arg(long)]
         all: bool,
+        /// Timeout in milliseconds.
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -451,13 +452,6 @@ fn read_text_source(
             .map_err(|e| invalid(what, format!("failed reading {}: {e}", path.display()))),
         (None, None) => Err(invalid(what, format!("provide --{what} or --{what}-file"))),
     }
-}
-
-pub fn to_command(cmd: &Cmd) -> Result<WireCommand, ApiError> {
-    let default_me = Principal::Operator {
-        seat: SeatName::parse("owner").expect("valid seat"),
-    };
-    to_command_for(cmd, &default_me)
 }
 
 pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError> {
@@ -1057,6 +1051,13 @@ mod tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("valid CLI args")
+    }
+
+    fn to_command(cmd: &Cmd) -> Result<WireCommand, ApiError> {
+        let default_me = Principal::Operator {
+            seat: SeatName::parse("owner").expect("valid seat"),
+        };
+        to_command_for(cmd, &default_me)
     }
 
     #[test]

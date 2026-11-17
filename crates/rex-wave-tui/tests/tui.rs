@@ -533,3 +533,242 @@ async fn graphics_cycle_mouse_hitmap_and_kitty_unplace_work_across_modes() {
         Effect::Terminal(rex_wave_tui::kitty::TermOut::ProgramStatus(osc)) if osc.state == ProgramState::Clear
     )));
 }
+
+struct PanicAfterEndStream {
+    ended: bool,
+}
+
+impl futures_core::Stream for PanicAfterEndStream {
+    type Item = Result<Frame, rex_wave_api::ApiError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        assert!(!self.ended, "stream polled again after returning None");
+        self.ended = true;
+        std::task::Poll::Ready(None)
+    }
+}
+
+#[tokio::test]
+async fn room_paging_watch_eof_state_preservation_errors_and_inbox_scroll_hold() {
+    let client = DemoClient::new();
+    let wave_room = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("p_123").unwrap(),
+        },
+        name: ChannelName::parse("wave-auth-v2").unwrap(),
+    };
+    client.seed_room_posts(&wave_room, 250);
+
+    let WireReply::Sidebar(overview) = client
+        .call_wire(WireCommand::Sidebar(Default::default()))
+        .await
+        .unwrap()
+    else {
+        panic!("sidebar");
+    };
+    let mut model = Model::new(client.me().clone(), overview.clone());
+
+    let target = StageTarget::Room {
+        room: wave_room.clone(),
+    };
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Room(wave_room.clone()))),
+    );
+    let req_seq = model.stage_req_seq;
+    let (initial_res, _watch_res) =
+        rex_wave_tui::load_stage_target(&client, &overview, &target).await;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(req_seq),
+            result: initial_res.unwrap(),
+        },
+    );
+    if let Stage::Room(rv) = &mut model.stage {
+        assert_eq!(
+            rv.entries.len(),
+            250,
+            "room > 200 entries pages forward to head"
+        );
+        assert_eq!(rv.scroll, u16::MAX, "room opens scrolled to tail");
+        assert_eq!(
+            rv.cursor.at(&StreamId::Room {
+                room: wave_room.clone()
+            }),
+            Seq(250)
+        );
+        rv.scroll = 7;
+        rv.status_banner = Some("Banked".to_owned());
+    } else {
+        panic!("expected room");
+    }
+
+    let refresh_fx = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Ok(WireReply::RoomJoin(rex_wave_api::Ack)),
+        },
+    );
+    for eff in refresh_fx {
+        if let Effect::Call { tag, cmd } = eff {
+            let res = client.call_wire(cmd).await;
+            let _ = update(&mut model, Msg::Reply { tag, result: res });
+        }
+    }
+    if let Stage::Room(rv) = &model.stage {
+        assert_eq!(rv.scroll, 7);
+        assert_eq!(rv.status_banner.as_deref(), Some("Banked"));
+    }
+
+    let _ = update(&mut model, Msg::Action(Action::Activate(NodeKey::Kanban)));
+    let k_seq = model.stage_req_seq;
+    let board_res = client
+        .call_wire(WireCommand::BoardView(rex_wave_api::board::BoardView {
+            board: BoardId::parse("project:p_123").unwrap(),
+            filter: None,
+        }))
+        .await;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(k_seq),
+            result: board_res,
+        },
+    );
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char(']'));
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char(']'));
+    let post_cmd_fx = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Ok(WireReply::CardArchive(rex_wave_api::Ack)),
+        },
+    );
+    for eff in post_cmd_fx {
+        if let Effect::Call { tag, cmd } = eff {
+            let res = client.call_wire(cmd).await;
+            let _ = update(&mut model, Msg::Reply { tag, result: res });
+        }
+    }
+    if let Stage::Kanban(kv) = &model.stage {
+        assert_eq!(
+            kv.cursor.0, 2,
+            "Kanban lane cursor must survive UserCommand refresh"
+        );
+    } else {
+        panic!("expected kanban");
+    }
+
+    let mut slot: Option<rex_wave_api::FrameStream> =
+        Some(Box::pin(PanicAfterEndStream { ended: false }));
+    let closed_msg = rex_wave_tui::poll_watch_slot(&mut slot, WatchSlot::Tree).await;
+    assert!(slot.is_none(), "completed watch clears slot immediately");
+    let _ = update(&mut model, closed_msg);
+    assert_eq!(model.last_error.as_deref(), Some("daemon disconnected"));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            rex_wave_tui::poll_watch_slot(&mut slot, WatchSlot::Tree),
+        )
+        .await
+        .is_err()
+    );
+
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Agent {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("missing").unwrap(),
+        })),
+    );
+    let err_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(err_seq),
+            result: Err(rex_wave_api::ApiError::NotFound {
+                what: "@auth-v2/missing".to_owned(),
+            }),
+        },
+    );
+    assert!(
+        matches!(model.stage, Stage::Error { .. }),
+        "failed StageInitial leaves Loading for Stage::Error"
+    );
+
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Err(rex_wave_api::ApiError::Conflict {
+                detail: "revision mismatch".to_owned(),
+            }),
+        },
+    );
+    assert!(
+        model
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("revision mismatch")
+    );
+
+    let _ = update(
+        &mut model,
+        Msg::Resize {
+            cols: 120,
+            rows: 24,
+        },
+    );
+    let _ = update(&mut model, Msg::Action(Action::Activate(NodeKey::Inbox)));
+    let i_seq = model.stage_req_seq;
+    let mut many_items = Vec::new();
+    for idx in 1..=12u64 {
+        many_items.push(rex_wave_api::notify::Notification {
+            id: NotificationId(idx),
+            at: UnixMs(1_000 + idx),
+            rank: rex_wave_api::notify::Rank(500),
+            state: rex_wave_api::notify::NotifyState::Unread,
+            draft: rex_wave_api::notify::NotificationDraft {
+                kind: rex_wave_api::notify::NotifyKind::Reminder {
+                    bell_id: format!("b{idx}"),
+                },
+                title: format!("Card {idx}"),
+                preview: "body".to_owned(),
+                actions: Vec::new(),
+                dedupe: format!("d{idx}"),
+            },
+        });
+    }
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(i_seq),
+            result: Ok(WireReply::InboxList(rex_wave_api::notify::InboxPage {
+                head: Seq(12),
+                items: many_items,
+                unread: 12,
+                cursors: Vec::new(),
+            })),
+        },
+    );
+    model.focus = Pane::Stage;
+    for _ in 0..10 {
+        let _ = press(&mut model, Pane::Stage, KeyCode::Char('j'));
+    }
+    let mut term = Terminal::new(TestBackend::new(120, 24)).expect("backend");
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .expect("draw");
+    let selected_placement = cards
+        .iter()
+        .find(|c| c.placement == 11)
+        .expect("selected 11th card (index 10) must be placed in viewport");
+    assert_eq!(selected_placement.clip().unwrap().visible_rows, 4);
+}

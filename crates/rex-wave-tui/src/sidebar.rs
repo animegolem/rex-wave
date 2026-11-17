@@ -236,10 +236,6 @@ impl Sidebar {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, hits: &mut HitMap) {
-        self.render_pane(area, buf, hits, true);
-    }
-
     pub fn render_pane(&self, area: Rect, buf: &mut Buffer, hits: &mut HitMap, focused: bool) {
         if area.width < 6 || area.height < 3 {
             return;
@@ -418,10 +414,6 @@ impl Sidebar {
             }
         }
     }
-}
-
-pub fn build(overview: &SidebarTreeSnapshot) -> Vec<SidebarNode> {
-    build_with_ctx(overview, &BTreeMap::new())
 }
 
 pub fn build_with_ctx(

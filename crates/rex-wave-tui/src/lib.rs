@@ -14,7 +14,7 @@ use crossterm::{
 };
 use input::{Action, Dir, HitMap, Pane};
 use kitty::{
-    CardPlacement, CellPx, GraphicsMode, KittyCompositor, Osc7501, TermOut, program_status,
+    CardPlacement, CellPx, GraphicsMode, KittyCompositor, Osc7501, TermOut, encode, program_status,
 };
 use ratatui::{
     Terminal,
@@ -24,18 +24,20 @@ use ratatui::{
 use rex_wave_api::{
     board::{BoardId, CardPatch, CardUpsert, LaneName, Title},
     mail::{LetterPriority, MailPromote},
-    read::SidebarTreeSnapshot,
+    read::{Page, SidebarTreeSnapshot},
     room::{Body, RoomId, RoomPost, RoomRef},
     wave::{InteractionResolution, SteerDeliveryMode, WaveResolve, WaveTell},
     *,
 };
 use sidebar::{NodeKey, Sidebar};
 use stage::{
-    AgentInspector, HOVER_DEBOUNCE, InboxView, KanbanView, RoomView, Stage, StageRenderCtx,
-    StageTarget, find_blocked_worker_for_room, plan_for, target_for,
+    AgentInspector, HOVER_DEBOUNCE, INBOX_CARD_HEIGHT, InboxView, KanbanView, RoomView, Stage,
+    StageRenderCtx, StageTarget, find_blocked_worker_for_room, plan_for, target_for,
 };
 use std::io::{self, Write as _};
 use tokio::sync::mpsc;
+
+const ROOM_PAGE_LIMIT: u32 = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerTarget {
@@ -56,7 +58,8 @@ pub struct Model {
     pub focus: Pane,
     pub composer_target: Option<ComposerTarget>,
     pub graphics: GraphicsMode,
-    pub last_osc: Option<Osc7501>,
+    pub term_rows: u16,
+    pub last_error: Option<String>,
     pub quit: bool,
 }
 
@@ -76,7 +79,8 @@ impl Model {
             focus: Pane::Sidebar,
             composer_target: None,
             graphics: GraphicsMode::Hybrid,
-            last_osc: None,
+            term_rows: 34,
+            last_error: None,
             quit: false,
         }
     }
@@ -88,6 +92,10 @@ pub enum Msg {
     Frame {
         watch: WatchSlot,
         frame: Frame,
+    },
+    WatchClosed {
+        watch: WatchSlot,
+        error: Option<ApiError>,
     },
     Reply {
         tag: ReplyTag,
@@ -122,12 +130,23 @@ pub enum Effect {
     Quit,
 }
 
+fn inbox_viewport_rows(term_rows: u16) -> u16 {
+    term_rows.saturating_sub(3).max(INBOX_CARD_HEIGHT)
+}
+
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
     match msg {
-        Msg::Action(action) => handle_action(model, action, &mut effects),
+        Msg::Action(action) => {
+            if !matches!(action, Action::Hover(_) | Action::Scroll { .. }) {
+                model.last_error = None;
+            }
+            handle_action(model, action, &mut effects);
+        }
         Msg::HoverSettled(key) => {
-            if model.sidebar.hover.as_ref() == Some(&key) || model.sidebar.cursor == key {
+            if model.focus != Pane::Composer
+                && (model.sidebar.hover.as_ref() == Some(&key) || model.sidebar.cursor == key)
+            {
                 retarget_if_changed(model, target_for(&key), &mut effects);
             }
         }
@@ -137,7 +156,6 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         } => {
             model.sidebar_snapshot = *snap;
             model.sidebar.rebuild(&model.sidebar_snapshot);
-            emit_osc_if_changed(model, &mut effects);
         }
         Msg::Frame {
             watch: WatchSlot::Stage,
@@ -163,8 +181,34 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
         },
         Msg::Frame { .. } => {}
+        Msg::WatchClosed { watch, error } => match watch {
+            WatchSlot::Tree => {
+                let detail = match error {
+                    Some(e) => format!("daemon disconnected: {e}"),
+                    None => "daemon disconnected".to_owned(),
+                };
+                model.last_error = Some(detail);
+            }
+            WatchSlot::Stage => {
+                if let Some(err) = error {
+                    if matches!(model.stage, Stage::Loading(_)) {
+                        model.stage = Stage::Error {
+                            target: model.active_target.clone(),
+                            error: err.to_string(),
+                        };
+                    } else {
+                        model.last_error = Some(err.to_string());
+                    }
+                }
+            }
+        },
         Msg::Reply { tag, result } => handle_reply(model, tag, result, &mut effects),
-        Msg::Resize { .. } => {}
+        Msg::Resize { rows, .. } => {
+            model.term_rows = rows;
+            if let Stage::Inbox(inbox) = &mut model.stage {
+                inbox.keep_selected_visible(inbox_viewport_rows(model.term_rows));
+            }
+        }
     }
     effects
 }
@@ -194,7 +238,7 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
             model.sidebar.cursor = key.clone();
             model.sidebar.hover = None;
             let target = target_for(&key);
-            if model.active_target == target {
+            if model.active_target == target && !matches!(model.stage, Stage::Loading(_)) {
                 model.focus = Pane::Stage;
             } else {
                 retarget_if_changed(model, target, effects);
@@ -219,7 +263,8 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                     effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
                 }
             } else {
-                move_in_stage(&mut model.stage, dir, &mut model.focus);
+                let vp = inbox_viewport_rows(model.term_rows);
+                move_in_stage(&mut model.stage, dir, &mut model.focus, vp);
             }
         }
         Action::Top => {
@@ -230,7 +275,7 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                     effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
                 }
             } else {
-                scroll_stage_extreme(&mut model.stage, true);
+                scroll_stage_extreme(&mut model.stage, true, inbox_viewport_rows(model.term_rows));
             }
         }
         Action::Bottom => {
@@ -241,7 +286,11 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                     effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
                 }
             } else {
-                scroll_stage_extreme(&mut model.stage, false);
+                scroll_stage_extreme(
+                    &mut model.stage,
+                    false,
+                    inbox_viewport_rows(model.term_rows),
+                );
             }
         }
         Action::PrevLane => {
@@ -555,32 +604,96 @@ fn handle_reply(
     result: Result<WireReply, ApiError>,
     effects: &mut Vec<Effect>,
 ) {
-    let Ok(reply) = result else {
-        return;
-    };
-    match (tag, reply) {
-        (ReplyTag::Sidebar, WireReply::Sidebar(snap)) => {
+    match (tag, result) {
+        (ReplyTag::StageInitial(seq), Err(err)) if seq == model.stage_req_seq => {
+            model.stage = Stage::Error {
+                target: model.active_target.clone(),
+                error: err.to_string(),
+            };
+        }
+        (ReplyTag::StageInitial(_), Err(_)) => {}
+        (_, Err(err)) => {
+            model.last_error = Some(err.to_string());
+        }
+        (ReplyTag::Sidebar, Ok(WireReply::Sidebar(snap))) => {
             model.sidebar_snapshot = snap;
             model.sidebar.rebuild(&model.sidebar_snapshot);
-            emit_osc_if_changed(model, effects);
         }
-        (ReplyTag::StageInitial(seq), reply) if seq == model.stage_req_seq => match reply {
-            WireReply::InboxList(page) if matches!(model.active_target, StageTarget::Inbox) => {
+        (ReplyTag::StageInitial(seq), Ok(reply)) if seq == model.stage_req_seq => {
+            apply_stage_snapshot(model, reply);
+        }
+        (ReplyTag::UserCommand, Ok(WireReply::MailPromote(letter))) => {
+            if let Stage::Room(r) = &mut model.stage {
+                r.status_banner = Some(format!("Banked {}", letter.path.display()));
+                r.selection = None;
+            }
+        }
+        (ReplyTag::UserCommand, Ok(_)) => {
+            let refresh_cmd = match &model.stage {
+                Stage::Room(r) => {
+                    let room_stream = StreamId::Room {
+                        room: r.room.clone(),
+                    };
+                    Some(WireCommand::Read(read::Read {
+                        after: r.cursor.at(&room_stream),
+                        stream: room_stream,
+                        limit: Some(ROOM_PAGE_LIMIT),
+                    }))
+                }
+                _ => plan_for(&model.active_target, &model.sidebar_snapshot, &model.me).initial,
+            };
+            if let Some(cmd) = refresh_cmd {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_stage_snapshot(model: &mut Model, reply: WireReply) {
+    let vp = inbox_viewport_rows(model.term_rows);
+    match reply {
+        WireReply::InboxList(page) if matches!(model.active_target, StageTarget::Inbox) => {
+            if let Stage::Inbox(existing) = &mut model.stage {
+                existing.page = page;
+                existing.keep_selected_visible(vp);
+            } else {
                 model.stage = Stage::Inbox(InboxView::new(page));
             }
-            WireReply::BoardView(snap)
-                if matches!(model.active_target, StageTarget::Kanban { .. }) =>
+        }
+        WireReply::BoardView(snap) if matches!(model.active_target, StageTarget::Kanban { .. }) => {
+            if let Stage::Kanban(existing) = &mut model.stage
+                && existing.snapshot.board == snap.board
             {
+                existing.snapshot = snap;
+                existing.clamp_cursor();
+            } else {
                 model.stage = Stage::Kanban(KanbanView::new(snap));
             }
-            WireReply::Read(page) => {
-                if let StageTarget::Room { room } = &model.active_target {
+        }
+        WireReply::Read(page) => {
+            if let StageTarget::Room { room } = &model.active_target {
+                if let Stage::Room(existing) = &mut model.stage
+                    && &existing.room == room
+                {
+                    existing.merge_entries(page.entries, page.cursor);
+                } else {
                     model.stage =
                         Stage::Room(RoomView::new(room.clone(), page.entries, page.cursor));
                 }
             }
-            WireReply::ThreadPage(tp) => {
-                if let StageTarget::Agent { wave, role } = &model.active_target {
+        }
+        WireReply::ThreadPage(tp) => {
+            if let StageTarget::Agent { wave, role } = &model.active_target {
+                if let Stage::Agent(existing) = &mut model.stage
+                    && &existing.wave == wave
+                    && &existing.role == role
+                {
+                    existing.page = tp;
+                } else {
                     model.stage = Stage::Agent(AgentInspector {
                         wave: wave.clone(),
                         role: role.clone(),
@@ -588,25 +701,8 @@ fn handle_reply(
                         composer: String::new(),
                         scroll: u16::MAX,
                     });
-                    sync_agent_ctx_from_stage(model);
                 }
-            }
-            _ => {}
-        },
-        (ReplyTag::UserCommand, WireReply::MailPromote(letter)) => {
-            if let Stage::Room(r) = &mut model.stage {
-                r.status_banner = Some(format!("Banked {}", letter.path.display()));
-                r.selection = None;
-            }
-        }
-        (ReplyTag::UserCommand, _) => {
-            if let Some(cmd) =
-                plan_for(&model.active_target, &model.sidebar_snapshot, &model.me).initial
-            {
-                effects.push(Effect::Call {
-                    tag: ReplyTag::StageInitial(model.stage_req_seq),
-                    cmd,
-                });
+                sync_agent_ctx_from_stage(model);
             }
         }
         _ => {}
@@ -647,14 +743,6 @@ fn sync_agent_ctx_from_stage(model: &mut Model) {
     }
 }
 
-fn emit_osc_if_changed(model: &mut Model, effects: &mut Vec<Effect>) {
-    let next = program_status(&model.sidebar_snapshot);
-    if model.last_osc.as_ref() != Some(&next) {
-        model.last_osc = Some(next.clone());
-        effects.push(Effect::Terminal(TermOut::ProgramStatus(next)));
-    }
-}
-
 fn active_composer_mut(stage: &mut Stage) -> Option<&mut String> {
     match stage {
         Stage::Room(r) => Some(&mut r.composer),
@@ -664,18 +752,18 @@ fn active_composer_mut(stage: &mut Stage) -> Option<&mut String> {
     }
 }
 
-fn move_in_stage(stage: &mut Stage, dir: Dir, focus: &mut Pane) {
+fn move_in_stage(stage: &mut Stage, dir: Dir, focus: &mut Pane, inbox_vp_rows: u16) {
     match stage {
         Stage::Inbox(inbox) => {
             let count = inbox.visible_items().len();
             match dir {
                 Dir::Down if inbox.selected + 1 < count => {
                     inbox.selected += 1;
-                    inbox.scroll = inbox.scroll.saturating_add(2);
+                    inbox.keep_selected_visible(inbox_vp_rows);
                 }
                 Dir::Up if inbox.selected > 0 => {
                     inbox.selected -= 1;
-                    inbox.scroll = inbox.scroll.saturating_sub(2);
+                    inbox.keep_selected_visible(inbox_vp_rows);
                 }
                 Dir::Left => *focus = Pane::Sidebar,
                 _ => {}
@@ -728,7 +816,7 @@ fn move_in_stage(stage: &mut Stage, dir: Dir, focus: &mut Pane) {
             Dir::Left => *focus = Pane::Sidebar,
             Dir::Right => {}
         },
-        Stage::Summary(_) | Stage::Loading(_) => {
+        Stage::Summary(_) | Stage::Loading(_) | Stage::Error { .. } => {
             if dir == Dir::Left {
                 *focus = Pane::Sidebar;
             }
@@ -756,7 +844,7 @@ fn scroll_stage(stage: &mut Stage, lines: i16) {
     }
 }
 
-fn scroll_stage_extreme(stage: &mut Stage, top: bool) {
+fn scroll_stage_extreme(stage: &mut Stage, top: bool, inbox_vp_rows: u16) {
     match stage {
         Stage::Inbox(v) => {
             v.selected = if top {
@@ -764,7 +852,11 @@ fn scroll_stage_extreme(stage: &mut Stage, top: bool) {
             } else {
                 v.visible_items().len().saturating_sub(1)
             };
-            v.scroll = if top { 0 } else { (v.selected as u16) * 5 };
+            if top {
+                v.scroll = 0;
+            } else {
+                v.keep_selected_visible(inbox_vp_rows);
+            }
         }
         Stage::Room(v) => v.scroll = if top { 0 } else { u16::MAX },
         Stage::Agent(v) => v.scroll = if top { 0 } else { u16::MAX },
@@ -806,8 +898,112 @@ pub fn view(
             graphics: model.graphics,
             stage_focused: model.focus == Pane::Stage,
             composing: model.focus == Pane::Composer,
+            last_error: model.last_error.as_deref(),
         },
     );
+}
+
+/// Polls an active `FrameStream` slot, clearing `*slot = None` immediately on
+/// `None` or `Err` so a completed `Unfold` stream is never polled a second time.
+pub async fn poll_watch_slot(slot: &mut Option<FrameStream>, watch: WatchSlot) -> Msg {
+    let Some(stream) = slot.as_mut() else {
+        return std::future::pending().await;
+    };
+    match std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        Some(Ok(frame)) => Msg::Frame { watch, frame },
+        Some(Err(err)) => {
+            *slot = None;
+            Msg::WatchClosed {
+                watch,
+                error: Some(err),
+            }
+        }
+        None => {
+            *slot = None;
+            Msg::WatchClosed { watch, error: None }
+        }
+    }
+}
+
+/// Loads initial stage data and opens the matching server `Interest::Stage` watch.
+/// For rooms, pages `Read` forward to the current head first and starts the watch
+/// from the returned `Cursor` so rooms longer than one page never skip entries.
+pub async fn load_stage_target<C: Client>(
+    client: &C,
+    overview: &SidebarTreeSnapshot,
+    target: &StageTarget,
+) -> (
+    Option<Result<WireReply, ApiError>>,
+    Result<Option<FrameStream>, ApiError>,
+) {
+    if let StageTarget::Room { room } = target {
+        let stream_id = StreamId::Room { room: room.clone() };
+        let mut after = Seq::ORIGIN;
+        let mut all_entries = Vec::new();
+        let mut cursor = Cursor::default();
+
+        loop {
+            let res = client
+                .call_wire(WireCommand::Read(read::Read {
+                    stream: stream_id.clone(),
+                    after,
+                    limit: Some(ROOM_PAGE_LIMIT),
+                }))
+                .await;
+            match res {
+                Ok(WireReply::Read(page)) => {
+                    let count = page.entries.len();
+                    if let Some(last) = page.entries.last() {
+                        after = last.seq;
+                    }
+                    cursor.advance(&stream_id, after);
+                    all_entries.extend(page.entries);
+                    if count < ROOM_PAGE_LIMIT as usize {
+                        break;
+                    }
+                }
+                Ok(other) => {
+                    return (
+                        Some(Err(ApiError::ReplyMismatch {
+                            expected: "read".to_owned(),
+                            got: format!("{other:?}"),
+                        })),
+                        Ok(None),
+                    );
+                }
+                Err(e) => return (Some(Err(e)), Ok(None)),
+            }
+        }
+
+        let watch_res = client
+            .watch(
+                Interest::Stage {
+                    target: rex_wave_api::StageTarget::Room {
+                        room: RoomRef::Id { id: room.clone() },
+                    },
+                },
+                cursor.clone(),
+            )
+            .await
+            .map(Some);
+        let initial = WireReply::Read(Page {
+            entries: all_entries,
+            cursor,
+            timed_out: false,
+        });
+        return (Some(Ok(initial)), watch_res);
+    }
+
+    let plan = plan_for(target, overview, client.me());
+    let watch_res = match plan.watch {
+        Some((interest, cursor)) => client.watch(interest, cursor).await.map(Some),
+        None => Ok(None),
+    };
+    let initial_res = match plan.initial {
+        Some(cmd) => Some(client.call_wire(cmd).await),
+        None => None,
+    };
+    (initial_res, watch_res)
 }
 
 pub async fn run<C: Client + Clone + 'static>(client: C) -> io::Result<()> {
@@ -845,6 +1041,9 @@ async fn run_loop<C: Client + Clone + 'static>(
     };
 
     let mut model = Model::new(client.me().clone(), initial_overview);
+    if let Ok(sz) = terminal.size() {
+        model.term_rows = sz.height;
+    }
     let mut hits = HitMap::default();
     let mut cards = Vec::new();
 
@@ -859,7 +1058,13 @@ async fn run_loop<C: Client + Clone + 'static>(
 
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Msg>();
 
-    let mut tree_watch = client.watch(Interest::Sidebar, Cursor::live()).await.ok();
+    let mut tree_watch = match client.watch(Interest::Sidebar, Cursor::live()).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            model.last_error = Some(format!("sidebar watch: {e}"));
+            None
+        }
+    };
     let mut stage_watch: Option<FrameStream> = None;
     let mut hover_deadline: Option<(tokio::time::Instant, NodeKey)> = None;
 
@@ -895,12 +1100,8 @@ async fn run_loop<C: Client + Clone + 'static>(
                 _ => None,
             },
             Some(m) = msg_rx.recv() => Some(m),
-            Some(Ok(frame)) = next_watch_frame(&mut tree_watch) => {
-                Some(Msg::Frame { watch: WatchSlot::Tree, frame })
-            },
-            Some(Ok(frame)) = next_watch_frame(&mut stage_watch) => {
-                Some(Msg::Frame { watch: WatchSlot::Stage, frame })
-            },
+            m = poll_watch_slot(&mut tree_watch, WatchSlot::Tree) => Some(m),
+            m = poll_watch_slot(&mut stage_watch, WatchSlot::Stage) => Some(m),
             key = wait_hover(&mut hover_deadline) => Some(Msg::HoverSettled(key)),
         };
 
@@ -923,7 +1124,10 @@ async fn run_loop<C: Client + Clone + 'static>(
                     Effect::DebounceHover(key) => {
                         hover_deadline = Some((tokio::time::Instant::now() + HOVER_DEBOUNCE, key));
                     }
-                    Effect::Terminal(_) => {}
+                    Effect::Terminal(term_out) => {
+                        let bytes = encode(&term_out, CellPx::default(), None);
+                        terminal.backend_mut().write_all(&bytes)?;
+                    }
                     Effect::Quit => {
                         model.quit = true;
                     }
@@ -943,28 +1147,22 @@ async fn open_stage_target<C: Client + Clone + 'static>(
     target: &StageTarget,
 ) {
     *stage_watch = None;
-    let plan = plan_for(target, &model.sidebar_snapshot, &model.me);
-    if let Some((interest, cursor)) = plan.watch {
-        *stage_watch = client.watch(interest, cursor).await.ok();
-    }
-    if let Some(cmd) = plan.initial {
-        let c = client.clone();
-        let tx = msg_tx.clone();
-        let seq = model.stage_req_seq;
-        tokio::spawn(async move {
-            let result = c.call_wire(cmd).await;
-            let _ = tx.send(Msg::Reply {
-                tag: ReplyTag::StageInitial(seq),
-                result,
+    let seq = model.stage_req_seq;
+    let (initial_res, watch_res) = load_stage_target(client, &model.sidebar_snapshot, target).await;
+    match watch_res {
+        Ok(stream_opt) => *stage_watch = stream_opt,
+        Err(err) => {
+            let _ = msg_tx.send(Msg::WatchClosed {
+                watch: WatchSlot::Stage,
+                error: Some(err),
             });
-        });
+        }
     }
-}
-
-async fn next_watch_frame(slot: &mut Option<FrameStream>) -> Option<Result<Frame, ApiError>> {
-    match slot {
-        Some(stream) => std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await,
-        None => std::future::pending().await,
+    if let Some(result) = initial_res {
+        let _ = msg_tx.send(Msg::Reply {
+            tag: ReplyTag::StageInitial(seq),
+            result,
+        });
     }
 }
 

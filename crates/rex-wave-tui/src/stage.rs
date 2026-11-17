@@ -83,13 +83,6 @@ pub fn default_board_id(overview: &SidebarTreeSnapshot, me: &Principal) -> Board
     }
 }
 
-pub fn plan(target: &StageTarget) -> Plan {
-    let fallback_me = Principal::Operator {
-        seat: SeatName::parse("owner").expect("valid default seat"),
-    };
-    plan_for(target, &SidebarTreeSnapshot::default(), &fallback_me)
-}
-
 pub fn plan_for(target: &StageTarget, overview: &SidebarTreeSnapshot, me: &Principal) -> Plan {
     match target {
         StageTarget::Inbox => Plan {
@@ -167,7 +160,11 @@ pub enum Stage {
     Agent(AgentInspector),
     Summary(NodeKey),
     Loading(StageTarget),
+    Error { target: StageTarget, error: String },
 }
+
+pub const INBOX_CARD_HEIGHT: u16 = 4;
+pub const INBOX_CARD_STRIDE: u16 = 5;
 
 pub struct InboxView {
     pub page: InboxPage,
@@ -190,6 +187,24 @@ impl InboxView {
             .iter()
             .filter(|n| !matches!(n.state, NotifyState::Done | NotifyState::Dismissed))
             .collect()
+    }
+
+    pub fn keep_selected_visible(&mut self, viewport_rows: u16) {
+        let count = self.visible_items().len();
+        if count == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = self.selected.min(count - 1);
+        let avail = viewport_rows.max(INBOX_CARD_HEIGHT);
+        let card_top = (self.selected as u16).saturating_mul(INBOX_CARD_STRIDE);
+        let card_bottom = card_top.saturating_add(INBOX_CARD_HEIGHT);
+        if card_top < self.scroll {
+            self.scroll = card_top;
+        } else if card_bottom > self.scroll.saturating_add(avail) {
+            self.scroll = card_bottom.saturating_sub(avail);
+        }
     }
 }
 
@@ -265,9 +280,23 @@ impl RoomView {
             cursor,
             selection: None,
             composer: String::new(),
-            scroll: 0,
+            scroll: u16::MAX,
             status_banner: None,
         }
+    }
+
+    pub fn merge_entries(&mut self, incoming: Vec<Envelope>, cursor: Cursor) {
+        for env in incoming {
+            if !self.entries.iter().any(|e| e.seq == env.seq) {
+                self.cursor.advance(&env.stream, env.seq);
+                self.entries.push(env);
+            }
+        }
+        self.entries.sort_by_key(|e| e.seq);
+        let room_stream = StreamId::Room {
+            room: self.room.clone(),
+        };
+        self.cursor.advance(&room_stream, cursor.at(&room_stream));
     }
 
     pub fn effective_promote_range(&self) -> Option<SeqRange> {
@@ -330,6 +359,7 @@ pub struct StageRenderCtx<'a> {
     pub graphics: GraphicsMode,
     pub stage_focused: bool,
     pub composing: bool,
+    pub last_error: Option<&'a str>,
 }
 
 impl Stage {
@@ -398,28 +428,6 @@ impl Stage {
         }
     }
 
-    pub fn render(
-        &self,
-        area: Rect,
-        buf: &mut Buffer,
-        hits: &mut HitMap,
-        cards: &mut Vec<CardPlacement>,
-    ) {
-        let default_overview = SidebarTreeSnapshot::default();
-        self.render_with_ctx(
-            area,
-            buf,
-            hits,
-            cards,
-            StageRenderCtx {
-                overview: &default_overview,
-                graphics: GraphicsMode::Hybrid,
-                stage_focused: false,
-                composing: false,
-            },
-        );
-    }
-
     pub fn render_with_ctx(
         &self,
         area: Rect,
@@ -440,6 +448,24 @@ impl Stage {
             Stage::Agent(inspector) => render_agent(inspector, area, buf, hits, &ctx),
             Stage::Summary(key) => render_summary(key, area, buf, &ctx),
             Stage::Loading(target) => render_loading(target, area, buf, &ctx),
+            Stage::Error { target, error } => render_error(target, error, area, buf, &ctx),
+        }
+
+        if let Some(err) = ctx.last_error
+            && area.height >= 2
+            && area.width > 12
+        {
+            let banner = format!(
+                " ✕ {} ",
+                truncate_chars(err, area.width.saturating_sub(8) as usize)
+            );
+            let w = (banner.chars().count() as u16).min(area.width.saturating_sub(4));
+            let rect = Rect::new(area.x + 2, area.bottom() - 1, w, 1);
+            Paragraph::new(Line::from(Span::styled(
+                banner,
+                Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
+            )))
+            .render(rect, buf);
         }
     }
 }
@@ -547,8 +573,8 @@ fn render_inbox(
         return;
     }
 
-    const CARD_H: i32 = 4;
-    const CARD_STRIDE: i32 = 5;
+    const CARD_H: i32 = INBOX_CARD_HEIGHT as i32;
+    const CARD_STRIDE: i32 = INBOX_CARD_STRIDE as i32;
     let card_x = viewport.x + 1;
     let card_w = viewport.width.saturating_sub(2);
     if card_w < 8 {
@@ -1340,6 +1366,27 @@ fn render_loading(target: &StageTarget, area: Rect, buf: &mut Buffer, ctx: &Stag
         Paragraph::new(Line::from(Span::styled(
             format!("  Loading {target:?}..."),
             Style::default().fg(C_DIM),
+        )))
+        .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
+    }
+}
+
+fn render_error(
+    target: &StageTarget,
+    error: &str,
+    area: Rect,
+    buf: &mut Buffer,
+    ctx: &StageRenderCtx<'_>,
+) {
+    let mut dummy_hits = HitMap::default();
+    let inner = draw_stage_frame("Stage Error".to_owned(), area, buf, &mut dummy_hits, ctx);
+    if inner.height >= 1 {
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "  ✕ {target:?}: {}",
+                truncate_chars(error, inner.width.saturating_sub(8) as usize)
+            ),
+            Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
         )))
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
     }

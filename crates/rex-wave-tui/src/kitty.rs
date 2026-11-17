@@ -136,10 +136,6 @@ pub fn clip(card: Rect, viewport: Rect) -> Option<Clip> {
     clip_with_pre_top(card, viewport, 0).map(|(_, c)| c)
 }
 
-pub fn clipped_rect(card: Rect, viewport: Rect) -> Option<(Rect, Clip)> {
-    clip_with_pre_top(card, viewport, 0)
-}
-
 pub fn clip_with_pre_top(card: Rect, viewport: Rect, pre_clipped_top: u16) -> Option<(Rect, Clip)> {
     if card.width == 0 || card.height == 0 || viewport.width == 0 || viewport.height == 0 {
         return None;
