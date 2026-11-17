@@ -16,5 +16,8 @@ serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+rex-wave-rooms.workspace = true
+
 [lints]
 workspace = true
