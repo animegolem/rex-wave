@@ -1415,8 +1415,12 @@ dependencies = [
 name = "rex-wave-rooms"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rex-wave-api",
  "rex-wave-runtime",
+ "rex-wave-store",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
