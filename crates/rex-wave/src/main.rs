@@ -963,17 +963,20 @@ async fn main() -> ExitCode {
             stdio: _,
             http,
             token,
-        } => match RemoteClient::connect(endpoint, Credential::Token { token }, "mcp").await {
-            Ok(client) => {
-                let server = McpServer::new(client);
-                let res = match http {
-                    Some(addr) => server.serve_http(addr).await,
-                    None => server.serve_stdio().await,
-                };
-                res.map_err(|e| e.to_string())
+        } => {
+            let http_token = token.clone();
+            match RemoteClient::connect(endpoint, Credential::Token { token }, "mcp").await {
+                Ok(client) => {
+                    let server = McpServer::new(client);
+                    let res = match http {
+                        Some(addr) => server.with_http_token(http_token).serve_http(addr).await,
+                        None => server.serve_stdio().await,
+                    };
+                    res.map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
             }
-            Err(e) => Err(e.to_string()),
-        },
+        }
         Cmd::Token(token_args) => match extract_token_seat(&token_args) {
             Ok(seat) => match daemon::mint_seat_token(&sock_path, &seat) {
                 Ok(tok) => {

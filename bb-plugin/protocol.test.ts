@@ -207,7 +207,7 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
 
   await rexWaveBridge(mockBb);
   assert.ok(registeredTools.has("rex_room_post"));
-  assert.equal(registeredTools.has("rex_run_code"), false);
+  assert.ok(registeredTools.has("rex_run_code"));
 
   const nonWaveCfg = configureFn!({
     pluginMetadata: {},
@@ -222,8 +222,8 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
     provider: { id: "pi", model: "openrouter/model" },
   });
   assert.ok(waveCfg.tools.includes("rex_room_post"));
-  assert.equal(waveCfg.tools.includes("rex_run_code"), false);
-  assert.equal(waveCfg.instructions?.includes("rex_run_code"), false);
+  assert.ok(waveCfg.tools.includes("rex_run_code"));
+  assert.ok(waveCfg.instructions?.includes("rex_run_code"));
   assert.ok(waveCfg.instructions?.includes("@author"));
 
   const sentUp: Up[] = [];

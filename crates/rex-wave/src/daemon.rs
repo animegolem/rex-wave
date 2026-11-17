@@ -188,17 +188,37 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let mail_writer = journal
         .claim(StreamId::Mail)
         .map_err(|e| format!("claim mail stream: {e}"))?;
-    let bridge = BbBridge::new(BridgeConfig {
-        url: args.bb_url.clone(),
-        token: args.bb_token.clone(),
-    });
+    let bridge = BbBridge::with_code_runner(
+        BridgeConfig {
+            url: args.bb_url.clone(),
+            token: args.bb_token.clone(),
+        },
+        Arc::new(|client, args| {
+            Box::pin(async move {
+                let res = rex_wave_mcp::McpServer::new(client)
+                    .call_tool(rex_wave_mcp::RUN_CODE_TOOL, args)
+                    .await;
+                let text = res
+                    .content
+                    .into_iter()
+                    .find_map(|c| c.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+                    .unwrap_or_else(|| "null".into());
+                if res.is_error { Err(text) } else { Ok(text) }
+            })
+        }),
+    );
 
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(MailBridge::new(sandbox, journal.clone(), mail_writer)),
+        mail: Arc::new(MailBridge::with_hub(
+            sandbox,
+            journal.clone(),
+            mail_writer,
+            hub.clone(),
+        )),
         read: Arc::new(ReadSide {
             journal,
             hub,
