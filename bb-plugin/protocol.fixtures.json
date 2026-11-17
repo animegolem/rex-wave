@@ -1,0 +1,163 @@
+{
+  "up": [
+    {
+      "t": "hello",
+      "plugin_version": "0.1.0",
+      "sdk_version": "0.6.132"
+    },
+    {
+      "t": "thread",
+      "signal": "created",
+      "thread_id": "th_01",
+      "project_id": "proj_3vs7nkyeum",
+      "meta": {
+        "waveId": "auth-v2",
+        "role": "verifier",
+        "attempt": 1,
+        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+      },
+      "error": null
+    },
+    {
+      "t": "interaction",
+      "thread_id": "th_01",
+      "meta": {
+        "waveId": "auth-v2",
+        "role": "verifier",
+        "attempt": 1,
+        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+      },
+      "interaction": {
+        "id": "int_01",
+        "payload": {
+          "kind": "approval",
+          "reason": "Run cargo test"
+        }
+      }
+    },
+    {
+      "t": "thread_events",
+      "thread_id": "th_01",
+      "sequence": 14
+    },
+    {
+      "t": "tool_call",
+      "call_id": "call_99",
+      "thread_id": "th_01",
+      "project_id": "proj_3vs7nkyeum",
+      "meta": {
+        "waveId": "auth-v2",
+        "role": "verifier",
+        "attempt": 1,
+        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+      },
+      "tool": "room_post",
+      "args": {
+        "body": "@author slice verified"
+      }
+    },
+    {
+      "t": "result",
+      "req_id": 7,
+      "ok": true,
+      "value": {
+        "thread_id": "th_01"
+      }
+    }
+  ],
+  "down": [
+    {
+      "t": "spawn",
+      "req_id": 1,
+      "args": {
+        "projectId": "proj_3vs7nkyeum",
+        "environment": {
+          "type": "provider",
+          "environmentProviderId": "git-worktree",
+          "inputs": {
+            "branch": {
+              "kind": "default"
+            }
+          }
+        },
+        "providerId": "codex",
+        "model": "gpt-6.1-sol",
+        "permissionMode": "accept-edits",
+        "visibility": "hidden",
+        "prompt": "Verify auth-v2",
+        "pluginMetadata": {
+          "rexWave": {
+            "waveId": "auth-v2",
+            "role": "verifier",
+            "attempt": 1,
+            "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+          }
+        }
+      }
+    },
+    {
+      "t": "find_by_meta",
+      "req_id": 2,
+      "meta": {
+        "waveId": "auth-v2",
+        "role": "verifier",
+        "attempt": 1,
+        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+      }
+    },
+    {
+      "t": "send",
+      "req_id": 3,
+      "thread_id": "th_01",
+      "mode": "auto",
+      "text": "[#wave-auth-v2 seq=4 from @owner] ping"
+    },
+    {
+      "t": "resolve",
+      "req_id": 4,
+      "thread_id": "th_01",
+      "interaction_id": "int_01",
+      "resolution": {
+        "decision": "allow_once",
+        "grantedPermissions": null
+      }
+    },
+    {
+      "t": "retire",
+      "req_id": 5,
+      "thread_id": "th_01"
+    },
+    {
+      "t": "events_page",
+      "req_id": 6,
+      "thread_id": "th_01",
+      "after_seq": 10,
+      "limit": 100
+    },
+    {
+      "t": "thread_context",
+      "req_id": 7,
+      "thread_id": "th_01"
+    },
+    {
+      "t": "watch_thread",
+      "thread_id": "th_01",
+      "after_seq": 10
+    },
+    {
+      "t": "unwatch_thread",
+      "thread_id": "th_01"
+    },
+    {
+      "t": "tool_result",
+      "call_id": "call_99",
+      "ok": true,
+      "text": "{\"seq\":5}"
+    },
+    {
+      "t": "push",
+      "title": "Approval needed",
+      "body": "@verifier needs permission"
+    }
+  ]
+}
