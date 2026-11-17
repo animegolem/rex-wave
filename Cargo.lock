@@ -1408,7 +1408,11 @@ name = "rex-wave-notify"
 version = "0.1.0"
 dependencies = [
  "rex-wave-api",
+ "rex-wave-rooms",
  "rex-wave-runtime",
+ "rex-wave-store",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
