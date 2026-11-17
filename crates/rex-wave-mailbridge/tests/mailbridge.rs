@@ -3,8 +3,9 @@ use rex_wave_api::read::Read;
 use rex_wave_api::room::*;
 use rex_wave_api::*;
 use rex_wave_mailbridge::{
-    BellCourier, MAX_PROTECTED_ROOTS, MailBridge, SandboxError, SandboxRoot, bell_meta,
-    parse_protected_roots, project, render_letter, serve_wake_bell_sink, wake_id,
+    BellCourier, MAX_PROTECTED_ROOTS, MailBridge, Protection, SandboxError, SandboxRoot, bell_meta,
+    load_protected_roots_from, parse_protected_roots, project, protected_roots_file, render_letter,
+    serve_wake_bell_sink, wake_id,
 };
 use rex_wave_rooms::{Rooms, room_history};
 use rex_wave_runtime::{
@@ -43,7 +44,7 @@ impl TempSandbox {
             b"rex-wave-test-sandbox\n",
         )
         .unwrap();
-        let root = SandboxRoot::verify_with(&dir.path, &[]).unwrap();
+        let root = SandboxRoot::verify_with(&dir.path, &Protection::default()).unwrap();
         (dir, root)
     }
 
@@ -69,14 +70,14 @@ impl Drop for TempSandbox {
 fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
     let unmarked = TempSandbox::unmarked();
     assert!(matches!(
-        SandboxRoot::verify_with(&unmarked.path, &[]),
+        SandboxRoot::verify_with(&unmarked.path, &Protection::default()),
         Err(SandboxError::Unmarked(_))
     ));
 
     // The filesystem root and the home folder are refused with no list at all.
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME set"));
     for builtin in [home, PathBuf::from("/")] {
-        let res = SandboxRoot::verify_with(&builtin, &[]);
+        let res = SandboxRoot::verify_with(&builtin, &Protection::default());
         assert!(
             matches!(res, Err(SandboxError::Production(_))),
             "expected Production rejection for {}, got {res:?}",
@@ -90,7 +91,10 @@ fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
     let present = vault.path.join("letters");
     let absent = vault.path.join("memories");
     fs::create_dir_all(present.join("inbox")).unwrap();
-    let protected = vec![present.clone(), absent.clone()];
+    let protected = Protection {
+        roots: vec![present.clone(), absent.clone()],
+        names: vec!["sealed".into()],
+    };
     let forbidden_paths = [
         present.clone(),
         present.join("inbox"),
@@ -98,6 +102,21 @@ fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
         absent.join("deep/index.db"),
         vault.path.clone(),
     ];
+
+    // A protected name is refused wherever it appears, including in a folder
+    // that is marked as a sandbox and sits outside every listed folder.
+    let elsewhere = TempSandbox::unmarked();
+    let named = elsewhere.path.join("sealed").join("box");
+    fs::create_dir_all(&named).unwrap();
+    fs::write(named.join(".rex-wave-sandbox"), b"marked\n").unwrap();
+    for by_name in [named.clone(), elsewhere.path.join("sealed")] {
+        let res = SandboxRoot::verify_with(&by_name, &protected);
+        assert!(
+            matches!(res, Err(SandboxError::Production(_))),
+            "expected Production rejection by name for {}, got {res:?}",
+            by_name.display()
+        );
+    }
     for forbidden in &forbidden_paths {
         let res = SandboxRoot::verify_with(forbidden, &protected);
         assert!(
@@ -125,20 +144,63 @@ fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
     assert!(verified.path().is_absolute());
 }
 
+#[cfg(unix)]
+#[test]
+fn protected_folder_that_does_not_exist_yet_is_known_by_its_real_name() {
+    // `alias` is a symlink to `real`. The protected folder is written through
+    // the alias and does not exist. A marked sandbox at `real`, which would
+    // contain it, must still be refused.
+    let holder = TempSandbox::unmarked();
+    let real = holder.path.join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join(".rex-wave-sandbox"), b"marked\n").unwrap();
+    let alias = holder.path.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+    let protected = Protection {
+        roots: vec![alias.join("future-mail")],
+        names: vec![],
+    };
+    for candidate in [real.clone(), alias.clone(), real.join("future-mail")] {
+        let res = SandboxRoot::verify_with(&candidate, &protected);
+        assert!(
+            matches!(res, Err(SandboxError::Production(_))),
+            "expected Production rejection for {}, got {res:?}",
+            candidate.display()
+        );
+    }
+    // The same folder with nothing protected is an ordinary sandbox.
+    assert!(SandboxRoot::verify_with(&real, &Protection::default()).is_ok());
+}
+
 #[test]
 fn protected_roots_file_parses_fail_closed() {
     let home = PathBuf::from("/home/someone");
-    let text = "# folders the sandbox must never touch\n\n~/mail/live\n/srv/letters/../letters\n~/mail/live\n";
+    let text = "# what the sandbox must never touch\r\n\n~/mail/live\n/srv/./letters\n~/mail/live\nname: sealed\n";
     assert_eq!(
         parse_protected_roots(text, Some(&home)).unwrap(),
-        vec![
-            PathBuf::from("/home/someone/mail/live"),
-            PathBuf::from("/srv/letters"),
-        ]
+        Protection {
+            roots: vec![
+                PathBuf::from("/home/someone/mail/live"),
+                PathBuf::from("/srv/letters"),
+            ],
+            names: vec!["sealed".into()],
+        }
     );
-    assert!(parse_protected_roots("", None).unwrap().is_empty());
+    assert_eq!(
+        parse_protected_roots("", None).unwrap(),
+        Protection::default()
+    );
 
-    for bad in ["relative/path", "~/needs-home"] {
+    for bad in [
+        "relative/path",
+        "~/needs-home",
+        "~",
+        "/srv/link/../mail",
+        "name:",
+        "name: a/b",
+        "name: ..",
+    ] {
         assert!(
             matches!(
                 parse_protected_roots(bad, None),
@@ -154,6 +216,73 @@ fn protected_roots_file_parses_fail_closed() {
         parse_protected_roots(&too_many, None),
         Err(SandboxError::Config(_))
     ));
+}
+
+#[test]
+fn protected_roots_file_is_located_and_loaded_fail_closed() {
+    let home = PathBuf::from("/home/someone");
+    let xdg = PathBuf::from("/etc/xdg-someone");
+    assert_eq!(
+        protected_roots_file(Some(&xdg), Some(&home)).unwrap(),
+        PathBuf::from("/etc/xdg-someone/rex-wave/protected-roots")
+    );
+    // A relative XDG_CONFIG_HOME is ignored, never resolved against the
+    // working directory.
+    assert_eq!(
+        protected_roots_file(Some(&PathBuf::from("config")), Some(&home)).unwrap(),
+        PathBuf::from("/home/someone/.config/rex-wave/protected-roots")
+    );
+    for (xdg, home) in [
+        (None, None),
+        (Some(PathBuf::from("config")), None),
+        (None, Some(PathBuf::from("relative-home"))),
+    ] {
+        assert!(
+            matches!(
+                protected_roots_file(xdg.as_deref(), home.as_deref()),
+                Err(SandboxError::Config(_))
+            ),
+            "{xdg:?} / {home:?} must not locate a file"
+        );
+    }
+
+    let dir = TempSandbox::unmarked();
+    let missing = dir.path.join("missing");
+    let as_dir = dir.path.join("a-directory");
+    fs::create_dir_all(&as_dir).unwrap();
+    let not_text = dir.path.join("not-text");
+    fs::write(&not_text, [0xff, 0xfe, 0x00]).unwrap();
+    let mut unusable = vec![missing.clone(), as_dir, not_text];
+    #[cfg(unix)]
+    {
+        let dangling = dir.path.join("dangling");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        unusable.push(dangling);
+    }
+    for file in &unusable {
+        let res = load_protected_roots_from(file, Some(&home));
+        assert!(
+            matches!(res, Err(SandboxError::Config(_))),
+            "{} must be an error, never an empty list: {res:?}",
+            file.display()
+        );
+    }
+
+    let empty = dir.path.join("empty");
+    fs::write(&empty, b"").unwrap();
+    assert_eq!(
+        load_protected_roots_from(&empty, Some(&home)).unwrap(),
+        Protection::default()
+    );
+    let listed = dir.path.join("listed");
+    fs::write(&listed, b"~/mail/live\nname: sealed\n").unwrap();
+    assert_eq!(
+        load_protected_roots_from(&listed, Some(&home)).unwrap(),
+        Protection {
+            roots: vec![PathBuf::from("/home/someone/mail/live")],
+            names: vec!["sealed".into()],
+        }
+    );
 }
 
 #[test]

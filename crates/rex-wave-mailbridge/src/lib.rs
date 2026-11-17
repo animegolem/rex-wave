@@ -101,11 +101,101 @@ pub enum SandboxError {
 #[derive(Clone, Debug)]
 pub struct SandboxRoot {
     root: PathBuf,
-    protected: Vec<PathBuf>,
+    policy: Policy,
 }
 
-/// The most folders one deployment may protect.
+/// The most entries, folders and names together, one deployment may protect.
 pub const MAX_PROTECTED_ROOTS: usize = 64;
+
+/// What a sandbox may never touch on this machine, as a deployment lists it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Protection {
+    /// Absolute folders. A sandbox may not be one, contain one, or sit inside one.
+    pub roots: Vec<PathBuf>,
+    /// Folder names refused anywhere in a sandbox path.
+    pub names: Vec<String>,
+}
+
+/// A `Protection` resolved once against the filesystem and the home folder,
+/// so every later check sees the same answer.
+#[derive(Clone, Debug)]
+struct Policy {
+    roots: Vec<PathBuf>,
+    names: Vec<String>,
+    homes: Vec<PathBuf>,
+}
+
+/// Resolve symlinks in the part of `path` that exists and keep the rest as
+/// written, so a folder that does not exist yet is still known by its real name.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    loop {
+        if let Ok(canon) = fs::canonicalize(ancestor) {
+            return match path.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => canon.join(rest),
+                _ => canon,
+            };
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return path.to_path_buf(),
+        }
+    }
+}
+
+/// A protected folder must be absolute and free of `..`, because removing
+/// `..` by spelling can name a different folder than the filesystem would.
+fn checked_root(path: &Path) -> Result<PathBuf, SandboxError> {
+    if !path.is_absolute() {
+        return Err(SandboxError::Config(format!(
+            "`{}` is not an absolute path",
+            path.display()
+        )));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(SandboxError::Config(format!(
+            "`{}` contains `..`",
+            path.display()
+        )));
+    }
+    lexical_normalize(path)
+}
+
+fn checked_name(name: &str) -> Result<String, SandboxError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(SandboxError::Config(format!(
+            "`{name}` is not a single folder name"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+impl Policy {
+    fn resolve(protection: &Protection) -> Result<Self, SandboxError> {
+        if protection.roots.len() + protection.names.len() > MAX_PROTECTED_ROOTS {
+            return Err(SandboxError::Config(format!(
+                "more than {MAX_PROTECTED_ROOTS} protected entries"
+            )));
+        }
+        // Hold each folder under both its given and its resolved name, so a
+        // symlinked location cannot be used to step around it.
+        let mut roots = BTreeSet::new();
+        for root in &protection.roots {
+            let given = checked_root(root)?;
+            roots.insert(resolve_existing_prefix(&given));
+            roots.insert(given);
+        }
+        let mut names = BTreeSet::new();
+        for name in &protection.names {
+            names.insert(checked_name(name)?);
+        }
+        Ok(Policy {
+            roots: roots.into_iter().collect(),
+            names: names.into_iter().collect(),
+            homes: home_dirs().into_iter().collect(),
+        })
+    }
+}
 
 fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
     let abs = if path.is_absolute() {
@@ -146,105 +236,137 @@ fn home_dirs() -> BTreeSet<PathBuf> {
     homes
 }
 
-/// Parse a protected-roots file: one folder per line. Blank lines and lines
-/// starting with `#` are skipped, and a leading `~/` means `home`. Every
-/// other line must be an absolute path.
-pub fn parse_protected_roots(
-    text: &str,
-    home: Option<&Path>,
-) -> Result<Vec<PathBuf>, SandboxError> {
+/// Parse a protected-roots file, one entry per line. Blank lines and lines
+/// starting with `#` are skipped. `name: <folder name>` refuses that name
+/// anywhere in a sandbox path. Every other line is a folder: an absolute
+/// path, or one starting with `~/` for `home`, and never containing `..`.
+pub fn parse_protected_roots(text: &str, home: Option<&Path>) -> Result<Protection, SandboxError> {
     let mut roots = BTreeSet::new();
+    let mut names = BTreeSet::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let path = match line.strip_prefix("~/") {
-            Some(rest) => home
-                .ok_or_else(|| {
-                    SandboxError::Config(format!("line {}: `~/` needs HOME to be set", index + 1))
-                })?
-                .join(rest),
-            None => PathBuf::from(line),
+        let at_line = |e: SandboxError| match e {
+            SandboxError::Config(detail) => {
+                SandboxError::Config(format!("line {}: {detail}", index + 1))
+            }
+            other => other,
         };
-        if !path.is_absolute() {
-            return Err(SandboxError::Config(format!(
-                "line {}: `{line}` is not an absolute path",
-                index + 1
-            )));
+        if let Some(name) = line.strip_prefix("name:") {
+            names.insert(checked_name(name.trim()).map_err(at_line)?);
+        } else {
+            let path = match line.strip_prefix("~/") {
+                Some(rest) => home
+                    .ok_or_else(|| {
+                        SandboxError::Config(format!(
+                            "line {}: `~/` needs HOME to be set",
+                            index + 1
+                        ))
+                    })?
+                    .join(rest),
+                None => PathBuf::from(line),
+            };
+            roots.insert(checked_root(&path).map_err(at_line)?);
         }
-        roots.insert(lexical_normalize(&path)?);
-        if roots.len() > MAX_PROTECTED_ROOTS {
+        if roots.len() + names.len() > MAX_PROTECTED_ROOTS {
             return Err(SandboxError::Config(format!(
-                "more than {MAX_PROTECTED_ROOTS} protected folders"
+                "more than {MAX_PROTECTED_ROOTS} protected entries"
             )));
         }
     }
-    Ok(roots.into_iter().collect())
+    Ok(Protection {
+        roots: roots.into_iter().collect(),
+        names: names.into_iter().collect(),
+    })
 }
 
-/// Where this deployment lists its protected folders:
-/// `$XDG_CONFIG_HOME/rex-wave/protected-roots`, or the same under `~/.config`.
-pub fn protected_roots_file() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?).join(".config"),
+/// Where a deployment lists what it protects: `rex-wave/protected-roots`
+/// under `xdg_config_home`, or under `home/.config`. A relative
+/// `xdg_config_home` is ignored, as the XDG specification requires.
+pub fn protected_roots_file(
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, SandboxError> {
+    let base = match (xdg_config_home, home) {
+        (Some(dir), _) if dir.is_absolute() => dir.to_path_buf(),
+        (_, Some(home)) if home.is_absolute() => home.join(".config"),
+        _ => {
+            return Err(SandboxError::Config(
+                "cannot locate the protected-roots file: set HOME or XDG_CONFIG_HOME to an absolute path".into(),
+            ));
+        }
     };
-    Some(base.join("rex-wave").join("protected-roots"))
+    Ok(base.join("rex-wave").join("protected-roots"))
 }
 
-/// Read this deployment's protected folders. A missing file means there are
-/// none; a file that cannot be read or parsed is an error, never an empty list.
-pub fn load_protected_roots() -> Result<Vec<PathBuf>, SandboxError> {
-    let Some(file) = protected_roots_file() else {
-        return Ok(Vec::new());
-    };
-    let text = match fs::read_to_string(&file) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(SandboxError::Config(format!("{}: {e}", file.display()))),
-    };
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from);
-    parse_protected_roots(&text, home.as_deref())
+/// Read a protected-roots file. A file that is missing, unreadable or
+/// malformed is an error and never an empty list: running with nothing
+/// protected takes an explicit, empty file.
+pub fn load_protected_roots_from(
+    file: &Path,
+    home: Option<&Path>,
+) -> Result<Protection, SandboxError> {
+    let text = fs::read_to_string(file).map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+            " (create it; it may be empty if there is nothing to protect)"
+        } else {
+            ""
+        };
+        SandboxError::Config(format!("{}: {e}{hint}", file.display()))
+    })?;
+    parse_protected_roots(&text, home)
         .map_err(|e| SandboxError::Config(format!("{}: {e}", file.display())))
+}
+
+/// Read this deployment's protected-roots file, located from the environment.
+pub fn load_protected_roots() -> Result<Protection, SandboxError> {
+    let env_path = |key: &str| {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = env_path("HOME");
+    let file = protected_roots_file(env_path("XDG_CONFIG_HOME").as_deref(), home.as_deref())?;
+    load_protected_roots_from(&file, home.as_deref())
 }
 
 fn check_not_production(
     candidate: &Path,
     reported: &Path,
-    forbidden: &[PathBuf],
+    policy: &Policy,
 ) -> Result<(), SandboxError> {
+    let refused = || Err(SandboxError::Production(reported.to_path_buf()));
     // The filesystem root and the home folder are never a sandbox.
-    if candidate.parent().is_none() || home_dirs().iter().any(|home| home.starts_with(candidate)) {
-        return Err(SandboxError::Production(reported.to_path_buf()));
+    if candidate.parent().is_none() || policy.homes.iter().any(|home| home.starts_with(candidate)) {
+        return refused();
     }
-    for prod in forbidden {
+    if candidate.components().any(|c| {
+        policy
+            .names
+            .iter()
+            .any(|name| c.as_os_str() == name.as_str())
+    }) {
+        return refused();
+    }
+    for prod in &policy.roots {
         if candidate.starts_with(prod) || prod.starts_with(candidate) {
-            return Err(SandboxError::Production(reported.to_path_buf()));
+            return refused();
         }
     }
     Ok(())
 }
 
 impl SandboxRoot {
-    /// Verify `path` against the protected folders this deployment lists.
+    /// Verify `path` against what this deployment's protected-roots file lists.
     pub fn verify(path: &Path) -> Result<Self, SandboxError> {
         Self::verify_with(path, &load_protected_roots()?)
     }
 
-    /// Verify `path` against an explicit list of protected folders.
-    pub fn verify_with(path: &Path, protected: &[PathBuf]) -> Result<Self, SandboxError> {
-        assert!(
-            protected.len() <= MAX_PROTECTED_ROOTS,
-            "at most {MAX_PROTECTED_ROOTS} protected folders"
-        );
-        // Hold each protected folder under both its given and its resolved name,
-        // so a symlinked location cannot be used to step around it.
-        let mut forbidden: BTreeSet<PathBuf> = protected.iter().cloned().collect();
-        forbidden.extend(protected.iter().filter_map(|p| fs::canonicalize(p).ok()));
-        let forbidden: Vec<PathBuf> = forbidden.into_iter().collect();
+    /// Verify `path` against an explicit `Protection`.
+    pub fn verify_with(path: &Path, protection: &Protection) -> Result<Self, SandboxError> {
+        let forbidden = Policy::resolve(protection)?;
         let lex = lexical_normalize(path)?;
         check_not_production(&lex, path, &forbidden)?;
 
@@ -284,7 +406,7 @@ impl SandboxRoot {
         match fs::symlink_metadata(&marker) {
             Ok(m) if m.file_type().is_file() => Ok(SandboxRoot {
                 root: canon,
-                protected: forbidden,
+                policy: forbidden,
             }),
             _ => Err(SandboxError::Unmarked(canon)),
         }
@@ -295,7 +417,7 @@ impl SandboxRoot {
     }
 
     fn ensure_dir(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
-        let forbidden = self.protected.as_slice();
+        let forbidden = &self.policy;
         let mut cur = self.root.clone();
         for &seg in segments {
             if seg.is_empty()
@@ -350,7 +472,7 @@ impl SandboxRoot {
         {
             return Err(SandboxError::Io("invalid path outside sandbox".into()));
         }
-        let forbidden = self.protected.as_slice();
+        let forbidden = &self.policy;
         let joined = if raw.is_absolute() {
             raw.to_path_buf()
         } else {

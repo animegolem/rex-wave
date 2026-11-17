@@ -34,15 +34,24 @@ REX_WAVE_BB_TOKEN="$BB_PLUGIN_TOKEN" rex-wave daemon \
 	--wake-bell 127.0.0.1:7781
 ```
 
-The daemon refuses a sandbox that is the filesystem root, your home folder, or any folder you have protected. To protect real mail folders, list them one per line in `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default):
+The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
+
+```sh
+mkdir -p ~/.config/rex-wave
+touch ~/.config/rex-wave/protected-roots
+```
+
+To protect real mail folders, list them one per line:
 
 ```text
 # folders the mail sandbox must never be, contain, or sit inside
 ~/mail/live
 /srv/letters
+# a folder name the sandbox path must never include, wherever it is
+name: archive
 ```
 
-Each line is an absolute path or starts with `~/`. The file holds at most 64 folders, and the daemon exits on a file it cannot read or parse.
+A folder line is an absolute path or starts with `~/`, and cannot contain `..`. The file holds at most 64 entries. The daemon exits on a file that is missing, unreadable or malformed, so a mistake never leaves a folder unprotected.
 
 By default, the daemon listens on `$XDG_STATE_HOME/rex-wave/daemon.sock`, stores its SQLite WAL journal in `journal.sqlite3` beside that socket, and binds `wake-bell` HTTP `/sink` on `127.0.0.1:7781`. Pass `--socket <path>` to any `rex-wave` command to target a custom Unix socket.
 

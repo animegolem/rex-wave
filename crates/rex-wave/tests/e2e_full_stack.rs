@@ -371,6 +371,12 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
     std::fs::write(sandbox_dir.join(".rex-wave-sandbox"), b"e2e-sandbox\n")
         .expect("write sandbox marker");
+    // The daemon refuses to start without a protected-roots file; an empty one
+    // says this test has nothing to protect.
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(config_dir.join("rex-wave")).expect("create config dir");
+    std::fs::write(config_dir.join("rex-wave").join("protected-roots"), b"")
+        .expect("write protected-roots");
 
     let bb_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -538,6 +544,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             "--wake-bell",
             &sink_addr.to_string(),
         ])
+        .env("XDG_CONFIG_HOME", &config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

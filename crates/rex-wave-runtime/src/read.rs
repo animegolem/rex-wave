@@ -213,7 +213,21 @@ impl ReadSide {
                             }
                         }
                         Some(Err(e)) => {
-                            let _ = tx.send(Err(e)).await;
+                            // Deliver the error, but stop waiting on a full
+                            // channel once this stage has been replaced.
+                            let send = tx.send(Err(e));
+                            tokio::pin!(send);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    changed = gen_rx.changed() => {
+                                        if changed.is_err() || *gen_rx.borrow() != generation {
+                                            break;
+                                        }
+                                    }
+                                    _ = &mut send => break,
+                                }
+                            }
                             break;
                         }
                         None => break,
