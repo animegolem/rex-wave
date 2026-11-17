@@ -27,8 +27,14 @@ fn snippet(text: &str, max_chars: usize) -> String {
 
 fn room_slug(room: &room::RoomId) -> String {
     match room {
-        room::RoomId::Channel { scope: room::RoomScope::Global, name } => format!("global:{name}"),
-        room::RoomId::Channel { scope: room::RoomScope::Project { project }, name } => format!("project:{project}:{name}"),
+        room::RoomId::Channel {
+            scope: room::RoomScope::Global,
+            name,
+        } => format!("global:{name}"),
+        room::RoomId::Channel {
+            scope: room::RoomScope::Project { project },
+            name,
+        } => format!("project:{project}:{name}"),
         room::RoomId::Direct { pair } => {
             let (a, b): (Principal, Principal) = pair.clone().into();
             format!("dm:{a}:{b}")
@@ -38,8 +44,14 @@ fn room_slug(room: &room::RoomId) -> String {
 
 fn room_label(room: &room::RoomId) -> String {
     match room {
-        room::RoomId::Channel { scope: room::RoomScope::Global, name } => format!("#{name}"),
-        room::RoomId::Channel { scope: room::RoomScope::Project { project }, name } => format!("#{project}/{name}"),
+        room::RoomId::Channel {
+            scope: room::RoomScope::Global,
+            name,
+        } => format!("#{name}"),
+        room::RoomId::Channel {
+            scope: room::RoomScope::Project { project },
+            name,
+        } => format!("#{project}/{name}"),
         room::RoomId::Direct { pair } => {
             let (a, b): (Principal, Principal) = pair.clone().into();
             format!("DM({a},{b})")
@@ -82,7 +94,9 @@ fn interaction_actions(
                     wave: wave.clone(),
                     role: role.clone(),
                     interaction: interaction.id.clone(),
-                    resolution: wave::InteractionResolution::AllowOnce { granted_permissions: None },
+                    resolution: wave::InteractionResolution::AllowOnce {
+                        granted_permissions: None,
+                    },
                 })),
             },
             NotifyAction {
@@ -92,7 +106,9 @@ fn interaction_actions(
                     wave: wave.clone(),
                     role: role.clone(),
                     interaction: interaction.id.clone(),
-                    resolution: wave::InteractionResolution::AllowForSession { granted_permissions: None },
+                    resolution: wave::InteractionResolution::AllowForSession {
+                        granted_permissions: None,
+                    },
                 })),
             },
             deny,
@@ -103,7 +119,10 @@ fn interaction_actions(
 
 fn is_blocking_mail(item: &mail::MailboxItem) -> bool {
     matches!(item.kind.as_str(), "blocker" | "approval")
-        || item.label.as_deref().is_some_and(|l| l.starts_with("[blocking]"))
+        || item
+            .label
+            .as_deref()
+            .is_some_and(|l| l.starts_with("[blocking]"))
 }
 
 pub fn rank(kind: &NotifyKind, age_ms: u64) -> Rank {
@@ -152,7 +171,10 @@ impl HeraldView {
                 match ev {
                     room::RoomEvent::MemberJoined { member, .. } => {
                         self.record_principal(member);
-                        self.members.entry(room.clone()).or_default().insert(member.clone());
+                        self.members
+                            .entry(room.clone())
+                            .or_default()
+                            .insert(member.clone());
                     }
                     room::RoomEvent::MemberLeft { member } => {
                         if let Some(set) = self.members.get_mut(room) {
@@ -178,21 +200,32 @@ impl HeraldView {
                         if let Some((old_id, old_summary)) = self.blocked.remove(&key)
                             && old_id != interaction.id
                         {
-                            self.cleared_interactions
-                                .push((wave.clone(), role.clone(), old_id, old_summary));
+                            self.cleared_interactions.push((
+                                wave.clone(),
+                                role.clone(),
+                                old_id,
+                                old_summary,
+                            ));
                         }
-                        self.blocked.insert(key, (interaction.id.clone(), interaction.summary.clone()));
+                        self.blocked
+                            .insert(key, (interaction.id.clone(), interaction.summary.clone()));
                     }
                     _ => {
                         if let Some((old_id, old_summary)) =
                             self.blocked.remove(&(wave.clone(), role.clone()))
                         {
-                            self.cleared_interactions
-                                .push((wave.clone(), role.clone(), old_id, old_summary));
+                            self.cleared_interactions.push((
+                                wave.clone(),
+                                role.clone(),
+                                old_id,
+                                old_summary,
+                            ));
                         }
                     }
                 },
-                wave::WaveEvent::InteractionResolved { role, interaction, .. } => {
+                wave::WaveEvent::InteractionResolved {
+                    role, interaction, ..
+                } => {
                     let key = (wave.clone(), role.clone());
                     let summary = match self.blocked.get(&key) {
                         Some((id, s)) if id == interaction => {
@@ -202,15 +235,23 @@ impl HeraldView {
                         }
                         _ => "Resolved".into(),
                     };
-                    self.cleared_interactions
-                        .push((wave.clone(), role.clone(), interaction.clone(), summary));
+                    self.cleared_interactions.push((
+                        wave.clone(),
+                        role.clone(),
+                        interaction.clone(),
+                        summary,
+                    ));
                 }
                 wave::WaveEvent::WorkerRetiring { role, .. } => {
                     if let Some((old_id, old_summary)) =
                         self.blocked.remove(&(wave.clone(), role.clone()))
                     {
-                        self.cleared_interactions
-                            .push((wave.clone(), role.clone(), old_id, old_summary));
+                        self.cleared_interactions.push((
+                            wave.clone(),
+                            role.clone(),
+                            old_id,
+                            old_summary,
+                        ));
                     }
                 }
                 wave::WaveEvent::Finished { .. } => {
@@ -315,50 +356,61 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
     }
 
     match (&entry.stream, &entry.event) {
-        (StreamId::Room { room }, Event::Room(room::RoomEvent::Posted { body, mentions, .. })) => match room {
-            room::RoomId::Direct { pair } => {
-                let (a, b): (Principal, Principal) = pair.clone().into();
-                for recipient in [a, b] {
-                    if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
+        (StreamId::Room { room }, Event::Room(room::RoomEvent::Posted { body, mentions, .. })) => {
+            match room {
+                room::RoomId::Direct { pair } => {
+                    let (a, b): (Principal, Principal) = pair.clone().into();
+                    for recipient in [a, b] {
+                        if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
+                            out.push((
+                                recipient,
+                                NotificationDraft {
+                                    kind: NotifyKind::DirectMessage {
+                                        room: room.clone(),
+                                        seq: entry.seq,
+                                    },
+                                    title: format!("Direct message from {}", entry.by),
+                                    preview: snippet(body.as_str(), 160),
+                                    actions: vec![mark_read_action(room, entry.seq)],
+                                    dedupe: format!("dm:{}:{}", room_slug(room), entry.seq.0),
+                                },
+                            ));
+                        }
+                    }
+                }
+                room::RoomId::Channel { .. } => {
+                    let mut recipients: BTreeSet<Principal> =
+                        mentions.principals.iter().cloned().collect();
+                    if mentions.all
+                        && let Some(room_members) = view.members_of(room)
+                    {
+                        recipients.extend(room_members.iter().cloned());
+                    }
+                    recipients.retain(|p| p != &entry.by && !matches!(p, Principal::System { .. }));
+                    for recipient in recipients {
                         out.push((
                             recipient,
                             NotificationDraft {
-                                kind: NotifyKind::DirectMessage { room: room.clone(), seq: entry.seq },
-                                title: format!("Direct message from {}", entry.by),
+                                kind: NotifyKind::Mention {
+                                    room: room.clone(),
+                                    seq: entry.seq,
+                                },
+                                title: format!("Mention from {} in {}", entry.by, room_label(room)),
                                 preview: snippet(body.as_str(), 160),
                                 actions: vec![mark_read_action(room, entry.seq)],
-                                dedupe: format!("dm:{}:{}", room_slug(room), entry.seq.0),
+                                dedupe: format!("mention:{}:{}", room_slug(room), entry.seq.0),
                             },
                         ));
                     }
                 }
             }
-            room::RoomId::Channel { .. } => {
-                let mut recipients: BTreeSet<Principal> = mentions.principals.iter().cloned().collect();
-                if mentions.all
-                    && let Some(room_members) = view.members_of(room)
-                {
-                    recipients.extend(room_members.iter().cloned());
-                }
-                recipients.retain(|p| p != &entry.by && !matches!(p, Principal::System { .. }));
-                for recipient in recipients {
-                    out.push((
-                        recipient,
-                        NotificationDraft {
-                            kind: NotifyKind::Mention { room: room.clone(), seq: entry.seq },
-                            title: format!("Mention from {} in {}", entry.by, room_label(room)),
-                            preview: snippet(body.as_str(), 160),
-                            actions: vec![mark_read_action(room, entry.seq)],
-                            dedupe: format!("mention:{}:{}", room_slug(room), entry.seq.0),
-                        },
-                    ));
-                }
-            }
-        },
+        }
 
         (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
             wave::WaveEvent::WorkerObserved { role, observation } => match observation {
-                wave::Observation::Activity { activity: wave::Activity::Blocked { interaction } } => {
+                wave::Observation::Activity {
+                    activity: wave::Activity::Blocked { interaction },
+                } => {
                     let actions = interaction_actions(wave, role, interaction);
                     for op in view.operators_for_wave(wave) {
                         out.push((
@@ -377,7 +429,9 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                         ));
                     }
                 }
-                wave::Observation::Activity { activity: wave::Activity::Errored { error } }
+                wave::Observation::Activity {
+                    activity: wave::Activity::Errored { error },
+                }
                 | wave::Observation::SpawnFailed { error, .. } => {
                     for op in view.operators_for_wave(wave) {
                         out.push((
@@ -403,7 +457,8 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             wave::WaveEvent::Finished { outcome } => {
                 let detail = match outcome {
                     wave::WaveOutcome::Completed { summary } => summary.as_str(),
-                    wave::WaveOutcome::Cancelled { reason } | wave::WaveOutcome::Failed { reason } => reason.as_str(),
+                    wave::WaveOutcome::Cancelled { reason }
+                    | wave::WaveOutcome::Failed { reason } => reason.as_str(),
                 };
                 for op in view.operators_for_wave(wave) {
                     out.push((
@@ -444,12 +499,19 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                             title: format!("Card #{} assigned in {board}", card.no.0),
                             preview: snippet(card.title.as_str(), 160),
                             actions: Vec::new(),
-                            dedupe: format!("card-assigned:{board}:{}:{}", card.no.0, card.revision.0),
+                            dedupe: format!(
+                                "card-assigned:{board}:{}:{}",
+                                card.no.0, card.revision.0
+                            ),
                         },
                     ));
                 }
             }
-            board::BoardEvent::CardPatched { no, revision, patch } => {
+            board::BoardEvent::CardPatched {
+                no,
+                revision,
+                patch,
+            } => {
                 if let Some(board::Assign::To { who }) = &patch.assignee
                     && let Some(to) = view.principal_for_assignee(who.as_str())
                     && to != entry.by
@@ -462,7 +524,11 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                         to,
                         NotificationDraft {
                             kind: NotifyKind::CardAssigned {
-                                card: board::CardRef { board: board.clone(), no: *no, revision: *revision },
+                                card: board::CardRef {
+                                    board: board.clone(),
+                                    no: *no,
+                                    revision: *revision,
+                                },
                             },
                             title: format!("Card #{} assigned in {board}", no.0),
                             preview,
@@ -495,7 +561,9 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                         out.push((
                             to,
                             NotificationDraft {
-                                kind: NotifyKind::LetterBanked { letter: letter.clone() },
+                                kind: NotifyKind::LetterBanked {
+                                    letter: letter.clone(),
+                                },
                                 title: format!("Letter banked from {}", letter.item.from),
                                 preview: preview.clone(),
                                 actions: vec![ack_action.clone()],
@@ -517,7 +585,10 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                             sha256: item.reference.sha256.clone(),
                         })),
                     };
-                    let preview = item.label.as_deref().map_or_else(|| item.id.clone(), |l| snippet(l, 160));
+                    let preview = item
+                        .label
+                        .as_deref()
+                        .map_or_else(|| item.id.clone(), |l| snippet(l, 160));
                     for to in view.principals_for_seat(&seat) {
                         out.push((
                             to,
@@ -543,21 +614,45 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
 
 fn kinds_equal(a: &NotifyKind, b: &NotifyKind) -> bool {
     match (a, b) {
-        (NotifyKind::Mention { room: r1, seq: s1 }, NotifyKind::Mention { room: r2, seq: s2 }) => r1 == r2 && s1 == s2,
-        (NotifyKind::DirectMessage { room: r1, seq: s1 }, NotifyKind::DirectMessage { room: r2, seq: s2 }) => r1 == r2 && s1 == s2,
-        (
-            NotifyKind::Interaction { wave: w1, role: r1, interaction: i1 },
-            NotifyKind::Interaction { wave: w2, role: r2, interaction: i2 },
-        ) => w1 == w2 && r1 == r2 && i1 == i2,
-        (NotifyKind::WorkerStuck { wave: w1, role: r1, why: y1 }, NotifyKind::WorkerStuck { wave: w2, role: r2, why: y2 }) => {
-            w1 == w2 && r1 == r2 && y1 == y2
+        (NotifyKind::Mention { room: r1, seq: s1 }, NotifyKind::Mention { room: r2, seq: s2 }) => {
+            r1 == r2 && s1 == s2
         }
+        (
+            NotifyKind::DirectMessage { room: r1, seq: s1 },
+            NotifyKind::DirectMessage { room: r2, seq: s2 },
+        ) => r1 == r2 && s1 == s2,
+        (
+            NotifyKind::Interaction {
+                wave: w1,
+                role: r1,
+                interaction: i1,
+            },
+            NotifyKind::Interaction {
+                wave: w2,
+                role: r2,
+                interaction: i2,
+            },
+        ) => w1 == w2 && r1 == r2 && i1 == i2,
+        (
+            NotifyKind::WorkerStuck {
+                wave: w1,
+                role: r1,
+                why: y1,
+            },
+            NotifyKind::WorkerStuck {
+                wave: w2,
+                role: r2,
+                why: y2,
+            },
+        ) => w1 == w2 && r1 == r2 && y1 == y2,
         (NotifyKind::WaveFinished { wave: w1 }, NotifyKind::WaveFinished { wave: w2 }) => w1 == w2,
         (NotifyKind::CardAssigned { card: c1 }, NotifyKind::CardAssigned { card: c2 }) => {
             c1.board == c2.board && c1.no == c2.no && c1.revision == c2.revision
         }
         (NotifyKind::Mail { item: m1 }, NotifyKind::Mail { item: m2 }) => m1 == m2,
-        (NotifyKind::LetterBanked { letter: l1 }, NotifyKind::LetterBanked { letter: l2 }) => l1 == l2,
+        (NotifyKind::LetterBanked { letter: l1 }, NotifyKind::LetterBanked { letter: l2 }) => {
+            l1 == l2
+        }
         (NotifyKind::Reminder { bell_id: b1 }, NotifyKind::Reminder { bell_id: b2 }) => b1 == b2,
         _ => false,
     }
@@ -607,11 +702,16 @@ impl Decider for Inbox {
         None
     }
 
-    fn decide(state: &InboxState, cmd: &InboxCommand, _ctx: &DecideCtx) -> Result<Vec<InboxEvent>, ApiError> {
+    fn decide(
+        state: &InboxState,
+        cmd: &InboxCommand,
+        _ctx: &DecideCtx,
+    ) -> Result<Vec<InboxEvent>, ApiError> {
         match cmd {
             InboxCommand::InboxRaise(c) => {
-                let is_resolved_interaction = matches!(c.draft.kind, NotifyKind::Interaction { .. })
-                    && c.draft.actions.is_empty();
+                let is_resolved_interaction =
+                    matches!(c.draft.kind, NotifyKind::Interaction { .. })
+                        && c.draft.actions.is_empty();
                 let fresh_rank = rank(&c.draft.kind, 0);
                 if let Some(&existing_id) = state.by_dedupe.get(&c.draft.dedupe)
                     && let Some(existing) = state.items.get(&existing_id)
@@ -641,7 +741,11 @@ impl Decider for Inbox {
                     return Ok(vec![]);
                 }
                 let id = NotificationId(state.next_id + 1);
-                Ok(vec![InboxEvent::Raised { id, rank: fresh_rank, draft: c.draft.clone() }])
+                Ok(vec![InboxEvent::Raised {
+                    id,
+                    rank: fresh_rank,
+                    draft: c.draft.clone(),
+                }])
             }
 
             InboxCommand::InboxAck(c) => {
@@ -658,7 +762,10 @@ impl Decider for Inbox {
                 if changed.is_empty() {
                     Ok(vec![])
                 } else {
-                    Ok(vec![InboxEvent::StateSet { ids: changed, state: c.state }])
+                    Ok(vec![InboxEvent::StateSet {
+                        ids: changed,
+                        state: c.state,
+                    }])
                 }
             }
 
@@ -666,7 +773,10 @@ impl Decider for Inbox {
                 let mut events = Vec::new();
                 let current = state.cursors.get(&c.room).copied().unwrap_or(Seq::ORIGIN);
                 if c.upto > current {
-                    events.push(InboxEvent::CursorAdvanced { room: c.room.clone(), upto: c.upto });
+                    events.push(InboxEvent::CursorAdvanced {
+                        room: c.room.clone(),
+                        upto: c.upto,
+                    });
                 }
                 let seen_ids: Vec<NotificationId> = state
                     .items
@@ -737,7 +847,10 @@ impl Decider for Inbox {
                     },
                 );
             }
-            InboxEvent::StateSet { ids, state: next_state } => {
+            InboxEvent::StateSet {
+                ids,
+                state: next_state,
+            } => {
                 for id in ids {
                     if let Some(item) = state.items.get_mut(id) {
                         item.state = *next_state;
@@ -756,13 +869,18 @@ impl Decider for Inbox {
     fn reply(state: &InboxState, cmd: InboxCommand, _committed: &[Envelope]) -> WireReply {
         match cmd {
             InboxCommand::InboxList(q) => {
-                let unread = state.items.values().filter(|n| n.state == NotifyState::Unread).count() as u32;
+                let unread = state
+                    .items
+                    .values()
+                    .filter(|n| n.state == NotifyState::Unread)
+                    .count() as u32;
                 let limit = q.limit.unwrap_or(200).clamp(1, 1000) as usize;
                 let mut items: Vec<Notification> = state
                     .items
                     .values()
                     .filter(|n| {
-                        q.include_done || !matches!(n.state, NotifyState::Done | NotifyState::Dismissed)
+                        q.include_done
+                            || !matches!(n.state, NotifyState::Done | NotifyState::Dismissed)
                     })
                     .map(|n| {
                         let age_ms = state.latest_at.0.saturating_sub(n.at.0);
@@ -774,7 +892,12 @@ impl Decider for Inbox {
                 items.sort_by(|a, b| (b.rank, b.at, b.id).cmp(&(a.rank, a.at, a.id)));
                 items.truncate(limit);
                 let cursors = state.cursors.iter().map(|(r, s)| (r.clone(), *s)).collect();
-                WireReply::InboxList(InboxPage { head: state.head, items, unread, cursors })
+                WireReply::InboxList(InboxPage {
+                    head: state.head,
+                    items,
+                    unread,
+                    cursors,
+                })
             }
             InboxCommand::InboxAck(_) => WireReply::InboxAck(Ack),
             InboxCommand::InboxMarkRead(_) => WireReply::InboxMarkRead(Ack),
@@ -800,7 +923,9 @@ pub struct Herald {
 
 impl Herald {
     pub fn new() -> Self {
-        Herald { view: HeraldView::default() }
+        Herald {
+            view: HeraldView::default(),
+        }
     }
 }
 
@@ -817,7 +942,11 @@ impl Reactor for Herald {
         Interest::Everything
     }
 
-    fn react(&mut self, frame: Frame, client: &LocalClient) -> impl Future<Output = Result<(), ApiError>> + Send {
+    fn react(
+        &mut self,
+        frame: Frame,
+        client: &LocalClient,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
         let raises = match frame {
             Frame::Committed(env) => {
                 self.view.observe(&env);

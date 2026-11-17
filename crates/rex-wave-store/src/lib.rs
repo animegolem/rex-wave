@@ -96,10 +96,14 @@ struct Inner {
 
 impl Inner {
     fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
     fn claimed(&self) -> MutexGuard<'_, HashSet<String>> {
-        self.claimed.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.claimed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -113,14 +117,28 @@ fn key(stream: &StreamId) -> String {
     serde_json::to_string(stream).expect("stream ids serialize")
 }
 
-fn read_rows(conn: &Connection, stream: &StreamId, after: Seq, upto: Option<Seq>, limit: usize) -> Result<Vec<Envelope>, StoreError> {
+fn read_rows(
+    conn: &Connection,
+    stream: &StreamId,
+    after: Seq,
+    upto: Option<Seq>,
+    limit: usize,
+) -> Result<Vec<Envelope>, StoreError> {
     let mut stmt = conn.prepare_cached(
         "SELECT seq, at, by, event FROM entries WHERE stream = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq LIMIT ?4",
     )?;
     let upto = upto.map_or(i64::MAX, |s| s.0 as i64);
-    let rows = stmt.query_map(params![key(stream), after.0 as i64, upto, limit as i64], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
-    })?;
+    let rows = stmt.query_map(
+        params![key(stream), after.0 as i64, upto, limit as i64],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         let (seq, at, by, event) = row?;
@@ -136,11 +154,19 @@ fn read_rows(conn: &Connection, stream: &StreamId, after: Seq, upto: Option<Seq>
 }
 
 fn head_of(conn: &Connection, stream: &StreamId) -> Result<Seq, StoreError> {
-    let max: Option<i64> = conn.query_row("SELECT max(seq) FROM entries WHERE stream = ?1", params![key(stream)], |r| r.get(0))?;
+    let max: Option<i64> = conn.query_row(
+        "SELECT max(seq) FROM entries WHERE stream = ?1",
+        params![key(stream)],
+        |r| r.get(0),
+    )?;
     Ok(Seq(max.unwrap_or(0) as u64))
 }
 
-fn find_idem(conn: &Connection, stream: &StreamId, idem: &IdemKey) -> Result<Option<Vec<Envelope>>, StoreError> {
+fn find_idem(
+    conn: &Connection,
+    stream: &StreamId,
+    idem: &IdemKey,
+) -> Result<Option<Vec<Envelope>>, StoreError> {
     let first: Option<(i64, i64)> = conn
         .query_row(
             "SELECT seq, batch FROM entries WHERE stream = ?1 AND idem = ?2",
@@ -148,10 +174,18 @@ fn find_idem(conn: &Connection, stream: &StreamId, idem: &IdemKey) -> Result<Opt
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((seq, batch)) = first else { return Ok(None) };
+    let Some((seq, batch)) = first else {
+        return Ok(None);
+    };
     let first = Seq(seq as u64);
     let last = Seq((seq + batch - 1) as u64);
-    Ok(Some(read_rows(conn, stream, Seq(first.0 - 1), Some(last), batch as usize)?))
+    Ok(Some(read_rows(
+        conn,
+        stream,
+        Seq(first.0 - 1),
+        Some(last),
+        batch as usize,
+    )?))
 }
 
 impl Journal {
@@ -160,7 +194,9 @@ impl Journal {
         let conn = Connection::open(path)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
-            return Err(StoreError::Backend(format!("journal_mode is {mode}, want wal")));
+            return Err(StoreError::Backend(format!(
+                "journal_mode is {mode}, want wal"
+            )));
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
         Self::init(conn)
@@ -173,7 +209,12 @@ impl Journal {
 
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
-        Ok(Journal { inner: Arc::new(Inner { conn: Mutex::new(conn), claimed: Mutex::new(HashSet::new()) }) })
+        Ok(Journal {
+            inner: Arc::new(Inner {
+                conn: Mutex::new(conn),
+                claimed: Mutex::new(HashSet::new()),
+            }),
+        })
     }
 
     /// The unique writer for `stream`. Fails while another one is alive.
@@ -182,13 +223,23 @@ impl Journal {
         if !self.inner.claimed().insert(k.clone()) {
             return Err(StoreError::AlreadyClaimed(stream));
         }
-        let mut writer = StreamWriter { stream, key: k, head: Seq::ORIGIN, inner: self.inner.clone() };
+        let mut writer = StreamWriter {
+            stream,
+            key: k,
+            head: Seq::ORIGIN,
+            inner: self.inner.clone(),
+        };
         writer.head = head_of(&self.inner.conn(), &writer.stream)?;
         Ok(writer)
     }
 
     /// Entries with `seq > after`, ascending, at most `limit`.
-    pub fn read(&self, stream: &StreamId, after: Seq, limit: usize) -> Result<Vec<Envelope>, StoreError> {
+    pub fn read(
+        &self,
+        stream: &StreamId,
+        after: Seq,
+        limit: usize,
+    ) -> Result<Vec<Envelope>, StoreError> {
         read_rows(&self.inner.conn(), stream, after, None, limit)
     }
 
@@ -200,7 +251,9 @@ impl Journal {
     /// Every stream with at least one entry, with its head.
     pub fn streams(&self) -> Result<Vec<(StreamId, Seq)>, StoreError> {
         let conn = self.inner.conn();
-        let mut stmt = conn.prepare_cached("SELECT stream, max(seq) FROM entries GROUP BY stream ORDER BY stream")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT stream, max(seq) FROM entries GROUP BY stream ORDER BY stream",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
@@ -234,7 +287,13 @@ impl StreamWriter {
     }
 
     /// Append a batch in one transaction. All or nothing.
-    pub fn append(&mut self, by: &Principal, at: UnixMs, idem: Option<&IdemKey>, events: Vec<Event>) -> Result<Appended, StoreError> {
+    pub fn append(
+        &mut self,
+        by: &Principal,
+        at: UnixMs,
+        idem: Option<&IdemKey>,
+        events: Vec<Event>,
+    ) -> Result<Appended, StoreError> {
         if events.iter().any(|e| !e.fits(&self.stream)) {
             return Err(StoreError::WrongStream(self.stream.clone()));
         }
@@ -247,7 +306,10 @@ impl StreamWriter {
         }
         let found = head_of(&tx, &self.stream)?;
         if found != self.head {
-            return Err(StoreError::HeadMoved { expected: self.head, found });
+            return Err(StoreError::HeadMoved {
+                expected: self.head,
+                found,
+            });
         }
         let by_json = serde_json::to_string(by)?;
         let batch = events.len() as i64;
@@ -259,7 +321,11 @@ impl StreamWriter {
             )?;
             for (i, event) in events.into_iter().enumerate() {
                 seq = seq.next();
-                let (row_idem, row_batch) = if i == 0 { (idem.map(IdemKey::as_str), batch) } else { (None, 0) };
+                let (row_idem, row_batch) = if i == 0 {
+                    (idem.map(IdemKey::as_str), batch)
+                } else {
+                    (None, 0)
+                };
                 insert.execute(params![
                     self.key,
                     seq.0 as i64,
@@ -269,7 +335,13 @@ impl StreamWriter {
                     row_batch,
                     serde_json::to_string(&event)?
                 ])?;
-                committed.push(Envelope { stream: self.stream.clone(), seq, at, by: by.clone(), event });
+                committed.push(Envelope {
+                    stream: self.stream.clone(),
+                    seq,
+                    at,
+                    by: by.clone(),
+                    event,
+                });
             }
         }
         tx.commit()?;

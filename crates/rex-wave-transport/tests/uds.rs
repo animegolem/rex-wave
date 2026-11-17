@@ -6,7 +6,10 @@ use rex_wave_api::wave::Activity;
 use rex_wave_api::*;
 use rex_wave_runtime::*;
 use rex_wave_store::Journal;
-use rex_wave_transport::{Authenticator, Credential, Endpoint, RemoteClient, TableAuthenticator, bind_unix, serve_listener};
+use rex_wave_transport::{
+    Authenticator, Credential, Endpoint, RemoteClient, TableAuthenticator, bind_unix,
+    serve_listener,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,7 +34,9 @@ impl Decider for ToyRooms {
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
         };
-        Ok(StreamId::Room { room: r.resolve(&ctx.by)? })
+        Ok(StreamId::Room {
+            room: r.resolve(&ctx.by)?,
+        })
     }
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
@@ -61,8 +66,14 @@ impl Decider for ToyRooms {
         match cmd {
             RoomCommand::RoomPost(_) => {
                 let last = committed.last().unwrap();
-                let StreamId::Room { room } = &last.stream else { unreachable!() };
-                WireReply::RoomPost(Posted { room: room.clone(), seq: last.seq, mentions: Mentions::default() })
+                let StreamId::Room { room } = &last.stream else {
+                    unreachable!()
+                };
+                WireReply::RoomPost(Posted {
+                    room: room.clone(),
+                    seq: last.seq,
+                    mentions: Mentions::default(),
+                })
             }
             _ => WireReply::RoomJoin(Ack),
         }
@@ -90,7 +101,13 @@ impl Drop for DropLease {
 }
 
 impl AgentFeed for LeaseFeed {
-    fn page(&self, _: &WaveSlug, _: &RoleName, _: Option<BbSeq>, _: u32) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
+    fn page(
+        &self,
+        _: &WaveSlug,
+        _: &RoleName,
+        _: Option<BbSeq>,
+        _: u32,
+    ) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
         Box::pin(async {
             Ok(ThreadPageView {
                 thread: BbThreadId::parse("th_1").unwrap(),
@@ -108,15 +125,29 @@ impl AgentFeed for LeaseFeed {
         let guard = DropLease(self.0.clone());
         let (wave, role) = (wave.clone(), role.clone());
         Box::pin(async move {
-            let stream = futures_util::stream::unfold((guard, false, wave, role), |(guard, sent, wave, role)| async move {
-                if !sent {
-                    let ev = AgentEvent { seq: BbSeq(1), at: UnixMs(1), kind: AgentEventKind::TurnStarted };
-                    Some((Ok(Frame::Agent { wave: wave.clone(), role: role.clone(), event: ev }), (guard, true, wave, role)))
-                } else {
-                    std::future::pending::<()>().await;
-                    unreachable!()
-                }
-            });
+            let stream = futures_util::stream::unfold(
+                (guard, false, wave, role),
+                |(guard, sent, wave, role)| async move {
+                    if !sent {
+                        let ev = AgentEvent {
+                            seq: BbSeq(1),
+                            at: UnixMs(1),
+                            kind: AgentEventKind::TurnStarted,
+                        };
+                        Some((
+                            Ok(Frame::Agent {
+                                wave: wave.clone(),
+                                role: role.clone(),
+                                event: ev,
+                            }),
+                            (guard, true, wave, role),
+                        ))
+                    } else {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                },
+            );
             Ok(Box::pin(stream) as FrameStream)
         })
     }
@@ -138,7 +169,12 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
-        read: Arc::new(ReadSide { journal, hub, sidebar, agents: Arc::new(LeaseFeed(leases.clone())) }),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(LeaseFeed(leases.clone())),
+        }),
     });
     let auth: Arc<dyn Authenticator> = Arc::new(TableAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
@@ -149,26 +185,82 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     let server = tokio::spawn(serve_listener(listener, router, auth));
     let endpoint = Endpoint::Unix(sock);
 
-    let bad = RemoteClient::connect(endpoint.clone(), Credential::Token { token: "wrong".into() }, "test").await;
-    assert!(matches!(bad, Err(ApiError::Denied { .. })), "bad token fails with Denied on Hello");
+    let bad = RemoteClient::connect(
+        endpoint.clone(),
+        Credential::Token {
+            token: "wrong".into(),
+        },
+        "test",
+    )
+    .await;
+    assert!(
+        matches!(bad, Err(ApiError::Denied { .. })),
+        "bad token fails with Denied on Hello"
+    );
 
-    let op = RemoteClient::connect(endpoint.clone(), Credential::PeerUid, "tui").await.unwrap();
-    assert_eq!(op.me(), &Principal::Operator { seat: SeatName::parse("owner").unwrap() });
+    let op = RemoteClient::connect(endpoint.clone(), Credential::PeerUid, "tui")
+        .await
+        .unwrap();
+    assert_eq!(
+        op.me(),
+        &Principal::Operator {
+            seat: SeatName::parse("owner").unwrap()
+        }
+    );
 
-    let sol = RemoteClient::connect(endpoint, Credential::Token { token: "tok-sol".into() }, "mcp").await.unwrap();
-    assert_eq!(sol.me(), &Principal::Seat { seat: SeatName::parse("sol").unwrap() });
-    assert!(matches!(sol.watch(Interest::Everything, Cursor::default()).await, Err(ApiError::Denied { .. })));
+    let sol = RemoteClient::connect(
+        endpoint,
+        Credential::Token {
+            token: "tok-sol".into(),
+        },
+        "mcp",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sol.me(),
+        &Principal::Seat {
+            seat: SeatName::parse("sol").unwrap()
+        }
+    );
+    assert!(matches!(
+        sol.watch(Interest::Everything, Cursor::default()).await,
+        Err(ApiError::Denied { .. })
+    ));
 
-    let general = RoomRef::Channel { scope: RoomScope::Global, name: ChannelName::parse("general").unwrap() };
-    let mut room_watch = op.watch(Interest::Room { room: general.clone() }, Cursor::default()).await.unwrap();
-    assert!(matches!(room_watch.next().await, Some(Ok(Frame::CaughtUp { .. }))));
+    let general = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    };
+    let mut room_watch = op
+        .watch(
+            Interest::Room {
+                room: general.clone(),
+            },
+            Cursor::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        room_watch.next().await,
+        Some(Ok(Frame::CaughtUp { .. }))
+    ));
 
     let mut joins = Vec::new();
     for i in 1..=10 {
         let c = sol.clone();
         let g = general.clone();
         joins.push(tokio::spawn(async move {
-            c.call(RoomPost { room: g, body: Body::parse(format!("m-{i}")).unwrap(), reply_to: None, idem: None }).await.unwrap().seq.0
+            c.call(RoomPost {
+                room: g,
+                body: Body::parse(format!("m-{i}")).unwrap(),
+                reply_to: None,
+                idem: None,
+            })
+            .await
+            .unwrap()
+            .seq
+            .0
         }));
     }
     let mut returned: Vec<u64> = Vec::new();
@@ -176,7 +268,11 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         returned.push(j.await.unwrap());
     }
     returned.sort();
-    assert_eq!(returned, (1..=10).collect::<Vec<_>>(), "multiplexed calls over one socket all succeeded");
+    assert_eq!(
+        returned,
+        (1..=10).collect::<Vec<_>>(),
+        "multiplexed calls over one socket all succeeded"
+    );
 
     let mut streamed = Vec::new();
     for _ in 0..10 {
@@ -186,23 +282,55 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     }
     assert_eq!(streamed, (1..=10).collect::<Vec<_>>());
 
-    let general_id = RoomId::Channel { scope: RoomScope::Global, name: ChannelName::parse("general").unwrap() };
-    let page = sol.call(Read { stream: StreamId::Room { room: general_id.clone() }, after: Seq(8), limit: None }).await.unwrap();
+    let general_id = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    };
+    let page = sol
+        .call(Read {
+            stream: StreamId::Room {
+                room: general_id.clone(),
+            },
+            after: Seq(8),
+            limit: None,
+        })
+        .await
+        .unwrap();
     assert_eq!(page.entries.len(), 2);
 
     let waiter = tokio::spawn({
         let sol = sol.clone();
-        async move { sol.call(Wait::room(general_id, Seq(10), false)).await.unwrap() }
+        async move {
+            sol.call(Wait::room(general_id, Seq(10), false))
+                .await
+                .unwrap()
+        }
     });
     tokio::time::sleep(Duration::from_millis(15)).await;
-    op.call(RoomPost { room: general.clone(), body: Body::parse("wake!").unwrap(), reply_to: None, idem: None }).await.unwrap();
+    op.call(RoomPost {
+        room: general.clone(),
+        body: Body::parse("wake!").unwrap(),
+        reply_to: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
     assert_eq!(waiter.await.unwrap().entries[0].seq, Seq(11));
 
     let mut agent_watch = op
-        .watch(Interest::Agent { wave: WaveSlug::parse("auth").unwrap(), role: RoleName::parse("verifier").unwrap() }, Cursor::live())
+        .watch(
+            Interest::Agent {
+                wave: WaveSlug::parse("auth").unwrap(),
+                role: RoleName::parse("verifier").unwrap(),
+            },
+            Cursor::live(),
+        )
         .await
         .unwrap();
-    assert!(matches!(agent_watch.next().await, Some(Ok(Frame::Agent { .. }))));
+    assert!(matches!(
+        agent_watch.next().await,
+        Some(Ok(Frame::Agent { .. }))
+    ));
     assert_eq!(leases.load(Ordering::SeqCst), 1);
     drop(agent_watch);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -213,15 +341,46 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     .await
     .expect("dropping RemoteClient watch sent Unwatch and released server lease");
 
-    let mut stage1 = op.watch(Interest::Stage { target: StageTarget::Inbox }, Cursor::live()).await.unwrap();
-    assert!(matches!(stage1.next().await, Some(Ok(Frame::StageFocused { generation: FocusGeneration(1), .. }))));
-    let mut stage2 = op.watch(Interest::Stage { target: StageTarget::Room { room: general } }, Cursor::live()).await.unwrap();
-    assert!(matches!(stage2.next().await, Some(Ok(Frame::StageFocused { generation: FocusGeneration(2), .. }))));
+    let mut stage1 = op
+        .watch(
+            Interest::Stage {
+                target: StageTarget::Inbox,
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stage1.next().await,
+        Some(Ok(Frame::StageFocused {
+            generation: FocusGeneration(1),
+            ..
+        }))
+    ));
+    let mut stage2 = op
+        .watch(
+            Interest::Stage {
+                target: StageTarget::Room { room: general },
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stage2.next().await,
+        Some(Ok(Frame::StageFocused {
+            generation: FocusGeneration(2),
+            ..
+        }))
+    ));
     let ended = tokio::time::timeout(Duration::from_secs(2), async {
         while stage1.next().await.is_some() {}
     })
     .await;
-    assert!(ended.is_ok(), "opening stage2 over UDS closed stage1 cleanly");
+    assert!(
+        ended.is_ok(),
+        "opening stage2 over UDS closed stage1 cleanly"
+    );
 
     server.abort();
 }
@@ -230,7 +389,11 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
 async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
     struct HangingService;
     impl Service<RoomCommand> for HangingService {
-        fn dispatch(&self, _: RoomCommand, _: DecideCtx) -> BoxFut<'_, Result<WireReply, ApiError>> {
+        fn dispatch(
+            &self,
+            _: RoomCommand,
+            _: DecideCtx,
+        ) -> BoxFut<'_, Result<WireReply, ApiError>> {
             Box::pin(async {
                 std::future::pending::<()>().await;
                 unreachable!()
@@ -251,7 +414,12 @@ async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
-        read: Arc::new(ReadSide { journal, hub, sidebar, agents: Arc::new(NoAgentFeed) }),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
     });
     let auth: Arc<dyn Authenticator> = Arc::new(TableAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
@@ -270,7 +438,15 @@ async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
         drop((conn, router, auth, stream));
         let _ = accepted_tx.send(());
     });
-    let res = RemoteClient::connect(Endpoint::Unix(dir.path().join("daemon.sock")), Credential::PeerUid, "tui").await;
+    let res = RemoteClient::connect(
+        Endpoint::Unix(dir.path().join("daemon.sock")),
+        Credential::PeerUid,
+        "tui",
+    )
+    .await;
     accepted_rx.await.unwrap();
-    assert!(matches!(res, Err(ApiError::Transport(_))), "closed socket during handshake returns Transport error: {res:?}");
+    assert!(
+        matches!(res, Err(ApiError::Transport(_))),
+        "closed socket during handshake returns Transport error: {res:?}"
+    );
 }

@@ -55,9 +55,13 @@ pub fn task_move(
 fn map_kanban_error(err: KanbanError) -> ApiError {
     match err {
         KanbanError::NoSuchBoard(_) | KanbanError::NoSuchCard(_) | KanbanError::NoSuchLane(_) => {
-            ApiError::NotFound { what: err.to_string() }
+            ApiError::NotFound {
+                what: err.to_string(),
+            }
         }
-        KanbanError::RevisionConflict { .. } => ApiError::Conflict { detail: err.to_string() },
+        KanbanError::RevisionConflict { .. } => ApiError::Conflict {
+            detail: err.to_string(),
+        },
         KanbanError::MissingTitle => ApiError::Invalid(InvalidId {
             what: "title".into(),
             reason: err.to_string(),
@@ -82,9 +86,10 @@ impl Decider for Board {
 
     fn idem(cmd: &BoardCommand) -> Option<IdemKey> {
         match cmd {
-            BoardCommand::CardUpsert(c) => {
-                c.idem.as_ref().and_then(|k| IdemKey::parse(k.as_str()).ok())
-            }
+            BoardCommand::CardUpsert(c) => c
+                .idem
+                .as_ref()
+                .and_then(|k| IdemKey::parse(k.as_str()).ok()),
             _ => None,
         }
     }
@@ -136,7 +141,11 @@ impl Decider for Board {
                         let no = c.card.expect("noop patch verified card id");
                         (no, state.inner.cards[&no].revision)
                     });
-                WireReply::CardUpsert(CardRef { board: c.board, no, revision })
+                WireReply::CardUpsert(CardRef {
+                    board: c.board,
+                    no,
+                    revision,
+                })
             }
             BoardCommand::CardArchive(_) => WireReply::CardArchive(Ack),
             BoardCommand::BoardView(c) => {

@@ -38,14 +38,21 @@ struct TempSandbox {
 impl TempSandbox {
     fn marked() -> (Self, SandboxRoot) {
         let dir = Self::unmarked();
-        fs::write(dir.path.join(".rex-wave-sandbox"), b"rex-wave-test-sandbox\n").unwrap();
+        fs::write(
+            dir.path.join(".rex-wave-sandbox"),
+            b"rex-wave-test-sandbox\n",
+        )
+        .unwrap();
         let root = SandboxRoot::verify(&dir.path).unwrap();
         (dir, root)
     }
 
     fn unmarked() -> Self {
         let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rex-wave-mailbridge-test-{}-{n}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "rex-wave-mailbridge-test-{}-{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         TempSandbox { path }
@@ -113,7 +120,10 @@ fn schema_v1_wake_id_vector_projection_and_bell_meta() {
     );
     let sonnet = SeatName::parse("sonnet").unwrap();
     let wid = wake_id(&sonnet, "to-sonnet", "vector-r1.md", &sha);
-    assert_eq!(wid.0, "ce2dfdac6a18f680", "must match mailbox.item.schema.md test vector");
+    assert_eq!(
+        wid.0, "ce2dfdac6a18f680",
+        "must match mailbox.item.schema.md test vector"
+    );
 
     let (_guard, sandbox) = TempSandbox::marked();
     let box_dir = sandbox.path().join("to-sonnet");
@@ -147,19 +157,29 @@ fn schema_v1_wake_id_vector_projection_and_bell_meta() {
     let meta = bell_meta(&wake);
     assert_eq!(meta.get("schema").map(String::as_str), Some("1"));
     assert_eq!(meta.get("event").map(String::as_str), Some("letter"));
-    assert_eq!(meta.get("ts").map(String::as_str), Some("2026-10-07T15:41:02Z"));
-    assert_eq!(meta.get("wake_id").map(String::as_str), Some("ce2dfdac6a18f680"));
+    assert_eq!(
+        meta.get("ts").map(String::as_str),
+        Some("2026-10-07T15:41:02Z")
+    );
+    assert_eq!(
+        meta.get("wake_id").map(String::as_str),
+        Some("ce2dfdac6a18f680")
+    );
     assert_eq!(meta.get("kind").map(String::as_str), Some("letter"));
     assert_eq!(meta.get("from").map(String::as_str), Some("tally"));
     assert_eq!(meta.get("box").map(String::as_str), Some("to-sonnet"));
     assert_eq!(meta.get("file").map(String::as_str), Some("vector-r1.md"));
-    assert_eq!(meta.get("sha16").map(String::as_str), Some("d4eb1d5a086d8a07"));
+    assert_eq!(
+        meta.get("sha16").map(String::as_str),
+        Some("d4eb1d5a086d8a07")
+    );
     assert_eq!(meta.get("topic").map(String::as_str), Some("vector"));
     assert_eq!(meta.get("round").map(String::as_str), Some("1"));
 }
 
 #[tokio::test]
-async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_and_acks_exact_sha256() {
+async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_and_acks_exact_sha256()
+ {
     let (_guard, sandbox) = TempSandbox::marked();
     let outside = TempSandbox::unmarked();
     let journal = Journal::open(&sandbox.path().join("journal.sqlite3")).unwrap();
@@ -187,23 +207,33 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 
     let owner = LocalClient::new(
         router.clone(),
-        Principal::Operator { seat: SeatName::parse("owner").unwrap() },
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
     );
     let sol = LocalClient::new(
         router.clone(),
-        Principal::Seat { seat: SeatName::parse("sol").unwrap() },
+        Principal::Seat {
+            seat: SeatName::parse("sol").unwrap(),
+        },
     );
     let astra = LocalClient::new(
         router.clone(),
-        Principal::Seat { seat: SeatName::parse("astra").unwrap() },
+        Principal::Seat {
+            seat: SeatName::parse("astra").unwrap(),
+        },
     );
     let nodal = LocalClient::new(
         router.clone(),
-        Principal::Seat { seat: SeatName::parse("nodal").unwrap() },
+        Principal::Seat {
+            seat: SeatName::parse("nodal").unwrap(),
+        },
     );
 
     let design_room = RoomRef::Channel {
-        scope: RoomScope::Project { project: BbProjectId::parse("p_123").unwrap() },
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("p_123").unwrap(),
+        },
         name: ChannelName::parse("design-review").unwrap(),
     };
     let p1 = sol
@@ -270,7 +300,9 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 
     let raw_entries = journal
         .read(
-            &StreamId::Room { room: p1.room.clone() },
+            &StreamId::Room {
+                room: p1.room.clone(),
+            },
             Seq(p1.seq.0 - 1),
             (p2.seq.0 - p1.seq.0 + 1) as usize,
         )
@@ -284,16 +316,30 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 
     let on_disk_path = sandbox.path().join(&letter.path);
     let on_disk_bytes = fs::read(&on_disk_path).unwrap();
-    assert_eq!(on_disk_bytes, rendered_bytes, "on-disk bytes match canonical render_letter output");
+    assert_eq!(
+        on_disk_bytes, rendered_bytes,
+        "on-disk bytes match canonical render_letter output"
+    );
 
     let retry = sol.call(promote_req).await.unwrap();
-    assert_eq!(retry, letter, "idempotent promotion returns identical LetterRef");
+    assert_eq!(
+        retry, letter,
+        "idempotent promotion returns identical LetterRef"
+    );
 
     let mail_page = owner
-        .call(Read { stream: StreamId::Mail, after: Seq::ORIGIN, limit: None })
+        .call(Read {
+            stream: StreamId::Mail,
+            after: Seq::ORIGIN,
+            limit: None,
+        })
         .await
         .unwrap();
-    assert_eq!(mail_page.entries.len(), 1, "idempotent promotion commits exactly one Banked event");
+    assert_eq!(
+        mail_page.entries.len(),
+        1,
+        "idempotent promotion commits exactly one Banked event"
+    );
 
     let conflict_err = sol
         .call(MailPromote {
@@ -310,7 +356,11 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
         matches!(conflict_err, ApiError::Conflict { .. }),
         "BoxMonotone rejects overwriting an existing letter with different bytes"
     );
-    assert_eq!(fs::read(&on_disk_path).unwrap(), rendered_bytes, "existing file bytes never overwritten");
+    assert_eq!(
+        fs::read(&on_disk_path).unwrap(),
+        rendered_bytes,
+        "existing file bytes never overwritten"
+    );
     assert_eq!(
         journal.head(&StreamId::Mail).unwrap(),
         Seq(1),
@@ -318,16 +368,24 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     );
 
     sol.call(RoomPost {
-        room: RoomRef::Dm { with: Principal::Seat { seat: SeatName::parse("astra").unwrap() } },
+        room: RoomRef::Dm {
+            with: Principal::Seat {
+                seat: SeatName::parse("astra").unwrap(),
+            },
+        },
         body: Body::parse("private dm note").unwrap(),
         reply_to: None,
         idem: None,
     })
     .await
     .unwrap();
-    let dm_id = RoomRef::Dm { with: Principal::Seat { seat: SeatName::parse("astra").unwrap() } }
-        .resolve(sol.me())
-        .unwrap();
+    let dm_id = RoomRef::Dm {
+        with: Principal::Seat {
+            seat: SeatName::parse("astra").unwrap(),
+        },
+    }
+    .resolve(sol.me())
+    .unwrap();
     let dm_exfil = nodal
         .call(MailPromote {
             room: dm_id,
@@ -343,14 +401,20 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 
     let wrong_sha = Sha256Hex::parse("0".repeat(64)).unwrap();
     let bad_ack = owner
-        .call(MailAck { path: letter.path.clone(), sha256: wrong_sha })
+        .call(MailAck {
+            path: letter.path.clone(),
+            sha256: wrong_sha,
+        })
         .await
         .unwrap_err();
     assert!(matches!(bad_ack, ApiError::Conflict { .. }));
     assert!(!sandbox.path().join("state/acks.jsonl").exists());
 
     let wrong_seat_ack = nodal
-        .call(MailAck { path: letter.path.clone(), sha256: letter.sha256.clone() })
+        .call(MailAck {
+            path: letter.path.clone(),
+            sha256: letter.sha256.clone(),
+        })
         .await
         .unwrap_err();
     assert!(matches!(wrong_seat_ack, ApiError::Denied { .. }));
@@ -362,18 +426,30 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
         })
         .await
         .unwrap_err();
-    assert!(matches!(traversal_ack, ApiError::Invalid(_) | ApiError::Denied { .. }));
+    assert!(matches!(
+        traversal_ack,
+        ApiError::Invalid(_) | ApiError::Denied { .. }
+    ));
 
     owner
-        .call(MailAck { path: letter.path.clone(), sha256: letter.sha256.clone() })
+        .call(MailAck {
+            path: letter.path.clone(),
+            sha256: letter.sha256.clone(),
+        })
         .await
         .unwrap();
     owner
-        .call(MailAck { path: letter.path.clone(), sha256: letter.sha256.clone() })
+        .call(MailAck {
+            path: letter.path.clone(),
+            sha256: letter.sha256.clone(),
+        })
         .await
         .unwrap();
 
-    assert!(sandbox.path().join("state/acks.jsonl").is_file(), "acks.jsonl updated");
+    assert!(
+        sandbox.path().join("state/acks.jsonl").is_file(),
+        "acks.jsonl updated"
+    );
 
     let reprojected = project(&sandbox, &on_disk_path, &on_disk_bytes).unwrap();
     assert_eq!(reprojected.state, "acked");
@@ -386,7 +462,11 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     )
     .unwrap();
     assert_eq!(mail_service.rescan().await.unwrap(), 1);
-    assert_eq!(mail_service.rescan().await.unwrap(), 0, "rescan deduplicates already-projected letters");
+    assert_eq!(
+        mail_service.rescan().await.unwrap(),
+        0,
+        "rescan deduplicates already-projected letters"
+    );
 }
 
 #[tokio::test]
@@ -425,7 +505,9 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
 
     let bell_client = LocalClient::new(
         router.clone(),
-        Principal::System { part: SystemPart::WakeBell },
+        Principal::System {
+            part: SystemPart::WakeBell,
+        },
     );
     let courier_task = spawn_reactor(BellCourier, bell_client.clone());
 
@@ -452,7 +534,12 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
         task.abort();
     };
 
-    async fn post_raw(addr: SocketAddr, host: &str, content_type: &str, payload: &[u8]) -> (u16, serde_json::Value) {
+    async fn post_raw(
+        addr: SocketAddr,
+        host: &str,
+        content_type: &str,
+        payload: &[u8],
+    ) -> (u16, serde_json::Value) {
         let req = format!(
             "POST /sink HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
@@ -485,10 +572,17 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
     .unwrap();
 
     let (csrf_status, _) = post_raw(sink_addr, "127.0.0.1", "text/plain", &slot1).await;
-    assert_eq!(csrf_status, 415, "non-JSON Content-Type rejected against browser form POST");
+    assert_eq!(
+        csrf_status, 415,
+        "non-JSON Content-Type rejected against browser form POST"
+    );
 
-    let (host_status, _) = post_raw(sink_addr, "evil.example.com", "application/json", &slot1).await;
-    assert_eq!(host_status, 403, "non-loopback Host header rejected against DNS rebinding");
+    let (host_status, _) =
+        post_raw(sink_addr, "evil.example.com", "application/json", &slot1).await;
+    assert_eq!(
+        host_status, 403,
+        "non-loopback Host header rejected against DNS rebinding"
+    );
 
     for _attempt in 0..3 {
         let (status, body) = post_raw(sink_addr, "127.0.0.1", "application/json", &slot1).await;
@@ -498,10 +592,14 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
 
     let sol = LocalClient::new(
         router.clone(),
-        Principal::Seat { seat: SeatName::parse("sol").unwrap() },
+        Principal::Seat {
+            seat: SeatName::parse("sol").unwrap(),
+        },
     );
     let dm_with_bell = RoomRef::Dm {
-        with: Principal::System { part: SystemPart::WakeBell },
+        with: Principal::System {
+            part: SystemPart::WakeBell,
+        },
     };
 
     let first_delivery = tokio::time::timeout(Duration::from_secs(2), async {
@@ -556,7 +654,10 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
     })
     .await
     .expect("next schedule mark delivered a second DM post");
-    assert_eq!(second_delivery[1].body.as_str(), "Summarize Tuesday PR queue.");
+    assert_eq!(
+        second_delivery[1].body.as_str(),
+        "Summarize Tuesday PR queue."
+    );
     assert_eq!(journal.head(&StreamId::Mail).unwrap(), Seq(2));
 
     courier_task.abort();

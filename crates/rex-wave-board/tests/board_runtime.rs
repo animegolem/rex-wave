@@ -40,7 +40,9 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
     let db_path = dir.path().join("board-wal.sqlite3");
 
     let board = project_board(&BbProjectId::parse("proj_3vs7nkyeum").unwrap());
-    let sol_principal = Principal::Operator { seat: SeatName::parse("sol").unwrap() };
+    let sol_principal = Principal::Operator {
+        seat: SeatName::parse("sol").unwrap(),
+    };
     let worker_principal = Principal::Worker {
         wave: WaveSlug::parse("auth-v2").unwrap(),
         role: RoleName::parse("author-jwt").unwrap(),
@@ -52,17 +54,26 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
         let worker = LocalClient::new(router.clone(), worker_principal.clone());
 
         let missing = sol
-            .call(BoardView { board: board.clone(), filter: None })
+            .call(BoardView {
+                board: board.clone(),
+                filter: None,
+            })
             .await
             .unwrap_err();
         assert!(matches!(missing, ApiError::NotFound { .. }));
 
         let info1 = sol
-            .call(BoardEnsure { board: board.clone(), lanes: Some(Lane::all_lane_names()) })
+            .call(BoardEnsure {
+                board: board.clone(),
+                lanes: Some(Lane::all_lane_names()),
+            })
             .await
             .unwrap();
         let info2 = sol
-            .call(BoardEnsure { board: board.clone(), lanes: None })
+            .call(BoardEnsure {
+                board: board.clone(),
+                lanes: None,
+            })
             .await
             .unwrap();
         assert_eq!(info1.lanes, Lane::all_lane_names());
@@ -78,7 +89,9 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
                 patch: CardPatch {
                     title: Some(Title::parse("Wire OAuth refresh").unwrap()),
                     lane: Some(Lane::Todo.lane_name()),
-                    assignee: Some(Assign::To { who: assignee(&worker_principal) }),
+                    assignee: Some(Assign::To {
+                        who: assignee(&worker_principal),
+                    }),
                     priority: Some(Priority::High),
                     labels_add: vec!["auth".into(), "wave".into()],
                     ..Default::default()
@@ -99,7 +112,9 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
                     title: Some(Title::parse("Audit token scopes").unwrap()),
                     lane: Some(Lane::Todo.lane_name()),
                     position: Some(0),
-                    assignee: Some(Assign::To { who: assignee(&sol_principal) }),
+                    assignee: Some(Assign::To {
+                        who: assignee(&sol_principal),
+                    }),
                     ..Default::default()
                 },
                 idem: None,
@@ -141,7 +156,10 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
             ))
             .await
             .unwrap_err();
-        assert!(matches!(stale, ApiError::Conflict { .. }), "stale revision fails CAS");
+        assert!(
+            matches!(stale, ApiError::Conflict { .. }),
+            "stale revision fails CAS"
+        );
 
         let replayed_create = worker
             .call(CardUpsert {
@@ -177,7 +195,11 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
             })
             .await
             .unwrap();
-        assert_eq!(c3.no, CardNo(3), "rehydrated actor continues card numbering from WAL");
+        assert_eq!(
+            c3.no,
+            CardNo(3),
+            "rehydrated actor continues card numbering from WAL"
+        );
     }
 
     let restarted_router = open_wal_router(&db_path, Duration::from_secs(60));
@@ -185,7 +207,10 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
     let worker = LocalClient::new(restarted_router, worker_principal);
 
     let snap = sol
-        .call(BoardView { board: board.clone(), filter: None })
+        .call(BoardView {
+            board: board.clone(),
+            filter: None,
+        })
         .await
         .unwrap();
     let review_cards = &snap
@@ -201,7 +226,10 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
 
     let sidebar = worker.call(Sidebar::default()).await.unwrap();
     let badge = sidebar.kanban.iter().find(|b| b.board == board).unwrap();
-    assert_eq!(badge.open, 2, "cards 1 and 2 are open; card 3 in done is excluded");
+    assert_eq!(
+        badge.open, 2,
+        "cards 1 and 2 are open; card 3 in done is excluded"
+    );
     assert_eq!(badge.mine, 1, "card 1 is assigned to worker");
 }
 
@@ -211,20 +239,29 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
     let router = build_router(journal, Duration::from_secs(60));
     let sol = LocalClient::new(
         router,
-        Principal::Operator { seat: SeatName::parse("sol").unwrap() },
+        Principal::Operator {
+            seat: SeatName::parse("sol").unwrap(),
+        },
     );
 
     let personal = seat_board(&SeatName::parse("sol").unwrap());
     let mut stage = sol
         .watch(
-            Interest::Stage { target: StageTarget::Kanban { board: personal.clone() } },
+            Interest::Stage {
+                target: StageTarget::Kanban {
+                    board: personal.clone(),
+                },
+            },
             Cursor::default(),
         )
         .await
         .unwrap();
     assert!(matches!(
         stage.next().await,
-        Some(Ok(Frame::StageFocused { generation: FocusGeneration(1), .. }))
+        Some(Ok(Frame::StageFocused {
+            generation: FocusGeneration(1),
+            ..
+        }))
     ));
     assert!(matches!(
         stage.next().await,
@@ -242,7 +279,9 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
                 title: Some(Title::parse("Implicitly open personal board").unwrap()),
                 priority: Some(Priority::Blocking),
                 labels_add: vec!["personal".into()],
-                links_add: vec![Link::External(ExternalLink::parse_uri("wave:pr2/owner").unwrap())],
+                links_add: vec![Link::External(
+                    ExternalLink::parse_uri("wave:pr2/owner").unwrap(),
+                )],
                 ..Default::default()
             },
             idem: Some(auto_idem.clone()),
@@ -265,7 +304,10 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
         })
         .await
         .unwrap();
-    assert_eq!(r1_retry, r1, "multi-event [Opened, CardCreated] batch replays idempotently");
+    assert_eq!(
+        r1_retry, r1,
+        "multi-event [Opened, CardCreated] batch replays idempotently"
+    );
 
     for _ in 0..2 {
         let frame = tokio::time::timeout(Duration::from_secs(1), stage.next())
@@ -273,16 +315,28 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(matches!(frame, Frame::Stage { generation: FocusGeneration(1), .. }));
+        assert!(matches!(
+            frame,
+            Frame::Stage {
+                generation: FocusGeneration(1),
+                ..
+            }
+        ));
     }
 
     let snap = sol
-        .call(BoardView { board: personal.clone(), filter: None })
+        .call(BoardView {
+            board: personal.clone(),
+            filter: None,
+        })
         .await
         .unwrap();
     let org_text = rex_kanban::org::render(&snap);
     assert!(org_text.contains("#+TITLE: seat:sol"));
     assert!(org_text.contains("* TODO [#A] Implicitly open personal board :personal:"));
     assert!(org_text.contains(":LINKS: wave:pr2/owner"));
-    assert_eq!(rex_kanban::org::parse(&org_text).unwrap(), snap.lanes[0].cards);
+    assert_eq!(
+        rex_kanban::org::parse(&org_text).unwrap(),
+        snap.lanes[0].cards
+    );
 }

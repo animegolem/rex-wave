@@ -4,9 +4,9 @@
 //! assignees, and links.
 
 pub use rex_kanban::{
-    Assign, Assignee, BoardEnsure, BoardEvent, BoardFilter, BoardId, BoardInfo, BoardSnapshot, BoardView, Card,
-    CardArchive, CardNo, CardPatch, CardRef, CardRevision, CardUpsert, ExternalLink, LaneCards, LaneName, Link,
-    Priority, Title,
+    Assign, Assignee, BoardEnsure, BoardEvent, BoardFilter, BoardId, BoardInfo, BoardSnapshot,
+    BoardView, Card, CardArchive, CardNo, CardPatch, CardRef, CardRevision, CardUpsert,
+    ExternalLink, LaneCards, LaneName, Link, Priority, Title,
 };
 
 use crate::id::{BbProjectId, Principal, RoleName, SeatName, Seq, WaveSlug};
@@ -35,9 +35,15 @@ pub fn message_link(room: &RoomId, seq: Seq) -> Link {
 }
 
 pub fn worker_link(wave: &WaveSlug, role: &RoleName) -> Link {
-    Link::External(ExternalLink { namespace: "rex-wave.worker".into(), key: format!("{wave}/{role}") })
+    Link::External(ExternalLink {
+        namespace: "rex-wave.worker".into(),
+        key: format!("{wave}/{role}"),
+    })
 }
 
 pub fn letter_link(letter: &LetterRef) -> Link {
-    Link::External(ExternalLink { namespace: "rex-wave.letter".into(), key: letter.sha256.to_string() })
+    Link::External(ExternalLink {
+        namespace: "rex-wave.letter".into(),
+        key: letter.sha256.to_string(),
+    })
 }

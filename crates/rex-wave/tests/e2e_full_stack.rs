@@ -311,7 +311,9 @@ async fn http_post(
     }
     req.push_str("\r\n");
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect loopback http");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("connect loopback http");
     let _ = stream.write_all(req.as_bytes()).await;
     let _ = stream.write_all(body).await;
     let mut raw = Vec::new();
@@ -370,7 +372,9 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     std::fs::write(sandbox_dir.join(".rex-wave-sandbox"), b"e2e-sandbox\n")
         .expect("write sandbox marker");
 
-    let bb_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock bb");
+    let bb_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock bb");
     let bb_addr = bb_listener.local_addr().unwrap();
     let bb_token = "bb_tok_e2e";
     let bb_state = Arc::new(Mutex::new(MockBbState::default()));
@@ -791,7 +795,13 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .expect("builder reached Parked and verifier reached Idle");
 
     let tok_output = Command::new(bin_path())
-        .args(["--socket", sock_path.to_str().unwrap(), "token", "--seat", "sol"])
+        .args([
+            "--socket",
+            sock_path.to_str().unwrap(),
+            "token",
+            "--seat",
+            "sol",
+        ])
         .output()
         .expect("mint seat token");
     assert!(tok_output.status.success());
@@ -919,12 +929,18 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .await;
     assert_eq!(mcp_status, 200);
     let mcp_json: Value = serde_json::from_str(&mcp_body).expect("mcp json");
-    assert_eq!(mcp_json["result"]["isError"], false, "mcp error: {mcp_json}");
+    assert_eq!(
+        mcp_json["result"]["isError"], false,
+        "mcp error: {mcp_json}"
+    );
     let outcome_text = mcp_json["result"]["content"][0]["text"]
         .as_str()
         .expect("run_code outcome text");
     let outcome_val: Value = serde_json::from_str(outcome_text).unwrap();
-    assert_eq!(outcome_val["value"]["who"], json!({ "kind": "seat", "seat": "sol" }));
+    assert_eq!(
+        outcome_val["value"]["who"],
+        json!({ "kind": "seat", "seat": "sol" })
+    );
     assert_eq!(outcome_val["value"]["c1"], 1);
     assert_eq!(outcome_val["value"]["c2"], 2);
     let post_seq = Seq(outcome_val["value"]["postSeq"].as_u64().unwrap());
@@ -933,10 +949,11 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
         loop {
             let st = bb_state.lock().await;
             let got_wait = st.tool_results.get("call_wait_builder_1").cloned();
-            let has_verifier_doorbell = st
-                .sends
-                .iter()
-                .any(|(tid, mode, txt)| tid == "th_auth-v2_verifier" && mode == "auto" && txt.contains("@verifier slice #1 ready for review"));
+            let has_verifier_doorbell = st.sends.iter().any(|(tid, mode, txt)| {
+                tid == "th_auth-v2_verifier"
+                    && mode == "auto"
+                    && txt.contains("@verifier slice #1 ready for review")
+            });
             if let Some((ok, text)) = got_wait
                 && has_verifier_doorbell
             {
@@ -1139,7 +1156,10 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             let still_blocking = inbox
                 .items
                 .iter()
-                .filter(|i| i.state == NotifyState::Unread && matches!(i.draft.kind, NotifyKind::Interaction { .. }))
+                .filter(|i| {
+                    i.state == NotifyState::Unread
+                        && matches!(i.draft.kind, NotifyKind::Interaction { .. })
+                })
                 .count() as u32;
             let snap = operator
                 .call(WaveView {
@@ -1184,7 +1204,8 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
         letter.path.display()
     );
     let letter_on_disk = sandbox_dir.join(&letter.path);
-    let letter_disk = std::fs::read_to_string(&letter_on_disk).expect("read banked Markdown letter");
+    let letter_disk =
+        std::fs::read_to_string(&letter_on_disk).expect("read banked Markdown letter");
     assert!(letter_disk.contains("auth-v2 slice 1 ratified"));
     assert!(letter_disk.contains("@verifier slice #1 ready for review"));
     assert_eq!(letter.item.schema, MailSchemaV1);

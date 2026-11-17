@@ -19,14 +19,22 @@ const WATCH_BUFFER: usize = 128;
 
 pub fn frame_channel(buffer: usize) -> (mpsc::Sender<Result<Frame, ApiError>>, FrameStream) {
     let (tx, rx) = mpsc::channel(buffer);
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
     (tx, Box::pin(stream))
 }
 
 /// BB-owned agent data, proxied (implemented by `rex-wave-bb`). Never journaled:
 /// BB is the single owner of thread events.
 pub trait AgentFeed: Send + Sync + 'static {
-    fn page(&self, wave: &WaveSlug, role: &RoleName, after: Option<BbSeq>, limit: u32) -> BoxFut<'_, Result<ThreadPageView, ApiError>>;
+    fn page(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        after: Option<BbSeq>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<ThreadPageView, ApiError>>;
     /// Live frames for one agent. Lease semantics: BB-side watch is held only
     /// while the returned stream is alive.
     fn live(&self, wave: &WaveSlug, role: &RoleName) -> BoxFut<'_, Result<FrameStream, ApiError>>;
@@ -36,29 +44,57 @@ pub trait AgentFeed: Send + Sync + 'static {
 pub struct NoAgentFeed;
 
 impl AgentFeed for NoAgentFeed {
-    fn page(&self, _wave: &WaveSlug, _role: &RoleName, _after: Option<BbSeq>, _limit: u32) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
-        Box::pin(async { Err(ApiError::Unavailable { family: Family::Wave }) })
+    fn page(
+        &self,
+        _wave: &WaveSlug,
+        _role: &RoleName,
+        _after: Option<BbSeq>,
+        _limit: u32,
+    ) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
+        Box::pin(async {
+            Err(ApiError::Unavailable {
+                family: Family::Wave,
+            })
+        })
     }
-    fn live(&self, _wave: &WaveSlug, _role: &RoleName) -> BoxFut<'_, Result<FrameStream, ApiError>> {
-        Box::pin(async { Err(ApiError::Unavailable { family: Family::Wave }) })
+    fn live(
+        &self,
+        _wave: &WaveSlug,
+        _role: &RoleName,
+    ) -> BoxFut<'_, Result<FrameStream, ApiError>> {
+        Box::pin(async {
+            Err(ApiError::Unavailable {
+                family: Family::Wave,
+            })
+        })
     }
 }
 
 /// Stream-level read privacy: a principal's inbox is theirs alone, and a DM is
 /// only for its two members.
 pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
-    if matches!(viewer, Principal::Operator { .. } | Principal::System { .. }) {
+    if matches!(
+        viewer,
+        Principal::Operator { .. } | Principal::System { .. }
+    ) {
         return Ok(());
     }
     let allowed = match stream {
         StreamId::Inbox { owner } => owner == viewer,
-        StreamId::Room { room: RoomId::Direct { pair } } => pair.contains(viewer),
-        StreamId::Room { .. } | StreamId::Wave { .. } | StreamId::Board { .. } | StreamId::Mail => true,
+        StreamId::Room {
+            room: RoomId::Direct { pair },
+        } => pair.contains(viewer),
+        StreamId::Room { .. } | StreamId::Wave { .. } | StreamId::Board { .. } | StreamId::Mail => {
+            true
+        }
     };
     if allowed {
         Ok(())
     } else {
-        Err(ApiError::Denied { principal: viewer.to_string(), action: format!("read {stream:?}") })
+        Err(ApiError::Denied {
+            principal: viewer.to_string(),
+            action: format!("read {stream:?}"),
+        })
     }
 }
 
@@ -72,7 +108,12 @@ pub struct ReadSide {
 
 impl ReadSide {
     /// Tap first, replay second, dedupe by `(stream, seq)`.
-    pub fn watch(&self, session: Session, interest: Interest, from: Cursor) -> BoxFut<'_, Result<FrameStream, ApiError>> {
+    pub fn watch(
+        &self,
+        session: Session,
+        interest: Interest,
+        from: Cursor,
+    ) -> BoxFut<'_, Result<FrameStream, ApiError>> {
         Box::pin(async move {
             let viewer = session.me().clone();
             match interest {
@@ -90,7 +131,11 @@ impl ReadSide {
         tokio::spawn(async move {
             let mut last = rx.borrow_and_update().clone();
             let mut sent = last.snapshot(&viewer);
-            if tx.send(Ok(Frame::Sidebar(Box::new(sent.clone())))).await.is_err() {
+            if tx
+                .send(Ok(Frame::Sidebar(Box::new(sent.clone()))))
+                .await
+                .is_err()
+            {
                 return;
             }
             loop {
@@ -116,16 +161,28 @@ impl ReadSide {
         stream
     }
 
-    async fn watch_stage(&self, session: Session, target: StageTarget, from: Cursor) -> Result<FrameStream, ApiError> {
+    async fn watch_stage(
+        &self,
+        session: Session,
+        target: StageTarget,
+        from: Cursor,
+    ) -> Result<FrameStream, ApiError> {
         // Claiming the stage slot before opening `inner` ends the old stage
         // watch even if the new target fails validation.
         let (generation, mut gen_rx) = session.focus();
         let viewer = session.me().clone();
         let inner_interest = match &target {
             StageTarget::Inbox => Interest::MyInbox,
-            StageTarget::Kanban { board } => Interest::Streams { streams: vec![StreamId::Board { board: board.clone() }] },
+            StageTarget::Kanban { board } => Interest::Streams {
+                streams: vec![StreamId::Board {
+                    board: board.clone(),
+                }],
+            },
             StageTarget::Room { room } => Interest::Room { room: room.clone() },
-            StageTarget::Agent { wave, role } => Interest::Agent { wave: wave.clone(), role: role.clone() },
+            StageTarget::Agent { wave, role } => Interest::Agent {
+                wave: wave.clone(),
+                role: role.clone(),
+            },
         };
         let mut inner = match inner_interest {
             Interest::Agent { wave, role } => self.agents.live(&wave, &role).await?,
@@ -133,7 +190,11 @@ impl ReadSide {
         };
         let (tx, stream) = frame_channel(WATCH_BUFFER);
         tokio::spawn(async move {
-            if tx.send(Ok(Frame::StageFocused { generation, target })).await.is_err() {
+            if tx
+                .send(Ok(Frame::StageFocused { generation, target }))
+                .await
+                .is_err()
+            {
                 return;
             }
             loop {
@@ -163,10 +224,20 @@ impl ReadSide {
         Ok(stream)
     }
 
-    fn watch_journal(&self, viewer: Principal, interest: Interest, from: Cursor) -> Result<FrameStream, ApiError> {
+    fn watch_journal(
+        &self,
+        viewer: Principal,
+        interest: Interest,
+        from: Cursor,
+    ) -> Result<FrameStream, ApiError> {
         let mut filter = Filter::build(&viewer, interest, self.sidebar.clone())?;
         let mut tap = self.hub.tap();
-        let initial: BTreeMap<StreamId, Seq> = self.journal.streams().map_err(store_error)?.into_iter().collect();
+        let initial: BTreeMap<StreamId, Seq> = self
+            .journal
+            .streams()
+            .map_err(store_error)?
+            .into_iter()
+            .collect();
 
         let journal = self.journal.clone();
         let (tx, stream) = frame_channel(WATCH_BUFFER);
@@ -186,11 +257,27 @@ impl ReadSide {
                 if from.from_head() && !from.lists(&s) {
                     continue;
                 }
-                if !replay_stream(&journal, &s, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
+                if !replay_stream(
+                    &journal,
+                    &s,
+                    &viewer,
+                    &mut filter,
+                    &mut seen,
+                    &mut cursor,
+                    &tx,
+                )
+                .await
+                {
                     return;
                 }
             }
-            if tx.send(Ok(Frame::CaughtUp { cursor: cursor.clone() })).await.is_err() {
+            if tx
+                .send(Ok(Frame::CaughtUp {
+                    cursor: cursor.clone(),
+                }))
+                .await
+                .is_err()
+            {
                 return;
             }
 
@@ -245,14 +332,24 @@ impl ReadSide {
         let mut entries = Vec::new();
         let mut cursor = req.after;
         let mut caught_up = false;
-        let deadline = req.timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+        let deadline = req
+            .timeout_ms
+            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
 
         loop {
             let next = match deadline {
-                Some(until) if caught_up => match tokio::time::timeout_at(until, stream.next()).await {
-                    Ok(item) => item,
-                    Err(_) => return Ok(Page { entries, cursor, timed_out: true }),
-                },
+                Some(until) if caught_up => {
+                    match tokio::time::timeout_at(until, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
+                            return Ok(Page {
+                                entries,
+                                cursor,
+                                timed_out: true,
+                            });
+                        }
+                    }
+                }
                 _ => stream.next().await,
             };
             match next {
@@ -261,26 +358,46 @@ impl ReadSide {
                     entries.push(env);
                     if caught_up {
                         tokio::task::yield_now().await;
-                        while let Ok(Some(Ok(Frame::Committed(extra)))) = tokio::time::timeout(Duration::ZERO, stream.next()).await {
+                        while let Ok(Some(Ok(Frame::Committed(extra)))) =
+                            tokio::time::timeout(Duration::ZERO, stream.next()).await
+                        {
                             cursor.advance(&extra.stream, extra.seq);
                             entries.push(extra);
                         }
-                        return Ok(Page { entries, cursor, timed_out: false });
+                        return Ok(Page {
+                            entries,
+                            cursor,
+                            timed_out: false,
+                        });
                     }
                 }
                 Some(Ok(Frame::CaughtUp { cursor: c })) => {
                     cursor = c;
                     caught_up = true;
                     if !entries.is_empty() {
-                        return Ok(Page { entries, cursor, timed_out: false });
+                        return Ok(Page {
+                            entries,
+                            cursor,
+                            timed_out: false,
+                        });
                     }
                     if req.timeout_ms == Some(0) {
-                        return Ok(Page { entries, cursor, timed_out: true });
+                        return Ok(Page {
+                            entries,
+                            cursor,
+                            timed_out: true,
+                        });
                     }
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e),
-                None => return Ok(Page { entries, cursor, timed_out: false }),
+                None => {
+                    return Ok(Page {
+                        entries,
+                        cursor,
+                        timed_out: false,
+                    });
+                }
             }
         }
     }
@@ -330,13 +447,24 @@ async fn replay_stream(
 
 enum Filter {
     Exact(BTreeSet<StreamId>),
-    Mentions { sidebar: Arc<SidebarProjection>, joined: BTreeMap<RoomId, BTreeSet<Principal>> },
-    Project { project: BbProjectId, board: BoardId, waves: BTreeSet<WaveSlug> },
+    Mentions {
+        sidebar: Arc<SidebarProjection>,
+        joined: BTreeMap<RoomId, BTreeSet<Principal>>,
+    },
+    Project {
+        project: BbProjectId,
+        board: BoardId,
+        waves: BTreeSet<WaveSlug>,
+    },
     Everything,
 }
 
 impl Filter {
-    fn build(viewer: &Principal, interest: Interest, sidebar: Arc<SidebarProjection>) -> Result<Self, ApiError> {
+    fn build(
+        viewer: &Principal,
+        interest: Interest,
+        sidebar: Arc<SidebarProjection>,
+    ) -> Result<Self, ApiError> {
         match interest {
             Interest::Streams { streams } => {
                 for s in &streams {
@@ -345,25 +473,42 @@ impl Filter {
                 Ok(Filter::Exact(streams.into_iter().collect()))
             }
             Interest::Room { room } => {
-                let s = StreamId::Room { room: room.resolve(viewer)? };
+                let s = StreamId::Room {
+                    room: room.resolve(viewer)?,
+                };
                 can_read(viewer, &s)?;
                 Ok(Filter::Exact(BTreeSet::from([s])))
             }
-            Interest::MyInbox => Ok(Filter::Exact(BTreeSet::from([StreamId::Inbox { owner: viewer.clone() }]))),
-            Interest::Mentions => Ok(Filter::Mentions { sidebar, joined: BTreeMap::new() }),
+            Interest::MyInbox => Ok(Filter::Exact(BTreeSet::from([StreamId::Inbox {
+                owner: viewer.clone(),
+            }]))),
+            Interest::Mentions => Ok(Filter::Mentions {
+                sidebar,
+                joined: BTreeMap::new(),
+            }),
             Interest::Project { project } => {
                 let board = project_board(&project);
-                Ok(Filter::Project { project, board, waves: BTreeSet::new() })
+                Ok(Filter::Project {
+                    project,
+                    board,
+                    waves: BTreeSet::new(),
+                })
             }
             Interest::Everything => {
-                if !matches!(viewer, Principal::Operator { .. } | Principal::System { .. }) {
-                    return Err(ApiError::Denied { principal: viewer.to_string(), action: "watch everything".into() });
+                if !matches!(
+                    viewer,
+                    Principal::Operator { .. } | Principal::System { .. }
+                ) {
+                    return Err(ApiError::Denied {
+                        principal: viewer.to_string(),
+                        action: "watch everything".into(),
+                    });
                 }
                 Ok(Filter::Everything)
             }
-            Interest::Agent { .. } | Interest::Sidebar | Interest::Stage { .. } => {
-                Err(ApiError::Internal("non-journal interest routed to watch_journal".into()))
-            }
+            Interest::Agent { .. } | Interest::Sidebar | Interest::Stage { .. } => Err(
+                ApiError::Internal("non-journal interest routed to watch_journal".into()),
+            ),
         }
     }
 
@@ -381,15 +526,28 @@ impl Filter {
 
     fn observe(&mut self, env: &Envelope) {
         match (self, &env.stream, &env.event) {
-            (Filter::Project { project, waves, .. }, StreamId::Wave { wave }, Event::Wave(WaveEvent::Started { spec, .. }))
-                if &spec.project == project =>
-            {
+            (
+                Filter::Project { project, waves, .. },
+                StreamId::Wave { wave },
+                Event::Wave(WaveEvent::Started { spec, .. }),
+            ) if &spec.project == project => {
                 waves.insert(wave.clone());
             }
-            (Filter::Mentions { joined, .. }, StreamId::Room { room }, Event::Room(RoomEvent::MemberJoined { member, .. })) => {
-                joined.entry(room.clone()).or_default().insert(member.clone());
+            (
+                Filter::Mentions { joined, .. },
+                StreamId::Room { room },
+                Event::Room(RoomEvent::MemberJoined { member, .. }),
+            ) => {
+                joined
+                    .entry(room.clone())
+                    .or_default()
+                    .insert(member.clone());
             }
-            (Filter::Mentions { joined, .. }, StreamId::Room { room }, Event::Room(RoomEvent::MemberLeft { member })) => {
+            (
+                Filter::Mentions { joined, .. },
+                StreamId::Room { room },
+                Event::Room(RoomEvent::MemberLeft { member }),
+            ) => {
                 if let Some(m) = joined.get_mut(room) {
                     m.remove(member);
                 }
@@ -402,8 +560,18 @@ impl Filter {
         match self {
             Filter::Exact(set) => set.contains(stream),
             Filter::Mentions { .. } => matches!(stream, StreamId::Room { .. }),
-            Filter::Project { project, board, waves } => match stream {
-                StreamId::Room { room: RoomId::Channel { scope: RoomScope::Project { project: p }, .. } } => p == project,
+            Filter::Project {
+                project,
+                board,
+                waves,
+            } => match stream {
+                StreamId::Room {
+                    room:
+                        RoomId::Channel {
+                            scope: RoomScope::Project { project: p },
+                            ..
+                        },
+                } => p == project,
                 StreamId::Wave { wave } => waves.contains(wave),
                 StreamId::Board { board: b } => b == board,
                 _ => false,
@@ -419,9 +587,12 @@ impl Filter {
         match self {
             Filter::Exact(_) | Filter::Project { .. } | Filter::Everything => true,
             Filter::Mentions { sidebar, joined } => match (&env.stream, &env.event) {
-                (StreamId::Room { room: RoomId::Direct { pair } }, Event::Room(RoomEvent::Posted { .. })) => {
-                    pair.contains(viewer) && &env.by != viewer
-                }
+                (
+                    StreamId::Room {
+                        room: RoomId::Direct { pair },
+                    },
+                    Event::Room(RoomEvent::Posted { .. }),
+                ) => pair.contains(viewer) && &env.by != viewer,
                 (StreamId::Room { room }, Event::Room(RoomEvent::Posted { mentions, .. })) => {
                     if &env.by == viewer {
                         return false;
@@ -429,7 +600,8 @@ impl Filter {
                     if mentions.principals.contains(viewer) {
                         return true;
                     }
-                    let in_room = joined.get(room).is_some_and(|m| m.contains(viewer)) || sidebar.is_member(room, viewer);
+                    let in_room = joined.get(room).is_some_and(|m| m.contains(viewer))
+                        || sidebar.is_member(room, viewer);
                     mentions.all && in_room
                 }
                 _ => false,
@@ -439,22 +611,35 @@ impl Filter {
 }
 
 impl Service<ReadCommand> for ReadSide {
-    fn dispatch(&self, cmd: ReadCommand, ctx: DecideCtx) -> BoxFut<'_, Result<WireReply, ApiError>> {
+    fn dispatch(
+        &self,
+        cmd: ReadCommand,
+        ctx: DecideCtx,
+    ) -> BoxFut<'_, Result<WireReply, ApiError>> {
         Box::pin(async move {
             match cmd {
                 ReadCommand::Read(r) => {
                     can_read(&ctx.by, &r.stream)?;
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
-                    let entries = self.journal.read(&r.stream, r.after, limit).map_err(store_error)?;
+                    let entries = self
+                        .journal
+                        .read(&r.stream, r.after, limit)
+                        .map_err(store_error)?;
                     let last = entries.last().map_or(r.after, |e| e.seq);
                     let cursor = Cursor::default().with(r.stream, last);
-                    Ok(WireReply::Read(Page { entries, cursor, timed_out: false }))
+                    Ok(WireReply::Read(Page {
+                        entries,
+                        cursor,
+                        timed_out: false,
+                    }))
                 }
                 ReadCommand::Wait(w) => Ok(WireReply::Wait(self.wait_for(ctx.by, w).await?)),
                 ReadCommand::Sidebar(_) => Ok(WireReply::Sidebar(self.sidebar.snapshot(&ctx.by))),
                 ReadCommand::ThreadPage(t) => {
                     let limit = t.limit.unwrap_or(100).clamp(1, 500);
-                    Ok(WireReply::ThreadPage(self.agents.page(&t.wave, &t.role, t.after, limit).await?))
+                    Ok(WireReply::ThreadPage(
+                        self.agents.page(&t.wave, &t.role, t.after, limit).await?,
+                    ))
                 }
             }
         })

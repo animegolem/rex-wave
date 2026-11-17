@@ -39,27 +39,58 @@ mod wire {
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "t", rename_all = "snake_case")]
     pub enum ClientFrame {
-        Hello { credential: super::Credential, client: String },
-        Call { id: u64, cmd: WireCommand },
-        Watch { id: u64, interest: Interest, from: Cursor },
-        Unwatch { id: u64 },
+        Hello {
+            credential: super::Credential,
+            client: String,
+        },
+        Call {
+            id: u64,
+            cmd: WireCommand,
+        },
+        Watch {
+            id: u64,
+            interest: Interest,
+            from: Cursor,
+        },
+        Unwatch {
+            id: u64,
+        },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "t", rename_all = "snake_case")]
     pub enum ServerFrame {
-        Welcome { result: Result<Principal, ApiError>, daemon: String },
-        Reply { id: u64, result: Result<WireReply, ApiError> },
-        WatchOpened { id: u64, result: Result<(), ApiError> },
-        Frame { id: u64, frame: Frame },
-        WatchEnded { id: u64, error: Option<ApiError> },
+        Welcome {
+            result: Result<Principal, ApiError>,
+            daemon: String,
+        },
+        Reply {
+            id: u64,
+            result: Result<WireReply, ApiError>,
+        },
+        WatchOpened {
+            id: u64,
+            result: Result<(), ApiError>,
+        },
+        Frame {
+            id: u64,
+            frame: Frame,
+        },
+        WatchEnded {
+            id: u64,
+            error: Option<ApiError>,
+        },
     }
 }
 
 async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
-    let bytes = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes =
+        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if bytes.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds 16 MiB"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds 16 MiB",
+        ));
     }
     w.write_u32(bytes.len() as u32).await?;
     w.write_all(&bytes).await?;
@@ -75,11 +106,15 @@ async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io:
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds 16 MiB"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds 16 MiB",
+        ));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
-    let msg = serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let msg =
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
 }
 
@@ -114,7 +149,11 @@ pub enum Credential {
 
 /// Maps a credential (plus the kernel-verified peer uid, on Unix) to a principal.
 pub trait Authenticator: Send + Sync + 'static {
-    fn authenticate(&self, peer_uid: Option<u32>, credential: &Credential) -> Result<Principal, ApiError>;
+    fn authenticate(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<Principal, ApiError>;
 }
 
 /// Standard authenticator: `PeerUid` succeeds when the peer's Unix uid equals
@@ -126,23 +165,42 @@ pub struct TableAuthenticator {
 }
 
 impl Authenticator for TableAuthenticator {
-    fn authenticate(&self, peer_uid: Option<u32>, credential: &Credential) -> Result<Principal, ApiError> {
+    fn authenticate(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<Principal, ApiError> {
         match credential {
             Credential::PeerUid => match (peer_uid, self.daemon_uid) {
-                (Some(peer), Some(daemon)) if peer == daemon => Ok(Principal::Operator { seat: self.operator.clone() }),
-                _ => Err(ApiError::Denied { principal: "anonymous".into(), action: "peer-uid hello".into() }),
+                (Some(peer), Some(daemon)) if peer == daemon => Ok(Principal::Operator {
+                    seat: self.operator.clone(),
+                }),
+                _ => Err(ApiError::Denied {
+                    principal: "anonymous".into(),
+                    action: "peer-uid hello".into(),
+                }),
             },
             Credential::Token { token } => match self.tokens.get(token) {
                 Some(seat) => Ok(Principal::Seat { seat: seat.clone() }),
-                None => Err(ApiError::Denied { principal: "anonymous".into(), action: "invalid token".into() }),
+                None => Err(ApiError::Denied {
+                    principal: "anonymous".into(),
+                    action: "invalid token".into(),
+                }),
             },
         }
     }
 }
 
 enum ClientReq {
-    Call { cmd: WireCommand, reply: oneshot::Sender<Result<WireReply, ApiError>> },
-    Watch { interest: Interest, from: Cursor, reply: oneshot::Sender<Result<FrameStream, ApiError>> },
+    Call {
+        cmd: WireCommand,
+        reply: oneshot::Sender<Result<WireReply, ApiError>>,
+    },
+    Watch {
+        interest: Interest,
+        from: Cursor,
+        reply: oneshot::Sender<Result<FrameStream, ApiError>>,
+    },
 }
 
 /// A connected client session. Implements `api::Client`.
@@ -154,29 +212,52 @@ pub struct RemoteClient {
 
 impl std::fmt::Debug for RemoteClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteClient").field("me", &self.me).finish()
+        f.debug_struct("RemoteClient")
+            .field("me", &self.me)
+            .finish()
     }
 }
 
 impl RemoteClient {
     /// Connect, send `Hello`, await `Welcome`. Bound to one principal for life.
-    pub async fn connect(endpoint: Endpoint, credential: Credential, client_name: &str) -> Result<Self, ApiError> {
+    pub async fn connect(
+        endpoint: Endpoint,
+        credential: Credential,
+        client_name: &str,
+    ) -> Result<Self, ApiError> {
         let stream = match endpoint {
-            Endpoint::Unix(path) => UnixStream::connect(&path).await.map_err(|e| ApiError::Transport(e.to_string()))?,
-            Endpoint::WebSocket(_) => return Err(ApiError::Transport("websocket endpoint is not enabled".into())),
+            Endpoint::Unix(path) => UnixStream::connect(&path)
+                .await
+                .map_err(|e| ApiError::Transport(e.to_string()))?,
+            Endpoint::WebSocket(_) => {
+                return Err(ApiError::Transport(
+                    "websocket endpoint is not enabled".into(),
+                ));
+            }
         };
         let (mut reader, mut writer) = stream.into_split();
-        write_frame(&mut writer, &wire::ClientFrame::Hello { credential, client: client_name.to_owned() })
-            .await
-            .map_err(|e| ApiError::Transport(e.to_string()))?;
-        let welcome: wire::ServerFrame = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
-            .await
-            .map_err(|_| ApiError::Timeout)?
-            .map_err(|e| ApiError::Transport(e.to_string()))?
-            .ok_or_else(|| ApiError::Transport("server closed before welcome".into()))?;
+        write_frame(
+            &mut writer,
+            &wire::ClientFrame::Hello {
+                credential,
+                client: client_name.to_owned(),
+            },
+        )
+        .await
+        .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let welcome: wire::ServerFrame =
+            tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
+                .await
+                .map_err(|_| ApiError::Timeout)?
+                .map_err(|e| ApiError::Transport(e.to_string()))?
+                .ok_or_else(|| ApiError::Transport("server closed before welcome".into()))?;
         let me = match welcome {
             wire::ServerFrame::Welcome { result, .. } => result?,
-            other => return Err(ApiError::Transport(format!("expected welcome, got {other:?}"))),
+            other => {
+                return Err(ApiError::Transport(format!(
+                    "expected welcome, got {other:?}"
+                )));
+            }
         };
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<wire::ClientFrame>();
@@ -199,21 +280,36 @@ impl Client for RemoteClient {
         &self.me
     }
 
-    fn call_wire(&self, cmd: WireCommand) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
+    fn call_wire(
+        &self,
+        cmd: WireCommand,
+    ) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
         let tx = self.req_tx.clone();
         async move {
             let (reply, rx) = oneshot::channel();
-            tx.send(ClientReq::Call { cmd, reply }).map_err(|_| ApiError::Transport("connection closed".into()))?;
-            rx.await.map_err(|_| ApiError::Transport("connection closed".into()))?
+            tx.send(ClientReq::Call { cmd, reply })
+                .map_err(|_| ApiError::Transport("connection closed".into()))?;
+            rx.await
+                .map_err(|_| ApiError::Transport("connection closed".into()))?
         }
     }
 
-    fn watch(&self, interest: Interest, from: Cursor) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
+    fn watch(
+        &self,
+        interest: Interest,
+        from: Cursor,
+    ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
         let tx = self.req_tx.clone();
         async move {
             let (reply, rx) = oneshot::channel();
-            tx.send(ClientReq::Watch { interest, from, reply }).map_err(|_| ApiError::Transport("connection closed".into()))?;
-            rx.await.map_err(|_| ApiError::Transport("connection closed".into()))?
+            tx.send(ClientReq::Watch {
+                interest,
+                from,
+                reply,
+            })
+            .map_err(|_| ApiError::Transport("connection closed".into()))?;
+            rx.await
+                .map_err(|_| ApiError::Transport("connection closed".into()))?
         }
     }
 }
@@ -239,8 +335,14 @@ async fn run_client<R: AsyncRead + Unpin + Send + 'static>(
 ) {
     let mut next_id = 1u64;
     let mut calls: HashMap<u64, oneshot::Sender<Result<WireReply, ApiError>>> = HashMap::new();
-    let mut opening: HashMap<u64, (oneshot::Sender<Result<FrameStream, ApiError>>, mpsc::Sender<Result<Frame, ApiError>>, FrameStream)> =
-        HashMap::new();
+    let mut opening: HashMap<
+        u64,
+        (
+            oneshot::Sender<Result<FrameStream, ApiError>>,
+            mpsc::Sender<Result<Frame, ApiError>>,
+            FrameStream,
+        ),
+    > = HashMap::new();
     let mut watches: HashMap<u64, mpsc::Sender<Result<Frame, ApiError>>> = HashMap::new();
 
     let reason = loop {
@@ -346,7 +448,11 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
 }
 
 /// Serve `router` on an already-bound `UnixListener` until cancelled.
-pub async fn serve_listener(listener: UnixListener, router: Arc<Router>, auth: Arc<dyn Authenticator>) -> io::Result<()> {
+pub async fn serve_listener(
+    listener: UnixListener,
+    router: Arc<Router>,
+    auth: Arc<dyn Authenticator>,
+) -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
@@ -360,31 +466,58 @@ pub async fn serve_listener(listener: UnixListener, router: Arc<Router>, auth: A
 
 /// Serve `router` on `endpoint` until cancelled. One task per connection, one
 /// task per watch; replies complete in whatever order they finish.
-pub async fn serve(endpoint: Endpoint, router: Arc<Router>, auth: Arc<dyn Authenticator>) -> io::Result<()> {
+pub async fn serve(
+    endpoint: Endpoint,
+    router: Arc<Router>,
+    auth: Arc<dyn Authenticator>,
+) -> io::Result<()> {
     match endpoint {
         Endpoint::Unix(path) => {
             let (listener, _) = bind_unix(&path)?;
             serve_listener(listener, router, auth).await
         }
-        Endpoint::WebSocket(_) => Err(io::Error::new(io::ErrorKind::Unsupported, "websocket endpoint is not enabled")),
+        Endpoint::WebSocket(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "websocket endpoint is not enabled",
+        )),
     }
 }
 
-async fn handle_conn(stream: UnixStream, peer_uid: Option<u32>, router: Arc<Router>, auth: Arc<dyn Authenticator>) -> io::Result<()> {
+async fn handle_conn(
+    stream: UnixStream,
+    peer_uid: Option<u32>,
+    router: Arc<Router>,
+    auth: Arc<dyn Authenticator>,
+) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let first: Option<wire::ClientFrame> = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hello timed out"))??;
+    let first: Option<wire::ClientFrame> =
+        tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hello timed out"))??;
     let Some(wire::ClientFrame::Hello { credential, .. }) = first else {
         return Ok(());
     };
     let me = match auth.authenticate(peer_uid, &credential) {
         Ok(me) => {
-            write_frame(&mut writer, &wire::ServerFrame::Welcome { result: Ok(me.clone()), daemon: env!("CARGO_PKG_VERSION").into() }).await?;
+            write_frame(
+                &mut writer,
+                &wire::ServerFrame::Welcome {
+                    result: Ok(me.clone()),
+                    daemon: env!("CARGO_PKG_VERSION").into(),
+                },
+            )
+            .await?;
             me
         }
         Err(e) => {
-            let _ = write_frame(&mut writer, &wire::ServerFrame::Welcome { result: Err(e), daemon: env!("CARGO_PKG_VERSION").into() }).await;
+            let _ = write_frame(
+                &mut writer,
+                &wire::ServerFrame::Welcome {
+                    result: Err(e),
+                    daemon: env!("CARGO_PKG_VERSION").into(),
+                },
+            )
+            .await;
             return Ok(());
         }
     };
@@ -422,13 +555,19 @@ async fn handle_conn(stream: UnixStream, peer_uid: Option<u32>, router: Arc<Rout
                 let handle = tokio::spawn(async move {
                     let mut stream = match router.watch(&session, interest, from).await {
                         Ok(s) => {
-                            if out_tx.send(wire::ServerFrame::WatchOpened { id, result: Ok(()) }).await.is_err() {
+                            if out_tx
+                                .send(wire::ServerFrame::WatchOpened { id, result: Ok(()) })
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                             s
                         }
                         Err(e) => {
-                            let _ = out_tx.send(wire::ServerFrame::WatchOpened { id, result: Err(e) }).await;
+                            let _ = out_tx
+                                .send(wire::ServerFrame::WatchOpened { id, result: Err(e) })
+                                .await;
                             return;
                         }
                     };
@@ -436,7 +575,11 @@ async fn handle_conn(stream: UnixStream, peer_uid: Option<u32>, router: Arc<Rout
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(frame) => {
-                                if out_tx.send(wire::ServerFrame::Frame { id, frame }).await.is_err() {
+                                if out_tx
+                                    .send(wire::ServerFrame::Frame { id, frame })
+                                    .await
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -446,7 +589,9 @@ async fn handle_conn(stream: UnixStream, peer_uid: Option<u32>, router: Arc<Rout
                             }
                         }
                     }
-                    let _ = out_tx.send(wire::ServerFrame::WatchEnded { id, error: end_err }).await;
+                    let _ = out_tx
+                        .send(wire::ServerFrame::WatchEnded { id, error: end_err })
+                        .await;
                 });
                 watches.insert(id, handle.abort_handle());
             }

@@ -9,12 +9,19 @@ use std::time::Duration;
 pub trait Reactor: Send + 'static {
     const NAME: &'static str;
     fn interest(&self) -> Interest;
-    fn react(&mut self, frame: Frame, client: &LocalClient) -> impl Future<Output = Result<(), ApiError>> + Send;
+    fn react(
+        &mut self,
+        frame: Frame,
+        client: &LocalClient,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
 }
 
 /// Run a reactor from `Cursor::default()` (full replay = level-triggered
 /// reconcile), resuming from its cursor if the watch stream ends or errors.
-pub fn spawn_reactor<R: Reactor>(mut reactor: R, client: LocalClient) -> tokio::task::JoinHandle<()> {
+pub fn spawn_reactor<R: Reactor>(
+    mut reactor: R,
+    client: LocalClient,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cursor = Cursor::default();
         loop {

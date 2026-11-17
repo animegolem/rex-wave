@@ -91,7 +91,9 @@ checked_str!(
     IdemKey, "idempotency key", |s| opaque_bytes(&s, 256));
 
 /// Canonical Kanban / Org-todo workflow states.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
     Idea,
@@ -103,7 +105,14 @@ pub enum Lane {
 }
 
 impl Lane {
-    pub const ALL: [Lane; 6] = [Lane::Idea, Lane::Todo, Lane::Doing, Lane::Review, Lane::Blocked, Lane::Done];
+    pub const ALL: [Lane; 6] = [
+        Lane::Idea,
+        Lane::Todo,
+        Lane::Doing,
+        Lane::Review,
+        Lane::Blocked,
+        Lane::Done,
+    ];
     pub const DEFAULT_BOARD: [Lane; 4] = [Lane::Todo, Lane::Doing, Lane::Review, Lane::Done];
 
     pub const fn as_str(self) -> &'static str {
@@ -165,7 +174,10 @@ impl Lane {
     }
 
     pub fn default_board_lanes() -> Vec<LaneName> {
-        Self::DEFAULT_BOARD.into_iter().map(Self::lane_name).collect()
+        Self::DEFAULT_BOARD
+            .into_iter()
+            .map(Self::lane_name)
+            .collect()
     }
 }
 
@@ -193,7 +205,9 @@ impl fmt::Display for Lane {
 }
 
 /// Org-mode priority cookies (`[#A]`, `[#B]`, `[#C]`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub enum OrgPriority {
     A,
     B,
@@ -252,14 +266,29 @@ impl fmt::Display for OrgPriority {
 }
 
 /// Per-board card number, assigned by the board in creation order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct CardNo(pub u32);
 
 /// Bumped on every change to one card. A patch or archive that names an
 /// `expected` revision fails with [`KanbanError::RevisionConflict`] instead
 /// of overwriting a concurrent edit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(transparent)]
 pub struct CardRevision(pub u64);
 
@@ -269,7 +298,9 @@ impl CardRevision {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
@@ -291,10 +322,16 @@ impl ExternalLink {
         let namespace = namespace.into();
         let key = key.into();
         if namespace.is_empty() || namespace.chars().any(char::is_control) {
-            return Err(InvalidValue { what: "external link namespace".into(), reason: "empty or contains control characters".into() });
+            return Err(InvalidValue {
+                what: "external link namespace".into(),
+                reason: "empty or contains control characters".into(),
+            });
         }
         if key.is_empty() || key.chars().any(char::is_control) {
-            return Err(InvalidValue { what: "external link key".into(), reason: "empty or contains control characters".into() });
+            return Err(InvalidValue {
+                what: "external link key".into(),
+                reason: "empty or contains control characters".into(),
+            });
         }
         Ok(Self { namespace, key })
     }
@@ -302,21 +339,38 @@ impl ExternalLink {
     /// Parses opaque URIs such as `rex://room/general#4`, `letter://sha256`, or `wave:auth-v2/verifier`.
     pub fn parse_uri(raw: &str) -> Result<Self, InvalidValue> {
         if raw.is_empty() || raw.chars().any(char::is_control) {
-            return Err(InvalidValue { what: "external link".into(), reason: "empty or contains control characters".into() });
+            return Err(InvalidValue {
+                what: "external link".into(),
+                reason: "empty or contains control characters".into(),
+            });
         }
         let Some((scheme, rest)) = raw.split_once(':') else {
-            return Err(InvalidValue { what: "external link".into(), reason: "missing scheme separator `:`".into() });
+            return Err(InvalidValue {
+                what: "external link".into(),
+                reason: "missing scheme separator `:`".into(),
+            });
         };
         let valid_scheme = !scheme.is_empty()
             && scheme.as_bytes()[0].is_ascii_alphabetic()
-            && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_'));
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_'));
         if !valid_scheme {
-            return Err(InvalidValue { what: "external link".into(), reason: "invalid URI scheme".into() });
+            return Err(InvalidValue {
+                what: "external link".into(),
+                reason: "invalid URI scheme".into(),
+            });
         }
         if rest.is_empty() || rest == "//" {
-            return Err(InvalidValue { what: "external link".into(), reason: "empty URI target".into() });
+            return Err(InvalidValue {
+                what: "external link".into(),
+                reason: "empty URI target".into(),
+            });
         }
-        Ok(Self { namespace: scheme.to_owned(), key: rest.to_owned() })
+        Ok(Self {
+            namespace: scheme.to_owned(),
+            key: rest.to_owned(),
+        })
     }
 
     pub fn to_uri(&self) -> String {
@@ -339,7 +393,10 @@ impl fmt::Display for ExternalLink {
 pub enum Link {
     External(ExternalLink),
     /// An org-mode heading (org-todo panel): file plus outline path.
-    Org { file: PathBuf, outline: Vec<String> },
+    Org {
+        file: PathBuf,
+        outline: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -560,10 +617,22 @@ pub struct BoardSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BoardEvent {
-    Opened { board: BoardId, lanes: Vec<LaneName> },
-    CardCreated { card: Card },
-    CardPatched { no: CardNo, revision: CardRevision, patch: CardPatch },
-    CardArchived { no: CardNo, revision: CardRevision },
+    Opened {
+        board: BoardId,
+        lanes: Vec<LaneName>,
+    },
+    CardCreated {
+        card: Card,
+    },
+    CardPatched {
+        no: CardNo,
+        revision: CardRevision,
+        patch: CardPatch,
+    },
+    CardArchived {
+        no: CardNo,
+        revision: CardRevision,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -575,7 +644,11 @@ pub enum KanbanError {
     #[error("lane {0} does not exist")]
     NoSuchLane(LaneName),
     #[error("card {card:?} is at revision {actual:?}, not {expected:?}")]
-    RevisionConflict { card: CardNo, expected: CardRevision, actual: CardRevision },
+    RevisionConflict {
+        card: CardNo,
+        expected: CardRevision,
+        actual: CardRevision,
+    },
     #[error("a new card needs a title")]
     MissingTitle,
 }
@@ -626,7 +699,10 @@ impl BoardState {
             }
             None => Lane::default_board_lanes(),
         };
-        Ok(vec![BoardEvent::Opened { board: cmd.board.clone(), lanes }])
+        Ok(vec![BoardEvent::Opened {
+            board: cmd.board.clone(),
+            lanes,
+        }])
     }
 
     /// Policy for `CardUpsert`: CAS against `expected`, then emit
@@ -657,7 +733,10 @@ impl BoardState {
                     self.lanes.clone()
                 } else {
                     let lanes = Lane::default_board_lanes();
-                    events.push(BoardEvent::Opened { board: cmd.board.clone(), lanes: lanes.clone() });
+                    events.push(BoardEvent::Opened {
+                        board: cmd.board.clone(),
+                        lanes: lanes.clone(),
+                    });
                     lanes
                 };
 
@@ -704,7 +783,10 @@ impl BoardState {
                     events.push(BoardEvent::CardPatched {
                         no: next_no,
                         revision: CardRevision(1),
-                        patch: CardPatch { position: Some(pos), ..CardPatch::default() },
+                        patch: CardPatch {
+                            position: Some(pos),
+                            ..CardPatch::default()
+                        },
                     });
                 }
                 Ok(events)
@@ -784,11 +866,20 @@ impl BoardState {
                 for list in self.order.values_mut() {
                     list.retain(|&c| c != card.no);
                 }
-                self.order.entry(card.lane.clone()).or_default().push(card.no);
+                self.order
+                    .entry(card.lane.clone())
+                    .or_default()
+                    .push(card.no);
                 self.cards.insert(card.no, card.clone());
             }
-            BoardEvent::CardPatched { no, revision, patch } => {
-                let Some(card) = self.cards.get_mut(no) else { return };
+            BoardEvent::CardPatched {
+                no,
+                revision,
+                patch,
+            } => {
+                let Some(card) = self.cards.get_mut(no) else {
+                    return;
+                };
                 let old_lane = card.lane.clone();
                 card.revision = *revision;
                 if let Some(title) = &patch.title {
@@ -869,7 +960,9 @@ impl BoardState {
             let mut cards = Vec::new();
             if let Some(order) = self.order.get(lane) {
                 for no in order {
-                    let Some(card) = self.cards.get(no) else { continue };
+                    let Some(card) = self.cards.get(no) else {
+                        continue;
+                    };
                     if let Some(f) = filter {
                         if let Some(who) = &f.assignee
                             && card.assignee.as_ref() != Some(who)
@@ -885,7 +978,10 @@ impl BoardState {
                     cards.push(card.clone());
                 }
             }
-            lanes.push(LaneCards { lane: lane.clone(), cards });
+            lanes.push(LaneCards {
+                lane: lane.clone(),
+                cards,
+            });
         }
         Some(BoardSnapshot { board, head, lanes })
     }
@@ -928,7 +1024,10 @@ impl KanbanEngine {
 
     pub fn upsert_card(&mut self, cmd: CardUpsert) -> Result<CardRef, KanbanError> {
         if let Some(key) = &cmd.idem
-            && let Some(existing) = self.boards.get(&cmd.board).and_then(|b| b.idem_receipts.get(key))
+            && let Some(existing) = self
+                .boards
+                .get(&cmd.board)
+                .and_then(|b| b.idem_receipts.get(key))
         {
             return Ok(existing.clone());
         }
@@ -941,7 +1040,11 @@ impl KanbanEngine {
         entry.apply(events);
         let receipt = receipt.unwrap_or_else(|| {
             let no = cmd.card.expect("card validated");
-            CardRef { board: cmd.board.clone(), no, revision: entry.state.cards[&no].revision }
+            CardRef {
+                board: cmd.board.clone(),
+                no,
+                revision: entry.state.cards[&no].revision,
+            }
         });
         if let Some(key) = cmd.idem {
             entry.idem_receipts.insert(key, receipt.clone());
@@ -962,7 +1065,12 @@ impl KanbanEngine {
             board,
             card: Some(card),
             expected,
-            patch: CardPatch { lane: Some(lane), position, links_add, ..CardPatch::default() },
+            patch: CardPatch {
+                lane: Some(lane),
+                position,
+                links_add,
+                ..CardPatch::default()
+            },
             idem: None,
         })
     }
@@ -1000,19 +1108,35 @@ impl ManagedBoard {
     }
 }
 
-fn receipt_from_events_or_state(cmd: &CardUpsert, events: &[BoardEvent], state: &BoardState) -> Option<CardRef> {
+fn receipt_from_events_or_state(
+    cmd: &CardUpsert,
+    events: &[BoardEvent],
+    state: &BoardState,
+) -> Option<CardRef> {
     for event in events.iter().rev() {
         match event {
             BoardEvent::CardCreated { card } => {
-                return Some(CardRef { board: cmd.board.clone(), no: card.no, revision: card.revision });
+                return Some(CardRef {
+                    board: cmd.board.clone(),
+                    no: card.no,
+                    revision: card.revision,
+                });
             }
             BoardEvent::CardPatched { no, revision, .. } => {
-                return Some(CardRef { board: cmd.board.clone(), no: *no, revision: *revision });
+                return Some(CardRef {
+                    board: cmd.board.clone(),
+                    no: *no,
+                    revision: *revision,
+                });
             }
             BoardEvent::Opened { .. } | BoardEvent::CardArchived { .. } => {}
         }
     }
     let no = cmd.card?;
     let card = state.cards.get(&no)?;
-    Some(CardRef { board: cmd.board.clone(), no, revision: card.revision })
+    Some(CardRef {
+        board: cmd.board.clone(),
+        no,
+        revision: card.revision,
+    })
 }

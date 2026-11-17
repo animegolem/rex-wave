@@ -31,19 +31,21 @@
 
 mod actor;
 mod hub;
-mod read;
 mod reactor;
+mod read;
 mod router;
 mod sidebar;
 
 pub use actor::Registry;
 pub use hub::Hub;
-pub use read::{AgentFeed, NoAgentFeed, ReadSide, can_read, frame_channel};
 pub use reactor::{Reactor, spawn_reactor};
+pub use read::{AgentFeed, NoAgentFeed, ReadSide, can_read, frame_channel};
 pub use router::{LocalClient, Remote, Router, Session, Unavailable, authorize};
 pub use sidebar::SidebarProjection;
 
-use rex_wave_api::{ApiError, Envelope, Event, IdemKey, Principal, Seq, StreamId, UnixMs, WireReply};
+use rex_wave_api::{
+    ApiError, Envelope, Event, IdemKey, Principal, Seq, StreamId, UnixMs, WireReply,
+};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -76,7 +78,11 @@ pub trait Decider: Send + Sync + 'static {
     fn idem(cmd: &Self::Cmd) -> Option<IdemKey>;
     /// Policy: validate against current state and emit events. No I/O.
     /// Returning no events is how read-only commands (views) work.
-    fn decide(state: &Self::State, cmd: &Self::Cmd, ctx: &DecideCtx) -> Result<Vec<Self::Event>, ApiError>;
+    fn decide(
+        state: &Self::State,
+        cmd: &Self::Cmd,
+        ctx: &DecideCtx,
+    ) -> Result<Vec<Self::Event>, ApiError>;
     /// Fold one committed event into state. Must be total.
     fn evolve(state: &mut Self::State, event: &Self::Event, meta: &EntryMeta);
     /// Build the reply from post-commit state and the committed envelopes
@@ -94,13 +100,18 @@ pub trait Service<C>: Send + Sync + 'static {
 }
 
 pub fn now() -> UnixMs {
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     UnixMs(ms)
 }
 
 fn store_error(e: rex_wave_store::StoreError) -> ApiError {
     match e {
-        rex_wave_store::StoreError::HeadMoved { .. } => ApiError::Conflict { detail: e.to_string() },
+        rex_wave_store::StoreError::HeadMoved { .. } => ApiError::Conflict {
+            detail: e.to_string(),
+        },
         other => ApiError::Internal(other.to_string()),
     }
 }

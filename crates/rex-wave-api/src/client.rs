@@ -58,12 +58,19 @@ pub trait Client: Send + Sync {
     fn me(&self) -> &Principal;
 
     /// Send one command and await its reply. The only required call path.
-    fn call_wire(&self, cmd: WireCommand) -> impl Future<Output = Result<WireReply, ApiError>> + Send;
+    fn call_wire(
+        &self,
+        cmd: WireCommand,
+    ) -> impl Future<Output = Result<WireReply, ApiError>> + Send;
 
     /// Subscribe from `from`. The daemon guarantees *no sleep-through*: it
     /// registers the live tap first, then replays the journal after `from`,
     /// then switches to live frames, de-duplicating by `(stream, seq)`.
-    fn watch(&self, interest: Interest, from: Cursor) -> impl Future<Output = Result<FrameStream, ApiError>> + Send;
+    fn watch(
+        &self,
+        interest: Interest,
+        from: Cursor,
+    ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send;
 
     /// Typed convenience over [`Client::call_wire`]. Provided once, here.
     fn call<C: Command>(&self, cmd: C) -> impl Future<Output = Result<C::Reply, ApiError>> + Send

@@ -19,8 +19,14 @@ struct ActorMsg<C> {
 type Mailbox<C> = mpsc::Sender<ActorMsg<C>>;
 
 enum RegistryMsg<C> {
-    Lookup { stream: StreamId, reply: oneshot::Sender<Mailbox<C>> },
-    Gone { stream: StreamId, incarnation: u64 },
+    Lookup {
+        stream: StreamId,
+        reply: oneshot::Sender<Mailbox<C>>,
+    },
+    Gone {
+        stream: StreamId,
+        incarnation: u64,
+    },
 }
 
 /// Spawn-on-demand actors for one decider, one per stream. Implements
@@ -42,15 +48,26 @@ impl<D: Decider> Registry<D> {
     /// passivates (drops its state and its writer claim).
     pub fn with_idle(journal: Journal, hub: Hub, idle: Duration) -> std::sync::Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let owner = RegistryTask::<D> { journal, hub, idle, me: tx.downgrade(), live: HashMap::new(), waiting: HashMap::new(), incarnations: 0 };
+        let owner = RegistryTask::<D> {
+            journal,
+            hub,
+            idle,
+            me: tx.downgrade(),
+            live: HashMap::new(),
+            waiting: HashMap::new(),
+            incarnations: 0,
+        };
         tokio::spawn(owner.run(rx));
         std::sync::Arc::new(Registry { tx })
     }
 
     async fn mailbox(&self, stream: StreamId) -> Result<Mailbox<D::Cmd>, ApiError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RegistryMsg::Lookup { stream, reply }).map_err(|_| ApiError::Internal("registry stopped".into()))?;
-        rx.await.map_err(|_| ApiError::Internal("registry dropped lookup".into()))
+        self.tx
+            .send(RegistryMsg::Lookup { stream, reply })
+            .map_err(|_| ApiError::Internal("registry stopped".into()))?;
+        rx.await
+            .map_err(|_| ApiError::Internal("registry dropped lookup".into()))
     }
 }
 
@@ -74,7 +91,8 @@ impl<D: Decider> Service<D::Cmd> for Registry<D> {
                     Err(_) => return Err(ApiError::Internal("stream actor unavailable".into())),
                 }
             }
-            rx.await.map_err(|_| ApiError::Internal("actor dropped reply".into()))?
+            rx.await
+                .map_err(|_| ApiError::Internal("actor dropped reply".into()))?
         })
     }
 }
@@ -109,8 +127,15 @@ impl<D: Decider> RegistryTask<D> {
                         let _ = reply.send(mailbox);
                     }
                 },
-                RegistryMsg::Gone { stream, incarnation } => {
-                    if self.live.get(&stream).is_some_and(|s| s.incarnation == incarnation) {
+                RegistryMsg::Gone {
+                    stream,
+                    incarnation,
+                } => {
+                    if self
+                        .live
+                        .get(&stream)
+                        .is_some_and(|s| s.incarnation == incarnation)
+                    {
                         self.live.remove(&stream);
                         if let Some(waiters) = self.waiting.remove(&stream) {
                             let mailbox = self.spawn(stream);
@@ -127,9 +152,26 @@ impl<D: Decider> RegistryTask<D> {
     fn spawn(&mut self, stream: StreamId) -> Mailbox<D::Cmd> {
         self.incarnations += 1;
         let (mailbox, inbox) = mpsc::channel(MAILBOX);
-        let gone = GoneOnDrop::<D> { registry: self.me.clone(), stream: Some(stream.clone()), incarnation: self.incarnations };
-        tokio::spawn(run_actor::<D>(stream.clone(), self.journal.clone(), self.hub.clone(), inbox, self.idle, gone));
-        self.live.insert(stream, Slot { mailbox: mailbox.clone(), incarnation: self.incarnations });
+        let gone = GoneOnDrop::<D> {
+            registry: self.me.clone(),
+            stream: Some(stream.clone()),
+            incarnation: self.incarnations,
+        };
+        tokio::spawn(run_actor::<D>(
+            stream.clone(),
+            self.journal.clone(),
+            self.hub.clone(),
+            inbox,
+            self.idle,
+            gone,
+        ));
+        self.live.insert(
+            stream,
+            Slot {
+                mailbox: mailbox.clone(),
+                incarnation: self.incarnations,
+            },
+        );
         mailbox
     }
 }
@@ -143,7 +185,10 @@ struct GoneOnDrop<D: Decider> {
 impl<D: Decider> Drop for GoneOnDrop<D> {
     fn drop(&mut self) {
         if let (Some(registry), Some(stream)) = (self.registry.upgrade(), self.stream.take()) {
-            let _ = registry.send(RegistryMsg::Gone { stream, incarnation: self.incarnation });
+            let _ = registry.send(RegistryMsg::Gone {
+                stream,
+                incarnation: self.incarnation,
+            });
         }
     }
 }
@@ -201,10 +246,17 @@ struct StreamActor<D: Decider> {
 impl<D: Decider> StreamActor<D> {
     fn rehydrate(journal: &Journal, stream: StreamId, hub: Hub) -> Result<Self, ApiError> {
         let writer = journal.claim(stream).map_err(store_error)?;
-        let mut actor = StreamActor::<D> { writer, state: D::State::default(), hub, stale: false };
+        let mut actor = StreamActor::<D> {
+            writer,
+            state: D::State::default(),
+            hub,
+            stale: false,
+        };
         let mut after = rex_wave_api::Seq::ORIGIN;
         loop {
-            let page = journal.read(actor.writer.stream(), after, REHYDRATE_PAGE).map_err(store_error)?;
+            let page = journal
+                .read(actor.writer.stream(), after, REHYDRATE_PAGE)
+                .map_err(store_error)?;
             let Some(last) = page.last() else { break };
             after = last.seq;
             for e in &page {
@@ -216,7 +268,15 @@ impl<D: Decider> StreamActor<D> {
 
     fn evolve(&mut self, e: &Envelope) {
         if let Some(event) = D::unwrap(&e.event) {
-            D::evolve(&mut self.state, event, &EntryMeta { seq: e.seq, at: e.at, by: e.by.clone() });
+            D::evolve(
+                &mut self.state,
+                event,
+                &EntryMeta {
+                    seq: e.seq,
+                    at: e.at,
+                    by: e.by.clone(),
+                },
+            );
         }
     }
 
@@ -240,10 +300,13 @@ impl<D: Decider> StreamActor<D> {
             return Ok(D::reply(&self.state, cmd, &[]));
         }
         let events = events.into_iter().map(D::wrap).collect();
-        let appended = self.writer.append(&ctx.by, ctx.at, idem.as_ref(), events).map_err(|e| {
-            self.stale = matches!(e, rex_wave_store::StoreError::HeadMoved { .. });
-            store_error(e)
-        })?;
+        let appended = self
+            .writer
+            .append(&ctx.by, ctx.at, idem.as_ref(), events)
+            .map_err(|e| {
+                self.stale = matches!(e, rex_wave_store::StoreError::HeadMoved { .. });
+                store_error(e)
+            })?;
         match appended {
             Appended::Fresh(committed) => {
                 for e in &committed {

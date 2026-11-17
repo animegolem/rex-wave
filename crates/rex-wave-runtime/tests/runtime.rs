@@ -33,7 +33,9 @@ impl Decider for ToyRooms {
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
         };
-        Ok(StreamId::Room { room: r.resolve(&ctx.by)? })
+        Ok(StreamId::Room {
+            room: r.resolve(&ctx.by)?,
+        })
     }
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
@@ -43,12 +45,20 @@ impl Decider for ToyRooms {
         }
     }
 
-    fn decide(state: &ToyRoomState, cmd: &RoomCommand, ctx: &DecideCtx) -> Result<Vec<RoomEvent>, ApiError> {
+    fn decide(
+        state: &ToyRoomState,
+        cmd: &RoomCommand,
+        ctx: &DecideCtx,
+    ) -> Result<Vec<RoomEvent>, ApiError> {
         match cmd {
             RoomCommand::RoomEnsure(c) => {
                 let id = c.room.resolve(&ctx.by)?;
                 if state.head == Seq::ORIGIN {
-                    Ok(vec![RoomEvent::Opened { id, origin: c.origin.clone().unwrap_or(RoomOrigin::Manual), topic: c.topic.clone() }])
+                    Ok(vec![RoomEvent::Opened {
+                        id,
+                        origin: c.origin.clone().unwrap_or(RoomOrigin::Manual),
+                        topic: c.topic.clone(),
+                    }])
                 } else {
                     Ok(vec![])
                 }
@@ -59,9 +69,14 @@ impl Decider for ToyRooms {
                     Some(h) => h.clone(),
                     None => Handle::parse(who.to_string().trim_start_matches('@'))?,
                 };
-                Ok(vec![RoomEvent::MemberJoined { member: who, handle }])
+                Ok(vec![RoomEvent::MemberJoined {
+                    member: who,
+                    handle,
+                }])
             }
-            RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft { member: ctx.by.clone() }]),
+            RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft {
+                member: ctx.by.clone(),
+            }]),
             RoomCommand::RoomPost(c) => {
                 let mut principals = Vec::new();
                 let mut all = false;
@@ -103,21 +118,40 @@ impl Decider for ToyRooms {
             RoomCommand::RoomEnsure(c) => WireReply::RoomEnsure(RoomInfo {
                 id: match &committed.first().map(|e| &e.stream) {
                     Some(StreamId::Room { room }) => room.clone(),
-                    _ => c.room.resolve(&Principal::System { part: SystemPart::Herald }).unwrap_or_else(|_| RoomId::Channel {
-                        scope: RoomScope::Global,
-                        name: ChannelName::parse("fallback").unwrap(),
-                    }),
+                    _ => c
+                        .room
+                        .resolve(&Principal::System {
+                            part: SystemPart::Herald,
+                        })
+                        .unwrap_or_else(|_| RoomId::Channel {
+                            scope: RoomScope::Global,
+                            name: ChannelName::parse("fallback").unwrap(),
+                        }),
                 },
                 origin: RoomOrigin::Manual,
                 topic: None,
                 head: state.head,
-                members: state.members.iter().map(|(h, p)| (h.clone(), p.clone())).collect(),
+                members: state
+                    .members
+                    .iter()
+                    .map(|(h, p)| (h.clone(), p.clone()))
+                    .collect(),
             }),
             RoomCommand::RoomPost(_) => {
-                let last = committed.last().expect("post commits or replays one envelope");
-                let StreamId::Room { room } = &last.stream else { unreachable!() };
-                let Event::Room(RoomEvent::Posted { mentions, .. }) = &last.event else { unreachable!() };
-                WireReply::RoomPost(Posted { room: room.clone(), seq: last.seq, mentions: mentions.clone() })
+                let last = committed
+                    .last()
+                    .expect("post commits or replays one envelope");
+                let StreamId::Room { room } = &last.stream else {
+                    unreachable!()
+                };
+                let Event::Room(RoomEvent::Posted { mentions, .. }) = &last.event else {
+                    unreachable!()
+                };
+                WireReply::RoomPost(Posted {
+                    room: room.clone(),
+                    seq: last.seq,
+                    mentions: mentions.clone(),
+                })
             }
             RoomCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
             RoomCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),
@@ -161,15 +195,25 @@ impl Decider for ToyInbox {
         None
     }
 
-    fn decide(state: &ToyInboxState, cmd: &InboxCommand, _ctx: &DecideCtx) -> Result<Vec<InboxEvent>, ApiError> {
+    fn decide(
+        state: &ToyInboxState,
+        cmd: &InboxCommand,
+        _ctx: &DecideCtx,
+    ) -> Result<Vec<InboxEvent>, ApiError> {
         match cmd {
             InboxCommand::InboxRaise(c) => Ok(vec![InboxEvent::Raised {
                 id: NotificationId(state.next_id + 1),
                 rank: Rank(10),
                 draft: c.draft.clone(),
             }]),
-            InboxCommand::InboxAck(c) => Ok(vec![InboxEvent::StateSet { ids: c.ids.clone(), state: c.state }]),
-            InboxCommand::InboxMarkRead(c) => Ok(vec![InboxEvent::CursorAdvanced { room: c.room.clone(), upto: c.upto }]),
+            InboxCommand::InboxAck(c) => Ok(vec![InboxEvent::StateSet {
+                ids: c.ids.clone(),
+                state: c.state,
+            }]),
+            InboxCommand::InboxMarkRead(c) => Ok(vec![InboxEvent::CursorAdvanced {
+                room: c.room.clone(),
+                upto: c.upto,
+            }]),
             InboxCommand::InboxList(_) => Ok(vec![]),
         }
     }
@@ -183,7 +227,12 @@ impl Decider for ToyInbox {
 
     fn reply(state: &ToyInboxState, cmd: InboxCommand, _: &[Envelope]) -> WireReply {
         match cmd {
-            InboxCommand::InboxList(_) => WireReply::InboxList(InboxPage { head: state.head, items: vec![], unread: 0, cursors: vec![] }),
+            InboxCommand::InboxList(_) => WireReply::InboxList(InboxPage {
+                head: state.head,
+                items: vec![],
+                unread: 0,
+                cursors: vec![],
+            }),
             InboxCommand::InboxAck(_) => WireReply::InboxAck(Ack),
             InboxCommand::InboxMarkRead(_) => WireReply::InboxMarkRead(Ack),
             InboxCommand::InboxRaise(_) => WireReply::InboxRaise(Ack),
@@ -214,7 +263,13 @@ impl Drop for LeaseDrop {
 }
 
 impl AgentFeed for LeaseCountingFeed {
-    fn page(&self, _wave: &WaveSlug, _role: &RoleName, _after: Option<BbSeq>, _limit: u32) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
+    fn page(
+        &self,
+        _wave: &WaveSlug,
+        _role: &RoleName,
+        _after: Option<BbSeq>,
+        _limit: u32,
+    ) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
         Box::pin(async {
             Ok(ThreadPageView {
                 thread: BbThreadId::parse("th_live").unwrap(),
@@ -233,15 +288,29 @@ impl AgentFeed for LeaseCountingFeed {
         let wave = wave.clone();
         let role = role.clone();
         Box::pin(async move {
-            let stream = futures_util::stream::unfold((guard, 0u64, wave, role), |(guard, n, wave, role)| async move {
-                if n == 0 {
-                    let ev = AgentEvent { seq: BbSeq(1), at: UnixMs(1), kind: AgentEventKind::TurnStarted };
-                    Some((Ok(Frame::Agent { wave: wave.clone(), role: role.clone(), event: ev }), (guard, 1, wave, role)))
-                } else {
-                    std::future::pending::<()>().await;
-                    unreachable!()
-                }
-            });
+            let stream = futures_util::stream::unfold(
+                (guard, 0u64, wave, role),
+                |(guard, n, wave, role)| async move {
+                    if n == 0 {
+                        let ev = AgentEvent {
+                            seq: BbSeq(1),
+                            at: UnixMs(1),
+                            kind: AgentEventKind::TurnStarted,
+                        };
+                        Some((
+                            Ok(Frame::Agent {
+                                wave: wave.clone(),
+                                role: role.clone(),
+                                event: ev,
+                            }),
+                            (guard, 1, wave, role),
+                        ))
+                    } else {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                },
+            );
             Ok(Box::pin(stream) as FrameStream)
         })
     }
@@ -262,54 +331,103 @@ fn harness(idle: Duration) -> (Arc<Router>, Journal, Arc<AtomicUsize>) {
             journal: journal.clone(),
             hub,
             sidebar,
-            agents: Arc::new(LeaseCountingFeed { active: leases.clone() }),
+            agents: Arc::new(LeaseCountingFeed {
+                active: leases.clone(),
+            }),
         }),
     });
     (router, journal, leases)
 }
 
 fn chan(name: &str) -> RoomRef {
-    RoomRef::Channel { scope: RoomScope::Global, name: ChannelName::parse(name).unwrap() }
+    RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse(name).unwrap(),
+    }
 }
 
 fn post(room: RoomRef, text: &str, idem: Option<&str>) -> RoomPost {
-    RoomPost { room, body: Body::parse(text).unwrap(), reply_to: None, idem: idem.map(|k| IdemKey::parse(k).unwrap()) }
+    RoomPost {
+        room,
+        body: Body::parse(text).unwrap(),
+        reply_to: None,
+        idem: idem.map(|k| IdemKey::parse(k).unwrap()),
+    }
 }
 
 #[tokio::test]
 async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
     let (router, _journal, _) = harness(Duration::from_millis(20));
-    let sol = LocalClient::new(router.clone(), Principal::Operator { seat: SeatName::parse("sol").unwrap() });
+    let sol = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("sol").unwrap(),
+        },
+    );
 
-    let p1 = sol.call(post(chan("general"), "first", None)).await.unwrap();
-    let p2 = sol.call(post(chan("general"), "second", Some("idem-2"))).await.unwrap();
-    let p2_retry = sol.call(post(chan("general"), "mutated-retry", Some("idem-2"))).await.unwrap();
+    let p1 = sol
+        .call(post(chan("general"), "first", None))
+        .await
+        .unwrap();
+    let p2 = sol
+        .call(post(chan("general"), "second", Some("idem-2")))
+        .await
+        .unwrap();
+    let p2_retry = sol
+        .call(post(chan("general"), "mutated-retry", Some("idem-2")))
+        .await
+        .unwrap();
     assert_eq!(p1.seq, Seq(1));
     assert_eq!(p2.seq, Seq(2));
-    assert_eq!(p2_retry.seq, Seq(2), "idempotent retry returns original seq");
+    assert_eq!(
+        p2_retry.seq,
+        Seq(2),
+        "idempotent retry returns original seq"
+    );
 
     tokio::time::sleep(Duration::from_millis(45)).await;
 
-    let p3 = sol.call(post(chan("general"), "after-passivation", None)).await.unwrap();
-    assert_eq!(p3.seq, Seq(3), "rehydrated actor continues from journal head");
+    let p3 = sol
+        .call(post(chan("general"), "after-passivation", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        p3.seq,
+        Seq(3),
+        "rehydrated actor continues from journal head"
+    );
 
     let page = sol
         .call(Read {
-            stream: StreamId::Room { room: RoomId::Channel { scope: RoomScope::Global, name: ChannelName::parse("general").unwrap() } },
+            stream: StreamId::Room {
+                room: RoomId::Channel {
+                    scope: RoomScope::Global,
+                    name: ChannelName::parse("general").unwrap(),
+                },
+            },
             after: Seq::ORIGIN,
             limit: None,
         })
         .await
         .unwrap();
-    assert_eq!(page.entries.iter().map(|e| e.seq.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        page.entries.iter().map(|e| e.seq.0).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 #[tokio::test]
 async fn audience_and_privacy_boundaries_hold() {
     let (router, _, _) = harness(Duration::from_secs(60));
-    let sol = Principal::Seat { seat: SeatName::parse("sol").unwrap() };
-    let astra = Principal::Seat { seat: SeatName::parse("astra").unwrap() };
-    let nodal = Principal::Seat { seat: SeatName::parse("nodal").unwrap() };
+    let sol = Principal::Seat {
+        seat: SeatName::parse("sol").unwrap(),
+    };
+    let astra = Principal::Seat {
+        seat: SeatName::parse("astra").unwrap(),
+    };
+    let nodal = Principal::Seat {
+        seat: SeatName::parse("nodal").unwrap(),
+    };
     let sol_c = LocalClient::new(router.clone(), sol.clone());
     let nodal_c = LocalClient::new(router.clone(), nodal);
 
@@ -317,7 +435,9 @@ async fn audience_and_privacy_boundaries_hold() {
         .call(InboxRaise {
             to: astra.clone(),
             draft: NotificationDraft {
-                kind: NotifyKind::Reminder { bell_id: "b1".into() },
+                kind: NotifyKind::Reminder {
+                    bell_id: "b1".into(),
+                },
                 title: "t".into(),
                 preview: "p".into(),
                 actions: vec![],
@@ -326,39 +446,90 @@ async fn audience_and_privacy_boundaries_hold() {
         })
         .await
         .unwrap_err();
-    assert!(matches!(err, ApiError::Denied { .. }), "seat cannot call System commands");
+    assert!(
+        matches!(err, ApiError::Denied { .. }),
+        "seat cannot call System commands"
+    );
 
-    assert!(matches!(sol_c.watch(Interest::Everything, Cursor::default()).await, Err(ApiError::Denied { .. })));
+    assert!(matches!(
+        sol_c.watch(Interest::Everything, Cursor::default()).await,
+        Err(ApiError::Denied { .. })
+    ));
 
-    sol_c.call(post(RoomRef::Dm { with: astra.clone() }, "secret", None)).await.unwrap();
+    sol_c
+        .call(post(
+            RoomRef::Dm {
+                with: astra.clone(),
+            },
+            "secret",
+            None,
+        ))
+        .await
+        .unwrap();
     let dm = RoomRef::Dm { with: astra }.resolve(&sol).unwrap();
-    let denied = nodal_c.call(Read { stream: StreamId::Room { room: dm }, after: Seq::ORIGIN, limit: None }).await.unwrap_err();
-    assert!(matches!(denied, ApiError::Denied { .. }), "outsider cannot read a DM");
+    let denied = nodal_c
+        .call(Read {
+            stream: StreamId::Room { room: dm },
+            after: Seq::ORIGIN,
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(denied, ApiError::Denied { .. }),
+        "outsider cannot read a DM"
+    );
 }
 
 #[tokio::test]
 async fn watch_and_wait_never_sleep_through_concurrent_commits() {
     let (router, _, _) = harness(Duration::from_secs(60));
-    let sol = LocalClient::new(router.clone(), Principal::Operator { seat: SeatName::parse("sol").unwrap() });
-    let astra_p = Principal::Seat { seat: SeatName::parse("astra").unwrap() };
+    let sol = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("sol").unwrap(),
+        },
+    );
+    let astra_p = Principal::Seat {
+        seat: SeatName::parse("astra").unwrap(),
+    };
     let astra = LocalClient::new(router.clone(), astra_p.clone());
 
-    sol.call(RoomJoin { room: chan("general"), member: Some(astra_p), handle: None }).await.unwrap();
+    sol.call(RoomJoin {
+        room: chan("general"),
+        member: Some(astra_p),
+        handle: None,
+    })
+    .await
+    .unwrap();
     for i in 1..=5 {
-        sol.call(post(chan("general"), &format!("pre-{i}"), None)).await.unwrap();
+        sol.call(post(chan("general"), &format!("pre-{i}"), None))
+            .await
+            .unwrap();
     }
 
     let writer_client = sol.clone();
     let writer = tokio::spawn(async move {
         for i in 6..=30 {
-            writer_client.call(post(chan("general"), &format!("msg-{i}"), None)).await.unwrap();
+            writer_client
+                .call(post(chan("general"), &format!("msg-{i}"), None))
+                .await
+                .unwrap();
             if i % 5 == 0 {
                 tokio::task::yield_now().await;
             }
         }
     });
 
-    let mut watch = sol.watch(Interest::Room { room: chan("general") }, Cursor::default()).await.unwrap();
+    let mut watch = sol
+        .watch(
+            Interest::Room {
+                room: chan("general"),
+            },
+            Cursor::default(),
+        )
+        .await
+        .unwrap();
     let mut seqs = Vec::new();
     while seqs.len() < 31 {
         if let Some(Ok(Frame::Committed(env))) = watch.next().await {
@@ -367,15 +538,32 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
     }
     writer.await.unwrap();
     let expected: Vec<u64> = (1..=31).collect();
-    assert_eq!(seqs, expected, "tap-before-replay-and-dedupe delivered 1..=31 with no gap or duplicate");
+    assert_eq!(
+        seqs, expected,
+        "tap-before-replay-and-dedupe delivered 1..=31 with no gap or duplicate"
+    );
 
-    let general_id = RoomId::Channel { scope: RoomScope::Global, name: ChannelName::parse("general").unwrap() };
-    let catchup = sol.call(Wait::room(general_id.clone(), Seq(28), false)).await.unwrap();
+    let general_id = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    };
+    let catchup = sol
+        .call(Wait::room(general_id.clone(), Seq(28), false))
+        .await
+        .unwrap();
     assert!(!catchup.timed_out);
-    assert_eq!(catchup.entries.iter().map(|e| e.seq.0).collect::<Vec<_>>(), vec![29, 30, 31], "Wait returns the full catch-up slice");
+    assert_eq!(
+        catchup.entries.iter().map(|e| e.seq.0).collect::<Vec<_>>(),
+        vec![29, 30, 31],
+        "Wait returns the full catch-up slice"
+    );
 
     let quiet = astra
-        .call(Wait { interest: Interest::Mentions, after: Cursor::live(), timeout_ms: Some(15) })
+        .call(Wait {
+            interest: Interest::Mentions,
+            after: Cursor::live(),
+            timeout_ms: Some(15),
+        })
         .await
         .unwrap();
     assert!(quiet.timed_out && quiet.entries.is_empty());
@@ -383,42 +571,99 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
     let wake_cursor = quiet.cursor.clone();
     let waiter = tokio::spawn({
         let astra = astra.clone();
-        async move { astra.call(Wait { interest: Interest::Mentions, after: wake_cursor, timeout_ms: Some(2000) }).await.unwrap() }
+        async move {
+            astra
+                .call(Wait {
+                    interest: Interest::Mentions,
+                    after: wake_cursor,
+                    timeout_ms: Some(2000),
+                })
+                .await
+                .unwrap()
+        }
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
-    sol.call(post(chan("general"), "unrelated noise", None)).await.unwrap();
-    sol.call(post(chan("general"), "hey @astra check this", None)).await.unwrap();
+    sol.call(post(chan("general"), "unrelated noise", None))
+        .await
+        .unwrap();
+    sol.call(post(chan("general"), "hey @astra check this", None))
+        .await
+        .unwrap();
     let woken = waiter.await.unwrap();
     assert!(!woken.timed_out);
-    assert_eq!(woken.entries.len(), 1, "only the @astra mention woke the waiter");
+    assert_eq!(
+        woken.entries.len(),
+        1,
+        "only the @astra mention woke the waiter"
+    );
 }
 
 #[tokio::test]
 async fn stage_focus_generation_cancels_prior_watch_and_releases_agent_lease() {
     let (router, _, leases) = harness(Duration::from_secs(60));
-    let sol = LocalClient::new(router, Principal::Operator { seat: SeatName::parse("sol").unwrap() });
+    let sol = LocalClient::new(
+        router,
+        Principal::Operator {
+            seat: SeatName::parse("sol").unwrap(),
+        },
+    );
 
     let mut s1 = sol
         .watch(
             Interest::Stage {
-                target: StageTarget::Agent { wave: WaveSlug::parse("auth").unwrap(), role: RoleName::parse("verifier").unwrap() },
+                target: StageTarget::Agent {
+                    wave: WaveSlug::parse("auth").unwrap(),
+                    role: RoleName::parse("verifier").unwrap(),
+                },
             },
             Cursor::live(),
         )
         .await
         .unwrap();
-    assert!(matches!(s1.next().await, Some(Ok(Frame::StageFocused { generation: FocusGeneration(1), .. }))));
-    assert!(matches!(s1.next().await, Some(Ok(Frame::Stage { generation: FocusGeneration(1), .. }))));
+    assert!(matches!(
+        s1.next().await,
+        Some(Ok(Frame::StageFocused {
+            generation: FocusGeneration(1),
+            ..
+        }))
+    ));
+    assert!(matches!(
+        s1.next().await,
+        Some(Ok(Frame::Stage {
+            generation: FocusGeneration(1),
+            ..
+        }))
+    ));
     assert_eq!(leases.load(Ordering::SeqCst), 1);
 
     let mut s2 = sol
-        .watch(Interest::Stage { target: StageTarget::Room { room: chan("general") } }, Cursor::live())
+        .watch(
+            Interest::Stage {
+                target: StageTarget::Room {
+                    room: chan("general"),
+                },
+            },
+            Cursor::live(),
+        )
         .await
         .unwrap();
-    assert!(matches!(s2.next().await, Some(Ok(Frame::StageFocused { generation: FocusGeneration(2), .. }))));
-    assert!(s1.next().await.is_none(), "opening a newer stage focus ends the older stage stream");
+    assert!(matches!(
+        s2.next().await,
+        Some(Ok(Frame::StageFocused {
+            generation: FocusGeneration(2),
+            ..
+        }))
+    ));
+    assert!(
+        s1.next().await.is_none(),
+        "opening a newer stage focus ends the older stage stream"
+    );
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(leases.load(Ordering::SeqCst), 0, "older agent lease was dropped automatically");
+    assert_eq!(
+        leases.load(Ordering::SeqCst),
+        0,
+        "older agent lease was dropped automatically"
+    );
 }
 
 struct MentionReactor;
@@ -429,15 +674,22 @@ impl Reactor for MentionReactor {
         Interest::Everything
     }
     async fn react(&mut self, frame: Frame, client: &LocalClient) -> Result<(), ApiError> {
-        if let Frame::Committed(Envelope { stream: StreamId::Room { room }, seq, event: Event::Room(RoomEvent::Posted { mentions, body, .. }), .. }) =
-            frame
+        if let Frame::Committed(Envelope {
+            stream: StreamId::Room { room },
+            seq,
+            event: Event::Room(RoomEvent::Posted { mentions, body, .. }),
+            ..
+        }) = frame
         {
             for who in mentions.principals {
                 client
                     .call(InboxRaise {
                         to: who,
                         draft: NotificationDraft {
-                            kind: NotifyKind::Mention { room: room.clone(), seq },
+                            kind: NotifyKind::Mention {
+                                room: room.clone(),
+                                seq,
+                            },
                             title: "Mention".into(),
                             preview: body.as_str().to_owned(),
                             actions: vec![],
@@ -454,24 +706,56 @@ impl Reactor for MentionReactor {
 #[tokio::test]
 async fn sidebar_projection_and_reactor_update_live() {
     let (router, _, _) = harness(Duration::from_secs(60));
-    let sol = LocalClient::new(router.clone(), Principal::Operator { seat: SeatName::parse("sol").unwrap() });
-    let astra_p = Principal::Seat { seat: SeatName::parse("astra").unwrap() };
+    let sol = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("sol").unwrap(),
+        },
+    );
+    let astra_p = Principal::Seat {
+        seat: SeatName::parse("astra").unwrap(),
+    };
     let astra = LocalClient::new(router.clone(), astra_p.clone());
 
-    let reactor_handle = spawn_reactor(MentionReactor, LocalClient::new(router.clone(), Principal::System { part: SystemPart::Herald }));
+    let reactor_handle = spawn_reactor(
+        MentionReactor,
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
 
-    let mut sidebar = astra.watch(Interest::Sidebar, Cursor::live()).await.unwrap();
-    let Some(Ok(Frame::Sidebar(initial))) = sidebar.next().await else { panic!("expected initial sidebar") };
+    let mut sidebar = astra
+        .watch(Interest::Sidebar, Cursor::live())
+        .await
+        .unwrap();
+    let Some(Ok(Frame::Sidebar(initial))) = sidebar.next().await else {
+        panic!("expected initial sidebar")
+    };
     assert_eq!(initial.inbox.unread, 0);
 
-    sol.call(RoomJoin { room: chan("general"), member: Some(astra_p), handle: None }).await.unwrap();
-    let posted = sol.call(post(chan("general"), "hello @astra", None)).await.unwrap();
+    sol.call(RoomJoin {
+        room: chan("general"),
+        member: Some(astra_p),
+        handle: None,
+    })
+    .await
+    .unwrap();
+    let posted = sol
+        .call(post(chan("general"), "hello @astra", None))
+        .await
+        .unwrap();
 
     let updated = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
                 && snap.inbox.unread == 1
-                && snap.channels.first().is_some_and(|c| c.unread == 1 && c.mentions == 1)
+                && snap
+                    .channels
+                    .first()
+                    .is_some_and(|c| c.unread == 1 && c.mentions == 1)
             {
                 break *snap;
             }
@@ -481,8 +765,20 @@ async fn sidebar_projection_and_reactor_update_live() {
     .expect("sidebar converged with unread mention + inbox item");
     assert_eq!(updated.inbox.unread, 1);
 
-    astra.call(InboxMarkRead { room: posted.room, upto: posted.seq }).await.unwrap();
-    astra.call(InboxAck { ids: vec![NotificationId(1)], state: NotifyState::Done }).await.unwrap();
+    astra
+        .call(InboxMarkRead {
+            room: posted.room,
+            upto: posted.seq,
+        })
+        .await
+        .unwrap();
+    astra
+        .call(InboxAck {
+            ids: vec![NotificationId(1)],
+            state: NotifyState::Done,
+        })
+        .await
+        .unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {

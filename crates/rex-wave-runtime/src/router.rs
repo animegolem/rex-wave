@@ -16,7 +16,10 @@ pub struct Session {
 
 impl Session {
     pub fn new(me: Principal) -> Self {
-        Session { me, stage: Arc::new(watch::channel(FocusGeneration::default()).0) }
+        Session {
+            me,
+            stage: Arc::new(watch::channel(FocusGeneration::default()).0),
+        }
     }
 
     pub fn me(&self) -> &Principal {
@@ -52,13 +55,23 @@ pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
         (Audience::Operator, by) => matches!(by, Principal::Operator { .. }),
         (Audience::Member, _) => true,
     };
-    if ok { Ok(()) } else { Err(ApiError::Denied { principal: by.to_string(), action: format!("{audience:?} command") }) }
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("{audience:?} command"),
+        })
+    }
 }
 
 impl Router {
     pub async fn dispatch(&self, by: &Principal, cmd: WireCommand) -> Result<WireReply, ApiError> {
         authorize(cmd.meta().audience, by)?;
-        let ctx = DecideCtx { by: by.clone(), at: now() };
+        let ctx = DecideCtx {
+            by: by.clone(),
+            at: now(),
+        };
         match cmd.route() {
             Routed::Room(c) => self.room.dispatch(c, ctx).await,
             Routed::Wave(c) => self.wave.dispatch(c, ctx).await,
@@ -69,7 +82,12 @@ impl Router {
         }
     }
 
-    pub async fn watch(&self, session: &Session, interest: Interest, from: Cursor) -> Result<FrameStream, ApiError> {
+    pub async fn watch(
+        &self,
+        session: &Session,
+        interest: Interest,
+        from: Cursor,
+    ) -> Result<FrameStream, ApiError> {
         self.read.watch(session.clone(), interest, from).await
     }
 }
@@ -103,7 +121,9 @@ where
         let wire: WireCommand = cmd.into();
         Box::pin(async move {
             self.client.call_wire(wire).await.map_err(|e| match e {
-                ApiError::Transport(_) => ApiError::Unavailable { family: self.family },
+                ApiError::Transport(_) => ApiError::Unavailable {
+                    family: self.family,
+                },
                 other => other,
             })
         })
@@ -120,7 +140,10 @@ pub struct LocalClient {
 
 impl LocalClient {
     pub fn new(router: Arc<Router>, me: Principal) -> Self {
-        LocalClient { router, session: Session::new(me) }
+        LocalClient {
+            router,
+            session: Session::new(me),
+        }
     }
 }
 
@@ -128,10 +151,17 @@ impl Client for LocalClient {
     fn me(&self) -> &Principal {
         self.session.me()
     }
-    fn call_wire(&self, cmd: WireCommand) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
+    fn call_wire(
+        &self,
+        cmd: WireCommand,
+    ) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
         self.router.dispatch(self.session.me(), cmd)
     }
-    fn watch(&self, interest: Interest, from: Cursor) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
+    fn watch(
+        &self,
+        interest: Interest,
+        from: Cursor,
+    ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
         self.router.watch(&self.session, interest, from)
     }
 }

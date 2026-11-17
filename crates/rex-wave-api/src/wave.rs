@@ -2,7 +2,9 @@
 //! Pure state machines live in `rex-wave-waves`; these are the shapes.
 
 use crate::board::BoardId;
-use crate::id::{BbInteractionId, BbProjectId, BbThreadId, IdemKey, ModelId, ProviderId, RoleName, Seq, WaveSlug};
+use crate::id::{
+    BbInteractionId, BbProjectId, BbThreadId, IdemKey, ModelId, ProviderId, RoleName, Seq, WaveSlug,
+};
 use crate::room::{Body, RoomId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -78,11 +80,22 @@ pub struct WaveSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum WorkerPhase {
-    Requested { attempt: u32 },
-    Live { thread: BbThreadId, activity: Activity },
-    Retiring { thread: BbThreadId },
-    Retired { thread: Option<BbThreadId> },
-    Failed { error: String },
+    Requested {
+        attempt: u32,
+    },
+    Live {
+        thread: BbThreadId,
+        activity: Activity,
+    },
+    Retiring {
+        thread: BbThreadId,
+    },
+    Retired {
+        thread: Option<BbThreadId>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 impl WorkerPhase {
@@ -93,19 +106,35 @@ impl WorkerPhase {
     /// new `WorkerRequested`.
     pub fn observe(&self, observation: &Observation) -> WorkerPhase {
         match (self, observation) {
-            (WorkerPhase::Requested { attempt }, Observation::Spawned { attempt: a, thread }) if a == attempt => {
-                WorkerPhase::Live { thread: thread.clone(), activity: Activity::Working }
+            (WorkerPhase::Requested { attempt }, Observation::Spawned { attempt: a, thread })
+                if a == attempt =>
+            {
+                WorkerPhase::Live {
+                    thread: thread.clone(),
+                    activity: Activity::Working,
+                }
             }
-            (WorkerPhase::Requested { attempt }, Observation::SpawnFailed { attempt: a, error }) if a == attempt => {
-                WorkerPhase::Failed { error: error.clone() }
-            }
+            (
+                WorkerPhase::Requested { attempt },
+                Observation::SpawnFailed { attempt: a, error },
+            ) if a == attempt => WorkerPhase::Failed {
+                error: error.clone(),
+            },
             (WorkerPhase::Live { thread, .. }, Observation::Activity { activity }) => {
-                WorkerPhase::Live { thread: thread.clone(), activity: activity.clone() }
+                WorkerPhase::Live {
+                    thread: thread.clone(),
+                    activity: activity.clone(),
+                }
             }
-            (WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread }, Observation::Archived) => {
-                WorkerPhase::Retired { thread: Some(thread.clone()) }
+            (
+                WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread },
+                Observation::Archived,
+            ) => WorkerPhase::Retired {
+                thread: Some(thread.clone()),
+            },
+            (WorkerPhase::Requested { .. }, Observation::Archived) => {
+                WorkerPhase::Retired { thread: None }
             }
-            (WorkerPhase::Requested { .. }, Observation::Archived) => WorkerPhase::Retired { thread: None },
             (phase, _) => phase.clone(),
         }
     }
@@ -113,7 +142,9 @@ impl WorkerPhase {
     /// The phase after `wave_retire_worker` or `wave_finish`.
     pub fn retiring(&self) -> WorkerPhase {
         match self {
-            WorkerPhase::Live { thread, .. } => WorkerPhase::Retiring { thread: thread.clone() },
+            WorkerPhase::Live { thread, .. } => WorkerPhase::Retiring {
+                thread: thread.clone(),
+            },
             WorkerPhase::Requested { .. } => WorkerPhase::Retired { thread: None },
             phase => phase.clone(),
         }
@@ -129,11 +160,18 @@ pub enum Activity {
     Working,
     /// Inside a `wait` tool call (zero-token park) on `room` since `since`;
     /// `room: None` is a mentions-only wait, which covers every room.
-    Parked { room: Option<RoomId>, since: Seq },
+    Parked {
+        room: Option<RoomId>,
+        since: Seq,
+    },
     /// Turn ended; needs a doorbell to run again.
     Idle,
-    Blocked { interaction: PendingInteraction },
-    Errored { error: String },
+    Blocked {
+        interaction: PendingInteraction,
+    },
+    Errored {
+        error: String,
+    },
 }
 
 /// A BB pending interaction, normalized.
@@ -174,7 +212,9 @@ pub enum InteractionResolution {
         granted_permissions: Option<GrantedPermissions>,
     },
     Deny,
-    UserAnswer { answers: BTreeMap<String, UserAnswer> },
+    UserAnswer {
+        answers: BTreeMap<String, UserAnswer>,
+    },
     PluginSubmitted {
         #[serde(default)]
         title: Option<String>,
@@ -183,7 +223,9 @@ pub enum InteractionResolution {
         #[serde(default)]
         payload: Option<serde_json::Value>,
     },
-    RequestAnswer { value: serde_json::Value },
+    RequestAnswer {
+        value: serde_json::Value,
+    },
 }
 
 /// BB `grantedPermissions`: `None` on a field means "no change to that grant".
@@ -250,12 +292,16 @@ pub fn plan_mention_wakeup(phase: &WorkerPhase, room: &RoomId) -> WakePlan {
         WorkerPhase::Live { activity, .. } => match activity {
             Activity::Working => WakePlan::Covered,
             Activity::Parked { room: None, .. } => WakePlan::Covered,
-            Activity::Parked { room: Some(parked), .. } if parked == room => WakePlan::Covered,
+            Activity::Parked {
+                room: Some(parked), ..
+            } if parked == room => WakePlan::Covered,
             Activity::Parked { .. } => WakePlan::Doorbell(SteerDeliveryMode::SteerIfActive),
             Activity::Idle => WakePlan::Doorbell(SteerDeliveryMode::Auto),
             Activity::Blocked { .. } | Activity::Errored { .. } => WakePlan::Suppress,
         },
-        WorkerPhase::Retiring { .. } | WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => WakePlan::Suppress,
+        WorkerPhase::Retiring { .. } | WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => {
+            WakePlan::Suppress
+        }
     }
 }
 
@@ -276,7 +322,6 @@ pub enum Observation {
     Activity { activity: Activity },
     Archived,
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WaveStart {
@@ -333,7 +378,6 @@ pub struct WaveView {
     pub wave: WaveSlug,
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WaveStarted {
     pub wave: WaveSlug,
@@ -355,15 +399,39 @@ pub enum WaveStatus {
     Finished { outcome: WaveOutcome },
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WaveEvent {
-    Started { spec: WaveSpec, room: RoomId, board: BoardId },
-    WorkerRequested { role: RoleName, agent: AgentSpec, brief: Body, attempt: u32 },
-    WorkerObserved { role: RoleName, observation: Observation },
-    Told { role: RoleName, body: Body, mode: SteerDeliveryMode },
-    InteractionResolved { role: RoleName, interaction: BbInteractionId, resolution: InteractionResolution },
-    WorkerRetiring { role: RoleName, reason: Option<String> },
-    Finished { outcome: WaveOutcome },
+    Started {
+        spec: WaveSpec,
+        room: RoomId,
+        board: BoardId,
+    },
+    WorkerRequested {
+        role: RoleName,
+        agent: AgentSpec,
+        brief: Body,
+        attempt: u32,
+    },
+    WorkerObserved {
+        role: RoleName,
+        observation: Observation,
+    },
+    Told {
+        role: RoleName,
+        body: Body,
+        mode: SteerDeliveryMode,
+    },
+    InteractionResolved {
+        role: RoleName,
+        interaction: BbInteractionId,
+        resolution: InteractionResolution,
+    },
+    WorkerRetiring {
+        role: RoleName,
+        reason: Option<String>,
+    },
+    Finished {
+        outcome: WaveOutcome,
+    },
 }
