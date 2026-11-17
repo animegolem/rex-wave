@@ -1,0 +1,332 @@
+use futures_core::Stream;
+use rex_wave_api::room::{RoomId, RoomRef, RoomScope};
+use rex_wave_api::*;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
+
+pub(crate) const SIDEBAR_URI: &str = "rex://sidebar";
+const DEFAULT_ROOM_READ_LIMIT: u32 = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResourceTarget {
+    Sidebar,
+    Room(RoomRef),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResourceError {
+    #[error("{0}")]
+    InvalidUri(String),
+    #[error(transparent)]
+    Api(#[from] ApiError),
+}
+
+pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
+    if uri == SIDEBAR_URI {
+        return Ok(ResourceTarget::Sidebar);
+    }
+    let Some(rest) = uri.strip_prefix("rex://room/") else {
+        return Err(ResourceError::InvalidUri(format!("unsupported resource uri: {uri}")));
+    };
+    if rest.is_empty() {
+        return Err(ResourceError::InvalidUri("room resource uri requires a room path".into()));
+    }
+
+    let raw_parts: Vec<&str> = rest.split('/').collect();
+    if raw_parts.iter().any(|p| p.is_empty()) {
+        return Err(ResourceError::InvalidUri(format!("empty path segment in resource uri: {uri}")));
+    }
+    let parts: Vec<String> = raw_parts
+        .into_iter()
+        .map(percent_decode)
+        .collect::<Result<_, _>>()
+        .map_err(ResourceError::InvalidUri)?;
+
+    let room_ref = match parts.as_slice() {
+        [name] => RoomRef::Channel {
+            scope: RoomScope::Global,
+            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
+        },
+        [kind, name] if kind == "channel" => RoomRef::Channel {
+            scope: RoomScope::Global,
+            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
+        },
+        [kind, seat] if kind == "dm" => RoomRef::Dm {
+            with: Principal::Seat {
+                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
+            },
+        },
+        [kind, sub, seat] if kind == "dm" && sub == "seat" => RoomRef::Dm {
+            with: Principal::Seat {
+                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
+            },
+        },
+        [kind, sub, seat] if kind == "dm" && sub == "operator" => RoomRef::Dm {
+            with: Principal::Operator {
+                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
+            },
+        },
+        [kind, sub, wave, role] if kind == "dm" && sub == "worker" => RoomRef::Dm {
+            with: Principal::Worker {
+                wave: WaveSlug::parse(wave).map_err(|e| ResourceError::Api(e.into()))?,
+                role: RoleName::parse(role).map_err(|e| ResourceError::Api(e.into()))?,
+            },
+        },
+        [kind, project, name] if kind == "project" => RoomRef::Channel {
+            scope: RoomScope::Project {
+                project: BbProjectId::parse(project).map_err(|e| ResourceError::Api(e.into()))?,
+            },
+            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
+        },
+        [project, name] if project != "project" => RoomRef::Channel {
+            scope: RoomScope::Project {
+                project: BbProjectId::parse(project).map_err(|e| ResourceError::Api(e.into()))?,
+            },
+            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
+        },
+        _ => return Err(ResourceError::InvalidUri(format!("unsupported room resource uri: {uri}"))),
+    };
+
+    Ok(ResourceTarget::Room(room_ref))
+}
+
+pub(crate) fn room_uri(room: &RoomId, viewer: &Principal) -> Option<(String, String)> {
+    match room {
+        RoomId::Channel { scope: RoomScope::Global, name } => {
+            Some((format!("rex://room/channel/{name}"), format!("#{name}")))
+        }
+        RoomId::Channel { scope: RoomScope::Project { project }, name } => {
+            let encoded = percent_encode_segment(project.as_str());
+            Some((format!("rex://room/project/{encoded}/{name}"), format!("#{project}/{name}")))
+        }
+        RoomId::Direct { pair } => {
+            let other = pair.other(viewer)?;
+            let uri = match other {
+                Principal::Seat { seat } => format!("rex://room/dm/seat/{seat}"),
+                Principal::Operator { seat } => format!("rex://room/dm/operator/{seat}"),
+                Principal::Worker { wave, role } => format!("rex://room/dm/worker/{wave}/{role}"),
+                Principal::System { .. } => return None,
+            };
+            Some((uri, format!("DM with {other}")))
+        }
+    }
+}
+
+pub(crate) async fn list_resources<C: Client>(client: &C) -> Result<Value, ApiError> {
+    let mut resources = vec![json!({
+        "uri": SIDEBAR_URI,
+        "name": "Sidebar",
+        "description": "Live sidebar tree: inbox badge, kanban boards, projects, wave rooms, channels, and direct messages.",
+        "mimeType": "application/json",
+    })];
+
+    match client.call(read::Sidebar {}).await {
+        Ok(snap) => {
+            let viewer = client.me();
+            for leaf in &snap.channels {
+                if let Some((uri, name)) = room_uri(&leaf.room, viewer) {
+                    resources.push(room_descriptor(uri, name, "Global channel stream."));
+                }
+            }
+            for proj in &snap.projects {
+                for leaf in &proj.channels {
+                    if let Some((uri, name)) = room_uri(&leaf.room, viewer) {
+                        resources.push(room_descriptor(uri, name, "Project channel stream."));
+                    }
+                }
+                for wave in &proj.waves {
+                    if let Some((uri, name)) = room_uri(&wave.room, viewer) {
+                        resources.push(room_descriptor(uri, name, "Wave room stream."));
+                    }
+                }
+            }
+            for dm in &snap.direct_messages {
+                if let Some((uri, name)) = room_uri(&dm.room, viewer) {
+                    resources.push(room_descriptor(uri, name, "Direct message room stream."));
+                }
+            }
+        }
+        Err(ApiError::Unavailable { .. }) => {}
+        Err(err) => return Err(err),
+    }
+
+    Ok(json!({ "resources": resources }))
+}
+
+pub(crate) fn resource_templates() -> Value {
+    json!({
+        "resourceTemplates": [
+            {
+                "uriTemplate": "rex://room/channel/{name}",
+                "name": "Global channel",
+                "description": "Journal entries for a global #channel.",
+                "mimeType": "application/json",
+            },
+            {
+                "uriTemplate": "rex://room/project/{project}/{name}",
+                "name": "Project or wave channel",
+                "description": "Journal entries for a project #channel or #wave-<slug> room.",
+                "mimeType": "application/json",
+            },
+            {
+                "uriTemplate": "rex://room/dm/seat/{seat}",
+                "name": "Direct message room",
+                "description": "Journal entries for a 1:1 DM with a seat.",
+                "mimeType": "application/json",
+            },
+        ]
+    })
+}
+
+pub(crate) async fn read_resource<C: Client>(client: &C, uri: &str) -> Result<Value, ResourceError> {
+    let text = match parse_uri(uri)? {
+        ResourceTarget::Sidebar => {
+            let snap = client.call(read::Sidebar {}).await?;
+            serde_json::to_string(&snap).map_err(|e| ApiError::Internal(e.to_string()))?
+        }
+        ResourceTarget::Room(room_ref) => {
+            let room = room_ref.resolve(client.me()).map_err(ApiError::from)?;
+            let page = client
+                .call(read::Read {
+                    stream: StreamId::Room { room },
+                    after: Seq::ORIGIN,
+                    limit: Some(DEFAULT_ROOM_READ_LIMIT),
+                })
+                .await?;
+            serde_json::to_string(&page).map_err(|e| ApiError::Internal(e.to_string()))?
+        }
+    };
+
+    Ok(json!({
+        "contents": [
+            {
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": text,
+            }
+        ]
+    }))
+}
+
+pub(crate) async fn subscribe_resource<C: Client>(
+    client: &C,
+    uri: String,
+    out_tx: mpsc::UnboundedSender<Value>,
+) -> Result<AbortHandle, ResourceError> {
+    match parse_uri(&uri)? {
+        ResourceTarget::Sidebar => {
+            // ReadSide::watch_sidebar emits the current snapshot immediately on open; capture
+            // the subscribe-time snapshot first so only real subsequent transitions notify.
+            let mut last_seen = client.call(read::Sidebar {}).await.ok();
+            let mut stream = client.watch(Interest::Sidebar, Cursor::live()).await?;
+            let handle = tokio::spawn(async move {
+                while let Some(item) = next_frame(&mut stream).await {
+                    match item {
+                        Ok(Frame::Sidebar(snap)) => {
+                            if last_seen.as_ref() == Some(snap.as_ref()) {
+                                continue;
+                            }
+                            last_seen = Some(*snap);
+                            if out_tx.send(updated_notification(&uri)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Frame::Committed(_)) => {
+                            if out_tx.send(updated_notification(&uri)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Frame::CaughtUp { .. } | Frame::Agent { .. } | Frame::StageFocused { .. } | Frame::Stage { .. }) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            Ok(handle.abort_handle())
+        }
+        ResourceTarget::Room(room_ref) => {
+            room_ref.resolve(client.me()).map_err(ApiError::from)?;
+            let mut stream = client.watch(Interest::Room { room: room_ref }, Cursor::live()).await?;
+            let handle = tokio::spawn(async move {
+                while let Some(item) = next_frame(&mut stream).await {
+                    match item {
+                        Ok(Frame::Committed(_)) => {
+                            if out_tx.send(updated_notification(&uri)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            Ok(handle.abort_handle())
+        }
+    }
+}
+
+fn room_descriptor(uri: String, name: String, description: &str) -> Value {
+    json!({
+        "uri": uri,
+        "name": name,
+        "description": description,
+        "mimeType": "application/json",
+    })
+}
+
+fn updated_notification(uri: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/resources/updated",
+        "params": { "uri": uri },
+    })
+}
+
+async fn next_frame(stream: &mut FrameStream) -> Option<Result<Frame, ApiError>> {
+    std::future::poll_fn(|cx| Stream::poll_next(stream.as_mut(), cx)).await
+}
+
+fn percent_encode_segment(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn percent_decode(seg: &str) -> Result<String, String> {
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(format!("incomplete percent-encoding in '{seg}'"));
+            }
+            let hi = hex_val(bytes[i + 1]).ok_or_else(|| format!("invalid percent-encoding in '{seg}'"))?;
+            let lo = hex_val(bytes[i + 2]).ok_or_else(|| format!("invalid percent-encoding in '{seg}'"))?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| format!("non-utf8 segment '{seg}': {e}"))
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
