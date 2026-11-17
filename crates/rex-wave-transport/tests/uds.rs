@@ -450,3 +450,114 @@ async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
         "closed socket during handshake returns Transport error: {res:?}"
     );
 }
+
+/// A reply that arrives in two pieces must survive the client starting another
+/// call between them. The client once read frames inside a `select!`, so a new
+/// request dropped the half-read frame and every later frame was read from the
+/// wrong offset.
+#[tokio::test]
+async fn reply_split_across_writes_survives_a_call_issued_mid_frame() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_json(stream: &mut tokio::net::UnixStream) -> serde_json::Value {
+        let len = stream.read_u32().await.unwrap() as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+    fn frame(value: &serde_json::Value) -> Vec<u8> {
+        let body = serde_json::to_vec(value).unwrap();
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend(body);
+        out
+    }
+    fn reply(id: u64, error: ApiError) -> Vec<u8> {
+        frame(&serde_json::json!({
+            "t": "reply",
+            "id": id,
+            "result": Err::<WireReply, ApiError>(error),
+        }))
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("stub.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+    let (half_sent_tx, half_sent_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert_eq!(read_json(&mut stream).await["t"], "hello");
+        let me = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+        stream
+            .write_all(&frame(&serde_json::json!({
+                "t": "welcome",
+                "result": Ok::<Principal, ApiError>(me),
+                "daemon": "stub",
+            })))
+            .await
+            .unwrap();
+
+        // Answer the first call with only the first half of its reply.
+        let first = read_json(&mut stream).await;
+        assert_eq!(first["t"], "call");
+        let first_reply = reply(first["id"].as_u64().unwrap(), ApiError::Timeout);
+        let (head, tail) = first_reply.split_at(first_reply.len() / 2);
+        stream.write_all(head).await.unwrap();
+        stream.flush().await.unwrap();
+        half_sent_tx.send(()).unwrap();
+
+        // The second call arrives while the client is part-way through that reply.
+        let second = read_json(&mut stream).await;
+        assert_eq!(second["t"], "call");
+        stream.write_all(tail).await.unwrap();
+        let second_reply = reply(
+            second["id"].as_u64().unwrap(),
+            ApiError::NotFound {
+                what: "second".into(),
+            },
+        );
+        stream.write_all(&second_reply).await.unwrap();
+        stream.flush().await.unwrap();
+        // Hold the socket open until the client has read both replies.
+        let _ = stream.read_u8().await;
+    });
+
+    let client = Arc::new(
+        RemoteClient::connect(Endpoint::Unix(sock), Credential::PeerUid, "split-test")
+            .await
+            .unwrap(),
+    );
+    let first_call = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .call_wire(WireCommand::Sidebar(Default::default()))
+                .await
+        }
+    });
+    half_sent_rx.await.unwrap();
+    // Let the client take the half frame off the socket before the next call.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_wire(WireCommand::Sidebar(Default::default())),
+    )
+    .await
+    .expect("second call answered");
+    let first_result = tokio::time::timeout(Duration::from_secs(5), first_call)
+        .await
+        .expect("first call answered")
+        .unwrap();
+
+    assert_eq!(first_result.unwrap_err(), ApiError::Timeout);
+    assert_eq!(
+        second_result.unwrap_err(),
+        ApiError::NotFound {
+            what: "second".into()
+        }
+    );
+    drop(client);
+    server.abort();
+}

@@ -329,10 +329,26 @@ impl Drop for UnwatchGuard {
 }
 
 async fn run_client<R: AsyncRead + Unpin + Send + 'static>(
-    mut reader: R,
+    reader: R,
     out_tx: mpsc::UnboundedSender<wire::ClientFrame>,
     mut req_rx: mpsc::UnboundedReceiver<ClientReq>,
 ) {
+    // `read_frame` is not cancel-safe: dropping it part-way through a frame
+    // loses the bytes it has already taken off the socket, and every later
+    // frame is then read from the wrong offset. Read on a task of its own and
+    // select on the channel, whose `recv` can be dropped safely.
+    let (in_tx, mut in_rx) = mpsc::channel(WATCH_BUFFER);
+    let mut reader = reader;
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let incoming = read_frame::<_, wire::ServerFrame>(&mut reader).await;
+            let last = !matches!(incoming, Ok(Some(_)));
+            if in_tx.send(incoming).await.is_err() || last {
+                break;
+            }
+        }
+    });
+
     let mut next_id = 1u64;
     let mut calls: HashMap<u64, oneshot::Sender<Result<WireReply, ApiError>>> = HashMap::new();
     let mut opening: HashMap<
@@ -376,9 +392,12 @@ async fn run_client<R: AsyncRead + Unpin + Send + 'static>(
                         break "connection writer closed".to_owned();
                     }
                 }
-                None => return,
+                None => {
+                    reader_task.abort();
+                    return;
+                }
             },
-            incoming = read_frame::<_, wire::ServerFrame>(&mut reader) => match incoming {
+            incoming = in_rx.recv() => match incoming.unwrap_or(Ok(None)) {
                 Ok(Some(wire::ServerFrame::Reply { id, result })) => {
                     if let Some(reply) = calls.remove(&id) {
                         let _ = reply.send(result);
@@ -420,6 +439,7 @@ async fn run_client<R: AsyncRead + Unpin + Send + 'static>(
         }
     };
 
+    reader_task.abort();
     let err = || ApiError::Transport(reason.clone());
     for (_, reply) in calls {
         let _ = reply.send(Err(err()));
