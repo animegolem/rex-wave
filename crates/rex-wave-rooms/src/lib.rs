@@ -38,7 +38,7 @@ pub struct RoomMessage {
     pub reply_to: Option<Seq>,
 }
 
-pub fn extract_messages(entries: &[Envelope]) -> Vec<RoomMessage> {
+fn extract_messages(entries: &[Envelope]) -> Vec<RoomMessage> {
     let mut out = Vec::new();
     for env in entries {
         if let (StreamId::Room { room }, Event::Room(RoomEvent::Posted { body, mentions, reply_to, .. })) = (&env.stream, &env.event) {
@@ -235,6 +235,19 @@ fn ensure_dm_access(pair: &PrincipalPair, by: &Principal) -> Result<(), ApiError
     }
 }
 
+fn ensure_wave_name_policy(id: &RoomId, origin: &RoomOrigin, by: &Principal) -> Result<(), ApiError> {
+    if let RoomId::Channel { name, .. } = id
+        && name.as_str().starts_with("wave-")
+        && !matches!(origin, RoomOrigin::Wave { .. })
+    {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("open reserved wave channel #{name} without wave origin"),
+        });
+    }
+    Ok(())
+}
+
 fn open_dm_events(id: RoomId, pair: &PrincipalPair, topic: Option<String>, members: &mut BTreeMap<Handle, Principal>) -> Result<Vec<RoomEvent>, ApiError> {
     let mut events = vec![RoomEvent::Opened { id, origin: RoomOrigin::Manual, topic }];
     let (a, b): (Principal, Principal) = pair.clone().into();
@@ -308,6 +321,7 @@ impl Decider for Rooms {
                     RoomId::Direct { pair } => open_dm_events(id.clone(), pair, c.topic.clone(), &mut members),
                     RoomId::Channel { .. } => {
                         let origin = c.origin.clone().unwrap_or(RoomOrigin::Manual);
+                        ensure_wave_name_policy(&id, &origin, &ctx.by)?;
                         let mut events = vec![RoomEvent::Opened { id, origin, topic: c.topic.clone() }];
                         if !matches!(ctx.by, Principal::System { .. }) {
                             let handle = unique_handle(&ctx.by, &members)?;
@@ -353,6 +367,7 @@ impl Decider for Rooms {
 
                 let mut events = Vec::new();
                 if state.opened.is_none() {
+                    ensure_wave_name_policy(&id, &RoomOrigin::Manual, &ctx.by)?;
                     events.push(RoomEvent::Opened { id, origin: RoomOrigin::Manual, topic: None });
                 }
 
@@ -430,6 +445,7 @@ impl Decider for Rooms {
                             }
                         }
                         None => {
+                            ensure_wave_name_policy(&id, &RoomOrigin::Manual, &ctx.by)?;
                             events.push(RoomEvent::Opened { id: id.clone(), origin: RoomOrigin::Manual, topic: None });
                             if !matches!(ctx.by, Principal::System { .. }) {
                                 let handle = unique_handle(&ctx.by, &members)?;

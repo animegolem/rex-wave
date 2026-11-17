@@ -58,6 +58,49 @@ fn mark_read_action(room: &room::RoomId, upto: Seq) -> NotifyAction {
     }
 }
 
+fn interaction_actions(
+    wave: &WaveSlug,
+    role: &RoleName,
+    interaction: &wave::PendingInteraction,
+) -> Vec<NotifyAction> {
+    let deny = NotifyAction {
+        label: "Deny".into(),
+        key: Some('d'),
+        run: Box::new(WireCommand::WaveResolve(wave::WaveResolve {
+            wave: wave.clone(),
+            role: role.clone(),
+            interaction: interaction.id.clone(),
+            resolution: wave::InteractionResolution::Deny,
+        })),
+    };
+    match &interaction.kind {
+        wave::InteractionKind::Permission => vec![
+            NotifyAction {
+                label: "Allow once".into(),
+                key: Some('a'),
+                run: Box::new(WireCommand::WaveResolve(wave::WaveResolve {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    interaction: interaction.id.clone(),
+                    resolution: wave::InteractionResolution::AllowOnce { granted_permissions: None },
+                })),
+            },
+            NotifyAction {
+                label: "Allow for session".into(),
+                key: Some('s'),
+                run: Box::new(WireCommand::WaveResolve(wave::WaveResolve {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    interaction: interaction.id.clone(),
+                    resolution: wave::InteractionResolution::AllowForSession { granted_permissions: None },
+                })),
+            },
+            deny,
+        ],
+        wave::InteractionKind::Question { .. } | wave::InteractionKind::Extension => vec![deny],
+    }
+}
+
 fn is_blocking_mail(item: &mail::MailboxItem) -> bool {
     matches!(item.kind.as_str(), "blocker" | "approval")
         || item.label.as_deref().is_some_and(|l| l.starts_with("[blocking]"))
@@ -87,10 +130,13 @@ pub struct HeraldView {
     operators: BTreeSet<Principal>,
     operator_seats: BTreeSet<SeatName>,
     resident_seats: BTreeSet<SeatName>,
+    blocked: BTreeMap<(WaveSlug, RoleName), (BbInteractionId, String)>,
+    cleared_interactions: Vec<(WaveSlug, RoleName, BbInteractionId, String)>,
 }
 
 impl HeraldView {
     pub fn observe(&mut self, entry: &Envelope) {
+        self.cleared_interactions.clear();
         self.record_principal(&entry.by);
 
         match (&entry.stream, &entry.event) {
@@ -118,11 +164,71 @@ impl HeraldView {
                     | room::RoomEvent::TopicSet { .. } => {}
                 }
             }
-            (StreamId::Wave { wave }, Event::Wave(wave::WaveEvent::Started { .. })) => {
-                if matches!(entry.by, Principal::Operator { .. }) {
-                    self.wave_owners.insert(wave.clone(), entry.by.clone());
+            (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
+                wave::WaveEvent::Started { .. } => {
+                    if matches!(entry.by, Principal::Operator { .. }) {
+                        self.wave_owners.insert(wave.clone(), entry.by.clone());
+                    }
                 }
-            }
+                wave::WaveEvent::WorkerObserved { role, observation } => match observation {
+                    wave::Observation::Activity {
+                        activity: wave::Activity::Blocked { interaction },
+                    } => {
+                        let key = (wave.clone(), role.clone());
+                        if let Some((old_id, old_summary)) = self.blocked.remove(&key)
+                            && old_id != interaction.id
+                        {
+                            self.cleared_interactions
+                                .push((wave.clone(), role.clone(), old_id, old_summary));
+                        }
+                        self.blocked.insert(key, (interaction.id.clone(), interaction.summary.clone()));
+                    }
+                    _ => {
+                        if let Some((old_id, old_summary)) =
+                            self.blocked.remove(&(wave.clone(), role.clone()))
+                        {
+                            self.cleared_interactions
+                                .push((wave.clone(), role.clone(), old_id, old_summary));
+                        }
+                    }
+                },
+                wave::WaveEvent::InteractionResolved { role, interaction, .. } => {
+                    let key = (wave.clone(), role.clone());
+                    let summary = match self.blocked.get(&key) {
+                        Some((id, s)) if id == interaction => {
+                            let s = s.clone();
+                            self.blocked.remove(&key);
+                            s
+                        }
+                        _ => "Resolved".into(),
+                    };
+                    self.cleared_interactions
+                        .push((wave.clone(), role.clone(), interaction.clone(), summary));
+                }
+                wave::WaveEvent::WorkerRetiring { role, .. } => {
+                    if let Some((old_id, old_summary)) =
+                        self.blocked.remove(&(wave.clone(), role.clone()))
+                    {
+                        self.cleared_interactions
+                            .push((wave.clone(), role.clone(), old_id, old_summary));
+                    }
+                }
+                wave::WaveEvent::Finished { .. } => {
+                    let keys: Vec<(WaveSlug, RoleName)> = self
+                        .blocked
+                        .keys()
+                        .filter(|(w, _)| w == wave)
+                        .cloned()
+                        .collect();
+                    for key in keys {
+                        if let Some((old_id, old_summary)) = self.blocked.remove(&key) {
+                            self.cleared_interactions
+                                .push((key.0, key.1, old_id, old_summary));
+                        }
+                    }
+                }
+                wave::WaveEvent::WorkerRequested { .. } | wave::WaveEvent::Told { .. } => {}
+            },
             _ => {}
         }
     }
@@ -189,22 +295,43 @@ impl HeraldView {
 pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, NotificationDraft)> {
     let mut out = Vec::new();
 
+    for (wave, role, interaction_id, summary) in &view.cleared_interactions {
+        for op in view.operators_for_wave(wave) {
+            out.push((
+                op,
+                NotificationDraft {
+                    kind: NotifyKind::Interaction {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        interaction: interaction_id.clone(),
+                    },
+                    title: format!("@{wave}/{role} interaction resolved"),
+                    preview: snippet(summary, 160),
+                    actions: Vec::new(),
+                    dedupe: format!("interaction:{wave}:{role}:{interaction_id}"),
+                },
+            ));
+        }
+    }
+
     match (&entry.stream, &entry.event) {
         (StreamId::Room { room }, Event::Room(room::RoomEvent::Posted { body, mentions, .. })) => match room {
             room::RoomId::Direct { pair } => {
-                let (a, b): (Principal, Principal) = pair.clone().into();
-                for recipient in [a, b] {
-                    if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
-                        out.push((
-                            recipient,
-                            NotificationDraft {
-                                kind: NotifyKind::DirectMessage { room: room.clone(), seq: entry.seq },
-                                title: format!("Direct message from {}", entry.by),
-                                preview: snippet(body.as_str(), 160),
-                                actions: vec![mark_read_action(room, entry.seq)],
-                                dedupe: format!("dm:{}:{}", room_slug(room), entry.seq.0),
-                            },
-                        ));
+                if !matches!(entry.by, Principal::System { part: SystemPart::WakeBell }) {
+                    let (a, b): (Principal, Principal) = pair.clone().into();
+                    for recipient in [a, b] {
+                        if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
+                            out.push((
+                                recipient,
+                                NotificationDraft {
+                                    kind: NotifyKind::DirectMessage { room: room.clone(), seq: entry.seq },
+                                    title: format!("Direct message from {}", entry.by),
+                                    preview: snippet(body.as_str(), 160),
+                                    actions: vec![mark_read_action(room, entry.seq)],
+                                    dedupe: format!("dm:{}:{}", room_slug(room), entry.seq.0),
+                                },
+                            ));
+                        }
                     }
                 }
             }
@@ -234,28 +361,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
         (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
             wave::WaveEvent::WorkerObserved { role, observation } => match observation {
                 wave::Observation::Activity { activity: wave::Activity::Blocked { interaction } } => {
-                    let actions = vec![
-                        NotifyAction {
-                            label: "Allow once".into(),
-                            key: Some('a'),
-                            run: Box::new(WireCommand::WaveResolve(wave::WaveResolve {
-                                wave: wave.clone(),
-                                role: role.clone(),
-                                interaction: interaction.id.clone(),
-                                resolution: wave::InteractionResolution::AllowOnce { granted_permissions: None },
-                            })),
-                        },
-                        NotifyAction {
-                            label: "Deny".into(),
-                            key: Some('d'),
-                            run: Box::new(WireCommand::WaveResolve(wave::WaveResolve {
-                                wave: wave.clone(),
-                                role: role.clone(),
-                                interaction: interaction.id.clone(),
-                                resolution: wave::InteractionResolution::Deny,
-                            })),
-                        },
-                    ];
+                    let actions = interaction_actions(wave, role, interaction);
                     for op in view.operators_for_wave(wave) {
                         out.push((
                             op,
@@ -340,7 +446,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                             title: format!("Card #{} assigned in {board}", card.no.0),
                             preview: snippet(card.title.as_str(), 160),
                             actions: Vec::new(),
-                            dedupe: format!("card-assigned:{board}:{}", card.no.0),
+                            dedupe: format!("card-assigned:{board}:{}:{}", card.no.0, card.revision.0),
                         },
                     ));
                 }
@@ -363,7 +469,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                             title: format!("Card #{} assigned in {board}", no.0),
                             preview,
                             actions: Vec::new(),
-                            dedupe: format!("card-assigned:{board}:{}", no.0),
+                            dedupe: format!("card-assigned:{board}:{}:{}", no.0, revision.0),
                         },
                     ));
                 }
@@ -520,18 +626,30 @@ impl Decider for Inbox {
     fn decide(state: &InboxState, cmd: &InboxCommand, _ctx: &DecideCtx) -> Result<Vec<InboxEvent>, ApiError> {
         match cmd {
             InboxCommand::InboxRaise(c) => {
+                let is_resolved_interaction = matches!(c.draft.kind, NotifyKind::Interaction { .. })
+                    && c.draft.actions.is_empty();
                 let fresh_rank = rank(&c.draft.kind, 0);
                 if let Some(&existing_id) = state.by_dedupe.get(&c.draft.dedupe)
                     && let Some(existing) = state.items.get(&existing_id)
                 {
-                    if drafts_equal(&existing.draft, &c.draft) {
-                        return Ok(vec![]);
+                    let mut events = Vec::new();
+                    if !drafts_equal(&existing.draft, &c.draft) {
+                        events.push(InboxEvent::Updated {
+                            id: existing_id,
+                            rank: fresh_rank,
+                            draft: c.draft.clone(),
+                        });
                     }
-                    return Ok(vec![InboxEvent::Updated {
-                        id: existing_id,
-                        rank: fresh_rank,
-                        draft: c.draft.clone(),
-                    }]);
+                    if is_resolved_interaction && existing.state != NotifyState::Done {
+                        events.push(InboxEvent::StateSet {
+                            ids: vec![existing_id],
+                            state: NotifyState::Done,
+                        });
+                    }
+                    return Ok(events);
+                }
+                if is_resolved_interaction {
+                    return Ok(vec![]);
                 }
                 let id = NotificationId(state.next_id + 1);
                 Ok(vec![InboxEvent::Raised { id, rank: fresh_rank, draft: c.draft.clone() }])
@@ -556,12 +674,32 @@ impl Decider for Inbox {
             }
 
             InboxCommand::InboxMarkRead(c) => {
+                let mut events = Vec::new();
                 let current = state.cursors.get(&c.room).copied().unwrap_or(Seq::ORIGIN);
                 if c.upto > current {
-                    Ok(vec![InboxEvent::CursorAdvanced { room: c.room.clone(), upto: c.upto }])
-                } else {
-                    Ok(vec![])
+                    events.push(InboxEvent::CursorAdvanced { room: c.room.clone(), upto: c.upto });
                 }
+                let seen_ids: Vec<NotificationId> = state
+                    .items
+                    .values()
+                    .filter(|n| {
+                        n.state == NotifyState::Unread
+                            && matches!(
+                                &n.draft.kind,
+                                NotifyKind::Mention { room, seq }
+                                    | NotifyKind::DirectMessage { room, seq }
+                                    if room == &c.room && *seq <= c.upto
+                            )
+                    })
+                    .map(|n| n.id)
+                    .collect();
+                if !seen_ids.is_empty() {
+                    events.push(InboxEvent::StateSet {
+                        ids: seen_ids,
+                        state: NotifyState::Seen,
+                    });
+                }
+                Ok(events)
             }
 
             InboxCommand::InboxList(_) => Ok(vec![]),
@@ -589,7 +727,10 @@ impl Decider for Inbox {
                 );
             }
             InboxEvent::Updated { id, rank, draft } => {
-                let prev_state = state.items.get(id).map_or(NotifyState::Unread, |n| n.state);
+                let (prev_state, prev_at) = state
+                    .items
+                    .get(id)
+                    .map_or((NotifyState::Unread, meta.at), |n| (n.state, n.at));
                 if let Some(old) = state.items.get(id)
                     && old.draft.dedupe != draft.dedupe
                 {
@@ -600,7 +741,7 @@ impl Decider for Inbox {
                     *id,
                     Notification {
                         id: *id,
-                        at: meta.at,
+                        at: prev_at,
                         rank: *rank,
                         state: prev_state,
                         draft: draft.clone(),

@@ -100,6 +100,16 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .unwrap_err();
     assert!(matches!(denied, ApiError::Denied { .. }));
 
+    let squat_denied = sol
+        .call(RoomEnsure {
+            room: wave_room.clone(),
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(squat_denied, ApiError::Denied { .. }), "wave-* names cannot be squatted as Manual");
+
     let w1 = conductor
         .call(RoomEnsure {
             room: wave_room.clone(),

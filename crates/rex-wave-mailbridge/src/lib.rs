@@ -5,6 +5,7 @@
 //! and [`BellCourier`] scheduled wake delivery.
 
 use rex_wave_api::mail::*;
+use rex_wave_api::read::Read;
 use rex_wave_api::*;
 use rex_wave_runtime::{BoxFut, DecideCtx, Hub, LocalClient, Reactor, Service, can_read};
 use rex_wave_store::{Appended, Journal, StreamWriter};
@@ -20,27 +21,52 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, broadcast};
 
 const MARKER_FILE: &str = ".rex-wave-sandbox";
+const MAX_PROMOTE_SPAN: u64 = 1_000;
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 const MAX_HTTP_BODY: usize = 128 * 1024;
+const MAX_SINK_CONNS: usize = 32;
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
-static BELL_PROMPTS: OnceLock<RwLock<BTreeMap<(SeatName, String), String>>> = OnceLock::new();
+static SANDBOX_ROOTS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
+static LIVE_BELLS: OnceLock<broadcast::Sender<(PathBuf, Envelope)>> = OnceLock::new();
 
-fn bell_store() -> &'static RwLock<BTreeMap<(SeatName, String), String>> {
-    BELL_PROMPTS.get_or_init(|| RwLock::new(BTreeMap::new()))
+fn sandbox_registry() -> &'static RwLock<Vec<PathBuf>> {
+    SANDBOX_ROOTS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-fn record_bell_prompt(seat: SeatName, bell_id: String, prompt: String) {
-    let mut guard = bell_store().write().unwrap_or_else(|e| e.into_inner());
-    guard.insert((seat, bell_id), prompt);
+fn register_sandbox_root(path: &Path) {
+    let mut guard = sandbox_registry().write().unwrap_or_else(|e| e.into_inner());
+    if !guard.iter().any(|p| p == path) {
+        guard.push(path.to_path_buf());
+    }
 }
 
-fn lookup_bell_prompt(seat: &SeatName, bell_id: &str) -> Option<String> {
-    let guard = bell_store().read().unwrap_or_else(|e| e.into_inner());
-    guard.get(&(seat.clone(), bell_id.to_owned())).cloned()
+fn live_bell_bus() -> &'static broadcast::Sender<(PathBuf, Envelope)> {
+    LIVE_BELLS.get_or_init(|| broadcast::channel(256).0)
+}
+
+fn read_bell_prompt_from_root(root: &Path, digest16: &str) -> Option<String> {
+    let path = root.join("state").join("bells").join(format!("{digest16}.json"));
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    val.get("prompt").and_then(|v| v.as_str()).map(str::to_owned)
+}
+
+fn read_bell_prompt_any_sandbox(digest16: &str) -> Option<String> {
+    let roots = sandbox_registry().read().unwrap_or_else(|e| e.into_inner()).clone();
+    for root in roots.iter().rev() {
+        if let Some(prompt) = read_bell_prompt_from_root(root, digest16) {
+            return Some(prompt);
+        }
+    }
+    None
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,7 +107,6 @@ fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
 
 fn forbidden_prod_roots() -> Vec<PathBuf> {
     let mut homes = BTreeSet::new();
-    homes.insert(PathBuf::from("/Users/golem"));
     if let Some(h) = std::env::var_os("HOME") {
         let hp = PathBuf::from(h);
         if !hp.as_os_str().is_empty() {
@@ -160,6 +185,49 @@ impl SandboxRoot {
         &self.root
     }
 
+    fn ensure_dir(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
+        let forbidden = forbidden_prod_roots();
+        let mut cur = self.root.clone();
+        for &seg in segments {
+            if seg.is_empty() || seg == "." || seg == ".." || seg.contains('/') || seg.contains('\\') {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: "sandbox directory".into(),
+                    reason: "invalid directory segment".into(),
+                }));
+            }
+            cur = cur.join(seg);
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(ApiError::Denied {
+                        principal: "mailbridge".into(),
+                        action: format!("write through symlink {}", cur.display()),
+                    });
+                }
+                Ok(m) if !m.file_type().is_dir() => {
+                    return Err(ApiError::Conflict {
+                        detail: format!("{} exists and is not a directory", cur.display()),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&cur)
+                        .map_err(|ce| ApiError::Internal(format!("mkdir {}: {ce}", cur.display())))?;
+                }
+                Err(e) => return Err(ApiError::Internal(format!("stat {}: {e}", cur.display()))),
+            }
+            let canon = fs::canonicalize(&cur)
+                .map_err(|e| ApiError::Internal(format!("canonicalize {}: {e}", cur.display())))?;
+            if check_not_production(&canon, &cur, &forbidden).is_err() || !canon.starts_with(&self.root) {
+                return Err(ApiError::Denied {
+                    principal: "mailbridge".into(),
+                    action: format!("escape sandbox via {}", cur.display()),
+                });
+            }
+            cur = canon;
+        }
+        Ok(cur)
+    }
+
     fn confine(&self, raw: &Path) -> Result<(PathBuf, String, bool), SandboxError> {
         if raw.as_os_str().is_empty()
             || raw.components().any(|c| matches!(c, Component::ParentDir))
@@ -178,6 +246,18 @@ impl SandboxRoot {
             return Err(SandboxError::Production(raw.to_path_buf()));
         }
 
+        let mut walk = self.root.clone();
+        if let Ok(rel_parts) = lex.strip_prefix(&self.root) {
+            for comp in rel_parts.components() {
+                walk.push(comp.as_os_str());
+                if let Ok(sm) = fs::symlink_metadata(&walk)
+                    && sm.file_type().is_symlink()
+                {
+                    return Err(SandboxError::Production(raw.to_path_buf()));
+                }
+            }
+        }
+
         match fs::canonicalize(&lex) {
             Ok(canon) => {
                 check_not_production(&canon, raw, &forbidden)?;
@@ -191,9 +271,11 @@ impl SandboxRoot {
                 if let Some(parent) = lex.parent()
                     && let Ok(canon_parent) = fs::canonicalize(parent)
                 {
-                    check_not_production(&canon_parent, raw, &forbidden)?;
                     if !canon_parent.starts_with(&self.root) {
                         return Err(SandboxError::Production(raw.to_path_buf()));
+                    }
+                    if let Some(fname) = lex.file_name() {
+                        check_not_production(&canon_parent.join(fname), raw, &forbidden)?;
                     }
                 }
                 let rel = relative_slash(&self.root, &lex)?;
@@ -224,7 +306,7 @@ fn relative_slash(root: &Path, target: &Path) -> Result<String, SandboxError> {
     Ok(parts.join("/"))
 }
 
-pub fn sha256_bytes(bytes: &[u8]) -> Sha256Hex {
+fn sha256_bytes(bytes: &[u8]) -> Sha256Hex {
     let mut h = Sha256::new();
     h.update(bytes);
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -245,7 +327,7 @@ pub fn wake_id(seat: &SeatName, mailbox: &str, file: &str, full_sha256: &Sha256H
     WakeId(hex[..16].to_owned())
 }
 
-pub fn unix_secs_to_iso8601_utc(secs: u64) -> String {
+fn unix_secs_to_iso8601_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hour = rem / 3_600;
@@ -337,20 +419,6 @@ fn is_valid_ts(s: &str) -> bool {
         && b.iter().enumerate().all(|(i, c)| {
             matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit()
         })
-}
-
-pub fn wake_for_letter(seat: &SeatName, mailbox: &str, file: &str, item: MailboxItem, ts: &str) -> WakeRecord {
-    let wid = wake_id(seat, mailbox, file, &item.reference.sha256);
-    WakeRecord {
-        schema: MailSchemaV1,
-        wake_id: wid,
-        event: "letter".into(),
-        to: seat.as_str().to_owned(),
-        ts: if is_valid_ts(ts) { ts.to_owned() } else { "1970-01-01T00:00:00Z".into() },
-        item,
-        count: 1,
-        unknown: 0,
-    }
 }
 
 pub fn bell_meta(wake: &WakeRecord) -> BTreeMap<String, String> {
@@ -648,16 +716,14 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
     out
 }
 
-fn is_acked_in_sandbox(root: &SandboxRoot, to_seat: &str, rel_path: &str, abs_path: &Path, sha256: &Sha256Hex) -> bool {
-    let sidecar = PathBuf::from(format!("{}.ack.json", abs_path.display()));
-    if let Ok(raw) = fs::read_to_string(&sidecar)
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-        && ack_row_matches(&val, to_seat, rel_path, sha256)
-    {
-        return true;
-    }
-
+fn is_acked_in_sandbox(root: &SandboxRoot, to_seat: &str, rel_path: &str, sha256: &Sha256Hex) -> bool {
     let acks_path = root.path().join("state/acks.jsonl");
+    let Ok(sm) = fs::symlink_metadata(&acks_path) else {
+        return false;
+    };
+    if !sm.file_type().is_file() {
+        return false;
+    }
     let Ok(contents) = fs::read_to_string(&acks_path) else {
         return false;
     };
@@ -734,7 +800,7 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         ("1970-01-01T00:00:00Z".to_owned(), "recorded".to_owned())
     };
 
-    let state = if is_acked_in_sandbox(root, &to, &rel_path, &abs_path, &sha256) {
+    let state = if is_acked_in_sandbox(root, &to, &rel_path, &sha256) {
         "acked".to_owned()
     } else {
         "open".to_owned()
@@ -775,17 +841,25 @@ fn fsync_dir(dir: &Path) -> Result<(), String> {
 }
 
 fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, ApiError> {
-    fs::create_dir_all(dir).map_err(|e| ApiError::Internal(format!("mkdir {}: {e}", dir.display())))?;
     let dest = dir.join(file_name);
-
-    if dest.exists() {
-        let existing = fs::read(&dest).map_err(|e| ApiError::Internal(format!("read {}: {e}", dest.display())))?;
-        if existing == bytes {
-            return Ok(dest);
+    match fs::symlink_metadata(&dest) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("write through symlink {}", dest.display()),
+            });
         }
-        return Err(ApiError::Conflict {
-            detail: format!("canon file {} already exists with different bytes (BoxMonotone)", dest.display()),
-        });
+        Ok(_) => {
+            let existing = fs::read(&dest).map_err(|e| ApiError::Internal(format!("read {}: {e}", dest.display())))?;
+            if existing == bytes {
+                return Ok(dest);
+            }
+            return Err(ApiError::Conflict {
+                detail: format!("canon file {} already exists with different bytes (BoxMonotone)", dest.display()),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ApiError::Internal(format!("stat {}: {e}", dest.display()))),
     }
 
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -815,6 +889,12 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
             Ok(dest)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(ApiError::Denied {
+                    principal: "mailbridge".into(),
+                    action: format!("write through symlink {}", dest.display()),
+                });
+            }
             let existing = fs::read(&dest).map_err(|re| ApiError::Internal(format!("read {}: {re}", dest.display())))?;
             if existing == bytes {
                 Ok(dest)
@@ -828,7 +908,7 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
     }
 }
 
-pub fn canonical_bell_key(schedule_id: &str, mark: &str) -> String {
+fn canonical_bell_key(schedule_id: &str, mark: &str) -> String {
     let sched = schedule_id.trim();
     let m = mark.trim();
     if m.is_empty() || sched.ends_with(&format!("@{m}")) {
@@ -884,7 +964,7 @@ pub struct MailBridge {
 
 impl MailBridge {
     pub fn new(root: SandboxRoot, reader: Journal, writer: StreamWriter) -> Self {
-        load_banked_bells(&root);
+        register_sandbox_root(root.path());
         let seen_wakes = collect_seen_wakes(&reader);
         MailBridge {
             root,
@@ -895,7 +975,7 @@ impl MailBridge {
     }
 
     pub fn with_hub(root: SandboxRoot, reader: Journal, writer: StreamWriter, hub: Hub) -> Self {
-        load_banked_bells(&root);
+        register_sandbox_root(root.path());
         let seen_wakes = collect_seen_wakes(&reader);
         MailBridge {
             root,
@@ -906,8 +986,17 @@ impl MailBridge {
     }
 
     fn publish_fresh(&self, appended: &Appended) {
-        if let (Appended::Fresh(committed), Some(hub)) = (appended, &self.hub) {
+        let Appended::Fresh(committed) = appended else {
+            return;
+        };
+        if let Some(hub) = &self.hub {
             hub.publish(committed);
+        } else {
+            for env in committed {
+                if matches!(env.event, Event::Mail(MailEvent::BellRang { .. })) {
+                    let _ = live_bell_bus().send((self.root.path().to_path_buf(), env.clone()));
+                }
+            }
         }
     }
 
@@ -932,13 +1021,20 @@ impl MailBridge {
             }));
         }
 
+        let span_u64 = req.range.last().0 - req.range.first().0 + 1;
+        if span_u64 > MAX_PROMOTE_SPAN {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "range".into(),
+                reason: format!("promotion range may span at most {MAX_PROMOTE_SPAN} seqs"),
+            }));
+        }
+
         let room_stream = StreamId::Room { room: req.room.clone() };
         can_read(&ctx.by, &room_stream)?;
 
-        let span = (req.range.last().0 - req.range.first().0 + 1) as usize;
         let entries: Vec<Envelope> = self
             .reader
-            .read(&room_stream, Seq(req.range.first().0 - 1), span)
+            .read(&room_stream, Seq(req.range.first().0 - 1), span_u64 as usize)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .into_iter()
             .filter(|e| e.seq <= req.range.last())
@@ -971,7 +1067,7 @@ impl MailBridge {
         let mut banked_letters = Vec::with_capacity(unique_seats.len());
         for seat in &unique_seats {
             let box_name = format!("to-{seat}");
-            let box_dir = self.root.path().join(&box_name);
+            let box_dir = self.root.ensure_dir(&[&box_name])?;
             let dest = atomic_write_if_absent(&box_dir, &file_name, &bytes)?;
             let item = project(&self.root, &dest, &bytes)
                 .map_err(|e| ApiError::Internal(format!("project banked letter: {e}")))?;
@@ -1040,13 +1136,7 @@ impl MailBridge {
 
         let acker_seat = match (&ctx.by, box_seat) {
             (Principal::Seat { seat }, Some(target)) if seat.as_str() == target => seat.as_str().to_owned(),
-            (Principal::Seat { .. }, Some(target)) => {
-                return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
-                    action: format!("ack letter in to-{target}"),
-                });
-            }
-            (Principal::Worker { .. }, Some(target)) => {
+            (Principal::Seat { .. } | Principal::Worker { .. }, Some(target)) => {
                 return Err(ApiError::Denied {
                     principal: ctx.by.to_string(),
                     action: format!("ack letter in to-{target}"),
@@ -1091,22 +1181,18 @@ impl MailBridge {
         });
 
         let mut st = self.state.lock().await;
-        if let Some(parent) = abs_path.parent()
-            && let Some(fname) = abs_path.file_name().and_then(|n| n.to_str())
+        let state_dir = self.root.ensure_dir(&["state"])?;
+        let acks_file = state_dir.join("acks.jsonl");
+        if let Ok(sm) = fs::symlink_metadata(&acks_file)
+            && sm.file_type().is_symlink()
         {
-            let sidecar_name = format!("{fname}.ack.json");
-            let mut sidecar_bytes = serde_json::to_vec_pretty(&ack_json)
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            sidecar_bytes.push(b'\n');
-            if !parent.join(&sidecar_name).exists() {
-                let _ = atomic_write_if_absent(parent, &sidecar_name, &sidecar_bytes)?;
-            }
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("write through symlink {}", acks_file.display()),
+            });
         }
 
-        let state_dir = self.root.path().join("state");
-        fs::create_dir_all(&state_dir).map_err(|e| ApiError::Internal(e.to_string()))?;
-        let acks_file = state_dir.join("acks.jsonl");
-        if !is_acked_in_sandbox(&self.root, &acker_seat, &rel_path, Path::new(""), &req.sha256) {
+        if !is_acked_in_sandbox(&self.root, &acker_seat, &rel_path, &req.sha256) {
             let mut f = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -1157,7 +1243,6 @@ impl MailBridge {
         let digest16 = bell_digest16(&req.seat, &canonical);
         let idem = IdemKey::parse(format!("bell:{digest16}"))?;
 
-        let bells_dir = self.root.path().join("state/bells");
         let bell_doc = serde_json::json!({
             "bell_id": canonical,
             "schedule_id": sched,
@@ -1174,10 +1259,11 @@ impl MailBridge {
             return Ok(Ack);
         }
 
-        if !bells_dir.join(format!("{digest16}.json")).exists() {
-            atomic_write_if_absent(&bells_dir, &format!("{digest16}.json"), &bell_bytes)?;
+        let bells_dir = self.root.ensure_dir(&["state", "bells"])?;
+        let bell_file = format!("{digest16}.json");
+        if !bells_dir.join(&bell_file).exists() {
+            atomic_write_if_absent(&bells_dir, &bell_file, &bell_bytes)?;
         }
-        record_bell_prompt(req.seat.clone(), canonical.clone(), body.as_str().to_owned());
 
         let appended = st
             .writer
@@ -1263,35 +1349,6 @@ impl MailBridge {
     }
 }
 
-fn load_banked_bells(root: &SandboxRoot) {
-    let bells_dir = root.path().join("state/bells");
-    let Ok(entries) = fs::read_dir(&bells_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let (Some(seat_raw), Some(bell_id), Some(prompt)) = (
-            val.get("seat").and_then(|v| v.as_str()),
-            val.get("bell_id").and_then(|v| v.as_str()),
-            val.get("prompt").and_then(|v| v.as_str()),
-        ) else {
-            continue;
-        };
-        if let Ok(seat) = SeatName::parse(seat_raw) {
-            record_bell_prompt(seat, bell_id.to_owned(), prompt.to_owned());
-        }
-    }
-}
-
 impl Service<MailCommand> for MailBridge {
     fn dispatch(&self, cmd: MailCommand, ctx: DecideCtx) -> BoxFut<'_, Result<WireReply, ApiError>> {
         Box::pin(async move {
@@ -1304,6 +1361,18 @@ impl Service<MailCommand> for MailBridge {
     }
 }
 
+fn is_loopback_host(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("[::1]") {
+        return rest.is_empty() || rest.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok());
+    }
+    let host = match trimmed.rsplit_once(':') {
+        Some((h, port)) if port.parse::<u16>().is_ok() => h,
+        _ => trimmed,
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
+}
+
 pub async fn serve_wake_bell_sink<C: Client + 'static>(addr: SocketAddr, client: C) -> std::io::Result<()> {
     if !addr.ip().is_loopback() {
         return Err(std::io::Error::new(
@@ -1312,25 +1381,20 @@ pub async fn serve_wake_bell_sink<C: Client + 'static>(addr: SocketAddr, client:
         ));
     }
     let listener = TcpListener::bind(addr).await?;
-    serve_wake_bell_listener(listener, client).await
-}
-
-pub async fn serve_wake_bell_listener<C: Client + 'static>(listener: TcpListener, client: C) -> std::io::Result<()> {
-    let local = listener.local_addr()?;
-    if !local.ip().is_loopback() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "wake-bell listener must bind a loopback address",
-        ));
-    }
     let client = Arc::new(client);
+    let sem = Arc::new(Semaphore::new(MAX_SINK_CONNS));
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
         let client = client.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = handle_wake_bell_conn(stream, client.as_ref()).await;
         });
     }
+    Ok(())
 }
 
 async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> std::io::Result<()> {
@@ -1380,14 +1444,24 @@ async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> 
     }
 
     let mut content_length = 0usize;
+    let mut content_type_json = false;
+    let mut host_ok = false;
     for line in lines {
-        if let Some((name, val)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-            && let Ok(len) = val.trim().parse::<usize>()
-        {
-            content_length = len;
+        if let Some((name, val)) = line.split_once(':') {
+            let header = name.trim();
+            if header.eq_ignore_ascii_case("content-length")
+                && let Ok(len) = val.trim().parse::<usize>()
+            {
+                content_length = len;
+            } else if header.eq_ignore_ascii_case("content-type") {
+                let media = val.split(';').next().unwrap_or("").trim();
+                content_type_json = media.eq_ignore_ascii_case("application/json");
+            } else if header.eq_ignore_ascii_case("host") {
+                host_ok = is_loopback_host(val);
+            }
         }
     }
+
     if content_length > MAX_HTTP_BODY {
         write_http_json(
             &mut stream,
@@ -1409,6 +1483,28 @@ async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> 
             Err(_) => break,
         };
         buf.extend_from_slice(&chunk[..n]);
+    }
+
+    if !host_ok {
+        write_http_json(
+            &mut stream,
+            403,
+            "Forbidden",
+            &serde_json::json!({"ok": false, "code": "forbidden_host", "detail": "Host must be loopback"}),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !content_type_json {
+        write_http_json(
+            &mut stream,
+            415,
+            "Unsupported Media Type",
+            &serde_json::json!({"ok": false, "code": "unsupported_media_type", "detail": "Content-Type must be application/json"}),
+        )
+        .await?;
+        return Ok(());
     }
 
     if buf.len() < body_offset + content_length {
@@ -1461,7 +1557,73 @@ async fn write_http_json(stream: &mut TcpStream, status: u16, reason: &str, body
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(&payload).await?;
-    stream.flush().await
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
+async fn deliver_bell_dm(
+    client: &LocalClient,
+    seat: SeatName,
+    bell_id: String,
+    preferred_root: Option<&Path>,
+) -> Result<(), ApiError> {
+    let digest16 = bell_digest16(&seat, &bell_id);
+    let idem = IdemKey::parse(format!("bell:{digest16}"))?;
+    let prompt = preferred_root
+        .and_then(|r| read_bell_prompt_from_root(r, &digest16))
+        .or_else(|| read_bell_prompt_any_sandbox(&digest16))
+        .ok_or_else(|| ApiError::NotFound {
+            what: format!("banked wake bell {bell_id} for @{seat}"),
+        })?;
+    let body = room::Body::parse(prompt)?;
+    client
+        .call(room::RoomPost {
+            room: room::RoomRef::Dm { with: Principal::Seat { seat } },
+            body,
+            reply_to: None,
+            idem: Some(idem),
+        })
+        .await?;
+    Ok(())
+}
+
+fn spawn_unhubbed_bell_listener(client: LocalClient) {
+    let mut rx = live_bell_bus().subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok((root, env)) => {
+                    let Event::Mail(MailEvent::BellRang { bell_id, seat }) = &env.event else {
+                        continue;
+                    };
+                    let Ok(page) = client
+                        .call(Read {
+                            stream: StreamId::Mail,
+                            after: Seq(env.seq.0.saturating_sub(1)),
+                            limit: Some(1),
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+                    let matches_journal = page.entries.first().is_some_and(|found| {
+                        found.seq == env.seq
+                            && found.at == env.at
+                            && matches!(
+                                &found.event,
+                                Event::Mail(MailEvent::BellRang { bell_id: b, seat: s })
+                                    if b == bell_id && s == seat
+                            )
+                    });
+                    if matches_journal {
+                        let _ = deliver_bell_dm(&client, seat.clone(), bell_id.clone(), Some(&root)).await;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 pub struct BellCourier;
@@ -1474,32 +1636,19 @@ impl Reactor for BellCourier {
     }
 
     fn react(&mut self, frame: Frame, client: &LocalClient) -> impl Future<Output = Result<(), ApiError>> + Send {
-        let delivery = match frame {
-            Frame::Committed(Envelope {
-                event: Event::Mail(MailEvent::BellRang { bell_id, seat }),
-                ..
-            }) => Some((bell_id, seat)),
-            _ => None,
-        };
         let client = client.clone();
         async move {
-            let Some((bell_id, seat)) = delivery else {
-                return Ok(());
-            };
-            let digest16 = bell_digest16(&seat, &bell_id);
-            let idem = IdemKey::parse(format!("bell:{digest16}"))?;
-            let text = lookup_bell_prompt(&seat, &bell_id)
-                .unwrap_or_else(|| format!("[wake-bell] {bell_id}"));
-            let body = room::Body::parse(text)?;
-            client
-                .call(room::RoomPost {
-                    room: room::RoomRef::Dm { with: Principal::Seat { seat } },
-                    body,
-                    reply_to: None,
-                    idem: Some(idem),
-                })
-                .await?;
-            Ok(())
+            match frame {
+                Frame::CaughtUp { .. } => {
+                    spawn_unhubbed_bell_listener(client);
+                    Ok(())
+                }
+                Frame::Committed(Envelope {
+                    event: Event::Mail(MailEvent::BellRang { bell_id, seat }),
+                    ..
+                }) => deliver_bell_dm(&client, seat, bell_id, None).await,
+                _ => Ok(()),
+            }
         }
     }
 }

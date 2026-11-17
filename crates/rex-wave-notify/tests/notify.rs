@@ -334,6 +334,10 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         vec![(mention_post.room.clone(), mention_post.seq)],
         "read cursor advances monotonically and ignores regressions"
     );
+    assert_eq!(
+        after_read.unread, 1,
+        "marking room read transitions unread mention card to Seen while keeping unread DM"
+    );
     let _ = dm_post;
 
     let wave_slug = WaveSlug::parse("auth-v2").unwrap();
@@ -449,10 +453,6 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
 
     let reply = owner.call_wire((*allow_btn.run).clone()).await.unwrap();
     assert!(matches!(reply, WireReply::WaveResolve(Ack)));
-    owner
-        .call(InboxAck { ids: vec![card.id], state: NotifyState::Done })
-        .await
-        .unwrap();
 
     bb_bridge
         .call(WaveObserve {
@@ -476,6 +476,58 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     .unwrap();
     assert_eq!(snap_working.osc7501.block_kind, None);
 
+    bb_bridge
+        .call(WaveObserve {
+            wave: wave_slug.clone(),
+            role: role.clone(),
+            observation: Observation::Activity {
+                activity: Activity::Blocked {
+                    interaction: PendingInteraction {
+                        id: BbInteractionId::parse("int_q1").unwrap(),
+                        kind: InteractionKind::Question {
+                            questions: vec![Question {
+                                id: "q1".into(),
+                                prompt: "Which branch?".into(),
+                                options: vec!["main".into()],
+                                multi: false,
+                            }],
+                        },
+                        summary: "Select target branch".into(),
+                    },
+                },
+            },
+        })
+        .await
+        .unwrap();
+
+    let q_page = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = owner.call(InboxList { include_done: false, limit: None }).await.unwrap();
+            if page.items.iter().any(|n| n.draft.dedupe.ends_with(":int_q1")) {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let q_card = q_page.items.iter().find(|n| n.draft.dedupe.ends_with(":int_q1")).unwrap();
+    assert!(q_card.draft.actions.iter().all(|a| a.key != Some('a')), "question card omits AllowOnce");
+    let q_deny = q_card.draft.actions.iter().find(|a| a.key == Some('d')).unwrap();
+    owner.call_wire((*q_deny.run).clone()).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = owner.call(InboxList { include_done: false, limit: None }).await.unwrap();
+            if !page.items.iter().any(|n| n.draft.dedupe.ends_with(":int_q1")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
     herald_task.abort();
     let replay_herald = spawn_reactor(
         Herald::new(),
@@ -485,7 +537,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     let after_replay = owner.call(InboxList { include_done: true, limit: None }).await.unwrap();
     assert_eq!(
         after_replay.items.len(),
-        2,
+        3,
         "replaying Herald from origin deduplicates cards without duplicating or reopening Done items"
     );
     let resolved_card = after_replay.items.iter().find(|n| n.id == card.id).unwrap();

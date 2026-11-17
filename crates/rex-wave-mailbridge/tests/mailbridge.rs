@@ -4,7 +4,7 @@ use rex_wave_api::room::*;
 use rex_wave_api::*;
 use rex_wave_mailbridge::{
     BellCourier, MailBridge, SandboxError, SandboxRoot, bell_meta, project, render_letter,
-    serve_wake_bell_listener, sha256_bytes, wake_for_letter, wake_id,
+    serve_wake_bell_sink, wake_id,
 };
 use rex_wave_rooms::{Rooms, room_history};
 use rex_wave_runtime::{
@@ -12,15 +12,24 @@ use rex_wave_runtime::{
     spawn_reactor,
 };
 use rex_wave_store::Journal;
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn sha256_hex(bytes: &[u8]) -> Sha256Hex {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Sha256Hex::parse(hex).unwrap()
+}
 
 struct TempSandbox {
     path: PathBuf,
@@ -57,21 +66,24 @@ fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
         Err(SandboxError::Unmarked(_))
     ));
 
-    for forbidden in [
-        "/Users/golem/agent-folder/interchange",
-        "/Users/golem/agent-folder/interchange/to-owner",
-        "/Users/golem/.local/state/carrier",
-        "/Users/golem/.local/state/carrier/index.db",
-        "/Users/golem/agent-folder/resident_memories",
-        "/Users/golem/agent-folder/resident_memories/sol",
-        "/Users/golem/agent-folder",
-        "/Users/golem",
-        "/",
-    ] {
-        let res = SandboxRoot::verify(Path::new(forbidden));
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME set"));
+    let forbidden_paths = [
+        home.join("agent-folder/interchange"),
+        home.join("agent-folder/interchange/to-owner"),
+        home.join(".local/state/carrier"),
+        home.join(".local/state/carrier/index.db"),
+        home.join("agent-folder/resident_memories"),
+        home.join("agent-folder/resident_memories/sol"),
+        home.join("agent-folder"),
+        home.clone(),
+        PathBuf::from("/"),
+    ];
+    for forbidden in &forbidden_paths {
+        let res = SandboxRoot::verify(forbidden);
         assert!(
             matches!(res, Err(SandboxError::Production(_))),
-            "expected Production rejection for {forbidden}, got {res:?}"
+            "expected Production rejection for {}, got {res:?}",
+            forbidden.display()
         );
     }
 
@@ -79,7 +91,7 @@ fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
     {
         let holder = TempSandbox::unmarked();
         let link = holder.path.join("sneaky-link");
-        std::os::unix::fs::symlink("/Users/golem/agent-folder/interchange", &link).unwrap();
+        std::os::unix::fs::symlink(home.join("agent-folder/interchange"), &link).unwrap();
         let res = SandboxRoot::verify(&link);
         assert!(
             matches!(res, Err(SandboxError::Production(_))),
@@ -94,7 +106,7 @@ fn sandbox_root_requires_marker_and_rejects_all_production_paths() {
 #[test]
 fn schema_v1_wake_id_vector_projection_and_bell_meta() {
     let bytes = b"---\nauthor: tally\nto: sonnet\ntopic: vector\nround: 1\n---\n\nhello\n";
-    let sha = sha256_bytes(bytes);
+    let sha = sha256_hex(bytes);
     assert_eq!(
         sha.as_str(),
         "d4eb1d5a086d8a07b20cb67ca85a9b28f3dde81825c006cb988b15152aa3d678"
@@ -122,7 +134,16 @@ fn schema_v1_wake_id_vector_projection_and_bell_meta() {
     assert_eq!(item.reference.path, PathBuf::from("to-sonnet/vector-r1.md"));
     assert_eq!(item.reference.sha256, sha);
 
-    let wake = wake_for_letter(&sonnet, "to-sonnet", "vector-r1.md", item, "2026-10-07T15:41:02Z");
+    let wake = WakeRecord {
+        schema: MailSchemaV1,
+        wake_id: wid,
+        event: "letter".into(),
+        to: "sonnet".into(),
+        ts: "2026-10-07T15:41:02Z".into(),
+        item,
+        count: 1,
+        unknown: 0,
+    };
     let meta = bell_meta(&wake);
     assert_eq!(meta.get("schema").map(String::as_str), Some("1"));
     assert_eq!(meta.get("event").map(String::as_str), Some("letter"));
@@ -138,8 +159,9 @@ fn schema_v1_wake_id_vector_projection_and_bell_meta() {
 }
 
 #[tokio::test]
-async fn promote_banks_before_announce_enforces_box_monotone_and_acks_exact_sha256() {
+async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_and_acks_exact_sha256() {
     let (_guard, sandbox) = TempSandbox::marked();
+    let outside = TempSandbox::unmarked();
     let journal = Journal::open(&sandbox.path().join("journal.sqlite3")).unwrap();
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
@@ -180,13 +202,13 @@ async fn promote_banks_before_announce_enforces_box_monotone_and_acks_exact_sha2
         Principal::Seat { seat: SeatName::parse("nodal").unwrap() },
     );
 
-    let wave_room = RoomRef::Channel {
+    let design_room = RoomRef::Channel {
         scope: RoomScope::Project { project: BbProjectId::parse("p_123").unwrap() },
         name: ChannelName::parse("design-review").unwrap(),
     };
     let p1 = sol
         .call(RoomPost {
-            room: wave_room.clone(),
+            room: design_room.clone(),
             body: Body::parse("Proposal: adopt natural-key RoomId.").unwrap(),
             reply_to: None,
             idem: None,
@@ -195,13 +217,47 @@ async fn promote_banks_before_announce_enforces_box_monotone_and_acks_exact_sha2
         .unwrap();
     let p2 = astra
         .call(RoomPost {
-            room: wave_room.clone(),
+            room: design_room.clone(),
             body: Body::parse("Ratified. Let's bank this ruling.").unwrap(),
             reply_to: Some(p1.seq),
             idem: None,
         })
         .await
         .unwrap();
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside.path, sandbox.path().join("to-nodal")).unwrap();
+        let escape_err = sol
+            .call(MailPromote {
+                room: p1.room.clone(),
+                range: SeqRange::new(p1.seq, p2.seq).unwrap(),
+                to: vec![SeatName::parse("nodal").unwrap()],
+                subject: "Symlink escape attempt".into(),
+                topic: "escape".into(),
+                priority: LetterPriority::Normal,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(escape_err, ApiError::Denied { .. }));
+        assert!(
+            fs::read_dir(&outside.path).unwrap().next().is_none(),
+            "symlinked box must be rejected before writing any bytes"
+        );
+    }
+
+    let huge_span = sol
+        .call(MailPromote {
+            room: p1.room.clone(),
+            range: SeqRange::new(Seq(1), Seq(5_000)).unwrap(),
+            to: vec![SeatName::parse("owner").unwrap()],
+            subject: "Oversized span".into(),
+            topic: "huge".into(),
+            priority: LetterPriority::Low,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(huge_span, ApiError::Invalid(_)));
 
     let promote_req = MailPromote {
         room: p1.room.clone(),
@@ -224,7 +280,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_and_acks_exact_sha2
 
     let letter = sol.call(promote_req.clone()).await.unwrap();
     assert_eq!(letter.path, PathBuf::from("to-owner/roomid-ruling-r1.md"));
-    assert_eq!(letter.sha256, sha256_bytes(&rendered_bytes));
+    assert_eq!(letter.sha256, sha256_hex(&rendered_bytes));
 
     let on_disk_path = sandbox.path().join(&letter.path);
     let on_disk_bytes = fs::read(&on_disk_path).unwrap();
@@ -317,8 +373,6 @@ async fn promote_banks_before_announce_enforces_box_monotone_and_acks_exact_sha2
         .await
         .unwrap();
 
-    let sidecar = PathBuf::from(format!("{}.ack.json", on_disk_path.display()));
-    assert!(sidecar.is_file(), ".ack.json receipt written beside banked letter");
     assert!(sandbox.path().join("state/acks.jsonl").is_file(), "acks.jsonl updated");
 
     let reprojected = project(&sandbox, &on_disk_path, &on_disk_bytes).unwrap();
@@ -336,16 +390,15 @@ async fn promote_banks_before_announce_enforces_box_monotone_and_acks_exact_sha2
 }
 
 #[tokio::test]
-async fn wake_bell_deduplicates_schedule_mark_and_bell_courier_delivers_seat_dm() {
+async fn wake_bell_via_three_arg_constructor_hardens_http_and_delivers_live_seat_dm() {
     let (_guard, sandbox) = TempSandbox::marked();
     let journal = Journal::open(&sandbox.path().join("bell.sqlite3")).unwrap();
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
-    let mail_service = Arc::new(MailBridge::with_hub(
+    let mail_service = Arc::new(MailBridge::new(
         sandbox,
         journal.clone(),
         journal.claim(StreamId::Mail).unwrap(),
-        hub.clone(),
     ));
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
@@ -366,20 +419,28 @@ async fn wake_bell_deduplicates_schedule_mark_and_bell_courier_delivers_seat_dm(
         Principal::System { part: SystemPart::WakeBell },
     );
     let courier_task = spawn_reactor(BellCourier, bell_client.clone());
+    tokio::time::sleep(Duration::from_millis(25)).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let sink_addr = listener.local_addr().unwrap();
-    let sink_task = tokio::spawn(serve_wake_bell_listener(listener, bell_client));
+    let sink_addr: SocketAddr = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap()
+    };
+    let sink_task = tokio::spawn(serve_wake_bell_sink(sink_addr, bell_client));
+    for _ in 0..20 {
+        if TcpStream::connect(sink_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
-    async fn post_sink(addr: std::net::SocketAddr, body: &serde_json::Value) -> (u16, serde_json::Value) {
-        let payload = serde_json::to_vec(body).unwrap();
+    async fn post_raw(addr: SocketAddr, host: &str, content_type: &str, payload: &[u8]) -> (u16, serde_json::Value) {
         let req = format!(
-            "POST /sink HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /sink HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
         );
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(req.as_bytes()).await.unwrap();
-        stream.write_all(&payload).await.unwrap();
+        stream.write_all(payload).await.unwrap();
         let mut resp = Vec::new();
         stream.read_to_end(&mut resp).await.unwrap();
         let text = String::from_utf8(resp).unwrap();
@@ -396,15 +457,22 @@ async fn wake_bell_deduplicates_schedule_mark_and_bell_courier_delivers_seat_dm(
         (code, serde_json::from_str(json_body).unwrap())
     }
 
-    let slot1 = serde_json::json!({
+    let slot1 = serde_json::to_vec(&serde_json::json!({
         "bell_id": "morning-brief",
         "seat": "sol",
         "prompt": "Summarize overnight PR queue and open blockers.",
         "fired_at": "2026-11-16T09:00",
-    });
+    }))
+    .unwrap();
+
+    let (csrf_status, _) = post_raw(sink_addr, "127.0.0.1", "text/plain", &slot1).await;
+    assert_eq!(csrf_status, 415, "non-JSON Content-Type rejected against browser form POST");
+
+    let (host_status, _) = post_raw(sink_addr, "evil.example.com", "application/json", &slot1).await;
+    assert_eq!(host_status, 403, "non-loopback Host header rejected against DNS rebinding");
 
     for _attempt in 0..3 {
-        let (status, body) = post_sink(sink_addr, &slot1).await;
+        let (status, body) = post_raw(sink_addr, "127.0.0.1", "application/json", &slot1).await;
         assert_eq!(status, 200);
         assert_eq!(body["ok"], true);
     }
@@ -429,7 +497,7 @@ async fn wake_bell_deduplicates_schedule_mark_and_bell_courier_delivers_seat_dm(
         }
     })
     .await
-    .expect("BellCourier delivered wake prompt to sol DM room");
+    .expect("BellCourier delivered live wake prompt even via 3-arg MailBridge::new");
 
     tokio::time::sleep(Duration::from_millis(40)).await;
     let after_retries = room_history(&sol, dm_with_bell.clone(), Seq::ORIGIN, Some(10))
@@ -446,13 +514,14 @@ async fn wake_bell_deduplicates_schedule_mark_and_bell_courier_delivers_seat_dm(
     );
     assert_eq!(journal.head(&StreamId::Mail).unwrap(), Seq(1));
 
-    let slot2 = serde_json::json!({
+    let slot2 = serde_json::to_vec(&serde_json::json!({
         "bell_id": "morning-brief",
         "seat": "sol",
         "prompt": "Summarize Tuesday PR queue.",
         "fired_at": "2026-11-17T09:00",
-    });
-    let (status2, _) = post_sink(sink_addr, &slot2).await;
+    }))
+    .unwrap();
+    let (status2, _) = post_raw(sink_addr, "127.0.0.1", "application/json", &slot2).await;
     assert_eq!(status2, 200);
 
     let second_delivery = tokio::time::timeout(Duration::from_secs(2), async {
