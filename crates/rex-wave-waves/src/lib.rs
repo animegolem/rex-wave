@@ -1062,28 +1062,35 @@ impl<H: AgentHost> WaveConductor<H> {
         role: &RoleName,
         thread: &BbThreadId,
     ) -> Result<(), ApiError> {
-        if let Err(e) = self.host.retire(thread).await {
-            let attempts = self.retire_attempts.entry(thread.clone()).or_insert(0);
-            *attempts += 1;
-            let attempt = *attempts;
-            if attempt < MAX_RETIRE_ATTEMPTS {
+        match self.host.retire(thread).await {
+            Ok(()) => {}
+            Err(HostError::Unreachable(msg)) => {
                 self.needs_reconcile = true;
-            } else if let Some(room) = self.view.get(wave).and_then(|st| st.room.clone()) {
-                let idem =
-                    IdemKey::parse(format!("wave:{wave}:retire-failed:{role}:{thread}")).ok();
-                let body = bounded_body(format!(
-                    "retire failed for @{role} ({thread}) after {attempt} attempts ({e})"
-                ));
-                let _ = client
-                    .call(RoomPost {
-                        room: RoomRef::Id { id: room },
-                        body,
-                        reply_to: None,
-                        idem,
-                    })
-                    .await;
+                return Err(ApiError::Transport(msg));
             }
-            return Err(ApiError::Transport(e.to_string()));
+            Err(HostError::Rejected(err)) => {
+                let attempts = self.retire_attempts.entry(thread.clone()).or_insert(0);
+                *attempts += 1;
+                let attempt = *attempts;
+                if attempt < MAX_RETIRE_ATTEMPTS {
+                    self.needs_reconcile = true;
+                } else if let Some(room) = self.view.get(wave).and_then(|st| st.room.clone()) {
+                    let idem =
+                        IdemKey::parse(format!("wave:{wave}:retire-failed:{role}:{thread}")).ok();
+                    let body = bounded_body(format!(
+                        "retire failed for @{role} ({thread}) after {attempt} attempts ({err})"
+                    ));
+                    let _ = client
+                        .call(RoomPost {
+                            room: RoomRef::Id { id: room },
+                            body,
+                            reply_to: None,
+                            idem,
+                        })
+                        .await;
+                }
+                return Err(ApiError::Transport(format!("BB rejected action: {err}")));
+            }
         }
         self.retire_attempts.remove(thread);
         client
@@ -1551,6 +1558,7 @@ mod tests {
     struct FakeHost {
         calls: Arc<Mutex<Vec<HostCall>>>,
         unreachable_role: Arc<Mutex<Option<String>>>,
+        unreachable_retire: Arc<Mutex<bool>>,
         reject_retire: Arc<Mutex<bool>>,
         retire_attempts: Arc<Mutex<u32>>,
     }
@@ -1600,6 +1608,9 @@ mod tests {
 
         async fn retire(&self, thread: &BbThreadId) -> Result<(), HostError> {
             *self.retire_attempts.lock().unwrap() += 1;
+            if *self.unreachable_retire.lock().unwrap() {
+                return Err(HostError::Unreachable("BB bridge disconnected".into()));
+            }
             if *self.reject_retire.lock().unwrap() {
                 return Err(HostError::Rejected("thread remained stopping".into()));
             }
@@ -2379,7 +2390,7 @@ mod tests {
         );
 
         *host.retire_attempts.lock().unwrap() = 0;
-        *host.reject_retire.lock().unwrap() = true;
+        *host.unreachable_retire.lock().unwrap() = true;
         block_on(op.call(WaveRetireWorker {
             wave,
             role: RoleName::parse("author").unwrap(),
@@ -2388,6 +2399,36 @@ mod tests {
         .unwrap();
         drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
         for n in 1..=4 {
+            block_on(op.call(RoomPost {
+                room: RoomRef::Id {
+                    id: started.room.clone(),
+                },
+                body: Body::parse(format!("offline frame {n}")).unwrap(),
+                reply_to: None,
+                idem: None,
+            }))
+            .unwrap();
+            drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
+        }
+        assert_eq!(
+            *host.retire_attempts.lock().unwrap(),
+            5,
+            "Unreachable retire keeps retrying beyond MAX_RETIRE_ATTEMPTS without burning the rejection cap"
+        );
+        let failure_idem =
+            IdemKey::parse("wave:auth-v2:retire-failed:author:th_auth-v2_author_1").unwrap();
+        assert!(
+            !bus.lock()
+                .unwrap()
+                .room_posts
+                .contains_key(&(started.room.clone(), failure_idem.clone())),
+            "transient Unreachable must not post a permanent retire-failed notice"
+        );
+
+        *host.unreachable_retire.lock().unwrap() = false;
+        *host.retire_attempts.lock().unwrap() = 0;
+        *host.reject_retire.lock().unwrap() = true;
+        for n in 1..=5 {
             block_on(op.call(RoomPost {
                 room: RoomRef::Id {
                     id: started.room.clone(),
@@ -2402,10 +2443,8 @@ mod tests {
         assert_eq!(
             *host.retire_attempts.lock().unwrap(),
             MAX_RETIRE_ATTEMPTS,
-            "stuck retire stops retrying after MAX_RETIRE_ATTEMPTS so chat frames do not stall"
+            "stuck Rejected retire stops retrying after MAX_RETIRE_ATTEMPTS so chat frames do not stall"
         );
-        let failure_idem =
-            IdemKey::parse("wave:auth-v2:retire-failed:author:th_auth-v2_author_1").unwrap();
         assert!(
             bus.lock()
                 .unwrap()
