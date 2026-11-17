@@ -390,15 +390,24 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 }
 
 #[tokio::test]
-async fn wake_bell_via_three_arg_constructor_hardens_http_and_delivers_live_seat_dm() {
+async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm() {
+    let (_compat_guard, compat_sandbox) = TempSandbox::marked();
+    let compat_journal = Journal::in_memory().unwrap();
+    let _compat = MailBridge::new(
+        compat_sandbox,
+        compat_journal.clone(),
+        compat_journal.claim(StreamId::Mail).unwrap(),
+    );
+
     let (_guard, sandbox) = TempSandbox::marked();
     let journal = Journal::open(&sandbox.path().join("bell.sqlite3")).unwrap();
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
-    let mail_service = Arc::new(MailBridge::new(
+    let mail_service = Arc::new(MailBridge::with_hub(
         sandbox,
         journal.clone(),
         journal.claim(StreamId::Mail).unwrap(),
+        hub.clone(),
     ));
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
@@ -419,19 +428,29 @@ async fn wake_bell_via_three_arg_constructor_hardens_http_and_delivers_live_seat
         Principal::System { part: SystemPart::WakeBell },
     );
     let courier_task = spawn_reactor(BellCourier, bell_client.clone());
-    tokio::time::sleep(Duration::from_millis(25)).await;
 
-    let sink_addr: SocketAddr = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap()
-    };
-    let sink_task = tokio::spawn(serve_wake_bell_sink(sink_addr, bell_client));
-    for _ in 0..20 {
-        if TcpStream::connect(sink_addr).await.is_ok() {
-            break;
+    let (sink_addr, sink_task) = loop {
+        let candidate: SocketAddr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        let task = tokio::spawn(serve_wake_bell_sink(candidate, bell_client.clone()));
+        let mut connected = false;
+        for _ in 0..20 {
+            if TcpStream::connect(candidate).await.is_ok() {
+                connected = true;
+                break;
+            }
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        if connected {
+            break (candidate, task);
+        }
+        task.abort();
+    };
 
     async fn post_raw(addr: SocketAddr, host: &str, content_type: &str, payload: &[u8]) -> (u16, serde_json::Value) {
         let req = format!(

@@ -5,7 +5,6 @@
 //! and [`BellCourier`] scheduled wake delivery.
 
 use rex_wave_api::mail::*;
-use rex_wave_api::read::Read;
 use rex_wave_api::*;
 use rex_wave_runtime::{BoxFut, DecideCtx, Hub, LocalClient, Reactor, Service, can_read};
 use rex_wave_store::{Appended, Journal, StreamWriter};
@@ -21,7 +20,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore, broadcast};
+use tokio::sync::{Mutex, Semaphore};
 
 const MARKER_FILE: &str = ".rex-wave-sandbox";
 const MAX_PROMOTE_SPAN: u64 = 1_000;
@@ -31,7 +30,6 @@ const MAX_SINK_CONNS: usize = 32;
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 static SANDBOX_ROOTS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
-static LIVE_BELLS: OnceLock<broadcast::Sender<(PathBuf, Envelope)>> = OnceLock::new();
 
 fn sandbox_registry() -> &'static RwLock<Vec<PathBuf>> {
     SANDBOX_ROOTS.get_or_init(|| RwLock::new(Vec::new()))
@@ -44,16 +42,28 @@ fn register_sandbox_root(path: &Path) {
     }
 }
 
-fn live_bell_bus() -> &'static broadcast::Sender<(PathBuf, Envelope)> {
-    LIVE_BELLS.get_or_init(|| broadcast::channel(256).0)
+fn regular_file_without_symlinks(root: &Path, segments: &[&str]) -> Option<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for (idx, seg) in segments.iter().enumerate() {
+        cur.push(seg);
+        let meta = fs::symlink_metadata(&cur).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        if idx + 1 < segments.len() {
+            if !meta.file_type().is_dir() {
+                return None;
+            }
+        } else if !meta.file_type().is_file() {
+            return None;
+        }
+    }
+    Some(cur)
 }
 
 fn read_bell_prompt_from_root(root: &Path, digest16: &str) -> Option<String> {
-    let path = root.join("state").join("bells").join(format!("{digest16}.json"));
-    let meta = fs::symlink_metadata(&path).ok()?;
-    if !meta.file_type().is_file() {
-        return None;
-    }
+    let fname = format!("{digest16}.json");
+    let path = regular_file_without_symlinks(root, &["state", "bells", &fname])?;
     let raw = fs::read_to_string(&path).ok()?;
     let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
     val.get("prompt").and_then(|v| v.as_str()).map(str::to_owned)
@@ -717,13 +727,9 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
 }
 
 fn is_acked_in_sandbox(root: &SandboxRoot, to_seat: &str, rel_path: &str, sha256: &Sha256Hex) -> bool {
-    let acks_path = root.path().join("state/acks.jsonl");
-    let Ok(sm) = fs::symlink_metadata(&acks_path) else {
+    let Some(acks_path) = regular_file_without_symlinks(root.path(), &["state", "acks.jsonl"]) else {
         return false;
     };
-    if !sm.file_type().is_file() {
-        return false;
-    }
     let Ok(contents) = fs::read_to_string(&acks_path) else {
         return false;
     };
@@ -963,6 +969,8 @@ pub struct MailBridge {
 }
 
 impl MailBridge {
+    /// Without a [`Hub`], committed `Mail` entries persist for replay and `Read` only;
+    /// live daemons pass a [`Hub`] via [`MailBridge::with_hub`].
     pub fn new(root: SandboxRoot, reader: Journal, writer: StreamWriter) -> Self {
         register_sandbox_root(root.path());
         let seen_wakes = collect_seen_wakes(&reader);
@@ -986,17 +994,8 @@ impl MailBridge {
     }
 
     fn publish_fresh(&self, appended: &Appended) {
-        let Appended::Fresh(committed) = appended else {
-            return;
-        };
-        if let Some(hub) = &self.hub {
+        if let (Appended::Fresh(committed), Some(hub)) = (appended, &self.hub) {
             hub.publish(committed);
-        } else {
-            for env in committed {
-                if matches!(env.event, Event::Mail(MailEvent::BellRang { .. })) {
-                    let _ = live_bell_bus().send((self.root.path().to_path_buf(), env.clone()));
-                }
-            }
         }
     }
 
@@ -1391,7 +1390,11 @@ pub async fn serve_wake_bell_sink<C: Client + 'static>(addr: SocketAddr, client:
         let client = client.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = handle_wake_bell_conn(stream, client.as_ref()).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                handle_wake_bell_conn(stream, client.as_ref()),
+            )
+            .await;
         });
     }
     Ok(())
@@ -1565,16 +1568,12 @@ async fn deliver_bell_dm(
     client: &LocalClient,
     seat: SeatName,
     bell_id: String,
-    preferred_root: Option<&Path>,
 ) -> Result<(), ApiError> {
     let digest16 = bell_digest16(&seat, &bell_id);
     let idem = IdemKey::parse(format!("bell:{digest16}"))?;
-    let prompt = preferred_root
-        .and_then(|r| read_bell_prompt_from_root(r, &digest16))
-        .or_else(|| read_bell_prompt_any_sandbox(&digest16))
-        .ok_or_else(|| ApiError::NotFound {
-            what: format!("banked wake bell {bell_id} for @{seat}"),
-        })?;
+    let prompt = read_bell_prompt_any_sandbox(&digest16).ok_or_else(|| ApiError::NotFound {
+        what: format!("banked wake bell {bell_id} for @{seat}"),
+    })?;
     let body = room::Body::parse(prompt)?;
     client
         .call(room::RoomPost {
@@ -1585,45 +1584,6 @@ async fn deliver_bell_dm(
         })
         .await?;
     Ok(())
-}
-
-fn spawn_unhubbed_bell_listener(client: LocalClient) {
-    let mut rx = live_bell_bus().subscribe();
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok((root, env)) => {
-                    let Event::Mail(MailEvent::BellRang { bell_id, seat }) = &env.event else {
-                        continue;
-                    };
-                    let Ok(page) = client
-                        .call(Read {
-                            stream: StreamId::Mail,
-                            after: Seq(env.seq.0.saturating_sub(1)),
-                            limit: Some(1),
-                        })
-                        .await
-                    else {
-                        break;
-                    };
-                    let matches_journal = page.entries.first().is_some_and(|found| {
-                        found.seq == env.seq
-                            && found.at == env.at
-                            && matches!(
-                                &found.event,
-                                Event::Mail(MailEvent::BellRang { bell_id: b, seat: s })
-                                    if b == bell_id && s == seat
-                            )
-                    });
-                    if matches_journal {
-                        let _ = deliver_bell_dm(&client, seat.clone(), bell_id.clone(), Some(&root)).await;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
 }
 
 pub struct BellCourier;
@@ -1639,14 +1599,10 @@ impl Reactor for BellCourier {
         let client = client.clone();
         async move {
             match frame {
-                Frame::CaughtUp { .. } => {
-                    spawn_unhubbed_bell_listener(client);
-                    Ok(())
-                }
                 Frame::Committed(Envelope {
                     event: Event::Mail(MailEvent::BellRang { bell_id, seat }),
                     ..
-                }) => deliver_bell_dm(&client, seat, bell_id, None).await,
+                }) => deliver_bell_dm(&client, seat, bell_id).await,
                 _ => Ok(()),
             }
         }

@@ -317,21 +317,19 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
     match (&entry.stream, &entry.event) {
         (StreamId::Room { room }, Event::Room(room::RoomEvent::Posted { body, mentions, .. })) => match room {
             room::RoomId::Direct { pair } => {
-                if !matches!(entry.by, Principal::System { part: SystemPart::WakeBell }) {
-                    let (a, b): (Principal, Principal) = pair.clone().into();
-                    for recipient in [a, b] {
-                        if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
-                            out.push((
-                                recipient,
-                                NotificationDraft {
-                                    kind: NotifyKind::DirectMessage { room: room.clone(), seq: entry.seq },
-                                    title: format!("Direct message from {}", entry.by),
-                                    preview: snippet(body.as_str(), 160),
-                                    actions: vec![mark_read_action(room, entry.seq)],
-                                    dedupe: format!("dm:{}:{}", room_slug(room), entry.seq.0),
-                                },
-                            ));
-                        }
+                let (a, b): (Principal, Principal) = pair.clone().into();
+                for recipient in [a, b] {
+                    if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
+                        out.push((
+                            recipient,
+                            NotificationDraft {
+                                kind: NotifyKind::DirectMessage { room: room.clone(), seq: entry.seq },
+                                title: format!("Direct message from {}", entry.by),
+                                preview: snippet(body.as_str(), 160),
+                                actions: vec![mark_read_action(room, entry.seq)],
+                                dedupe: format!("dm:{}:{}", room_slug(room), entry.seq.0),
+                            },
+                        ));
                     }
                 }
             }
@@ -534,21 +532,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     }
                 }
             }
-            mail::MailEvent::BellRang { bell_id, seat } => {
-                for to in view.principals_for_seat(seat) {
-                    out.push((
-                        to,
-                        NotificationDraft {
-                            kind: NotifyKind::Reminder { bell_id: bell_id.clone() },
-                            title: format!("Wake bell {bell_id}"),
-                            preview: format!("Scheduled wake bell for @{seat}"),
-                            actions: Vec::new(),
-                            dedupe: format!("bell:{seat}:{bell_id}"),
-                        },
-                    ));
-                }
-            }
-            mail::MailEvent::Acked { .. } => {}
+            mail::MailEvent::BellRang { .. } | mail::MailEvent::Acked { .. } => {}
         },
 
         _ => {}
@@ -632,6 +616,11 @@ impl Decider for Inbox {
                 if let Some(&existing_id) = state.by_dedupe.get(&c.draft.dedupe)
                     && let Some(existing) = state.items.get(&existing_id)
                 {
+                    if matches!(c.draft.kind, NotifyKind::Interaction { .. })
+                        && matches!(existing.state, NotifyState::Done | NotifyState::Dismissed)
+                    {
+                        return Ok(vec![]);
+                    }
                     let mut events = Vec::new();
                     if !drafts_equal(&existing.draft, &c.draft) {
                         events.push(InboxEvent::Updated {

@@ -528,6 +528,51 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     .await
     .unwrap();
 
+    let wake_bell_sys = LocalClient::new(
+        router.clone(),
+        Principal::System { part: SystemPart::WakeBell },
+    );
+    let bell_rang = mail_writer
+        .append(
+            wake_bell_sys.me(),
+            UnixMs(1_700_000_001_000),
+            None,
+            vec![Event::Mail(MailEvent::BellRang {
+                bell_id: "daily@2026-11-16T09:00".into(),
+                seat: SeatName::parse("sol").unwrap(),
+            })],
+        )
+        .unwrap();
+    hub.publish(bell_rang.envelopes());
+    wake_bell_sys
+        .call(RoomPost {
+            room: RoomRef::Dm {
+                with: Principal::Seat { seat: SeatName::parse("sol").unwrap() },
+            },
+            body: Body::parse("Scheduled check-in").unwrap(),
+            reply_to: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let sol_after_bell = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = sol.call(InboxList { include_done: true, limit: None }).await.unwrap();
+            if !page.items.is_empty() {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let sol_settled = sol.call(InboxList { include_done: true, limit: None }).await.unwrap();
+    assert_eq!(sol_settled.items.len(), 1, "wake bell raises exactly one DM card without duplicate Reminder");
+    assert!(matches!(sol_after_bell.items[0].draft.kind, NotifyKind::DirectMessage { .. }));
+
+    let pre_replay = owner.call(InboxList { include_done: true, limit: None }).await.unwrap();
     herald_task.abort();
     let replay_herald = spawn_reactor(
         Herald::new(),
@@ -535,6 +580,11 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     );
     tokio::time::sleep(Duration::from_millis(80)).await;
     let after_replay = owner.call(InboxList { include_done: true, limit: None }).await.unwrap();
+    assert_eq!(
+        after_replay.head,
+        pre_replay.head,
+        "replaying Herald appends zero journal rows onto resolved interactions or existing cards"
+    );
     assert_eq!(
         after_replay.items.len(),
         3,
