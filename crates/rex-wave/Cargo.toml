@@ -25,7 +25,7 @@ rex-wave-transport.workspace = true
 rex-wave-mcp.workspace = true
 rex-wave-tui.workspace = true
 clap.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 
 [lints]
