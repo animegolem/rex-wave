@@ -73,6 +73,7 @@ struct WorkerRecord {
     agent: AgentSpec,
     brief: Body,
     phase: WorkerPhase,
+    resolved_interaction: Option<(BbInteractionId, InteractionResolution)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -245,6 +246,16 @@ impl Decider for Waves {
                                 ),
                             });
                         }
+                        if let Some((prev_id, prev_res)) = &rec.resolved_interaction
+                            && prev_id == &c.interaction
+                        {
+                            if prev_res == &c.resolution {
+                                return Ok(vec![]);
+                            }
+                            return Err(ApiError::Conflict {
+                                detail: format!("interaction {} was already resolved for @{}/{}", c.interaction, c.wave, c.role),
+                            });
+                        }
                         Ok(vec![WaveEvent::InteractionResolved {
                             role: c.role.clone(),
                             interaction: c.interaction.clone(),
@@ -329,26 +340,35 @@ impl Decider for Waves {
                         agent: agent.clone(),
                         brief: brief.clone(),
                         phase: WorkerPhase::Requested { attempt: *attempt },
+                        resolved_interaction: None,
                     },
                 );
             }
             WaveEvent::WorkerObserved { role, observation } => {
                 if let Some(rec) = state.workers.get_mut(role) {
                     rec.phase = rec.phase.observe(observation);
+                    rec.resolved_interaction = None;
                 }
             }
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = state.workers.get_mut(role) {
                     rec.phase = rec.phase.retiring();
+                    rec.resolved_interaction = None;
                 }
             }
             WaveEvent::Finished { outcome } => {
                 state.status = Some(WaveStatus::Finished { outcome: outcome.clone() });
                 for rec in state.workers.values_mut() {
                     rec.phase = rec.phase.retiring();
+                    rec.resolved_interaction = None;
                 }
             }
-            WaveEvent::Told { .. } | WaveEvent::InteractionResolved { .. } => {}
+            WaveEvent::InteractionResolved { role, interaction, resolution } => {
+                if let Some(rec) = state.workers.get_mut(role) {
+                    rec.resolved_interaction = Some((interaction.clone(), resolution.clone()));
+                }
+            }
+            WaveEvent::Told { .. } => {}
         }
     }
 
@@ -548,6 +568,13 @@ impl<H: AgentHost> WaveConductor<H> {
                 match &rec.phase {
                     WorkerPhase::Requested { attempt } => {
                         self.spawn_worker(client, spec, &room, role, rec, *attempt).await?;
+                    }
+                    WorkerPhase::Live { thread, activity: Activity::Blocked { interaction } } => {
+                        if let Some((resolved_id, resolution)) = &rec.resolved_interaction
+                            && resolved_id == &interaction.id
+                        {
+                            map_host_action(self.host.resolve_interaction(thread, resolved_id, resolution).await)?;
+                        }
                     }
                     WorkerPhase::Retiring { thread } => {
                         self.retire_worker(client, &wave, role, thread).await?;
@@ -1397,8 +1424,6 @@ mod tests {
         let author = RoleName::parse("author").unwrap();
         let verifier = RoleName::parse("verifier").unwrap();
 
-        // Simulate crash state in journal: `author` already spawned + retiring, `verifier` still Requested,
-        // plus an old @all room post from before restart.
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: author.clone(),
@@ -1414,7 +1439,6 @@ mod tests {
         }))
         .unwrap();
 
-        // Replay pre-CaughtUp frames: zero host calls until CaughtUp triggers level-triggered reconcile.
         drain_conductor(&mut conductor, &sys_conductor, &bus);
         assert!(host.calls.lock().unwrap().is_empty(), "no side effects during pre-CaughtUp replay");
 

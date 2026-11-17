@@ -107,7 +107,13 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
         up({ t: "hello", plugin_version: "0.1.0", sdk_version: SDK_VERSION });
       },
       async onMessage(socket, data) {
-        const msg = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data)) as Down;
+        let msg: Down;
+        try {
+          msg = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data)) as Down;
+        } catch (e) {
+          bb.log.error(`rex-wave bridge invalid JSON frame: ${e instanceof Error ? e.message : String(e)}`);
+          return;
+        }
         await handleDown(msg).catch((e: unknown) => {
           const text = e instanceof Error ? e.message : String(e);
           if ("req_id" in msg) up({ t: "result", req_id: msg.req_id, ok: false, value: text });
