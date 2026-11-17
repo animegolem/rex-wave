@@ -1,6 +1,6 @@
 use crate::HostError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -42,7 +42,12 @@ pub(crate) fn sha1(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
                 _ => (b ^ c ^ d, 0xCA62_C1D6),
             };
-            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -99,15 +104,19 @@ pub(crate) fn ws_accept(client_key: &str) -> String {
 }
 
 pub(crate) fn parse_ws_url(url: &str) -> Result<(String, String), HostError> {
-    let rest = url
-        .strip_prefix("ws://")
-        .ok_or_else(|| HostError::Rejected(format!("unsupported bridge URL scheme (expected ws://): {url}")))?;
+    let rest = url.strip_prefix("ws://").ok_or_else(|| {
+        HostError::Rejected(format!(
+            "unsupported bridge URL scheme (expected ws://): {url}"
+        ))
+    })?;
     let (authority, path) = match rest.find('/') {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
     };
     if authority.is_empty() {
-        return Err(HostError::Rejected(format!("missing host:port in bridge URL: {url}")));
+        return Err(HostError::Rejected(format!(
+            "missing host:port in bridge URL: {url}"
+        )));
     }
     Ok((authority.to_owned(), path.to_owned()))
 }
@@ -118,7 +127,8 @@ fn next_mask_bytes() -> [u8; 4] {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mixed = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ nanos.rotate_left(17) ^ 0xA5A5_5A5A_C3C3_3C3C;
+    let mixed =
+        seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ nanos.rotate_left(17) ^ 0xA5A5_5A5A_C3C3_3C3C;
     (mixed as u32).to_be_bytes()
 }
 
@@ -130,10 +140,27 @@ fn next_ws_key() -> String {
     base64_encode(&raw)
 }
 
+#[derive(Debug)]
+pub(crate) enum WsInbound {
+    Text(String),
+    Ping(Vec<u8>),
+    Close(Vec<u8>),
+}
+
 pub(crate) struct WsConn<S> {
     stream: S,
+    leftover: Vec<u8>,
+    mask_outbound: bool,
+}
+
+pub(crate) struct WsReader<R> {
+    reader: R,
     read_buf: Vec<u8>,
     read_pos: usize,
+}
+
+pub(crate) struct WsWriter<W> {
+    writer: W,
     mask_outbound: bool,
     closed: bool,
 }
@@ -147,6 +174,7 @@ impl WsConn<TcpStream> {
         let _ = stream.set_nodelay(true);
 
         let key = next_ws_key();
+        // BB's plugin HTTP/WebSocket `auth: "token"` guard checks `x-bb-plugin-token` or `?token=`.
         let req = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: {authority}\r\n\
@@ -154,7 +182,7 @@ impl WsConn<TcpStream> {
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: {key}\r\n\
              Sec-WebSocket-Version: 13\r\n\
-             Authorization: Bearer {token}\r\n\
+             x-bb-plugin-token: {token}\r\n\
              \r\n"
         );
         stream
@@ -168,7 +196,9 @@ impl WsConn<TcpStream> {
         let mut lines = header_str.split("\r\n");
         let status = lines.next().unwrap_or("");
         if !status.starts_with("HTTP/1.1 101") {
-            return Err(HostError::Unreachable(format!("unexpected upgrade status: {status}")));
+            return Err(HostError::Unreachable(format!(
+                "unexpected upgrade status: {status}"
+            )));
         }
 
         let expected_accept = ws_accept(&key);
@@ -182,15 +212,15 @@ impl WsConn<TcpStream> {
             }
         }
         if !accept_ok {
-            return Err(HostError::Unreachable("missing or invalid Sec-WebSocket-Accept".into()));
+            return Err(HostError::Unreachable(
+                "missing or invalid Sec-WebSocket-Accept".into(),
+            ));
         }
 
         Ok(WsConn {
             stream,
-            read_buf: leftover,
-            read_pos: 0,
+            leftover,
             mask_outbound: true,
-            closed: false,
         })
     }
 }
@@ -201,25 +231,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
         let (header_bytes, leftover) = read_http_headers(&mut stream).await?;
         let header_str = std::str::from_utf8(&header_bytes)
             .map_err(|_| HostError::Rejected("invalid UTF-8 in upgrade request".into()))?;
-        let mut ws_key: Option<String> = None;
-        let mut auth_ok = expected_token.is_empty();
+        let mut lines = header_str.split("\r\n");
+        let req_line = lines.next().unwrap_or("");
+        let query_token = req_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|target| target.split_once('?'))
+            .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
 
-        for line in header_str.split("\r\n").skip(1) {
+        let mut ws_key: Option<String> = None;
+        let mut header_token: Option<&str> = None;
+
+        for line in lines {
             if let Some((name, val)) = line.split_once(':') {
                 let name = name.trim();
                 let val = val.trim();
                 if name.eq_ignore_ascii_case("sec-websocket-key") {
                     ws_key = Some(val.to_owned());
-                } else if name.eq_ignore_ascii_case("authorization")
-                    && val.strip_prefix("Bearer ").map(str::trim) == Some(expected_token)
-                {
-                    auth_ok = true;
+                } else if name.eq_ignore_ascii_case("x-bb-plugin-token") {
+                    header_token = Some(val);
                 }
             }
         }
+        let presented = header_token.or(query_token);
+        let auth_ok = expected_token.is_empty() || presented == Some(expected_token);
         if !auth_ok {
-            let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n").await;
-            return Err(HostError::Rejected("unauthorized token".into()));
+            let _ = stream
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return Err(HostError::Rejected("unauthorized x-bb-plugin-token".into()));
         }
         let key = ws_key.ok_or_else(|| HostError::Rejected("missing Sec-WebSocket-Key".into()))?;
         let accept = ws_accept(&key);
@@ -237,27 +277,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
 
         Ok(WsConn {
             stream,
-            read_buf: leftover,
-            read_pos: 0,
+            leftover,
             mask_outbound: false,
-            closed: false,
         })
     }
 
-    pub(crate) async fn send_text(&mut self, text: &str) -> Result<(), HostError> {
-        self.write_frame(0x1, text.as_bytes()).await
+    pub(crate) fn into_split(self) -> (WsReader<ReadHalf<S>>, WsWriter<WriteHalf<S>>) {
+        let (reader, writer) = tokio::io::split(self.stream);
+        (
+            WsReader {
+                reader,
+                read_buf: self.leftover,
+                read_pos: 0,
+            },
+            WsWriter {
+                writer,
+                mask_outbound: self.mask_outbound,
+                closed: false,
+            },
+        )
     }
+}
 
-    #[cfg(test)]
-    pub(crate) async fn send_close(&mut self, code: u16, reason: &str) -> Result<(), HostError> {
-        let mut payload = Vec::with_capacity(2 + reason.len());
-        payload.extend_from_slice(&code.to_be_bytes());
-        payload.extend_from_slice(reason.as_bytes());
-        self.closed = true;
-        self.write_frame(0x8, &payload).await
-    }
-
-    pub(crate) async fn recv_text(&mut self) -> Result<Option<String>, HostError> {
+impl<R: AsyncRead + Unpin> WsReader<R> {
+    pub(crate) async fn recv(&mut self) -> Result<Option<WsInbound>, HostError> {
         let mut message = Vec::new();
         let mut fragmenting = false;
 
@@ -281,12 +324,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
                     let mut ext = [0u8; 8];
                     self.read_exact_bytes(&mut ext).await?;
                     let n = u64::from_be_bytes(ext);
-                    usize::try_from(n).map_err(|_| HostError::Unreachable("frame too large".into()))?
+                    usize::try_from(n)
+                        .map_err(|_| HostError::Unreachable("frame too large".into()))?
                 }
                 n => n,
             };
             if payload_len > MAX_FRAME_BYTES {
-                return Err(HostError::Unreachable(format!("frame exceeds {MAX_FRAME_BYTES} bytes")));
+                return Err(HostError::Unreachable(format!(
+                    "frame exceeds {MAX_FRAME_BYTES} bytes"
+                )));
             }
 
             let mask_key = if masked {
@@ -309,42 +355,120 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
 
             match opcode {
                 0x8 => {
-                    if !self.closed {
-                        self.closed = true;
-                        let reply = if payload.len() >= 2 { &payload[..2] } else { &[] };
-                        let _ = self.write_frame(0x8, reply).await;
-                    }
-                    return Ok(None);
+                    let reply = if payload.len() >= 2 {
+                        payload[..2].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(Some(WsInbound::Close(reply)));
                 }
-                0x9 => {
-                    self.write_frame(0xA, &payload).await?;
-                }
+                0x9 => return Ok(Some(WsInbound::Ping(payload))),
                 0xA => {}
                 0x1 | 0x2 => {
                     if fin && !fragmenting {
                         return String::from_utf8(payload)
-                            .map(Some)
-                            .map_err(|_| HostError::Unreachable("non-UTF8 websocket frame".into()));
+                            .map(|s| Some(WsInbound::Text(s)))
+                            .map_err(|_| {
+                                HostError::Unreachable("non-UTF8 websocket frame".into())
+                            });
                     }
                     fragmenting = true;
                     message.extend_from_slice(&payload);
                     if fin {
                         return String::from_utf8(message)
-                            .map(Some)
-                            .map_err(|_| HostError::Unreachable("non-UTF8 fragmented websocket message".into()));
+                            .map(|s| Some(WsInbound::Text(s)))
+                            .map_err(|_| {
+                                HostError::Unreachable(
+                                    "non-UTF8 fragmented websocket message".into(),
+                                )
+                            });
                     }
                 }
                 0x0 if fragmenting => {
                     message.extend_from_slice(&payload);
                     if fin {
                         return String::from_utf8(message)
-                            .map(Some)
-                            .map_err(|_| HostError::Unreachable("non-UTF8 fragmented websocket message".into()));
+                            .map(|s| Some(WsInbound::Text(s)))
+                            .map_err(|_| {
+                                HostError::Unreachable(
+                                    "non-UTF8 fragmented websocket message".into(),
+                                )
+                            });
                     }
                 }
-                other => return Err(HostError::Unreachable(format!("unsupported websocket opcode {other}"))),
+                other => {
+                    return Err(HostError::Unreachable(format!(
+                        "unsupported websocket opcode {other}"
+                    )));
+                }
             }
         }
+    }
+
+    async fn read_exact_or_eof(&mut self, dst: &mut [u8]) -> Result<bool, HostError> {
+        let mut filled = 0;
+        while filled < dst.len() {
+            let buffered = self.read_buf.len() - self.read_pos;
+            if buffered > 0 {
+                let take = buffered.min(dst.len() - filled);
+                dst[filled..filled + take]
+                    .copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + take]);
+                self.read_pos += take;
+                if self.read_pos == self.read_buf.len() {
+                    self.read_buf.clear();
+                    self.read_pos = 0;
+                }
+                filled += take;
+            } else {
+                let n = self
+                    .reader
+                    .read(&mut dst[filled..])
+                    .await
+                    .map_err(|e| HostError::Unreachable(format!("websocket read: {e}")))?;
+                if n == 0 {
+                    if filled == 0 {
+                        return Ok(false);
+                    }
+                    return Err(HostError::Unreachable("unexpected EOF mid-frame".into()));
+                }
+                filled += n;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn read_exact_bytes(&mut self, dst: &mut [u8]) -> Result<(), HostError> {
+        if !self.read_exact_or_eof(dst).await? {
+            return Err(HostError::Unreachable("unexpected EOF".into()));
+        }
+        Ok(())
+    }
+}
+
+impl<W: AsyncWrite + Unpin> WsWriter<W> {
+    pub(crate) async fn send_text(&mut self, text: &str) -> Result<(), HostError> {
+        self.write_frame(0x1, text.as_bytes()).await
+    }
+
+    pub(crate) async fn send_pong(&mut self, payload: &[u8]) -> Result<(), HostError> {
+        self.write_frame(0xA, payload).await
+    }
+
+    pub(crate) async fn send_close_reply(&mut self, reply: &[u8]) -> Result<(), HostError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.write_frame(0x8, reply).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn send_close(&mut self, code: u16, reason: &str) -> Result<(), HostError> {
+        let mut payload = Vec::with_capacity(2 + reason.len());
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason.as_bytes());
+        self.closed = true;
+        self.write_frame(0x8, &payload).await
     }
 
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), HostError> {
@@ -373,56 +497,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
             frame.extend_from_slice(payload);
         }
 
-        self.stream
+        self.writer
             .write_all(&frame)
             .await
             .map_err(|e| HostError::Unreachable(format!("websocket write: {e}")))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| HostError::Unreachable(format!("websocket flush: {e}")))
     }
-
-    async fn read_exact_or_eof(&mut self, dst: &mut [u8]) -> Result<bool, HostError> {
-        let mut filled = 0;
-        while filled < dst.len() {
-            let buffered = self.read_buf.len() - self.read_pos;
-            if buffered > 0 {
-                let take = buffered.min(dst.len() - filled);
-                dst[filled..filled + take].copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + take]);
-                self.read_pos += take;
-                if self.read_pos == self.read_buf.len() {
-                    self.read_buf.clear();
-                    self.read_pos = 0;
-                }
-                filled += take;
-            } else {
-                let n = self
-                    .stream
-                    .read(&mut dst[filled..])
-                    .await
-                    .map_err(|e| HostError::Unreachable(format!("websocket read: {e}")))?;
-                if n == 0 {
-                    if filled == 0 {
-                        return Ok(false);
-                    }
-                    return Err(HostError::Unreachable("unexpected EOF mid-frame".into()));
-                }
-                filled += n;
-            }
-        }
-        Ok(true)
-    }
-
-    async fn read_exact_bytes(&mut self, dst: &mut [u8]) -> Result<(), HostError> {
-        if !self.read_exact_or_eof(dst).await? {
-            return Err(HostError::Unreachable("unexpected EOF".into()));
-        }
-        Ok(())
-    }
 }
 
-async fn read_http_headers<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Vec<u8>, Vec<u8>), HostError> {
+async fn read_http_headers<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(Vec<u8>, Vec<u8>), HostError> {
     let mut buf = Vec::with_capacity(512);
     let mut scratch = [0u8; 1024];
     loop {
@@ -432,7 +520,9 @@ async fn read_http_headers<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Vec<
             return Ok((buf, leftover));
         }
         if buf.len() >= MAX_HEADER_BYTES {
-            return Err(HostError::Unreachable("HTTP upgrade headers exceeded 16 KiB".into()));
+            return Err(HostError::Unreachable(
+                "HTTP upgrade headers exceeded 16 KiB".into(),
+            ));
         }
         let n = stream
             .read(&mut scratch)

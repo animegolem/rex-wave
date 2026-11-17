@@ -21,34 +21,13 @@ type Resolution = Parameters<BbPluginApi["sdk"]["threads"]["interactions"]["reso
 
 const SDK_VERSION = "0.6.132";
 const TOOL_TIMEOUT_MS = 10 * 60_000;
-
-function normalizeSpawnArgs(raw: unknown): SpawnArgs {
-  if (typeof raw !== "object" || raw === null) {
-    throw new Error("spawn args must be an object");
-  }
-  const args = { ...(raw as Record<string, unknown>) };
-  const env = args.environment;
-  if (typeof env === "object" && env !== null) {
-    const e = env as Record<string, unknown>;
-    if (e.type === "project-default") {
-      args.environment = { type: "provider", environmentProviderId: "project-checkout", inputs: {} };
-    } else if (e.type === "host" && typeof e.workspace === "object" && e.workspace !== null) {
-      const ws = e.workspace as Record<string, unknown>;
-      if (ws.type === "managed-worktree" && ws.baseBranch) {
-        args.environment = {
-          type: "provider",
-          environmentProviderId: "git-worktree",
-          inputs: { branch: ws.baseBranch },
-        };
-      }
-    }
-  }
-  return args as unknown as SpawnArgs;
-}
+const STOP_SETTLE_POLLS = 30;
+const STOP_SETTLE_MS = 50;
 
 function formatTurnFailure(ev: TurnFailed): string {
   if (!ev.errorInfo) return "turn failed";
-  const detail = ev.errorInfo.providerCode ?? (ev.errorInfo.httpStatusCode !== null ? String(ev.errorInfo.httpStatusCode) : null);
+  const detail =
+    ev.errorInfo.providerCode ?? (ev.errorInfo.httpStatusCode !== null ? String(ev.errorInfo.httpStatusCode) : null);
   return detail ? `${ev.errorInfo.category} (${detail})` : ev.errorInfo.category;
 }
 
@@ -78,23 +57,26 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
   async function lookupThreadByMeta(target: WaveMeta): Promise<string | null> {
     const cached = await bb.storage.kv.get<string>(metaKey(target));
     if (cached) return cached;
-    const threads = await bb.sdk.threads.list({
-      originPluginId: bb.pluginId,
-      includeHidden: true,
-      limit: 200,
-    });
-    if (threads.length === 0) return null;
-    const metaList = await bb.sdk.threads.experimental_listPluginMetadata({
-      threadIds: threads.map((t) => t.id),
-    });
-    for (const row of metaList.threads) {
-      const m = extractWaveMeta(row.metadata);
-      if (m && m.waveId === target.waveId && m.role === target.role && m.attempt === target.attempt) {
-        await bb.storage.kv.set(metaKey(m), row.threadId);
-        return row.threadId;
+    for (let offset = 0; ; offset += 200) {
+      const threads = await bb.sdk.threads.list({
+        originPluginId: bb.pluginId,
+        includeHidden: true,
+        limit: 200,
+        offset,
+      });
+      if (threads.length === 0) return null;
+      const metaList = await bb.sdk.threads.experimental_listPluginMetadata({
+        threadIds: threads.map((t) => t.id),
+      });
+      for (const row of metaList.threads) {
+        const m = extractWaveMeta(row.metadata);
+        if (m && m.waveId === target.waveId && m.role === target.role && m.attempt === target.attempt) {
+          await bb.storage.kv.set(metaKey(m), row.threadId);
+          return row.threadId;
+        }
       }
+      if (threads.length < 200) return null;
     }
-    return null;
   }
 
   bb.http.experimental_websocket(
@@ -141,7 +123,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
     const reply = (req_id: number, value: unknown) => up({ t: "result", req_id, ok: true, value });
     switch (msg.t) {
       case "spawn": {
-        const spawnArgs = normalizeSpawnArgs(msg.args);
+        const spawnArgs = msg.args as SpawnArgs;
         const thread = await bb.sdk.threads.spawn(spawnArgs);
         const meta = extractWaveMeta(spawnArgs.pluginMetadata) ?? (await waveMetaOf(thread));
         if (meta) await bb.storage.kv.set(metaKey(meta), thread.id);
@@ -164,12 +146,21 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
           resolution: msg.resolution as Resolution,
         });
         return reply(msg.req_id, null);
-      case "retire":
-        // Hidden BB threads keep provider runtimes resident when archived while active or idle.
+      case "retire": {
+        // Hidden BB threads keep provider runtimes resident when archived while active or stopping.
         await bb.sdk.threads.stop({ threadId: msg.thread_id });
+        for (let i = 0; i < STOP_SETTLE_POLLS; i++) {
+          const cur = await bb.sdk.threads.get({ threadId: msg.thread_id });
+          if (cur.status !== "stopping" && cur.status !== "active") break;
+          if (i === STOP_SETTLE_POLLS - 1) {
+            throw new Error(`thread ${msg.thread_id} remained ${cur.status} after stop`);
+          }
+          await new Promise((r) => setTimeout(r, STOP_SETTLE_MS));
+        }
         await bb.sdk.threads.archive({ threadId: msg.thread_id });
         watched.delete(msg.thread_id);
         return reply(msg.req_id, null);
+      }
       case "events_page": {
         const rows = await bb.sdk.threads.events.list({
           threadId: msg.thread_id,
@@ -271,7 +262,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
     up({ t: "thread_events", thread_id: thread.id, sequence });
   });
 
-  const tools = catalog as ToolCatalogEntry[];
+  const tools = (catalog as ToolCatalogEntry[]).filter((t) => t.name !== "run_code");
   for (const tool of tools) {
     bb.agents.registerTool({
       name: `rex_${tool.name}`,
@@ -326,7 +317,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
         `roomId ${JSON.stringify(meta.roomId)}, project ${JSON.stringify(context.project.id)}), ` +
         `running on ${context.provider.id}/${context.provider.model}. ` +
         `Coordinate through rex_room_post and rex_wait (pass the last seq you read). ` +
-        `@mention a peer to wake it. Use rex_run_code to batch multiple calls in one turn.`,
+        `@mention a peer to wake it.`,
     };
   });
 

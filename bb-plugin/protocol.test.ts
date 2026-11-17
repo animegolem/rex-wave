@@ -5,7 +5,6 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
   type Down,
   type Up,
-  buildSpawnEnvironment,
   extractWaveMeta,
   mapThreadContextUsage,
   metaKey,
@@ -28,22 +27,6 @@ test("protocol fixtures round-trip and helpers match BB 0.6.132 contracts", () =
     roomId: "#p/wave-auth-v2",
   });
   assert.equal(metaKey(nestedMeta!), "spawn:auth-v2/verifier/2");
-
-  assert.deepEqual(buildSpawnEnvironment({ workspace: "managed_worktree", base: { kind: "default" } }), {
-    type: "provider",
-    environmentProviderId: "git-worktree",
-    inputs: { branch: { kind: "default" } },
-  });
-  assert.deepEqual(buildSpawnEnvironment({ workspace: "existing_path", path: "/tmp/wt" }), {
-    type: "provider",
-    environmentProviderId: "git-worktree",
-    inputs: { kind: "existing", path: "/tmp/wt" },
-  });
-  assert.deepEqual(buildSpawnEnvironment({ workspace: "project_default" }), {
-    type: "provider",
-    environmentProviderId: "project-checkout",
-    inputs: {},
-  });
 
   const mapped = mapThreadContextUsage({
     usage: {
@@ -80,19 +63,23 @@ test("protocol fixtures round-trip and helpers match BB 0.6.132 contracts", () =
   });
 });
 
-test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, turn.failed, and tool injection", async () => {
+test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconciliation, turn.failed, and tool filtering", async () => {
   const sdkOrder: string[] = [];
   const kv = new Map<string, unknown>();
   const threadMeta = new Map<string, Record<string, unknown>>();
-  const threadRecords = new Map<string, { id: string; projectId: string; originPluginId: string }>();
+  const threadRecords = new Map<string, { id: string; projectId: string; originPluginId: string; status: string }>();
   const listeners = new Map<string, Array<(payload: unknown) => unknown>>();
-  const registeredTools = new Map<string, { execute: (params: unknown, ctx: { threadId: string; projectId: string; signal: AbortSignal }) => Promise<unknown> }>();
+  const registeredTools = new Map<
+    string,
+    { execute: (params: unknown, ctx: { threadId: string; projectId: string; signal: AbortSignal }) => Promise<unknown> }
+  >();
   let configureFn: ((ctx: unknown) => { tools: unknown[]; skills: string[]; instructions?: string }) | null = null;
   let wsFactory: (() => {
     onOpen?: (ws: { send: (s: string) => void; close: () => void; readyState: number }) => void;
     onMessage?: (ws: unknown, data: string) => Promise<void>;
     onClose?: (ws: unknown) => void;
   }) | null = null;
+  let stopPollsRemaining = 0;
 
   const mockBb = {
     pluginId: "rex-wave",
@@ -120,7 +107,10 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
       },
     },
     agents: {
-      registerTool(def: { name: string; execute: (params: unknown, ctx: { threadId: string; projectId: string; signal: AbortSignal }) => Promise<unknown> }) {
+      registerTool(def: {
+        name: string;
+        execute: (params: unknown, ctx: { threadId: string; projectId: string; signal: AbortSignal }) => Promise<unknown>;
+      }) {
         registeredTools.set(def.name, def);
       },
       configure(fn: NonNullable<typeof configureFn>) {
@@ -133,7 +123,7 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
         async spawn(args: Record<string, unknown>) {
           sdkOrder.push(`spawn:${(args.environment as { environmentProviderId: string }).environmentProviderId}`);
           const id = "th_spawned_1";
-          const rec = { id, projectId: String(args.projectId), originPluginId: "rex-wave" };
+          const rec = { id, projectId: String(args.projectId), originPluginId: "rex-wave", status: "active" };
           threadRecords.set(id, rec);
           threadMeta.set(id, (args.pluginMetadata as Record<string, unknown>) ?? {});
           return rec;
@@ -141,10 +131,15 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
         async get({ threadId }: { threadId: string }) {
           const rec = threadRecords.get(threadId);
           if (!rec) throw new Error("not found");
-          return rec;
+          if (rec.status === "stopping" && stopPollsRemaining > 0) {
+            stopPollsRemaining -= 1;
+            if (stopPollsRemaining === 0) rec.status = "idle";
+          }
+          sdkOrder.push(`get:${threadId}:${rec.status}`);
+          return { ...rec };
         },
-        async list() {
-          return [...threadRecords.values()];
+        async list({ offset = 0, limit = 200 }: { offset?: number; limit?: number } = {}) {
+          return [...threadRecords.values()].slice(offset, offset + limit);
         },
         async getPluginMetadata({ threadId }: { threadId: string }) {
           return threadMeta.get(threadId) ?? {};
@@ -167,6 +162,8 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
           },
         },
         async stop({ threadId }: { threadId: string }) {
+          const rec = threadRecords.get(threadId);
+          if (rec) rec.status = stopPollsRemaining > 0 ? "stopping" : "idle";
           sdkOrder.push(`stop:${threadId}`);
           return { ok: true };
         },
@@ -201,7 +198,7 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
 
   await rexWaveBridge(mockBb);
   assert.ok(registeredTools.has("rex_room_post"));
-  assert.ok(registeredTools.has("rex_run_code"));
+  assert.equal(registeredTools.has("rex_run_code"), false);
 
   const nonWaveCfg = configureFn!({
     pluginMetadata: {},
@@ -216,6 +213,8 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
     provider: { id: "pi", model: "openrouter/model" },
   });
   assert.ok(waveCfg.tools.includes("rex_room_post"));
+  assert.equal(waveCfg.tools.includes("rex_run_code"), false);
+  assert.equal(waveCfg.instructions?.includes("rex_run_code"), false);
   assert.ok(waveCfg.instructions?.includes("@author"));
 
   const sentUp: Up[] = [];
@@ -237,7 +236,7 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
       req_id: 1,
       args: {
         projectId: "proj_1",
-        environment: { type: "project-default" },
+        environment: { type: "provider", environmentProviderId: "project-checkout", inputs: {} },
         prompt: "go",
         pluginMetadata: {
           rexWave: { waveId: "w1", role: "author", attempt: 1, roomId: "#proj_1/wave-w1" },
@@ -298,6 +297,12 @@ test("rexWaveBridge enforces stop-then-archive, afterSeq watch reconciliation, t
   assert.equal(toolRes.content[0].text, "{\"seq\":1}");
 
   sdkOrder.length = 0;
+  stopPollsRemaining = 2;
   await session.onMessage!(socket, JSON.stringify({ t: "retire", req_id: 9, thread_id: "th_spawned_1" } satisfies Down));
-  assert.deepEqual(sdkOrder, ["stop:th_spawned_1", "archive:th_spawned_1"]);
+  assert.deepEqual(sdkOrder, [
+    "stop:th_spawned_1",
+    "get:th_spawned_1:stopping",
+    "get:th_spawned_1:idle",
+    "archive:th_spawned_1",
+  ]);
 });

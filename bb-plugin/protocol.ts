@@ -29,25 +29,6 @@ export type ThreadContextUsage = {
   categories: ContextCategory[];
 };
 
-export type WaveWorkspace =
-  | { workspace: "managed_worktree"; base: { kind: "default" } | { kind: "named"; name: string } }
-  | { workspace: "project_default" }
-  | { workspace: "existing_path"; path: string };
-
-export type SpawnEnvironment =
-  | {
-      type: "provider";
-      environmentProviderId: "git-worktree";
-      inputs:
-        | { branch: { kind: "default" } | { kind: "named"; name: string } }
-        | { kind: "existing"; path: string };
-    }
-  | {
-      type: "provider";
-      environmentProviderId: "project-checkout";
-      inputs: Record<string, never>;
-    };
-
 export type Up =
   | { t: "hello"; plugin_version: string; sdk_version: string }
   | {
@@ -130,29 +111,6 @@ export function extractWaveMeta(pluginMetadata: unknown): WaveMeta | null {
 
 export function metaKey(m: WaveMeta): string {
   return `spawn:${m.waveId}/${m.role}/${m.attempt}`;
-}
-
-export function buildSpawnEnvironment(ws: WaveWorkspace): SpawnEnvironment {
-  switch (ws.workspace) {
-    case "managed_worktree":
-      return {
-        type: "provider",
-        environmentProviderId: "git-worktree",
-        inputs: { branch: ws.base },
-      };
-    case "existing_path":
-      return {
-        type: "provider",
-        environmentProviderId: "git-worktree",
-        inputs: { kind: "existing", path: ws.path },
-      };
-    case "project_default":
-      return {
-        type: "provider",
-        environmentProviderId: "project-checkout",
-        inputs: {},
-      };
-  }
 }
 
 export function mapThreadContextUsage(res: ThreadContextResult): ThreadContextUsage | null {
