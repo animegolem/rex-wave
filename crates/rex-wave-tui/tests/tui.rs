@@ -176,7 +176,7 @@ fn hover_debounces_while_activate_retargets_immediately_and_filters_stale_genera
             seq: Seq(seq),
             at: UnixMs(100),
             by: Principal::Seat {
-                seat: SeatName::parse("sol").unwrap(),
+                seat: SeatName::parse("sam").unwrap(),
             },
             event: Event::Room(RoomEvent::Posted {
                 body: Body::parse(text).unwrap(),

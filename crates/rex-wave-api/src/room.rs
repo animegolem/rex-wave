@@ -84,7 +84,7 @@ impl From<PrincipalPair> for (Principal, Principal) {
 
 /// How a caller *names* a room. Resolved to a [`RoomId`] server-side using the
 /// session principal (a DM ref needs "me"). Parsed from `#general`,
-/// `#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.
+/// `#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "ref", rename_all = "snake_case")]
 pub enum RoomRef {

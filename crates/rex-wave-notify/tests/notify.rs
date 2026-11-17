@@ -176,14 +176,14 @@ fn sample_mailbox_item(kind: &str, label: Option<&str>) -> MailboxItem {
     MailboxItem {
         schema: MailSchemaV1,
         id: "letter:to-owner/ruling-r1.md".into(),
-        from: "sol".into(),
+        from: "sam".into(),
         to: "owner".into(),
         kind: kind.into(),
         state: "open".into(),
         ts: "2026-11-16T10:30:00Z".into(),
         ts_basis: "mtime".into(),
         reference: MailRef {
-            store: "interchange".into(),
+            store: "letters".into(),
             path: PathBuf::from("to-owner/ruling-r1.md"),
             sha256: Sha256Hex::parse(
                 "d4eb1d5a086d8a07b20cb67ca85a9b28f3dde81825c006cb988b15152aa3d678",
@@ -311,14 +311,14 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
             seat: SeatName::parse("owner").unwrap(),
         },
     );
-    let astra_p = Principal::Seat {
-        seat: SeatName::parse("astra").unwrap(),
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
     };
-    let astra = LocalClient::new(router.clone(), astra_p.clone());
-    let sol = LocalClient::new(
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let sam = LocalClient::new(
         router.clone(),
         Principal::Seat {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         },
     );
     let bb_bridge = LocalClient::new(
@@ -340,7 +340,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         })
         .await
         .unwrap();
-    astra
+    alice
         .call(RoomJoin {
             room: general.clone(),
             member: None,
@@ -348,7 +348,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         })
         .await
         .unwrap();
-    sol.call(RoomJoin {
+    sam.call(RoomJoin {
         room: general.clone(),
         member: None,
         handle: None,
@@ -356,20 +356,20 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     .await
     .unwrap();
 
-    let mention_post = sol
+    let mention_post = sam
         .call(RoomPost {
             room: general.clone(),
-            body: Body::parse("hey @astra please review").unwrap(),
+            body: Body::parse("hey @alice please review").unwrap(),
             reply_to: None,
             idem: None,
         })
         .await
         .unwrap();
 
-    let dm_post = sol
+    let dm_post = sam
         .call(RoomPost {
             room: RoomRef::Dm {
-                with: astra_p.clone(),
+                with: alice_p.clone(),
             },
             body: Body::parse("private heads up").unwrap(),
             reply_to: None,
@@ -378,9 +378,9 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .await
         .unwrap();
 
-    let astra_inbox = tokio::time::timeout(Duration::from_secs(2), async {
+    let alice_inbox = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = astra
+            let page = alice
                 .call(InboxList {
                     include_done: false,
                     limit: None,
@@ -394,22 +394,22 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         }
     })
     .await
-    .expect("astra received both DM and mention notifications");
+    .expect("alice received both DM and mention notifications");
 
     assert!(
         matches!(
-            astra_inbox.items[0].draft.kind,
+            alice_inbox.items[0].draft.kind,
             NotifyKind::DirectMessage { .. }
         ),
         "DM ranks higher than channel mention"
     );
     assert!(matches!(
-        astra_inbox.items[1].draft.kind,
+        alice_inbox.items[1].draft.kind,
         NotifyKind::Mention { .. }
     ));
-    assert_eq!(astra_inbox.unread, 2);
+    assert_eq!(alice_inbox.unread, 2);
 
-    let sol_inbox = sol
+    let sam_inbox = sam
         .call(InboxList {
             include_done: true,
             limit: None,
@@ -417,25 +417,25 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .await
         .unwrap();
     assert!(
-        sol_inbox.items.is_empty(),
+        sam_inbox.items.is_empty(),
         "sender does not notify themselves"
     );
 
-    astra
+    alice
         .call(InboxMarkRead {
             room: mention_post.room.clone(),
             upto: mention_post.seq,
         })
         .await
         .unwrap();
-    astra
+    alice
         .call(InboxMarkRead {
             room: mention_post.room.clone(),
             upto: Seq(1),
         })
         .await
         .unwrap();
-    let after_read = astra
+    let after_read = alice
         .call(InboxList {
             include_done: false,
             limit: None,
@@ -515,7 +515,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     let banked = mail_writer
         .append(
             &Principal::Seat {
-                seat: SeatName::parse("sol").unwrap(),
+                seat: SeatName::parse("sam").unwrap(),
             },
             UnixMs(1_700_000_000_000),
             None,
@@ -714,7 +714,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
             None,
             vec![Event::Mail(MailEvent::BellRang {
                 bell_id: "daily@2026-11-16T09:00".into(),
-                seat: SeatName::parse("sol").unwrap(),
+                seat: SeatName::parse("sam").unwrap(),
             })],
         )
         .unwrap();
@@ -723,7 +723,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(RoomPost {
             room: RoomRef::Dm {
                 with: Principal::Seat {
-                    seat: SeatName::parse("sol").unwrap(),
+                    seat: SeatName::parse("sam").unwrap(),
                 },
             },
             body: Body::parse("Scheduled check-in").unwrap(),
@@ -733,9 +733,9 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .await
         .unwrap();
 
-    let sol_after_bell = tokio::time::timeout(Duration::from_secs(2), async {
+    let sam_after_bell = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = sol
+            let page = sam
                 .call(InboxList {
                     include_done: true,
                     limit: None,
@@ -751,7 +751,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
-    let sol_settled = sol
+    let sam_settled = sam
         .call(InboxList {
             include_done: true,
             limit: None,
@@ -759,12 +759,12 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .await
         .unwrap();
     assert_eq!(
-        sol_settled.items.len(),
+        sam_settled.items.len(),
         1,
         "wake bell raises exactly one DM card without duplicate Reminder"
     );
     assert!(matches!(
-        sol_after_bell.items[0].draft.kind,
+        sam_after_bell.items[0].draft.kind,
         NotifyKind::DirectMessage { .. }
     ));
 

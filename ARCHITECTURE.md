@@ -16,7 +16,7 @@ Several constraints fix the design:
 - **Many clients, one behavior.** TUI, CLI, MCP stdio and HTTP (both atomic tools and `run_code`), BB agent tools, and a future GUI must agree on every command and permission check. Any per-client logic drifts.
 - **Kanban must lift out cleanly.** `rex-kanban` owns the board model, `CardRevision` compare-and-swap, and `.org` codec with zero dependency on rooms, waves, BB, mail, or `rex-wave-api`.
 - **BB owns threads.** BB owns provider runtimes, worktrees, logins, and thread event logs. rex-wave proxies BB thread events and never copies them into its journal. Workers sit in four distinct non-working states (`Parked` inside `wait`, `Idle` after a turn ends, `Blocked` on an interaction, `Errored`), and each state takes a different wake path.
-- **House mail laws hold.** Rooms are weather and letters are canon. `promote_to_letter` writes and syncs the letter file before appending `Banked` to the journal (law I2), never deletes existing files, and acknowledges only exact `Sha256Hex` bytes. All mail I/O runs inside a verified non-production `SandboxRoot`.
+- **Mail laws hold.** Rooms are weather and letters are canon. `promote_to_letter` writes and syncs the letter file before appending `Banked` to the journal (law I2), never deletes existing files, and acknowledges only exact `Sha256Hex` bytes. All mail I/O runs inside a verified non-production `SandboxRoot`.
 - **Identity never comes from arguments.** The transport binds `Principal` once during `Hello`, or the BB bridge resolves it from the thread's recorded `pluginMetadata`. No command struct has a `from` field.
 - **Measured runtime budgets apply.** A fresh `rquickjs` `AsyncRuntime` per `run_code` call takes 0.55 ms at p50. BB's worktree provider id is `"git-worktree"`. Kitty `z=-1` cards need `Color::Reset` cell interiors, DECSET 2026 synchronized frames, and viewport clip math.
 - **Two-pane TUI layout.** The left pane is a foldable org-tree (`Inbox`, `Kanban`, divider, `Projects` unfolding to `#channels` and `#wave-<slug>` rooms with child wave agents, `Channels`, `Direct Messages`). The right pane is a single context-sensitive stage driven by tree selection or hover, stamped with a server-assigned `FocusGeneration` so rapid navigation never renders a stale frame.
@@ -36,12 +36,12 @@ rex-wave wave start auth-v2 --project p_123 --goal-file goal.md \
 	--worker migrator=pi/openrouter/~anthropic/claude-sonnet-latest
 
 rex-wave post '#p_123/wave-auth-v2' '@verifier check #4'
-rex-wave post @sol 'can you take the migration?'
+rex-wave post @sam 'can you take the migration?'
 rex-wave wait '#p_123/wave-auth-v2' --since 41
 rex-wave wave approve auth-v2 migrator int_8f2
 rex-wave task add 'Wire OAuth refresh' --board project:p_123 --lane todo --assign @auth-v2/author-jwt
 rex-wave promote '#p_123/wave-auth-v2' 40..44 --to owner --subject 'auth-v2 ruling' --topic auth-v2-ruling
-rex-wave call room_post '{"room":{"ref":"dm","with":{"kind":"seat","seat":"astra"}},"body":"lgtm"}'
+rex-wave call room_post '{"room":{"ref":"dm","with":{"kind":"seat","seat":"alice"}},"body":"lgtm"}'
 rex-wave schema --bb > bb-plugin/tools.generated.json
 ```
 
@@ -50,7 +50,7 @@ rex-wave schema --bb > bb-plugin/tools.generated.json
 A seat connects with a capability token, so the daemon binds `Principal::Seat` at session open:
 
 ```sh
-REX_WAVE_TOKEN=$(rex-wave token --seat sol) rex-wave mcp --stdio
+REX_WAVE_TOKEN=$(rex-wave token --seat sam) rex-wave mcp --stdio
 ```
 
 ```json
@@ -99,7 +99,7 @@ let mut sidebar = client.watch(Interest::Sidebar, Cursor::live()).await?;
 
 // Send a typed command over the same socket.
 let posted = client.call(RoomPost {
-	room: RoomRef::Dm { with: sol },
+	room: RoomRef::Dm { with: sam },
 	body: Body::parse("ping")?,
 	reply_to: None,
 	idem: None,
@@ -189,7 +189,7 @@ In the blinded three-way architecture bakeoff (`#29`), `arch-judge` selected **C
 
 - **Flat tool names** (`room_post`, `card_upsert`, `wave_start`) trade per-module name nesting for zero-mapping dispatch across CLI, MCP, Code Mode, and BB agent tools.
 - **Eventual consistency on external effects.** `wave_start` commits wave intent before BB spawns finish; `WaveConductor` reconciles on startup replay and live frames so BB restarts never block chat or boards.
-- **Mail I/O inside `MailBridge`.** `MailBridge` is the one service that writes disk before appending its journal event, because house-mail law I2 forbids announcing a letter before its bytes are banked.
+- **Mail I/O inside `MailBridge`.** `MailBridge` is the one service that writes disk before appending its journal event, because mail law I2 forbids announcing a letter before its bytes are banked.
 - **Spawn crash window.** `bb-plugin/server.ts` writes the `(waveId, role, attempt) -> threadId` KV entry both after `threads.spawn` and on `thread.created`; `rex-wave-bb` can also scan `experimental_listPluginMetadata` if KV is cold.
 - **Remote principal delegation after a Kanban split.** `Remote<C>` currently calls the split-out board daemon under the forwarding daemon's session; carrying `ctx.by` across processes will need a signed delegation envelope when Kanban runs multi-user out of process.
 - **BB push plugin RPC.** The bundled `push-notifications` plugin id and `notifications.send` schema in `bb-plugin/server.ts` still need live runtime verification against BB 0.49.

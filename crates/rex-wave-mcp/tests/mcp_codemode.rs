@@ -638,7 +638,7 @@ fn parse_tool_result_json(res: &rex_wave_mcp::ToolResult) -> Value {
 #[tokio::test]
 async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_codemode() {
     let harness = TestHarness::new();
-    let seat_srv = McpServer::new(harness.client(seat_principal("sol")));
+    let seat_srv = McpServer::new(harness.client(seat_principal("sam")));
     let worker_srv = McpServer::new(harness.client(worker_principal("auth-v2", "verifier")));
     let op_srv = McpServer::new(harness.client(operator_principal("owner")));
 
@@ -780,8 +780,8 @@ async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_c
 #[tokio::test]
 async fn codemode_executes_multistep_host_composition_with_unforgeable_principal() {
     let harness = TestHarness::new();
-    let sol_client = harness.client(seat_principal("sol"));
-    let sol_srv = McpServer::new(sol_client);
+    let sam_client = harness.client(seat_principal("sam"));
+    let sam_srv = McpServer::new(sam_client);
 
     let script = r#"
         const me = rex.whoami();
@@ -792,7 +792,7 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
             patch: {
                 title: "Implement MCP server",
                 lane: "doing",
-                assignee: { assign: "to", who: "@sol" }
+                assignee: { assign: "to", who: "@sam" }
             }
         });
         await rex.card_upsert({
@@ -800,13 +800,13 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
             patch: {
                 title: "Build TUI inspector",
                 lane: "todo",
-                assignee: { assign: "to", who: "@astra" }
+                assignee: { assign: "to", who: "@alice" }
             }
         });
         const snap = await rex.board_view({ board });
         const mine = snap.lanes
             .flatMap(l => l.cards)
-            .filter(c => c.assignee === "@sol");
+            .filter(c => c.assignee === "@sam");
         for (const c of mine) {
             await rex.cardUpsert({
                 board,
@@ -819,8 +819,8 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
         await rex.roomEnsure({ room });
         const posted = await rex.room_post({
             room,
-            body: `@astra moved ${mine.length} card to review`,
-            from: { kind: "seat", seat: "astra" }
+            body: `@alice moved ${mine.length} card to review`,
+            from: { kind: "seat", seat: "alice" }
         });
         console.log("handoff_seq", posted.seq);
         return {
@@ -831,7 +831,7 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
         };
     "#;
 
-    let res = sol_srv
+    let res = sam_srv
         .call_tool(RUN_CODE_TOOL, json!({ "code": script }))
         .await;
     assert!(!res.is_error, "multi-step script failed: {:?}", res.content);
@@ -839,12 +839,12 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
 
     assert_eq!(
         out["value"]["caller"],
-        json!({ "kind": "seat", "seat": "sol" })
+        json!({ "kind": "seat", "seat": "sam" })
     );
     assert_eq!(out["value"]["movedCards"], json!([1]));
     assert_eq!(
         out["value"]["mentioned"],
-        json!([{ "kind": "seat", "seat": "astra" }])
+        json!([{ "kind": "seat", "seat": "alice" }])
     );
     assert_eq!(out["logs"], json!(["handoff_seq 3"]));
     assert_eq!(out["calls"].as_array().unwrap().len(), 7);
@@ -864,7 +864,7 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
     let last = entries.last().expect("posted entry");
     assert_eq!(
         last.by,
-        seat_principal("sol"),
+        seat_principal("sam"),
         "principal must come from session, never from JS args"
     );
 }
@@ -872,14 +872,14 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
 #[tokio::test]
 async fn codemode_supports_concurrent_promise_all_host_calls() {
     let harness = TestHarness::new();
-    let sol_client = harness.client(seat_principal("sol"));
-    let astra_client = harness.client(seat_principal("astra"));
+    let sam_client = harness.client(seat_principal("sam"));
+    let alice_client = harness.client(seat_principal("alice"));
 
     let room = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("coord").unwrap(),
     };
-    sol_client
+    sam_client
         .call(RoomEnsure {
             room: room.clone(),
             topic: None,
@@ -887,7 +887,7 @@ async fn codemode_supports_concurrent_promise_all_host_calls() {
         })
         .await
         .unwrap();
-    astra_client
+    alice_client
         .call(rex_wave_api::room::RoomJoin {
             room: room.clone(),
             member: None,
@@ -898,7 +898,7 @@ async fn codemode_supports_concurrent_promise_all_host_calls() {
 
     let waiter = tokio::spawn(async move {
         run_code(
-            &astra_client,
+            &alice_client,
             r#"
                 const page = await rex.wait({
                     interest: { interest: "mentions" },
@@ -915,11 +915,11 @@ async fn codemode_supports_concurrent_promise_all_host_calls() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let poster_out = run_code(
-        &sol_client,
+        &sam_client,
         r#"
             const [p1, p2] = await Promise.all([
                 rex.room_post({ room: { ref: "channel", scope: { scope: "global" }, name: "coord" }, body: "progress note" }),
-                rex.room_post({ room: { ref: "channel", scope: { scope: "global" }, name: "coord" }, body: "@astra ready" })
+                rex.room_post({ room: { ref: "channel", scope: { scope: "global" }, name: "coord" }, body: "@alice ready" })
             ]);
             return [p1.seq, p2.seq];
         "#,
@@ -936,14 +936,14 @@ async fn codemode_supports_concurrent_promise_all_host_calls() {
 #[tokio::test]
 async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
     let fast_budget = Budget {
         deadline: Duration::from_millis(25),
         ..Budget::default()
     };
 
     let t0 = Instant::now();
-    let err = run_code(&sol, "while (true) {}", fast_budget.clone())
+    let err = run_code(&sam, "while (true) {}", fast_budget.clone())
         .await
         .expect_err("infinite loop must fail");
     assert_eq!(err, CodeError::Deadline(Duration::from_millis(25)));
@@ -954,7 +954,7 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     );
 
     let err_caught = run_code(
-        &sol,
+        &sam,
         r#"try { while (true) {} } catch (_) { return "swallowed"; }"#,
         fast_budget.clone(),
     )
@@ -963,7 +963,7 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     assert_eq!(err_caught, CodeError::Deadline(Duration::from_millis(25)));
 
     let err_microtask = run_code(
-        &sol,
+        &sam,
         "while (true) { await Promise.resolve(); }",
         fast_budget,
     )
@@ -980,7 +980,7 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     };
     let t_wait = Instant::now();
     let err_wait = run_code(
-        &sol,
+        &sam,
         r#"
             return await rex.wait({
                 interest: { interest: "mentions" },
@@ -995,7 +995,7 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     assert_eq!(err_wait, CodeError::Deadline(Duration::from_millis(40)));
     assert!(t_wait.elapsed() < Duration::from_millis(500));
 
-    let srv = McpServer::new(sol);
+    let srv = McpServer::new(sam);
     let clamped = srv
         .call_tool(
             RUN_CODE_TOOL,
@@ -1009,10 +1009,10 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
 #[tokio::test]
 async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let oom = run_code(
-        &sol,
+        &sam,
         "const buf = new Uint8Array(64 * 1024 * 1024); return buf.length;",
         Budget::default(),
     )
@@ -1021,7 +1021,7 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     assert_eq!(oom, CodeError::OutOfMemory);
 
     let stack = run_code(
-        &sol,
+        &sam,
         "function recurse(n) { return 1 + recurse(n + 1); } return recurse(0);",
         Budget::default(),
     )
@@ -1037,7 +1037,7 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
         ..Budget::default()
     };
     let capped = run_code(
-        &sol,
+        &sam,
         r#"
             for (let i = 0; i < 5; i++) {
                 try { await rex.sidebar({}); } catch (_) {}
@@ -1051,7 +1051,7 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     assert_eq!(capped, CodeError::HostCallBudget);
 
     let log_flood = run_code(
-        &sol,
+        &sam,
         r#"
             const big = "x".repeat(16384);
             for (let i = 0; i < 600; i++) {
@@ -1070,10 +1070,10 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
 #[tokio::test]
 async fn codemode_has_zero_ambient_authority_frozen_rex_and_per_call_isolation() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let probe = run_code(
-        &sol,
+        &sam,
         r#"
             globalThis.leakedAcrossCalls = "secret";
             try { globalThis.rex = { hacked: true }; } catch (_) {}
@@ -1120,7 +1120,7 @@ async fn codemode_has_zero_ambient_authority_frozen_rex_and_per_call_isolation()
     );
 
     let second = run_code(
-        &sol,
+        &sam,
         "return typeof globalThis.leakedAcrossCalls;",
         Budget::default(),
     )
@@ -1132,8 +1132,8 @@ async fn codemode_has_zero_ambient_authority_frozen_rex_and_per_call_isolation()
 #[tokio::test]
 async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     let harness = TestHarness::new();
-    let sol_client = harness.client(seat_principal("sol"));
-    let astra_client = harness.client(seat_principal("astra"));
+    let sam_client = harness.client(seat_principal("sam"));
+    let alice_client = harness.client(seat_principal("alice"));
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (srv_r, srv_w) = tokio::io::split(server_io);
@@ -1141,7 +1141,7 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     let mut cli_lines = BufReader::new(cli_r).lines();
 
     let server_task =
-        tokio::spawn(async move { McpServer::new(sol_client).serve_stream(srv_r, srv_w).await });
+        tokio::spawn(async move { McpServer::new(sam_client).serve_stream(srv_r, srv_w).await });
 
     async fn send_msg<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, val: Value) {
         let mut line = serde_json::to_vec(&val).unwrap();
@@ -1292,7 +1292,7 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     .await;
     assert_eq!(recv_msg(&mut cli_lines).await["id"], 7);
 
-    astra_client
+    alice_client
         .call(RoomPost {
             room: RoomRef::Channel {
                 scope: RoomScope::Project {
@@ -1300,12 +1300,12 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
                 },
                 name: ChannelName::parse("wave-mcp").unwrap(),
             },
-            body: Body::parse("@sol live update arrived").unwrap(),
+            body: Body::parse("@sam live update arrived").unwrap(),
             reply_to: None,
             idem: None,
         })
         .await
-        .expect("astra post");
+        .expect("alice post");
 
     let n1 = recv_msg(&mut cli_lines).await;
     let n2 = recv_msg(&mut cli_lines).await;
@@ -1360,7 +1360,7 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     .await;
     assert_eq!(recv_msg(&mut cli_lines).await["id"], 10);
 
-    astra_client
+    alice_client
         .call(RoomPost {
             room: RoomRef::Channel {
                 scope: RoomScope::Project {
@@ -1373,7 +1373,7 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
             idem: None,
         })
         .await
-        .expect("second astra post");
+        .expect("second alice post");
 
     send_msg(
         &mut cli_w,
@@ -1397,13 +1397,13 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
 #[tokio::test]
 async fn mcp_supports_content_length_framing_and_loopback_http() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let (client_io, server_io) = tokio::io::duplex(16 * 1024);
     let (srv_r, srv_w) = tokio::io::split(server_io);
     let (mut cli_r, mut cli_w) = tokio::io::split(client_io);
 
-    let srv_cl = sol.clone();
+    let srv_cl = sam.clone();
     let stream_task =
         tokio::spawn(async move { McpServer::new(srv_cl).serve_stream(srv_r, srv_w).await });
 
@@ -1435,17 +1435,17 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     assert_eq!(resp_json["id"], 77);
     let code_res: Value =
         serde_json::from_str(resp_json["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(code_res["value"], json!("sol"));
+    assert_eq!(code_res["value"], json!("sam"));
     stream_task.await.unwrap().unwrap();
 
     let non_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    let bind_err = McpServer::new(sol.clone())
+    let bind_err = McpServer::new(sam.clone())
         .serve_http(non_loopback)
         .await
         .unwrap_err();
     assert_eq!(bind_err.kind(), std::io::ErrorKind::InvalidInput);
     let unspec_listener = TcpListener::bind(non_loopback).await.unwrap();
-    let listener_err = McpServer::new(sol.clone())
+    let listener_err = McpServer::new(sam.clone())
         .serve_http_listener(unspec_listener)
         .await
         .unwrap_err();
@@ -1456,8 +1456,8 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     let http_task = tokio::spawn(async move {
-        McpServer::new(sol)
-            .with_http_token("cap-sol-token")
+        McpServer::new(sam)
+            .with_http_token("cap-sam-token")
             .serve_http_listener(listener)
             .await
     });
@@ -1482,7 +1482,7 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let bad_origin = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
             body_bytes.len()
         ),
     )
@@ -1495,7 +1495,7 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let bad_host = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
             body_bytes.len()
         ),
     )
@@ -1521,7 +1521,7 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let bad_ct = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body_str}",
             body_bytes.len()
         ),
     )
@@ -1534,7 +1534,7 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let http_str = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://localhost:3000\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://localhost:3000\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body_str}",
             addr.port(),
             body_bytes.len()
         ),
@@ -1554,7 +1554,7 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
 #[tokio::test]
 async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_completion() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let (srv_r, srv_w) = tokio::io::split(server_io);
@@ -1562,7 +1562,7 @@ async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_compl
     let mut cli_lines = BufReader::new(cli_r).lines();
 
     let server_task =
-        tokio::spawn(async move { McpServer::new(sol).serve_stream(srv_r, srv_w).await });
+        tokio::spawn(async move { McpServer::new(sam).serve_stream(srv_r, srv_w).await });
 
     let slow_call = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -1632,13 +1632,13 @@ async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_compl
 #[tokio::test]
 async fn resources_read_returns_latest_200_entries_for_long_rooms() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
     let room = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("busy").unwrap(),
     };
     for i in 1..=210u32 {
-        sol.call(RoomPost {
+        sam.call(RoomPost {
             room: room.clone(),
             body: Body::parse(format!("entry-{i}")).unwrap(),
             reply_to: None,
@@ -1654,7 +1654,7 @@ async fn resources_read_returns_latest_200_entries_for_long_rooms() {
     let mut cli_lines = BufReader::new(cli_r).lines();
 
     let server_task =
-        tokio::spawn(async move { McpServer::new(sol).serve_stream(srv_r, srv_w).await });
+        tokio::spawn(async move { McpServer::new(sam).serve_stream(srv_r, srv_w).await });
 
     let req = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",

@@ -1313,7 +1313,7 @@ mod tests {
             part: SystemPart::BbBridge,
         };
         let outsider_seat = Principal::Seat {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         };
         let spec = sample_spec();
 

@@ -358,22 +358,22 @@ fn post(room: RoomRef, text: &str, idem: Option<&str>) -> RoomPost {
 #[tokio::test]
 async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
     let (router, _journal, _) = harness(Duration::from_millis(20));
-    let sol = LocalClient::new(
+    let sam = LocalClient::new(
         router.clone(),
         Principal::Operator {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         },
     );
 
-    let p1 = sol
+    let p1 = sam
         .call(post(chan("general"), "first", None))
         .await
         .unwrap();
-    let p2 = sol
+    let p2 = sam
         .call(post(chan("general"), "second", Some("idem-2")))
         .await
         .unwrap();
-    let p2_retry = sol
+    let p2_retry = sam
         .call(post(chan("general"), "mutated-retry", Some("idem-2")))
         .await
         .unwrap();
@@ -387,7 +387,7 @@ async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
 
     tokio::time::sleep(Duration::from_millis(45)).await;
 
-    let p3 = sol
+    let p3 = sam
         .call(post(chan("general"), "after-passivation", None))
         .await
         .unwrap();
@@ -397,7 +397,7 @@ async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
         "rehydrated actor continues from journal head"
     );
 
-    let page = sol
+    let page = sam
         .call(Read {
             stream: StreamId::Room {
                 room: RoomId::Channel {
@@ -419,21 +419,21 @@ async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
 #[tokio::test]
 async fn audience_and_privacy_boundaries_hold() {
     let (router, _, _) = harness(Duration::from_secs(60));
-    let sol = Principal::Seat {
-        seat: SeatName::parse("sol").unwrap(),
+    let sam = Principal::Seat {
+        seat: SeatName::parse("sam").unwrap(),
     };
-    let astra = Principal::Seat {
-        seat: SeatName::parse("astra").unwrap(),
+    let alice = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
     };
     let nodal = Principal::Seat {
         seat: SeatName::parse("nodal").unwrap(),
     };
-    let sol_c = LocalClient::new(router.clone(), sol.clone());
+    let sam_c = LocalClient::new(router.clone(), sam.clone());
     let nodal_c = LocalClient::new(router.clone(), nodal);
 
-    let err = sol_c
+    let err = sam_c
         .call(InboxRaise {
-            to: astra.clone(),
+            to: alice.clone(),
             draft: NotificationDraft {
                 kind: NotifyKind::Reminder {
                     bell_id: "b1".into(),
@@ -452,21 +452,21 @@ async fn audience_and_privacy_boundaries_hold() {
     );
 
     assert!(matches!(
-        sol_c.watch(Interest::Everything, Cursor::default()).await,
+        sam_c.watch(Interest::Everything, Cursor::default()).await,
         Err(ApiError::Denied { .. })
     ));
 
-    sol_c
+    sam_c
         .call(post(
             RoomRef::Dm {
-                with: astra.clone(),
+                with: alice.clone(),
             },
             "secret",
             None,
         ))
         .await
         .unwrap();
-    let dm = RoomRef::Dm { with: astra }.resolve(&sol).unwrap();
+    let dm = RoomRef::Dm { with: alice }.resolve(&sam).unwrap();
     let denied = nodal_c
         .call(Read {
             stream: StreamId::Room { room: dm },
@@ -484,31 +484,31 @@ async fn audience_and_privacy_boundaries_hold() {
 #[tokio::test]
 async fn watch_and_wait_never_sleep_through_concurrent_commits() {
     let (router, _, _) = harness(Duration::from_secs(60));
-    let sol = LocalClient::new(
+    let sam = LocalClient::new(
         router.clone(),
         Principal::Operator {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         },
     );
-    let astra_p = Principal::Seat {
-        seat: SeatName::parse("astra").unwrap(),
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
     };
-    let astra = LocalClient::new(router.clone(), astra_p.clone());
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
 
-    sol.call(RoomJoin {
+    sam.call(RoomJoin {
         room: chan("general"),
-        member: Some(astra_p),
+        member: Some(alice_p),
         handle: None,
     })
     .await
     .unwrap();
     for i in 1..=5 {
-        sol.call(post(chan("general"), &format!("pre-{i}"), None))
+        sam.call(post(chan("general"), &format!("pre-{i}"), None))
             .await
             .unwrap();
     }
 
-    let writer_client = sol.clone();
+    let writer_client = sam.clone();
     let writer = tokio::spawn(async move {
         for i in 6..=30 {
             writer_client
@@ -521,7 +521,7 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
         }
     });
 
-    let mut watch = sol
+    let mut watch = sam
         .watch(
             Interest::Room {
                 room: chan("general"),
@@ -547,7 +547,7 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
         scope: RoomScope::Global,
         name: ChannelName::parse("general").unwrap(),
     };
-    let catchup = sol
+    let catchup = sam
         .call(Wait::room(general_id.clone(), Seq(28), false))
         .await
         .unwrap();
@@ -558,7 +558,7 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
         "Wait returns the full catch-up slice"
     );
 
-    let quiet = astra
+    let quiet = alice
         .call(Wait {
             interest: Interest::Mentions,
             after: Cursor::live(),
@@ -570,9 +570,9 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
 
     let wake_cursor = quiet.cursor.clone();
     let waiter = tokio::spawn({
-        let astra = astra.clone();
+        let alice = alice.clone();
         async move {
-            astra
+            alice
                 .call(Wait {
                     interest: Interest::Mentions,
                     after: wake_cursor,
@@ -583,10 +583,10 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
         }
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
-    sol.call(post(chan("general"), "unrelated noise", None))
+    sam.call(post(chan("general"), "unrelated noise", None))
         .await
         .unwrap();
-    sol.call(post(chan("general"), "hey @astra check this", None))
+    sam.call(post(chan("general"), "hey @alice check this", None))
         .await
         .unwrap();
     let woken = waiter.await.unwrap();
@@ -594,21 +594,21 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
     assert_eq!(
         woken.entries.len(),
         1,
-        "only the @astra mention woke the waiter"
+        "only the @alice mention woke the waiter"
     );
 }
 
 #[tokio::test]
 async fn stage_focus_generation_cancels_prior_watch_and_releases_agent_lease() {
     let (router, _, leases) = harness(Duration::from_secs(60));
-    let sol = LocalClient::new(
+    let sam = LocalClient::new(
         router,
         Principal::Operator {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         },
     );
 
-    let mut s1 = sol
+    let mut s1 = sam
         .watch(
             Interest::Stage {
                 target: StageTarget::Agent {
@@ -636,7 +636,7 @@ async fn stage_focus_generation_cancels_prior_watch_and_releases_agent_lease() {
     ));
     assert_eq!(leases.load(Ordering::SeqCst), 1);
 
-    let mut s2 = sol
+    let mut s2 = sam
         .watch(
             Interest::Stage {
                 target: StageTarget::Room {
@@ -706,16 +706,16 @@ impl Reactor for MentionReactor {
 #[tokio::test]
 async fn sidebar_projection_and_reactor_update_live() {
     let (router, _, _) = harness(Duration::from_secs(60));
-    let sol = LocalClient::new(
+    let sam = LocalClient::new(
         router.clone(),
         Principal::Operator {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         },
     );
-    let astra_p = Principal::Seat {
-        seat: SeatName::parse("astra").unwrap(),
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
     };
-    let astra = LocalClient::new(router.clone(), astra_p.clone());
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
 
     let reactor_handle = spawn_reactor(
         MentionReactor,
@@ -727,7 +727,7 @@ async fn sidebar_projection_and_reactor_update_live() {
         ),
     );
 
-    let mut sidebar = astra
+    let mut sidebar = alice
         .watch(Interest::Sidebar, Cursor::live())
         .await
         .unwrap();
@@ -736,15 +736,15 @@ async fn sidebar_projection_and_reactor_update_live() {
     };
     assert_eq!(initial.inbox.unread, 0);
 
-    sol.call(RoomJoin {
+    sam.call(RoomJoin {
         room: chan("general"),
-        member: Some(astra_p),
+        member: Some(alice_p),
         handle: None,
     })
     .await
     .unwrap();
-    let posted = sol
-        .call(post(chan("general"), "hello @astra", None))
+    let posted = sam
+        .call(post(chan("general"), "hello @alice", None))
         .await
         .unwrap();
 
@@ -765,14 +765,14 @@ async fn sidebar_projection_and_reactor_update_live() {
     .expect("sidebar converged with unread mention + inbox item");
     assert_eq!(updated.inbox.unread, 1);
 
-    astra
+    alice
         .call(InboxMarkRead {
             room: posted.room,
             upto: posted.seq,
         })
         .await
         .unwrap();
-    astra
+    alice
         .call(InboxAck {
             ids: vec![NotificationId(1)],
             state: NotifyState::Done,

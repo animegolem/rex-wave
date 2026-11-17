@@ -40,8 +40,8 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
     let db_path = dir.path().join("board-wal.sqlite3");
 
     let board = project_board(&BbProjectId::parse("proj_3vs7nkyeum").unwrap());
-    let sol_principal = Principal::Operator {
-        seat: SeatName::parse("sol").unwrap(),
+    let sam_principal = Principal::Operator {
+        seat: SeatName::parse("sam").unwrap(),
     };
     let worker_principal = Principal::Worker {
         wave: WaveSlug::parse("auth-v2").unwrap(),
@@ -50,10 +50,10 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
 
     {
         let router = open_wal_router(&db_path, Duration::from_millis(25));
-        let sol = LocalClient::new(router.clone(), sol_principal.clone());
+        let sam = LocalClient::new(router.clone(), sam_principal.clone());
         let worker = LocalClient::new(router.clone(), worker_principal.clone());
 
-        let missing = sol
+        let missing = sam
             .call(BoardView {
                 board: board.clone(),
                 filter: None,
@@ -62,14 +62,14 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
             .unwrap_err();
         assert!(matches!(missing, ApiError::NotFound { .. }));
 
-        let info1 = sol
+        let info1 = sam
             .call(BoardEnsure {
                 board: board.clone(),
                 lanes: Some(Lane::all_lane_names()),
             })
             .await
             .unwrap();
-        let info2 = sol
+        let info2 = sam
             .call(BoardEnsure {
                 board: board.clone(),
                 lanes: None,
@@ -103,7 +103,7 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
         assert_eq!(c1.no, CardNo(1));
         assert_eq!(c1.revision, CardRevision(1));
 
-        let c2 = sol
+        let c2 = sam
             .call(CardUpsert {
                 board: board.clone(),
                 card: None,
@@ -113,7 +113,7 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
                     lane: Some(Lane::Todo.lane_name()),
                     position: Some(0),
                     assignee: Some(Assign::To {
-                        who: assignee(&sol_principal),
+                        who: assignee(&sam_principal),
                     }),
                     ..Default::default()
                 },
@@ -144,7 +144,7 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
             .unwrap();
         assert_eq!(moved.revision, CardRevision(2));
 
-        let stale = sol
+        let stale = sam
             .call(task_move(
                 board.clone(),
                 CardNo(1),
@@ -181,7 +181,7 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
 
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        let c3 = sol
+        let c3 = sam
             .call(CardUpsert {
                 board: board.clone(),
                 card: None,
@@ -203,10 +203,10 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
     }
 
     let restarted_router = open_wal_router(&db_path, Duration::from_secs(60));
-    let sol = LocalClient::new(restarted_router.clone(), sol_principal);
+    let sam = LocalClient::new(restarted_router.clone(), sam_principal);
     let worker = LocalClient::new(restarted_router, worker_principal);
 
-    let snap = sol
+    let snap = sam
         .call(BoardView {
             board: board.clone(),
             filter: None,
@@ -237,15 +237,15 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
 async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
     let journal = Journal::in_memory().unwrap();
     let router = build_router(journal, Duration::from_secs(60));
-    let sol = LocalClient::new(
+    let sam = LocalClient::new(
         router,
         Principal::Operator {
-            seat: SeatName::parse("sol").unwrap(),
+            seat: SeatName::parse("sam").unwrap(),
         },
     );
 
-    let personal = seat_board(&SeatName::parse("sol").unwrap());
-    let mut stage = sol
+    let personal = seat_board(&SeatName::parse("sam").unwrap());
+    let mut stage = sam
         .watch(
             Interest::Stage {
                 target: StageTarget::Kanban {
@@ -270,7 +270,7 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
     ));
 
     let auto_idem = rex_kanban::IdemKey::parse("implicit-open-1").unwrap();
-    let r1 = sol
+    let r1 = sam
         .call(CardUpsert {
             board: personal.clone(),
             card: None,
@@ -291,7 +291,7 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
     assert_eq!(r1.no, CardNo(1));
     assert_eq!(r1.revision, CardRevision(1));
 
-    let r1_retry = sol
+    let r1_retry = sam
         .call(CardUpsert {
             board: personal.clone(),
             card: None,
@@ -324,7 +324,7 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
         ));
     }
 
-    let snap = sol
+    let snap = sam
         .call(BoardView {
             board: personal.clone(),
             filter: None,
@@ -332,7 +332,7 @@ async fn implicit_board_open_stage_watch_and_org_import_export_round_trip() {
         .await
         .unwrap();
     let org_text = rex_kanban::org::render(&snap);
-    assert!(org_text.contains("#+TITLE: seat:sol"));
+    assert!(org_text.contains("#+TITLE: seat:sam"));
     assert!(org_text.contains("* TODO [#A] Implicitly open personal board :personal:"));
     assert!(org_text.contains(":LINKS: wave:pr2/owner"));
     assert_eq!(

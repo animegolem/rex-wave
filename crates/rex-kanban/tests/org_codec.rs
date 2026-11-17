@@ -37,10 +37,10 @@ Ensure refresh tokens rotate atomically.
 :PROPERTIES:
 :ID: 3
 :REV: 2
-:ASSIGNEE: @sol
+:ASSIGNEE: @sam
 :END:
 
-* WAIT [#C] Cross-model Sol review :review:
+* WAIT [#C] Cross-model Sam review :review:
 :PROPERTIES:
 :ID: 4
 :REV: 1
@@ -127,7 +127,7 @@ fn board_snapshot_render_and_parse_round_trip_without_loss() {
                     revision: CardRevision(3),
                     title: Title::parse("Handle UTF-8 café & colons: 1:2").unwrap(),
                     lane: Lane::Todo.lane_name(),
-                    assignee: Some(Assignee::parse("@sol").unwrap()),
+                    assignee: Some(Assignee::parse("@sam").unwrap()),
                     priority: Priority::Blocking,
                     due_ms: Some(1_800_000_000_000),
                     labels: vec!["utf8-café".into(), "space tag".into(), "colon:tag".into()],

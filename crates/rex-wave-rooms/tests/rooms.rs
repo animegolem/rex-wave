@@ -55,8 +55,8 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
     let router = build_harness(journal.clone(), Duration::from_millis(30));
 
     let op = LocalClient::new(router.clone(), operator("owner"));
-    let sol = LocalClient::new(router.clone(), seat("sol"));
-    let astra = LocalClient::new(router.clone(), seat("astra"));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let alice = LocalClient::new(router.clone(), seat("alice"));
     let nodal = LocalClient::new(router.clone(), seat("nodal"));
     let conductor = LocalClient::new(
         router.clone(),
@@ -69,15 +69,15 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         scope: RoomScope::Global,
         name: ChannelName::parse("general").unwrap(),
     };
-    let g1 = sol
+    let g1 = sam
         .call(RoomEnsure {
             room: global_ref.clone(),
-            topic: Some("Estate town hall".into()),
+            topic: Some("Town hall".into()),
             origin: None,
         })
         .await
         .unwrap();
-    let g2 = astra
+    let g2 = alice
         .call(RoomEnsure {
             room: global_ref.clone(),
             topic: None,
@@ -90,7 +90,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         g1.head, g2.head,
         "repeating room_ensure without topic change appends no events"
     );
-    assert_eq!(g2.topic.as_deref(), Some("Estate town hall"));
+    assert_eq!(g2.topic.as_deref(), Some("Town hall"));
 
     let proj = BbProjectId::parse("proj_3vs7nkyeum").unwrap();
     let proj_chan = RoomRef::Channel {
@@ -99,7 +99,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         },
         name: ChannelName::parse("design").unwrap(),
     };
-    let p1 = sol
+    let p1 = sam
         .call(RoomEnsure {
             room: proj_chan.clone(),
             topic: None,
@@ -107,7 +107,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         })
         .await
         .unwrap();
-    let p2 = sol
+    let p2 = sam
         .call(RoomEnsure {
             room: proj_chan.clone(),
             topic: None,
@@ -123,7 +123,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         scope: RoomScope::Project { project: proj },
         name: ChannelName::parse("wave-auth-v2").unwrap(),
     };
-    let denied = sol
+    let denied = sam
         .call(RoomEnsure {
             room: wave_room.clone(),
             topic: None,
@@ -135,7 +135,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .unwrap_err();
     assert!(matches!(denied, ApiError::Denied { .. }));
 
-    let squat_denied = sol
+    let squat_denied = sam
         .call(RoomEnsure {
             room: wave_room.clone(),
             topic: None,
@@ -158,7 +158,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         })
         .await
         .unwrap();
-    let w2 = sol
+    let w2 = sam
         .call(RoomEnsure {
             room: wave_room.clone(),
             topic: None,
@@ -206,34 +206,34 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         vec![worker("auth-v2", "verifier")]
     );
 
-    let dm_from_sol = sol
+    let dm_from_sam = sam
         .call(RoomEnsure {
             room: RoomRef::Dm {
-                with: seat("astra"),
+                with: seat("alice"),
             },
             topic: None,
             origin: None,
         })
         .await
         .unwrap();
-    let dm_from_astra = astra
+    let dm_from_alice = alice
         .call(RoomEnsure {
-            room: RoomRef::Dm { with: seat("sol") },
+            room: RoomRef::Dm { with: seat("sam") },
             topic: None,
             origin: None,
         })
         .await
         .unwrap();
     assert_eq!(
-        dm_from_sol.id, dm_from_astra.id,
+        dm_from_sam.id, dm_from_alice.id,
         "DM natural key normalizes pair order"
     );
-    assert_eq!(dm_from_sol.head, dm_from_astra.head);
-    assert_eq!(dm_from_sol.members.len(), 2);
+    assert_eq!(dm_from_sam.head, dm_from_alice.head);
+    assert_eq!(dm_from_sam.members.len(), 2);
 
-    let self_dm = sol
+    let self_dm = sam
         .call(RoomEnsure {
-            room: RoomRef::Dm { with: seat("sol") },
+            room: RoomRef::Dm { with: seat("sam") },
             topic: None,
             origin: None,
         })
@@ -241,10 +241,10 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .unwrap_err();
     assert!(matches!(self_dm, ApiError::Invalid(_)));
 
-    let dm_leave = sol
+    let dm_leave = sam
         .call(RoomLeave {
             room: RoomRef::Dm {
-                with: seat("astra"),
+                with: seat("alice"),
             },
         })
         .await
@@ -253,7 +253,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
 
     let outsider_dm = nodal
         .call(RoomPost {
-            room: RoomRef::Id { id: dm_from_sol.id },
+            room: RoomRef::Id { id: dm_from_sam.id },
             body: Body::parse("intrude").unwrap(),
             reply_to: None,
             idem: None,
@@ -266,21 +266,21 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
 #[test]
 fn resolve_mentions_parses_handles_qualified_roles_all_and_ignores_emails() {
     let mut members = BTreeMap::new();
-    let sol = seat("sol");
+    let sam = seat("sam");
     let verifier = worker("auth-v2", "verifier");
     let author = worker("auth-v2", "author-jwt");
-    members.insert(Handle::parse("sol").unwrap(), sol.clone());
+    members.insert(Handle::parse("sam").unwrap(), sam.clone());
     members.insert(Handle::parse("verifier").unwrap(), verifier.clone());
     members.insert(Handle::parse("author-jwt").unwrap(), author.clone());
 
     let body = Body::parse(
-        "Ping (@verifier, @auth-v2/author-jwt!) and email ops@sol.dev or @missing; cc @sol.",
+        "Ping (@verifier, @auth-v2/author-jwt!) and email ops@sam.dev or @missing; cc @sam.",
     )
     .unwrap();
     let m = resolve_mentions(&body, &members);
     assert!(!m.all);
     assert_eq!(m.principals.len(), 3);
-    assert!(m.principals.contains(&sol));
+    assert!(m.principals.contains(&sam));
     assert!(m.principals.contains(&verifier));
     assert!(m.principals.contains(&author));
 
@@ -296,8 +296,8 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
     let journal = Journal::open(&dir.path().join("history.sqlite3")).unwrap();
     let router = build_harness(journal, Duration::from_millis(25));
 
-    let sol = LocalClient::new(router.clone(), seat("sol"));
-    let astra = LocalClient::new(router.clone(), seat("astra"));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let alice = LocalClient::new(router.clone(), seat("alice"));
     let nodal = LocalClient::new(router.clone(), seat("nodal"));
     let w1_ver = LocalClient::new(router.clone(), worker("w1", "verifier"));
     let w2_ver = LocalClient::new(router.clone(), worker("w2", "verifier"));
@@ -307,22 +307,22 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         name: ChannelName::parse("ops").unwrap(),
     };
 
-    sol.call(RoomEnsure {
+    sam.call(RoomEnsure {
         room: room.clone(),
         topic: None,
         origin: None,
     })
     .await
     .unwrap();
-    sol.call(RoomJoin {
+    sam.call(RoomJoin {
         room: room.clone(),
-        member: Some(seat("astra")),
+        member: Some(seat("alice")),
         handle: None,
     })
     .await
     .unwrap();
 
-    let unauthorized_invite = astra
+    let unauthorized_invite = alice
         .call(RoomJoin {
             room: room.clone(),
             member: Some(seat("nodal")),
@@ -336,7 +336,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         .call(RoomJoin {
             room: room.clone(),
             member: None,
-            handle: Some(Handle::parse("astra").unwrap()),
+            handle: Some(Handle::parse("alice").unwrap()),
         })
         .await
         .unwrap_err();
@@ -358,7 +358,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         })
         .await
         .unwrap();
-    let info = sol
+    let info = sam
         .call(RoomEnsure {
             room: room.clone(),
             topic: None,
@@ -372,18 +372,18 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         "colliding default worker handles disambiguate cleanly"
     );
 
-    let first = sol
+    let first = sam
         .call(RoomPost {
             room: room.clone(),
-            body: Body::parse("hello @astra").unwrap(),
+            body: Body::parse("hello @alice").unwrap(),
             reply_to: None,
             idem: Some(IdemKey::parse("post-1").unwrap()),
         })
         .await
         .unwrap();
-    assert_eq!(first.mentions.principals, vec![seat("astra")]);
+    assert_eq!(first.mentions.principals, vec![seat("alice")]);
 
-    let bad_reply = astra
+    let bad_reply = alice
         .call(RoomPost {
             room: room.clone(),
             body: Body::parse("bad reply target").unwrap(),
@@ -399,7 +399,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let replayed = sol
+    let replayed = sam
         .call(RoomPost {
             room: room.clone(),
             body: Body::parse("different text").unwrap(),
@@ -413,36 +413,36 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         "idempotent retry after passivation returns original seq"
     );
 
-    let second = astra
+    let second = alice
         .call(RoomPost {
             room: room.clone(),
-            body: Body::parse("ack @sol").unwrap(),
+            body: Body::parse("ack @sam").unwrap(),
             reply_to: Some(first.seq),
             idem: None,
         })
         .await
         .unwrap();
 
-    astra.call(RoomLeave { room: room.clone() }).await.unwrap();
-    let leave_twice = astra
+    alice.call(RoomLeave { room: room.clone() }).await.unwrap();
+    let leave_twice = alice
         .call(RoomLeave { room: room.clone() })
         .await
         .unwrap_err();
     assert!(matches!(leave_twice, ApiError::Conflict { .. }));
 
-    let history = room_history(&sol, room.clone(), Seq::ORIGIN, Some(10))
+    let history = room_history(&sam, room.clone(), Seq::ORIGIN, Some(10))
         .await
         .unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].seq, first.seq);
-    assert_eq!(history[0].body.as_str(), "hello @astra");
+    assert_eq!(history[0].body.as_str(), "hello @alice");
     assert_eq!(history[1].seq, second.seq);
     assert_eq!(history[1].reply_to, Some(first.seq));
 
-    let raw = sol
+    let raw = sam
         .call(Read {
             stream: StreamId::Room {
-                room: room.resolve(sol.me()).unwrap(),
+                room: room.resolve(sam.me()).unwrap(),
             },
             after: Seq::ORIGIN,
             limit: None,
@@ -461,24 +461,24 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
     let journal = Journal::open(&dir.path().join("concurrent.sqlite3")).unwrap();
     let router = build_harness(journal, Duration::from_secs(60));
 
-    let sol = LocalClient::new(router.clone(), seat("sol"));
-    let astra = LocalClient::new(router.clone(), seat("astra"));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let alice = LocalClient::new(router.clone(), seat("alice"));
     let verifier = LocalClient::new(router.clone(), worker("auth-v2", "verifier"));
 
     let chan = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("coord").unwrap(),
     };
-    let room_id = chan.resolve(sol.me()).unwrap();
+    let room_id = chan.resolve(sam.me()).unwrap();
 
-    sol.call(RoomEnsure {
+    sam.call(RoomEnsure {
         room: chan.clone(),
         topic: None,
         origin: None,
     })
     .await
     .unwrap();
-    astra
+    alice
         .call(RoomJoin {
             room: chan.clone(),
             member: None,
@@ -498,9 +498,9 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
     let mut handles = Vec::new();
     for writer_idx in 0..4u32 {
         let c = if writer_idx % 2 == 0 {
-            sol.clone()
+            sam.clone()
         } else {
-            astra.clone()
+            alice.clone()
         };
         let room_ref = chan.clone();
         handles.push(tokio::spawn(async move {
@@ -565,7 +565,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         vec![head - 2, head - 1, head]
     );
 
-    let pre_mention_noise = sol
+    let pre_mention_noise = sam
         .call(RoomPost {
             room: chan.clone(),
             body: Body::parse("background chatter 1").unwrap(),
@@ -574,7 +574,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         })
         .await
         .unwrap();
-    let mention_hit = sol
+    let mention_hit = sam
         .call(RoomPost {
             room: chan.clone(),
             body: Body::parse("please check @verifier").unwrap(),
@@ -583,7 +583,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         })
         .await
         .unwrap();
-    let all_hit = astra
+    let all_hit = alice
         .call(RoomPost {
             room: chan.clone(),
             body: Body::parse("@all ship gate ready").unwrap(),
@@ -624,7 +624,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         }
     });
     tokio::time::sleep(Duration::from_millis(15)).await;
-    let dm_post = sol
+    let dm_post = sam
         .call(RoomPost {
             room: RoomRef::Dm {
                 with: worker("auth-v2", "verifier"),

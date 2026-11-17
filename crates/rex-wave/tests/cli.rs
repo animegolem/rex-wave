@@ -120,7 +120,7 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
     let sock_for_tok = sock_path.to_str().unwrap().to_owned();
     let tok_val = tokio::task::spawn_blocking(move || {
         let out = Command::new(bin_path())
-            .args(["--socket", &sock_for_tok, "token", "--seat", "sol"])
+            .args(["--socket", &sock_for_tok, "token", "--seat", "sam"])
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -155,7 +155,7 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
         ),
         (
             "room_post",
-            vec!["post", "@sol", "can you take the migration?"],
+            vec!["post", "@sam", "can you take the migration?"],
         ),
         (
             "wait",
@@ -237,7 +237,7 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
             vec![
                 "call",
                 "room_post",
-                r#"{"room":{"ref":"dm","with":{"kind":"seat","seat":"astra"}},"body":"lgtm"}"#,
+                r#"{"room":{"ref":"dm","with":{"kind":"seat","seat":"alice"}},"body":"lgtm"}"#,
             ],
         ),
     ];

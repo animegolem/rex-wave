@@ -61,7 +61,7 @@ pub enum Cmd {
         #[arg(long, env = "REX_WAVE_TOKEN")]
         token: String,
     },
-    /// Mint a capability token for a seat (`rex-wave token --seat sol` or `rex-wave token mint --seat sol`).
+    /// Mint a capability token for a seat (`rex-wave token --seat sam` or `rex-wave token mint --seat sam`).
     Token(TokenArgs),
     /// Post to `#channel`, `#<project>/<channel>`, `@seat`, or `@<wave>/<role>`.
     Post {
@@ -1182,7 +1182,7 @@ mod tests {
             WireCommand::RoomPost(_)
         ));
 
-        let post_dm = parse_cli(&["rex-wave", "post", "@sol", "can you take the migration?"]);
+        let post_dm = parse_cli(&["rex-wave", "post", "@sam", "can you take the migration?"]);
         assert!(matches!(
             to_command(&post_dm.cmd).unwrap(),
             WireCommand::RoomPost(_)
@@ -1244,7 +1244,7 @@ mod tests {
             "rex-wave",
             "call",
             "room_post",
-            r#"{"room":{"ref":"dm","with":{"kind":"seat","seat":"astra"}},"body":"lgtm"}"#,
+            r#"{"room":{"ref":"dm","with":{"kind":"seat","seat":"alice"}},"body":"lgtm"}"#,
         ]);
         assert!(matches!(
             to_command(&call_cli.cmd).unwrap(),
@@ -1259,7 +1259,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("daemon.sock");
 
-        let tok_cli = parse_cli(&["rex-wave", "token", "mint", "--seat", "sol"]);
+        let tok_cli = parse_cli(&["rex-wave", "token", "mint", "--seat", "sam"]);
         let Cmd::Token(targs) = tok_cli.cmd else {
             panic!("expected token");
         };

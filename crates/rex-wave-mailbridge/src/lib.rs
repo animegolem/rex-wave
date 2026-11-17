@@ -88,8 +88,10 @@ fn read_bell_prompt_any_sandbox(digest16: &str) -> Option<String> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("{0} is (or is under) a production mail root")]
+    #[error("{0} is, contains, or is under a protected folder")]
     Production(PathBuf),
+    #[error("protected roots: {0}")]
+    Config(String),
     #[error("{0} lacks the .rex-wave-sandbox marker")]
     Unmarked(PathBuf),
     #[error("io: {0}")]
@@ -99,7 +101,11 @@ pub enum SandboxError {
 #[derive(Clone, Debug)]
 pub struct SandboxRoot {
     root: PathBuf,
+    protected: Vec<PathBuf>,
 }
+
+/// The most folders one deployment may protect.
+pub const MAX_PROTECTED_ROOTS: usize = 64;
 
 fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
     let abs = if path.is_absolute() {
@@ -124,7 +130,7 @@ fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
     Ok(out)
 }
 
-fn forbidden_prod_roots() -> Vec<PathBuf> {
+fn home_dirs() -> BTreeSet<PathBuf> {
     let mut homes = BTreeSet::new();
     if let Some(h) = std::env::var_os("HOME") {
         let hp = PathBuf::from(h);
@@ -137,21 +143,72 @@ fn forbidden_prod_roots() -> Vec<PathBuf> {
             }
         }
     }
+    homes
+}
 
+/// Parse a protected-roots file: one folder per line. Blank lines and lines
+/// starting with `#` are skipped, and a leading `~/` means `home`. Every
+/// other line must be an absolute path.
+pub fn parse_protected_roots(
+    text: &str,
+    home: Option<&Path>,
+) -> Result<Vec<PathBuf>, SandboxError> {
     let mut roots = BTreeSet::new();
-    for home in homes {
-        for rel in [
-            "agent-folder/interchange",
-            ".local/state/carrier",
-            "agent-folder/resident_memories",
-        ] {
-            let p = home.join(rel);
-            if let Ok(lex) = lexical_normalize(&p) {
-                roots.insert(lex);
-            }
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let path = match line.strip_prefix("~/") {
+            Some(rest) => home
+                .ok_or_else(|| {
+                    SandboxError::Config(format!("line {}: `~/` needs HOME to be set", index + 1))
+                })?
+                .join(rest),
+            None => PathBuf::from(line),
+        };
+        if !path.is_absolute() {
+            return Err(SandboxError::Config(format!(
+                "line {}: `{line}` is not an absolute path",
+                index + 1
+            )));
+        }
+        roots.insert(lexical_normalize(&path)?);
+        if roots.len() > MAX_PROTECTED_ROOTS {
+            return Err(SandboxError::Config(format!(
+                "more than {MAX_PROTECTED_ROOTS} protected folders"
+            )));
         }
     }
-    roots.into_iter().collect()
+    Ok(roots.into_iter().collect())
+}
+
+/// Where this deployment lists its protected folders:
+/// `$XDG_CONFIG_HOME/rex-wave/protected-roots`, or the same under `~/.config`.
+pub fn protected_roots_file() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?).join(".config"),
+    };
+    Some(base.join("rex-wave").join("protected-roots"))
+}
+
+/// Read this deployment's protected folders. A missing file means there are
+/// none; a file that cannot be read or parsed is an error, never an empty list.
+pub fn load_protected_roots() -> Result<Vec<PathBuf>, SandboxError> {
+    let Some(file) = protected_roots_file() else {
+        return Ok(Vec::new());
+    };
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(SandboxError::Config(format!("{}: {e}", file.display()))),
+    };
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
+    parse_protected_roots(&text, home.as_deref())
+        .map_err(|e| SandboxError::Config(format!("{}: {e}", file.display())))
 }
 
 fn check_not_production(
@@ -159,10 +216,8 @@ fn check_not_production(
     reported: &Path,
     forbidden: &[PathBuf],
 ) -> Result<(), SandboxError> {
-    if candidate
-        .components()
-        .any(|c| c.as_os_str() == "resident_memories")
-    {
+    // The filesystem root and the home folder are never a sandbox.
+    if candidate.parent().is_none() || home_dirs().iter().any(|home| home.starts_with(candidate)) {
         return Err(SandboxError::Production(reported.to_path_buf()));
     }
     for prod in forbidden {
@@ -174,8 +229,22 @@ fn check_not_production(
 }
 
 impl SandboxRoot {
+    /// Verify `path` against the protected folders this deployment lists.
     pub fn verify(path: &Path) -> Result<Self, SandboxError> {
-        let forbidden = forbidden_prod_roots();
+        Self::verify_with(path, &load_protected_roots()?)
+    }
+
+    /// Verify `path` against an explicit list of protected folders.
+    pub fn verify_with(path: &Path, protected: &[PathBuf]) -> Result<Self, SandboxError> {
+        assert!(
+            protected.len() <= MAX_PROTECTED_ROOTS,
+            "at most {MAX_PROTECTED_ROOTS} protected folders"
+        );
+        // Hold each protected folder under both its given and its resolved name,
+        // so a symlinked location cannot be used to step around it.
+        let mut forbidden: BTreeSet<PathBuf> = protected.iter().cloned().collect();
+        forbidden.extend(protected.iter().filter_map(|p| fs::canonicalize(p).ok()));
+        let forbidden: Vec<PathBuf> = forbidden.into_iter().collect();
         let lex = lexical_normalize(path)?;
         check_not_production(&lex, path, &forbidden)?;
 
@@ -213,7 +282,10 @@ impl SandboxRoot {
 
         let marker = canon.join(MARKER_FILE);
         match fs::symlink_metadata(&marker) {
-            Ok(m) if m.file_type().is_file() => Ok(SandboxRoot { root: canon }),
+            Ok(m) if m.file_type().is_file() => Ok(SandboxRoot {
+                root: canon,
+                protected: forbidden,
+            }),
             _ => Err(SandboxError::Unmarked(canon)),
         }
     }
@@ -223,7 +295,7 @@ impl SandboxRoot {
     }
 
     fn ensure_dir(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
-        let forbidden = forbidden_prod_roots();
+        let forbidden = self.protected.as_slice();
         let mut cur = self.root.clone();
         for &seg in segments {
             if seg.is_empty()
@@ -260,7 +332,7 @@ impl SandboxRoot {
             }
             let canon = fs::canonicalize(&cur)
                 .map_err(|e| ApiError::Internal(format!("canonicalize {}: {e}", cur.display())))?;
-            if check_not_production(&canon, &cur, &forbidden).is_err()
+            if check_not_production(&canon, &cur, forbidden).is_err()
                 || !canon.starts_with(&self.root)
             {
                 return Err(ApiError::Denied {
@@ -278,14 +350,14 @@ impl SandboxRoot {
         {
             return Err(SandboxError::Io("invalid path outside sandbox".into()));
         }
-        let forbidden = forbidden_prod_roots();
+        let forbidden = self.protected.as_slice();
         let joined = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
             self.root.join(raw)
         };
         let lex = lexical_normalize(&joined)?;
-        check_not_production(&lex, raw, &forbidden)?;
+        check_not_production(&lex, raw, forbidden)?;
         if !lex.starts_with(&self.root) || lex == self.root {
             return Err(SandboxError::Production(raw.to_path_buf()));
         }
@@ -304,7 +376,7 @@ impl SandboxRoot {
 
         match fs::canonicalize(&lex) {
             Ok(canon) => {
-                check_not_production(&canon, raw, &forbidden)?;
+                check_not_production(&canon, raw, forbidden)?;
                 if !canon.starts_with(&self.root) || canon == self.root {
                     return Err(SandboxError::Production(raw.to_path_buf()));
                 }
@@ -319,7 +391,7 @@ impl SandboxRoot {
                         return Err(SandboxError::Production(raw.to_path_buf()));
                     }
                     if let Some(fname) = lex.file_name() {
-                        check_not_production(&canon_parent.join(fname), raw, &forbidden)?;
+                        check_not_production(&canon_parent.join(fname), raw, forbidden)?;
                     }
                 }
                 let rel = relative_slash(&self.root, &lex)?;
@@ -917,7 +989,7 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         ts,
         ts_basis,
         reference: MailRef {
-            store: "interchange".into(),
+            store: "letters".into(),
             path: PathBuf::from(&rel_path),
             sha256,
         },

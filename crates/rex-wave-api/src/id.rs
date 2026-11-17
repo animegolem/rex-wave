@@ -87,7 +87,7 @@ macro_rules! branded_str {
 }
 
 branded_str!(
-    /// A resident seat on the estate roster (`sol`, `astra`, `owner`, ...).
+    /// A named, long-lived seat (`sam`, `alice`, `owner`, ...).
     SeatName, "seat", |s| slug(&s, 32));
 branded_str!(
     /// A worker's role inside one wave (`author-jwt`, `verifier`). Unique per wave.
@@ -237,7 +237,7 @@ impl From<SeqRange> for (u64, u64) {
 pub enum Principal {
     /// The human operator at the TUI / CLI (authenticated by Unix peer uid).
     Operator { seat: SeatName },
-    /// A resident estate seat using a minted capability token (MCP stdio/HTTP).
+    /// A seat using a minted capability token (MCP stdio/HTTP).
     Seat { seat: SeatName },
     /// A BB thread spawned by a wave; resolved server-side from its BB thread id.
     Worker { wave: WaveSlug, role: RoleName },
@@ -269,7 +269,7 @@ impl fmt::Display for Principal {
 }
 
 branded_str!(
-    /// Short `@handle` unique *within one room* (`verifier`, `sol`). Rooms
+    /// Short `@handle` unique *within one room* (`verifier`, `sam`). Rooms
     /// resolve handles to principals at post time, so mention resolution never
     /// needs a cross-actor lookup.
     Handle, "handle", |s| slug(&s, 32));

@@ -1,6 +1,6 @@
 //! Kanban / org-todo. The model lives in the standalone `rex-kanban` crate;
 //! this module re-exports it for the `commands!` list and adds the only
-//! rex-wave-specific knowledge: how estate things become opaque board keys,
+//! rex-wave-specific knowledge: how projects, seats and waves become opaque board keys,
 //! assignees, and links.
 
 pub use rex_kanban::{

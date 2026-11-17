@@ -138,7 +138,7 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
             patch: CardPatch {
                 lane: Some(Lane::Doing.lane_name()),
                 assignee: Some(Assign::To {
-                    who: Assignee::parse("@sol").unwrap(),
+                    who: Assignee::parse("@sam").unwrap(),
                 }),
                 labels_remove: vec!["core".into()],
                 labels_add: vec!["active".into()],
@@ -311,7 +311,7 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
                 lane: Some(Lane::Review.lane_name()),
                 position: Some(0),
                 assignee: Some(Assign::To {
-                    who: Assignee::parse("@astra").unwrap(),
+                    who: Assignee::parse("@alice").unwrap(),
                 }),
                 ..Default::default()
             },
@@ -333,7 +333,7 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
         .snapshot(
             log.len() as u64,
             Some(&BoardFilter {
-                assignee: Some(Assignee::parse("@astra").unwrap()),
+                assignee: Some(Assignee::parse("@alice").unwrap()),
                 label: None,
                 lane: Some(Lane::Review.lane_name()),
             }),
@@ -347,7 +347,7 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
 #[test]
 fn standalone_engine_handles_idem_moves_and_links() {
     let mut engine = KanbanEngine::new();
-    let board = BoardId::parse("seat:sol").unwrap();
+    let board = BoardId::parse("seat:sam").unwrap();
 
     let info = engine
         .ensure_board(BoardEnsure {

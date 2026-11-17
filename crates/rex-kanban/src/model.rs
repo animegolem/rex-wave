@@ -75,7 +75,7 @@ fn opaque_bytes(s: &str, max: usize) -> Result<(), &'static str> {
 }
 
 checked_str!(
-    /// Opaque board key chosen by the host (`project:p_123`, `seat:sol`).
+    /// Opaque board key chosen by the host (`project:p_123`, `seat:sam`).
     BoardId, "board id", |s| printable(&s, 256));
 checked_str!(
     /// A lane (`todo`, `doing`, `review`, `done`, or custom): `[a-z0-9_-]{1,32}`.
@@ -84,7 +84,7 @@ checked_str!(
     /// Card title: one line, 1..=200 chars.
     Title, "title", |s| if s.contains('\n') { Err("must be one line") } else { printable(&s, 200) });
 checked_str!(
-    /// Who a card is assigned to, as the host renders them (`@sol`, `@auth-v2/verifier`).
+    /// Who a card is assigned to, as the host renders them (`@sam`, `@auth-v2/verifier`).
     Assignee, "assignee", |s| printable(&s, 128));
 checked_str!(
     /// Client-chosen key that makes a create or patch safe to retry.

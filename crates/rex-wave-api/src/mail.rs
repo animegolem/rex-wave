@@ -95,7 +95,7 @@ pub enum LetterPriority {
 }
 
 /// A banked letter in the sandbox. Exists only after the bytes are on disk
-/// (bank before announce, house-mail I2).
+/// (bank before announce, law I2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LetterRef {
     pub path: PathBuf,

@@ -11,9 +11,9 @@ fn room(name: &str) -> StreamId {
     }
 }
 
-fn sol() -> Principal {
+fn sam() -> Principal {
     Principal::Operator {
-        seat: SeatName::parse("sol").unwrap(),
+        seat: SeatName::parse("sam").unwrap(),
     }
 }
 
@@ -41,9 +41,9 @@ fn appends_are_gapless_and_read_back_in_order() {
     let j = Journal::in_memory().unwrap();
     let s = room("general");
     let mut w = j.claim(s.clone()).unwrap();
-    w.append(&sol(), UnixMs(1), None, vec![post("a"), post("b")])
+    w.append(&sam(), UnixMs(1), None, vec![post("a"), post("b")])
         .unwrap();
-    w.append(&sol(), UnixMs(2), None, vec![post("c")]).unwrap();
+    w.append(&sam(), UnixMs(2), None, vec![post("c")]).unwrap();
     let all = j.read(&s, Seq::ORIGIN, 100).unwrap();
     assert_eq!(
         all.iter().map(|e| e.seq.0).collect::<Vec<_>>(),
@@ -56,7 +56,7 @@ fn appends_are_gapless_and_read_back_in_order() {
         "after + limit page correctly"
     );
     assert_eq!(j.head(&s).unwrap(), Seq(3));
-    assert_eq!(all[0].by, sol(), "principal round-trips");
+    assert_eq!(all[0].by, sam(), "principal round-trips");
 }
 
 #[test]
@@ -66,11 +66,11 @@ fn same_idem_returns_the_original_batch_without_appending() {
     let key = IdemKey::parse("retry-1").unwrap();
     let mut w = j.claim(s.clone()).unwrap();
     let first = w
-        .append(&sol(), UnixMs(1), Some(&key), vec![post("x"), post("y")])
+        .append(&sam(), UnixMs(1), Some(&key), vec![post("x"), post("y")])
         .unwrap();
     assert!(matches!(first, Appended::Fresh(_)));
     let again = w
-        .append(&sol(), UnixMs(9), Some(&key), vec![post("different")])
+        .append(&sam(), UnixMs(9), Some(&key), vec![post("different")])
         .unwrap();
     let Appended::Replayed(prior) = again else {
         panic!("expected replay")
@@ -83,7 +83,7 @@ fn same_idem_returns_the_original_batch_without_appending() {
     let mut w2 = j.claim(other.clone()).unwrap();
     assert!(
         matches!(
-            w2.append(&sol(), UnixMs(1), Some(&key), vec![post("z")])
+            w2.append(&sam(), UnixMs(1), Some(&key), vec![post("z")])
                 .unwrap(),
             Appended::Fresh(_)
         ),
@@ -103,7 +103,7 @@ fn one_writer_per_stream_until_dropped() {
     drop(w);
     let mut again = j.claim(s.clone()).unwrap();
     again
-        .append(&sol(), UnixMs(1), None, vec![post("ok")])
+        .append(&sam(), UnixMs(1), None, vec![post("ok")])
         .unwrap();
 }
 
@@ -112,7 +112,7 @@ fn rejects_events_from_another_family() {
     let j = Journal::in_memory().unwrap();
     let mut w = j.claim(StreamId::Mail).unwrap();
     assert!(matches!(
-        w.append(&sol(), UnixMs(1), None, vec![post("nope")]),
+        w.append(&sam(), UnixMs(1), None, vec![post("nope")]),
         Err(StoreError::WrongStream(_))
     ));
     assert_eq!(j.head(&StreamId::Mail).unwrap(), Seq::ORIGIN);
@@ -127,7 +127,7 @@ fn file_journal_is_wal_persists_and_detects_a_foreign_writer() {
         let j = Journal::open(&path).unwrap();
         j.claim(s.clone())
             .unwrap()
-            .append(&sol(), UnixMs(1), None, vec![post("kept")])
+            .append(&sam(), UnixMs(1), None, vec![post("kept")])
             .unwrap();
     }
     let a = Journal::open(&path).unwrap();
@@ -141,9 +141,9 @@ fn file_journal_is_wal_persists_and_detects_a_foreign_writer() {
     let b = Journal::open(&path).unwrap();
     let mut wa = a.claim(s.clone()).unwrap();
     let mut wb = b.claim(s.clone()).unwrap();
-    wa.append(&sol(), UnixMs(2), None, vec![post("a")]).unwrap();
+    wa.append(&sam(), UnixMs(2), None, vec![post("a")]).unwrap();
     let err = wb
-        .append(&sol(), UnixMs(3), None, vec![post("b")])
+        .append(&sam(), UnixMs(3), None, vec![post("b")])
         .unwrap_err();
     assert!(
         matches!(

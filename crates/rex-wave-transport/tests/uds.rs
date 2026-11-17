@@ -179,7 +179,7 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     let auth: Arc<dyn Authenticator> = Arc::new(TableAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
         daemon_uid: Some(daemon_uid),
-        tokens: BTreeMap::from([("tok-sol".into(), SeatName::parse("sol").unwrap())]),
+        tokens: BTreeMap::from([("tok-sam".into(), SeatName::parse("sam").unwrap())]),
     });
 
     let server = tokio::spawn(serve_listener(listener, router, auth));
@@ -208,23 +208,23 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         }
     );
 
-    let sol = RemoteClient::connect(
+    let sam = RemoteClient::connect(
         endpoint,
         Credential::Token {
-            token: "tok-sol".into(),
+            token: "tok-sam".into(),
         },
         "mcp",
     )
     .await
     .unwrap();
     assert_eq!(
-        sol.me(),
+        sam.me(),
         &Principal::Seat {
-            seat: SeatName::parse("sol").unwrap()
+            seat: SeatName::parse("sam").unwrap()
         }
     );
     assert!(matches!(
-        sol.watch(Interest::Everything, Cursor::default()).await,
+        sam.watch(Interest::Everything, Cursor::default()).await,
         Err(ApiError::Denied { .. })
     ));
 
@@ -248,7 +248,7 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
 
     let mut joins = Vec::new();
     for i in 1..=10 {
-        let c = sol.clone();
+        let c = sam.clone();
         let g = general.clone();
         joins.push(tokio::spawn(async move {
             c.call(RoomPost {
@@ -286,7 +286,7 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         scope: RoomScope::Global,
         name: ChannelName::parse("general").unwrap(),
     };
-    let page = sol
+    let page = sam
         .call(Read {
             stream: StreamId::Room {
                 room: general_id.clone(),
@@ -299,9 +299,9 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     assert_eq!(page.entries.len(), 2);
 
     let waiter = tokio::spawn({
-        let sol = sol.clone();
+        let sam = sam.clone();
         async move {
-            sol.call(Wait::room(general_id, Seq(10), false))
+            sam.call(Wait::room(general_id, Seq(10), false))
                 .await
                 .unwrap()
         }

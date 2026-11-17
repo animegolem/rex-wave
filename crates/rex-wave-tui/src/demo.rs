@@ -67,8 +67,8 @@ struct DemoState {
     wave_room: RoomId,
     general_room: RoomId,
     lounge_room: RoomId,
-    sol_dm: RoomId,
-    astra_dm: RoomId,
+    sam_dm: RoomId,
+    alice_dm: RoomId,
     board: BoardSnapshot,
     inbox: InboxPage,
     rooms: BTreeMap<RoomId, Vec<Envelope>>,
@@ -96,11 +96,11 @@ impl DemoClient {
         let me = Principal::Operator {
             seat: owner.clone(),
         };
-        let sol = Principal::Seat {
-            seat: SeatName::parse("sol").expect("seat"),
+        let sam = Principal::Seat {
+            seat: SeatName::parse("sam").expect("seat"),
         };
-        let astra = Principal::Seat {
-            seat: SeatName::parse("astra").expect("seat"),
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").expect("seat"),
         };
         let project = BbProjectId::parse("p_123").expect("project");
         let wave = WaveSlug::parse("auth-v2").expect("wave");
@@ -121,11 +121,11 @@ impl DemoClient {
             scope: RoomScope::Global,
             name: ChannelName::parse("lounge").expect("channel"),
         };
-        let sol_dm = RoomId::Direct {
-            pair: PrincipalPair::new(me.clone(), sol.clone()).expect("pair"),
+        let sam_dm = RoomId::Direct {
+            pair: PrincipalPair::new(me.clone(), sam.clone()).expect("pair"),
         };
-        let astra_dm = RoomId::Direct {
-            pair: PrincipalPair::new(me.clone(), astra.clone()).expect("pair"),
+        let alice_dm = RoomId::Direct {
+            pair: PrincipalPair::new(me.clone(), alice.clone()).expect("pair"),
         };
 
         let author_role = RoleName::parse("author-jwt").expect("role");
@@ -313,7 +313,7 @@ impl DemoClient {
         let mail_item = MailboxItem {
             schema: MailSchemaV1,
             id: "auth-v2-ruling-r1".to_owned(),
-            from: "@sol".to_owned(),
+            from: "@sam".to_owned(),
             to: "@owner".to_owned(),
             kind: "letter".to_owned(),
             state: "unread".to_owned(),
@@ -395,7 +395,7 @@ impl DemoClient {
                     draft: NotificationDraft {
                         kind: NotifyKind::Mail { item: mail_item },
                         title: "Sandbox Canon Letter · auth-v2-ruling (r1)".to_owned(),
-                        preview: "From @sol: ratify 15m access token TTL + strict rotation"
+                        preview: "From @sam: ratify 15m access token TTL + strict rotation"
                             .to_owned(),
                         actions: vec![NotifyAction {
                             label: "Dismiss".to_owned(),
@@ -466,7 +466,7 @@ impl DemoClient {
                         revision: CardRevision(1),
                         title: Title::parse("Audit token replay window").expect("title"),
                         lane: LaneName::parse("review").expect("lane"),
-                        assignee: Some(Assignee::parse("@sol").expect("assignee")),
+                        assignee: Some(Assignee::parse("@sam").expect("assignee")),
                         priority: Priority::Normal,
                         due_ms: None,
                         labels: Vec::new(),
@@ -527,14 +527,14 @@ impl DemoClient {
             ],
         );
         rooms.insert(
-            sol_dm.clone(),
+            sam_dm.clone(),
             vec![Envelope {
                 stream: StreamId::Room {
-                    room: sol_dm.clone(),
+                    room: sam_dm.clone(),
                 },
                 seq: Seq(1),
                 at: UnixMs(1_700_000_400),
-                by: sol,
+                by: sam,
                 event: Event::Room(RoomEvent::Posted {
                     body: Body::parse("@owner can you review the migration ruling when free?")
                         .expect("body"),
@@ -549,7 +549,7 @@ impl DemoClient {
         );
         rooms.insert(general_room.clone(), Vec::new());
         rooms.insert(lounge_room.clone(), Vec::new());
-        rooms.insert(astra_dm.clone(), Vec::new());
+        rooms.insert(alice_dm.clone(), Vec::new());
 
         let state = DemoState {
             project,
@@ -557,8 +557,8 @@ impl DemoClient {
             wave_room,
             general_room,
             lounge_room,
-            sol_dm,
-            astra_dm,
+            sam_dm,
+            alice_dm,
             board,
             inbox,
             rooms,
@@ -634,11 +634,11 @@ impl DemoState {
             .collect();
         let osc7501 = derive_osc7501_status(&inbox_badge, workers.iter().map(|w| &w.phase));
 
-        let sol = Principal::Seat {
-            seat: SeatName::parse("sol").expect("seat"),
+        let sam = Principal::Seat {
+            seat: SeatName::parse("sam").expect("seat"),
         };
-        let astra = Principal::Seat {
-            seat: SeatName::parse("astra").expect("seat"),
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").expect("seat"),
         };
         let _ = me;
 
@@ -667,13 +667,13 @@ impl DemoState {
             }],
             direct_messages: vec![
                 DmLeaf {
-                    room: self.sol_dm.clone(),
-                    with: sol,
+                    room: self.sam_dm.clone(),
+                    with: sam,
                     unread: 1,
                 },
                 DmLeaf {
-                    room: self.astra_dm.clone(),
-                    with: astra,
+                    room: self.alice_dm.clone(),
+                    with: alice,
                     unread: 0,
                 },
             ],

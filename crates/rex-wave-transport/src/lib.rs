@@ -9,7 +9,7 @@
 //!
 //! Auth happens once, in `Hello`, and yields the session [`Principal`]:
 //! * Unix socket + peer uid == daemon uid -> `Operator{seat}` (TUI, CLI);
-//! * `Token` minted by `rex-wave token --seat sol` -> `Seat{sol}` (MCP);
+//! * `Token` minted by `rex-wave token --seat sam` -> `Seat{sam}` (MCP);
 //! * the BB bridge runs in-process and never uses this crate.
 
 use futures_util::StreamExt;
