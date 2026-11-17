@@ -173,6 +173,83 @@ fn protected_folder_that_does_not_exist_yet_is_known_by_its_real_name() {
     assert!(SandboxRoot::verify_with(&real, &Protection::default()).is_ok());
 }
 
+#[cfg(unix)]
+#[test]
+fn protected_folder_behind_a_dangling_symlink_is_followed_to_its_target() {
+    // `alias` points at `real/not-created`, which does not exist. The
+    // protected folder is `alias/mail`, so its real location is
+    // `real/not-created/mail`, and a marked sandbox at `real` would contain it.
+    let holder = TempSandbox::unmarked();
+    let real = holder.path.join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join(".rex-wave-sandbox"), b"marked\n").unwrap();
+    let alias = holder.path.join("alias");
+    std::os::unix::fs::symlink(real.join("not-created"), &alias).unwrap();
+    let protected = Protection {
+        roots: vec![alias.join("mail")],
+        names: vec![],
+    };
+    let res = SandboxRoot::verify_with(&real, &protected);
+    assert!(
+        matches!(res, Err(SandboxError::Production(_))),
+        "expected Production rejection for {}, got {res:?}",
+        real.display()
+    );
+
+    // A relative link with `..` in it resolves the way the filesystem would.
+    let side = holder.path.join("side");
+    fs::create_dir_all(&side).unwrap();
+    let hop = side.join("hop");
+    std::os::unix::fs::symlink("../real/not-created", &hop).unwrap();
+    let via_hop = Protection {
+        roots: vec![hop.join("mail")],
+        names: vec![],
+    };
+    assert!(matches!(
+        SandboxRoot::verify_with(&real, &via_hop),
+        Err(SandboxError::Production(_))
+    ));
+
+    // A protected folder that cannot be resolved is a configuration error.
+    let (a, b) = (holder.path.join("loop-a"), holder.path.join("loop-b"));
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    let looping = Protection {
+        roots: vec![a.join("mail")],
+        names: vec![],
+    };
+    assert!(matches!(
+        SandboxRoot::verify_with(&real, &looping),
+        Err(SandboxError::Config(_))
+    ));
+}
+
+#[test]
+fn protection_given_directly_is_validated_like_the_file() {
+    let (_guard, sandbox) = TempSandbox::marked();
+    for bad in ["relative/mail", "/srv/link/../mail"] {
+        let protection = Protection {
+            roots: vec![PathBuf::from(bad)],
+            names: vec![],
+        };
+        assert!(
+            matches!(
+                SandboxRoot::verify_with(sandbox.path(), &protection),
+                Err(SandboxError::Config(_))
+            ),
+            "root `{bad}` must be refused"
+        );
+    }
+    let bad_name = Protection {
+        roots: vec![],
+        names: vec!["a/b".into()],
+    };
+    assert!(matches!(
+        SandboxRoot::verify_with(sandbox.path(), &bad_name),
+        Err(SandboxError::Config(_))
+    ));
+}
+
 #[test]
 fn protected_roots_file_parses_fail_closed() {
     let home = PathBuf::from("/home/someone");

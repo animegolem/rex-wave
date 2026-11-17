@@ -125,22 +125,57 @@ struct Policy {
     homes: Vec<PathBuf>,
 }
 
-/// Resolve symlinks in the part of `path` that exists and keep the rest as
-/// written, so a folder that does not exist yet is still known by its real name.
-fn resolve_existing_prefix(path: &Path) -> PathBuf {
-    let mut ancestor = path;
-    loop {
-        if let Ok(canon) = fs::canonicalize(ancestor) {
-            return match path.strip_prefix(ancestor) {
-                Ok(rest) if !rest.as_os_str().is_empty() => canon.join(rest),
-                _ => canon,
-            };
+/// The most symlinks followed while resolving one protected folder.
+const MAX_LINK_HOPS: usize = 40;
+
+/// Resolve every symlink on the way to `path`, component by component, the
+/// way the filesystem would, including links whose targets do not exist yet.
+/// Components that do not exist are kept as written. A folder whose real
+/// location cannot be established is an error, never a guess.
+fn resolve_links(path: &Path) -> Result<PathBuf, SandboxError> {
+    let unresolved = |at: &Path, why: &dyn std::fmt::Display| {
+        SandboxError::Config(format!("cannot resolve `{}`: {why}", at.display()))
+    };
+    let mut out = PathBuf::new();
+    let mut pending: Vec<std::ffi::OsString> = Vec::new();
+    for comp in path.components().rev() {
+        pending.push(comp.as_os_str().to_owned());
+    }
+    let mut hops = 0;
+    while let Some(seg) = pending.pop() {
+        match Path::new(&seg).components().next() {
+            Some(Component::Prefix(_) | Component::RootDir) => {
+                out.push(&seg);
+                continue;
+            }
+            Some(Component::CurDir) | None => continue,
+            Some(Component::ParentDir) => {
+                out.pop();
+                continue;
+            }
+            Some(Component::Normal(_)) => {}
         }
-        match ancestor.parent() {
-            Some(parent) => ancestor = parent,
-            None => return path.to_path_buf(),
+        let next = out.join(&seg);
+        match fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(unresolved(path, &"too many symlinks"));
+                }
+                let target = fs::read_link(&next).map_err(|e| unresolved(&next, &e))?;
+                if target.is_absolute() {
+                    out = PathBuf::new();
+                }
+                for comp in target.components().rev() {
+                    pending.push(comp.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => out = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
+            Err(e) => return Err(unresolved(&next, &e)),
         }
     }
+    Ok(out)
 }
 
 /// A protected folder must be absolute and free of `..`, because removing
@@ -182,7 +217,7 @@ impl Policy {
         let mut roots = BTreeSet::new();
         for root in &protection.roots {
             let given = checked_root(root)?;
-            roots.insert(resolve_existing_prefix(&given));
+            roots.insert(resolve_links(&given)?);
             roots.insert(given);
         }
         let mut names = BTreeSet::new();
