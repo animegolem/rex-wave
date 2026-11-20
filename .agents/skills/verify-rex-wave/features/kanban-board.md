@@ -32,4 +32,4 @@ Preconditions:
 
 - Pressing `h` while on lane `0` (`todo`) returns focus from `Stage` to `Sidebar` instead of wrapping to the last lane; use `[` and `]` when testing lane-only movement.
 - Each Kanban column splits the stage width across 4 lanes (`~21` inner cells at `132` columns), so rendered card titles truncate with `…`. Assert the prefix on screen and the full title in `rex-wave --json task list`.
-- `default_board_id` selects the first board in `overview.kanban` (or `project:<first_project>` before any board exists), so seed `project:proj_alpha` before expecting `Kanban` to open that project's board.
+- Settling (`HoverSettled` after 100 ms) or activating a project or any room, wave, or worker inside it updates `active_project`, so selecting `Kanban` when that project's board exists in `overview.kanban` (or pressing `B`) opens `project:<active_project>`; before visiting any project, `default_board_id` selects the first board in `overview.kanban` (or `project:<first_project>`).

@@ -596,14 +596,14 @@ async fn room_paging_watch_eof_state_preservation_errors_and_inbox_scroll_hold()
             250,
             "room > 200 entries pages forward to head"
         );
-        assert_eq!(rv.scroll, u16::MAX, "room opens scrolled to tail");
+        assert_eq!(rv.scroll.pos, u16::MAX, "room opens scrolled to tail");
         assert_eq!(
             rv.cursor.at(&StreamId::Room {
                 room: wave_room.clone()
             }),
             Seq(250)
         );
-        rv.scroll = 7;
+        rv.scroll.pos = 7;
         rv.status_banner = Some("Banked".to_owned());
     } else {
         panic!("expected room");
@@ -623,7 +623,7 @@ async fn room_paging_watch_eof_state_preservation_errors_and_inbox_scroll_hold()
         }
     }
     if let Stage::Room(rv) = &model.stage {
-        assert_eq!(rv.scroll, 7);
+        assert_eq!(rv.scroll.pos, 7);
         assert_eq!(rv.status_banner.as_deref(), Some("Banked"));
     }
 
@@ -773,4 +773,704 @@ async fn room_paging_watch_eof_state_preservation_errors_and_inbox_scroll_hold()
         .find(|c| c.placement == 11)
         .expect("selected 11th card (index 10) must be placed in viewport");
     assert_eq!(selected_placement.clip().unwrap().visible_rows, 4);
+}
+
+fn screen_text(term: &Terminal<TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let area = buf.area;
+    let mut out = String::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            line.push_str(buf[(x, y)].symbol());
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn room_wraps_markdown_collapses_briefs_shortens_senders_and_opens_pager() {
+    let me = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let project = BbProjectId::parse("proj_alpha").unwrap();
+    let wave = WaveSlug::parse("auth-v2").unwrap();
+    let role = RoleName::parse("council-claude").unwrap();
+    let wave_room = RoomId::Channel {
+        scope: RoomScope::Project { project },
+        name: ChannelName::parse("wave-auth-v2").unwrap(),
+    };
+
+    let mut model = Model::new(me, SidebarTreeSnapshot::default());
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Room(wave_room.clone()))),
+    );
+    let req_seq = model.stage_req_seq;
+
+    let brief_env = Envelope {
+        stream: StreamId::Room {
+            room: wave_room.clone(),
+        },
+        seq: Seq(1),
+        at: UnixMs(100),
+        by: Principal::System {
+            part: rex_wave_api::SystemPart::WaveConductor,
+        },
+        event: Event::Room(RoomEvent::Posted {
+            body: Body::parse(
+                "@council-claude Review the JWT rotation design.\nHidden brief line 2.\nHidden brief line 3.",
+            )
+            .unwrap(),
+            mentions: Mentions::default(),
+            reply_to: None,
+            idem: Some(rex_wave_api::IdemKey::parse("wave:auth-v2:brief:council-claude:1").unwrap()),
+        }),
+    };
+    let review_env = Envelope {
+        stream: StreamId::Room {
+            room: wave_room.clone(),
+        },
+        seq: Seq(2),
+        at: UnixMs(200),
+        by: Principal::Worker {
+            wave: wave.clone(),
+            role: role.clone(),
+        },
+        event: Event::Room(RoomEvent::Posted {
+            body: Body::parse(
+                "# Council Verdict\n\nOverall **7/10** on `verify_jwt()`.\n\n```rust\nlet ttl = 900;\n```\n\nFinal paragraph survives multi-line wrap.",
+            )
+            .unwrap(),
+            mentions: Mentions::default(),
+            reply_to: None,
+            idem: None,
+        }),
+    };
+
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(req_seq),
+            result: Ok(WireReply::Read(rex_wave_api::read::Page {
+                entries: vec![brief_env, review_env],
+                cursor: Cursor::live(),
+                timed_out: false,
+            })),
+        },
+    );
+    model.focus = Pane::Stage;
+
+    let mut term = Terminal::new(TestBackend::new(124, 34)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let rendered = screen_text(&term);
+
+    assert!(
+        rendered.contains("brief for @council-claude [Enter to expand]"),
+        "WaveConductor brief must collapse to 1-line summary, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Hidden brief line 2"),
+        "collapsed brief body must stay hidden until expanded"
+    );
+    assert!(
+        rendered.contains("#2 @council-claude") && !rendered.contains("@auth-v2/council-claude"),
+        "sender inside #wave-auth-v2 must shorten to @council-claude, got:\n{rendered}"
+    );
+    assert!(rendered.contains("Council Verdict"));
+    assert!(rendered.contains("7/10"));
+    assert!(rendered.contains("let ttl = 900;"));
+    assert!(
+        rendered.contains("Final paragraph survives multi-line wrap."),
+        "multi-line room post must render all wrapped lines instead of clipping to line 1"
+    );
+
+    // Select #2, then step up to #1 (brief) and expand in place with Enter; Enter again opens Pager; Space collapses.
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char('k'));
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char('k'));
+    let _ = press(&mut model, Pane::Stage, KeyCode::Enter);
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("Hidden brief line 2"));
+
+    let _ = press(&mut model, Pane::Stage, KeyCode::Enter);
+    assert_eq!(
+        model.focus,
+        Pane::Overlay,
+        "Enter on an already-expanded brief opens the Pager"
+    );
+    let _ = press(&mut model, Pane::Overlay, KeyCode::Esc);
+
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char(' '));
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(!screen_text(&term).contains("Hidden brief line 2"));
+
+    // Step down to #2 (council review) and open full-message Pager with Enter.
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char('j'));
+    let _ = press(&mut model, Pane::Stage, KeyCode::Enter);
+    assert_eq!(model.focus, Pane::Overlay);
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let pager = screen_text(&term);
+    assert!(pager.contains("#2 @council-claude"));
+    assert!(pager.contains("Final paragraph survives multi-line wrap."));
+
+    let _ = press(&mut model, Pane::Overlay, KeyCode::Esc);
+    assert_eq!(model.focus, Pane::Stage);
+    assert!(model.overlay.is_none());
+}
+
+#[test]
+fn agent_inspector_wraps_turns_pins_latest_output_and_pages_turns() {
+    let me = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let wave = WaveSlug::parse("auth-v2").unwrap();
+    let role = RoleName::parse("author-jwt").unwrap();
+    let mut model = Model::new(me, SidebarTreeSnapshot::default());
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Agent {
+            wave: wave.clone(),
+            role: role.clone(),
+        })),
+    );
+    let seq = model.stage_req_seq;
+    let tp = rex_wave_api::read::ThreadPageView {
+        thread: rex_wave_api::BbThreadId::parse("thr_1").unwrap(),
+        activity: rex_wave_api::wave::Activity::Idle,
+        usage: None,
+        pending: None,
+        events: vec![
+            AgentEvent {
+                seq: BbSeq(1),
+                at: UnixMs(10),
+                kind: AgentEventKind::AssistantText {
+                    text: "Earlier turn line 1\nEarlier turn line 2".to_owned(),
+                },
+            },
+            AgentEvent {
+                seq: BbSeq(2),
+                at: UnixMs(20),
+                kind: AgentEventKind::TurnEnded,
+            },
+            AgentEvent {
+                seq: BbSeq(3),
+                at: UnixMs(30),
+                kind: AgentEventKind::AssistantText {
+                    text: "# Final Summary\nAll **tests** pass on `main`.\nSecond wrapped line."
+                        .to_owned(),
+                },
+            },
+        ],
+        next: None,
+    };
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(seq),
+            result: Ok(WireReply::ThreadPage(tp)),
+        },
+    );
+    model.focus = Pane::Stage;
+
+    let mut term = Terminal::new(TestBackend::new(124, 34)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let screen = screen_text(&term);
+    assert!(screen.contains("TEXT ★ latest output"));
+    assert!(screen.contains("Earlier turn line 2"));
+    assert!(screen.contains("Second wrapped line."));
+
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char('k'));
+    let _ = press(&mut model, Pane::Stage, KeyCode::Enter);
+    assert_eq!(model.focus, Pane::Overlay);
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("Turn · @auth-v2/author-jwt · #3"));
+}
+
+struct SingleSlotStream {
+    rx: tokio::sync::mpsc::Receiver<Result<Frame, rex_wave_api::ApiError>>,
+}
+
+impl futures_core::Stream for SingleSlotStream {
+    type Item = Result<Frame, rex_wave_api::ApiError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+#[derive(Clone)]
+struct SingleSlotSlowClient {
+    inner: DemoClient,
+    stage_slot: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Result<Frame, rex_wave_api::ApiError>>>>,
+    >,
+}
+
+impl Client for SingleSlotSlowClient {
+    fn me(&self) -> &Principal {
+        self.inner.me()
+    }
+
+    async fn call_wire(&self, cmd: WireCommand) -> Result<WireReply, rex_wave_api::ApiError> {
+        match &cmd {
+            WireCommand::ThreadPage(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+                return Err(rex_wave_api::ApiError::Timeout);
+            }
+            WireCommand::Read(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+            }
+            _ => {}
+        }
+        self.inner.call_wire(cmd).await
+    }
+
+    async fn watch(
+        &self,
+        interest: rex_wave_api::Interest,
+        from: Cursor,
+    ) -> Result<rex_wave_api::FrameStream, rex_wave_api::ApiError> {
+        if let rex_wave_api::Interest::Stage { target } = interest {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let _ = tx.try_send(Ok(Frame::StageFocused {
+                generation: FocusGeneration(1),
+                target,
+            }));
+            // Single server stage slot: opening a new stage watch drops the previous sender.
+            *self.stage_slot.lock().unwrap() = Some(tx);
+            return Ok(Box::pin(SingleSlotStream { rx }));
+        }
+        self.inner.watch(interest, from).await
+    }
+}
+
+#[tokio::test]
+async fn async_stage_retarget_cancels_slow_room_without_stealing_single_stage_slot() {
+    let client = SingleSlotSlowClient {
+        inner: DemoClient::new(),
+        stage_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+    };
+    let WireReply::Sidebar(overview) = client
+        .call_wire(WireCommand::Sidebar(Default::default()))
+        .await
+        .unwrap()
+    else {
+        panic!("sidebar");
+    };
+    let mut model = Model::new(client.me().clone(), overview);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let loader = rex_wave_tui::StageLoader::new(client.clone(), tx);
+
+    // Leave a slow paged Room (seq A) for Kanban (seq B); loader must cancel the slow Room
+    // before it opens a late watch that would evict Kanban's single server stage slot.
+    let slow_room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("lounge").unwrap(),
+    };
+    let fx = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Room(slow_room))),
+    );
+    let t0 = std::time::Instant::now();
+    for eff in fx {
+        if let Effect::Retarget(target) = eff {
+            loader.retarget(model.stage_req_seq, model.sidebar_snapshot.clone(), target);
+        }
+    }
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(30),
+        "StageLoader::retarget must not block the UI loop"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let fx2 = update(&mut model, Msg::Action(Action::Activate(NodeKey::Kanban)));
+    for eff in fx2 {
+        if let Effect::Retarget(target) = eff {
+            loader.retarget(model.stage_req_seq, model.sidebar_snapshot.clone(), target);
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+    let mut stage_watch = None;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            Msg::StageWatchOpened {
+                seq,
+                watch: Ok(opt),
+            } => {
+                if seq == model.stage_req_seq {
+                    stage_watch = opt.map(|w| w.0);
+                }
+            }
+            other => {
+                let _ = update(&mut model, other);
+            }
+        }
+    }
+    assert!(
+        matches!(model.stage, Stage::Kanban(_)),
+        "stale slow target must not clobber active Kanban stage"
+    );
+    let first_frame = rex_wave_tui::poll_watch_slot(&mut stage_watch, WatchSlot::Stage).await;
+    assert!(
+        matches!(
+            first_frame,
+            Msg::Frame {
+                watch: WatchSlot::Stage,
+                frame: Frame::StageFocused { .. }
+            }
+        ),
+        "active Kanban stage watch must remain open on the server's single slot"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            rex_wave_tui::poll_watch_slot(&mut stage_watch, WatchSlot::Stage),
+        )
+        .await
+        .is_err(),
+        "active stage watch must stay parked rather than closing immediately"
+    );
+
+    // Verify human Stage Error label and connection status pill in top chrome.
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Agent {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("missing").unwrap(),
+        })),
+    );
+    let err_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(err_seq),
+            result: Err(rex_wave_api::ApiError::NotFound {
+                what: "worker".to_owned(),
+            }),
+        },
+    );
+    let mut term = Terminal::new(TestBackend::new(124, 24)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let screen = screen_text(&term);
+    assert!(screen.contains("✕ @auth-v2/missing: not found: worker"));
+    assert!(!screen.contains("WaveSlug"));
+    assert!(screen.contains("● connected"));
+
+    let _ = update(
+        &mut model,
+        Msg::WatchClosed {
+            watch: WatchSlot::Tree,
+            error: None,
+        },
+    );
+    assert!(!model.connected);
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("○ disconnected"));
+}
+
+#[tokio::test]
+async fn inbox_keys_help_overlay_sidebar_resize_project_kanban_and_multiline_composer() {
+    let client = DemoClient::new();
+    let WireReply::Sidebar(mut overview) = client
+        .call_wire(WireCommand::Sidebar(Default::default()))
+        .await
+        .unwrap()
+    else {
+        panic!("sidebar");
+    };
+    let proj_beta = BbProjectId::parse("proj_beta").unwrap();
+    overview.projects.push(rex_wave_api::read::ProjectBranch {
+        project: proj_beta.clone(),
+        channels: vec![rex_wave_api::read::ChannelLeaf {
+            room: RoomId::Channel {
+                scope: RoomScope::Project {
+                    project: proj_beta.clone(),
+                },
+                name: ChannelName::parse("ops").unwrap(),
+            },
+            unread: 0,
+            mentions: 0,
+        }],
+        waves: Vec::new(),
+    });
+
+    let mut model = Model::new(client.me().clone(), overview);
+    let room_alpha = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("p_123").unwrap(),
+        },
+        name: ChannelName::parse("wave-auth-v2").unwrap(),
+    };
+    let page = rex_wave_api::notify::InboxPage {
+        head: Seq(3),
+        unread: 3,
+        cursors: Vec::new(),
+        items: vec![
+            rex_wave_api::notify::Notification {
+                id: NotificationId(10),
+                at: UnixMs(300),
+                rank: rex_wave_api::notify::Rank(700),
+                state: rex_wave_api::notify::NotifyState::Unread,
+                draft: rex_wave_api::notify::NotificationDraft {
+                    kind: rex_wave_api::notify::NotifyKind::Mention {
+                        room: room_alpha.clone(),
+                        seq: Seq(5),
+                    },
+                    title: "Mention 1".to_owned(),
+                    preview: "hi".to_owned(),
+                    actions: vec![rex_wave_api::notify::NotifyAction {
+                        label: "Mark read".to_owned(),
+                        key: Some('r'),
+                        run: Box::new(WireCommand::InboxMarkRead(
+                            rex_wave_api::notify::InboxMarkRead {
+                                room: room_alpha.clone(),
+                                upto: Seq(5),
+                            },
+                        )),
+                    }],
+                    dedupe: "m1".to_owned(),
+                },
+            },
+            rex_wave_api::notify::Notification {
+                id: NotificationId(11),
+                at: UnixMs(200),
+                rank: rex_wave_api::notify::Rank(690),
+                state: rex_wave_api::notify::NotifyState::Unread,
+                draft: rex_wave_api::notify::NotificationDraft {
+                    kind: rex_wave_api::notify::NotifyKind::Mention {
+                        room: room_alpha.clone(),
+                        seq: Seq(8),
+                    },
+                    title: "Mention 2".to_owned(),
+                    preview: "hi again".to_owned(),
+                    actions: Vec::new(),
+                    dedupe: "m2".to_owned(),
+                },
+            },
+        ],
+    };
+    let req_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(req_seq),
+            result: Ok(WireReply::InboxList(page)),
+        },
+    );
+
+    // [r] runs the card's Mark read action; [x] dismisses; [X] dismisses all MENTION cards + advances cursor.
+    let r_fx = press(&mut model, Pane::Stage, KeyCode::Char('r'));
+    assert!(r_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::InboxMarkRead(mr), .. } if mr.upto == Seq(5)
+    )));
+    let x_fx = press(&mut model, Pane::Stage, KeyCode::Char('x'));
+    assert!(x_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::InboxAck(ack), .. }
+            if ack.ids == vec![NotificationId(10)]
+                && ack.state == rex_wave_api::notify::NotifyState::Dismissed
+    )));
+    let shift_x = key_action(
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+        Pane::Stage,
+        &model.sidebar.cursor,
+    )
+    .unwrap();
+    let group_fx = update(&mut model, Msg::Action(shift_x));
+    assert!(group_fx.iter().any(|e| matches!(
+        e,
+        Effect::CallBatch { cmds }
+            if cmds.len() == 2
+                && matches!(
+                    &cmds[0],
+                    WireCommand::InboxAck(ack)
+                        if ack.ids == vec![NotificationId(10), NotificationId(11)]
+                )
+                && matches!(
+                    &cmds[1],
+                    WireCommand::InboxMarkRead(mr) if mr.upto == Seq(8)
+                )
+    )));
+
+    // [?] opens Help Overlay showing Graphics mode, blocks margin clicks, and [v] cycles graphics.
+    let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('?'));
+    assert_eq!(model.focus, Pane::Overlay);
+    let mut term = Terminal::new(TestBackend::new(132, 38)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert_eq!(
+        mouse_action(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &hits,
+        ),
+        None,
+        "clicks in the margin while an overlay is open must not hit underlying sidebar rows"
+    );
+    let help_screen = screen_text(&term);
+    assert!(help_screen.contains("Hybrid z=-1 + U+10EEEE"));
+    assert!(help_screen.contains("mark card read"));
+    let _ = press(&mut model, Pane::Overlay, KeyCode::Char('v'));
+    assert_eq!(model.graphics, GraphicsMode::BackdropOnly);
+    let _ = press(&mut model, Pane::Overlay, KeyCode::Char('?'));
+    assert_eq!(model.focus, Pane::Sidebar);
+
+    // Sidebar badges shorten claude-code -> claude, strip #wave-, and < / > / \ + clamped drag resize.
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let main_screen = screen_text(&term);
+    assert!(
+        main_screen.contains("[claude]") && !main_screen.contains("[claude-code]"),
+        "sidebar must shorten claude-code badge, got:\n{main_screen}"
+    );
+    assert!(
+        !main_screen.contains("#wave-auth-v2"),
+        "sidebar wave branch must strip redundant #wave- prefix"
+    );
+
+    let _ = update(&mut model, Msg::Resize { cols: 90, rows: 34 });
+    let _ = update(&mut model, Msg::Action(Action::ResizeBegin));
+    let _ = update(&mut model, Msg::Action(Action::ResizeDrag(85)));
+    let _ = update(&mut model, Msg::Action(Action::ResizeEnd));
+    assert_eq!(model.sidebar_width, 66, "drag clamps to term_cols - 24");
+    let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('<'));
+    assert_eq!(
+        model.sidebar_width, 64,
+        "< acts on the very first press after dragging to max width"
+    );
+    let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('>'));
+    assert_eq!(model.sidebar_width, 66);
+    let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('\\'));
+    assert!(model.sidebar_hidden);
+    assert_eq!(model.focus, Pane::Stage);
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char('\\'));
+    assert!(!model.sidebar_hidden);
+
+    // Project-scoped Kanban:
+    // 1) Visiting proj_beta (which has no board in overview.kanban) falls back cleanly to board: None,
+    //    while explicit [B] targets project:proj_beta.
+    let _ = update(
+        &mut model,
+        Msg::HoverSettled(NodeKey::Project(proj_beta.clone())),
+    );
+    model.sidebar.cursor = NodeKey::Project(proj_beta.clone());
+    let fallback_fx = update(&mut model, Msg::Action(Action::Activate(NodeKey::Kanban)));
+    assert!(
+        fallback_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(StageTarget::Kanban { board: None })))
+    );
+    model.sidebar.cursor = NodeKey::Project(proj_beta.clone());
+    let explicit_b = update(&mut model, Msg::Action(Action::OpenProjectBoard));
+    assert!(explicit_b.iter().any(|e| matches!(
+        e,
+        Effect::Retarget(StageTarget::Kanban { board: Some(b) })
+            if b == &BoardId::parse("project:proj_beta").unwrap()
+    )));
+
+    // 2) Once proj_beta has an ensured board in overview.kanban, stepping cursor [k] across p_123
+    //    on the way up to Kanban does NOT clobber active_project.
+    model
+        .sidebar_snapshot
+        .kanban
+        .push(rex_wave_api::read::BoardBadge {
+            board: BoardId::parse("project:proj_beta").unwrap(),
+            open: 1,
+            mine: 0,
+        });
+    model.sidebar.cursor = NodeKey::Project(proj_beta.clone());
+    let _ = update(
+        &mut model,
+        Msg::HoverSettled(NodeKey::Project(proj_beta.clone())),
+    );
+    model.focus = Pane::Sidebar;
+    while model.sidebar.cursor != NodeKey::Kanban {
+        let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('k'));
+    }
+    let scoped_fx = update(&mut model, Msg::Action(Action::Activate(NodeKey::Kanban)));
+    assert!(scoped_fx.iter().any(|e| matches!(
+        e,
+        Effect::Retarget(StageTarget::Kanban { board: Some(b) })
+            if b == &BoardId::parse("project:proj_beta").unwrap()
+    )));
+
+    // Multiline composer with paste, Ctrl+W word delete, Shift+Enter newline, and cursor tracking.
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Room(room_alpha.clone()))),
+    );
+    let r_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(r_seq),
+            result: Ok(WireReply::Read(rex_wave_api::read::Page {
+                entries: Vec::new(),
+                cursor: Cursor::live(),
+                timed_out: false,
+            })),
+        },
+    );
+    let _ = press(&mut model, Pane::Stage, KeyCode::Char('i'));
+    assert_eq!(model.focus, Pane::Composer);
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Paste("first line typo\r\nsecond line".to_owned())),
+    );
+    // Move up to line 1 end, Ctrl+W deletes "typo", then submit preserving newline.
+    let up_act = key_action(
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        Pane::Composer,
+        &model.sidebar.cursor,
+    )
+    .unwrap();
+    let _ = update(&mut model, Msg::Action(up_act));
+    let end_act = key_action(
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        Pane::Composer,
+        &model.sidebar.cursor,
+    )
+    .unwrap();
+    let _ = update(&mut model, Msg::Action(end_act));
+    let cw_act = key_action(
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        Pane::Composer,
+        &model.sidebar.cursor,
+    )
+    .unwrap();
+    let _ = update(&mut model, Msg::Action(cw_act));
+    let _ = press(&mut model, Pane::Composer, KeyCode::Backspace);
+    let submit_fx = press(&mut model, Pane::Composer, KeyCode::Enter);
+    assert!(submit_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::RoomPost(rp), .. }
+            if rp.body.as_str() == "first line\nsecond line"
+    )));
 }

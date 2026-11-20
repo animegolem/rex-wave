@@ -1,8 +1,11 @@
 //! Context-sensitive right-pane main stage driven by the focused or hovered
 //! sidebar node, stamped with server `FocusGeneration`.
 
+use crate::composer::Composer;
 use crate::input::{HitMap, Target};
 use crate::kitty::{Badge, CONTEXT_BAR_IMAGE, CardPlacement, CardTone, GraphicsMode};
+use crate::richtext::{Palette, display_width, markdown_lines};
+use crate::scroll::ScrollState;
 use crate::sidebar::NodeKey;
 use ratatui::{
     buffer::Buffer,
@@ -25,6 +28,8 @@ use rex_wave_api::{
     wave::{Activity, InteractionKind, PendingInteraction, WorkerPhase},
     *,
 };
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 const C_ACCENT: Color = Color::Rgb(86, 194, 255);
@@ -211,7 +216,7 @@ impl InboxView {
 pub struct KanbanView {
     pub snapshot: BoardSnapshot,
     pub cursor: (usize, usize),
-    pub composer: String,
+    pub composer: Composer,
 }
 
 impl KanbanView {
@@ -228,7 +233,7 @@ impl KanbanView {
         Self {
             snapshot,
             cursor: (0, 0),
-            composer: String::new(),
+            composer: Composer::new(),
         }
     }
 
@@ -262,14 +267,46 @@ impl KanbanView {
     }
 }
 
+/// Where one feed item (room message or agent event) landed in the last rendered layout,
+/// in visual lines. Keyboard selection uses it to scroll the item into view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemSpan {
+    pub key: u64,
+    pub top: u16,
+    pub height: u16,
+}
+
+fn reveal_item(scroll: &mut ScrollState, layout: &RefCell<Vec<ItemSpan>>, key: u64) {
+    let found = layout.borrow().iter().find(|s| s.key == key).copied();
+    if let Some(span) = found {
+        scroll.reveal(span.top, span.height);
+    }
+}
+
+fn step_index(len: usize, current: Option<usize>, delta: i8) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        None => len - 1,
+        Some(i) => (i as i64 + i64::from(delta)).clamp(0, len as i64 - 1) as usize,
+    })
+}
+
 pub struct RoomView {
     pub room: RoomId,
     pub entries: Vec<Envelope>,
     pub cursor: Cursor,
+    /// Click-selected promote range.
     pub selection: Option<(Seq, Seq)>,
-    pub composer: String,
-    pub scroll: u16,
+    /// Keyboard message cursor (`j` / `k`).
+    pub focused: Option<Seq>,
+    /// WaveConductor briefs the operator expanded in place.
+    pub expanded: BTreeSet<Seq>,
+    pub composer: Composer,
+    pub scroll: ScrollState,
     pub status_banner: Option<String>,
+    pub layout: RefCell<Vec<ItemSpan>>,
 }
 
 impl RoomView {
@@ -279,10 +316,65 @@ impl RoomView {
             entries,
             cursor,
             selection: None,
-            composer: String::new(),
-            scroll: u16::MAX,
+            focused: None,
+            expanded: BTreeSet::new(),
+            composer: Composer::new(),
+            scroll: ScrollState::follow(),
             status_banner: None,
+            layout: RefCell::new(Vec::new()),
         }
+    }
+
+    fn posted_seqs(&self) -> Vec<Seq> {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
+            .map(|e| e.seq)
+            .collect()
+    }
+
+    pub fn select_step(&mut self, delta: i8) {
+        let seqs = self.posted_seqs();
+        let cur = self.focused.and_then(|f| seqs.iter().position(|s| *s == f));
+        if let Some(idx) = step_index(seqs.len(), cur, delta) {
+            self.focused = Some(seqs[idx]);
+            reveal_item(&mut self.scroll, &self.layout, seqs[idx].0);
+        }
+    }
+
+    pub fn focused_entry(&self) -> Option<&Envelope> {
+        let f = self.focused?;
+        self.entries.iter().find(|e| e.seq == f)
+    }
+
+    pub fn is_collapsed_brief(&self, env: &Envelope) -> bool {
+        is_brief(env) && !self.expanded.contains(&env.seq)
+    }
+
+    pub fn toggle_focused_brief(&mut self) -> bool {
+        let Some(env) = self.focused_entry() else {
+            return false;
+        };
+        if !is_brief(env) {
+            return false;
+        }
+        let seq = env.seq;
+        if !self.expanded.remove(&seq) {
+            self.expanded.insert(seq);
+        }
+        true
+    }
+
+    /// Title and raw body for the pager overlay.
+    pub fn pager_for_focused(&self) -> Option<(String, String)> {
+        let env = self.focused_entry()?;
+        let Event::Room(RoomEvent::Posted { body, .. }) = &env.event else {
+            return None;
+        };
+        Some((
+            format!("#{} {}", env.seq.0, sender_label(&env.by, &self.room)),
+            body.as_str().to_owned(),
+        ))
     }
 
     pub fn merge_entries(&mut self, incoming: Vec<Envelope>, cursor: Cursor) {
@@ -330,11 +422,99 @@ pub struct AgentInspector {
     pub wave: WaveSlug,
     pub role: RoleName,
     pub page: ThreadPageView,
-    pub composer: String,
-    pub scroll: u16,
+    pub composer: Composer,
+    pub scroll: ScrollState,
+    /// Keyboard turn cursor (`j` / `k`).
+    pub focused: Option<BbSeq>,
+    pub layout: RefCell<Vec<ItemSpan>>,
+}
+
+fn is_readable_event(ev: &AgentEvent) -> bool {
+    matches!(
+        ev.kind,
+        AgentEventKind::UserMessage { .. }
+            | AgentEventKind::AssistantText { .. }
+            | AgentEventKind::ToolCall { .. }
+            | AgentEventKind::ToolResult { .. }
+    )
 }
 
 impl AgentInspector {
+    pub fn new(wave: WaveSlug, role: RoleName, page: ThreadPageView) -> Self {
+        Self {
+            wave,
+            role,
+            page,
+            composer: Composer::new(),
+            scroll: ScrollState::follow(),
+            focused: None,
+            layout: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The worker's most recent assistant output, pinned and highlighted in the log.
+    pub fn latest_text_seq(&self) -> Option<BbSeq> {
+        self.page
+            .events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, AgentEventKind::AssistantText { .. }))
+            .map(|e| e.seq)
+    }
+
+    pub fn select_step(&mut self, delta: i8) {
+        let seqs: Vec<BbSeq> = self
+            .page
+            .events
+            .iter()
+            .filter(|e| is_readable_event(e))
+            .map(|e| e.seq)
+            .collect();
+        let cur = self.focused.and_then(|f| seqs.iter().position(|s| *s == f));
+        if let Some(idx) = step_index(seqs.len(), cur, delta) {
+            self.focused = Some(seqs[idx]);
+            reveal_item(&mut self.scroll, &self.layout, seqs[idx].0);
+        }
+    }
+
+    /// Markdown for the whole turn holding `seq`: everything after the previous
+    /// `TurnEnded` up to the next one.
+    pub fn turn_pager(&self, seq: BbSeq) -> Option<(String, String)> {
+        let events = &self.page.events;
+        let idx = events.iter().position(|e| e.seq == seq)?;
+        let start = events[..idx]
+            .iter()
+            .rposition(|e| matches!(e.kind, AgentEventKind::TurnEnded))
+            .map_or(0, |i| i + 1);
+        let end = events[idx..]
+            .iter()
+            .position(|e| matches!(e.kind, AgentEventKind::TurnEnded))
+            .map_or(events.len(), |p| idx + p);
+        let mut body = String::new();
+        for ev in &events[start..end] {
+            match &ev.kind {
+                AgentEventKind::UserMessage { text } => {
+                    body.push_str(&format!("## User · #{}\n\n{text}\n\n", ev.seq.0));
+                }
+                AgentEventKind::AssistantText { text } => {
+                    body.push_str(&format!("## Assistant · #{}\n\n{text}\n\n", ev.seq.0));
+                }
+                AgentEventKind::ToolCall { name, summary } => {
+                    body.push_str(&format!("- **call** `{name}` {summary}\n"));
+                }
+                AgentEventKind::ToolResult { name, ok, summary } => {
+                    let tag = if *ok { "ok" } else { "error" };
+                    body.push_str(&format!("- **{tag}** `{name}` {summary}\n"));
+                }
+                _ => {}
+            }
+        }
+        Some((
+            format!("Turn · @{}/{} · #{}", self.wave, self.role, seq.0),
+            body.trim_end().to_owned(),
+        ))
+    }
+
     pub fn context_pct(&self) -> Option<u8> {
         let u = self.page.usage.as_ref()?;
         if u.model_context_window == 0 {
@@ -359,7 +539,9 @@ pub struct StageRenderCtx<'a> {
     pub graphics: GraphicsMode,
     pub stage_focused: bool,
     pub composing: bool,
+    pub connected: bool,
     pub last_error: Option<&'a str>,
+    pub cursor_out: &'a std::cell::Cell<Option<(u16, u16)>>,
 }
 
 impl Stage {
@@ -470,13 +652,7 @@ impl Stage {
     }
 }
 
-fn draw_stage_frame(
-    title: String,
-    area: Rect,
-    buf: &mut Buffer,
-    hits: &mut HitMap,
-    ctx: &StageRenderCtx<'_>,
-) -> Rect {
+fn draw_stage_frame(title: String, area: Rect, buf: &mut Buffer, ctx: &StageRenderCtx<'_>) -> Rect {
     let focused = ctx.stage_focused || ctx.composing;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -491,19 +667,74 @@ fn draw_stage_frame(
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let gfx_pill = format!(" [v] {} ", ctx.graphics.label());
-    let gfx_w = gfx_pill.chars().count() as u16;
-    if area.width > gfx_w + 20 {
-        let gx = area.right().saturating_sub(gfx_w + 2);
-        let pill_rect = Rect::new(gx, area.y, gfx_w, 1);
-        Paragraph::new(Line::from(Span::styled(
-            gfx_pill,
+    let (status, status_fg) = if ctx.connected {
+        ("● connected", C_MINT)
+    } else {
+        ("○ disconnected", C_ROSE)
+    };
+    let pill = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            status,
+            Style::default().fg(status_fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(C_DIM)),
+        Span::styled(
+            "?",
             Style::default().fg(C_LAVENDER).add_modifier(Modifier::BOLD),
-        )))
-        .render(pill_rect, buf);
-        hits.push(pill_rect, Target::GraphicsToggle);
+        ),
+        Span::styled(" help ", Style::default().fg(C_DIM)),
+    ]);
+    let pill_w = pill.width() as u16;
+    let title_w = display_width(&title) as u16 + 4;
+    if area.width > pill_w + title_w + 2 {
+        let px = area.right().saturating_sub(pill_w + 2);
+        Paragraph::new(pill).render(Rect::new(px, area.y, pill_w, 1), buf);
     }
     inner
+}
+
+/// Human label for a stage target (`#proj/room`, `@wave/role`, `Inbox`).
+pub fn target_label(target: &StageTarget) -> String {
+    match target {
+        StageTarget::Inbox => "Inbox".to_owned(),
+        StageTarget::Kanban { board: Some(b) } => format!("Kanban {b}"),
+        StageTarget::Kanban { board: None } => "Kanban".to_owned(),
+        StageTarget::Room { room } => room_label(room),
+        StageTarget::Agent { wave, role } => format!("@{wave}/{role}"),
+        StageTarget::Summary { key } => node_label(key),
+    }
+}
+
+fn room_label(room: &RoomId) -> String {
+    match room {
+        RoomId::Channel {
+            scope: room::RoomScope::Global,
+            name,
+        } => format!("#{name}"),
+        RoomId::Channel {
+            scope: room::RoomScope::Project { project },
+            name,
+        } => format!("#{project}/{name}"),
+        RoomId::Direct { pair } => {
+            let (a, b) = pair.clone().into();
+            format!("{a} ↔ {b}")
+        }
+    }
+}
+
+fn node_label(key: &NodeKey) -> String {
+    match key {
+        NodeKey::Inbox => "Inbox".to_owned(),
+        NodeKey::Kanban => "Kanban".to_owned(),
+        NodeKey::Divider => "Overview".to_owned(),
+        NodeKey::ProjectsHeader => "Projects".to_owned(),
+        NodeKey::Project(p) => format!("Project {p}"),
+        NodeKey::Room(r) | NodeKey::Dm(r) => room_label(r),
+        NodeKey::Agent { wave, role } => format!("@{wave}/{role}"),
+        NodeKey::ChannelsHeader => "Channels".to_owned(),
+        NodeKey::DmsHeader => "Direct Messages".to_owned(),
+    }
 }
 
 fn render_inbox(
@@ -520,7 +751,7 @@ fn render_inbox(
         items.len(),
         view.page.unread
     );
-    let inner = draw_stage_frame(title, area, buf, hits, ctx);
+    let inner = draw_stage_frame(title, area, buf, ctx);
     if inner.height < 2 || inner.width < 12 {
         return;
     }
@@ -547,12 +778,22 @@ fn render_inbox(
             "[d]",
             Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" deny/dismiss  ", Style::default().fg(C_DIM)),
+        Span::styled(" deny  ", Style::default().fg(C_DIM)),
         Span::styled(
-            "[v]",
+            "[r]",
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" read  ", Style::default().fg(C_DIM)),
+        Span::styled(
+            "[x/X]",
+            Style::default().fg(C_AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" dismiss / all of kind  ", Style::default().fg(C_DIM)),
+        Span::styled(
+            "[?]",
             Style::default().fg(C_LAVENDER).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" graphics", Style::default().fg(C_DIM)),
+        Span::styled(" keys", Style::default().fg(C_DIM)),
     ]))
     .render(footer, buf);
 
@@ -634,6 +875,9 @@ fn render_inbox(
         hits.push(vis_rect, Target::Card { id: item.id });
 
         let kind_badge = kind_label(&item.draft.kind);
+        let is_seen = item.state == NotifyState::Seen;
+        let state_prefix = if is_seen { "✓ " } else { "" };
+        let title_fg = if is_seen { C_DIM } else { Color::White };
         // Rule A: Every cell inside a `z=-1` card keeps `Color::Reset` background so SGR 48;2 never hides the RGBA backdrop.
         let line0 = Line::from(vec![
             Span::styled(
@@ -650,12 +894,17 @@ fn render_inbox(
                     .bg(Color::Reset)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(state_prefix, Style::default().fg(C_MINT).bg(Color::Reset)),
             Span::styled(
-                truncate_chars(&item.draft.title, card_w.saturating_sub(16) as usize),
+                truncate_chars(&item.draft.title, card_w.saturating_sub(18) as usize),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(title_fg)
                     .bg(Color::Reset)
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(if is_seen {
+                        Modifier::empty()
+                    } else {
+                        Modifier::BOLD
+                    }),
             ),
         ]);
         let line1 = Line::from(vec![
@@ -751,7 +1000,7 @@ fn render_kanban(
 ) {
     let total_cards: usize = view.snapshot.lanes.iter().map(|l| l.cards.len()).sum();
     let title = format!("Kanban · {} ({total_cards} cards)", view.snapshot.board);
-    let inner = draw_stage_frame(title, area, buf, hits, ctx);
+    let inner = draw_stage_frame(title, area, buf, ctx);
     if inner.height < 4 || inner.width < 16 {
         return;
     }
@@ -887,18 +1136,12 @@ fn render_kanban(
             .get(view.cursor.0)
             .map(|l| l.lane.as_str())
             .unwrap_or("todo");
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" New task ({lane_name}) > "),
-                Style::default().fg(C_MINT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(view.composer.clone(), Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(C_ACCENT)),
-        ]))
-        .render(
-            Rect::new(bottom_area.x, bottom_area.y, bottom_area.width, 1),
+        ctx.cursor_out.set(render_composer_rows(
+            bottom_area,
             buf,
-        );
+            &format!(" New task ({lane_name}) > "),
+            &view.composer,
+        ));
     } else {
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -937,20 +1180,21 @@ fn render_room(
     ctx: &StageRenderCtx<'_>,
 ) {
     let room_label = format_room_title(&view.room);
-    let inner = draw_stage_frame(room_label, area, buf, hits, ctx);
+    let inner = draw_stage_frame(room_label, area, buf, ctx);
     if inner.height < 4 || inner.width < 16 {
         return;
     }
 
     let blocked_worker = find_blocked_worker_for_room(ctx.overview, &view.room);
     let banner_h = u16::from(blocked_worker.is_some());
+    let composer_h = composer_height(&view.composer, inner.width, ctx.composing, " Message > ");
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(banner_h),
             Constraint::Min(2),
-            Constraint::Length(2),
+            Constraint::Length(composer_h),
         ])
         .split(inner);
 
@@ -988,17 +1232,20 @@ fn render_room(
     if let Some((wave, role, interaction)) = blocked_worker {
         let approve_txt = "[a] Approve";
         let deny_txt = "[d] Deny";
-        let prefix = format!(
-            " ◐ @{role} blocked ({}) · {}  ",
-            interaction_kind_tag(&interaction.kind),
-            truncate_chars(
-                &interaction.summary,
-                banner_area.width.saturating_sub(42) as usize
-            )
+        let head = format!(
+            " ◐ @{role} blocked ({}) · ",
+            interaction_kind_tag(&interaction.kind)
         );
-        let p_len = prefix.chars().count() as u16;
         let a_len = approve_txt.chars().count() as u16;
         let d_len = deny_txt.chars().count() as u16;
+        let buttons_w = a_len + 2 + d_len + 3;
+        let sum_avail =
+            (banner_area.width as usize).saturating_sub(display_width(&head) + buttons_w as usize);
+        let prefix = format!(
+            "{head}{}  ",
+            truncate_chars(&interaction.summary, sum_avail)
+        );
+        let p_len = display_width(&prefix) as u16;
         Paragraph::new(Line::from(vec![
             Span::styled(
                 prefix,
@@ -1039,42 +1286,274 @@ fn render_room(
         }
     }
 
-    let rendered_rows: Vec<(Seq, Line<'static>)> = view
-        .entries
-        .iter()
-        .filter_map(|env| format_room_entry(env, view.selection, feed_area.width))
-        .collect();
-
-    let vis_h = feed_area.height as usize;
-    let max_scroll = rendered_rows.len().saturating_sub(vis_h);
-    let start = if view.scroll == u16::MAX {
-        max_scroll
-    } else {
-        (view.scroll as usize).min(max_scroll)
-    };
-
-    for (off, (seq, line)) in rendered_rows
-        .into_iter()
-        .skip(start)
-        .take(vis_h)
-        .enumerate()
-    {
-        let row_rect = Rect::new(feed_area.x, feed_area.y + off as u16, feed_area.width, 1);
-        if seq.0 > 0 {
-            hits.push(row_rect, Target::Message { seq: seq.0 });
-        }
-        Paragraph::new(line).render(row_rect, buf);
-    }
+    let items = room_feed(view, feed_area.width);
+    render_feed(
+        items,
+        feed_area,
+        buf,
+        hits,
+        &view.scroll,
+        &view.layout,
+        true,
+    );
 
     render_composer_box(
         composer_area,
         buf,
         hits,
-        ctx.composing,
+        ctx,
         &view.composer,
-        "Message",
-        "[i/Enter] compose  [click] select range  [P] promote to letter",
+        " Message > ",
+        "[i] compose  [j/k] select  [enter] read / expand  [P] promote  [?] keys",
     );
+}
+
+/// One renderable feed item: a room message or an agent event.
+struct FeedItem {
+    key: u64,
+    clickable: bool,
+    lines: Vec<Line<'static>>,
+}
+
+const FEED_INDENT: &str = "   ";
+const SEL_BG: Color = Color::Rgb(30, 44, 68);
+
+fn palette() -> Palette {
+    Palette {
+        text: Style::default().fg(C_TEXT),
+        heading: Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+        bold: Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        code: Style::default().fg(C_LAVENDER),
+        code_block: Style::default().fg(C_MINT),
+        fence: Style::default().fg(C_DIM),
+        mention: Style::default().fg(C_AMBER).add_modifier(Modifier::BOLD),
+        quote: Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
+    }
+}
+
+/// Lays out `items`, records their visual-line spans, and paints the visible window.
+fn render_feed(
+    items: Vec<FeedItem>,
+    area: Rect,
+    buf: &mut Buffer,
+    hits: &mut HitMap,
+    scroll: &ScrollState,
+    layout: &RefCell<Vec<ItemSpan>>,
+    message_hits: bool,
+) {
+    let mut rows: Vec<(u64, bool, Line<'static>)> = Vec::new();
+    let mut spans = Vec::with_capacity(items.len());
+    for item in items {
+        spans.push(ItemSpan {
+            key: item.key,
+            top: rows.len().min(u16::MAX as usize) as u16,
+            height: item.lines.len().min(u16::MAX as usize) as u16,
+        });
+        for line in item.lines {
+            rows.push((item.key, item.clickable, line));
+        }
+    }
+    *layout.borrow_mut() = spans;
+
+    let start = scroll.resolve(rows.len(), area.height);
+    let total = rows.len();
+    for (off, (key, clickable, line)) in rows
+        .into_iter()
+        .skip(start)
+        .take(area.height as usize)
+        .enumerate()
+    {
+        let row_rect = Rect::new(area.x, area.y + off as u16, area.width, 1);
+        if message_hits && clickable {
+            hits.push(row_rect, Target::Message { seq: key });
+        }
+        Paragraph::new(line).render(row_rect, buf);
+    }
+
+    let below = total.saturating_sub(start + area.height as usize);
+    if below > 0 && area.width > 20 {
+        let more = format!(" ↓ {below} more lines ");
+        let w = display_width(&more) as u16;
+        Paragraph::new(Line::from(Span::styled(
+            more,
+            Style::default().fg(Color::Black).bg(C_DIM),
+        )))
+        .render(
+            Rect::new(area.right().saturating_sub(w + 1), area.bottom() - 1, w, 1),
+            buf,
+        );
+    }
+}
+
+/// Inside a wave's own `#wave-<slug>` room, `@<slug>/<role>` shortens to `@<role>`.
+pub fn sender_label(by: &Principal, room: &RoomId) -> String {
+    if let Principal::Worker { wave, role } = by
+        && let RoomId::Channel { name, .. } = room
+        && name.as_str().strip_prefix("wave-") == Some(wave.as_str())
+    {
+        return format!("@{role}");
+    }
+    by.to_string()
+}
+
+pub fn is_brief(env: &Envelope) -> bool {
+    if !matches!(
+        env.by,
+        Principal::System {
+            part: SystemPart::WaveConductor
+        }
+    ) {
+        return false;
+    }
+    let Event::Room(RoomEvent::Posted { body, idem, .. }) = &env.event else {
+        return false;
+    };
+    if let Some(key) = idem {
+        return key.as_str().contains(":brief:");
+    }
+    body.as_str().trim_start().starts_with('@')
+}
+
+fn brief_role(env: &Envelope, body: &str) -> String {
+    if let Event::Room(RoomEvent::Posted {
+        idem: Some(key), ..
+    }) = &env.event
+        && let Some((_, after)) = key.as_str().split_once(":brief:")
+        && let Some(role) = after.split(':').next()
+        && !role.is_empty()
+    {
+        return format!("@{role}");
+    }
+    body.split_whitespace()
+        .next()
+        .filter(|w| w.starts_with('@') && w.len() > 1)
+        .map(|w| w.trim_end_matches([':', ',', '.']).to_owned())
+        .unwrap_or_else(|| "@worker".to_owned())
+}
+
+fn with_gutter(
+    mut line: Line<'static>,
+    gutter: &Span<'static>,
+    bg: Option<Color>,
+) -> Line<'static> {
+    line.spans.insert(0, gutter.clone());
+    if let Some(bg) = bg {
+        line.style = line.style.bg(bg);
+        for span in &mut line.spans {
+            span.style = span.style.bg(bg);
+        }
+    }
+    line
+}
+
+fn indent_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|mut l| {
+            l.spans.insert(0, Span::raw(FEED_INDENT));
+            l
+        })
+        .collect()
+}
+
+fn room_feed(view: &RoomView, width: u16) -> Vec<FeedItem> {
+    let pal = palette();
+    let content_w = width.saturating_sub(1);
+    let mut items = Vec::new();
+    for env in &view.entries {
+        let Event::Room(ev) = &env.event else {
+            continue;
+        };
+        match ev {
+            RoomEvent::Posted { body, .. } => {
+                let focused = view.focused == Some(env.seq);
+                let in_sel = view
+                    .selection
+                    .is_some_and(|(a, b)| env.seq >= a.min(b) && env.seq <= a.max(b));
+                let gutter = if focused {
+                    Span::styled(
+                        "▌",
+                        Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(" ")
+                };
+                let seq_span = Span::styled(format!("#{} ", env.seq.0), Style::default().fg(C_DIM));
+                let sender = sender_label(&env.by, &view.room);
+                let sender_style = Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD);
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                if view.is_collapsed_brief(env) {
+                    let summary = format!(
+                        "▸ {} · brief for {} [Enter to expand]",
+                        env.by,
+                        brief_role(env, body.as_str())
+                    );
+                    let avail =
+                        (content_w as usize).saturating_sub(display_width(&seq_span.content));
+                    lines.push(Line::from(vec![
+                        seq_span,
+                        Span::styled(
+                            truncate_chars(&summary, avail),
+                            Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                } else {
+                    let head_w = display_width(&seq_span.content) + display_width(&sender) + 2;
+                    let inline_w = (content_w as usize).saturating_sub(head_w) as u16;
+                    let inline = markdown_lines(body.as_str(), inline_w, &pal);
+                    let one_line = !body.as_str().trim().contains('\n') && inline.len() <= 1;
+                    if one_line && inline_w >= 8 {
+                        let mut spans = vec![
+                            seq_span,
+                            Span::styled(sender, sender_style),
+                            Span::styled(": ", Style::default().fg(C_DIM)),
+                        ];
+                        if let Some(first) = inline.into_iter().next() {
+                            spans.extend(first.spans);
+                        }
+                        lines.push(Line::from(spans));
+                    } else {
+                        let mut head = vec![seq_span, Span::styled(sender, sender_style)];
+                        if is_brief(env) {
+                            head.push(Span::styled(
+                                "  ▾ brief [Space to collapse]",
+                                Style::default().fg(C_DIM),
+                            ));
+                        }
+                        lines.push(Line::from(head));
+                        let body_w = content_w.saturating_sub(FEED_INDENT.len() as u16);
+                        lines.extend(indent_lines(markdown_lines(body.as_str(), body_w, &pal)));
+                    }
+                }
+                let bg = in_sel.then_some(SEL_BG);
+                items.push(FeedItem {
+                    key: env.seq.0,
+                    clickable: true,
+                    lines: lines
+                        .into_iter()
+                        .map(|l| with_gutter(l, &gutter, bg))
+                        .collect(),
+                });
+            }
+            RoomEvent::TopicSet { topic } => items.push(FeedItem {
+                key: 0,
+                clickable: false,
+                lines: vec![Line::from(Span::styled(
+                    format!(
+                        "      ── topic: {} ──",
+                        truncate_chars(topic, width.saturating_sub(20) as usize)
+                    ),
+                    Style::default().fg(C_DIM),
+                ))],
+            }),
+            RoomEvent::Opened { .. }
+            | RoomEvent::MemberJoined { .. }
+            | RoomEvent::MemberLeft { .. } => {}
+        }
+    }
+    items
 }
 
 fn render_agent(
@@ -1085,20 +1564,21 @@ fn render_agent(
     ctx: &StageRenderCtx<'_>,
 ) {
     let title = format!("Agent Inspector · @{}/{}", inspector.wave, inspector.role);
-    let inner = draw_stage_frame(title, area, buf, hits, ctx);
+    let inner = draw_stage_frame(title, area, buf, ctx);
     if inner.height < 6 || inner.width < 20 {
         return;
     }
 
     let pending = inspector.active_pending();
     let pending_h = if pending.is_some() { 2 } else { 0 };
+    let composer_h = composer_height(&inspector.composer, inner.width, ctx.composing, " Steer > ");
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
             Constraint::Length(pending_h),
             Constraint::Min(2),
-            Constraint::Length(2),
+            Constraint::Length(composer_h),
         ])
         .split(inner);
 
@@ -1284,39 +1764,64 @@ fn render_agent(
         }
     }
 
-    let event_lines: Vec<Line<'static>> = inspector
-        .page
-        .events
-        .iter()
-        .map(|ev| format_agent_event(ev, log_area.width))
-        .collect();
-    let vis_h = log_area.height as usize;
-    let max_scroll = event_lines.len().saturating_sub(vis_h);
-    let start = if inspector.scroll == u16::MAX {
-        max_scroll
-    } else {
-        (inspector.scroll as usize).min(max_scroll)
-    };
-    for (off, line) in event_lines.into_iter().skip(start).take(vis_h).enumerate() {
-        Paragraph::new(line).render(
-            Rect::new(log_area.x, log_area.y + off as u16, log_area.width, 1),
-            buf,
-        );
-    }
+    let items = agent_feed(inspector, log_area.width);
+    render_feed(
+        items,
+        log_area,
+        buf,
+        hits,
+        &inspector.scroll,
+        &inspector.layout,
+        false,
+    );
 
     render_composer_box(
         composer_area,
         buf,
         hits,
-        ctx.composing,
+        ctx,
         &inspector.composer,
-        "Steer",
-        "[i/Enter] steer agent (wave_tell)  [a/d] resolve pending interaction",
+        " Steer > ",
+        "[i] steer  [j/k] select turn  [enter] read turn  [a/d] resolve  [?] keys",
     );
 }
 
+fn agent_feed(inspector: &AgentInspector, width: u16) -> Vec<FeedItem> {
+    let pal = palette();
+    let latest = inspector.latest_text_seq();
+    let content_w = width.saturating_sub(1);
+    inspector
+        .page
+        .events
+        .iter()
+        .map(|ev| {
+            let focused = inspector.focused == Some(ev.seq);
+            let is_latest = latest == Some(ev.seq);
+            let gutter = if focused {
+                Span::styled(
+                    "▌",
+                    Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+                )
+            } else if is_latest {
+                Span::styled("┃", Style::default().fg(C_MINT))
+            } else {
+                Span::raw(" ")
+            };
+            let mut lines = format_agent_event(ev, content_w, &pal, is_latest);
+            lines = lines
+                .into_iter()
+                .map(|l| with_gutter(l, &gutter, None))
+                .collect();
+            FeedItem {
+                key: ev.seq.0,
+                clickable: false,
+                lines,
+            }
+        })
+        .collect()
+}
+
 fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRenderCtx<'_>) {
-    let mut dummy_hits = HitMap::default();
     let (title, body) = match key {
         NodeKey::ProjectsHeader => (
             "Projects".to_owned(),
@@ -1336,7 +1841,7 @@ fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRender
             (
                 format!("Project · {p}"),
                 format!(
-                    "  {} channel(s), {} wave(s). Expand with l or Space.",
+                    "  {} channel(s), {} wave(s). Expand with l or Space. Kanban now opens this project's board.",
                     counts.0, counts.1
                 ),
             )
@@ -1353,11 +1858,11 @@ fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRender
             ),
         ),
         other => (
-            format!("{other:?}"),
+            node_label(other),
             "  Select a leaf node to inspect.".to_owned(),
         ),
     };
-    let inner = draw_stage_frame(title, area, buf, &mut dummy_hits, ctx);
+    let inner = draw_stage_frame(title, area, buf, ctx);
     if inner.height >= 2 {
         Paragraph::new(Line::from(Span::styled(body, Style::default().fg(C_TEXT))))
             .render(Rect::new(inner.x, inner.y + 1, inner.width, 1), buf);
@@ -1365,11 +1870,10 @@ fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRender
 }
 
 fn render_loading(target: &StageTarget, area: Rect, buf: &mut Buffer, ctx: &StageRenderCtx<'_>) {
-    let mut dummy_hits = HitMap::default();
-    let inner = draw_stage_frame("Loading".to_owned(), area, buf, &mut dummy_hits, ctx);
+    let inner = draw_stage_frame("Loading".to_owned(), area, buf, ctx);
     if inner.height >= 1 {
         Paragraph::new(Line::from(Span::styled(
-            format!("  Loading {target:?}..."),
+            format!("  ◌ Loading {}…", target_label(target)),
             Style::default().fg(C_DIM),
         )))
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
@@ -1383,12 +1887,12 @@ fn render_error(
     buf: &mut Buffer,
     ctx: &StageRenderCtx<'_>,
 ) {
-    let mut dummy_hits = HitMap::default();
-    let inner = draw_stage_frame("Stage Error".to_owned(), area, buf, &mut dummy_hits, ctx);
+    let inner = draw_stage_frame("Stage Error".to_owned(), area, buf, ctx);
     if inner.height >= 1 {
         Paragraph::new(Line::from(Span::styled(
             format!(
-                "  ✕ {target:?}: {}",
+                "  ✕ {}: {}",
+                target_label(target),
                 truncate_chars(error, inner.width.saturating_sub(8) as usize)
             ),
             Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
@@ -1397,12 +1901,77 @@ fn render_error(
     }
 }
 
+const COMPOSER_MAX_ROWS: u16 = 8;
+
+/// Rows the composer box needs: a rule plus the wrapped draft (capped) while composing.
+pub fn composer_height(composer: &Composer, width: u16, composing: bool, label: &str) -> u16 {
+    if !composing {
+        return 2;
+    }
+    let text_w = width.saturating_sub(display_width(label) as u16).max(1);
+    let rows = composer.layout(text_w).rows.len() as u16;
+    1 + rows.clamp(1, COMPOSER_MAX_ROWS)
+}
+
+/// Paints `label` and the wrapped draft into `area`, keeping the cursor row visible and
+/// drawing the cursor as a reversed cell at its exact display position.
+pub fn render_composer_rows(
+    area: Rect,
+    buf: &mut Buffer,
+    label: &str,
+    composer: &Composer,
+) -> Option<(u16, u16)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let label_w = (display_width(label) as u16).min(area.width.saturating_sub(1));
+    let text_w = area.width.saturating_sub(label_w).max(1);
+    let layout = composer.layout(text_w);
+    let (cur_row, cur_col) = layout.cursor;
+    let first = cur_row.saturating_sub(area.height - 1);
+    Paragraph::new(Line::from(Span::styled(
+        label.to_owned(),
+        Style::default().fg(C_MINT).add_modifier(Modifier::BOLD),
+    )))
+    .render(Rect::new(area.x, area.y, label_w, 1), buf);
+    for (off, row) in layout
+        .rows
+        .iter()
+        .skip(first as usize)
+        .take(area.height as usize)
+        .enumerate()
+    {
+        Paragraph::new(Line::from(Span::styled(
+            row.clone(),
+            Style::default().fg(Color::White),
+        )))
+        .render(
+            Rect::new(area.x + label_w, area.y + off as u16, text_w, 1),
+            buf,
+        );
+    }
+    let cx = area.x + label_w + cur_col.min(text_w.saturating_sub(1));
+    let cy = area.y + cur_row - first;
+    if let Some(cell) = buf.cell_mut((cx, cy)) {
+        if cell.symbol().trim().is_empty() {
+            cell.set_symbol(" ");
+        }
+        cell.set_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(C_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    Some((cx, cy))
+}
+
 fn render_composer_box(
     area: Rect,
     buf: &mut Buffer,
     hits: &mut HitMap,
-    composing: bool,
-    text: &str,
+    ctx: &StageRenderCtx<'_>,
+    composer: &Composer,
     label: &str,
     hint: &str,
 ) {
@@ -1417,23 +1986,16 @@ fn render_composer_box(
     )))
     .render(Rect::new(area.x, area.y, area.width, 1), buf);
     if area.height >= 2 {
-        let input_rect = Rect::new(area.x, area.y + 1, area.width, 1);
-        if composing {
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {label} > "),
-                    Style::default().fg(C_MINT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(text.to_owned(), Style::default().fg(Color::White)),
-                Span::styled("█", Style::default().fg(C_ACCENT)),
-            ]))
-            .render(input_rect, buf);
+        let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+        if ctx.composing {
+            ctx.cursor_out
+                .set(render_composer_rows(body, buf, label, composer));
         } else {
             Paragraph::new(Line::from(Span::styled(
                 format!(" {hint}"),
                 Style::default().fg(C_DIM),
             )))
-            .render(input_rect, buf);
+            .render(Rect::new(body.x, body.y, body.width, 1), buf);
         }
     }
 }
@@ -1611,7 +2173,7 @@ fn card_tone(kind: &NotifyKind) -> CardTone {
     }
 }
 
-fn kind_label(kind: &NotifyKind) -> &'static str {
+pub(crate) fn kind_label(kind: &NotifyKind) -> &'static str {
     match kind {
         NotifyKind::Interaction { .. } => "APPROVAL",
         NotifyKind::WorkerStuck { .. } => "STUCK",
@@ -1645,115 +2207,46 @@ fn activity_badge(activity: &Activity) -> (&'static str, Color) {
 
 fn format_room_title(room: &RoomId) -> String {
     match room {
-        RoomId::Channel {
-            scope: room::RoomScope::Global,
-            name,
-        } => format!("Room · #{name}"),
-        RoomId::Channel {
-            scope: room::RoomScope::Project { project },
-            name,
-        } => format!("Room · #{project}/{name}"),
-        RoomId::Direct { pair } => {
-            let (a, b) = pair.clone().into();
-            format!("Direct Message · {a} ↔ {b}")
-        }
+        RoomId::Direct { .. } => format!("Direct Message · {}", room_label(room)),
+        RoomId::Channel { .. } => format!("Room · {}", room_label(room)),
     }
 }
 
-fn format_room_entry(
-    env: &Envelope,
-    selection: Option<(Seq, Seq)>,
+fn format_agent_event(
+    ev: &AgentEvent,
     width: u16,
-) -> Option<(Seq, Line<'static>)> {
-    let Event::Room(ev) = &env.event else {
-        return None;
-    };
-    let in_sel = selection.is_some_and(|(a, b)| env.seq >= a && env.seq <= b);
-    let bg = if in_sel {
-        Color::Rgb(30, 44, 68)
-    } else {
-        Color::Reset
-    };
-
-    match ev {
-        RoomEvent::Posted { body, .. } => {
-            let prefix = format!(" #{:<3} {}: ", env.seq.0, env.by);
-            let avail = width.saturating_sub(prefix.chars().count() as u16) as usize;
-            let text = truncate_chars(body.as_str().lines().next().unwrap_or(""), avail);
-            let mut spans = vec![
-                Span::styled(
-                    format!(" #{:<3} ", env.seq.0),
-                    Style::default().fg(C_DIM).bg(bg),
-                ),
-                Span::styled(
-                    format!("{}: ", env.by),
-                    Style::default()
-                        .fg(C_ACCENT)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
-            for (idx, word) in text.split_whitespace().enumerate() {
-                if idx > 0 {
-                    spans.push(Span::styled(" ", Style::default().bg(bg)));
-                }
-                if word.starts_with('@') {
-                    spans.push(Span::styled(
-                        word.to_owned(),
-                        Style::default()
-                            .fg(C_AMBER)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    spans.push(Span::styled(
-                        word.to_owned(),
-                        Style::default().fg(C_TEXT).bg(bg),
-                    ));
-                }
-            }
-            Some((env.seq, Line::from(spans)))
-        }
-        RoomEvent::TopicSet { topic } => Some((
-            Seq::ORIGIN,
-            Line::from(Span::styled(
-                format!(
-                    "      ── topic: {} ──",
-                    truncate_chars(topic, width.saturating_sub(20) as usize)
-                ),
-                Style::default().fg(C_DIM),
-            )),
-        )),
-        RoomEvent::Opened { .. }
-        | RoomEvent::MemberJoined { .. }
-        | RoomEvent::MemberLeft { .. } => None,
-    }
-}
-
-fn format_agent_event(ev: &AgentEvent, width: u16) -> Line<'static> {
+    pal: &Palette,
+    is_latest: bool,
+) -> Vec<Line<'static>> {
+    let seq_span = Span::styled(format!("{:>4} ", ev.seq.0), Style::default().fg(C_DIM));
+    let one = |spans: Vec<Span<'static>>| vec![Line::from(spans)];
     let max_body = width.saturating_sub(18) as usize;
-    let seq_span = Span::styled(format!(" {:>4} ", ev.seq.0), Style::default().fg(C_DIM));
+    let block = |tag: Span<'static>, text: &str| {
+        let mut lines = vec![Line::from(vec![seq_span.clone(), tag])];
+        let body_w = width.saturating_sub(FEED_INDENT.len() as u16);
+        lines.extend(indent_lines(markdown_lines(text, body_w, pal)));
+        lines
+    };
     match &ev.kind {
-        AgentEventKind::UserMessage { text } => Line::from(vec![
-            seq_span,
+        AgentEventKind::UserMessage { text } => block(
             Span::styled(
-                "USER  ",
+                "USER",
                 Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
             ),
+            text,
+        ),
+        AgentEventKind::AssistantText { text } => block(
             Span::styled(
-                truncate_chars(text, max_body),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        AgentEventKind::AssistantText { text } => Line::from(vec![
-            seq_span,
-            Span::styled(
-                "TEXT  ",
+                if is_latest {
+                    "TEXT ★ latest output"
+                } else {
+                    "TEXT"
+                },
                 Style::default().fg(C_MINT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(truncate_chars(text, max_body), Style::default().fg(C_TEXT)),
-        ]),
-        AgentEventKind::ToolCall { name, summary } => Line::from(vec![
+            text,
+        ),
+        AgentEventKind::ToolCall { name, summary } => one(vec![
             seq_span,
             Span::styled(
                 "CALL  ",
@@ -1770,7 +2263,7 @@ fn format_agent_event(ev: &AgentEvent, width: u16) -> Line<'static> {
                 Style::default().fg(C_DIM),
             ),
         ]),
-        AgentEventKind::ToolResult { name, ok, summary } => Line::from(vec![
+        AgentEventKind::ToolResult { name, ok, summary } => one(vec![
             seq_span,
             Span::styled(
                 if *ok { "✓ OK  " } else { "✕ ERR " },
@@ -1784,15 +2277,15 @@ fn format_agent_event(ev: &AgentEvent, width: u16) -> Line<'static> {
                 Style::default().fg(C_DIM),
             ),
         ]),
-        AgentEventKind::TurnStarted => Line::from(vec![
+        AgentEventKind::TurnStarted => one(vec![
             seq_span,
             Span::styled("── turn started ──", Style::default().fg(C_DIM)),
         ]),
-        AgentEventKind::TurnEnded => Line::from(vec![
+        AgentEventKind::TurnEnded => one(vec![
             seq_span,
             Span::styled("── turn ended ──", Style::default().fg(C_DIM)),
         ]),
-        AgentEventKind::Usage { usage } => Line::from(vec![
+        AgentEventKind::Usage { usage } => one(vec![
             seq_span,
             Span::styled("CTX   ", Style::default().fg(C_AMBER)),
             Span::styled(
@@ -1804,7 +2297,7 @@ fn format_agent_event(ev: &AgentEvent, width: u16) -> Line<'static> {
                 Style::default().fg(C_DIM),
             ),
         ]),
-        AgentEventKind::Other { bb_type } => Line::from(vec![
+        AgentEventKind::Other { bb_type } => one(vec![
             seq_span,
             Span::styled(format!("EVENT {bb_type}"), Style::default().fg(C_DIM)),
         ]),
