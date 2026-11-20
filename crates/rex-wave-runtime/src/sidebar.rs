@@ -4,7 +4,7 @@ use rex_wave_api::notify::{InboxEvent, NotificationId, NotifyKind, NotifyState};
 use rex_wave_api::read::*;
 use rex_wave_api::room::{Mentions, RoomEvent, RoomId, RoomOrigin, RoomScope};
 use rex_wave_api::stage::derive_osc7501_status;
-use rex_wave_api::wave::{AgentSpec, WaveEvent, WorkerPhase};
+use rex_wave_api::wave::{AgentSpec, WaveEvent, WaveOutcome, WorkerPhase};
 use rex_wave_api::{
     BbProjectId, Cursor, Envelope, Event, Principal, RoleName, Seq, StreamId, WaveSlug,
 };
@@ -58,7 +58,15 @@ impl SidebarProjection {
     }
 
     pub fn snapshot(&self, viewer: &Principal) -> SidebarTreeSnapshot {
-        self.world.borrow().snapshot(viewer)
+        self.world.borrow().snapshot(viewer, &BTreeMap::new())
+    }
+
+    pub fn snapshot_with_names(
+        &self,
+        viewer: &Principal,
+        project_names: &BTreeMap<BbProjectId, String>,
+    ) -> SidebarTreeSnapshot {
+        self.world.borrow().snapshot(viewer, project_names)
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<World>> {
@@ -98,6 +106,9 @@ pub(crate) struct World {
     waves: BTreeMap<WaveSlug, WaveEntry>,
     boards: BTreeMap<BoardId, BoardEntry>,
     inboxes: BTreeMap<Principal, InboxEntry>,
+    archived_projects: BTreeSet<BbProjectId>,
+    archived_waves: BTreeSet<WaveSlug>,
+    archived_rooms: BTreeSet<RoomId>,
     cursor: Cursor,
 }
 
@@ -119,6 +130,7 @@ struct PostMeta {
 struct WaveEntry {
     project: BbProjectId,
     room: RoomId,
+    finished: Option<WaveOutcome>,
     workers: BTreeMap<RoleName, (AgentSpec, WorkerPhase)>,
 }
 
@@ -173,6 +185,7 @@ impl World {
                         WaveEntry {
                             project: spec.project.clone(),
                             room: room.clone(),
+                            finished: None,
                             workers: BTreeMap::new(),
                         },
                     );
@@ -204,8 +217,9 @@ impl World {
                         *phase = phase.retiring();
                     }
                 }
-                WaveEvent::Finished { .. } => {
+                WaveEvent::Finished { outcome } => {
                     if let Some(w) = self.waves.get_mut(wave) {
+                        w.finished = Some(outcome.clone());
                         for (_, phase) in w.workers.values_mut() {
                             *phase = phase.retiring();
                         }
@@ -288,6 +302,29 @@ impl World {
                             *cur = *upto;
                         }
                     }
+                    InboxEvent::ArchivedSet { target, archived } => match target {
+                        ArchiveTarget::Project { project } => {
+                            if *archived {
+                                self.archived_projects.insert(project.clone());
+                            } else {
+                                self.archived_projects.remove(project);
+                            }
+                        }
+                        ArchiveTarget::Wave { wave } => {
+                            if *archived {
+                                self.archived_waves.insert(wave.clone());
+                            } else {
+                                self.archived_waves.remove(wave);
+                            }
+                        }
+                        ArchiveTarget::Room { room } => {
+                            if *archived {
+                                self.archived_rooms.insert(room.clone());
+                            } else {
+                                self.archived_rooms.remove(room);
+                            }
+                        }
+                    },
                 }
             }
             _ => {}
@@ -315,7 +352,11 @@ impl World {
         for p in &r.posts {
             if p.seq > upto && &p.by != viewer {
                 unread += 1;
-                if p.mentions.principals.contains(viewer) || (p.mentions.all && in_room) {
+                let system_to_operator = matches!(p.by, Principal::System { .. })
+                    && matches!(viewer, Principal::Operator { .. });
+                if !system_to_operator
+                    && (p.mentions.principals.contains(viewer) || (p.mentions.all && in_room))
+                {
                     mentions += 1;
                 }
             }
@@ -323,7 +364,11 @@ impl World {
         (unread, mentions)
     }
 
-    pub(crate) fn snapshot(&self, viewer: &Principal) -> SidebarTreeSnapshot {
+    pub(crate) fn snapshot(
+        &self,
+        viewer: &Principal,
+        project_names: &BTreeMap<BbProjectId, String>,
+    ) -> SidebarTreeSnapshot {
         let viewer_inbox = self.inboxes.get(viewer);
         let upto = |room: &RoomId| {
             viewer_inbox
@@ -382,10 +427,13 @@ impl World {
                     phase: phase.clone(),
                 })
                 .collect();
+            let archived = self.archived_waves.contains(slug);
             projects
                 .entry(w.project.clone())
                 .or_insert_with(|| ProjectBranch {
                     project: w.project.clone(),
+                    name: project_names.get(&w.project).cloned(),
+                    archived: self.archived_projects.contains(&w.project),
                     channels: Vec::new(),
                     waves: Vec::new(),
                 })
@@ -395,6 +443,8 @@ impl World {
                     room: w.room.clone(),
                     unread,
                     mentions,
+                    finished: w.finished.clone(),
+                    archived,
                     workers,
                 });
         }
@@ -406,6 +456,7 @@ impl World {
                 continue;
             }
             let (unread, mentions) = self.unread_for(room, viewer, upto(room));
+            let archived = self.archived_rooms.contains(room);
             match room {
                 RoomId::Channel {
                     scope: RoomScope::Global,
@@ -415,6 +466,7 @@ impl World {
                         room: room.clone(),
                         unread,
                         mentions,
+                        archived,
                     });
                 }
                 RoomId::Channel {
@@ -425,6 +477,8 @@ impl World {
                         .entry(project.clone())
                         .or_insert_with(|| ProjectBranch {
                             project: project.clone(),
+                            name: project_names.get(project).cloned(),
+                            archived: self.archived_projects.contains(project),
                             channels: Vec::new(),
                             waves: Vec::new(),
                         })
@@ -433,6 +487,7 @@ impl World {
                             room: room.clone(),
                             unread,
                             mentions,
+                            archived,
                         });
                 }
                 RoomId::Direct { pair } => {
@@ -441,6 +496,7 @@ impl World {
                             room: room.clone(),
                             with: other.clone(),
                             unread,
+                            archived,
                         });
                     }
                 }

@@ -647,16 +647,21 @@ impl DemoState {
             kanban,
             projects: vec![ProjectBranch {
                 project: self.project.clone(),
+                name: None,
+                archived: false,
                 channels: vec![ChannelLeaf {
                     room: self.general_room.clone(),
                     unread: 1,
                     mentions: 0,
+                    archived: false,
                 }],
                 waves: vec![WaveRoomBranch {
                     wave: self.wave.clone(),
                     room: self.wave_room.clone(),
                     unread: 1,
                     mentions: 1,
+                    finished: None,
+                    archived: false,
                     workers,
                 }],
             }],
@@ -664,17 +669,20 @@ impl DemoState {
                 room: self.lounge_room.clone(),
                 unread: 0,
                 mentions: 0,
+                archived: false,
             }],
             direct_messages: vec![
                 DmLeaf {
                     room: self.sam_dm.clone(),
                     with: sam,
                     unread: 1,
+                    archived: false,
                 },
                 DmLeaf {
                     room: self.alice_dm.clone(),
                     with: alice,
                     unread: 0,
+                    archived: false,
                 },
             ],
             osc7501,
@@ -996,6 +1004,7 @@ impl Client for DemoClient {
                 WireCommand::MailAck(_) => WireReply::MailAck(Ack),
                 WireCommand::MailWakeBell(_) => WireReply::MailWakeBell(Ack),
                 WireCommand::InboxRaise(_) => WireReply::InboxRaise(Ack),
+                WireCommand::SetArchived(_) => WireReply::SetArchived(Ack),
             };
             Ok(reply)
         }

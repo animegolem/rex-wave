@@ -877,7 +877,7 @@ fn print_reply(reply: &WireReply, as_json: bool) {
                     WorkerPhase::Live { thread, activity } => {
                         format!("live({thread}, {activity:?})")
                     }
-                    WorkerPhase::Retiring { thread } => format!("retiring({thread})"),
+                    WorkerPhase::Retiring { thread, .. } => format!("retiring({thread})"),
                     WorkerPhase::Retired { .. } => "retired".to_owned(),
                     WorkerPhase::Failed { error } => format!("failed({error})"),
                 };

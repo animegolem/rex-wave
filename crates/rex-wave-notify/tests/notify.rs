@@ -806,3 +806,604 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     assert_eq!(resolved_card.state, NotifyState::Done);
     replay_herald.abort();
 }
+
+#[tokio::test]
+async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let herald_task = spawn_reactor(
+        Herald::new(),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("genga").unwrap(),
+    };
+    let owner = LocalClient::new(router.clone(), owner_p.clone());
+    let conductor = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let bb_bridge = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
+    );
+
+    let wave_slug = WaveSlug::parse("pancake-spec-r2").unwrap();
+    let role = RoleName::parse("council-gemini").unwrap();
+    let started = owner
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave_slug.clone(),
+                project: BbProjectId::parse("proj_edaym59nyn").unwrap(),
+                goal: Body::parse("Review spec").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("acp-opencode").unwrap(),
+                    model: Some(ModelId::parse("opencode/gemini-4-argon").unwrap()),
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("Post review to @genga").unwrap(),
+                    agent: None,
+                }],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let room_ref = RoomRef::Id {
+        id: started.room.clone(),
+    };
+    conductor
+        .call(RoomEnsure {
+            room: room_ref.clone(),
+            topic: None,
+            origin: Some(RoomOrigin::Wave {
+                wave: wave_slug.clone(),
+            }),
+        })
+        .await
+        .unwrap();
+    owner
+        .call(RoomJoin {
+            room: room_ref.clone(),
+            member: None,
+            handle: None,
+        })
+        .await
+        .unwrap();
+    conductor
+        .call(RoomPost {
+            room: room_ref.clone(),
+            body: Body::parse("@council-gemini Post your review to @genga when done.").unwrap(),
+            reply_to: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    for attempt in 1..=3 {
+        bb_bridge
+            .call(WaveObserve {
+                wave: wave_slug.clone(),
+                role: role.clone(),
+                observation: Observation::SpawnFailed {
+                    attempt,
+                    error: "HTTP 400: requires a machine selection".into(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+    bb_bridge
+        .call(WaveObserve {
+            wave: wave_slug.clone(),
+            role: role.clone(),
+            observation: Observation::Activity {
+                activity: Activity::Errored {
+                    error: "Command thread.start failed".into(),
+                },
+            },
+        })
+        .await
+        .unwrap();
+    bb_bridge
+        .call(WaveObserve {
+            wave: wave_slug.clone(),
+            role: role.clone(),
+            observation: Observation::Activity {
+                activity: Activity::Errored {
+                    error: "ServiceUnavailableError (503)".into(),
+                },
+            },
+        })
+        .await
+        .unwrap();
+
+    let inbox = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = owner
+                .call(InboxList {
+                    include_done: true,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if page
+                .items
+                .iter()
+                .any(|n| n.draft.preview.contains("ServiceUnavailableError"))
+            {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("updated stuck card arrived");
+
+    assert_eq!(
+        inbox.items.len(),
+        1,
+        "system mention suppressed and 5 worker failures coalesced into 1 card: {:?}",
+        inbox.items
+    );
+    assert_eq!(
+        inbox.items[0].draft.dedupe,
+        "worker-stuck:pancake-spec-r2:council-gemini"
+    );
+    assert!(matches!(
+        &inbox.items[0].draft.kind,
+        NotifyKind::WorkerStuck { why, .. } if why == "ServiceUnavailableError (503)"
+    ));
+
+    let sb = owner.call(Sidebar::default()).await.unwrap();
+    assert_eq!(
+        sb.projects[0].waves[0].mentions, 0,
+        "system post naming @genga must not bump operator sidebar mention badge"
+    );
+
+    let stuck_id = inbox.items[0].id;
+    owner
+        .call(InboxAck {
+            ids: vec![stuck_id],
+            state: NotifyState::Dismissed,
+        })
+        .await
+        .unwrap();
+    bb_bridge
+        .call(WaveObserve {
+            wave: wave_slug.clone(),
+            role: role.clone(),
+            observation: Observation::Activity {
+                activity: Activity::Errored {
+                    error: "ServiceUnavailableError (503)".into(),
+                },
+            },
+        })
+        .await
+        .unwrap();
+    let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if page.unread == 1 {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dismissed stuck card reopened as Unread on a newer failure with identical text");
+    assert_eq!(reopened.items.len(), 1);
+    assert_eq!(reopened.items[0].id, stuck_id);
+    assert_eq!(reopened.items[0].state, NotifyState::Unread);
+
+    owner
+        .call(InboxAck {
+            ids: vec![stuck_id],
+            state: NotifyState::Dismissed,
+        })
+        .await
+        .unwrap();
+    let pre_head = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .head;
+    herald_task.abort();
+    let replay_task = spawn_reactor(
+        Herald::new(),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let replayed = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.head, pre_head,
+        "replaying multi-error worker_stuck history neither appends events nor reopens dismissed card"
+    );
+    assert_eq!(replayed.unread, 0);
+    replay_task.abort();
+}
+
+#[tokio::test]
+async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let owner = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let sam = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: SeatName::parse("sam").unwrap(),
+        },
+    );
+
+    let project = BbProjectId::parse("proj_edaym59nyn").unwrap();
+    let wave = WaveSlug::parse("pancake-spec-r2").unwrap();
+    let lounge = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("lounge").unwrap(),
+    };
+    let lounge_info = owner
+        .call(RoomEnsure {
+            room: lounge,
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+
+    owner
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse("Spec review").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("codex").unwrap(),
+                    model: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                workers: vec![],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            sam.call(SetArchived {
+                target: ArchiveTarget::Project {
+                    project: project.clone(),
+                },
+                archived: true,
+            })
+            .await,
+            Err(ApiError::Denied { .. })
+        ),
+        "non-operator seat cannot archive sidebar branches"
+    );
+
+    let outcome = WaveOutcome::Completed {
+        summary: Body::parse("Round 1 complete").unwrap(),
+    };
+    owner
+        .call(WaveFinish {
+            wave: wave.clone(),
+            outcome: outcome.clone(),
+        })
+        .await
+        .unwrap();
+    owner
+        .call(SetArchived {
+            target: ArchiveTarget::Wave { wave: wave.clone() },
+            archived: true,
+        })
+        .await
+        .unwrap();
+    owner
+        .call(SetArchived {
+            target: ArchiveTarget::Project {
+                project: project.clone(),
+            },
+            archived: true,
+        })
+        .await
+        .unwrap();
+    owner
+        .call(SetArchived {
+            target: ArchiveTarget::Room {
+                room: lounge_info.id.clone(),
+            },
+            archived: true,
+        })
+        .await
+        .unwrap();
+
+    let snap = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let s = owner.call(Sidebar::default()).await.unwrap();
+            if s.projects.first().is_some_and(|p| {
+                p.archived
+                    && p.waves
+                        .first()
+                        .is_some_and(|w| w.archived && w.finished.is_some())
+            }) && s.channels.first().is_some_and(|c| c.archived)
+            {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sidebar folded finished outcome and archive flags");
+
+    assert_eq!(snap.projects[0].waves[0].finished, Some(outcome.clone()));
+    assert!(snap.projects[0].archived);
+    assert!(snap.projects[0].waves[0].archived);
+    assert!(snap.channels[0].archived);
+
+    let rehydrated = SidebarProjection::spawn(journal.clone(), hub.clone()).snapshot(owner.me());
+    assert_eq!(rehydrated.projects[0].waves[0].finished, Some(outcome));
+    assert!(rehydrated.projects[0].archived);
+    assert!(rehydrated.projects[0].waves[0].archived);
+    assert!(rehydrated.channels[0].archived);
+
+    owner
+        .call(SetArchived {
+            target: ArchiveTarget::Wave { wave },
+            archived: false,
+        })
+        .await
+        .unwrap();
+    let unarchived = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let s = owner.call(Sidebar::default()).await.unwrap();
+            if s.projects[0].waves.first().is_some_and(|w| !w.archived) {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!unarchived.projects[0].waves[0].archived);
+}
+
+#[tokio::test]
+async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_replay() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("genga").unwrap(),
+    };
+    let owner = LocalClient::new(router.clone(), owner_p.clone());
+    let bb_bridge = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
+    );
+    let herald_sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::Herald,
+        },
+    );
+
+    let wave = WaveSlug::parse("pancake-spec").unwrap();
+    let role = RoleName::parse("council-claude").unwrap();
+    owner
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: BbProjectId::parse("proj_edaym59nyn").unwrap(),
+                goal: Body::parse("Spec").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("Review").unwrap(),
+                    agent: None,
+                }],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+    bb_bridge
+        .call(WaveObserve {
+            wave: wave.clone(),
+            role: role.clone(),
+            observation: Observation::SpawnFailed {
+                attempt: 1,
+                error: "requires a machine selection".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let wave_entries = journal
+        .read(&StreamId::Wave { wave: wave.clone() }, Seq::ORIGIN, 50)
+        .unwrap();
+    let fail_seq = wave_entries.last().unwrap().seq;
+
+    herald_sys
+        .call(InboxRaise {
+            to: owner_p.clone(),
+            draft: NotificationDraft {
+                kind: NotifyKind::WorkerStuck {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    why: "requires a machine selection".into(),
+                    seq: Seq::ORIGIN,
+                },
+                title: format!("@{wave}/{role} stuck"),
+                preview: "requires a machine selection".into(),
+                actions: Vec::new(),
+                dedupe: format!("worker-stuck:{wave}:{role}:{}", fail_seq.0),
+            },
+        })
+        .await
+        .unwrap();
+    owner
+        .call(InboxAck {
+            ids: vec![NotificationId(1)],
+            state: NotifyState::Dismissed,
+        })
+        .await
+        .unwrap();
+
+    let before = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(before.unread, 0);
+
+    let herald_task = spawn_reactor(Herald::new(), herald_sys);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let after = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after.head, before.head,
+        "upgrading Herald over legacy worker-stuck:{{wave}}:{{role}}:{{seq}} cards raises zero new items"
+    );
+    assert_eq!(after.unread, 0);
+    assert_eq!(after.items.len(), 1);
+
+    bb_bridge
+        .call(WaveObserve {
+            wave: wave.clone(),
+            role: role.clone(),
+            observation: Observation::SpawnFailed {
+                attempt: 2,
+                error: "new failure after upgrade".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let adopted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.unread == 1 {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("newer failure adopted and reopened legacy card");
+    assert_eq!(adopted.items.len(), 1);
+    assert_eq!(adopted.items[0].id, NotificationId(1));
+    assert_eq!(
+        adopted.items[0].draft.dedupe,
+        "worker-stuck:pancake-spec:council-claude"
+    );
+    herald_task.abort();
+}

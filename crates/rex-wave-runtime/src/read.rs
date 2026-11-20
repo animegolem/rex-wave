@@ -12,7 +12,7 @@ use rex_wave_store::Journal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast::error::RecvError, mpsc};
+use tokio::sync::{broadcast::error::RecvError, mpsc, watch};
 
 const REPLAY_PAGE: usize = 512;
 const WATCH_BUFFER: usize = 128;
@@ -38,6 +38,11 @@ pub trait AgentFeed: Send + Sync + 'static {
     /// Live frames for one agent. Lease semantics: BB-side watch is held only
     /// while the returned stream is alive.
     fn live(&self, wave: &WaveSlug, role: &RoleName) -> BoxFut<'_, Result<FrameStream, ApiError>>;
+    /// Human BB project names (`proj_...` -> `"pancake-work"`), loaded from the
+    /// local BB metadata cache with graceful fallback to `None` when offline.
+    fn project_names(&self) -> Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>> {
+        None
+    }
 }
 
 /// Placeholder `AgentFeed` for tests and deployments without BB attached.
@@ -125,12 +130,27 @@ impl ReadSide {
         })
     }
 
+    fn snapshot_sidebar(&self, viewer: &Principal) -> rex_wave_api::read::SidebarTreeSnapshot {
+        match self.agents.project_names() {
+            Some(rx) => {
+                let names = rx.borrow().clone();
+                self.sidebar.snapshot_with_names(viewer, &names)
+            }
+            None => self.sidebar.snapshot(viewer),
+        }
+    }
+
     fn watch_sidebar(&self, viewer: Principal) -> FrameStream {
         let mut rx = self.sidebar.subscribe();
+        let mut names_rx = self.agents.project_names();
         let (tx, stream) = frame_channel(16);
         tokio::spawn(async move {
+            let empty_names = Arc::new(BTreeMap::new());
             let mut last = rx.borrow_and_update().clone();
-            let mut sent = last.snapshot(&viewer);
+            let mut last_names = names_rx
+                .as_mut()
+                .map_or_else(|| empty_names.clone(), |r| r.borrow_and_update().clone());
+            let mut sent = last.snapshot(&viewer, &last_names);
             if tx
                 .send(Ok(Frame::Sidebar(Box::new(sent.clone()))))
                 .await
@@ -147,13 +167,23 @@ impl ReadSide {
                             break;
                         }
                         last = rx.borrow_and_update().clone();
-                        let next = last.snapshot(&viewer);
-                        if next != sent {
-                            sent = next.clone();
-                            if tx.send(Ok(Frame::Sidebar(Box::new(next)))).await.is_err() {
-                                break;
-                            }
+                    }
+                    Ok(()) = async {
+                        match names_rx.as_mut() {
+                            Some(r) => r.changed().await,
+                            None => std::future::pending().await,
                         }
+                    } => {
+                        if let Some(r) = names_rx.as_mut() {
+                            last_names = r.borrow_and_update().clone();
+                        }
+                    }
+                }
+                let next = last.snapshot(&viewer, &last_names);
+                if next != sent {
+                    sent = next.clone();
+                    if tx.send(Ok(Frame::Sidebar(Box::new(next)))).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -648,7 +678,7 @@ impl Service<ReadCommand> for ReadSide {
                     }))
                 }
                 ReadCommand::Wait(w) => Ok(WireReply::Wait(self.wait_for(ctx.by, w).await?)),
-                ReadCommand::Sidebar(_) => Ok(WireReply::Sidebar(self.sidebar.snapshot(&ctx.by))),
+                ReadCommand::Sidebar(_) => Ok(WireReply::Sidebar(self.snapshot_sidebar(&ctx.by))),
                 ReadCommand::ThreadPage(t) => {
                     let limit = t.limit.unwrap_or(100).clamp(1, 500);
                     Ok(WireReply::ThreadPage(
