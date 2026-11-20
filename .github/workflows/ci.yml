@@ -49,9 +49,20 @@ jobs:
             ~/.cargo/git
             target
           key: test-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-      - run: cargo test --workspace --locked
-      - run: cargo build --release --locked
-      - name: TUI self-test
-        run: ./target/release/rex-wave tui --self-test
-      - name: Generated tool catalog is current
-        run: ./target/release/rex-wave schema --bb | diff - bb-plugin/tools.generated.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install pinned bb-plugin dependencies and SDK peer types
+        working-directory: bb-plugin
+        run: |
+          npm install --no-save --no-package-lock --no-audit --no-fund --ignore-scripts \
+            @get-bb/plugin-sdk@0.6.132 \
+            typescript@5.9.3 \
+            @types/node@22.20.5 \
+            zod@4.6.7 \
+            @types/react@19.3.0 \
+            @types/better-sqlite3@7.6.13 \
+            better-sqlite3@12.11.1 \
+            hono@4.13.18
+      - name: Run deterministic commit and CI gate
+        run: ./scripts/check.sh
