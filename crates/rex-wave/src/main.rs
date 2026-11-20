@@ -948,7 +948,19 @@ async fn main() -> ExitCode {
     let endpoint = Endpoint::Unix(sock_path.clone());
 
     let outcome: Result<(), String> = match cli.cmd {
-        Cmd::Daemon(args) => daemon::run(args, cli.socket).await,
+        Cmd::Daemon(args) => {
+            let bb = args.bb_url.split('?').next().unwrap_or(&args.bb_url);
+            eprintln!(
+                "rex-wave daemon: starting (operator={}, socket={}, bb={bb})",
+                args.operator,
+                sock_path.display(),
+            );
+            let res = daemon::run(args, cli.socket).await;
+            if res.is_ok() {
+                eprintln!("rex-wave daemon: stopped");
+            }
+            res
+        }
         Cmd::Tui { self_test: true } => rex_wave_tui::demo::run_self_test_demo()
             .await
             .map(|_| ())

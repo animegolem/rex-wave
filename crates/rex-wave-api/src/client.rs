@@ -34,11 +34,35 @@ pub enum ApiError {
     #[error("timed out")]
     Timeout,
     #[error("transport: {0}")]
-    Transport(String),
+    Transport(#[serde(with = "detail")] String),
     #[error("reply mismatch: expected {expected}, got {got}")]
     ReplyMismatch { expected: String, got: String },
     #[error("internal: {0}")]
-    Internal(String),
+    Internal(#[serde(with = "detail")] String),
+}
+
+/// An internally tagged enum cannot carry a bare string, so the `String` of
+/// `Transport` and `Internal` goes on the wire as `{"detail": ...}`.
+mod detail {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Out<'a> {
+        detail: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    struct In {
+        detail: String,
+    }
+
+    pub fn serialize<S: Serializer>(detail: &str, s: S) -> Result<S::Ok, S::Error> {
+        Out { detail }.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        In::deserialize(d).map(|i| i.detail)
+    }
 }
 
 impl From<InvalidId> for ApiError {

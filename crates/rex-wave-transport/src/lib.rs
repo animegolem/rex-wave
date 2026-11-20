@@ -7,10 +7,18 @@
 //! many watches (sidebar tree, stage) share one socket and a stage retarget or
 //! drop is `Unwatch{old}` + `Watch{new}` with no reconnect.
 //!
-//! Auth happens once, in `Hello`, and yields the session [`Principal`]:
+//! Auth happens once per connection, in `Hello`, and yields the session
+//! [`Principal`]:
 //! * Unix socket + peer uid == daemon uid -> `Operator{seat}` (TUI, CLI);
 //! * `Token` minted by `rex-wave token --seat sam` -> `Seat{sam}` (MCP);
 //! * the BB bridge runs in-process and never uses this crate.
+//!
+//! [`RemoteClient`] outlives its socket. When the connection drops (a daemon
+//! restart unlinks and rebinds the socket), it redials with backoff, sends
+//! `Hello` again, and re-opens every live watch from the last cursor it
+//! delivered, so callers keep one `FrameStream` across the restart. Calls in
+//! flight at the drop fail with the cause, since the daemon may or may not have
+//! run them.
 
 use futures_util::StreamExt;
 use rex_wave_api::*;
@@ -21,16 +29,41 @@ use std::future::Future;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinSet};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const WATCH_BUFFER: usize = 128;
+const REDIAL_MIN: Duration = Duration::from_millis(50);
+const REDIAL_MAX: Duration = Duration::from_secs(2);
+const MAX_LOG_LINE: usize = 512;
+
+fn log_daemon(args: std::fmt::Arguments<'_>) {
+    let line = args.to_string();
+    if line.len() <= MAX_LOG_LINE {
+        eprintln!("rex-wave daemon: {line}");
+    } else {
+        let mut end = MAX_LOG_LINE;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        eprintln!("rex-wave daemon: {}...", &line[..end]);
+    }
+}
+
+/// Daemon-side log line on stderr. Only the serving half logs: a client may be
+/// drawing a full-screen TUI on the same terminal.
+macro_rules! daemon_log {
+    ($($arg:tt)*) => {
+        log_daemon(format_args!($($arg)*))
+    };
+}
 
 mod wire {
     use rex_wave_api::*;
@@ -81,9 +114,46 @@ mod wire {
             error: Option<ApiError>,
         },
     }
+
+    impl ServerFrame {
+        pub fn kind(&self) -> &'static str {
+            match self {
+                ServerFrame::Welcome { .. } => "welcome",
+                ServerFrame::Reply { .. } => "reply",
+                ServerFrame::WatchOpened { .. } => "watch_opened",
+                ServerFrame::Frame { .. } => "frame",
+                ServerFrame::WatchEnded { .. } => "watch_ended",
+            }
+        }
+
+        /// The frame to send instead when this one cannot be encoded: the
+        /// same answer slot, carrying `error`. A watch frame ends its watch.
+        pub fn fallback(&self, error: ApiError) -> ServerFrame {
+            match self {
+                ServerFrame::Welcome { daemon, .. } => ServerFrame::Welcome {
+                    result: Err(error),
+                    daemon: daemon.clone(),
+                },
+                ServerFrame::Reply { id, .. } => ServerFrame::Reply {
+                    id: *id,
+                    result: Err(error),
+                },
+                ServerFrame::WatchOpened { id, .. } => ServerFrame::WatchOpened {
+                    id: *id,
+                    result: Err(error),
+                },
+                ServerFrame::Frame { id, .. } | ServerFrame::WatchEnded { id, .. } => {
+                    ServerFrame::WatchEnded {
+                        id: *id,
+                        error: Some(error),
+                    }
+                }
+            }
+        }
+    }
 }
 
-async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
+fn encode<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     let bytes =
         serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if bytes.len() > MAX_FRAME {
@@ -92,9 +162,40 @@ async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) ->
             "frame exceeds 16 MiB",
         ));
     }
+    Ok(bytes)
+}
+
+async fn write_bytes<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_u32(bytes.len() as u32).await?;
-    w.write_all(&bytes).await?;
+    w.write_all(bytes).await?;
     w.flush().await
+}
+
+async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
+    write_bytes(w, &encode(msg)?).await
+}
+
+/// Write `frame`, or its [`wire::ServerFrame::fallback`] if it cannot be
+/// encoded, so one bad payload answers one request instead of closing the
+/// connection. Errors only when the socket itself fails.
+async fn write_server_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    conn: u64,
+    frame: &wire::ServerFrame,
+) -> io::Result<()> {
+    let bytes = match encode(frame) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let kind = frame.kind();
+            daemon_log!(
+                "conn #{conn}: cannot encode {kind} frame ({e}); sending an internal error"
+            );
+            encode(&frame.fallback(ApiError::Internal(format!(
+                "daemon could not encode {kind} frame: {e}"
+            ))))?
+        }
+    };
+    write_bytes(w, &bytes).await
 }
 
 async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
@@ -116,6 +217,15 @@ async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io:
     let msg =
         serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
+}
+
+/// Aborts a spawned task when dropped, so a connection's helper tasks die with it.
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Where the daemon listens.
@@ -191,42 +301,18 @@ impl Authenticator for TableAuthenticator {
     }
 }
 
-enum ClientReq {
-    Call {
-        cmd: WireCommand,
-        reply: oneshot::Sender<Result<WireReply, ApiError>>,
-    },
-    Watch {
-        interest: Interest,
-        from: Cursor,
-        reply: oneshot::Sender<Result<FrameStream, ApiError>>,
-    },
+/// Where and how to (re)dial. Kept for the life of a [`RemoteClient`].
+struct Dialer {
+    endpoint: Endpoint,
+    credential: Credential,
+    client_name: String,
 }
 
-/// A connected client session. Implements `api::Client`.
-#[derive(Clone)]
-pub struct RemoteClient {
-    me: Principal,
-    req_tx: mpsc::UnboundedSender<ClientReq>,
-}
-
-impl std::fmt::Debug for RemoteClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteClient")
-            .field("me", &self.me)
-            .finish()
-    }
-}
-
-impl RemoteClient {
-    /// Connect, send `Hello`, await `Welcome`. Bound to one principal for life.
-    pub async fn connect(
-        endpoint: Endpoint,
-        credential: Credential,
-        client_name: &str,
-    ) -> Result<Self, ApiError> {
-        let stream = match endpoint {
-            Endpoint::Unix(path) => UnixStream::connect(&path)
+impl Dialer {
+    /// Connect, send `Hello`, await `Welcome`.
+    async fn dial(&self) -> Result<(Principal, OwnedReadHalf, OwnedWriteHalf), ApiError> {
+        let stream = match &self.endpoint {
+            Endpoint::Unix(path) => UnixStream::connect(path)
                 .await
                 .map_err(|e| ApiError::Transport(e.to_string()))?,
             Endpoint::WebSocket(_) => {
@@ -239,8 +325,8 @@ impl RemoteClient {
         write_frame(
             &mut writer,
             &wire::ClientFrame::Hello {
-                credential,
-                client: client_name.to_owned(),
+                credential: self.credential.clone(),
+                client: self.client_name.clone(),
             },
         )
         .await
@@ -251,27 +337,112 @@ impl RemoteClient {
                 .map_err(|_| ApiError::Timeout)?
                 .map_err(|e| ApiError::Transport(e.to_string()))?
                 .ok_or_else(|| ApiError::Transport("server closed before welcome".into()))?;
-        let me = match welcome {
-            wire::ServerFrame::Welcome { result, .. } => result?,
-            other => {
-                return Err(ApiError::Transport(format!(
-                    "expected welcome, got {other:?}"
-                )));
-            }
-        };
+        match welcome {
+            wire::ServerFrame::Welcome { result, .. } => Ok((result?, reader, writer)),
+            other => Err(ApiError::Transport(format!(
+                "expected welcome, got {other:?}"
+            ))),
+        }
+    }
+}
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<wire::ClientFrame>();
-        tokio::spawn(async move {
-            while let Some(frame) = out_rx.recv().await {
-                if write_frame(&mut writer, &frame).await.is_err() {
-                    break;
-                }
-            }
+enum ClientReq {
+    Call {
+        cmd: WireCommand,
+        reply: oneshot::Sender<Result<WireReply, ApiError>>,
+    },
+    Watch {
+        interest: Interest,
+        from: Cursor,
+        reply: oneshot::Sender<Result<FrameStream, ApiError>>,
+    },
+    /// Sent by a dropped [`FrameStream`].
+    Unwatch { id: u64 },
+}
+
+/// A client session that survives daemon restarts. Implements `api::Client`.
+#[derive(Clone)]
+pub struct RemoteClient {
+    me: Principal,
+    req_tx: mpsc::UnboundedSender<ClientReq>,
+    connected: watch::Receiver<bool>,
+    /// Why the session ended for good, once it has.
+    closed: Arc<OnceLock<ApiError>>,
+}
+
+impl std::fmt::Debug for RemoteClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteClient")
+            .field("me", &self.me)
+            .field("connected", &self.connected())
+            .finish()
+    }
+}
+
+impl RemoteClient {
+    /// Connect, send `Hello`, await `Welcome`. Bound to one principal for life:
+    /// a redial that authenticates as anyone else ends the session.
+    pub async fn connect(
+        endpoint: Endpoint,
+        credential: Credential,
+        client_name: &str,
+    ) -> Result<Self, ApiError> {
+        let dialer = Arc::new(Dialer {
+            endpoint,
+            credential,
+            client_name: client_name.to_owned(),
         });
-
+        let (me, reader, writer) = dialer.dial().await?;
         let (req_tx, req_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_client(reader, out_tx, req_rx));
-        Ok(RemoteClient { me, req_tx })
+        let (connected_tx, connected) = watch::channel(true);
+        let closed = Arc::new(OnceLock::new());
+        let session = Connection {
+            dialer,
+            me: me.clone(),
+            req_rx,
+            unwatch_tx: req_tx.downgrade(),
+            connected: connected_tx,
+            closed: closed.clone(),
+            next_id: 1,
+            watches: BTreeMap::new(),
+            generations: Generations::default(),
+        };
+        tokio::spawn(session.run(reader, writer));
+        Ok(RemoteClient {
+            me,
+            req_tx,
+            connected,
+            closed,
+        })
+    }
+
+    /// Whether the socket is up right now. False while redialing.
+    pub fn connected(&self) -> bool {
+        *self.connected.borrow()
+    }
+
+    /// Follows [`RemoteClient::connected`], for status badges.
+    pub fn watch_connection(&self) -> watch::Receiver<bool> {
+        self.connected.clone()
+    }
+
+    fn request<T: Send>(
+        &self,
+        req: impl FnOnce(oneshot::Sender<Result<T, ApiError>>) -> ClientReq + Send,
+    ) -> impl Future<Output = Result<T, ApiError>> + Send {
+        let tx = self.req_tx.clone();
+        let closed = self.closed.clone();
+        async move {
+            let gone = || {
+                closed
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| ApiError::Transport("connection closed".into()))
+            };
+            let (reply, rx) = oneshot::channel();
+            tx.send(req(reply)).map_err(|_| gone())?;
+            rx.await.map_err(|_| gone())?
+        }
     }
 }
 
@@ -284,14 +455,7 @@ impl Client for RemoteClient {
         &self,
         cmd: WireCommand,
     ) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
-        let tx = self.req_tx.clone();
-        async move {
-            let (reply, rx) = oneshot::channel();
-            tx.send(ClientReq::Call { cmd, reply })
-                .map_err(|_| ApiError::Transport("connection closed".into()))?;
-            rx.await
-                .map_err(|_| ApiError::Transport("connection closed".into()))?
-        }
+        self.request(|reply| ClientReq::Call { cmd, reply })
     }
 
     fn watch(
@@ -299,156 +463,480 @@ impl Client for RemoteClient {
         interest: Interest,
         from: Cursor,
     ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
-        let tx = self.req_tx.clone();
-        async move {
-            let (reply, rx) = oneshot::channel();
-            tx.send(ClientReq::Watch {
-                interest,
-                from,
-                reply,
-            })
-            .map_err(|_| ApiError::Transport("connection closed".into()))?;
-            rx.await
-                .map_err(|_| ApiError::Transport("connection closed".into()))?
-        }
+        self.request(|reply| ClientReq::Watch {
+            interest,
+            from,
+            reply,
+        })
     }
 }
 
 struct UnwatchGuard {
     id: u64,
-    out_tx: mpsc::UnboundedSender<wire::ClientFrame>,
+    req_tx: mpsc::UnboundedSender<ClientReq>,
     armed: bool,
 }
 
 impl Drop for UnwatchGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.out_tx.send(wire::ClientFrame::Unwatch { id: self.id });
+            let _ = self.req_tx.send(ClientReq::Unwatch { id: self.id });
         }
     }
 }
 
-async fn run_client<R: AsyncRead + Unpin + Send + 'static>(
-    reader: R,
-    out_tx: mpsc::UnboundedSender<wire::ClientFrame>,
-    mut req_rx: mpsc::UnboundedReceiver<ClientReq>,
-) {
-    // `read_frame` is not cancel-safe: dropping it part-way through a frame
-    // loses the bytes it has already taken off the socket, and every later
-    // frame is then read from the wrong offset. Read on a task of its own and
-    // select on the channel, whose `recv` can be dropped safely.
-    let (in_tx, mut in_rx) = mpsc::channel(WATCH_BUFFER);
-    let mut reader = reader;
-    let reader_task = tokio::spawn(async move {
-        loop {
-            let incoming = read_frame::<_, wire::ServerFrame>(&mut reader).await;
-            let last = !matches!(incoming, Ok(Some(_)));
-            if in_tx.send(incoming).await.is_err() || last {
-                break;
-            }
-        }
-    });
-
-    let mut next_id = 1u64;
-    let mut calls: HashMap<u64, oneshot::Sender<Result<WireReply, ApiError>>> = HashMap::new();
-    let mut opening: HashMap<
-        u64,
-        (
-            oneshot::Sender<Result<FrameStream, ApiError>>,
-            mpsc::Sender<Result<Frame, ApiError>>,
-            FrameStream,
-        ),
-    > = HashMap::new();
-    let mut watches: HashMap<u64, mpsc::Sender<Result<Frame, ApiError>>> = HashMap::new();
-
-    let reason = loop {
-        tokio::select! {
-            req = req_rx.recv() => match req {
-                Some(ClientReq::Call { cmd, reply }) => {
-                    let id = next_id;
-                    next_id += 1;
-                    calls.insert(id, reply);
-                    if out_tx.send(wire::ClientFrame::Call { id, cmd }).is_err() {
-                        break "connection writer closed".to_owned();
-                    }
-                }
-                Some(ClientReq::Watch { interest, from, reply }) => {
-                    let id = next_id;
-                    next_id += 1;
-                    let (tx, rx) = mpsc::channel(WATCH_BUFFER);
-                    let guard = UnwatchGuard { id, out_tx: out_tx.clone(), armed: true };
-                    let stream: FrameStream = Box::pin(futures_util::stream::unfold((rx, guard), |(mut rx, mut guard)| async move {
-                        match rx.recv().await {
-                            Some(item) => Some((item, (rx, guard))),
-                            None => {
-                                // Server already ended the watch; no Unwatch needed.
-                                guard.armed = false;
-                                None
-                            }
-                        }
-                    }));
-                    opening.insert(id, (reply, tx, stream));
-                    if out_tx.send(wire::ClientFrame::Watch { id, interest, from }).is_err() {
-                        break "connection writer closed".to_owned();
-                    }
-                }
+fn frame_stream(rx: mpsc::Receiver<Result<Frame, ApiError>>, guard: UnwatchGuard) -> FrameStream {
+    Box::pin(futures_util::stream::unfold(
+        (rx, guard),
+        |(mut rx, mut guard)| async move {
+            match rx.recv().await {
+                Some(item) => Some((item, (rx, guard))),
                 None => {
-                    reader_task.abort();
+                    // The watch already ended; no Unwatch needed.
+                    guard.armed = false;
+                    None
+                }
+            }
+        },
+    ))
+}
+
+/// Maps each connection's stage generations into one increasing sequence.
+/// The daemon numbers generations per session, so after a redial they restart
+/// at 1, and a caller that drops frames older than its newest generation (the
+/// TUI does) would drop every frame from the new session.
+#[derive(Default)]
+struct Generations {
+    offset: u64,
+    high: u64,
+}
+
+impl Generations {
+    /// Called as each connection starts.
+    fn rebase(&mut self) {
+        self.offset = self.high;
+    }
+
+    fn map(&mut self, generation: FocusGeneration) -> FocusGeneration {
+        let mapped = generation.0 + self.offset;
+        self.high = self.high.max(mapped);
+        FocusGeneration(mapped)
+    }
+}
+
+/// A watch the caller still holds, with what it takes to re-open it.
+struct LiveWatch {
+    interest: Interest,
+    /// Where to resume: the caller has every frame up to here.
+    resume: Cursor,
+    tx: mpsc::Sender<Result<Frame, ApiError>>,
+    caught_up: bool,
+    /// The generation the caller saw in `StageFocused`; a re-opened stage
+    /// watch keeps it.
+    stage: Option<FocusGeneration>,
+}
+
+impl LiveWatch {
+    /// Record `frame` and return what the caller should see, or `None` for a
+    /// frame the caller already has the meaning of (a re-opened watch's second
+    /// `CaughtUp` or `StageFocused`).
+    fn admit(&mut self, frame: Frame, generations: &mut Generations) -> Option<Frame> {
+        match frame {
+            Frame::StageFocused { generation, target } => {
+                if self.stage.is_some() {
+                    return None;
+                }
+                let generation = generations.map(generation);
+                self.stage = Some(generation);
+                Some(Frame::StageFocused { generation, target })
+            }
+            Frame::Stage { generation, inner } => {
+                let generation = match self.stage {
+                    Some(pinned) => pinned,
+                    None => generations.map(generation),
+                };
+                let inner = self.track(*inner)?;
+                Some(Frame::Stage {
+                    generation,
+                    inner: Box::new(inner),
+                })
+            }
+            other => self.track(other),
+        }
+    }
+
+    fn track(&mut self, frame: Frame) -> Option<Frame> {
+        match &frame {
+            Frame::Committed(env) => self.resume.advance(&env.stream, env.seq),
+            Frame::CaughtUp { cursor } => {
+                // `cursor` lists every stream that existed when this watch
+                // started, so clear `from_head` before a redial can mistake a
+                // stream created while down for one to skip.
+                self.resume = pin_caught_up(cursor);
+                if std::mem::replace(&mut self.caught_up, true) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        Some(frame)
+    }
+}
+
+fn pin_caught_up(cursor: &Cursor) -> Cursor {
+    if !cursor.from_head() {
+        return cursor.clone();
+    }
+    let mut value = serde_json::to_value(cursor).expect("Cursor serializes");
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("from_head".into(), serde_json::Value::Bool(false));
+    }
+    serde_json::from_value(value).expect("Cursor deserializes")
+}
+
+/// A watch sent to the daemon whose `WatchOpened` has not arrived.
+struct Opening {
+    reply: oneshot::Sender<Result<FrameStream, ApiError>>,
+    watch: LiveWatch,
+    stream: FrameStream,
+}
+
+enum ConnEvent {
+    Read(io::Result<Option<wire::ServerFrame>>),
+    WriteFailed(io::Error),
+}
+
+enum Redial {
+    Connected(OwnedReadHalf, OwnedWriteHalf),
+    Shutdown,
+    Fatal(ApiError),
+}
+
+/// The task behind a [`RemoteClient`]: owns the socket, redials it, and keeps
+/// watches open across redials.
+struct Connection {
+    dialer: Arc<Dialer>,
+    me: Principal,
+    req_rx: mpsc::UnboundedReceiver<ClientReq>,
+    /// Weak, so this task ends once every client handle and stream is gone.
+    unwatch_tx: mpsc::WeakUnboundedSender<ClientReq>,
+    connected: watch::Sender<bool>,
+    closed: Arc<OnceLock<ApiError>>,
+    next_id: u64,
+    watches: BTreeMap<u64, LiveWatch>,
+    generations: Generations,
+}
+
+impl Connection {
+    async fn run(mut self, mut reader: OwnedReadHalf, mut writer: OwnedWriteHalf) {
+        let mut delay = REDIAL_MIN;
+        loop {
+            self.set_connected(true);
+            let started = tokio::time::Instant::now();
+            let Some(cause) = self.serve(reader, writer).await else {
+                return;
+            };
+            if started.elapsed() >= REDIAL_MAX {
+                delay = REDIAL_MIN;
+            }
+            self.set_connected(false);
+            match self.redial(&cause, &mut delay).await {
+                Redial::Connected(r, w) => (reader, writer) = (r, w),
+                Redial::Shutdown => return,
+                Redial::Fatal(e) => {
+                    let _ = self.closed.set(e.clone());
+                    for (_, w) in std::mem::take(&mut self.watches) {
+                        let _ = w.tx.send(Err(e.clone())).await;
+                    }
                     return;
                 }
-            },
-            incoming = in_rx.recv() => match incoming.unwrap_or(Ok(None)) {
-                Ok(Some(wire::ServerFrame::Reply { id, result })) => {
-                    if let Some(reply) = calls.remove(&id) {
-                        let _ = reply.send(result);
-                    }
-                }
-                Ok(Some(wire::ServerFrame::WatchOpened { id, result })) => {
-                    if let Some((reply, tx, stream)) = opening.remove(&id) {
-                        match result {
-                            Ok(()) => {
-                                watches.insert(id, tx);
-                                let _ = reply.send(Ok(stream));
-                            }
-                            Err(e) => {
-                                let _ = reply.send(Err(e));
-                            }
-                        }
-                    }
-                }
-                Ok(Some(wire::ServerFrame::Frame { id, frame })) => {
-                    let closed = match watches.get(&id) {
-                        Some(tx) => tx.send(Ok(frame)).await.is_err(),
-                        None => false,
-                    };
-                    if closed {
-                        watches.remove(&id);
-                    }
-                }
-                Ok(Some(wire::ServerFrame::WatchEnded { id, error })) => {
-                    if let Some(tx) = watches.remove(&id)
-                        && let Some(e) = error
-                    {
-                        let _ = tx.send(Err(e)).await;
-                    }
-                }
-                Ok(Some(wire::ServerFrame::Welcome { .. })) => {}
-                Ok(None) => break "server closed connection".to_owned(),
-                Err(e) => break e.to_string(),
             }
         }
-    };
+    }
 
-    reader_task.abort();
-    let err = || ApiError::Transport(reason.clone());
-    for (_, reply) in calls {
-        let _ = reply.send(Err(err()));
+    /// Notify `watch_connection` receivers only on a real change.
+    fn set_connected(&self, up: bool) {
+        self.connected
+            .send_if_modified(|was| std::mem::replace(was, up) != up);
     }
-    for (_, (reply, _, _)) in opening {
-        let _ = reply.send(Err(err()));
+
+    fn take_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
-    for (_, tx) in watches {
-        let _ = tx.send(Err(err())).await;
+
+    /// Serve one socket until it drops (returning why) or every handle is
+    /// gone (returning `None`).
+    async fn serve(&mut self, reader: OwnedReadHalf, mut writer: OwnedWriteHalf) -> Option<String> {
+        // `read_frame` is not cancel-safe: dropping it part-way through a frame
+        // loses the bytes it has already taken off the socket, and every later
+        // frame is then read from the wrong offset. Read on a task of its own
+        // and select on the channel, whose `recv` can be dropped safely.
+        let (ev_tx, mut ev_rx) = mpsc::channel(WATCH_BUFFER);
+        let read_tx = ev_tx.clone();
+        let mut reader = reader;
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let incoming = read_frame::<_, wire::ServerFrame>(&mut reader).await;
+                let last = !matches!(incoming, Ok(Some(_)));
+                if read_tx.send(ConnEvent::Read(incoming)).await.is_err() || last {
+                    break;
+                }
+            }
+        });
+        let _reader = AbortOnDrop(reader_task.abort_handle());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let writer_task = tokio::spawn(async move {
+            while let Some(bytes) = out_rx.recv().await {
+                if let Err(e) = write_bytes(&mut writer, &bytes).await {
+                    let _ = ev_tx.send(ConnEvent::WriteFailed(e)).await;
+                    break;
+                }
+            }
+        });
+        let _writer = AbortOnDrop(writer_task.abort_handle());
+
+        self.generations.rebase();
+        // A session holds at most one stage watch. If the socket died before
+        // `WatchEnded` arrived for a superseded stage, drop the older one now
+        // so two `Watch` frames cannot race to claim the new session's slot.
+        if let Some(&latest_stage) = self
+            .watches
+            .iter()
+            .rev()
+            .find_map(|(id, w)| matches!(w.interest, Interest::Stage { .. }).then_some(id))
+        {
+            self.watches.retain(|&id, w| {
+                id == latest_stage || !matches!(w.interest, Interest::Stage { .. })
+            });
+        }
+        for (&id, w) in &self.watches {
+            let reopen = wire::ClientFrame::Watch {
+                id,
+                interest: w.interest.clone(),
+                from: w.resume.clone(),
+            };
+            if let Ok(bytes) = encode(&reopen) {
+                let _ = out_tx.send(bytes);
+            }
+        }
+
+        let mut calls: HashMap<u64, oneshot::Sender<Result<WireReply, ApiError>>> = HashMap::new();
+        let mut opening: HashMap<u64, Opening> = HashMap::new();
+        let cause = loop {
+            tokio::select! {
+                req = self.req_rx.recv() => match req {
+                    Some(req) => self.submit(req, &out_tx, &mut calls, &mut opening),
+                    None => return None,
+                },
+                ev = ev_rx.recv() => match ev {
+                    Some(ConnEvent::Read(Ok(Some(frame)))) => {
+                        self.receive(frame, &out_tx, &mut calls, &mut opening).await;
+                    }
+                    Some(ConnEvent::Read(Ok(None))) | None => {
+                        break "daemon closed the connection".to_owned();
+                    }
+                    Some(ConnEvent::Read(Err(e))) => break format!("reading from daemon: {e}"),
+                    Some(ConnEvent::WriteFailed(e)) => break format!("writing to daemon: {e}"),
+                },
+            }
+        };
+        for (_, reply) in calls {
+            let _ = reply.send(Err(ApiError::Transport(cause.clone())));
+        }
+        for (_, o) in opening {
+            let _ = o.reply.send(Err(ApiError::Transport(cause.clone())));
+        }
+        Some(cause)
+    }
+
+    fn submit(
+        &mut self,
+        req: ClientReq,
+        out_tx: &mpsc::UnboundedSender<Vec<u8>>,
+        calls: &mut HashMap<u64, oneshot::Sender<Result<WireReply, ApiError>>>,
+        opening: &mut HashMap<u64, Opening>,
+    ) {
+        match req {
+            ClientReq::Call { cmd, reply } => {
+                let id = self.take_id();
+                match encode(&wire::ClientFrame::Call { id, cmd }) {
+                    Ok(bytes) => {
+                        calls.insert(id, reply);
+                        let _ = out_tx.send(bytes);
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(ApiError::Transport(format!("encoding call: {e}"))));
+                    }
+                }
+            }
+            ClientReq::Watch {
+                interest,
+                from,
+                reply,
+            } => {
+                let id = self.take_id();
+                let frame = wire::ClientFrame::Watch {
+                    id,
+                    interest: interest.clone(),
+                    from: from.clone(),
+                };
+                let bytes = match encode(&frame) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ =
+                            reply.send(Err(ApiError::Transport(format!("encoding watch: {e}"))));
+                        return;
+                    }
+                };
+                // The requester holds a sender until it hears back, so this
+                // upgrade only fails if it has already given up.
+                let Some(req_tx) = self.unwatch_tx.upgrade() else {
+                    return;
+                };
+                let (tx, rx) = mpsc::channel(WATCH_BUFFER);
+                let guard = UnwatchGuard {
+                    id,
+                    req_tx,
+                    armed: true,
+                };
+                opening.insert(
+                    id,
+                    Opening {
+                        reply,
+                        watch: LiveWatch {
+                            interest,
+                            resume: from,
+                            tx,
+                            caught_up: false,
+                            stage: None,
+                        },
+                        stream: frame_stream(rx, guard),
+                    },
+                );
+                let _ = out_tx.send(bytes);
+            }
+            ClientReq::Unwatch { id } => {
+                if self.watches.remove(&id).is_some()
+                    && let Ok(bytes) = encode(&wire::ClientFrame::Unwatch { id })
+                {
+                    let _ = out_tx.send(bytes);
+                }
+            }
+        }
+    }
+
+    async fn receive(
+        &mut self,
+        frame: wire::ServerFrame,
+        out_tx: &mpsc::UnboundedSender<Vec<u8>>,
+        calls: &mut HashMap<u64, oneshot::Sender<Result<WireReply, ApiError>>>,
+        opening: &mut HashMap<u64, Opening>,
+    ) {
+        match frame {
+            wire::ServerFrame::Reply { id, result } => {
+                if let Some(reply) = calls.remove(&id) {
+                    let _ = reply.send(result);
+                }
+            }
+            wire::ServerFrame::WatchOpened { id, result } => {
+                if let Some(o) = opening.remove(&id) {
+                    match result {
+                        Ok(()) => {
+                            self.watches.insert(id, o.watch);
+                            let _ = o.reply.send(Ok(o.stream));
+                        }
+                        Err(e) => {
+                            let _ = o.reply.send(Err(e));
+                        }
+                    }
+                } else if let Err(e) = result
+                    && let Some(w) = self.watches.remove(&id)
+                {
+                    // A re-opened watch the daemon now refuses.
+                    let _ = w.tx.send(Err(e)).await;
+                }
+            }
+            wire::ServerFrame::Frame { id, frame } => {
+                let Some(w) = self.watches.get_mut(&id) else {
+                    return;
+                };
+                let Some(frame) = w.admit(frame, &mut self.generations) else {
+                    return;
+                };
+                if w.tx.send(Ok(frame)).await.is_err() {
+                    self.watches.remove(&id);
+                    if let Ok(bytes) = encode(&wire::ClientFrame::Unwatch { id }) {
+                        let _ = out_tx.send(bytes);
+                    }
+                }
+            }
+            wire::ServerFrame::WatchEnded { id, error } => {
+                if let Some(w) = self.watches.remove(&id)
+                    && let Some(e) = error
+                {
+                    if let Ok(bytes) = encode(&wire::ClientFrame::Unwatch { id }) {
+                        let _ = out_tx.send(bytes);
+                    }
+                    let _ = w.tx.send(Err(e)).await;
+                }
+            }
+            wire::ServerFrame::Welcome { .. } => {}
+        }
+    }
+
+    /// Redial with backoff until connected as the same principal.
+    async fn redial(&mut self, cause: &str, delay: &mut Duration) -> Redial {
+        let dialer = self.dialer.clone();
+        loop {
+            let wait = *delay;
+            *delay = (*delay * 2).min(REDIAL_MAX);
+            if self
+                .while_down(tokio::time::sleep(wait), cause)
+                .await
+                .is_none()
+            {
+                return Redial::Shutdown;
+            }
+            match self.while_down(dialer.dial(), cause).await {
+                None => return Redial::Shutdown,
+                Some(Ok((me, reader, writer))) if me == self.me => {
+                    return Redial::Connected(reader, writer);
+                }
+                Some(Ok((me, ..))) => {
+                    return Redial::Fatal(ApiError::Transport(format!(
+                        "daemon now authenticates this client as {me}, not {}",
+                        self.me
+                    )));
+                }
+                Some(Err(e @ ApiError::Denied { .. })) => return Redial::Fatal(e),
+                Some(Err(_)) => {}
+            }
+        }
+    }
+
+    /// Drive `fut` while the socket is down, refusing calls and new watches
+    /// with `cause`. `None` once every handle is gone.
+    async fn while_down<F: Future>(&mut self, fut: F, cause: &str) -> Option<F::Output> {
+        tokio::pin!(fut);
+        let refusal = || ApiError::Transport(format!("reconnecting to daemon ({cause})"));
+        loop {
+            tokio::select! {
+                out = &mut fut => return Some(out),
+                req = self.req_rx.recv() => match req? {
+                    ClientReq::Call { reply, .. } => {
+                        let _ = reply.send(Err(refusal()));
+                    }
+                    ClientReq::Watch { reply, .. } => {
+                        let _ = reply.send(Err(refusal()));
+                    }
+                    ClientReq::Unwatch { id } => {
+                        self.watches.remove(&id);
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -468,19 +956,36 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
 }
 
 /// Serve `router` on an already-bound `UnixListener` until cancelled.
+/// Cancelling closes every connection, as a daemon exit would.
 pub async fn serve_listener(
     listener: UnixListener,
     router: Arc<Router>,
     auth: Arc<dyn Authenticator>,
 ) -> io::Result<()> {
+    if let Ok(addr) = listener.local_addr()
+        && let Some(path) = addr.as_pathname()
+    {
+        daemon_log!("listening on {}", path.display());
+    }
+    let mut conns = JoinSet::new();
+    let mut next_conn = 0u64;
     loop {
-        let (stream, _) = listener.accept().await?;
-        let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
-        let router = router.clone();
-        let auth = auth.clone();
-        tokio::spawn(async move {
-            let _ = handle_conn(stream, peer_uid, router, auth).await;
-        });
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.inspect_err(|e| daemon_log!("accept failed: {e}"))?;
+                next_conn += 1;
+                let conn = next_conn;
+                let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
+                let router = router.clone();
+                let auth = auth.clone();
+                conns.spawn(async move {
+                    if let Err(e) = handle_conn(conn, stream, peer_uid, router, auth).await {
+                        daemon_log!("conn #{conn}: {e}");
+                    }
+                });
+            }
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+        }
     }
 }
 
@@ -503,7 +1008,14 @@ pub async fn serve(
     }
 }
 
+/// Errors that point at the daemon or what it fronts, as opposed to a caller
+/// asking for something it may not have.
+fn worth_logging(e: &ApiError) -> bool {
+    matches!(e, ApiError::Internal(_) | ApiError::Transport(_))
+}
+
 async fn handle_conn(
+    conn: u64,
     stream: UnixStream,
     peer_uid: Option<u32>,
     router: Arc<Router>,
@@ -514,61 +1026,64 @@ async fn handle_conn(
         tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hello timed out"))??;
-    let Some(wire::ClientFrame::Hello { credential, .. }) = first else {
+    let Some(wire::ClientFrame::Hello { credential, client }) = first else {
+        daemon_log!("conn #{conn}: closed without hello");
         return Ok(());
     };
-    let me = match auth.authenticate(peer_uid, &credential) {
-        Ok(me) => {
-            write_frame(
-                &mut writer,
-                &wire::ServerFrame::Welcome {
-                    result: Ok(me.clone()),
-                    daemon: env!("CARGO_PKG_VERSION").into(),
-                },
-            )
-            .await?;
-            me
-        }
+    let welcome = auth.authenticate(peer_uid, &credential);
+    write_server_frame(
+        &mut writer,
+        conn,
+        &wire::ServerFrame::Welcome {
+            result: welcome.clone(),
+            daemon: env!("CARGO_PKG_VERSION").into(),
+        },
+    )
+    .await?;
+    let me = match welcome {
+        Ok(me) => me,
         Err(e) => {
-            let _ = write_frame(
-                &mut writer,
-                &wire::ServerFrame::Welcome {
-                    result: Err(e),
-                    daemon: env!("CARGO_PKG_VERSION").into(),
-                },
-            )
-            .await;
+            daemon_log!("conn #{conn}: refused {client}: {e}");
             return Ok(());
         }
     };
+    daemon_log!("conn #{conn}: {client} connected as {me}");
 
-    let session = Session::new(me);
+    let session = Session::new(me.clone());
     let (out_tx, mut out_rx) = mpsc::channel::<wire::ServerFrame>(WATCH_BUFFER * 2);
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
-                break;
-            }
+            write_server_frame(&mut writer, conn, &frame).await?;
         }
+        Ok::<(), io::Error>(())
     });
+    let _writer = AbortOnDrop(writer_task.abort_handle());
 
-    let mut watches: HashMap<u64, AbortHandle> = HashMap::new();
-    while let Ok(Some(frame)) = read_frame::<_, wire::ClientFrame>(&mut reader).await {
+    let mut watches: HashMap<u64, AbortOnDrop> = HashMap::new();
+    let ended = loop {
+        let frame = match read_frame::<_, wire::ClientFrame>(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break "client hung up".to_owned(),
+            Err(e) => break format!("read failed: {e}"),
+        };
         match frame {
-            wire::ClientFrame::Hello { .. } => break,
+            wire::ClientFrame::Hello { .. } => break "second hello".to_owned(),
             wire::ClientFrame::Call { id, cmd } => {
                 let router = router.clone();
                 let by = session.me().clone();
                 let out_tx = out_tx.clone();
+                let name = cmd.meta().name;
                 tokio::spawn(async move {
                     let result = router.dispatch(&by, cmd).await;
+                    if let Err(e) = &result
+                        && worth_logging(e)
+                    {
+                        daemon_log!("conn #{conn}: {name} failed: {e}");
+                    }
                     let _ = out_tx.send(wire::ServerFrame::Reply { id, result }).await;
                 });
             }
             wire::ClientFrame::Watch { id, interest, from } => {
-                if let Some(prev) = watches.remove(&id) {
-                    prev.abort();
-                }
                 let router = router.clone();
                 let session = session.clone();
                 let out_tx = out_tx.clone();
@@ -585,6 +1100,9 @@ async fn handle_conn(
                             s
                         }
                         Err(e) => {
+                            if worth_logging(&e) {
+                                daemon_log!("conn #{conn}: watch {id} refused: {e}");
+                            }
                             let _ = out_tx
                                 .send(wire::ServerFrame::WatchOpened { id, result: Err(e) })
                                 .await;
@@ -604,6 +1122,9 @@ async fn handle_conn(
                                 }
                             }
                             Err(e) => {
+                                if worth_logging(&e) {
+                                    daemon_log!("conn #{conn}: watch {id} ended: {e}");
+                                }
                                 end_err = Some(e);
                                 break;
                             }
@@ -613,20 +1134,20 @@ async fn handle_conn(
                         .send(wire::ServerFrame::WatchEnded { id, error: end_err })
                         .await;
                 });
-                watches.insert(id, handle.abort_handle());
+                // Replacing an entry aborts the watch it held.
+                watches.insert(id, AbortOnDrop(handle.abort_handle()));
             }
             wire::ClientFrame::Unwatch { id } => {
-                if let Some(handle) = watches.remove(&id) {
-                    handle.abort();
-                }
+                watches.remove(&id);
             }
         }
-    }
+    };
 
-    for (_, handle) in watches {
-        handle.abort();
-    }
+    drop(watches);
     drop(out_tx);
-    let _ = writer_task.await;
+    match writer_task.await {
+        Ok(Err(e)) => daemon_log!("conn #{conn}: {me} disconnected ({ended}; write failed: {e})"),
+        _ => daemon_log!("conn #{conn}: {me} disconnected ({ended})"),
+    }
     Ok(())
 }

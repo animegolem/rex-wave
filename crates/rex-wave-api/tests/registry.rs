@@ -257,3 +257,49 @@ fn osc7501_and_context_usage_and_wait_constructor_behave() {
     };
     assert!(serde_json::to_value(frame).is_ok());
 }
+
+#[test]
+fn every_api_error_variant_round_trips_through_json() {
+    let every = [
+        ApiError::Invalid(InvalidId {
+            what: "seat".into(),
+            reason: "length out of range".into(),
+        }),
+        ApiError::Denied {
+            principal: "seat:sam".into(),
+            action: "watch everything".into(),
+        },
+        ApiError::NotFound {
+            what: "room #nope".into(),
+        },
+        ApiError::Conflict {
+            detail: "worker never spawned".into(),
+        },
+        ApiError::Unavailable {
+            family: Family::Wave,
+        },
+        ApiError::Timeout,
+        ApiError::Transport("bb events page: connection refused".into()),
+        ApiError::ReplyMismatch {
+            expected: "room_post".into(),
+            got: "ack".into(),
+        },
+        ApiError::Internal("journal locked".into()),
+    ];
+    for err in every {
+        let json = serde_json::to_value(&err)
+            .unwrap_or_else(|e| panic!("{err:?} must serialize, got {e}"));
+        let back: ApiError = serde_json::from_value(json.clone())
+            .unwrap_or_else(|e| panic!("{json} must deserialize, got {e}"));
+        assert_eq!(back, err, "{json} round-trips");
+    }
+
+    assert_eq!(
+        serde_json::to_value(ApiError::Transport("down".into())).unwrap(),
+        serde_json::json!({ "error": "transport", "detail": "down" })
+    );
+    assert_eq!(
+        serde_json::to_value(ApiError::Internal("boom".into())).unwrap(),
+        serde_json::json!({ "error": "internal", "detail": "boom" })
+    );
+}
