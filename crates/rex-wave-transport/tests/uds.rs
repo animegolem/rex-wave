@@ -561,3 +561,353 @@ async fn reply_split_across_writes_survives_a_call_issued_mid_frame() {
     drop(client);
     server.abort();
 }
+
+fn general() -> RoomRef {
+    RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    }
+}
+
+fn owner() -> Principal {
+    Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    }
+}
+
+fn router_with(journal: &Journal, room: Arc<dyn Service<RoomCommand>>) -> Arc<Router> {
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    Arc::new(Router {
+        room,
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    })
+}
+
+/// A fresh daemon (router, hub, registry) over `journal`, as after a restart.
+fn toy_router(journal: &Journal) -> Arc<Router> {
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    })
+}
+
+fn serve_on(sock: &std::path::Path, router: Arc<Router>) -> tokio::task::JoinHandle<()> {
+    let (listener, daemon_uid) = bind_unix(sock).unwrap();
+    let auth: Arc<dyn Authenticator> = Arc::new(TableAuthenticator {
+        operator: SeatName::parse("owner").unwrap(),
+        daemon_uid: Some(daemon_uid),
+        tokens: BTreeMap::new(),
+    });
+    tokio::spawn(async move {
+        let _ = serve_listener(listener, router, auth).await;
+    })
+}
+
+fn post(body: &str) -> RoomPost {
+    RoomPost {
+        room: general(),
+        body: Body::parse(body).unwrap(),
+        reply_to: None,
+        idem: None,
+    }
+}
+
+async fn next_frame(stream: &mut FrameStream) -> Frame {
+    tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("frame within 5s")
+        .expect("stream still open")
+        .expect("frame, not error")
+}
+
+fn committed_seq(frame: &Frame) -> u64 {
+    match frame {
+        Frame::Committed(env) => env.seq.0,
+        other => panic!("expected a committed entry, got {other:?}"),
+    }
+}
+
+/// `(generation, seq)` of a stage frame wrapping a committed entry.
+fn stage_committed(frame: &Frame) -> (u64, u64) {
+    match frame {
+        Frame::Stage { generation, inner } => (generation.0, committed_seq(inner)),
+        other => panic!("expected a stage frame, got {other:?}"),
+    }
+}
+
+/// `ApiError` once failed to serialize for `Transport` and `Internal`, and the
+/// daemon's writer closed the socket instead of answering. Every variant must
+/// now arrive as itself, and the connection must stay up throughout.
+#[tokio::test]
+async fn every_api_error_crosses_the_socket_without_dropping_it() {
+    let every = vec![
+        ApiError::Invalid(InvalidId {
+            what: "seat".into(),
+            reason: "length out of range".into(),
+        }),
+        ApiError::Denied {
+            principal: "seat:sam".into(),
+            action: "watch everything".into(),
+        },
+        ApiError::NotFound {
+            what: "room #nope".into(),
+        },
+        ApiError::Conflict {
+            detail: "worker never spawned".into(),
+        },
+        ApiError::Unavailable {
+            family: Family::Wave,
+        },
+        ApiError::Timeout,
+        ApiError::Transport("bb events page: connection refused".into()),
+        ApiError::ReplyMismatch {
+            expected: "room_post".into(),
+            got: "ack".into(),
+        },
+        ApiError::Internal("journal locked".into()),
+        // Too big for one frame: the daemon must answer with a small error.
+        ApiError::Internal("x".repeat(17 * 1024 * 1024)),
+    ];
+
+    struct Fails(Vec<ApiError>);
+    impl Service<RoomCommand> for Fails {
+        fn dispatch(
+            &self,
+            cmd: RoomCommand,
+            _: DecideCtx,
+        ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+            let RoomCommand::RoomPost(c) = cmd else {
+                unreachable!()
+            };
+            let i: usize = String::from(c.body).parse().unwrap();
+            let err = self.0[i].clone();
+            Box::pin(async move { Err(err) })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let journal = Journal::in_memory().unwrap();
+    let server = serve_on(&sock, router_with(&journal, Arc::new(Fails(every.clone()))));
+    let client = RemoteClient::connect(Endpoint::Unix(sock), Credential::PeerUid, "tui")
+        .await
+        .unwrap();
+    let mut connection = client.watch_connection();
+    connection.borrow_and_update();
+
+    let (oversized, fits) = every.split_last().unwrap();
+    for (i, expected) in fits.iter().enumerate() {
+        let got = client.call(post(&i.to_string())).await;
+        assert_eq!(got.unwrap_err(), *expected, "variant {i} arrives intact");
+    }
+    let got = client.call(post(&fits.len().to_string())).await;
+    match got.unwrap_err() {
+        ApiError::Internal(detail) => assert!(
+            detail.contains("exceeds 16 MiB") && detail.len() < 1024,
+            "oversized reply becomes a short internal error, got {} bytes",
+            detail.len()
+        ),
+        other => panic!("oversized reply should fail as internal, got {other:?} for {oversized:?}"),
+    }
+
+    assert!(client.connected());
+    assert!(
+        !connection.has_changed().unwrap(),
+        "the socket never dropped, so the client never reconnected"
+    );
+    drop(client);
+    server.abort();
+}
+
+/// A daemon restart unlinks and rebinds the socket. The client must redial,
+/// re-open its watches from the last frame it delivered, and serve calls again,
+/// so a TUI never freezes on a dead connection.
+#[tokio::test]
+async fn daemon_restart_reconnects_and_resumes_watches_from_their_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let journal = Journal::in_memory().unwrap();
+    let first = serve_on(&sock, toy_router(&journal));
+
+    let client = RemoteClient::connect(Endpoint::Unix(sock.clone()), Credential::PeerUid, "tui")
+        .await
+        .unwrap();
+    let mut connection = client.watch_connection();
+    assert!(*connection.borrow_and_update());
+
+    let mut room = client
+        .watch(Interest::Room { room: general() }, Cursor::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_frame(&mut room).await,
+        Frame::CaughtUp { .. }
+    ));
+    let mut everything = client
+        .watch(Interest::Everything, Cursor::live())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_frame(&mut everything).await,
+        Frame::CaughtUp { .. }
+    ));
+    // Two earlier retargets, so the live stage is generation 3 and a restarted
+    // daemon's fresh numbering (1, 2, ...) would read as stale to the TUI.
+    for generation in 1..=2 {
+        let mut earlier = client
+            .watch(
+                Interest::Stage {
+                    target: StageTarget::Inbox,
+                },
+                Cursor::live(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut earlier).await,
+            Frame::StageFocused { generation: g, .. } if g == FocusGeneration(generation)
+        ));
+    }
+    let mut stage = client
+        .watch(
+            Interest::Stage {
+                target: StageTarget::Room { room: general() },
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_frame(&mut stage).await,
+        Frame::StageFocused {
+            generation: FocusGeneration(3),
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_frame(&mut stage).await,
+        Frame::Stage { inner, .. } if matches!(*inner, Frame::CaughtUp { .. })
+    ));
+
+    for i in 1..=3 {
+        client.call(post(&format!("before-{i}"))).await.unwrap();
+    }
+    for seq in 1..=3 {
+        assert_eq!(committed_seq(&next_frame(&mut room).await), seq);
+        assert_eq!(committed_seq(&next_frame(&mut everything).await), seq);
+        assert_eq!(stage_committed(&next_frame(&mut stage).await), (3, seq));
+    }
+
+    first.abort();
+    let _ = first.await;
+    tokio::time::timeout(Duration::from_secs(5), connection.wait_for(|up| !*up))
+        .await
+        .expect("client notices the daemon is gone")
+        .unwrap();
+    match client.call(post("while-down")).await.unwrap_err() {
+        ApiError::Transport(detail) => assert!(
+            detail.contains("daemon closed the connection"),
+            "a refused call names why the socket dropped: {detail}"
+        ),
+        other => panic!("expected a transport error while down, got {other:?}"),
+    }
+
+    // The restarted daemon commits entries (including a room that did not
+    // exist before the crash) before it listens, so the client can only see
+    // them by replaying from its cursor.
+    let second_router = toy_router(&journal);
+    let local = LocalClient::new(second_router.clone(), owner());
+    for i in 4..=5 {
+        local.call(post(&format!("during-{i}"))).await.unwrap();
+    }
+    let alerts = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("alerts").unwrap(),
+    };
+    local
+        .call(RoomPost {
+            room: alerts,
+            body: Body::parse("new-room-while-down").unwrap(),
+            reply_to: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let second = serve_on(&sock, second_router);
+    tokio::time::timeout(Duration::from_secs(5), connection.wait_for(|up| *up))
+        .await
+        .expect("client redials the rebound socket")
+        .unwrap();
+
+    let posted = client.call(post("after-6")).await.unwrap();
+    assert_eq!(posted.seq, Seq(6), "calls work again after the redial");
+    for seq in 4..=6 {
+        assert_eq!(
+            committed_seq(&next_frame(&mut room).await),
+            seq,
+            "room watch resumes after seq 3 with no gap and no repeat"
+        );
+        assert_eq!(
+            stage_committed(&next_frame(&mut stage).await),
+            (3, seq),
+            "stage watch keeps the generation its caller already saw"
+        );
+    }
+    let mut wild_seqs = Vec::new();
+    for _ in 0..4 {
+        wild_seqs.push(committed_seq(&next_frame(&mut everything).await));
+    }
+    wild_seqs.sort_unstable();
+    assert_eq!(
+        wild_seqs,
+        vec![1, 4, 5, 6],
+        "live wildcard watch catches a brand-new stream created while down"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), room.next())
+            .await
+            .is_err(),
+        "no duplicate frames or second CaughtUp after the resume"
+    );
+
+    let mut retargeted = client
+        .watch(
+            Interest::Stage {
+                target: StageTarget::Inbox,
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    match next_frame(&mut retargeted).await {
+        Frame::StageFocused { generation, .. } => assert!(
+            generation > FocusGeneration(3),
+            "a stage opened after the restart outranks the old one, got {generation:?}"
+        ),
+        other => panic!("expected StageFocused, got {other:?}"),
+    }
+
+    drop((room, everything, stage, retargeted, client));
+    second.abort();
+}
