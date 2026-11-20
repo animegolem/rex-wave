@@ -16,7 +16,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Monotonic per session; assigned by the server when a stage watch opens.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(transparent)]
 pub struct FocusGeneration(pub u64);
 
@@ -32,11 +45,18 @@ impl FocusGeneration {
 pub enum StageTarget {
     /// Notifications and BB approval cards.
     Inbox,
-    Kanban { board: BoardId },
+    Kanban {
+        board: BoardId,
+    },
     /// A project `#channel`, a `#wave-<slug>` room, a global channel, or a DM.
-    Room { room: RoomRef },
+    Room {
+        room: RoomRef,
+    },
     /// One wave agent's context window and BB thread.
-    Agent { wave: WaveSlug, role: RoleName },
+    Agent {
+        wave: WaveSlug,
+        role: RoleName,
+    },
 }
 
 /// `OSC 7501` program status for the Rex terminal.
@@ -68,13 +88,21 @@ pub struct Osc7501Status {
 
 impl Default for Osc7501Status {
     fn default() -> Self {
-        Osc7501Status { state: Osc7501State::Idle, block_kind: None, progress_pct: None, message: String::new() }
+        Osc7501Status {
+            state: Osc7501State::Idle,
+            block_kind: None,
+            progress_pct: None,
+            message: String::new(),
+        }
     }
 }
 
 /// Pure. Precedence is blocked, then error, then working, then done, then idle,
 /// because the terminal shows one state and "waiting on you" must win.
-pub fn derive_osc7501_status<'a>(inbox: &InboxBadge, workers: impl IntoIterator<Item = &'a WorkerPhase>) -> Osc7501Status {
+pub fn derive_osc7501_status<'a>(
+    inbox: &InboxBadge,
+    workers: impl IntoIterator<Item = &'a WorkerPhase>,
+) -> Osc7501Status {
     let (mut total, mut retired, mut working, mut failed) = (0u32, 0u32, 0u32, 0u32);
     let mut blocked: Option<Osc7501BlockKind> = None;
     let mut blocked_count = 0u32;
@@ -91,7 +119,9 @@ pub fn derive_osc7501_status<'a>(inbox: &InboxBadge, workers: impl IntoIterator<
                     blocked_count += 1;
                     blocked.get_or_insert(match interaction.kind {
                         InteractionKind::Question { .. } => Osc7501BlockKind::Question,
-                        InteractionKind::Permission | InteractionKind::Extension => Osc7501BlockKind::Permission,
+                        InteractionKind::Permission | InteractionKind::Extension => {
+                            Osc7501BlockKind::Permission
+                        }
                     });
                 }
             },
@@ -123,7 +153,15 @@ pub fn derive_osc7501_status<'a>(inbox: &InboxBadge, workers: impl IntoIterator<
         };
     }
     if total > 0 {
-        return Osc7501Status { state: Osc7501State::Done, block_kind: None, progress_pct: Some(100), message: "all workers retired".into() };
+        return Osc7501Status {
+            state: Osc7501State::Done,
+            block_kind: None,
+            progress_pct: Some(100),
+            message: "all workers retired".into(),
+        };
     }
-    Osc7501Status { message: format!("{} unread", inbox.unread), ..Osc7501Status::default() }
+    Osc7501Status {
+        message: format!("{} unread", inbox.unread),
+        ..Osc7501Status::default()
+    }
 }

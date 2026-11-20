@@ -1,17 +1,18 @@
 use rex_wave_api::board::{
-    Assign, BoardEnsure, BoardEvent, BoardId, BoardInfo, BoardSnapshot, BoardView, Card, CardNo, CardRef,
-    CardRevision, CardUpsert, LaneCards, LaneName, Priority,
+    Assign, BoardEnsure, BoardEvent, BoardId, BoardInfo, BoardSnapshot, BoardView, Card, CardNo,
+    CardRef, CardRevision, CardUpsert, LaneCards, LaneName, Priority,
 };
 use rex_wave_api::room::{
-    Body, Mentions, Posted, RoomEnsure, RoomEvent, RoomId, RoomInfo, RoomOrigin, RoomPost, RoomRef, RoomScope,
+    Body, Mentions, Posted, RoomEnsure, RoomEvent, RoomId, RoomInfo, RoomOrigin, RoomPost, RoomRef,
+    RoomScope,
 };
 use rex_wave_api::wave::{WaveEvent, WaveSnapshot, WaveStarted, WaveStatus};
 use rex_wave_api::*;
 use rex_wave_mcp::codemode::{Budget, CodeError, run_code};
 use rex_wave_mcp::{MAX_RUN_CODE_TIMEOUT_MS, McpServer, PROTOCOL_VERSION, RUN_CODE_TOOL};
 use rex_wave_runtime::{
-    DecideCtx, Decider, EntryMeta, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, SidebarProjection,
-    Unavailable,
+    DecideCtx, Decider, EntryMeta, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router,
+    SidebarProjection, Unavailable,
 };
 use rex_wave_store::Journal;
 use serde_json::{Value, json};
@@ -46,7 +47,9 @@ impl Decider for TestRooms {
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
         };
-        Ok(StreamId::Room { room: room_ref.resolve(&ctx.by)? })
+        Ok(StreamId::Room {
+            room: room_ref.resolve(&ctx.by)?,
+        })
     }
 
     fn idem(cmd: &Self::Cmd) -> Option<IdemKey> {
@@ -56,9 +59,17 @@ impl Decider for TestRooms {
         }
     }
 
-    fn decide(state: &Self::State, cmd: &Self::Cmd, ctx: &DecideCtx) -> Result<Vec<Self::Event>, ApiError> {
+    fn decide(
+        state: &Self::State,
+        cmd: &Self::Cmd,
+        ctx: &DecideCtx,
+    ) -> Result<Vec<Self::Event>, ApiError> {
         match cmd {
-            RoomCommand::RoomEnsure(RoomEnsure { room, topic, origin }) => {
+            RoomCommand::RoomEnsure(RoomEnsure {
+                room,
+                topic,
+                origin,
+            }) => {
                 if state.id.is_some() {
                     return Ok(Vec::new());
                 }
@@ -69,7 +80,10 @@ impl Decider for TestRooms {
                     topic: topic.clone(),
                 }];
                 if let Some(h) = default_handle(&ctx.by) {
-                    events.push(RoomEvent::MemberJoined { member: ctx.by.clone(), handle: h });
+                    events.push(RoomEvent::MemberJoined {
+                        member: ctx.by.clone(),
+                        handle: h,
+                    });
                 }
                 Ok(events)
             }
@@ -80,22 +94,39 @@ impl Decider for TestRooms {
                 }
                 let handle = match &j.handle {
                     Some(h) => h.clone(),
-                    None => default_handle(&who).ok_or_else(|| ApiError::Internal("no handle for system".into()))?,
+                    None => default_handle(&who)
+                        .ok_or_else(|| ApiError::Internal("no handle for system".into()))?,
                 };
-                Ok(vec![RoomEvent::MemberJoined { member: who, handle }])
+                Ok(vec![RoomEvent::MemberJoined {
+                    member: who,
+                    handle,
+                }])
             }
-            RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft { member: ctx.by.clone() }]),
-            RoomCommand::RoomPost(RoomPost { room, body, reply_to, idem }) => {
+            RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft {
+                member: ctx.by.clone(),
+            }]),
+            RoomCommand::RoomPost(RoomPost {
+                room,
+                body,
+                reply_to,
+                idem,
+            }) => {
                 let mut events = Vec::new();
                 if state.id.is_none() {
                     let id = room.resolve(&ctx.by)?;
-                    events.push(RoomEvent::Opened { id, origin: RoomOrigin::Manual, topic: None });
+                    events.push(RoomEvent::Opened {
+                        id,
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    });
                 }
                 let mut mentioned = Vec::new();
                 let mut all = false;
                 for token in body.as_str().split_whitespace() {
                     if let Some(tag) = token.strip_prefix('@') {
-                        let clean = tag.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+                        let clean = tag.trim_end_matches(|c: char| {
+                            !c.is_ascii_alphanumeric() && c != '-' && c != '_'
+                        });
                         if clean == "all" {
                             all = true;
                         } else if let Ok(seat) = SeatName::parse(clean) {
@@ -108,7 +139,10 @@ impl Decider for TestRooms {
                 }
                 events.push(RoomEvent::Posted {
                     body: body.clone(),
-                    mentions: Mentions { principals: mentioned, all },
+                    mentions: Mentions {
+                        principals: mentioned,
+                        all,
+                    },
                     reply_to: *reply_to,
                     idem: idem.clone(),
                 });
@@ -175,7 +209,9 @@ impl Decider for TestRooms {
 
 fn default_handle(principal: &Principal) -> Option<Handle> {
     match principal {
-        Principal::Operator { seat } | Principal::Seat { seat } => Handle::parse(seat.as_str()).ok(),
+        Principal::Operator { seat } | Principal::Seat { seat } => {
+            Handle::parse(seat.as_str()).ok()
+        }
         Principal::Worker { role, .. } => Handle::parse(role.as_str()).ok(),
         Principal::System { .. } => None,
     }
@@ -211,7 +247,11 @@ impl Decider for TestBoards {
         None
     }
 
-    fn decide(state: &Self::State, cmd: &Self::Cmd, _ctx: &DecideCtx) -> Result<Vec<Self::Event>, ApiError> {
+    fn decide(
+        state: &Self::State,
+        cmd: &Self::Cmd,
+        _ctx: &DecideCtx,
+    ) -> Result<Vec<Self::Event>, ApiError> {
         match cmd {
             BoardCommand::BoardEnsure(BoardEnsure { board, lanes }) => {
                 if state.board.is_some() {
@@ -224,25 +264,39 @@ impl Decider for TestBoards {
                         .map(|s| LaneName::parse(s).expect("lane"))
                         .collect(),
                 };
-                Ok(vec![BoardEvent::Opened { board: board.clone(), lanes: default_lanes }])
+                Ok(vec![BoardEvent::Opened {
+                    board: board.clone(),
+                    lanes: default_lanes,
+                }])
             }
-            BoardCommand::CardUpsert(CardUpsert { board, card, expected, patch, .. }) => {
+            BoardCommand::CardUpsert(CardUpsert {
+                board,
+                card,
+                expected,
+                patch,
+                ..
+            }) => {
                 let mut out = Vec::new();
                 if state.board.is_none() {
                     let default_lanes = ["todo", "doing", "review", "done"]
                         .into_iter()
                         .map(|s| LaneName::parse(s).expect("lane"))
                         .collect();
-                    out.push(BoardEvent::Opened { board: board.clone(), lanes: default_lanes });
+                    out.push(BoardEvent::Opened {
+                        board: board.clone(),
+                        lanes: default_lanes,
+                    });
                 }
                 match card {
                     None => {
                         let next_no = CardNo((state.cards.len() as u32) + 1);
-                        let title = patch
-                            .title
+                        let title = patch.title.clone().ok_or_else(|| ApiError::Conflict {
+                            detail: "missing card title".into(),
+                        })?;
+                        let lane = patch
+                            .lane
                             .clone()
-                            .ok_or_else(|| ApiError::Conflict { detail: "missing card title".into() })?;
-                        let lane = patch.lane.clone().unwrap_or_else(|| LaneName::parse("todo").expect("todo"));
+                            .unwrap_or_else(|| LaneName::parse("todo").expect("todo"));
                         let assignee = match &patch.assignee {
                             Some(Assign::To { who }) => Some(who.clone()),
                             _ => None,
@@ -263,15 +317,17 @@ impl Decider for TestBoards {
                         Ok(out)
                     }
                     Some(no) => {
-                        let existing = state
-                            .cards
-                            .get(no)
-                            .ok_or_else(|| ApiError::NotFound { what: format!("card {}", no.0) })?;
+                        let existing = state.cards.get(no).ok_or_else(|| ApiError::NotFound {
+                            what: format!("card {}", no.0),
+                        })?;
                         if let Some(exp) = expected
                             && &existing.revision != exp
                         {
                             return Err(ApiError::Conflict {
-                                detail: format!("expected rev {}, got {}", exp.0, existing.revision.0),
+                                detail: format!(
+                                    "expected rev {}, got {}",
+                                    exp.0, existing.revision.0
+                                ),
                             });
                         }
                         out.push(BoardEvent::CardPatched {
@@ -287,7 +343,9 @@ impl Decider for TestBoards {
                 let existing = state
                     .cards
                     .get(&arch.card)
-                    .ok_or_else(|| ApiError::NotFound { what: format!("card {}", arch.card.0) })?;
+                    .ok_or_else(|| ApiError::NotFound {
+                        what: format!("card {}", arch.card.0),
+                    })?;
                 Ok(vec![BoardEvent::CardArchived {
                     no: arch.card,
                     revision: existing.revision.next(),
@@ -295,7 +353,9 @@ impl Decider for TestBoards {
             }
             BoardCommand::BoardView(_) => {
                 if state.board.is_none() {
-                    return Err(ApiError::NotFound { what: "board".into() });
+                    return Err(ApiError::NotFound {
+                        what: "board".into(),
+                    });
                 }
                 Ok(Vec::new())
             }
@@ -311,10 +371,18 @@ impl Decider for TestBoards {
             }
             BoardEvent::CardCreated { card } => {
                 let board = state.board.clone().expect("board set");
-                state.last_card = Some(CardRef { board, no: card.no, revision: card.revision });
+                state.last_card = Some(CardRef {
+                    board,
+                    no: card.no,
+                    revision: card.revision,
+                });
                 state.cards.insert(card.no, card.clone());
             }
-            BoardEvent::CardPatched { no, revision, patch } => {
+            BoardEvent::CardPatched {
+                no,
+                revision,
+                patch,
+            } => {
                 if let Some(c) = state.cards.get_mut(no) {
                     c.revision = *revision;
                     if let Some(t) = &patch.title {
@@ -330,7 +398,11 @@ impl Decider for TestBoards {
                         };
                     }
                     let board = state.board.clone().expect("board set");
-                    state.last_card = Some(CardRef { board, no: *no, revision: *revision });
+                    state.last_card = Some(CardRef {
+                        board,
+                        no: *no,
+                        revision: *revision,
+                    });
                 }
             }
             BoardEvent::CardArchived { no, .. } => {
@@ -347,7 +419,9 @@ impl Decider for TestBoards {
                 lanes: state.lanes.clone(),
                 head: state.head,
             }),
-            BoardCommand::CardUpsert(_) => WireReply::CardUpsert(state.last_card.clone().expect("card ref")),
+            BoardCommand::CardUpsert(_) => {
+                WireReply::CardUpsert(state.last_card.clone().expect("card ref"))
+            }
             BoardCommand::CardArchive(_) => WireReply::CardArchive(Ack),
             BoardCommand::BoardView(BoardView { filter, .. }) => {
                 let lanes = state
@@ -359,15 +433,25 @@ impl Decider for TestBoards {
                             .values()
                             .filter(|c| &c.lane == lane)
                             .filter(|c| match &filter {
-                                Some(f) => f.assignee.as_ref().is_none_or(|a| c.assignee.as_ref() == Some(a)),
+                                Some(f) => f
+                                    .assignee
+                                    .as_ref()
+                                    .is_none_or(|a| c.assignee.as_ref() == Some(a)),
                                 None => true,
                             })
                             .cloned()
                             .collect();
-                        LaneCards { lane: lane.clone(), cards }
+                        LaneCards {
+                            lane: lane.clone(),
+                            cards,
+                        }
                     })
                     .collect();
-                WireReply::BoardView(BoardSnapshot { board, head: state.head, lanes })
+                WireReply::BoardView(BoardSnapshot {
+                    board,
+                    head: state.head,
+                    lanes,
+                })
             }
         }
     }
@@ -416,15 +500,22 @@ impl Decider for TestWaves {
         None
     }
 
-    fn decide(state: &Self::State, cmd: &Self::Cmd, _ctx: &DecideCtx) -> Result<Vec<Self::Event>, ApiError> {
+    fn decide(
+        state: &Self::State,
+        cmd: &Self::Cmd,
+        _ctx: &DecideCtx,
+    ) -> Result<Vec<Self::Event>, ApiError> {
         match cmd {
             WaveCommand::WaveStart(start) => {
                 if state.spec.is_some() {
                     return Ok(Vec::new());
                 }
                 let room = RoomId::Channel {
-                    scope: RoomScope::Project { project: start.spec.project.clone() },
-                    name: ChannelName::parse(format!("wave-{}", start.spec.slug)).expect("wave channel"),
+                    scope: RoomScope::Project {
+                        project: start.spec.project.clone(),
+                    },
+                    name: ChannelName::parse(format!("wave-{}", start.spec.slug))
+                        .expect("wave channel"),
                 };
                 let board = rex_wave_api::board::project_board(&start.spec.project);
                 Ok(vec![WaveEvent::Started {
@@ -508,7 +599,11 @@ impl TestHarness {
             mail: Arc::new(Unavailable(Family::Mail)),
             read,
         });
-        TestHarness { _dir: dir, journal, router }
+        TestHarness {
+            _dir: dir,
+            journal,
+            router,
+        }
     }
 
     fn client(&self, me: Principal) -> LocalClient {
@@ -517,11 +612,15 @@ impl TestHarness {
 }
 
 fn seat_principal(name: &str) -> Principal {
-    Principal::Seat { seat: SeatName::parse(name).expect("valid seat") }
+    Principal::Seat {
+        seat: SeatName::parse(name).expect("valid seat"),
+    }
 }
 
 fn operator_principal(name: &str) -> Principal {
-    Principal::Operator { seat: SeatName::parse(name).expect("valid operator seat") }
+    Principal::Operator {
+        seat: SeatName::parse(name).expect("valid operator seat"),
+    }
 }
 
 fn worker_principal(wave: &str, role: &str) -> Principal {
@@ -539,7 +638,7 @@ fn parse_tool_result_json(res: &rex_wave_mcp::ToolResult) -> Value {
 #[tokio::test]
 async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_codemode() {
     let harness = TestHarness::new();
-    let seat_srv = McpServer::new(harness.client(seat_principal("sol")));
+    let seat_srv = McpServer::new(harness.client(seat_principal("sam")));
     let worker_srv = McpServer::new(harness.client(worker_principal("auth-v2", "verifier")));
     let op_srv = McpServer::new(harness.client(operator_principal("owner")));
 
@@ -547,23 +646,48 @@ async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_c
     let worker_tools: Vec<String> = worker_srv.tools().into_iter().map(|t| t.name).collect();
     let op_tools: Vec<String> = op_srv.tools().into_iter().map(|t| t.name).collect();
 
-    assert_eq!(seat_tools, worker_tools, "Seat and Worker share Member tool visibility");
+    assert_eq!(
+        seat_tools, worker_tools,
+        "Seat and Worker share Member tool visibility"
+    );
     assert!(seat_tools.contains(&RUN_CODE_TOOL.to_string()));
     assert!(seat_tools.contains(&"room_post".to_string()));
 
     for sys_tool in ["wave_observe", "inbox_raise", "mail_wake_bell"] {
-        assert!(!seat_tools.contains(&sys_tool.to_string()), "Seat must not list System tool {sys_tool}");
-        assert!(!op_tools.contains(&sys_tool.to_string()), "Operator must not list System tool {sys_tool}");
+        assert!(
+            !seat_tools.contains(&sys_tool.to_string()),
+            "Seat must not list System tool {sys_tool}"
+        );
+        assert!(
+            !op_tools.contains(&sys_tool.to_string()),
+            "Operator must not list System tool {sys_tool}"
+        );
     }
     for op_tool in ["wave_start", "wave_resolve"] {
-        assert!(!seat_tools.contains(&op_tool.to_string()), "Member must not list Operator tool {op_tool}");
-        assert!(op_tools.contains(&op_tool.to_string()), "Operator must list {op_tool}");
+        assert!(
+            !seat_tools.contains(&op_tool.to_string()),
+            "Member must not list Operator tool {op_tool}"
+        );
+        assert!(
+            op_tools.contains(&op_tool.to_string()),
+            "Operator must list {op_tool}"
+        );
     }
 
-    let seat_run_code_desc = &seat_srv.tools().into_iter().find(|t| t.name == RUN_CODE_TOOL).unwrap().description;
+    let seat_run_code_desc = &seat_srv
+        .tools()
+        .into_iter()
+        .find(|t| t.name == RUN_CODE_TOOL)
+        .unwrap()
+        .description;
     assert!(!seat_run_code_desc.contains("wave_start("));
     assert!(!seat_run_code_desc.contains("wave_observe("));
-    let op_run_code_desc = &op_srv.tools().into_iter().find(|t| t.name == RUN_CODE_TOOL).unwrap().description;
+    let op_run_code_desc = &op_srv
+        .tools()
+        .into_iter()
+        .find(|t| t.name == RUN_CODE_TOOL)
+        .unwrap()
+        .description;
     assert!(op_run_code_desc.contains("wave_start("));
     assert!(!op_run_code_desc.contains("wave_observe("));
 
@@ -582,11 +706,21 @@ async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_c
         }
     });
 
-    let seat_wave_start = seat_srv.call_tool("wave_start", wave_start_args.clone()).await;
-    assert!(seat_wave_start.is_error, "Member atomic wave_start must be denied");
+    let seat_wave_start = seat_srv
+        .call_tool("wave_start", wave_start_args.clone())
+        .await;
+    assert!(
+        seat_wave_start.is_error,
+        "Member atomic wave_start must be denied"
+    );
 
-    let op_wave_start = op_srv.call_tool("wave_start", wave_start_args.clone()).await;
-    assert!(!op_wave_start.is_error, "Operator atomic wave_start must succeed");
+    let op_wave_start = op_srv
+        .call_tool("wave_start", wave_start_args.clone())
+        .await;
+    assert!(
+        !op_wave_start.is_error,
+        "Operator atomic wave_start must succeed"
+    );
 
     let op_wave_observe = op_srv
         .call_tool(
@@ -598,7 +732,10 @@ async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_c
             }),
         )
         .await;
-    assert!(op_wave_observe.is_error, "System-only wave_observe must be denied even to Operator");
+    assert!(
+        op_wave_observe.is_error,
+        "System-only wave_observe must be denied even to Operator"
+    );
 
     let seat_code_probe = seat_srv
         .call_tool(
@@ -643,8 +780,8 @@ async fn audience_filtering_blocks_operator_and_system_tools_atomically_and_in_c
 #[tokio::test]
 async fn codemode_executes_multistep_host_composition_with_unforgeable_principal() {
     let harness = TestHarness::new();
-    let sol_client = harness.client(seat_principal("sol"));
-    let sol_srv = McpServer::new(sol_client);
+    let sam_client = harness.client(seat_principal("sam"));
+    let sam_srv = McpServer::new(sam_client);
 
     let script = r#"
         const me = rex.whoami();
@@ -655,7 +792,7 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
             patch: {
                 title: "Implement MCP server",
                 lane: "doing",
-                assignee: { assign: "to", who: "@sol" }
+                assignee: { assign: "to", who: "@sam" }
             }
         });
         await rex.card_upsert({
@@ -663,13 +800,13 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
             patch: {
                 title: "Build TUI inspector",
                 lane: "todo",
-                assignee: { assign: "to", who: "@astra" }
+                assignee: { assign: "to", who: "@alice" }
             }
         });
         const snap = await rex.board_view({ board });
         const mine = snap.lanes
             .flatMap(l => l.cards)
-            .filter(c => c.assignee === "@sol");
+            .filter(c => c.assignee === "@sam");
         for (const c of mine) {
             await rex.cardUpsert({
                 board,
@@ -682,8 +819,8 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
         await rex.roomEnsure({ room });
         const posted = await rex.room_post({
             room,
-            body: `@astra moved ${mine.length} card to review`,
-            from: { kind: "seat", seat: "astra" }
+            body: `@alice moved ${mine.length} card to review`,
+            from: { kind: "seat", seat: "alice" }
         });
         console.log("handoff_seq", posted.seq);
         return {
@@ -694,49 +831,74 @@ async fn codemode_executes_multistep_host_composition_with_unforgeable_principal
         };
     "#;
 
-    let res = sol_srv.call_tool(RUN_CODE_TOOL, json!({ "code": script })).await;
+    let res = sam_srv
+        .call_tool(RUN_CODE_TOOL, json!({ "code": script }))
+        .await;
     assert!(!res.is_error, "multi-step script failed: {:?}", res.content);
     let out = parse_tool_result_json(&res);
 
-    assert_eq!(out["value"]["caller"], json!({ "kind": "seat", "seat": "sol" }));
+    assert_eq!(
+        out["value"]["caller"],
+        json!({ "kind": "seat", "seat": "sam" })
+    );
     assert_eq!(out["value"]["movedCards"], json!([1]));
-    assert_eq!(out["value"]["mentioned"], json!([{ "kind": "seat", "seat": "astra" }]));
+    assert_eq!(
+        out["value"]["mentioned"],
+        json!([{ "kind": "seat", "seat": "alice" }])
+    );
     assert_eq!(out["logs"], json!(["handoff_seq 3"]));
     assert_eq!(out["calls"].as_array().unwrap().len(), 7);
 
     let room_stream = StreamId::Room {
         room: RoomId::Channel {
-            scope: RoomScope::Project { project: BbProjectId::parse("proj_1").unwrap() },
+            scope: RoomScope::Project {
+                project: BbProjectId::parse("proj_1").unwrap(),
+            },
             name: ChannelName::parse("wave-mcp").unwrap(),
         },
     };
-    let entries = harness.journal.read(&room_stream, Seq::ORIGIN, 10).expect("read journal");
+    let entries = harness
+        .journal
+        .read(&room_stream, Seq::ORIGIN, 10)
+        .expect("read journal");
     let last = entries.last().expect("posted entry");
-    assert_eq!(last.by, seat_principal("sol"), "principal must come from session, never from JS args");
+    assert_eq!(
+        last.by,
+        seat_principal("sam"),
+        "principal must come from session, never from JS args"
+    );
 }
 
 #[tokio::test]
 async fn codemode_supports_concurrent_promise_all_host_calls() {
     let harness = TestHarness::new();
-    let sol_client = harness.client(seat_principal("sol"));
-    let astra_client = harness.client(seat_principal("astra"));
+    let sam_client = harness.client(seat_principal("sam"));
+    let alice_client = harness.client(seat_principal("alice"));
 
     let room = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("coord").unwrap(),
     };
-    sol_client
-        .call(RoomEnsure { room: room.clone(), topic: None, origin: None })
+    sam_client
+        .call(RoomEnsure {
+            room: room.clone(),
+            topic: None,
+            origin: None,
+        })
         .await
         .unwrap();
-    astra_client
-        .call( rex_wave_api::room::RoomJoin { room: room.clone(), member: None, handle: None })
+    alice_client
+        .call(rex_wave_api::room::RoomJoin {
+            room: room.clone(),
+            member: None,
+            handle: None,
+        })
         .await
         .unwrap();
 
     let waiter = tokio::spawn(async move {
         run_code(
-            &astra_client,
+            &alice_client,
             r#"
                 const page = await rex.wait({
                     interest: { interest: "mentions" },
@@ -753,11 +915,11 @@ async fn codemode_supports_concurrent_promise_all_host_calls() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let poster_out = run_code(
-        &sol_client,
+        &sam_client,
         r#"
             const [p1, p2] = await Promise.all([
                 rex.room_post({ room: { ref: "channel", scope: { scope: "global" }, name: "coord" }, body: "progress note" }),
-                rex.room_post({ room: { ref: "channel", scope: { scope: "global" }, name: "coord" }, body: "@astra ready" })
+                rex.room_post({ room: { ref: "channel", scope: { scope: "global" }, name: "coord" }, body: "@alice ready" })
             ]);
             return [p1.seq, p2.seq];
         "#,
@@ -774,21 +936,25 @@ async fn codemode_supports_concurrent_promise_all_host_calls() {
 #[tokio::test]
 async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
     let fast_budget = Budget {
         deadline: Duration::from_millis(25),
         ..Budget::default()
     };
 
     let t0 = Instant::now();
-    let err = run_code(&sol, "while (true) {}", fast_budget.clone())
+    let err = run_code(&sam, "while (true) {}", fast_budget.clone())
         .await
         .expect_err("infinite loop must fail");
     assert_eq!(err, CodeError::Deadline(Duration::from_millis(25)));
-    assert!(t0.elapsed() < Duration::from_millis(500), "deadline took too long: {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "deadline took too long: {:?}",
+        t0.elapsed()
+    );
 
     let err_caught = run_code(
-        &sol,
+        &sam,
         r#"try { while (true) {} } catch (_) { return "swallowed"; }"#,
         fast_budget.clone(),
     )
@@ -796,10 +962,17 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     .expect_err("try/catch must not swallow C interrupt");
     assert_eq!(err_caught, CodeError::Deadline(Duration::from_millis(25)));
 
-    let err_microtask = run_code(&sol, "while (true) { await Promise.resolve(); }", fast_budget)
-        .await
-        .expect_err("infinite microtask loop must fail");
-    assert_eq!(err_microtask, CodeError::Deadline(Duration::from_millis(25)));
+    let err_microtask = run_code(
+        &sam,
+        "while (true) { await Promise.resolve(); }",
+        fast_budget,
+    )
+    .await
+    .expect_err("infinite microtask loop must fail");
+    assert_eq!(
+        err_microtask,
+        CodeError::Deadline(Duration::from_millis(25))
+    );
 
     let wait_budget = Budget {
         deadline: Duration::from_millis(40),
@@ -807,7 +980,7 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     };
     let t_wait = Instant::now();
     let err_wait = run_code(
-        &sol,
+        &sam,
         r#"
             return await rex.wait({
                 interest: { interest: "mentions" },
@@ -822,9 +995,12 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
     assert_eq!(err_wait, CodeError::Deadline(Duration::from_millis(40)));
     assert!(t_wait.elapsed() < Duration::from_millis(500));
 
-    let srv = McpServer::new(sol);
+    let srv = McpServer::new(sam);
     let clamped = srv
-        .call_tool(RUN_CODE_TOOL, json!({ "code": "return 7 * 6;", "timeout_ms": 999_999 }))
+        .call_tool(
+            RUN_CODE_TOOL,
+            json!({ "code": "return 7 * 6;", "timeout_ms": 999_999 }),
+        )
         .await;
     assert!(!clamped.is_error);
     assert_eq!(parse_tool_result_json(&clamped)["value"], json!(42));
@@ -833,10 +1009,10 @@ async fn codemode_interrupts_infinite_loops_and_cancels_slow_waits_at_deadline()
 #[tokio::test]
 async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let oom = run_code(
-        &sol,
+        &sam,
         "const buf = new Uint8Array(64 * 1024 * 1024); return buf.length;",
         Budget::default(),
     )
@@ -845,20 +1021,23 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     assert_eq!(oom, CodeError::OutOfMemory);
 
     let stack = run_code(
-        &sol,
+        &sam,
         "function recurse(n) { return 1 + recurse(n + 1); } return recurse(0);",
         Budget::default(),
     )
     .await
     .expect_err("unbounded recursion must hit 512 KiB stack cap");
-    assert!(matches!(stack, CodeError::Thrown(_)), "expected Thrown on stack overflow, got {stack:?}");
+    assert!(
+        matches!(stack, CodeError::Thrown(_)),
+        "expected Thrown on stack overflow, got {stack:?}"
+    );
 
     let call_cap = Budget {
         max_host_calls: 2,
         ..Budget::default()
     };
     let capped = run_code(
-        &sol,
+        &sam,
         r#"
             for (let i = 0; i < 5; i++) {
                 try { await rex.sidebar({}); } catch (_) {}
@@ -872,7 +1051,7 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
     assert_eq!(capped, CodeError::HostCallBudget);
 
     let log_flood = run_code(
-        &sol,
+        &sam,
         r#"
             const big = "x".repeat(16384);
             for (let i = 0; i < 600; i++) {
@@ -891,10 +1070,10 @@ async fn codemode_enforces_heap_cap_stack_cap_and_host_call_budget() {
 #[tokio::test]
 async fn codemode_has_zero_ambient_authority_frozen_rex_and_per_call_isolation() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let probe = run_code(
-        &sol,
+        &sam,
         r#"
             globalThis.leakedAcrossCalls = "secret";
             try { globalThis.rex = { hacked: true }; } catch (_) {}
@@ -940,24 +1119,29 @@ async fn codemode_has_zero_ambient_authority_frozen_rex_and_per_call_isolation()
         })
     );
 
-    let second = run_code(&sol, "return typeof globalThis.leakedAcrossCalls;", Budget::default())
-        .await
-        .expect("second isolated call");
+    let second = run_code(
+        &sam,
+        "return typeof globalThis.leakedAcrossCalls;",
+        Budget::default(),
+    )
+    .await
+    .expect("second isolated call");
     assert_eq!(second.value, json!("undefined"));
 }
 
 #[tokio::test]
 async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     let harness = TestHarness::new();
-    let sol_client = harness.client(seat_principal("sol"));
-    let astra_client = harness.client(seat_principal("astra"));
+    let sam_client = harness.client(seat_principal("sam"));
+    let alice_client = harness.client(seat_principal("alice"));
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (srv_r, srv_w) = tokio::io::split(server_io);
     let (cli_r, mut cli_w) = tokio::io::split(client_io);
     let mut cli_lines = BufReader::new(cli_r).lines();
 
-    let server_task = tokio::spawn(async move { McpServer::new(sol_client).serve_stream(srv_r, srv_w).await });
+    let server_task =
+        tokio::spawn(async move { McpServer::new(sam_client).serve_stream(srv_r, srv_w).await });
 
     async fn send_msg<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, val: Value) {
         let mut line = serde_json::to_vec(&val).unwrap();
@@ -966,7 +1150,9 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
         w.flush().await.unwrap();
     }
 
-    async fn recv_msg<R: tokio::io::AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines<R>) -> Value {
+    async fn recv_msg<R: tokio::io::AsyncBufRead + Unpin>(
+        lines: &mut tokio::io::Lines<R>,
+    ) -> Value {
         let line = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
             .await
             .expect("timed out waiting for MCP message")
@@ -992,7 +1178,10 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     let init_resp = recv_msg(&mut cli_lines).await;
     assert_eq!(init_resp["id"], 1);
     assert_eq!(init_resp["result"]["protocolVersion"], PROTOCOL_VERSION);
-    assert_eq!(init_resp["result"]["capabilities"]["resources"]["subscribe"], true);
+    assert_eq!(
+        init_resp["result"]["capabilities"]["resources"]["subscribe"],
+        true
+    );
 
     send_msg(
         &mut cli_w,
@@ -1002,20 +1191,41 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
         }),
     )
     .await;
-    send_msg(&mut cli_w, json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" })).await;
+    send_msg(
+        &mut cli_w,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }),
+    )
+    .await;
     let ping_resp = recv_msg(&mut cli_lines).await;
-    assert_eq!(ping_resp["id"], 2, "notifications/initialized must not emit a response before ping");
+    assert_eq!(
+        ping_resp["id"], 2,
+        "notifications/initialized must not emit a response before ping"
+    );
     assert_eq!(ping_resp["result"], json!({}));
 
-    send_msg(&mut cli_w, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).await;
+    send_msg(
+        &mut cli_w,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+    )
+    .await;
     let list_resp = recv_msg(&mut cli_lines).await;
-    let tools = list_resp["result"]["tools"].as_array().expect("tools array");
-    let run_code_entry = tools.iter().find(|t| t["name"] == RUN_CODE_TOOL).expect("run_code listed");
+    let tools = list_resp["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    let run_code_entry = tools
+        .iter()
+        .find(|t| t["name"] == RUN_CODE_TOOL)
+        .expect("run_code listed");
     assert_eq!(
         run_code_entry["inputSchema"]["properties"]["timeout_ms"]["maximum"],
         json!(MAX_RUN_CODE_TIMEOUT_MS)
     );
-    assert!(run_code_entry["description"].as_str().unwrap().contains("declare const rex: Readonly<{"));
+    assert!(
+        run_code_entry["description"]
+            .as_str()
+            .unwrap()
+            .contains("declare const rex: Readonly<{")
+    );
 
     send_msg(
         &mut cli_w,
@@ -1039,7 +1249,11 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    send_msg(&mut cli_w, json!({ "jsonrpc": "2.0", "id": 5, "method": "resources/list" })).await;
+    send_msg(
+        &mut cli_w,
+        json!({ "jsonrpc": "2.0", "id": 5, "method": "resources/list" }),
+    )
+    .await;
     let res_list = recv_msg(&mut cli_lines).await;
     let res_uris: Vec<&str> = res_list["result"]["resources"]
         .as_array()
@@ -1049,7 +1263,10 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
         .collect();
     let room_uri = "rex://room/project/proj_1/wave-mcp";
     assert!(res_uris.contains(&"rex://sidebar"));
-    assert!(res_uris.contains(&room_uri), "expected {room_uri} in {res_uris:?}");
+    assert!(
+        res_uris.contains(&room_uri),
+        "expected {room_uri} in {res_uris:?}"
+    );
 
     send_msg(
         &mut cli_w,
@@ -1075,18 +1292,20 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     .await;
     assert_eq!(recv_msg(&mut cli_lines).await["id"], 7);
 
-    astra_client
+    alice_client
         .call(RoomPost {
             room: RoomRef::Channel {
-                scope: RoomScope::Project { project: BbProjectId::parse("proj_1").unwrap() },
+                scope: RoomScope::Project {
+                    project: BbProjectId::parse("proj_1").unwrap(),
+                },
                 name: ChannelName::parse("wave-mcp").unwrap(),
             },
-            body: Body::parse("@sol live update arrived").unwrap(),
+            body: Body::parse("@sam live update arrived").unwrap(),
             reply_to: None,
             idem: None,
         })
         .await
-        .expect("astra post");
+        .expect("alice post");
 
     let n1 = recv_msg(&mut cli_lines).await;
     let n2 = recv_msg(&mut cli_lines).await;
@@ -1097,7 +1316,10 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
         n2["params"]["uri"].as_str().unwrap().to_owned(),
     ];
     updated_uris.sort();
-    assert_eq!(updated_uris, vec!["rex://room/project/proj_1/wave-mcp", "rex://sidebar"]);
+    assert_eq!(
+        updated_uris,
+        vec!["rex://room/project/proj_1/wave-mcp", "rex://sidebar"]
+    );
 
     send_msg(
         &mut cli_w,
@@ -1111,7 +1333,8 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     .await;
     let read_resp = recv_msg(&mut cli_lines).await;
     assert_eq!(read_resp["id"], 8);
-    let page_json: Value = serde_json::from_str(read_resp["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    let page_json: Value =
+        serde_json::from_str(read_resp["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(page_json["entries"].as_array().unwrap().len(), 3);
 
     send_msg(
@@ -1137,10 +1360,12 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
     .await;
     assert_eq!(recv_msg(&mut cli_lines).await["id"], 10);
 
-    astra_client
+    alice_client
         .call(RoomPost {
             room: RoomRef::Channel {
-                scope: RoomScope::Project { project: BbProjectId::parse("proj_1").unwrap() },
+                scope: RoomScope::Project {
+                    project: BbProjectId::parse("proj_1").unwrap(),
+                },
                 name: ChannelName::parse("wave-mcp").unwrap(),
             },
             body: Body::parse("after unsubscribe").unwrap(),
@@ -1148,28 +1373,39 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
             idem: None,
         })
         .await
-        .expect("second astra post");
+        .expect("second alice post");
 
-    send_msg(&mut cli_w, json!({ "jsonrpc": "2.0", "id": 11, "method": "ping" })).await;
+    send_msg(
+        &mut cli_w,
+        json!({ "jsonrpc": "2.0", "id": 11, "method": "ping" }),
+    )
+    .await;
     let after_unsub = recv_msg(&mut cli_lines).await;
-    assert_eq!(after_unsub["id"], 11, "unsubscribed resources must not emit notifications");
+    assert_eq!(
+        after_unsub["id"], 11,
+        "unsubscribed resources must not emit notifications"
+    );
 
     cli_w.shutdown().await.unwrap();
     drop(cli_w);
-    server_task.await.expect("server join").expect("clean server exit");
+    server_task
+        .await
+        .expect("server join")
+        .expect("clean server exit");
 }
 
 #[tokio::test]
 async fn mcp_supports_content_length_framing_and_loopback_http() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let (client_io, server_io) = tokio::io::duplex(16 * 1024);
     let (srv_r, srv_w) = tokio::io::split(server_io);
     let (mut cli_r, mut cli_w) = tokio::io::split(client_io);
 
-    let srv_cl = sol.clone();
-    let stream_task = tokio::spawn(async move { McpServer::new(srv_cl).serve_stream(srv_r, srv_w).await });
+    let srv_cl = sam.clone();
+    let stream_task =
+        tokio::spawn(async move { McpServer::new(srv_cl).serve_stream(srv_r, srv_w).await });
 
     let req_bytes = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -1191,19 +1427,25 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let mut raw_resp = Vec::new();
     cli_r.read_to_end(&mut raw_resp).await.unwrap();
     let raw_str = std::str::from_utf8(&raw_resp).unwrap();
-    let (hdr, body) = raw_str.split_once("\r\n\r\n").expect("Content-Length response header");
+    let (hdr, body) = raw_str
+        .split_once("\r\n\r\n")
+        .expect("Content-Length response header");
     assert!(hdr.starts_with("Content-Length: "));
     let resp_json: Value = serde_json::from_str(body).unwrap();
     assert_eq!(resp_json["id"], 77);
-    let code_res: Value = serde_json::from_str(resp_json["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(code_res["value"], json!("sol"));
+    let code_res: Value =
+        serde_json::from_str(resp_json["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(code_res["value"], json!("sam"));
     stream_task.await.unwrap().unwrap();
 
     let non_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    let bind_err = McpServer::new(sol.clone()).serve_http(non_loopback).await.unwrap_err();
+    let bind_err = McpServer::new(sam.clone())
+        .serve_http(non_loopback)
+        .await
+        .unwrap_err();
     assert_eq!(bind_err.kind(), std::io::ErrorKind::InvalidInput);
     let unspec_listener = TcpListener::bind(non_loopback).await.unwrap();
-    let listener_err = McpServer::new(sol.clone())
+    let listener_err = McpServer::new(sam.clone())
         .serve_http_listener(unspec_listener)
         .await
         .unwrap_err();
@@ -1214,8 +1456,8 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     let http_task = tokio::spawn(async move {
-        McpServer::new(sol)
-            .with_http_token("cap-sol-token")
+        McpServer::new(sam)
+            .with_http_token("cap-sam-token")
             .serve_http_listener(listener)
             .await
     });
@@ -1240,22 +1482,28 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
     let bad_origin = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
             body_bytes.len()
         ),
     )
     .await;
-    assert!(bad_origin.starts_with("HTTP/1.1 403 Forbidden\r\n"), "got: {bad_origin}");
+    assert!(
+        bad_origin.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "got: {bad_origin}"
+    );
 
     let bad_host = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
             body_bytes.len()
         ),
     )
     .await;
-    assert!(bad_host.starts_with("HTTP/1.1 403 Forbidden\r\n"), "got: {bad_host}");
+    assert!(
+        bad_host.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "got: {bad_host}"
+    );
 
     let missing_auth = raw_http(
         addr,
@@ -1265,28 +1513,37 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
         ),
     )
     .await;
-    assert!(missing_auth.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "got: {missing_auth}");
+    assert!(
+        missing_auth.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "got: {missing_auth}"
+    );
 
     let bad_ct = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body_str}",
             body_bytes.len()
         ),
     )
     .await;
-    assert!(bad_ct.starts_with("HTTP/1.1 415 Unsupported Media Type\r\n"), "got: {bad_ct}");
+    assert!(
+        bad_ct.starts_with("HTTP/1.1 415 Unsupported Media Type\r\n"),
+        "got: {bad_ct}"
+    );
 
     let http_str = raw_http(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://localhost:3000\r\nAuthorization: Bearer cap-sol-token\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body_str}",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://localhost:3000\r\nAuthorization: Bearer cap-sam-token\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body_str}",
             addr.port(),
             body_bytes.len()
         ),
     )
     .await;
-    assert!(http_str.starts_with("HTTP/1.1 200 OK\r\n"), "got: {http_str}");
+    assert!(
+        http_str.starts_with("HTTP/1.1 200 OK\r\n"),
+        "got: {http_str}"
+    );
     let (_, json_body) = http_str.split_once("\r\n\r\n").unwrap();
     let parsed_http: Value = serde_json::from_str(json_body).unwrap();
     assert_eq!(parsed_http["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -1297,14 +1554,15 @@ async fn mcp_supports_content_length_framing_and_loopback_http() {
 #[tokio::test]
 async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_completion() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
 
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let (srv_r, srv_w) = tokio::io::split(server_io);
     let (cli_r, mut cli_w) = tokio::io::split(client_io);
     let mut cli_lines = BufReader::new(cli_r).lines();
 
-    let server_task = tokio::spawn(async move { McpServer::new(sol).serve_stream(srv_r, srv_w).await });
+    let server_task =
+        tokio::spawn(async move { McpServer::new(sam).serve_stream(srv_r, srv_w).await });
 
     let slow_call = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -1360,7 +1618,10 @@ async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_compl
         .unwrap()
         .unwrap();
     let second_resp: Value = serde_json::from_str(&second_line).unwrap();
-    assert_eq!(second_resp["id"], 2, "partial frame must survive concurrent rpc_tasks completion: {second_resp}");
+    assert_eq!(
+        second_resp["id"], 2,
+        "partial frame must survive concurrent rpc_tasks completion: {second_resp}"
+    );
     assert_eq!(second_resp["result"]["isError"], false);
 
     cli_w.shutdown().await.unwrap();
@@ -1371,13 +1632,13 @@ async fn mcp_stream_reader_preserves_partial_frames_across_concurrent_tool_compl
 #[tokio::test]
 async fn resources_read_returns_latest_200_entries_for_long_rooms() {
     let harness = TestHarness::new();
-    let sol = harness.client(seat_principal("sol"));
+    let sam = harness.client(seat_principal("sam"));
     let room = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("busy").unwrap(),
     };
     for i in 1..=210u32 {
-        sol.call(RoomPost {
+        sam.call(RoomPost {
             room: room.clone(),
             body: Body::parse(format!("entry-{i}")).unwrap(),
             reply_to: None,
@@ -1392,7 +1653,8 @@ async fn resources_read_returns_latest_200_entries_for_long_rooms() {
     let (cli_r, mut cli_w) = tokio::io::split(client_io);
     let mut cli_lines = BufReader::new(cli_r).lines();
 
-    let server_task = tokio::spawn(async move { McpServer::new(sol).serve_stream(srv_r, srv_w).await });
+    let server_task =
+        tokio::spawn(async move { McpServer::new(sam).serve_stream(srv_r, srv_w).await });
 
     let req = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -1411,12 +1673,16 @@ async fn resources_read_returns_latest_200_entries_for_long_rooms() {
         .unwrap()
         .unwrap();
     let resp: Value = serde_json::from_str(&resp_line).unwrap();
-    let page: Value = serde_json::from_str(resp["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    let page: Value =
+        serde_json::from_str(resp["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
     let entries = page["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 200);
     assert_eq!(entries.first().unwrap()["seq"], json!(12));
     assert_eq!(entries.last().unwrap()["seq"], json!(211));
-    assert_eq!(entries.last().unwrap()["event"]["event"]["body"], json!("entry-210"));
+    assert_eq!(
+        entries.last().unwrap()["event"]["event"]["body"],
+        json!("entry-210")
+    );
 
     cli_w.shutdown().await.unwrap();
     drop(cli_w);

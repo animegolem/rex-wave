@@ -169,22 +169,32 @@ struct ToolSpec<'a> {
 }
 
 /// Run one script in a fresh isolated QuickJS runtime.
-pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Result<CodeOutcome, CodeError> {
+pub async fn run_code<C: Client>(
+    client: &C,
+    source: &str,
+    budget: Budget,
+) -> Result<CodeOutcome, CodeError> {
     let start = Instant::now();
     let deadline_std = start + budget.deadline;
     let deadline_tokio = tokio::time::Instant::now() + budget.deadline;
     let interrupted = Arc::new(AtomicBool::new(false));
 
     let rt = fresh_runtime(&budget, interrupted.clone(), deadline_std).await?;
-    let ctx = AsyncContext::full(&rt).await.map_err(|e| classify_rquickjs_err(e, &interrupted, deadline_std, budget.deadline))?;
+    let ctx = AsyncContext::full(&rt)
+        .await
+        .map_err(|e| classify_rquickjs_err(e, &interrupted, deadline_std, budget.deadline))?;
 
     let allowed = allowed_tools(client.me());
     let specs: Vec<ToolSpec<'_>> = allowed
         .iter()
-        .map(|t| ToolSpec { snake: t.name, camel: to_camel_case(t.name) })
+        .map(|t| ToolSpec {
+            snake: t.name,
+            camel: to_camel_case(t.name),
+        })
         .collect();
     let specs_json = serde_json::to_string(&specs).map_err(|e| CodeError::Thrown(e.to_string()))?;
-    let whoami_json = serde_json::to_string(client.me()).map_err(|e| CodeError::Thrown(e.to_string()))?;
+    let whoami_json =
+        serde_json::to_string(client.me()).map_err(|e| CodeError::Thrown(e.to_string()))?;
     let user_code = source.to_owned();
 
     let (call_tx, mut call_rx) = mpsc::unbounded_channel::<HostCallReq>();
@@ -195,18 +205,21 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
     let eval_fut = ctx.async_with(async move |ctx| {
         install_bindings(&ctx, call_tx, log_tx, &specs_json, &whoami_json, &user_code)
             .catch(&ctx)
-            .map_err(|e| classify_caught_error(&ctx, e, &interrupted_eval, deadline_std, budget_deadline))?;
+            .map_err(|e| {
+                classify_caught_error(&ctx, e, &interrupted_eval, deadline_std, budget_deadline)
+            })?;
 
-        let promise: Promise<'_> = ctx
-            .eval(BOOTSTRAP_JS.as_bytes())
-            .catch(&ctx)
-            .map_err(|e| classify_caught_error(&ctx, e, &interrupted_eval, deadline_std, budget_deadline))?;
+        let promise: Promise<'_> = ctx.eval(BOOTSTRAP_JS.as_bytes()).catch(&ctx).map_err(|e| {
+            classify_caught_error(&ctx, e, &interrupted_eval, deadline_std, budget_deadline)
+        })?;
 
         promise
             .into_future::<String>()
             .await
             .catch(&ctx)
-            .map_err(|e| classify_caught_error(&ctx, e, &interrupted_eval, deadline_std, budget_deadline))
+            .map_err(|e| {
+                classify_caught_error(&ctx, e, &interrupted_eval, deadline_std, budget_deadline)
+            })
     });
 
     let mut eval_pin = std::pin::pin!(eval_fut);
@@ -241,15 +254,24 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
                         principal: client.me().to_string(),
                         action: format!("call {}", req.tool),
                     };
-                    let _ = req.reply.send(encode_host_err(&denied.to_string(), Some(&denied)));
+                    let _ = req
+                        .reply
+                        .send(encode_host_err(&denied.to_string(), Some(&denied)));
                     continue;
                 };
 
                 let parsed_args: Value = match serde_json::from_str(&req.args_json) {
                     Ok(v) => v,
                     Err(e) => {
-                        calls.push(CallTrace { tool: meta.name, ok: false, micros: 0 });
-                        let _ = req.reply.send(encode_host_err(&format!("invalid tool arguments JSON: {e}"), None));
+                        calls.push(CallTrace {
+                            tool: meta.name,
+                            ok: false,
+                            micros: 0,
+                        });
+                        let _ = req.reply.send(encode_host_err(
+                            &format!("invalid tool arguments JSON: {e}"),
+                            None,
+                        ));
                         continue;
                     }
                 };
@@ -257,7 +279,11 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
                 let cmd = match parse_wire_command(meta, parsed_args) {
                     Ok(c) => c,
                     Err(msg) => {
-                        calls.push(CallTrace { tool: meta.name, ok: false, micros: 0 });
+                        calls.push(CallTrace {
+                            tool: meta.name,
+                            ok: false,
+                            micros: 0,
+                        });
                         let _ = req.reply.send(encode_host_err(&msg, None));
                         continue;
                     }
@@ -280,16 +306,28 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
                     let payload = match res {
                         Ok(wire_reply) => match unwrap_wire_reply(finished.tool, wire_reply) {
                             Ok(val) => {
-                                calls.push(CallTrace { tool: finished.tool, ok: true, micros });
+                                calls.push(CallTrace {
+                                    tool: finished.tool,
+                                    ok: true,
+                                    micros,
+                                });
                                 encode_host_ok(&val)
                             }
                             Err(err) => {
-                                calls.push(CallTrace { tool: finished.tool, ok: false, micros });
+                                calls.push(CallTrace {
+                                    tool: finished.tool,
+                                    ok: false,
+                                    micros,
+                                });
                                 encode_host_err(&err.to_string(), Some(&err))
                             }
                         },
                         Err(err) => {
-                            calls.push(CallTrace { tool: finished.tool, ok: false, micros });
+                            calls.push(CallTrace {
+                                tool: finished.tool,
+                                ok: false,
+                                micros,
+                            });
                             encode_host_err(&err.to_string(), Some(&err))
                         }
                     };
@@ -315,7 +353,8 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
     rt.set_interrupt_handler(None).await;
 
     let raw_json = outcome_json?;
-    let value: Value = serde_json::from_str(&raw_json).map_err(|e| CodeError::Thrown(format!("invalid return JSON: {e}")))?;
+    let value: Value = serde_json::from_str(&raw_json)
+        .map_err(|e| CodeError::Thrown(format!("invalid return JSON: {e}")))?;
 
     let mut logs = Vec::new();
     while let Ok(line) = log_rx.try_recv() {
@@ -325,7 +364,11 @@ pub async fn run_code<C: Client>(client: &C, source: &str, budget: Budget) -> Re
     Ok(CodeOutcome { value, logs, calls })
 }
 
-async fn fresh_runtime(budget: &Budget, interrupted: Arc<AtomicBool>, deadline: Instant) -> Result<AsyncRuntime, CodeError> {
+async fn fresh_runtime(
+    budget: &Budget,
+    interrupted: Arc<AtomicBool>,
+    deadline: Instant,
+) -> Result<AsyncRuntime, CodeError> {
     let rt = AsyncRuntime::new().map_err(|e| CodeError::Thrown(e.to_string()))?;
     rt.set_memory_limit(budget.heap_bytes).await;
     rt.set_max_stack_size(budget.stack_bytes).await;
@@ -352,7 +395,14 @@ fn install_bindings<'js>(
             let tx = call_tx.clone();
             async move {
                 let (reply, rx) = oneshot::channel();
-                if tx.send(HostCallReq { tool, args_json, reply }).is_err() {
+                if tx
+                    .send(HostCallReq {
+                        tool,
+                        args_json,
+                        reply,
+                    })
+                    .is_err()
+                {
                     return Err(rquickjs::Error::Exception);
                 }
                 rx.await.map_err(|_| rquickjs::Error::Exception)
@@ -382,7 +432,8 @@ fn install_bindings<'js>(
 }
 
 fn encode_host_ok(value: &Value) -> String {
-    serde_json::to_string(&json!({ "ok": true, "value": value })).unwrap_or_else(|_| r#"{"ok":true,"value":null}"#.into())
+    serde_json::to_string(&json!({ "ok": true, "value": value }))
+        .unwrap_or_else(|_| r#"{"ok":true,"value":null}"#.into())
 }
 
 fn encode_host_err(message: &str, api_err: Option<&ApiError>) -> String {
@@ -409,7 +460,12 @@ fn api_error_json(err: &ApiError) -> Value {
     }
 }
 
-fn classify_rquickjs_err(err: rquickjs::Error, interrupted: &AtomicBool, deadline_at: Instant, deadline: Duration) -> CodeError {
+fn classify_rquickjs_err(
+    err: rquickjs::Error,
+    interrupted: &AtomicBool,
+    deadline_at: Instant,
+    deadline: Duration,
+) -> CodeError {
     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline_at {
         return CodeError::Deadline(deadline);
     }
@@ -444,7 +500,12 @@ fn classify_caught_error<'js>(
             let text = val
                 .as_string()
                 .and_then(|s| s.to_string().ok())
-                .or_else(|| ctx.json_stringify(val.clone()).ok().flatten().and_then(|s| s.to_string().ok()))
+                .or_else(|| {
+                    ctx.json_stringify(val.clone())
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.to_string().ok())
+                })
                 .unwrap_or_else(|| format!("{val:?}"));
             classify_message(&text, deadline)
         }

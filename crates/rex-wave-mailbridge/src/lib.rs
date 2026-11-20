@@ -36,7 +36,9 @@ fn sandbox_registry() -> &'static RwLock<Vec<PathBuf>> {
 }
 
 fn register_sandbox_root(path: &Path) {
-    let mut guard = sandbox_registry().write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = sandbox_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     if !guard.iter().any(|p| p == path) {
         guard.push(path.to_path_buf());
     }
@@ -66,11 +68,16 @@ fn read_bell_prompt_from_root(root: &Path, digest16: &str) -> Option<String> {
     let path = regular_file_without_symlinks(root, &["state", "bells", &fname])?;
     let raw = fs::read_to_string(&path).ok()?;
     let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    val.get("prompt").and_then(|v| v.as_str()).map(str::to_owned)
+    val.get("prompt")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 fn read_bell_prompt_any_sandbox(digest16: &str) -> Option<String> {
-    let roots = sandbox_registry().read().unwrap_or_else(|e| e.into_inner()).clone();
+    let roots = sandbox_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     for root in roots.iter().rev() {
         if let Some(prompt) = read_bell_prompt_from_root(root, digest16) {
             return Some(prompt);
@@ -81,8 +88,10 @@ fn read_bell_prompt_any_sandbox(digest16: &str) -> Option<String> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("{0} is (or is under) a production mail root")]
+    #[error("{0} is, contains, or is under a protected folder")]
     Production(PathBuf),
+    #[error("protected roots: {0}")]
+    Config(String),
     #[error("{0} lacks the .rex-wave-sandbox marker")]
     Unmarked(PathBuf),
     #[error("io: {0}")]
@@ -92,13 +101,144 @@ pub enum SandboxError {
 #[derive(Clone, Debug)]
 pub struct SandboxRoot {
     root: PathBuf,
+    policy: Policy,
+}
+
+/// The most entries, folders and names together, one deployment may protect.
+pub const MAX_PROTECTED_ROOTS: usize = 64;
+
+/// What a sandbox may never touch on this machine, as a deployment lists it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Protection {
+    /// Absolute folders. A sandbox may not be one, contain one, or sit inside one.
+    pub roots: Vec<PathBuf>,
+    /// Folder names refused anywhere in a sandbox path.
+    pub names: Vec<String>,
+}
+
+/// A `Protection` resolved once against the filesystem and the home folder,
+/// so every later check sees the same answer.
+#[derive(Clone, Debug)]
+struct Policy {
+    roots: Vec<PathBuf>,
+    names: Vec<String>,
+    homes: Vec<PathBuf>,
+}
+
+/// The most symlinks followed while resolving one protected folder.
+const MAX_LINK_HOPS: usize = 40;
+
+/// Resolve every symlink on the way to `path`, component by component, the
+/// way the filesystem would, including links whose targets do not exist yet.
+/// Components that do not exist are kept as written. A folder whose real
+/// location cannot be established is an error, never a guess.
+fn resolve_links(path: &Path) -> Result<PathBuf, SandboxError> {
+    let unresolved = |at: &Path, why: &dyn std::fmt::Display| {
+        SandboxError::Config(format!("cannot resolve `{}`: {why}", at.display()))
+    };
+    let mut out = PathBuf::new();
+    let mut pending: Vec<std::ffi::OsString> = Vec::new();
+    for comp in path.components().rev() {
+        pending.push(comp.as_os_str().to_owned());
+    }
+    let mut hops = 0;
+    while let Some(seg) = pending.pop() {
+        match Path::new(&seg).components().next() {
+            Some(Component::Prefix(_) | Component::RootDir) => {
+                out.push(&seg);
+                continue;
+            }
+            Some(Component::CurDir) | None => continue,
+            Some(Component::ParentDir) => {
+                out.pop();
+                continue;
+            }
+            Some(Component::Normal(_)) => {}
+        }
+        let next = out.join(&seg);
+        match fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(unresolved(path, &"too many symlinks"));
+                }
+                let target = fs::read_link(&next).map_err(|e| unresolved(&next, &e))?;
+                if target.is_absolute() {
+                    out = PathBuf::new();
+                }
+                for comp in target.components().rev() {
+                    pending.push(comp.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => out = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
+            Err(e) => return Err(unresolved(&next, &e)),
+        }
+    }
+    Ok(out)
+}
+
+/// A protected folder must be absolute and free of `..`, because removing
+/// `..` by spelling can name a different folder than the filesystem would.
+fn checked_root(path: &Path) -> Result<PathBuf, SandboxError> {
+    if !path.is_absolute() {
+        return Err(SandboxError::Config(format!(
+            "`{}` is not an absolute path",
+            path.display()
+        )));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(SandboxError::Config(format!(
+            "`{}` contains `..`",
+            path.display()
+        )));
+    }
+    lexical_normalize(path)
+}
+
+fn checked_name(name: &str) -> Result<String, SandboxError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(SandboxError::Config(format!(
+            "`{name}` is not a single folder name"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+impl Policy {
+    fn resolve(protection: &Protection) -> Result<Self, SandboxError> {
+        if protection.roots.len() + protection.names.len() > MAX_PROTECTED_ROOTS {
+            return Err(SandboxError::Config(format!(
+                "more than {MAX_PROTECTED_ROOTS} protected entries"
+            )));
+        }
+        // Hold each folder under both its given and its resolved name, so a
+        // symlinked location cannot be used to step around it.
+        let mut roots = BTreeSet::new();
+        for root in &protection.roots {
+            let given = checked_root(root)?;
+            roots.insert(resolve_links(&given)?);
+            roots.insert(given);
+        }
+        let mut names = BTreeSet::new();
+        for name in &protection.names {
+            names.insert(checked_name(name)?);
+        }
+        Ok(Policy {
+            roots: roots.into_iter().collect(),
+            names: names.into_iter().collect(),
+            homes: home_dirs().into_iter().collect(),
+        })
+    }
 }
 
 fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().map_err(|e| SandboxError::Io(e.to_string()))?.join(path)
+        std::env::current_dir()
+            .map_err(|e| SandboxError::Io(e.to_string()))?
+            .join(path)
     };
     let mut out = PathBuf::new();
     for comp in abs.components() {
@@ -115,7 +255,7 @@ fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
     Ok(out)
 }
 
-fn forbidden_prod_roots() -> Vec<PathBuf> {
+fn home_dirs() -> BTreeSet<PathBuf> {
     let mut homes = BTreeSet::new();
     if let Some(h) = std::env::var_os("HOME") {
         let hp = PathBuf::from(h);
@@ -128,40 +268,150 @@ fn forbidden_prod_roots() -> Vec<PathBuf> {
             }
         }
     }
-
-    let mut roots = BTreeSet::new();
-    for home in homes {
-        for rel in [
-            "agent-folder/interchange",
-            ".local/state/carrier",
-            "agent-folder/resident_memories",
-        ] {
-            let p = home.join(rel);
-            if let Ok(lex) = lexical_normalize(&p) {
-                roots.insert(lex);
-            }
-        }
-    }
-    roots.into_iter().collect()
+    homes
 }
 
-fn check_not_production(candidate: &Path, reported: &Path, forbidden: &[PathBuf]) -> Result<(), SandboxError> {
-    if candidate.components().any(|c| c.as_os_str() == "resident_memories") {
-        return Err(SandboxError::Production(reported.to_path_buf()));
+/// Parse a protected-roots file, one entry per line. Blank lines and lines
+/// starting with `#` are skipped. `name: <folder name>` refuses that name
+/// anywhere in a sandbox path. Every other line is a folder: an absolute
+/// path, or one starting with `~/` for `home`, and never containing `..`.
+pub fn parse_protected_roots(text: &str, home: Option<&Path>) -> Result<Protection, SandboxError> {
+    let mut roots = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at_line = |e: SandboxError| match e {
+            SandboxError::Config(detail) => {
+                SandboxError::Config(format!("line {}: {detail}", index + 1))
+            }
+            other => other,
+        };
+        if let Some(name) = line.strip_prefix("name:") {
+            names.insert(checked_name(name.trim()).map_err(at_line)?);
+        } else {
+            let path = match line.strip_prefix("~/") {
+                Some(rest) => home
+                    .ok_or_else(|| {
+                        SandboxError::Config(format!(
+                            "line {}: `~/` needs HOME to be set",
+                            index + 1
+                        ))
+                    })?
+                    .join(rest),
+                None => PathBuf::from(line),
+            };
+            roots.insert(checked_root(&path).map_err(at_line)?);
+        }
+        if roots.len() + names.len() > MAX_PROTECTED_ROOTS {
+            return Err(SandboxError::Config(format!(
+                "more than {MAX_PROTECTED_ROOTS} protected entries"
+            )));
+        }
     }
-    for prod in forbidden {
+    Ok(Protection {
+        roots: roots.into_iter().collect(),
+        names: names.into_iter().collect(),
+    })
+}
+
+/// Where a deployment lists what it protects: `rex-wave/protected-roots`
+/// under `xdg_config_home`, or under `home/.config`. A relative
+/// `xdg_config_home` is ignored, as the XDG specification requires.
+pub fn protected_roots_file(
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, SandboxError> {
+    let base = match (xdg_config_home, home) {
+        (Some(dir), _) if dir.is_absolute() => dir.to_path_buf(),
+        (_, Some(home)) if home.is_absolute() => home.join(".config"),
+        _ => {
+            return Err(SandboxError::Config(
+                "cannot locate the protected-roots file: set HOME or XDG_CONFIG_HOME to an absolute path".into(),
+            ));
+        }
+    };
+    Ok(base.join("rex-wave").join("protected-roots"))
+}
+
+/// Read a protected-roots file. A file that is missing, unreadable or
+/// malformed is an error and never an empty list: running with nothing
+/// protected takes an explicit, empty file.
+pub fn load_protected_roots_from(
+    file: &Path,
+    home: Option<&Path>,
+) -> Result<Protection, SandboxError> {
+    let text = fs::read_to_string(file).map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+            " (create it; it may be empty if there is nothing to protect)"
+        } else {
+            ""
+        };
+        SandboxError::Config(format!("{}: {e}{hint}", file.display()))
+    })?;
+    parse_protected_roots(&text, home)
+        .map_err(|e| SandboxError::Config(format!("{}: {e}", file.display())))
+}
+
+/// Read this deployment's protected-roots file, located from the environment.
+pub fn load_protected_roots() -> Result<Protection, SandboxError> {
+    let env_path = |key: &str| {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = env_path("HOME");
+    let file = protected_roots_file(env_path("XDG_CONFIG_HOME").as_deref(), home.as_deref())?;
+    load_protected_roots_from(&file, home.as_deref())
+}
+
+fn check_not_production(
+    candidate: &Path,
+    reported: &Path,
+    policy: &Policy,
+) -> Result<(), SandboxError> {
+    let refused = || Err(SandboxError::Production(reported.to_path_buf()));
+    // The filesystem root and the home folder are never a sandbox.
+    if candidate.parent().is_none() || policy.homes.iter().any(|home| home.starts_with(candidate)) {
+        return refused();
+    }
+    if candidate.components().any(|c| {
+        policy
+            .names
+            .iter()
+            .any(|name| c.as_os_str() == name.as_str())
+    }) {
+        return refused();
+    }
+    for prod in &policy.roots {
         if candidate.starts_with(prod) || prod.starts_with(candidate) {
-            return Err(SandboxError::Production(reported.to_path_buf()));
+            return refused();
         }
     }
     Ok(())
 }
 
 impl SandboxRoot {
+    /// Verify `path` against what this deployment's protected-roots file lists.
     pub fn verify(path: &Path) -> Result<Self, SandboxError> {
-        let forbidden = forbidden_prod_roots();
+        Self::verify_with(path, &load_protected_roots()?)
+    }
+
+    /// Verify `path` against an explicit `Protection`.
+    pub fn verify_with(path: &Path, protection: &Protection) -> Result<Self, SandboxError> {
+        let forbidden = Policy::resolve(protection)?;
         let lex = lexical_normalize(path)?;
         check_not_production(&lex, path, &forbidden)?;
+
+        // Judge a symlink by where it points, so the verdict is the same
+        // whether or not its target exists on this machine.
+        if let Ok(target) = fs::read_link(path) {
+            let base = lex.parent().unwrap_or(Path::new("/"));
+            let pointed = lexical_normalize(&base.join(target))?;
+            check_not_production(&pointed, path, &forbidden)?;
+        }
 
         let mut ancestor = lex.as_path();
         while let Some(parent) = ancestor.parent() {
@@ -181,12 +431,18 @@ impl SandboxRoot {
 
         let meta = fs::metadata(&canon).map_err(|e| SandboxError::Io(e.to_string()))?;
         if !meta.is_dir() {
-            return Err(SandboxError::Io(format!("{} is not a directory", canon.display())));
+            return Err(SandboxError::Io(format!(
+                "{} is not a directory",
+                canon.display()
+            )));
         }
 
         let marker = canon.join(MARKER_FILE);
         match fs::symlink_metadata(&marker) {
-            Ok(m) if m.file_type().is_file() => Ok(SandboxRoot { root: canon }),
+            Ok(m) if m.file_type().is_file() => Ok(SandboxRoot {
+                root: canon,
+                policy: forbidden,
+            }),
             _ => Err(SandboxError::Unmarked(canon)),
         }
     }
@@ -196,10 +452,15 @@ impl SandboxRoot {
     }
 
     fn ensure_dir(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
-        let forbidden = forbidden_prod_roots();
+        let forbidden = &self.policy;
         let mut cur = self.root.clone();
         for &seg in segments {
-            if seg.is_empty() || seg == "." || seg == ".." || seg.contains('/') || seg.contains('\\') {
+            if seg.is_empty()
+                || seg == "."
+                || seg == ".."
+                || seg.contains('/')
+                || seg.contains('\\')
+            {
                 return Err(ApiError::Invalid(InvalidId {
                     what: "sandbox directory".into(),
                     reason: "invalid directory segment".into(),
@@ -220,14 +481,17 @@ impl SandboxRoot {
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&cur)
-                        .map_err(|ce| ApiError::Internal(format!("mkdir {}: {ce}", cur.display())))?;
+                    fs::create_dir(&cur).map_err(|ce| {
+                        ApiError::Internal(format!("mkdir {}: {ce}", cur.display()))
+                    })?;
                 }
                 Err(e) => return Err(ApiError::Internal(format!("stat {}: {e}", cur.display()))),
             }
             let canon = fs::canonicalize(&cur)
                 .map_err(|e| ApiError::Internal(format!("canonicalize {}: {e}", cur.display())))?;
-            if check_not_production(&canon, &cur, &forbidden).is_err() || !canon.starts_with(&self.root) {
+            if check_not_production(&canon, &cur, forbidden).is_err()
+                || !canon.starts_with(&self.root)
+            {
                 return Err(ApiError::Denied {
                     principal: "mailbridge".into(),
                     action: format!("escape sandbox via {}", cur.display()),
@@ -239,19 +503,18 @@ impl SandboxRoot {
     }
 
     fn confine(&self, raw: &Path) -> Result<(PathBuf, String, bool), SandboxError> {
-        if raw.as_os_str().is_empty()
-            || raw.components().any(|c| matches!(c, Component::ParentDir))
+        if raw.as_os_str().is_empty() || raw.components().any(|c| matches!(c, Component::ParentDir))
         {
             return Err(SandboxError::Io("invalid path outside sandbox".into()));
         }
-        let forbidden = forbidden_prod_roots();
+        let forbidden = &self.policy;
         let joined = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
             self.root.join(raw)
         };
         let lex = lexical_normalize(&joined)?;
-        check_not_production(&lex, raw, &forbidden)?;
+        check_not_production(&lex, raw, forbidden)?;
         if !lex.starts_with(&self.root) || lex == self.root {
             return Err(SandboxError::Production(raw.to_path_buf()));
         }
@@ -270,7 +533,7 @@ impl SandboxRoot {
 
         match fs::canonicalize(&lex) {
             Ok(canon) => {
-                check_not_production(&canon, raw, &forbidden)?;
+                check_not_production(&canon, raw, forbidden)?;
                 if !canon.starts_with(&self.root) || canon == self.root {
                     return Err(SandboxError::Production(raw.to_path_buf()));
                 }
@@ -285,7 +548,7 @@ impl SandboxRoot {
                         return Err(SandboxError::Production(raw.to_path_buf()));
                     }
                     if let Some(fname) = lex.file_name() {
-                        check_not_production(&canon_parent.join(fname), raw, &forbidden)?;
+                        check_not_production(&canon_parent.join(fname), raw, forbidden)?;
                     }
                 }
                 let rel = relative_slash(&self.root, &lex)?;
@@ -304,7 +567,9 @@ fn relative_slash(root: &Path, target: &Path) -> Result<String, SandboxError> {
     for comp in stripped.components() {
         match comp {
             Component::Normal(seg) => {
-                let s = seg.to_str().ok_or_else(|| SandboxError::Io("non-utf8 path".into()))?;
+                let s = seg
+                    .to_str()
+                    .ok_or_else(|| SandboxError::Io("non-utf8 path".into()))?;
                 parts.push(s);
             }
             _ => return Err(SandboxError::Io("unexpected path component".into())),
@@ -363,7 +628,9 @@ fn is_valid_address_segment(seg: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 40
         && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        && bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 fn is_valid_address(s: &str) -> bool {
@@ -382,7 +649,9 @@ fn is_valid_token(s: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 64
         && bytes[0].is_ascii_alphanumeric()
-        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn is_valid_kind(s: &str) -> bool {
@@ -390,7 +659,9 @@ fn is_valid_kind(s: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 24
         && bytes[0].is_ascii_lowercase()
-        && bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
 fn is_valid_bell_from(s: &str) -> bool {
@@ -403,7 +674,9 @@ fn is_valid_box(s: &str) -> bool {
     };
     !rest.is_empty()
         && rest.len() <= 40
-        && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn is_valid_md_file(s: &str) -> bool {
@@ -414,7 +687,9 @@ fn is_valid_md_file(s: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 116
         && bytes[0].is_ascii_alphanumeric()
-        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn is_valid_ts(s: &str) -> bool {
@@ -426,9 +701,9 @@ fn is_valid_ts(s: &str) -> bool {
         && b[13] == b':'
         && b[16] == b':'
         && b[19] == b'Z'
-        && b.iter().enumerate().all(|(i, c)| {
-            matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit()
-        })
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit())
 }
 
 pub fn bell_meta(wake: &WakeRecord) -> BTreeMap<String, String> {
@@ -441,12 +716,20 @@ pub fn bell_meta(wake: &WakeRecord) -> BTreeMap<String, String> {
     meta.insert("event".into(), event.into());
     meta.insert(
         "ts".into(),
-        if is_valid_ts(&wake.ts) { wake.ts.clone() } else { "1970-01-01T00:00:00Z".into() },
+        if is_valid_ts(&wake.ts) {
+            wake.ts.clone()
+        } else {
+            "1970-01-01T00:00:00Z".into()
+        },
     );
 
     if matches!(event, "letter" | "changed") {
         if wake.wake_id.0.len() == 16
-            && wake.wake_id.0.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && wake
+                .wake_id
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
             meta.insert("wake_id".into(), wake.wake_id.0.clone());
         }
@@ -456,7 +739,11 @@ pub fn bell_meta(wake: &WakeRecord) -> BTreeMap<String, String> {
         let from_tok = wake.item.from.to_ascii_lowercase();
         meta.insert(
             "from".into(),
-            if is_valid_bell_from(&from_tok) { from_tok } else { "?".into() },
+            if is_valid_bell_from(&from_tok) {
+                from_tok
+            } else {
+                "?".into()
+            },
         );
 
         let path_str = wake.item.reference.path.to_string_lossy();
@@ -469,7 +756,10 @@ pub fn bell_meta(wake: &WakeRecord) -> BTreeMap<String, String> {
                 meta.insert("file".into(), file_part.to_owned());
             }
         }
-        meta.insert("sha16".into(), wake.item.reference.sha256.as_str()[..16].to_owned());
+        meta.insert(
+            "sha16".into(),
+            wake.item.reference.sha256.as_str()[..16].to_owned(),
+        );
         meta.insert(
             "topic".into(),
             match &wake.item.topic {
@@ -559,8 +849,14 @@ fn sanitize_topic_for_file(raw: &str) -> String {
 
 fn room_provenance(room: &room::RoomId) -> String {
     match room {
-        room::RoomId::Channel { scope: room::RoomScope::Global, name } => format!("#{name}"),
-        room::RoomId::Channel { scope: room::RoomScope::Project { project }, name } => format!("#{project}/{name}"),
+        room::RoomId::Channel {
+            scope: room::RoomScope::Global,
+            name,
+        } => format!("#{name}"),
+        room::RoomId::Channel {
+            scope: room::RoomScope::Project { project },
+            name,
+        } => format!("#{project}/{name}"),
         room::RoomId::Direct { pair } => {
             let (a, b): (Principal, Principal) = pair.clone().into();
             format!("dm:{a}<->{b}")
@@ -600,7 +896,11 @@ pub fn render_letter(req: &MailPromote, by: &Principal, entries: &[Envelope]) ->
     out.push_str(&format!("round: {round}\n"));
     out.push_str(&format!("priority: {}\n", priority_word(req.priority)));
     out.push_str(&format!("room: {}\n", yaml_quote(&room_label)));
-    out.push_str(&format!("range: [{}, {}]\n", req.range.first().0, req.range.last().0));
+    out.push_str(&format!(
+        "range: [{}, {}]\n",
+        req.range.first().0,
+        req.range.last().0
+    ));
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n\n", subject_clean.trim()));
     out.push_str(&format!(
@@ -613,7 +913,9 @@ pub fn render_letter(req: &MailPromote, by: &Principal, entries: &[Envelope]) ->
         if let Event::Room(room::RoomEvent::Posted { body, reply_to, .. }) = &env.event {
             out.push('\n');
             match reply_to {
-                Some(r) => out.push_str(&format!("> **[#{} -> #{}] {}**:\n", env.seq.0, r.0, env.by)),
+                Some(r) => {
+                    out.push_str(&format!("> **[#{} -> #{}] {}**:\n", env.seq.0, r.0, env.by))
+                }
                 None => out.push_str(&format!("> **[#{}] {}**:\n", env.seq.0, env.by)),
             }
             for line in body.as_str().lines() {
@@ -726,8 +1028,14 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
     out
 }
 
-fn is_acked_in_sandbox(root: &SandboxRoot, to_seat: &str, rel_path: &str, sha256: &Sha256Hex) -> bool {
-    let Some(acks_path) = regular_file_without_symlinks(root.path(), &["state", "acks.jsonl"]) else {
+fn is_acked_in_sandbox(
+    root: &SandboxRoot,
+    to_seat: &str,
+    rel_path: &str,
+    sha256: &Sha256Hex,
+) -> bool {
+    let Some(acks_path) = regular_file_without_symlinks(root.path(), &["state", "acks.jsonl"])
+    else {
         return false;
     };
     let Ok(contents) = fs::read_to_string(&acks_path) else {
@@ -747,7 +1055,12 @@ fn is_acked_in_sandbox(root: &SandboxRoot, to_seat: &str, rel_path: &str, sha256
     false
 }
 
-fn ack_row_matches(val: &serde_json::Value, to_seat: &str, rel_path: &str, sha256: &Sha256Hex) -> bool {
+fn ack_row_matches(
+    val: &serde_json::Value,
+    to_seat: &str,
+    rel_path: &str,
+    sha256: &Sha256Hex,
+) -> bool {
     let path_ok = val.get("path").and_then(|v| v.as_str()) == Some(rel_path);
     if !path_ok {
         return false;
@@ -815,7 +1128,9 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
     let topic = fm.topic.filter(|t| is_valid_token(t));
     let round = fm.round.filter(|&r| r <= 9_999);
     let label = match (fm.priority.as_deref(), fm.subject.as_deref()) {
-        (Some("blocking"), Some(subj)) if !subj.is_empty() => Some(truncate_label(&format!("[blocking] {subj}"), 160)),
+        (Some("blocking"), Some(subj)) if !subj.is_empty() => {
+            Some(truncate_label(&format!("[blocking] {subj}"), 160))
+        }
         (Some("blocking"), _) => Some("[blocking]".into()),
         (_, Some(subj)) if !subj.is_empty() => Some(truncate_label(subj, 160)),
         _ => None,
@@ -831,7 +1146,7 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         ts,
         ts_basis,
         reference: MailRef {
-            store: "interchange".into(),
+            store: "letters".into(),
             path: PathBuf::from(&rel_path),
             sha256,
         },
@@ -843,7 +1158,8 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
 
 fn fsync_dir(dir: &Path) -> Result<(), String> {
     let f = File::open(dir).map_err(|e| format!("open dir {}: {e}", dir.display()))?;
-    f.sync_all().map_err(|e| format!("fsync dir {}: {e}", dir.display()))
+    f.sync_all()
+        .map_err(|e| format!("fsync dir {}: {e}", dir.display()))
 }
 
 fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, ApiError> {
@@ -856,12 +1172,16 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
             });
         }
         Ok(_) => {
-            let existing = fs::read(&dest).map_err(|e| ApiError::Internal(format!("read {}: {e}", dest.display())))?;
+            let existing = fs::read(&dest)
+                .map_err(|e| ApiError::Internal(format!("read {}: {e}", dest.display())))?;
             if existing == bytes {
                 return Ok(dest);
             }
             return Err(ApiError::Conflict {
-                detail: format!("canon file {} already exists with different bytes (BoxMonotone)", dest.display()),
+                detail: format!(
+                    "canon file {} already exists with different bytes (BoxMonotone)",
+                    dest.display()
+                ),
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -876,8 +1196,10 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
             .create_new(true)
             .open(&tmp)
             .map_err(|e| format!("create temp {}: {e}", tmp.display()))?;
-        f.write_all(bytes).map_err(|e| format!("write temp {}: {e}", tmp.display()))?;
-        f.sync_all().map_err(|e| format!("fsync temp {}: {e}", tmp.display()))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write temp {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync temp {}: {e}", tmp.display()))?;
         Ok(())
     })();
 
@@ -901,12 +1223,16 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
                     action: format!("write through symlink {}", dest.display()),
                 });
             }
-            let existing = fs::read(&dest).map_err(|re| ApiError::Internal(format!("read {}: {re}", dest.display())))?;
+            let existing = fs::read(&dest)
+                .map_err(|re| ApiError::Internal(format!("read {}: {re}", dest.display())))?;
             if existing == bytes {
                 Ok(dest)
             } else {
                 Err(ApiError::Conflict {
-                    detail: format!("canon file {} already exists with different bytes (BoxMonotone)", dest.display()),
+                    detail: format!(
+                        "canon file {} already exists with different bytes (BoxMonotone)",
+                        dest.display()
+                    ),
                 })
             }
         }
@@ -1013,7 +1339,10 @@ impl MailBridge {
                 reason: "must be non-empty without control characters".into(),
             }));
         }
-        if !is_valid_token(req.topic.trim()) || req.topic.trim().starts_with('.') || req.topic.trim().starts_with('-') {
+        if !is_valid_token(req.topic.trim())
+            || req.topic.trim().starts_with('.')
+            || req.topic.trim().starts_with('-')
+        {
             return Err(ApiError::Invalid(InvalidId {
                 what: "topic".into(),
                 reason: "must be a safe token ([A-Za-z0-9._-], 1..=64 chars)".into(),
@@ -1028,12 +1357,18 @@ impl MailBridge {
             }));
         }
 
-        let room_stream = StreamId::Room { room: req.room.clone() };
+        let room_stream = StreamId::Room {
+            room: req.room.clone(),
+        };
         can_read(&ctx.by, &room_stream)?;
 
         let entries: Vec<Envelope> = self
             .reader
-            .read(&room_stream, Seq(req.range.first().0 - 1), span_u64 as usize)
+            .read(
+                &room_stream,
+                Seq(req.range.first().0 - 1),
+                span_u64 as usize,
+            )
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .into_iter()
             .filter(|e| e.seq <= req.range.last())
@@ -1111,7 +1446,10 @@ impl MailBridge {
         drop(st);
         self.publish_fresh(&appended);
 
-        Ok(banked_letters.into_iter().next().expect("non-empty recipients"))
+        Ok(banked_letters
+            .into_iter()
+            .next()
+            .expect("non-empty recipients"))
     }
 
     async fn ack(&self, req: MailAck, ctx: DecideCtx) -> Result<Ack, ApiError> {
@@ -1134,7 +1472,9 @@ impl MailBridge {
             .and_then(|(first, _)| first.strip_prefix("to-"));
 
         let acker_seat = match (&ctx.by, box_seat) {
-            (Principal::Seat { seat }, Some(target)) if seat.as_str() == target => seat.as_str().to_owned(),
+            (Principal::Seat { seat }, Some(target)) if seat.as_str() == target => {
+                seat.as_str().to_owned()
+            }
             (Principal::Seat { .. } | Principal::Worker { .. }, Some(target)) => {
                 return Err(ApiError::Denied {
                     principal: ctx.by.to_string(),
@@ -1153,11 +1493,14 @@ impl MailBridge {
                 });
             }
             (Principal::System { .. }, Some(target)) => target.to_owned(),
-            (Principal::Operator { seat } | Principal::Seat { seat }, None) => seat.as_str().to_owned(),
+            (Principal::Operator { seat } | Principal::Seat { seat }, None) => {
+                seat.as_str().to_owned()
+            }
             _ => principal_mail_address(&ctx.by),
         };
 
-        let bytes = fs::read(&abs_path).map_err(|e| ApiError::Internal(format!("read {rel_path}: {e}")))?;
+        let bytes =
+            fs::read(&abs_path).map_err(|e| ApiError::Internal(format!("read {rel_path}: {e}")))?;
         let on_disk_sha = sha256_bytes(&bytes);
         if on_disk_sha != req.sha256 {
             return Err(ApiError::Conflict {
@@ -1197,10 +1540,13 @@ impl MailBridge {
                 .append(true)
                 .open(&acks_file)
                 .map_err(|e| ApiError::Internal(format!("open acks.jsonl: {e}")))?;
-            let mut line = serde_json::to_vec(&ack_json).map_err(|e| ApiError::Internal(e.to_string()))?;
+            let mut line =
+                serde_json::to_vec(&ack_json).map_err(|e| ApiError::Internal(e.to_string()))?;
             line.push(b'\n');
-            f.write_all(&line).map_err(|e| ApiError::Internal(format!("append acks.jsonl: {e}")))?;
-            f.sync_all().map_err(|e| ApiError::Internal(format!("fsync acks.jsonl: {e}")))?;
+            f.write_all(&line)
+                .map_err(|e| ApiError::Internal(format!("append acks.jsonl: {e}")))?;
+            f.sync_all()
+                .map_err(|e| ApiError::Internal(format!("fsync acks.jsonl: {e}")))?;
             fsync_dir(&state_dir).map_err(ApiError::Internal)?;
         }
 
@@ -1249,12 +1595,17 @@ impl MailBridge {
             "seat": req.seat.as_str(),
             "prompt": body.as_str(),
         });
-        let mut bell_bytes = serde_json::to_vec_pretty(&bell_doc)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let mut bell_bytes =
+            serde_json::to_vec_pretty(&bell_doc).map_err(|e| ApiError::Internal(e.to_string()))?;
         bell_bytes.push(b'\n');
 
         let mut st = self.state.lock().await;
-        if st.writer.lookup(&idem).map_err(|e| ApiError::Internal(e.to_string()))?.is_some() {
+        if st
+            .writer
+            .lookup(&idem)
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .is_some()
+        {
             return Ok(Ack);
         }
 
@@ -1282,13 +1633,20 @@ impl MailBridge {
     }
 
     pub async fn rescan(&self) -> Result<u32, ApiError> {
-        let entries = fs::read_dir(self.root.path()).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let entries =
+            fs::read_dir(self.root.path()).map_err(|e| ApiError::Internal(e.to_string()))?;
         let mut boxes = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else { continue };
-            let Some(seat_raw) = name_str.strip_prefix("to-") else { continue };
-            let Ok(seat) = SeatName::parse(seat_raw) else { continue };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Some(seat_raw) = name_str.strip_prefix("to-") else {
+                continue;
+            };
+            let Ok(seat) = SeatName::parse(seat_raw) else {
+                continue;
+            };
             if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 boxes.push((seat, name_str.to_owned(), entry.path()));
             }
@@ -1296,14 +1654,20 @@ impl MailBridge {
         boxes.sort_by(|a, b| a.1.cmp(&b.1));
 
         let mut projected_count = 0u32;
-        let by = Principal::System { part: SystemPart::MailBridge };
+        let by = Principal::System {
+            part: SystemPart::MailBridge,
+        };
 
         for (seat, box_name, box_path) in boxes {
-            let Ok(files) = fs::read_dir(&box_path) else { continue };
+            let Ok(files) = fs::read_dir(&box_path) else {
+                continue;
+            };
             let mut md_files = Vec::new();
             for f in files.flatten() {
                 let fname = f.file_name();
-                let Some(fname_str) = fname.to_str() else { continue };
+                let Some(fname_str) = fname.to_str() else {
+                    continue;
+                };
                 if fname_str.starts_with('.') || !fname_str.ends_with(".md") {
                     continue;
                 }
@@ -1322,7 +1686,11 @@ impl MailBridge {
 
                 let mut st = self.state.lock().await;
                 if st.seen_wakes.contains(&wid)
-                    || st.writer.lookup(&idem).map_err(|e| ApiError::Internal(e.to_string()))?.is_some()
+                    || st
+                        .writer
+                        .lookup(&idem)
+                        .map_err(|e| ApiError::Internal(e.to_string()))?
+                        .is_some()
                 {
                     st.seen_wakes.insert(wid);
                     continue;
@@ -1334,7 +1702,12 @@ impl MailBridge {
                 );
                 let appended = st
                     .writer
-                    .append(&by, at, Some(&idem), vec![Event::Mail(MailEvent::Projected { item })])
+                    .append(
+                        &by,
+                        at,
+                        Some(&idem),
+                        vec![Event::Mail(MailEvent::Projected { item })],
+                    )
                     .map_err(|e| ApiError::Internal(e.to_string()))?;
                 st.seen_wakes.insert(wid);
                 drop(st);
@@ -1349,12 +1722,20 @@ impl MailBridge {
 }
 
 impl Service<MailCommand> for MailBridge {
-    fn dispatch(&self, cmd: MailCommand, ctx: DecideCtx) -> BoxFut<'_, Result<WireReply, ApiError>> {
+    fn dispatch(
+        &self,
+        cmd: MailCommand,
+        ctx: DecideCtx,
+    ) -> BoxFut<'_, Result<WireReply, ApiError>> {
         Box::pin(async move {
             match cmd {
-                MailCommand::MailPromote(req) => Ok(WireReply::MailPromote(self.promote(req, ctx).await?)),
+                MailCommand::MailPromote(req) => {
+                    Ok(WireReply::MailPromote(self.promote(req, ctx).await?))
+                }
                 MailCommand::MailAck(a) => Ok(WireReply::MailAck(self.ack(a, ctx).await?)),
-                MailCommand::MailWakeBell(b) => Ok(WireReply::MailWakeBell(self.wake_bell(b, ctx).await?)),
+                MailCommand::MailWakeBell(b) => {
+                    Ok(WireReply::MailWakeBell(self.wake_bell(b, ctx).await?))
+                }
             }
         })
     }
@@ -1363,7 +1744,10 @@ impl Service<MailCommand> for MailBridge {
 fn is_loopback_host(raw: &str) -> bool {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("[::1]") {
-        return rest.is_empty() || rest.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok());
+        return rest.is_empty()
+            || rest
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok());
     }
     let host = match trimmed.rsplit_once(':') {
         Some((h, port)) if port.parse::<u16>().is_ok() => h,
@@ -1372,7 +1756,10 @@ fn is_loopback_host(raw: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
 }
 
-pub async fn serve_wake_bell_sink<C: Client + 'static>(addr: SocketAddr, client: C) -> std::io::Result<()> {
+pub async fn serve_wake_bell_sink<C: Client + 'static>(
+    addr: SocketAddr,
+    client: C,
+) -> std::io::Result<()> {
     if !addr.ip().is_loopback() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1400,7 +1787,10 @@ pub async fn serve_wake_bell_sink<C: Client + 'static>(addr: SocketAddr, client:
     Ok(())
 }
 
-async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> std::io::Result<()> {
+async fn handle_wake_bell_conn<C: Client>(
+    mut stream: TcpStream,
+    client: &C,
+) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let header_end = loop {
@@ -1479,7 +1869,9 @@ async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> 
     let body_offset = header_end + 4;
     while buf.len() < body_offset + content_length {
         let need = (body_offset + content_length - buf.len()).min(chunk.len());
-        let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk[..need])).await {
+        let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk[..need]))
+            .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
@@ -1521,19 +1913,20 @@ async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> 
         return Ok(());
     }
 
-    let payload: MailWakeBell = match serde_json::from_slice(&buf[body_offset..body_offset + content_length]) {
-        Ok(p) => p,
-        Err(e) => {
-            write_http_json(
+    let payload: MailWakeBell =
+        match serde_json::from_slice(&buf[body_offset..body_offset + content_length]) {
+            Ok(p) => p,
+            Err(e) => {
+                write_http_json(
                 &mut stream,
                 400,
                 "Bad Request",
                 &serde_json::json!({"ok": false, "code": "invalid_json", "detail": e.to_string()}),
             )
             .await?;
-            return Ok(());
-        }
-    };
+                return Ok(());
+            }
+        };
 
     match client.call(payload).await {
         Ok(Ack) => {
@@ -1552,7 +1945,12 @@ async fn handle_wake_bell_conn<C: Client>(mut stream: TcpStream, client: &C) -> 
     Ok(())
 }
 
-async fn write_http_json(stream: &mut TcpStream, status: u16, reason: &str, body: &serde_json::Value) -> std::io::Result<()> {
+async fn write_http_json(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &serde_json::Value,
+) -> std::io::Result<()> {
     let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1577,7 +1975,9 @@ async fn deliver_bell_dm(
     let body = room::Body::parse(prompt)?;
     client
         .call(room::RoomPost {
-            room: room::RoomRef::Dm { with: Principal::Seat { seat } },
+            room: room::RoomRef::Dm {
+                with: Principal::Seat { seat },
+            },
             body,
             reply_to: None,
             idem: Some(idem),
@@ -1592,10 +1992,16 @@ impl Reactor for BellCourier {
     const NAME: &'static str = "bell-courier";
 
     fn interest(&self) -> Interest {
-        Interest::Streams { streams: vec![StreamId::Mail] }
+        Interest::Streams {
+            streams: vec![StreamId::Mail],
+        }
     }
 
-    fn react(&mut self, frame: Frame, client: &LocalClient) -> impl Future<Output = Result<(), ApiError>> + Send {
+    fn react(
+        &mut self,
+        frame: Frame,
+        client: &LocalClient,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
         let client = client.clone();
         async move {
             match frame {

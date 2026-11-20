@@ -2,14 +2,15 @@
 //! thread pages. None of these mutate.
 
 use crate::board::BoardId;
-use crate::id::{BbProjectId, BbSeq, BbThreadId, ModelId, Principal, ProviderId, RoleName, Seq, UnixMs, WaveSlug};
+use crate::id::{
+    BbProjectId, BbSeq, BbThreadId, ModelId, Principal, ProviderId, RoleName, Seq, UnixMs, WaveSlug,
+};
 use crate::room::{RoomId, RoomRef};
 use crate::stage::Osc7501Status;
 use crate::stream::{Cursor, Envelope, Interest, StreamId};
 use crate::wave::{Activity, PendingInteraction, WorkerPhase};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Read {
@@ -37,9 +38,19 @@ impl Wait {
     pub fn room(room: RoomId, since: Seq, mentions_only: bool) -> Self {
         let stream = StreamId::Room { room: room.clone() };
         if mentions_only {
-            Wait { interest: Interest::Mentions, after: Cursor::live().with(stream, since), timeout_ms: None }
+            Wait {
+                interest: Interest::Mentions,
+                after: Cursor::live().with(stream, since),
+                timeout_ms: None,
+            }
         } else {
-            Wait { interest: Interest::Room { room: RoomRef::Id { id: room } }, after: Cursor::default().with(stream, since), timeout_ms: None }
+            Wait {
+                interest: Interest::Room {
+                    room: RoomRef::Id { id: room },
+                },
+                after: Cursor::default().with(stream, since),
+                timeout_ms: None,
+            }
         }
     }
 }
@@ -56,7 +67,6 @@ pub struct ThreadPage {
     #[serde(default)]
     pub limit: Option<u32>,
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Page {
@@ -157,14 +167,29 @@ pub struct AgentEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEventKind {
-    UserMessage { text: String },
-    AssistantText { text: String },
-    ToolCall { name: String, summary: String },
-    ToolResult { name: String, ok: bool, summary: String },
+    UserMessage {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        name: String,
+        ok: bool,
+        summary: String,
+    },
     TurnStarted,
     TurnEnded,
-    Usage { usage: ThreadContextUsage },
-    Other { bb_type: String },
+    Usage {
+        usage: ThreadContextUsage,
+    },
+    Other {
+        bb_type: String,
+    },
 }
 
 /// Mirrors BB `ThreadContextResponse.usage` (SDK 0.6.132) without its HTTP DTOs.

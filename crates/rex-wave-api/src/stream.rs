@@ -9,23 +9,33 @@ use crate::id::{BbProjectId, Principal, RoleName, Seq, UnixMs, WaveSlug};
 use crate::mail::MailEvent;
 use crate::notify::InboxEvent;
 use crate::read::{AgentEvent, SidebarTreeSnapshot};
-use crate::stage::{FocusGeneration, StageTarget};
 use crate::room::{RoomEvent, RoomId, RoomRef};
+use crate::stage::{FocusGeneration, StageTarget};
 use crate::wave::WaveEvent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The identity of one single-writer log. Also the actor address.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(tag = "stream", rename_all = "snake_case")]
 pub enum StreamId {
-    Room { room: RoomId },
-    Wave { wave: WaveSlug },
-    Board { board: BoardId },
+    Room {
+        room: RoomId,
+    },
+    Wave {
+        wave: WaveSlug,
+    },
+    Board {
+        board: BoardId,
+    },
     /// One inbox per principal: notifications + read cursors. The only owner
     /// of "what has X seen", so unread = room head (room) - cursor (inbox),
     /// merged at the read boundary (per separate-before-serializing-shared-state).
-    Inbox { owner: Principal },
+    Inbox {
+        owner: Principal,
+    },
     /// The mail bridge's promotion / ack ledger (sandbox only).
     Mail,
 }
@@ -109,7 +119,10 @@ pub struct Cursor {
 impl Cursor {
     /// Start from now: only frames committed after subscription.
     pub fn live() -> Self {
-        Cursor { positions: Vec::new(), from_head: true }
+        Cursor {
+            positions: Vec::new(),
+            from_head: true,
+        }
     }
     pub fn from_head(&self) -> bool {
         self.from_head
@@ -123,7 +136,11 @@ impl Cursor {
         self
     }
     pub fn at(&self, stream: &StreamId) -> Seq {
-        self.positions.iter().find(|(s, _)| s == stream).map(|(_, q)| *q).unwrap_or(Seq::ORIGIN)
+        self.positions
+            .iter()
+            .find(|(s, _)| s == stream)
+            .map(|(_, q)| *q)
+            .unwrap_or(Seq::ORIGIN)
     }
     /// Advance monotonically (never moves backwards; idempotent on replays).
     pub fn advance(&mut self, stream: &StreamId, seq: Seq) {
@@ -144,11 +161,21 @@ pub enum Frame {
     /// Catch-up finished; everything after this is live.
     CaughtUp { cursor: Cursor },
     /// A BB-owned agent event (for `Interest::Agent`).
-    Agent { wave: WaveSlug, role: RoleName, event: AgentEvent },
+    Agent {
+        wave: WaveSlug,
+        role: RoleName,
+        event: AgentEvent,
+    },
     /// The current sidebar tree (`Interest::Sidebar`).
     Sidebar(Box<SidebarTreeSnapshot>),
     /// First frame of a stage watch: the generation every later frame carries.
-    StageFocused { generation: FocusGeneration, target: StageTarget },
+    StageFocused {
+        generation: FocusGeneration,
+        target: StageTarget,
+    },
     /// A frame of the stage watch with `generation`. Never nests.
-    Stage { generation: FocusGeneration, inner: Box<Frame> },
+    Stage {
+        generation: FocusGeneration,
+        inner: Box<Frame>,
+    },
 }

@@ -37,10 +37,10 @@ Ensure refresh tokens rotate atomically.
 :PROPERTIES:
 :ID: 3
 :REV: 2
-:ASSIGNEE: @sol
+:ASSIGNEE: @sam
 :END:
 
-* WAIT [#C] Cross-model Sol review :review:
+* WAIT [#C] Cross-model Sam review :review:
 :PROPERTIES:
 :ID: 4
 :REV: 1
@@ -74,7 +74,10 @@ Waiting on BB review thread.
         doc.tasks[0].properties,
         vec![
             ("EFFORT".to_owned(), "2h".to_owned()),
-            ("OWNER_NOTE".to_owned(), "keep this exact custom value".to_owned()),
+            (
+                "OWNER_NOTE".to_owned(),
+                "keep this exact custom value".to_owned()
+            ),
             ("EMPTY_CUSTOM".to_owned(), String::new()),
         ]
     );
@@ -101,7 +104,10 @@ Waiting on BB review thread.
     assert_eq!(doc.tasks[5].canonical_lane(), Some(Lane::Done));
 
     let rendered = render_document(&doc);
-    assert_eq!(rendered, canonical, "parse -> render is byte-identical on canonical org docs");
+    assert_eq!(
+        rendered, canonical,
+        "parse -> render is byte-identical on canonical org docs"
+    );
 
     let reparsed = parse_document(&rendered).expect("reparse succeeds");
     assert_eq!(reparsed, doc);
@@ -121,7 +127,7 @@ fn board_snapshot_render_and_parse_round_trip_without_loss() {
                     revision: CardRevision(3),
                     title: Title::parse("Handle UTF-8 café & colons: 1:2").unwrap(),
                     lane: Lane::Todo.lane_name(),
-                    assignee: Some(Assignee::parse("@sol").unwrap()),
+                    assignee: Some(Assignee::parse("@sam").unwrap()),
                     priority: Priority::Blocking,
                     due_ms: Some(1_800_000_000_000),
                     labels: vec!["utf8-café".into(), "space tag".into(), "colon:tag".into()],
@@ -171,11 +177,19 @@ fn board_snapshot_render_and_parse_round_trip_without_loss() {
 
     let org_text = render(&snapshot);
     let parsed_cards = parse(&org_text).expect("snapshot org parses cleanly");
-    let expected_cards: Vec<Card> = snapshot.lanes.iter().flat_map(|l| l.cards.clone()).collect();
+    let expected_cards: Vec<Card> = snapshot
+        .lanes
+        .iter()
+        .flat_map(|l| l.cards.clone())
+        .collect();
     assert_eq!(parsed_cards, expected_cards);
 
     let ast = parse_document(&org_text).unwrap();
-    assert_eq!(render_document(&ast), org_text, "render -> parse -> render is byte-identical");
+    assert_eq!(
+        render_document(&ast),
+        org_text,
+        "render -> parse -> render is byte-identical"
+    );
 }
 
 #[test]
@@ -190,7 +204,11 @@ fn hand_written_org_without_ids_assigns_non_colliding_card_numbers() {
 ";
     let cards = parse(hand_written).unwrap();
     assert_eq!(cards.len(), 2);
-    assert_eq!(cards[0].no, CardNo(2), "synthetic id avoids colliding with explicit :ID: 1");
+    assert_eq!(
+        cards[0].no,
+        CardNo(2),
+        "synthetic id avoids colliding with explicit :ID: 1"
+    );
     assert_eq!(cards[0].revision, CardRevision(1));
     assert_eq!(cards[1].no, CardNo(1));
     assert_eq!(cards[1].revision, CardRevision(5));
@@ -198,22 +216,53 @@ fn hand_written_org_without_ids_assigns_non_colliding_card_numbers() {
 
 #[test]
 fn malformed_headings_and_properties_report_accurate_line_errors() {
-    assert!(matches!(parse_document("*"), Err(OrgError::Heading { line: 1, .. })));
-    assert!(matches!(parse_document("* TODO"), Err(OrgError::Heading { line: 1, .. })));
-    assert!(matches!(parse_document("* [#A] Missing keyword"), Err(OrgError::Heading { line: 1, .. })));
-    assert!(matches!(parse_document("* todo Lowercase keyword"), Err(OrgError::Heading { line: 1, .. })));
-    assert!(matches!(parse_document("* TODO [#Z] Bad cookie"), Err(OrgError::Heading { line: 1, .. })));
-    assert!(matches!(parse_document("* TODO :onlytags:"), Err(OrgError::Heading { line: 1, .. })));
+    assert!(matches!(
+        parse_document("*"),
+        Err(OrgError::Heading { line: 1, .. })
+    ));
+    assert!(matches!(
+        parse_document("* TODO"),
+        Err(OrgError::Heading { line: 1, .. })
+    ));
+    assert!(matches!(
+        parse_document("* [#A] Missing keyword"),
+        Err(OrgError::Heading { line: 1, .. })
+    ));
+    assert!(matches!(
+        parse_document("* todo Lowercase keyword"),
+        Err(OrgError::Heading { line: 1, .. })
+    ));
+    assert!(matches!(
+        parse_document("* TODO [#Z] Bad cookie"),
+        Err(OrgError::Heading { line: 1, .. })
+    ));
+    assert!(matches!(
+        parse_document("* TODO :onlytags:"),
+        Err(OrgError::Heading { line: 1, .. })
+    ));
 
     let unclosed = "* TODO Task\n:PROPERTIES:\n:ID: 1\n* DONE Next\n";
-    assert!(matches!(parse_document(unclosed), Err(OrgError::Property { line: 2, .. })));
+    assert!(matches!(
+        parse_document(unclosed),
+        Err(OrgError::Property { line: 2, .. })
+    ));
 
-    let dup_id = "* TODO One\n:PROPERTIES:\n:ID: 7\n:END:\n\n* DONE Two\n:PROPERTIES:\n:ID: 7\n:END:\n";
-    assert!(matches!(parse_document(dup_id), Err(OrgError::Property { line: 8, .. })));
+    let dup_id =
+        "* TODO One\n:PROPERTIES:\n:ID: 7\n:END:\n\n* DONE Two\n:PROPERTIES:\n:ID: 7\n:END:\n";
+    assert!(matches!(
+        parse_document(dup_id),
+        Err(OrgError::Property { line: 8, .. })
+    ));
 
     let bad_rev = "* TODO One\n:PROPERTIES:\n:REV: nope\n:END:\n";
-    assert!(matches!(parse_document(bad_rev), Err(OrgError::Property { line: 3, .. })));
+    assert!(matches!(
+        parse_document(bad_rev),
+        Err(OrgError::Property { line: 3, .. })
+    ));
 
     let bad_link = "* TODO One\n:PROPERTIES:\n:LINKS: rex://\n:END:\n";
-    assert!(matches!(parse_document(bad_link), Err(OrgError::Property { line: 3, .. })));
+    assert!(matches!(
+        parse_document(bad_link),
+        Err(OrgError::Property { line: 3, .. })
+    ));
 }

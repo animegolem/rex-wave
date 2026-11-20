@@ -41,7 +41,16 @@ pub struct RoomMessage {
 fn extract_messages(entries: &[Envelope]) -> Vec<RoomMessage> {
     let mut out = Vec::new();
     for env in entries {
-        if let (StreamId::Room { room }, Event::Room(RoomEvent::Posted { body, mentions, reply_to, .. })) = (&env.stream, &env.event) {
+        if let (
+            StreamId::Room { room },
+            Event::Room(RoomEvent::Posted {
+                body,
+                mentions,
+                reply_to,
+                ..
+            }),
+        ) = (&env.stream, &env.event)
+        {
             out.push(RoomMessage {
                 room: room.clone(),
                 seq: env.seq,
@@ -74,7 +83,13 @@ pub async fn room_history<C: Client>(
             break;
         }
         let batch = remaining.clamp(64, 1000) as u32;
-        let page = client.call(Read { stream: stream.clone(), after: cursor, limit: Some(batch) }).await?;
+        let page = client
+            .call(Read {
+                stream: stream.clone(),
+                after: cursor,
+                limit: Some(batch),
+            })
+            .await?;
         let Some(last) = page.entries.last() else {
             break;
         };
@@ -156,7 +171,10 @@ pub fn resolve_mentions(body: &Body, members: &BTreeMap<Handle, Principal>) -> M
         }
     }
 
-    Mentions { principals: resolved.into_iter().collect(), all }
+    Mentions {
+        principals: resolved.into_iter().collect(),
+        all,
+    }
 }
 
 fn system_slug(part: SystemPart) -> &'static str {
@@ -174,7 +192,11 @@ fn sanitize_handle_prefix(raw: &str, max_len: usize) -> String {
         .bytes()
         .map(|b| {
             let lower = b.to_ascii_lowercase();
-            if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == b'-' || lower == b'_' {
+            if lower.is_ascii_lowercase()
+                || lower.is_ascii_digit()
+                || lower == b'-'
+                || lower == b'_'
+            {
                 lower as char
             } else {
                 '_'
@@ -231,11 +253,18 @@ fn ensure_dm_access(pair: &PrincipalPair, by: &Principal) -> Result<(), ApiError
     if pair.contains(by) || matches!(by, Principal::Operator { .. } | Principal::System { .. }) {
         Ok(())
     } else {
-        Err(ApiError::Denied { principal: by.to_string(), action: "access direct message room".into() })
+        Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: "access direct message room".into(),
+        })
     }
 }
 
-fn ensure_wave_name_policy(id: &RoomId, origin: &RoomOrigin, by: &Principal) -> Result<(), ApiError> {
+fn ensure_wave_name_policy(
+    id: &RoomId,
+    origin: &RoomOrigin,
+    by: &Principal,
+) -> Result<(), ApiError> {
     if let RoomId::Channel { name, .. } = id
         && name.as_str().starts_with("wave-")
         && !matches!(origin, RoomOrigin::Wave { .. })
@@ -248,8 +277,17 @@ fn ensure_wave_name_policy(id: &RoomId, origin: &RoomOrigin, by: &Principal) -> 
     Ok(())
 }
 
-fn open_dm_events(id: RoomId, pair: &PrincipalPair, topic: Option<String>, members: &mut BTreeMap<Handle, Principal>) -> Result<Vec<RoomEvent>, ApiError> {
-    let mut events = vec![RoomEvent::Opened { id, origin: RoomOrigin::Manual, topic }];
+fn open_dm_events(
+    id: RoomId,
+    pair: &PrincipalPair,
+    topic: Option<String>,
+    members: &mut BTreeMap<Handle, Principal>,
+) -> Result<Vec<RoomEvent>, ApiError> {
+    let mut events = vec![RoomEvent::Opened {
+        id,
+        origin: RoomOrigin::Manual,
+        topic,
+    }];
     let (a, b): (Principal, Principal) = pair.clone().into();
     for member in [a, b] {
         if !members.values().any(|p| p == &member) {
@@ -273,7 +311,9 @@ impl Decider for Rooms {
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
         };
-        Ok(StreamId::Room { room: r.resolve(&ctx.by)? })
+        Ok(StreamId::Room {
+            room: r.resolve(&ctx.by)?,
+        })
     }
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
@@ -283,13 +323,24 @@ impl Decider for Rooms {
         }
     }
 
-    fn decide(state: &RoomState, cmd: &RoomCommand, ctx: &DecideCtx) -> Result<Vec<RoomEvent>, ApiError> {
+    fn decide(
+        state: &RoomState,
+        cmd: &RoomCommand,
+        ctx: &DecideCtx,
+    ) -> Result<Vec<RoomEvent>, ApiError> {
         match cmd {
             RoomCommand::RoomEnsure(c) => {
                 let id = c.room.resolve(&ctx.by)?;
                 if matches!(c.origin, Some(RoomOrigin::Wave { .. })) {
-                    if ctx.by != (Principal::System { part: SystemPart::WaveConductor }) {
-                        return Err(ApiError::Denied { principal: ctx.by.to_string(), action: "create wave room".into() });
+                    if ctx.by
+                        != (Principal::System {
+                            part: SystemPart::WaveConductor,
+                        })
+                    {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by.to_string(),
+                            action: "create wave room".into(),
+                        });
                     }
                     if matches!(id, RoomId::Direct { .. }) {
                         return Err(ApiError::Invalid(InvalidId {
@@ -306,26 +357,39 @@ impl Decider for Rooms {
                     if let Some(req_origin) = &c.origin
                         && req_origin != existing_origin
                     {
-                        return Err(ApiError::Conflict { detail: format!("room origin already fixed as {existing_origin:?}") });
+                        return Err(ApiError::Conflict {
+                            detail: format!("room origin already fixed as {existing_origin:?}"),
+                        });
                     }
                     if let Some(topic) = &c.topic
                         && state.topic.as_ref() != Some(topic)
                     {
-                        return Ok(vec![RoomEvent::TopicSet { topic: topic.clone() }]);
+                        return Ok(vec![RoomEvent::TopicSet {
+                            topic: topic.clone(),
+                        }]);
                     }
                     return Ok(vec![]);
                 }
 
                 let mut members = state.members.clone();
                 match &id {
-                    RoomId::Direct { pair } => open_dm_events(id.clone(), pair, c.topic.clone(), &mut members),
+                    RoomId::Direct { pair } => {
+                        open_dm_events(id.clone(), pair, c.topic.clone(), &mut members)
+                    }
                     RoomId::Channel { .. } => {
                         let origin = c.origin.clone().unwrap_or(RoomOrigin::Manual);
                         ensure_wave_name_policy(&id, &origin, &ctx.by)?;
-                        let mut events = vec![RoomEvent::Opened { id, origin, topic: c.topic.clone() }];
+                        let mut events = vec![RoomEvent::Opened {
+                            id,
+                            origin,
+                            topic: c.topic.clone(),
+                        }];
                         if !matches!(ctx.by, Principal::System { .. }) {
                             let handle = unique_handle(&ctx.by, &members)?;
-                            events.push(RoomEvent::MemberJoined { member: ctx.by.clone(), handle });
+                            events.push(RoomEvent::MemberJoined {
+                                member: ctx.by.clone(),
+                                handle,
+                            });
                         }
                         Ok(events)
                     }
@@ -335,16 +399,23 @@ impl Decider for Rooms {
             RoomCommand::RoomJoin(c) => {
                 let id = c.room.resolve(&ctx.by)?;
                 if matches!(id, RoomId::Direct { .. }) {
-                    return Err(ApiError::Conflict { detail: "direct message membership is fixed to the pair".into() });
+                    return Err(ApiError::Conflict {
+                        detail: "direct message membership is fixed to the pair".into(),
+                    });
                 }
 
                 let target = c.member.clone().unwrap_or_else(|| ctx.by.clone());
-                let origin = state.opened.as_ref().map_or(&RoomOrigin::Manual, |(_, o)| o);
+                let origin = state
+                    .opened
+                    .as_ref()
+                    .map_or(&RoomOrigin::Manual, |(_, o)| o);
 
                 if target == ctx.by {
                     if let RoomOrigin::Wave { wave } = origin {
-                        let allowed = matches!(ctx.by, Principal::Operator { .. } | Principal::System { .. })
-                            || matches!(&ctx.by, Principal::Worker { wave: w, .. } if w == wave)
+                        let allowed = matches!(
+                            ctx.by,
+                            Principal::Operator { .. } | Principal::System { .. }
+                        ) || matches!(&ctx.by, Principal::Worker { wave: w, .. } if w == wave)
                             || state.opener.as_ref() == Some(&ctx.by)
                             || state.has_member(&ctx.by);
                         if !allowed {
@@ -355,8 +426,10 @@ impl Decider for Rooms {
                         }
                     }
                 } else {
-                    let can_invite = matches!(ctx.by, Principal::Operator { .. } | Principal::System { .. })
-                        || state.opener.as_ref() == Some(&ctx.by);
+                    let can_invite = matches!(
+                        ctx.by,
+                        Principal::Operator { .. } | Principal::System { .. }
+                    ) || state.opener.as_ref() == Some(&ctx.by);
                     if !can_invite {
                         return Err(ApiError::Denied {
                             principal: ctx.by.to_string(),
@@ -368,7 +441,11 @@ impl Decider for Rooms {
                 let mut events = Vec::new();
                 if state.opened.is_none() {
                     ensure_wave_name_policy(&id, &RoomOrigin::Manual, &ctx.by)?;
-                    events.push(RoomEvent::Opened { id, origin: RoomOrigin::Manual, topic: None });
+                    events.push(RoomEvent::Opened {
+                        id,
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    });
                 }
 
                 match &c.handle {
@@ -377,16 +454,24 @@ impl Decider for Rooms {
                             return Ok(vec![]);
                         }
                         if state.members.contains_key(handle) {
-                            return Err(ApiError::Conflict { detail: format!("handle @{handle} is already in use in this room") });
+                            return Err(ApiError::Conflict {
+                                detail: format!("handle @{handle} is already in use in this room"),
+                            });
                         }
-                        events.push(RoomEvent::MemberJoined { member: target, handle: handle.clone() });
+                        events.push(RoomEvent::MemberJoined {
+                            member: target,
+                            handle: handle.clone(),
+                        });
                     }
                     None => {
                         if state.has_member(&target) {
                             return Ok(vec![]);
                         }
                         let handle = unique_handle(&target, &state.members)?;
-                        events.push(RoomEvent::MemberJoined { member: target, handle });
+                        events.push(RoomEvent::MemberJoined {
+                            member: target,
+                            handle,
+                        });
                     }
                 }
                 Ok(events)
@@ -395,12 +480,18 @@ impl Decider for Rooms {
             RoomCommand::RoomLeave(c) => {
                 let id = c.room.resolve(&ctx.by)?;
                 if matches!(id, RoomId::Direct { .. }) {
-                    return Err(ApiError::Conflict { detail: "cannot leave a direct message room".into() });
+                    return Err(ApiError::Conflict {
+                        detail: "cannot leave a direct message room".into(),
+                    });
                 }
                 if !state.has_member(&ctx.by) {
-                    return Err(ApiError::Conflict { detail: format!("{} is not a member of room", ctx.by) });
+                    return Err(ApiError::Conflict {
+                        detail: format!("{} is not a member of room", ctx.by),
+                    });
                 }
-                Ok(vec![RoomEvent::MemberLeft { member: ctx.by.clone() }])
+                Ok(vec![RoomEvent::MemberLeft {
+                    member: ctx.by.clone(),
+                }])
             }
 
             RoomCommand::RoomPost(c) => {
@@ -408,7 +499,9 @@ impl Decider for Rooms {
                 if let Some(reply_seq) = c.reply_to
                     && !state.posts.contains(&reply_seq)
                 {
-                    return Err(ApiError::NotFound { what: format!("message seq {} in room", reply_seq.0) });
+                    return Err(ApiError::NotFound {
+                        what: format!("message seq {} in room", reply_seq.0),
+                    });
                 }
 
                 let mut events = Vec::new();
@@ -424,33 +517,55 @@ impl Decider for Rooms {
                     RoomId::Channel { .. } => match state.opened.as_ref().map(|(_, o)| o) {
                         Some(RoomOrigin::Wave { wave }) => {
                             let allowed = state.has_member(&ctx.by)
-                                || matches!(ctx.by, Principal::Operator { .. } | Principal::System { .. });
+                                || matches!(
+                                    ctx.by,
+                                    Principal::Operator { .. } | Principal::System { .. }
+                                );
                             if !allowed {
                                 return Err(ApiError::Denied {
                                     principal: ctx.by.to_string(),
-                                    action: format!("post to wave room #wave-{wave} without membership"),
+                                    action: format!(
+                                        "post to wave room #wave-{wave} without membership"
+                                    ),
                                 });
                             }
-                            if !members.values().any(|p| p == &ctx.by) && !matches!(ctx.by, Principal::System { .. }) {
+                            if !members.values().any(|p| p == &ctx.by)
+                                && !matches!(ctx.by, Principal::System { .. })
+                            {
                                 let handle = unique_handle(&ctx.by, &members)?;
                                 members.insert(handle.clone(), ctx.by.clone());
-                                events.push(RoomEvent::MemberJoined { member: ctx.by.clone(), handle });
+                                events.push(RoomEvent::MemberJoined {
+                                    member: ctx.by.clone(),
+                                    handle,
+                                });
                             }
                         }
                         Some(RoomOrigin::Manual) => {
-                            if !members.values().any(|p| p == &ctx.by) && !matches!(ctx.by, Principal::System { .. }) {
+                            if !members.values().any(|p| p == &ctx.by)
+                                && !matches!(ctx.by, Principal::System { .. })
+                            {
                                 let handle = unique_handle(&ctx.by, &members)?;
                                 members.insert(handle.clone(), ctx.by.clone());
-                                events.push(RoomEvent::MemberJoined { member: ctx.by.clone(), handle });
+                                events.push(RoomEvent::MemberJoined {
+                                    member: ctx.by.clone(),
+                                    handle,
+                                });
                             }
                         }
                         None => {
                             ensure_wave_name_policy(&id, &RoomOrigin::Manual, &ctx.by)?;
-                            events.push(RoomEvent::Opened { id: id.clone(), origin: RoomOrigin::Manual, topic: None });
+                            events.push(RoomEvent::Opened {
+                                id: id.clone(),
+                                origin: RoomOrigin::Manual,
+                                topic: None,
+                            });
                             if !matches!(ctx.by, Principal::System { .. }) {
                                 let handle = unique_handle(&ctx.by, &members)?;
                                 members.insert(handle.clone(), ctx.by.clone());
-                                events.push(RoomEvent::MemberJoined { member: ctx.by.clone(), handle });
+                                events.push(RoomEvent::MemberJoined {
+                                    member: ctx.by.clone(),
+                                    handle,
+                                });
                             }
                         }
                     },
@@ -491,13 +606,20 @@ impl Decider for Rooms {
     fn reply(state: &RoomState, cmd: RoomCommand, committed: &[Envelope]) -> WireReply {
         match cmd {
             RoomCommand::RoomEnsure(_) => {
-                let (id, origin) = state.opened.clone().expect("RoomEnsure guarantees opened state");
+                let (id, origin) = state
+                    .opened
+                    .clone()
+                    .expect("RoomEnsure guarantees opened state");
                 WireReply::RoomEnsure(RoomInfo {
                     id,
                     origin,
                     topic: state.topic.clone(),
                     head: state.head,
-                    members: state.members.iter().map(|(h, p)| (h.clone(), p.clone())).collect(),
+                    members: state
+                        .members
+                        .iter()
+                        .map(|(h, p)| (h.clone(), p.clone()))
+                        .collect(),
                 })
             }
             RoomCommand::RoomPost(_) => {
@@ -506,9 +628,17 @@ impl Decider for Rooms {
                     .rev()
                     .find(|e| matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
                     .expect("RoomPost commits or replays a Posted event");
-                let StreamId::Room { room } = &env.stream else { unreachable!() };
-                let Event::Room(RoomEvent::Posted { mentions, .. }) = &env.event else { unreachable!() };
-                WireReply::RoomPost(Posted { room: room.clone(), seq: env.seq, mentions: mentions.clone() })
+                let StreamId::Room { room } = &env.stream else {
+                    unreachable!()
+                };
+                let Event::Room(RoomEvent::Posted { mentions, .. }) = &env.event else {
+                    unreachable!()
+                };
+                WireReply::RoomPost(Posted {
+                    room: room.clone(),
+                    seq: env.seq,
+                    mentions: mentions.clone(),
+                })
             }
             RoomCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
             RoomCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),

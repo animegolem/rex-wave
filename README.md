@@ -34,6 +34,25 @@ REX_WAVE_BB_TOKEN="$BB_PLUGIN_TOKEN" rex-wave daemon \
 	--wake-bell 127.0.0.1:7781
 ```
 
+The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
+
+```sh
+mkdir -p ~/.config/rex-wave
+touch ~/.config/rex-wave/protected-roots
+```
+
+To protect real mail folders, list them one per line:
+
+```text
+# folders the mail sandbox must never be, contain, or sit inside
+~/mail/live
+/srv/letters
+# a folder name the sandbox path must never include, wherever it is
+name: archive
+```
+
+A folder line is an absolute path or starts with `~/`, and cannot contain `..`. The file holds at most 64 entries. The daemon exits on a file that is missing, unreadable or malformed, so a mistake never leaves a folder unprotected.
+
 By default, the daemon listens on `$XDG_STATE_HOME/rex-wave/daemon.sock`, stores its SQLite WAL journal in `journal.sqlite3` beside that socket, and binds `wake-bell` HTTP `/sink` on `127.0.0.1:7781`. Pass `--socket <path>` to any `rex-wave` command to target a custom Unix socket.
 
 ## Open the two-pane TUI
@@ -51,7 +70,7 @@ The left pane shows `Inbox`, `Kanban`, `Projects`, `Channels`, and `Direct Messa
 1. Mint a `0600` capability token for a seat. The running daemon reloads `tokens.json` on session open without a restart:
 
 ```sh
-REX_WAVE_TOKEN="$(rex-wave token --seat sol)"
+REX_WAVE_TOKEN="$(rex-wave token --seat sam)"
 ```
 
 2. Start the MCP `2025-11-25` server over `stdio` for a local host, or over loopback HTTP with bearer authentication:
@@ -113,3 +132,7 @@ rex-wave wave finish auth-v2 --summary 'Merged and verified'
 - **BB (`crates/rex-wave-bb` and `bb-plugin/`).** `BbHost` and `BbBridge` implement `AgentHost` and `AgentFeed` over the plugin WebSocket, enforcing `threads.stop` settle polling before `threads.archive`.
 - **T3 Code or another IDE host.** Implement `AgentHost` and `AgentFeed` in a sibling adapter crate that maps `SpawnRequest`, `SteerDeliveryMode`, and `InteractionResolution` to that host's session RPCs, then pass that host to `WaveConductor::new` in `crates/rex-wave/src/daemon.rs`.
 - **Direct CLI runners (`claude`, `codex`, or `pi` subprocesses).** Implement `AgentHost` over child process groups or tmux panes where `spawn` starts the CLI in a git worktree with `rex-wave mcp --stdio` configured, `tell` writes to stdin or a session socket, and `retire` terminates the process group cleanly.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE) or [MIT license](./LICENSE-MIT), at your option.

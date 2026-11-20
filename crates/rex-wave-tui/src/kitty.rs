@@ -595,7 +595,7 @@ pub fn program_status(sidebar: &SidebarTreeSnapshot) -> Osc7501 {
     let primary_wave = sidebar.projects.iter().flat_map(|p| p.waves.iter()).next();
     let (id, title) = match primary_wave {
         Some(w) => (format!("wave-{}", w.wave), format!("#wave-{}", w.wave)),
-        None => ("estate".to_owned(), "rex-wave".to_owned()),
+        None => ("rex-wave".to_owned(), "rex-wave".to_owned()),
     };
     let msg = if derived.message.is_empty() {
         "ready".to_owned()

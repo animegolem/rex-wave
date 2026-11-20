@@ -5,8 +5,8 @@
 use crate::id::{SeatName, Seq, SeqRange, Sha256Hex};
 use crate::room::RoomId;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// `item` object of `mailbox.item.schema.json` schema 1 (grounding #11), verbatim field names.
@@ -66,7 +66,11 @@ impl JsonSchema for MailSchemaV1 {
 impl TryFrom<u8> for MailSchemaV1 {
     type Error = String;
     fn try_from(v: u8) -> Result<Self, String> {
-        if v == 1 { Ok(MailSchemaV1) } else { Err(format!("unsupported mailbox schema {v}")) }
+        if v == 1 {
+            Ok(MailSchemaV1)
+        } else {
+            Err(format!("unsupported mailbox schema {v}"))
+        }
     }
 }
 impl From<MailSchemaV1> for u8 {
@@ -91,7 +95,7 @@ pub enum LetterPriority {
 }
 
 /// A banked letter in the sandbox. Exists only after the bytes are on disk
-/// (bank before announce, house-mail I2).
+/// (bank before announce, law I2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LetterRef {
     pub path: PathBuf,
@@ -99,7 +103,6 @@ pub struct LetterRef {
     pub wake_id: WakeId,
     pub item: MailboxItem,
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MailPromote {
@@ -126,13 +129,24 @@ pub struct MailWakeBell {
     pub fired_at: String,
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MailEvent {
     /// Written only after the file is durably on disk.
-    Banked { from_room: RoomId, range: (Seq, Seq), letter: LetterRef },
-    Acked { path: PathBuf, sha256: Sha256Hex },
-    Projected { item: MailboxItem },
-    BellRang { bell_id: String, seat: SeatName },
+    Banked {
+        from_room: RoomId,
+        range: (Seq, Seq),
+        letter: LetterRef,
+    },
+    Acked {
+        path: PathBuf,
+        sha256: Sha256Hex,
+    },
+    Projected {
+        item: MailboxItem,
+    },
+    BellRang {
+        bell_id: String,
+        seat: SeatName,
+    },
 }

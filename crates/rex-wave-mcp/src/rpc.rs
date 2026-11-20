@@ -7,7 +7,9 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
@@ -31,12 +33,23 @@ enum FrameInput {
 }
 
 enum ParsedRpc {
-    Notification { method: String, params: Option<Value> },
-    Request { id: Value, method: String, params: Value },
+    Notification {
+        method: String,
+        params: Option<Value>,
+    },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     Invalid(Value),
 }
 
-pub(crate) async fn serve_stream<C, R, W>(server: Arc<McpServer<C>>, reader: R, mut writer: W) -> io::Result<()>
+pub(crate) async fn serve_stream<C, R, W>(
+    server: Arc<McpServer<C>>,
+    reader: R,
+    mut writer: W,
+) -> io::Result<()>
 where
     C: Client + Clone + 'static,
     R: AsyncRead + Unpin + Send + 'static,
@@ -117,7 +130,9 @@ where
     reader_task.abort();
     while let Some(done) = rpc_tasks.join_next().await {
         if let Ok((Some(req_key), task_id)) = done
-            && in_flight_ids.get(&req_key).is_some_and(|h| h.id() == task_id)
+            && in_flight_ids
+                .get(&req_key)
+                .is_some_and(|h| h.id() == task_id)
         {
             in_flight_ids.remove(&req_key);
         }
@@ -126,12 +141,17 @@ where
         handle.abort();
     }
     drop(out_tx);
-    let writer_res = writer_task.await.unwrap_or_else(|e| Err(io::Error::other(e)));
+    let writer_res = writer_task
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)));
 
     read_res.and(writer_res)
 }
 
-pub(crate) async fn serve_http_listener<C>(server: Arc<McpServer<C>>, listener: TcpListener) -> io::Result<()>
+pub(crate) async fn serve_http_listener<C>(
+    server: Arc<McpServer<C>>,
+    listener: TcpListener,
+) -> io::Result<()>
 where
     C: Client + Clone + 'static,
 {
@@ -173,7 +193,10 @@ where
         let mut hdr = Vec::new();
         let hn = read_bounded_line(&mut reader, &mut hdr).await?;
         if hn == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated HTTP headers"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated HTTP headers",
+            ));
         }
         let line = std::str::from_utf8(&hdr)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -190,7 +213,13 @@ where
                     .parse::<usize>()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if content_length > MAX_FRAME_BYTES {
-                    return write_http_response(&mut writer_half, "413 Payload Too Large", "text/plain", b"payload exceeds 16 MiB").await;
+                    return write_http_response(
+                        &mut writer_half,
+                        "413 Payload Too Large",
+                        "text/plain",
+                        b"payload exceeds 16 MiB",
+                    )
+                    .await;
                 }
             } else if key.eq_ignore_ascii_case("content-type") {
                 content_type = Some(value.to_owned());
@@ -204,18 +233,36 @@ where
         }
     }
     if !saw_blank {
-        return write_http_response(&mut writer_half, "431 Request Header Fields Too Large", "text/plain", b"too many headers").await;
+        return write_http_response(
+            &mut writer_half,
+            "431 Request Header Fields Too Large",
+            "text/plain",
+            b"too many headers",
+        )
+        .await;
     }
 
     if let Some(ref orig) = origin
         && !is_loopback_origin(orig)
     {
-        return write_http_response(&mut writer_half, "403 Forbidden", "text/plain", b"forbidden Origin").await;
+        return write_http_response(
+            &mut writer_half,
+            "403 Forbidden",
+            "text/plain",
+            b"forbidden Origin",
+        )
+        .await;
     }
     if let Some(ref h) = host
         && !is_loopback_host(h)
     {
-        return write_http_response(&mut writer_half, "403 Forbidden", "text/plain", b"forbidden Host").await;
+        return write_http_response(
+            &mut writer_half,
+            "403 Forbidden",
+            "text/plain",
+            b"forbidden Host",
+        )
+        .await;
     }
     if let Some(ref expected) = server.http_token {
         let ok = authorization
@@ -223,15 +270,33 @@ where
             .and_then(strip_bearer)
             .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()));
         if !ok {
-            return write_http_response(&mut writer_half, "401 Unauthorized", "text/plain", b"bearer token required").await;
+            return write_http_response(
+                &mut writer_half,
+                "401 Unauthorized",
+                "text/plain",
+                b"bearer token required",
+            )
+            .await;
         }
     }
 
     if method != "POST" {
-        return write_http_response(&mut writer_half, "405 Method Not Allowed", "text/plain", b"POST required").await;
+        return write_http_response(
+            &mut writer_half,
+            "405 Method Not Allowed",
+            "text/plain",
+            b"POST required",
+        )
+        .await;
     }
     if !content_type.as_deref().is_some_and(is_json_content_type) {
-        return write_http_response(&mut writer_half, "415 Unsupported Media Type", "text/plain", b"application/json required").await;
+        return write_http_response(
+            &mut writer_half,
+            "415 Unsupported Media Type",
+            "text/plain",
+            b"application/json required",
+        )
+        .await;
     }
 
     let mut body = vec![0u8; content_length];
@@ -240,9 +305,14 @@ where
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            let err_body = serde_json::to_vec(&rpc_error(Value::Null, PARSE_ERROR, format!("parse error: {e}")))
-                .map_err(io::Error::other)?;
-            return write_http_response(&mut writer_half, "200 OK", "application/json", &err_body).await;
+            let err_body = serde_json::to_vec(&rpc_error(
+                Value::Null,
+                PARSE_ERROR,
+                format!("parse error: {e}"),
+            ))
+            .map_err(io::Error::other)?;
+            return write_http_response(&mut writer_half, "200 OK", "application/json", &err_body)
+                .await;
         }
     };
 
@@ -251,7 +321,9 @@ where
             let resp_bytes = serde_json::to_vec(&resp).map_err(io::Error::other)?;
             write_http_response(&mut writer_half, "200 OK", "application/json", &resp_bytes).await
         }
-        None => write_http_response(&mut writer_half, "202 Accepted", "application/json", b"").await,
+        None => {
+            write_http_response(&mut writer_half, "202 Accepted", "application/json", b"").await
+        }
     }
 }
 
@@ -288,7 +360,10 @@ fn is_loopback_host(authority: &str) -> bool {
             || tail
                 .strip_prefix(':')
                 .is_some_and(|p| p.parse::<u16>().is_ok_and(|n| n > 0));
-        return port_ok && ipv6_str.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
+        return port_ok
+            && ipv6_str
+                .parse::<Ipv6Addr>()
+                .is_ok_and(|ip| ip.is_loopback());
     }
     let (host, port_ok) = match trimmed.split_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().is_ok_and(|n| n > 0)),
@@ -297,7 +372,8 @@ fn is_loopback_host(authority: &str) -> bool {
     if !port_ok {
         return false;
     }
-    host.eq_ignore_ascii_case("localhost") || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn strip_bearer(header: &str) -> Option<&str> {
@@ -340,7 +416,11 @@ async fn write_http_response<W: AsyncWrite + Unpin>(
 
 fn parse_rpc_message(msg: Value) -> ParsedRpc {
     let Value::Object(mut obj) = msg else {
-        return ParsedRpc::Invalid(rpc_error(Value::Null, INVALID_REQUEST, "JSON-RPC message must be a single object"));
+        return ParsedRpc::Invalid(rpc_error(
+            Value::Null,
+            INVALID_REQUEST,
+            "JSON-RPC message must be a single object",
+        ));
     };
     let id_opt = obj.remove("id");
     let has_id = id_opt.is_some();
@@ -353,12 +433,27 @@ fn parse_rpc_message(msg: Value) -> ParsedRpc {
     };
     let raw_params = obj.remove("params");
     if !has_id {
-        return ParsedRpc::Notification { method, params: raw_params };
+        return ParsedRpc::Notification {
+            method,
+            params: raw_params,
+        };
     }
     match raw_params {
-        None | Some(Value::Null) => ParsedRpc::Request { id, method, params: json!({}) },
-        Some(v @ Value::Object(_)) => ParsedRpc::Request { id, method, params: v },
-        Some(_) => ParsedRpc::Invalid(rpc_error(id, INVALID_PARAMS, "MCP request params must be a JSON object")),
+        None | Some(Value::Null) => ParsedRpc::Request {
+            id,
+            method,
+            params: json!({}),
+        },
+        Some(v @ Value::Object(_)) => ParsedRpc::Request {
+            id,
+            method,
+            params: v,
+        },
+        Some(_) => ParsedRpc::Invalid(rpc_error(
+            id,
+            INVALID_PARAMS,
+            "MCP request params must be a JSON object",
+        )),
     }
 }
 
@@ -404,7 +499,8 @@ async fn dispatch_single_stream_msg<C>(
         return;
     }
 
-    let resp = execute_request_inline(server, id, &method, params, Some((out_tx, subscriptions))).await;
+    let resp =
+        execute_request_inline(server, id, &method, params, Some((out_tx, subscriptions))).await;
     let _ = out_tx.send(resp);
 }
 
@@ -421,7 +517,11 @@ where
     }
 }
 
-fn handle_notification(method: &str, params: &Value, in_flight_ids: &mut HashMap<String, AbortHandle>) {
+fn handle_notification(
+    method: &str,
+    params: &Value,
+    in_flight_ids: &mut HashMap<String, AbortHandle>,
+) {
     if method == "notifications/cancelled"
         && let Some(key) = request_key_ref(params.get("requestId"))
         && let Some(handle) = in_flight_ids.remove(&key)
@@ -435,7 +535,10 @@ async fn execute_request_inline<C>(
     id: Value,
     method: &str,
     params: Value,
-    mut sub_ctx: Option<(&mpsc::UnboundedSender<Value>, &mut HashMap<String, AbortHandle>)>,
+    mut sub_ctx: Option<(
+        &mpsc::UnboundedSender<Value>,
+        &mut HashMap<String, AbortHandle>,
+    )>,
 ) -> Value
 where
     C: Client,
@@ -467,7 +570,10 @@ where
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return rpc_error(id, INVALID_PARAMS, "tools/call requires string params.name");
             };
-            let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let res = server.call_tool(name, arguments).await;
             match serde_json::to_value(res) {
                 Ok(v) => rpc_ok(id, v),
@@ -481,7 +587,11 @@ where
         "resources/templates/list" => rpc_ok(id, resources::resource_templates()),
         "resources/read" => {
             let Some(uri) = params.get("uri").and_then(Value::as_str) else {
-                return rpc_error(id, INVALID_PARAMS, "resources/read requires string params.uri");
+                return rpc_error(
+                    id,
+                    INVALID_PARAMS,
+                    "resources/read requires string params.uri",
+                );
             };
             match resources::read_resource(&server.client, uri).await {
                 Ok(val) => rpc_ok(id, val),
@@ -490,15 +600,25 @@ where
         }
         "resources/subscribe" => {
             let Some((out_tx, subscriptions)) = sub_ctx.as_mut() else {
-                return rpc_error(id, METHOD_NOT_FOUND, "resources/subscribe requires a streaming MCP session");
+                return rpc_error(
+                    id,
+                    METHOD_NOT_FOUND,
+                    "resources/subscribe requires a streaming MCP session",
+                );
             };
             let Some(uri) = params.get("uri").and_then(Value::as_str) else {
-                return rpc_error(id, INVALID_PARAMS, "resources/subscribe requires string params.uri");
+                return rpc_error(
+                    id,
+                    INVALID_PARAMS,
+                    "resources/subscribe requires string params.uri",
+                );
             };
             if subscriptions.get(uri).is_some_and(|h| !h.is_finished()) {
                 return rpc_ok(id, json!({}));
             }
-            match resources::subscribe_resource(&server.client, uri.to_owned(), (*out_tx).clone()).await {
+            match resources::subscribe_resource(&server.client, uri.to_owned(), (*out_tx).clone())
+                .await
+            {
                 Ok(handle) => {
                     subscriptions.insert(uri.to_owned(), handle);
                     rpc_ok(id, json!({}))
@@ -508,10 +628,18 @@ where
         }
         "resources/unsubscribe" => {
             let Some((_, subscriptions)) = sub_ctx.as_mut() else {
-                return rpc_error(id, METHOD_NOT_FOUND, "resources/unsubscribe requires a streaming MCP session");
+                return rpc_error(
+                    id,
+                    METHOD_NOT_FOUND,
+                    "resources/unsubscribe requires a streaming MCP session",
+                );
             };
             let Some(uri) = params.get("uri").and_then(Value::as_str) else {
-                return rpc_error(id, INVALID_PARAMS, "resources/unsubscribe requires string params.uri");
+                return rpc_error(
+                    id,
+                    INVALID_PARAMS,
+                    "resources/unsubscribe requires string params.uri",
+                );
             };
             if let Some(handle) = subscriptions.remove(uri) {
                 handle.abort();
@@ -569,7 +697,9 @@ fn request_key_ref(id: Option<&Value>) -> Option<String> {
     id.and_then(request_key)
 }
 
-async fn read_next_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<(FrameInput, u8)>> {
+async fn read_next_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<(FrameInput, u8)>> {
     let mut line_buf = Vec::new();
     loop {
         line_buf.clear();
@@ -591,14 +721,20 @@ async fn read_next_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<
                 .parse::<usize>()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if len > MAX_FRAME_BYTES {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "MCP frame exceeds 16 MiB"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP frame exceeds 16 MiB",
+                ));
             }
             let mut saw_blank = false;
             for _ in 0..MAX_HEADER_LINES {
                 let mut hdr = Vec::new();
                 let hn = read_bounded_line(reader, &mut hdr).await?;
                 if hn == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF inside Content-Length frame headers"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF inside Content-Length frame headers",
+                    ));
                 }
                 let trimmed = std::str::from_utf8(&hdr)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -609,7 +745,10 @@ async fn read_next_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<
                 }
             }
             if !saw_blank {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "too many Content-Length frame headers"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many Content-Length frame headers",
+                ));
             }
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).await?;
@@ -628,7 +767,10 @@ async fn read_next_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<
     }
 }
 
-async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R, out: &mut Vec<u8>) -> io::Result<usize> {
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+) -> io::Result<usize> {
     let mut total = 0usize;
     loop {
         let buf = reader.fill_buf().await?;
@@ -638,7 +780,10 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R, out: &mut Ve
         if let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
             let take = nl_pos + 1;
             if total + take > MAX_FRAME_BYTES {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "MCP line exceeds 16 MiB"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP line exceeds 16 MiB",
+                ));
             }
             out.extend_from_slice(&buf[..take]);
             reader.consume(take);
@@ -646,7 +791,10 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R, out: &mut Ve
         }
         let len = buf.len();
         if total + len > MAX_FRAME_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "MCP line exceeds 16 MiB"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP line exceeds 16 MiB",
+            ));
         }
         out.extend_from_slice(buf);
         reader.consume(len);
@@ -654,8 +802,13 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R, out: &mut Ve
     }
 }
 
-async fn write_framed<W: AsyncWrite + Unpin>(writer: &mut W, msg: &Value, mode: u8) -> io::Result<()> {
-    let bytes = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+async fn write_framed<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg: &Value,
+    mode: u8,
+) -> io::Result<()> {
+    let bytes =
+        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if mode == FORMAT_CONTENT_LENGTH {
         let header = format!("Content-Length: {}\r\n\r\n", bytes.len());
         writer.write_all(header.as_bytes()).await?;

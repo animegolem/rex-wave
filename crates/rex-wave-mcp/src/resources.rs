@@ -29,15 +29,21 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
         return Ok(ResourceTarget::Sidebar);
     }
     let Some(rest) = uri.strip_prefix("rex://room/") else {
-        return Err(ResourceError::InvalidUri(format!("unsupported resource uri: {uri}")));
+        return Err(ResourceError::InvalidUri(format!(
+            "unsupported resource uri: {uri}"
+        )));
     };
     if rest.is_empty() {
-        return Err(ResourceError::InvalidUri("room resource uri requires a room path".into()));
+        return Err(ResourceError::InvalidUri(
+            "room resource uri requires a room path".into(),
+        ));
     }
 
     let raw_parts: Vec<&str> = rest.split('/').collect();
     if raw_parts.iter().any(|p| p.is_empty()) {
-        return Err(ResourceError::InvalidUri(format!("empty path segment in resource uri: {uri}")));
+        return Err(ResourceError::InvalidUri(format!(
+            "empty path segment in resource uri: {uri}"
+        )));
     }
     let parts: Vec<String> = raw_parts
         .into_iter()
@@ -87,7 +93,11 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
             },
             name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
         },
-        _ => return Err(ResourceError::InvalidUri(format!("unsupported room resource uri: {uri}"))),
+        _ => {
+            return Err(ResourceError::InvalidUri(format!(
+                "unsupported room resource uri: {uri}"
+            )));
+        }
     };
 
     Ok(ResourceTarget::Room(room_ref))
@@ -95,12 +105,19 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
 
 pub(crate) fn room_uri(room: &RoomId, viewer: &Principal) -> Option<(String, String)> {
     match room {
-        RoomId::Channel { scope: RoomScope::Global, name } => {
-            Some((format!("rex://room/channel/{name}"), format!("#{name}")))
-        }
-        RoomId::Channel { scope: RoomScope::Project { project }, name } => {
+        RoomId::Channel {
+            scope: RoomScope::Global,
+            name,
+        } => Some((format!("rex://room/channel/{name}"), format!("#{name}"))),
+        RoomId::Channel {
+            scope: RoomScope::Project { project },
+            name,
+        } => {
             let encoded = percent_encode_segment(project.as_str());
-            Some((format!("rex://room/project/{encoded}/{name}"), format!("#{project}/{name}")))
+            Some((
+                format!("rex://room/project/{encoded}/{name}"),
+                format!("#{project}/{name}"),
+            ))
         }
         RoomId::Direct { pair } => {
             let other = pair.other(viewer)?;
@@ -181,7 +198,10 @@ pub(crate) fn resource_templates() -> Value {
     })
 }
 
-pub(crate) async fn read_resource<C: Client>(client: &C, uri: &str) -> Result<Value, ResourceError> {
+pub(crate) async fn read_resource<C: Client>(
+    client: &C,
+    uri: &str,
+) -> Result<Value, ResourceError> {
     let text = match parse_uri(uri)? {
         ResourceTarget::Sidebar => {
             let snap = client.call(read::Sidebar {}).await?;
@@ -233,7 +253,12 @@ pub(crate) async fn subscribe_resource<C: Client>(
                                 break;
                             }
                         }
-                        Ok(Frame::CaughtUp { .. } | Frame::Agent { .. } | Frame::StageFocused { .. } | Frame::Stage { .. }) => {}
+                        Ok(
+                            Frame::CaughtUp { .. }
+                            | Frame::Agent { .. }
+                            | Frame::StageFocused { .. }
+                            | Frame::Stage { .. },
+                        ) => {}
                         Err(_) => break,
                     }
                 }
@@ -242,7 +267,9 @@ pub(crate) async fn subscribe_resource<C: Client>(
         }
         ResourceTarget::Room(room_ref) => {
             room_ref.resolve(client.me()).map_err(ApiError::from)?;
-            let mut stream = client.watch(Interest::Room { room: room_ref }, Cursor::live()).await?;
+            let mut stream = client
+                .watch(Interest::Room { room: room_ref }, Cursor::live())
+                .await?;
             let handle = tokio::spawn(async move {
                 while let Some(item) = next_frame(&mut stream).await {
                     match item {
@@ -341,8 +368,10 @@ fn percent_decode(seg: &str) -> Result<String, String> {
             if i + 2 >= bytes.len() {
                 return Err(format!("incomplete percent-encoding in '{seg}'"));
             }
-            let hi = hex_val(bytes[i + 1]).ok_or_else(|| format!("invalid percent-encoding in '{seg}'"))?;
-            let lo = hex_val(bytes[i + 2]).ok_or_else(|| format!("invalid percent-encoding in '{seg}'"))?;
+            let hi = hex_val(bytes[i + 1])
+                .ok_or_else(|| format!("invalid percent-encoding in '{seg}'"))?;
+            let lo = hex_val(bytes[i + 2])
+                .ok_or_else(|| format!("invalid percent-encoding in '{seg}'"))?;
             out.push((hi << 4) | lo);
             i += 3;
         } else {

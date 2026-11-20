@@ -5,7 +5,9 @@ use rex_wave_api::read::*;
 use rex_wave_api::room::{Mentions, RoomEvent, RoomId, RoomOrigin, RoomScope};
 use rex_wave_api::stage::derive_osc7501_status;
 use rex_wave_api::wave::{AgentSpec, WaveEvent, WorkerPhase};
-use rex_wave_api::{BbProjectId, Cursor, Envelope, Event, Principal, RoleName, Seq, StreamId, WaveSlug};
+use rex_wave_api::{
+    BbProjectId, Cursor, Envelope, Event, Principal, RoleName, Seq, StreamId, WaveSlug,
+};
 use rex_wave_store::Journal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -42,7 +44,9 @@ impl SidebarProjection {
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
-                        if catch_up(&journal, &mut world) && tx.send(Arc::new(world.clone())).is_err() {
+                        if catch_up(&journal, &mut world)
+                            && tx.send(Arc::new(world.clone())).is_err()
+                        {
                             break;
                         }
                     }
@@ -67,12 +71,16 @@ impl SidebarProjection {
 }
 
 fn catch_up(journal: &Journal, world: &mut World) -> bool {
-    let Ok(streams) = journal.streams() else { return false };
+    let Ok(streams) = journal.streams() else {
+        return false;
+    };
     let mut changed = false;
     for (stream, head) in streams {
         while world.cursor.at(&stream) < head {
             let after = world.cursor.at(&stream);
-            let Ok(page) = journal.read(&stream, after, REPLAY_PAGE) else { break };
+            let Ok(page) = journal.read(&stream, after, REPLAY_PAGE) else {
+                break;
+            };
             if page.is_empty() {
                 break;
             }
@@ -149,7 +157,11 @@ impl World {
                         r.members.remove(member);
                     }
                     RoomEvent::Posted { mentions, .. } => {
-                        r.posts.push(PostMeta { seq: env.seq, by: env.by.clone(), mentions: mentions.clone() });
+                        r.posts.push(PostMeta {
+                            seq: env.seq,
+                            by: env.by.clone(),
+                            mentions: mentions.clone(),
+                        });
                     }
                     RoomEvent::TopicSet { .. } => {}
                 }
@@ -158,12 +170,24 @@ impl World {
                 WaveEvent::Started { spec, room, .. } => {
                     self.waves.insert(
                         wave.clone(),
-                        WaveEntry { project: spec.project.clone(), room: room.clone(), workers: BTreeMap::new() },
+                        WaveEntry {
+                            project: spec.project.clone(),
+                            room: room.clone(),
+                            workers: BTreeMap::new(),
+                        },
                     );
                 }
-                WaveEvent::WorkerRequested { role, agent, attempt, .. } => {
+                WaveEvent::WorkerRequested {
+                    role,
+                    agent,
+                    attempt,
+                    ..
+                } => {
                     if let Some(w) = self.waves.get_mut(wave) {
-                        w.workers.insert(role.clone(), (agent.clone(), WorkerPhase::Requested { attempt: *attempt }));
+                        w.workers.insert(
+                            role.clone(),
+                            (agent.clone(), WorkerPhase::Requested { attempt: *attempt }),
+                        );
                     }
                 }
                 WaveEvent::WorkerObserved { role, observation } => {
@@ -203,7 +227,13 @@ impl World {
                         if card.lane.as_str() == "done" {
                             b.done_lanes.insert(card.lane.clone());
                         }
-                        b.cards.insert(card.no, (card.lane.clone(), card.assignee.as_ref().map(|a| a.as_str().to_owned())));
+                        b.cards.insert(
+                            card.no,
+                            (
+                                card.lane.clone(),
+                                card.assignee.as_ref().map(|a| a.as_str().to_owned()),
+                            ),
+                        );
                     }
                     BoardEvent::CardPatched { no, patch, .. } => {
                         if let Some((lane, who)) = b.cards.get_mut(no) {
@@ -230,11 +260,20 @@ impl World {
                 let inbox = self.inboxes.entry(owner.clone()).or_default();
                 match ev {
                     InboxEvent::Raised { id, draft, .. } => {
-                        inbox.items.insert(*id, (NotifyState::Unread, matches!(draft.kind, NotifyKind::Interaction { .. })));
+                        inbox.items.insert(
+                            *id,
+                            (
+                                NotifyState::Unread,
+                                matches!(draft.kind, NotifyKind::Interaction { .. }),
+                            ),
+                        );
                     }
                     InboxEvent::Updated { id, draft, .. } => {
                         let state = inbox.items.get(id).map_or(NotifyState::Unread, |(s, _)| *s);
-                        inbox.items.insert(*id, (state, matches!(draft.kind, NotifyKind::Interaction { .. })));
+                        inbox.items.insert(
+                            *id,
+                            (state, matches!(draft.kind, NotifyKind::Interaction { .. })),
+                        );
                     }
                     InboxEvent::StateSet { ids, state } => {
                         for id in ids {
@@ -259,12 +298,17 @@ impl World {
     fn is_member(&self, room: &RoomId, who: &Principal) -> bool {
         match room {
             RoomId::Direct { pair } => pair.contains(who),
-            RoomId::Channel { .. } => self.rooms.get(room).is_some_and(|r| r.members.contains(who)),
+            RoomId::Channel { .. } => self
+                .rooms
+                .get(room)
+                .is_some_and(|r| r.members.contains(who)),
         }
     }
 
     fn unread_for(&self, room: &RoomId, viewer: &Principal, upto: Seq) -> (u32, u32) {
-        let Some(r) = self.rooms.get(room) else { return (0, 0) };
+        let Some(r) = self.rooms.get(room) else {
+            return (0, 0);
+        };
         let in_room = self.is_member(room, viewer);
         let mut unread = 0u32;
         let mut mentions = 0u32;
@@ -281,7 +325,12 @@ impl World {
 
     pub(crate) fn snapshot(&self, viewer: &Principal) -> SidebarTreeSnapshot {
         let viewer_inbox = self.inboxes.get(viewer);
-        let upto = |room: &RoomId| viewer_inbox.and_then(|i| i.cursors.get(room)).copied().unwrap_or(Seq::ORIGIN);
+        let upto = |room: &RoomId| {
+            viewer_inbox
+                .and_then(|i| i.cursors.get(room))
+                .copied()
+                .unwrap_or(Seq::ORIGIN)
+        };
 
         let mut inbox = InboxBadge::default();
         if let Some(i) = viewer_inbox {
@@ -310,7 +359,11 @@ impl World {
                         }
                     }
                 }
-                BoardBadge { board: board.clone(), open, mine }
+                BoardBadge {
+                    board: board.clone(),
+                    open,
+                    mine,
+                }
             })
             .collect();
 
@@ -331,9 +384,19 @@ impl World {
                 .collect();
             projects
                 .entry(w.project.clone())
-                .or_insert_with(|| ProjectBranch { project: w.project.clone(), channels: Vec::new(), waves: Vec::new() })
+                .or_insert_with(|| ProjectBranch {
+                    project: w.project.clone(),
+                    channels: Vec::new(),
+                    waves: Vec::new(),
+                })
                 .waves
-                .push(WaveRoomBranch { wave: slug.clone(), room: w.room.clone(), unread, mentions, workers });
+                .push(WaveRoomBranch {
+                    wave: slug.clone(),
+                    room: w.room.clone(),
+                    unread,
+                    mentions,
+                    workers,
+                });
         }
 
         let mut channels = Vec::new();
@@ -344,25 +407,50 @@ impl World {
             }
             let (unread, mentions) = self.unread_for(room, viewer, upto(room));
             match room {
-                RoomId::Channel { scope: RoomScope::Global, .. } => {
-                    channels.push(ChannelLeaf { room: room.clone(), unread, mentions });
+                RoomId::Channel {
+                    scope: RoomScope::Global,
+                    ..
+                } => {
+                    channels.push(ChannelLeaf {
+                        room: room.clone(),
+                        unread,
+                        mentions,
+                    });
                 }
-                RoomId::Channel { scope: RoomScope::Project { project }, .. } => {
+                RoomId::Channel {
+                    scope: RoomScope::Project { project },
+                    ..
+                } => {
                     projects
                         .entry(project.clone())
-                        .or_insert_with(|| ProjectBranch { project: project.clone(), channels: Vec::new(), waves: Vec::new() })
+                        .or_insert_with(|| ProjectBranch {
+                            project: project.clone(),
+                            channels: Vec::new(),
+                            waves: Vec::new(),
+                        })
                         .channels
-                        .push(ChannelLeaf { room: room.clone(), unread, mentions });
+                        .push(ChannelLeaf {
+                            room: room.clone(),
+                            unread,
+                            mentions,
+                        });
                 }
                 RoomId::Direct { pair } => {
                     if let Some(other) = pair.other(viewer) {
-                        direct_messages.push(DmLeaf { room: room.clone(), with: other.clone(), unread });
+                        direct_messages.push(DmLeaf {
+                            room: room.clone(),
+                            with: other.clone(),
+                            unread,
+                        });
                     }
                 }
             }
         }
 
-        let all_phases = self.waves.values().flat_map(|w| w.workers.values().map(|(_, p)| p));
+        let all_phases = self
+            .waves
+            .values()
+            .flat_map(|w| w.workers.values().map(|(_, p)| p));
         let osc7501 = derive_osc7501_status(&inbox, all_phases);
         SidebarTreeSnapshot {
             inbox,

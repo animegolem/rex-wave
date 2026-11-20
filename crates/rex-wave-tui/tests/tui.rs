@@ -90,8 +90,10 @@ async fn sidebar_org_tree_skips_divider_folds_and_falls_back_on_rebuild() {
     );
     assert_eq!(model.sidebar.cursor, wave_room_key);
 
-    let mut empty = SidebarTreeSnapshot::default();
-    empty.inbox = overview.inbox;
+    let empty = SidebarTreeSnapshot {
+        inbox: overview.inbox,
+        ..Default::default()
+    };
     let _ = update(
         &mut model,
         Msg::Frame {
@@ -174,7 +176,7 @@ fn hover_debounces_while_activate_retargets_immediately_and_filters_stale_genera
             seq: Seq(seq),
             at: UnixMs(100),
             by: Principal::Seat {
-                seat: SeatName::parse("sol").unwrap(),
+                seat: SeatName::parse("sam").unwrap(),
             },
             event: Event::Room(RoomEvent::Posted {
                 body: Body::parse(text).unwrap(),

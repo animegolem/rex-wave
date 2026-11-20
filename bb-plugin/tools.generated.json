@@ -25,7 +25,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -175,7 +175,7 @@
           ]
         },
         "RoomRef": {
-          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
           "oneOf": [
             {
               "properties": {
@@ -339,7 +339,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -454,7 +454,7 @@
           ]
         },
         "RoomRef": {
-          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
           "oneOf": [
             {
               "properties": {
@@ -630,7 +630,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -745,7 +745,7 @@
           ]
         },
         "RoomRef": {
-          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
           "oneOf": [
             {
               "properties": {
@@ -910,7 +910,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -1025,7 +1025,7 @@
           ]
         },
         "RoomRef": {
-          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
           "oneOf": [
             {
               "properties": {
@@ -2000,7 +2000,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -2221,7 +2221,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -2486,7 +2486,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -2974,7 +2974,7 @@
               "type": "object"
             },
             {
-              "description": "A resident estate seat using a minted capability token (MCP stdio/HTTP).",
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
               "properties": {
                 "kind": {
                   "const": "seat",
@@ -3089,7 +3089,7 @@
           ]
         },
         "RoomRef": {
-          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sol` at the CLI/MCP boundary.",
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
           "oneOf": [
             {
               "properties": {

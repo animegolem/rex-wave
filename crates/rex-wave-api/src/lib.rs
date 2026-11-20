@@ -42,5 +42,15 @@ pub use stage::{FocusGeneration, StageTarget};
 pub use stream::{Cursor, Envelope, Event, Frame, Interest, StreamId};
 
 /// Empty success reply for commands whose only result is "it is now true".
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 pub struct Ack;

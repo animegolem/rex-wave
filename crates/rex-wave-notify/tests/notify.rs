@@ -51,11 +51,17 @@ impl Decider for TestWaves {
         }
     }
 
-    fn decide(_state: &TestWaveState, cmd: &WaveCommand, _ctx: &DecideCtx) -> Result<Vec<WaveEvent>, ApiError> {
+    fn decide(
+        _state: &TestWaveState,
+        cmd: &WaveCommand,
+        _ctx: &DecideCtx,
+    ) -> Result<Vec<WaveEvent>, ApiError> {
         match cmd {
             WaveCommand::WaveStart(c) => {
                 let room = RoomId::Channel {
-                    scope: RoomScope::Project { project: c.spec.project.clone() },
+                    scope: RoomScope::Project {
+                        project: c.spec.project.clone(),
+                    },
                     name: ChannelName::parse(format!("wave-{}", c.spec.slug)).unwrap(),
                 };
                 let board = board::project_board(&c.spec.project);
@@ -87,18 +93,28 @@ impl Decider for TestWaves {
                 role: c.role.clone(),
                 reason: c.reason.clone(),
             }]),
-            WaveCommand::WaveFinish(c) => Ok(vec![WaveEvent::Finished { outcome: c.outcome.clone() }]),
-            WaveCommand::WaveView(_)
-            | WaveCommand::WaveAddWorker(_)
-            | WaveCommand::WaveTell(_) => Ok(vec![]),
+            WaveCommand::WaveFinish(c) => Ok(vec![WaveEvent::Finished {
+                outcome: c.outcome.clone(),
+            }]),
+            WaveCommand::WaveView(_) | WaveCommand::WaveAddWorker(_) | WaveCommand::WaveTell(_) => {
+                Ok(vec![])
+            }
         }
     }
 
     fn evolve(state: &mut TestWaveState, event: &WaveEvent, _meta: &EntryMeta) {
         match event {
             WaveEvent::Started { spec, .. } => state.spec = Some(spec.clone()),
-            WaveEvent::WorkerRequested { role, agent, attempt, .. } => {
-                state.workers.insert(role.clone(), (agent.clone(), WorkerPhase::Requested { attempt: *attempt }));
+            WaveEvent::WorkerRequested {
+                role,
+                agent,
+                attempt,
+                ..
+            } => {
+                state.workers.insert(
+                    role.clone(),
+                    (agent.clone(), WorkerPhase::Requested { attempt: *attempt }),
+                );
             }
             WaveEvent::WorkerObserved { role, observation } => {
                 if let Some((_, phase)) = state.workers.get_mut(role) {
@@ -119,7 +135,9 @@ impl Decider for TestWaves {
             WaveCommand::WaveStart(c) => WireReply::WaveStart(WaveStarted {
                 wave: c.spec.slug.clone(),
                 room: RoomId::Channel {
-                    scope: RoomScope::Project { project: c.spec.project.clone() },
+                    scope: RoomScope::Project {
+                        project: c.spec.project.clone(),
+                    },
                     name: ChannelName::parse(format!("wave-{}", c.spec.slug)).unwrap(),
                 },
                 board: board::project_board(&c.spec.project),
@@ -158,14 +176,14 @@ fn sample_mailbox_item(kind: &str, label: Option<&str>) -> MailboxItem {
     MailboxItem {
         schema: MailSchemaV1,
         id: "letter:to-owner/ruling-r1.md".into(),
-        from: "sol".into(),
+        from: "sam".into(),
         to: "owner".into(),
         kind: kind.into(),
         state: "open".into(),
         ts: "2026-11-16T10:30:00Z".into(),
         ts_basis: "mtime".into(),
         reference: MailRef {
-            store: "interchange".into(),
+            store: "letters".into(),
             path: PathBuf::from("to-owner/ruling-r1.md"),
             sha256: Sha256Hex::parse(
                 "d4eb1d5a086d8a07b20cb67ca85a9b28f3dde81825c006cb988b15152aa3d678",
@@ -189,11 +207,20 @@ fn rank_orders_tiers_and_decays_with_age() {
         role: RoleName::parse("migrator").unwrap(),
         interaction: BbInteractionId::parse("int_1").unwrap(),
     };
-    let blocking_mail = NotifyKind::Mail { item: sample_mailbox_item("letter", Some("[blocking] Need ruling")) };
-    let dm = NotifyKind::DirectMessage { room: room.clone(), seq: Seq(1) };
+    let blocking_mail = NotifyKind::Mail {
+        item: sample_mailbox_item("letter", Some("[blocking] Need ruling")),
+    };
+    let dm = NotifyKind::DirectMessage {
+        room: room.clone(),
+        seq: Seq(1),
+    };
     let mention = NotifyKind::Mention { room, seq: Seq(2) };
-    let normal_mail = NotifyKind::Mail { item: sample_mailbox_item("letter", Some("FYI note")) };
-    let reminder = NotifyKind::Reminder { bell_id: "daily@2026-11-16T09:00".into() };
+    let normal_mail = NotifyKind::Mail {
+        item: sample_mailbox_item("letter", Some("FYI note")),
+    };
+    let reminder = NotifyKind::Reminder {
+        bell_id: "daily@2026-11-16T09:00".into(),
+    };
 
     assert!(rank(&interaction, 0) > rank(&blocking_mail, 0));
     assert!(rank(&blocking_mail, 0) > rank(&dm, 0));
@@ -216,16 +243,37 @@ fn osc7501_status_transitions_blocked_permission_to_working_to_idle() {
             },
         },
     };
-    let s1 = derive_osc7501_status(&InboxBadge { unread: 1, blocking: 1 }, [&blocked_phase]);
+    let s1 = derive_osc7501_status(
+        &InboxBadge {
+            unread: 1,
+            blocking: 1,
+        },
+        [&blocked_phase],
+    );
     assert_eq!(s1.state, Osc7501State::Blocked);
     assert_eq!(s1.block_kind, Some(Osc7501BlockKind::Permission));
 
-    let working_phase = WorkerPhase::Live { thread, activity: Activity::Working };
-    let s2 = derive_osc7501_status(&InboxBadge { unread: 0, blocking: 0 }, [&working_phase]);
+    let working_phase = WorkerPhase::Live {
+        thread,
+        activity: Activity::Working,
+    };
+    let s2 = derive_osc7501_status(
+        &InboxBadge {
+            unread: 0,
+            blocking: 0,
+        },
+        [&working_phase],
+    );
     assert_eq!(s2.state, Osc7501State::Working);
     assert_eq!(s2.block_kind, None);
 
-    let s3 = derive_osc7501_status(&InboxBadge { unread: 0, blocking: 0 }, std::iter::empty());
+    let s3 = derive_osc7501_status(
+        &InboxBadge {
+            unread: 0,
+            blocking: 0,
+        },
+        std::iter::empty(),
+    );
     assert_eq!(s3.state, Osc7501State::Idle);
     assert_eq!(s3.block_kind, None);
 }
@@ -251,46 +299,78 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
 
     let herald_client = LocalClient::new(
         router.clone(),
-        Principal::System { part: SystemPart::Herald },
+        Principal::System {
+            part: SystemPart::Herald,
+        },
     );
     let herald_task = spawn_reactor(Herald::new(), herald_client);
 
     let owner = LocalClient::new(
         router.clone(),
-        Principal::Operator { seat: SeatName::parse("owner").unwrap() },
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
     );
-    let astra_p = Principal::Seat { seat: SeatName::parse("astra").unwrap() };
-    let astra = LocalClient::new(router.clone(), astra_p.clone());
-    let sol = LocalClient::new(
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let sam = LocalClient::new(
         router.clone(),
-        Principal::Seat { seat: SeatName::parse("sol").unwrap() },
+        Principal::Seat {
+            seat: SeatName::parse("sam").unwrap(),
+        },
     );
     let bb_bridge = LocalClient::new(
         router.clone(),
-        Principal::System { part: SystemPart::BbBridge },
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
     );
 
     let general = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("general").unwrap(),
     };
-    owner.call(RoomEnsure { room: general.clone(), topic: None, origin: None }).await.unwrap();
-    astra.call(RoomJoin { room: general.clone(), member: None, handle: None }).await.unwrap();
-    sol.call(RoomJoin { room: general.clone(), member: None, handle: None }).await.unwrap();
+    owner
+        .call(RoomEnsure {
+            room: general.clone(),
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    alice
+        .call(RoomJoin {
+            room: general.clone(),
+            member: None,
+            handle: None,
+        })
+        .await
+        .unwrap();
+    sam.call(RoomJoin {
+        room: general.clone(),
+        member: None,
+        handle: None,
+    })
+    .await
+    .unwrap();
 
-    let mention_post = sol
+    let mention_post = sam
         .call(RoomPost {
             room: general.clone(),
-            body: Body::parse("hey @astra please review").unwrap(),
+            body: Body::parse("hey @alice please review").unwrap(),
             reply_to: None,
             idem: None,
         })
         .await
         .unwrap();
 
-    let dm_post = sol
+    let dm_post = sam
         .call(RoomPost {
-            room: RoomRef::Dm { with: astra_p.clone() },
+            room: RoomRef::Dm {
+                with: alice_p.clone(),
+            },
             body: Body::parse("private heads up").unwrap(),
             reply_to: None,
             idem: None,
@@ -298,9 +378,15 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .await
         .unwrap();
 
-    let astra_inbox = tokio::time::timeout(Duration::from_secs(2), async {
+    let alice_inbox = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = astra.call(InboxList { include_done: false, limit: None }).await.unwrap();
+            let page = alice
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
             if page.items.len() == 2 {
                 break page;
             }
@@ -308,27 +394,54 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         }
     })
     .await
-    .expect("astra received both DM and mention notifications");
+    .expect("alice received both DM and mention notifications");
 
     assert!(
-        matches!(astra_inbox.items[0].draft.kind, NotifyKind::DirectMessage { .. }),
+        matches!(
+            alice_inbox.items[0].draft.kind,
+            NotifyKind::DirectMessage { .. }
+        ),
         "DM ranks higher than channel mention"
     );
-    assert!(matches!(astra_inbox.items[1].draft.kind, NotifyKind::Mention { .. }));
-    assert_eq!(astra_inbox.unread, 2);
+    assert!(matches!(
+        alice_inbox.items[1].draft.kind,
+        NotifyKind::Mention { .. }
+    ));
+    assert_eq!(alice_inbox.unread, 2);
 
-    let sol_inbox = sol.call(InboxList { include_done: true, limit: None }).await.unwrap();
-    assert!(sol_inbox.items.is_empty(), "sender does not notify themselves");
-
-    astra
-        .call(InboxMarkRead { room: mention_post.room.clone(), upto: mention_post.seq })
+    let sam_inbox = sam
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
         .await
         .unwrap();
-    astra
-        .call(InboxMarkRead { room: mention_post.room.clone(), upto: Seq(1) })
+    assert!(
+        sam_inbox.items.is_empty(),
+        "sender does not notify themselves"
+    );
+
+    alice
+        .call(InboxMarkRead {
+            room: mention_post.room.clone(),
+            upto: mention_post.seq,
+        })
         .await
         .unwrap();
-    let after_read = astra.call(InboxList { include_done: false, limit: None }).await.unwrap();
+    alice
+        .call(InboxMarkRead {
+            room: mention_post.room.clone(),
+            upto: Seq(1),
+        })
+        .await
+        .unwrap();
+    let after_read = alice
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
     assert_eq!(
         after_read.cursors,
         vec![(mention_post.room.clone(), mention_post.seq)],
@@ -401,7 +514,9 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     let item = sample_mailbox_item("letter", Some("Ratified auth-v2 ruling"));
     let banked = mail_writer
         .append(
-            &Principal::Seat { seat: SeatName::parse("sol").unwrap() },
+            &Principal::Seat {
+                seat: SeatName::parse("sam").unwrap(),
+            },
             UnixMs(1_700_000_000_000),
             None,
             vec![Event::Mail(MailEvent::Banked {
@@ -420,7 +535,13 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
 
     let owner_inbox = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = owner.call(InboxList { include_done: false, limit: None }).await.unwrap();
+            let page = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
             if page.items.len() == 2 {
                 break page;
             }
@@ -432,7 +553,10 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
 
     let card = &owner_inbox.items[0];
     assert!(matches!(card.draft.kind, NotifyKind::Interaction { .. }));
-    assert!(matches!(owner_inbox.items[1].draft.kind, NotifyKind::LetterBanked { .. }));
+    assert!(matches!(
+        owner_inbox.items[1].draft.kind,
+        NotifyKind::LetterBanked { .. }
+    ));
 
     let snap_blocked = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -445,11 +569,26 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     })
     .await
     .unwrap();
-    assert_eq!(snap_blocked.osc7501.block_kind, Some(Osc7501BlockKind::Permission));
+    assert_eq!(
+        snap_blocked.osc7501.block_kind,
+        Some(Osc7501BlockKind::Permission)
+    );
 
-    let allow_btn = card.draft.actions.iter().find(|a| a.key == Some('a')).expect("[a] allow once button");
-    let deny_btn = card.draft.actions.iter().find(|a| a.key == Some('d')).expect("[d] deny button");
-    assert!(matches!(&*deny_btn.run, WireCommand::WaveResolve(r) if r.resolution == InteractionResolution::Deny));
+    let allow_btn = card
+        .draft
+        .actions
+        .iter()
+        .find(|a| a.key == Some('a'))
+        .expect("[a] allow once button");
+    let deny_btn = card
+        .draft
+        .actions
+        .iter()
+        .find(|a| a.key == Some('d'))
+        .expect("[d] deny button");
+    assert!(
+        matches!(&*deny_btn.run, WireCommand::WaveResolve(r) if r.resolution == InteractionResolution::Deny)
+    );
 
     let reply = owner.call_wire((*allow_btn.run).clone()).await.unwrap();
     assert!(matches!(reply, WireReply::WaveResolve(Ack)));
@@ -458,7 +597,9 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity { activity: Activity::Working },
+            observation: Observation::Activity {
+                activity: Activity::Working,
+            },
         })
         .await
         .unwrap();
@@ -502,8 +643,18 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
 
     let q_page = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = owner.call(InboxList { include_done: false, limit: None }).await.unwrap();
-            if page.items.iter().any(|n| n.draft.dedupe.ends_with(":int_q1")) {
+            let page = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if page
+                .items
+                .iter()
+                .any(|n| n.draft.dedupe.ends_with(":int_q1"))
+            {
                 break page;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -511,15 +662,37 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     })
     .await
     .unwrap();
-    let q_card = q_page.items.iter().find(|n| n.draft.dedupe.ends_with(":int_q1")).unwrap();
-    assert!(q_card.draft.actions.iter().all(|a| a.key != Some('a')), "question card omits AllowOnce");
-    let q_deny = q_card.draft.actions.iter().find(|a| a.key == Some('d')).unwrap();
+    let q_card = q_page
+        .items
+        .iter()
+        .find(|n| n.draft.dedupe.ends_with(":int_q1"))
+        .unwrap();
+    assert!(
+        q_card.draft.actions.iter().all(|a| a.key != Some('a')),
+        "question card omits AllowOnce"
+    );
+    let q_deny = q_card
+        .draft
+        .actions
+        .iter()
+        .find(|a| a.key == Some('d'))
+        .unwrap();
     owner.call_wire((*q_deny.run).clone()).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = owner.call(InboxList { include_done: false, limit: None }).await.unwrap();
-            if !page.items.iter().any(|n| n.draft.dedupe.ends_with(":int_q1")) {
+            let page = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if !page
+                .items
+                .iter()
+                .any(|n| n.draft.dedupe.ends_with(":int_q1"))
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -530,7 +703,9 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
 
     let wake_bell_sys = LocalClient::new(
         router.clone(),
-        Principal::System { part: SystemPart::WakeBell },
+        Principal::System {
+            part: SystemPart::WakeBell,
+        },
     );
     let bell_rang = mail_writer
         .append(
@@ -539,7 +714,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
             None,
             vec![Event::Mail(MailEvent::BellRang {
                 bell_id: "daily@2026-11-16T09:00".into(),
-                seat: SeatName::parse("sol").unwrap(),
+                seat: SeatName::parse("sam").unwrap(),
             })],
         )
         .unwrap();
@@ -547,7 +722,9 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     wake_bell_sys
         .call(RoomPost {
             room: RoomRef::Dm {
-                with: Principal::Seat { seat: SeatName::parse("sol").unwrap() },
+                with: Principal::Seat {
+                    seat: SeatName::parse("sam").unwrap(),
+                },
             },
             body: Body::parse("Scheduled check-in").unwrap(),
             reply_to: None,
@@ -556,9 +733,15 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .await
         .unwrap();
 
-    let sol_after_bell = tokio::time::timeout(Duration::from_secs(2), async {
+    let sam_after_bell = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let page = sol.call(InboxList { include_done: true, limit: None }).await.unwrap();
+            let page = sam
+                .call(InboxList {
+                    include_done: true,
+                    limit: None,
+                })
+                .await
+                .unwrap();
             if !page.items.is_empty() {
                 break page;
             }
@@ -568,21 +751,50 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
-    let sol_settled = sol.call(InboxList { include_done: true, limit: None }).await.unwrap();
-    assert_eq!(sol_settled.items.len(), 1, "wake bell raises exactly one DM card without duplicate Reminder");
-    assert!(matches!(sol_after_bell.items[0].draft.kind, NotifyKind::DirectMessage { .. }));
+    let sam_settled = sam
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sam_settled.items.len(),
+        1,
+        "wake bell raises exactly one DM card without duplicate Reminder"
+    );
+    assert!(matches!(
+        sam_after_bell.items[0].draft.kind,
+        NotifyKind::DirectMessage { .. }
+    ));
 
-    let pre_replay = owner.call(InboxList { include_done: true, limit: None }).await.unwrap();
+    let pre_replay = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
     herald_task.abort();
     let replay_herald = spawn_reactor(
         Herald::new(),
-        LocalClient::new(router.clone(), Principal::System { part: SystemPart::Herald }),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
     );
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let after_replay = owner.call(InboxList { include_done: true, limit: None }).await.unwrap();
+    let after_replay = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        after_replay.head,
-        pre_replay.head,
+        after_replay.head, pre_replay.head,
         "replaying Herald appends zero journal rows onto resolved interactions or existing cards"
     );
     assert_eq!(

@@ -1,8 +1,8 @@
 //! Bidirectional Org-mode codec for Kanban boards and standalone `.org` files.
 
 use crate::model::{
-    Assignee, BoardSnapshot, Card, CardNo, CardRevision, ExternalLink, Lane, LaneName, Link, OrgPriority, TaskCard,
-    Title,
+    Assignee, BoardSnapshot, Card, CardNo, CardRevision, ExternalLink, Lane, LaneName, Link,
+    OrgPriority, TaskCard, Title,
 };
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -41,7 +41,11 @@ impl OrgDocument {
     }
 
     pub fn to_cards(&self) -> Vec<Card> {
-        let mut used: BTreeSet<u32> = self.tasks.iter().filter_map(|t| t.id.map(|c| c.0)).collect();
+        let mut used: BTreeSet<u32> = self
+            .tasks
+            .iter()
+            .filter_map(|t| t.id.map(|c| c.0))
+            .collect();
         let mut probe = 1u32;
         let mut cards = Vec::with_capacity(self.tasks.len());
         for task in &self.tasks {
@@ -171,7 +175,9 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
     while idx < raw_lines.len() && !is_top_heading(raw_lines[idx]) {
         let line = raw_lines[idx];
         if title.is_none()
-            && let Some(rest) = line.strip_prefix("#+TITLE:").or_else(|| line.strip_prefix("#+title:"))
+            && let Some(rest) = line
+                .strip_prefix("#+TITLE:")
+                .or_else(|| line.strip_prefix("#+title:"))
         {
             let value = rest.strip_prefix(' ').unwrap_or(rest).to_owned();
             title = Some(value);
@@ -308,7 +314,11 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
         });
     }
 
-    Ok(OrgDocument { title, preamble, tasks })
+    Ok(OrgDocument {
+        title,
+        preamble,
+        tasks,
+    })
 }
 
 fn split_lines(text: &str) -> Vec<&str> {
@@ -316,7 +326,10 @@ fn split_lines(text: &str) -> Vec<&str> {
     if trimmed.is_empty() && text == "\n" {
         return vec![""];
     }
-    trimmed.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+    trimmed
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect()
 }
 
 fn is_top_heading(line: &str) -> bool {
@@ -365,7 +378,10 @@ fn parse_heading(
 ) -> Result<(LaneName, Option<OrgPriority>, Title, Vec<String>), OrgError> {
     let after_star = line
         .strip_prefix('*')
-        .ok_or_else(|| OrgError::Heading { line: line_no, reason: "missing leading `*`".into() })?
+        .ok_or_else(|| OrgError::Heading {
+            line: line_no,
+            reason: "missing leading `*`".into(),
+        })?
         .trim_start_matches([' ', '\t']);
     if after_star.is_empty() {
         return Err(OrgError::Heading {
@@ -376,7 +392,10 @@ fn parse_heading(
 
     let Some((keyword, rest)) = split_first_ws(after_star) else {
         let _ = lane_from_org_keyword(after_star, line_no)?;
-        return Err(OrgError::Heading { line: line_no, reason: "missing title".into() });
+        return Err(OrgError::Heading {
+            line: line_no,
+            reason: "missing title".into(),
+        });
     };
     let lane = lane_from_org_keyword(keyword, line_no)?;
     let mut rest = rest.trim_start_matches([' ', '\t']);
@@ -394,7 +413,10 @@ fn parse_heading(
     };
 
     if rest.is_empty() || is_tag_block(rest) {
-        return Err(OrgError::Heading { line: line_no, reason: "missing title".into() });
+        return Err(OrgError::Heading {
+            line: line_no,
+            reason: "missing title".into(),
+        });
     }
 
     let (raw_title, tags) = split_trailing_tags(rest);
@@ -487,13 +509,20 @@ fn parse_property_line(trimmed: &str, line: usize) -> Result<(&str, &str), OrgEr
             reason: "property missing closing `:`".into(),
         });
     };
-    if key.is_empty() || key.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+    if key.is_empty()
+        || key
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
         return Err(OrgError::Property {
             line,
             reason: format!("invalid property key `{key}`"),
         });
     }
-    let val = after_close.strip_prefix(' ').unwrap_or(after_close).trim_end();
+    let val = after_close
+        .strip_prefix(' ')
+        .unwrap_or(after_close)
+        .trim_end();
     Ok((key, val))
 }
 
@@ -547,7 +576,10 @@ fn decode_link_token(token: &str, line: usize) -> Result<Link, OrgError> {
                 reason: "empty org link file path".into(),
             });
         }
-        return Ok(Link::Org { file: PathBuf::from(decoded_file), outline });
+        return Ok(Link::Org {
+            file: PathBuf::from(decoded_file),
+            outline,
+        });
     }
 
     let Some((raw_ns, raw_key)) = split_unescaped_colon(token) else {

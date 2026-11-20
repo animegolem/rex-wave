@@ -18,7 +18,10 @@ fn slug(s: &str, max: usize) -> Result<(), &'static str> {
     if s.is_empty() || s.len() > max {
         return Err("length out of range");
     }
-    if !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
         return Err("only [a-z0-9_-] allowed");
     }
     if s.starts_with('-') {
@@ -84,7 +87,7 @@ macro_rules! branded_str {
 }
 
 branded_str!(
-    /// A resident seat on the estate roster (`sol`, `astra`, `owner`, ...).
+    /// A named, long-lived seat (`sam`, `alice`, `owner`, ...).
     SeatName, "seat", |s| slug(&s, 32));
 branded_str!(
     /// A worker's role inside one wave (`author-jwt`, `verifier`). Unique per wave.
@@ -120,7 +123,20 @@ branded_str!(
     Sha256Hex, "sha256", |s| if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { Ok(()) } else { Err("need 64 lower-hex chars") });
 
 /// Per-stream monotonically increasing position. `Seq(0)` means "before the first entry".
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Seq(pub u64);
 
@@ -132,12 +148,38 @@ impl Seq {
 }
 
 /// BB's own per-thread event sequence (foreign cursor; never mixed with [`Seq`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(transparent)]
 pub struct BbSeq(pub u64);
 
 /// Wall-clock milliseconds since the Unix epoch, stamped by the daemon only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(transparent)]
 pub struct UnixMs(pub u64);
 
@@ -152,7 +194,10 @@ pub struct SeqRange {
 impl SeqRange {
     pub fn new(first: Seq, last: Seq) -> Result<Self, InvalidId> {
         if first.0 == 0 || last < first {
-            return Err(InvalidId { what: "seq range".into(), reason: "need 1 <= first <= last".into() });
+            return Err(InvalidId {
+                what: "seq range".into(),
+                reason: "need 1 <= first <= last".into(),
+            });
         }
         Ok(Self { first, last })
     }
@@ -185,12 +230,14 @@ impl From<SeqRange> for (u64, u64) {
 
 /// Who did something. Bound at session open by the transport; never parsed
 /// from command arguments.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Principal {
     /// The human operator at the TUI / CLI (authenticated by Unix peer uid).
     Operator { seat: SeatName },
-    /// A resident estate seat using a minted capability token (MCP stdio/HTTP).
+    /// A seat using a minted capability token (MCP stdio/HTTP).
     Seat { seat: SeatName },
     /// A BB thread spawned by a wave; resolved server-side from its BB thread id.
     Worker { wave: WaveSlug, role: RoleName },
@@ -199,7 +246,9 @@ pub enum Principal {
 }
 
 /// The daemon-internal parts allowed to issue `Audience::System` commands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemPart {
     WaveConductor,
@@ -220,7 +269,7 @@ impl fmt::Display for Principal {
 }
 
 branded_str!(
-    /// Short `@handle` unique *within one room* (`verifier`, `sol`). Rooms
+    /// Short `@handle` unique *within one room* (`verifier`, `sam`). Rooms
     /// resolve handles to principals at post time, so mention resolution never
     /// needs a cross-actor lookup.
     Handle, "handle", |s| slug(&s, 32));

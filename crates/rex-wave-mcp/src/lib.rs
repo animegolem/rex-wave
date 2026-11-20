@@ -132,7 +132,9 @@ impl<C: Client> McpServer<C> {
             let mut budget = self.budget.clone();
             budget.deadline = match parsed.timeout_ms {
                 Some(ms) => Duration::from_millis(ms.clamp(1, MAX_RUN_CODE_TIMEOUT_MS)),
-                None => budget.deadline.min(Duration::from_millis(MAX_RUN_CODE_TIMEOUT_MS)),
+                None => budget
+                    .deadline
+                    .min(Duration::from_millis(MAX_RUN_CODE_TIMEOUT_MS)),
             };
             return match codemode::run_code(&self.client, &parsed.code, budget).await {
                 Ok(outcome) => match serde_json::to_value(outcome) {
@@ -180,7 +182,8 @@ impl<C: Client + Clone + 'static> McpServer<C> {
 
     /// Serve MCP `2025-11-25` over process `stdin` and `stdout`.
     pub async fn serve_stdio(self) -> io::Result<()> {
-        self.serve_stream(tokio::io::stdin(), tokio::io::stdout()).await
+        self.serve_stream(tokio::io::stdin(), tokio::io::stdout())
+            .await
     }
 
     /// Serve MCP `2025-11-25` HTTP JSON-RPC over an already-bound loopback listener.
@@ -231,7 +234,10 @@ pub(crate) fn allowed_for(audience: Audience, principal: &Principal) -> bool {
 }
 
 pub(crate) fn allowed_tools(principal: &Principal) -> Vec<&'static ToolMeta> {
-    TOOLS.iter().filter(|t| allowed_for(t.audience, principal)).collect()
+    TOOLS
+        .iter()
+        .filter(|t| allowed_for(t.audience, principal))
+        .collect()
 }
 
 pub(crate) fn to_camel_case(snake: &str) -> String {
@@ -250,8 +256,15 @@ pub(crate) fn to_camel_case(snake: &str) -> String {
     out
 }
 
-pub(crate) fn parse_wire_command(tool: &'static ToolMeta, arguments: Value) -> Result<WireCommand, String> {
-    let normalized = if arguments.is_null() { json!({}) } else { arguments };
+pub(crate) fn parse_wire_command(
+    tool: &'static ToolMeta,
+    arguments: Value,
+) -> Result<WireCommand, String> {
+    let normalized = if arguments.is_null() {
+        json!({})
+    } else {
+        arguments
+    };
     serde_json::from_value::<WireCommand>(json!({
         "cmd": tool.name,
         "args": normalized,
@@ -262,7 +275,9 @@ pub(crate) fn parse_wire_command(tool: &'static ToolMeta, arguments: Value) -> R
 pub(crate) fn unwrap_wire_reply(expected_tool: &str, reply: WireReply) -> Result<Value, ApiError> {
     let encoded = serde_json::to_value(reply).map_err(|e| ApiError::Internal(e.to_string()))?;
     let Value::Object(mut map) = encoded else {
-        return Err(ApiError::Internal("WireReply did not serialize as object".into()));
+        return Err(ApiError::Internal(
+            "WireReply did not serialize as object".into(),
+        ));
     };
     let got_tag = map.remove("reply").and_then(|v| match v {
         Value::String(s) => Some(s),
@@ -278,7 +293,10 @@ pub(crate) fn unwrap_wire_reply(expected_tool: &str, reply: WireReply) -> Result
 }
 
 fn run_code_descriptor(allowed: &[&'static ToolMeta], budget: &codemode::Budget) -> ToolDescriptor {
-    let default_ms = budget.deadline.as_millis().min(u128::from(MAX_RUN_CODE_TIMEOUT_MS)) as u64;
+    let default_ms = budget
+        .deadline
+        .as_millis()
+        .min(u128::from(MAX_RUN_CODE_TIMEOUT_MS)) as u64;
     let heap_kib = budget.heap_bytes >> 10;
     let stack_kib = budget.stack_bytes >> 10;
     let ts_signatures = render_typescript_summary(allowed);
@@ -319,7 +337,10 @@ fn render_typescript_summary(allowed: &[&'static ToolMeta]) -> String {
         let params_ts = render_params_ts(&schema);
         let camel = to_camel_case(tool.name);
         if camel == tool.name {
-            lines.push(format!("  {}(args{params_ts}): Promise<unknown>;", tool.name));
+            lines.push(format!(
+                "  {}(args{params_ts}): Promise<unknown>;",
+                tool.name
+            ));
         } else {
             lines.push(format!(
                 "  {}(args{params_ts}): Promise<unknown>; // alias: rex.{camel}",
@@ -347,7 +368,11 @@ fn render_params_ts(schema: &Value) -> String {
 
     let mut fields = Vec::with_capacity(props.len());
     for (name, prop_schema) in props {
-        let opt = if required.contains(name.as_str()) { "" } else { "?" };
+        let opt = if required.contains(name.as_str()) {
+            ""
+        } else {
+            "?"
+        };
         let ty = render_type_ts(prop_schema, defs, 0);
         fields.push(format!("{name}{opt}: {ty}"));
     }
@@ -403,7 +428,10 @@ fn render_type_ts(schema: &Value, defs: Option<&Map<String, Value>>, depth: usiz
             "null" => "null".into(),
             "array" => {
                 if let Some(prefix) = schema.get("prefixItems").and_then(Value::as_array) {
-                    let elems: Vec<String> = prefix.iter().map(|p| render_type_ts(p, defs, depth + 1)).collect();
+                    let elems: Vec<String> = prefix
+                        .iter()
+                        .map(|p| render_type_ts(p, defs, depth + 1))
+                        .collect();
                     format!("[{}]", elems.join(", "))
                 } else if let Some(items) = schema.get("items") {
                     let inner = render_type_ts(items, defs, depth + 1);
@@ -428,7 +456,11 @@ fn render_type_ts(schema: &Value, defs: Option<&Map<String, Value>>, depth: usiz
                     other => other.to_owned(),
                 })
                 .collect();
-            if parts.is_empty() { "unknown".into() } else { parts.join(" | ") }
+            if parts.is_empty() {
+                "unknown".into()
+            } else {
+                parts.join(" | ")
+            }
         }
         _ => "unknown".into(),
     }

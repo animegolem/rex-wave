@@ -311,7 +311,9 @@ async fn http_post(
     }
     req.push_str("\r\n");
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect loopback http");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("connect loopback http");
     let _ = stream.write_all(req.as_bytes()).await;
     let _ = stream.write_all(body).await;
     let mut raw = Vec::new();
@@ -369,8 +371,16 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
     std::fs::write(sandbox_dir.join(".rex-wave-sandbox"), b"e2e-sandbox\n")
         .expect("write sandbox marker");
+    // The daemon refuses to start without a protected-roots file; an empty one
+    // says this test has nothing to protect.
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(config_dir.join("rex-wave")).expect("create config dir");
+    std::fs::write(config_dir.join("rex-wave").join("protected-roots"), b"")
+        .expect("write protected-roots");
 
-    let bb_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock bb");
+    let bb_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock bb");
     let bb_addr = bb_listener.local_addr().unwrap();
     let bb_token = "bb_tok_e2e";
     let bb_state = Arc::new(Mutex::new(MockBbState::default()));
@@ -534,6 +544,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             "--wake-bell",
             &sink_addr.to_string(),
         ])
+        .env("XDG_CONFIG_HOME", &config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -717,12 +728,12 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
                 id: wave_room.clone(),
             },
             member: Some(Principal::Seat {
-                seat: SeatName::parse("sol").unwrap(),
+                seat: SeatName::parse("sam").unwrap(),
             }),
             handle: None,
         })
         .await
-        .expect("operator invited @sol to wave room");
+        .expect("operator invited @sam to wave room");
     let _ = join_reply;
     let room_after_invite = operator
         .call(Read {
@@ -791,15 +802,21 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .expect("builder reached Parked and verifier reached Idle");
 
     let tok_output = Command::new(bin_path())
-        .args(["--socket", sock_path.to_str().unwrap(), "token", "--seat", "sol"])
+        .args([
+            "--socket",
+            sock_path.to_str().unwrap(),
+            "token",
+            "--seat",
+            "sam",
+        ])
         .output()
         .expect("mint seat token");
     assert!(tok_output.status.success());
-    let sol_token = String::from_utf8(tok_output.stdout)
+    let sam_token = String::from_utf8(tok_output.stdout)
         .unwrap()
         .trim()
         .to_owned();
-    assert!(sol_token.starts_with("rw_"));
+    assert!(sam_token.starts_with("rw_"));
 
     let mcp_addr = free_loopback_addr();
     let mcp_child = Command::new(bin_path())
@@ -810,7 +827,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             "--http",
             &mcp_addr.to_string(),
             "--token",
-            &sol_token,
+            &sam_token,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -864,7 +881,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
         "HTTP MCP rejects mismatched bearer token"
     );
 
-    let bearer_hdr = format!("Bearer {sol_token}");
+    let bearer_hdr = format!("Bearer {sam_token}");
     let run_code_script = r#"
         const board = "project:proj_e2e";
         const c1 = await rex.card_upsert({
@@ -919,12 +936,18 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .await;
     assert_eq!(mcp_status, 200);
     let mcp_json: Value = serde_json::from_str(&mcp_body).expect("mcp json");
-    assert_eq!(mcp_json["result"]["isError"], false, "mcp error: {mcp_json}");
+    assert_eq!(
+        mcp_json["result"]["isError"], false,
+        "mcp error: {mcp_json}"
+    );
     let outcome_text = mcp_json["result"]["content"][0]["text"]
         .as_str()
         .expect("run_code outcome text");
     let outcome_val: Value = serde_json::from_str(outcome_text).unwrap();
-    assert_eq!(outcome_val["value"]["who"], json!({ "kind": "seat", "seat": "sol" }));
+    assert_eq!(
+        outcome_val["value"]["who"],
+        json!({ "kind": "seat", "seat": "sam" })
+    );
     assert_eq!(outcome_val["value"]["c1"], 1);
     assert_eq!(outcome_val["value"]["c2"], 2);
     let post_seq = Seq(outcome_val["value"]["postSeq"].as_u64().unwrap());
@@ -933,10 +956,11 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
         loop {
             let st = bb_state.lock().await;
             let got_wait = st.tool_results.get("call_wait_builder_1").cloned();
-            let has_verifier_doorbell = st
-                .sends
-                .iter()
-                .any(|(tid, mode, txt)| tid == "th_auth-v2_verifier" && mode == "auto" && txt.contains("@verifier slice #1 ready for review"));
+            let has_verifier_doorbell = st.sends.iter().any(|(tid, mode, txt)| {
+                tid == "th_auth-v2_verifier"
+                    && mode == "auto"
+                    && txt.contains("@verifier slice #1 ready for review")
+            });
             if let Some((ok, text)) = got_wait
                 && has_verifier_doorbell
             {
@@ -1139,7 +1163,10 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             let still_blocking = inbox
                 .items
                 .iter()
-                .filter(|i| i.state == NotifyState::Unread && matches!(i.draft.kind, NotifyKind::Interaction { .. }))
+                .filter(|i| {
+                    i.state == NotifyState::Unread
+                        && matches!(i.draft.kind, NotifyKind::Interaction { .. })
+                })
                 .count() as u32;
             let snap = operator
                 .call(WaveView {
@@ -1165,12 +1192,12 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .await
     .expect("derive_osc7501_status flipped from blocked:permission to working");
 
-    let sol_seat = SeatName::parse("sol").unwrap();
+    let sam_seat = SeatName::parse("sam").unwrap();
     let letter = operator
         .call(MailPromote {
             room: wave_room.clone(),
             range: SeqRange::new(Seq(1), post_seq).unwrap(),
-            to: vec![sol_seat.clone()],
+            to: vec![sam_seat.clone()],
             subject: "auth-v2 slice 1 ratified".into(),
             topic: "auth-v2-slice-1".into(),
             priority: LetterPriority::High,
@@ -1179,41 +1206,42 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
         .expect("promote_to_letter succeeded");
 
     assert!(
-        letter.path.is_relative() && letter.path.starts_with("to-sol"),
+        letter.path.is_relative() && letter.path.starts_with("to-sam"),
         "unexpected letter path: {}",
         letter.path.display()
     );
     let letter_on_disk = sandbox_dir.join(&letter.path);
-    let letter_disk = std::fs::read_to_string(&letter_on_disk).expect("read banked Markdown letter");
+    let letter_disk =
+        std::fs::read_to_string(&letter_on_disk).expect("read banked Markdown letter");
     assert!(letter_disk.contains("auth-v2 slice 1 ratified"));
     assert!(letter_disk.contains("@verifier slice #1 ready for review"));
     assert_eq!(letter.item.schema, MailSchemaV1);
-    assert_eq!(letter.item.to, "sol");
+    assert_eq!(letter.item.to, "sam");
     assert_eq!(letter.item.kind, "letter");
     assert_eq!(letter.item.state, "open");
     assert_eq!(letter.item.topic.as_deref(), Some("auth-v2-slice-1"));
     assert_eq!(letter.item.reference.sha256, letter.sha256);
 
-    let sol_client = RemoteClient::connect(
+    let sam_client = RemoteClient::connect(
         Endpoint::Unix(sock_path.clone()),
         Credential::Token {
-            token: sol_token.clone(),
+            token: sam_token.clone(),
         },
-        "sol-e2e",
+        "sam-e2e",
     )
     .await
-    .expect("connect as sol seat");
+    .expect("connect as sam seat");
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let sol_inbox = sol_client
+            let sam_inbox = sam_client
                 .call(InboxList {
                     include_done: false,
                     limit: None,
                 })
                 .await
                 .unwrap();
-            if sol_inbox.items.iter().any(|i| {
+            if sam_inbox.items.iter().any(|i| {
                 matches!(
                     &i.draft.kind,
                     NotifyKind::LetterBanked { letter: l } if l.sha256 == letter.sha256
@@ -1227,7 +1255,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .await
     .expect("MailBridge::with_hub published Banked to live Hub for Herald");
 
-    sol_client
+    sam_client
         .call(MailAck {
             path: letter.path.clone(),
             sha256: letter.sha256.clone(),
@@ -1237,7 +1265,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
 
     let bell_payload = serde_json::to_vec(&json!({
         "bell_id": "nightly-rotation-audit",
-        "seat": "sol",
+        "seat": "sam",
         "prompt": "Audit refresh token rotation telemetry.",
         "fired_at": "2026-11-17T08:00",
     }))
@@ -1259,12 +1287,12 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             part: SystemPart::WakeBell,
         },
     }
-    .resolve(sol_client.me())
+    .resolve(sam_client.me())
     .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let page = sol_client
+            let page = sam_client
                 .call(Read {
                     stream: StreamId::Room {
                         room: dm_room.clone(),
@@ -1289,7 +1317,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .expect("BellCourier delivered live wake-bell DM");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let dm_after_settle = sol_client
+    let dm_after_settle = sam_client
         .call(Read {
             stream: StreamId::Room { room: dm_room },
             after: Seq::ORIGIN,

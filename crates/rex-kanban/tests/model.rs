@@ -18,7 +18,10 @@ fn validated_strings_lanes_priorities_and_external_links_behave_at_boundary() {
 
     assert!(IdemKey::parse("a".repeat(256)).is_ok());
     assert!(IdemKey::parse("a".repeat(257)).is_err());
-    assert!(IdemKey::parse("é".repeat(129)).is_err(), "byte-length cap matches wire IdemKey");
+    assert!(
+        IdemKey::parse("é".repeat(129)).is_err(),
+        "byte-length cap matches wire IdemKey"
+    );
 
     let expected_pairs = [
         (Lane::Idea, "idea", "IDEA"),
@@ -48,13 +51,27 @@ fn validated_strings_lanes_priorities_and_external_links_behave_at_boundary() {
     }
     assert_eq!(OrgPriority::parse_cookie("[#D]"), None);
 
-    for raw in ["rex://rooms/general#42", "letter://9f86d081884c7d65", "wave:auth-v2/verifier"] {
+    for raw in [
+        "rex://rooms/general#42",
+        "letter://9f86d081884c7d65",
+        "wave:auth-v2/verifier",
+    ] {
         let parsed = ExternalLink::parse_uri(raw).unwrap();
         assert_eq!(parsed.to_uri(), raw);
         assert_eq!(parsed.to_string(), raw);
     }
-    for bad in ["", "noscheme", "rex://", "wave:", "9bad:key", "rex://bad\nctrl"] {
-        assert!(ExternalLink::parse_uri(bad).is_err(), "rejected malformed URI `{bad}`");
+    for bad in [
+        "",
+        "noscheme",
+        "rex://",
+        "wave:",
+        "9bad:key",
+        "rex://bad\nctrl",
+    ] {
+        assert!(
+            ExternalLink::parse_uri(bad).is_err(),
+            "rejected malformed URI `{bad}`"
+        );
     }
 
     let upsert = CardUpsert {
@@ -120,7 +137,9 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
             expected: Some(CardRevision(1)),
             patch: CardPatch {
                 lane: Some(Lane::Doing.lane_name()),
-                assignee: Some(Assign::To { who: Assignee::parse("@sol").unwrap() }),
+                assignee: Some(Assign::To {
+                    who: Assignee::parse("@sam").unwrap(),
+                }),
                 labels_remove: vec!["core".into()],
                 labels_add: vec!["active".into()],
                 ..Default::default()
@@ -137,7 +156,10 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
             board: board.clone(),
             card: Some(CardNo(1)),
             expected: Some(CardRevision(1)),
-            patch: CardPatch { title: Some(Title::parse("Overwrite").unwrap()), ..Default::default() },
+            patch: CardPatch {
+                title: Some(Title::parse("Overwrite").unwrap()),
+                ..Default::default()
+            },
             idem: None,
         })
         .unwrap_err();
@@ -177,7 +199,11 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
     assert!(!state.cards.contains_key(&CardNo(1)));
     assert_eq!(
         state
-            .decide_archive(&CardArchive { board: board.clone(), card: CardNo(1), expected: None })
+            .decide_archive(&CardArchive {
+                board: board.clone(),
+                card: CardNo(1),
+                expected: None
+            })
             .unwrap(),
         vec![],
         "unconditional archive of an already-archived card is idempotent"
@@ -188,12 +214,18 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
             board: board.clone(),
             card: None,
             expected: None,
-            patch: CardPatch { title: Some(Title::parse("Next card").unwrap()), ..Default::default() },
+            patch: CardPatch {
+                title: Some(Title::parse("Next card").unwrap()),
+                ..Default::default()
+            },
             idem: None,
         })
         .unwrap();
     apply_all(&mut state, &second);
-    assert!(state.cards.contains_key(&CardNo(2)), "card numbers never reuse archived ids");
+    assert!(
+        state.cards.contains_key(&CardNo(2)),
+        "card numbers never reuse archived ids"
+    );
 }
 
 #[test]
@@ -203,7 +235,10 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
     let mut state = BoardState::default();
 
     let open = state
-        .decide_ensure(&BoardEnsure { board: board.clone(), lanes: Some(Lane::all_lane_names()) })
+        .decide_ensure(&BoardEnsure {
+            board: board.clone(),
+            lanes: Some(Lane::all_lane_names()),
+        })
         .unwrap();
     apply_all(&mut state, &open);
     log.extend(open);
@@ -253,7 +288,10 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
             board: board.clone(),
             card: Some(CardNo(3)),
             expected: Some(CardRevision(1)),
-            patch: CardPatch { position: Some(1), ..Default::default() },
+            patch: CardPatch {
+                position: Some(1),
+                ..Default::default()
+            },
             idem: None,
         })
         .unwrap();
@@ -272,7 +310,9 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
             patch: CardPatch {
                 lane: Some(Lane::Review.lane_name()),
                 position: Some(0),
-                assignee: Some(Assign::To { who: Assignee::parse("@astra").unwrap() }),
+                assignee: Some(Assign::To {
+                    who: Assignee::parse("@alice").unwrap(),
+                }),
                 ..Default::default()
             },
             idem: None,
@@ -293,7 +333,7 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
         .snapshot(
             log.len() as u64,
             Some(&BoardFilter {
-                assignee: Some(Assignee::parse("@astra").unwrap()),
+                assignee: Some(Assignee::parse("@alice").unwrap()),
                 label: None,
                 lane: Some(Lane::Review.lane_name()),
             }),
@@ -307,10 +347,13 @@ fn deterministic_lane_ordering_and_replay_preserve_positions() {
 #[test]
 fn standalone_engine_handles_idem_moves_and_links() {
     let mut engine = KanbanEngine::new();
-    let board = BoardId::parse("seat:sol").unwrap();
+    let board = BoardId::parse("seat:sam").unwrap();
 
     let info = engine
-        .ensure_board(BoardEnsure { board: board.clone(), lanes: Some(Lane::all_lane_names()) })
+        .ensure_board(BoardEnsure {
+            board: board.clone(),
+            lanes: Some(Lane::all_lane_names()),
+        })
         .unwrap();
     assert_eq!(info.lanes.len(), 6);
 
@@ -353,14 +396,23 @@ fn standalone_engine_handles_idem_moves_and_links() {
             board: board.clone(),
             card: None,
             expected: None,
-            patch: CardPatch { title: Some(Title::parse("Different title on retry").unwrap()), ..Default::default() },
+            patch: CardPatch {
+                title: Some(Title::parse("Different title on retry").unwrap()),
+                ..Default::default()
+            },
             idem: Some(idem),
         })
         .unwrap();
-    assert_eq!(replay, r1, "idempotent retry returns original creation receipt");
+    assert_eq!(
+        replay, r1,
+        "idempotent retry returns original creation receipt"
+    );
 
     let snap = engine
-        .view_board(BoardView { board: board.clone(), filter: None })
+        .view_board(BoardView {
+            board: board.clone(),
+            filter: None,
+        })
         .unwrap();
     let org_rendered = org::render(&snap);
     let parsed_cards = org::parse(&org_rendered).unwrap();

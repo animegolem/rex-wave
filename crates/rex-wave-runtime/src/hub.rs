@@ -12,7 +12,9 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(capacity: usize) -> Self {
-        Hub { tx: broadcast::channel(capacity).0 }
+        Hub {
+            tx: broadcast::channel(capacity).0,
+        }
     }
 
     pub fn publish(&self, committed: &[Envelope]) {
