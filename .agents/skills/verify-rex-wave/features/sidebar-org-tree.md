@@ -24,7 +24,8 @@ Preconditions:
 
 - **Move across top nodes.** Step from `Inbox` to `Kanban` and `Projects`. Run `rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j` once, wait for `Kanban · project:proj_alpha` in `rex capture -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" --trim --unwrap`, then run `rex send-key ... j` a second time. Cursor lands on `▾ Projects`, skipping the `─` divider row.
 - **Collapse branch.** Fold `Projects`. Run `rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space`. `rex capture --trim --unwrap` shows `▸ Projects` and hides `proj_alpha`, `proj_beta`, and their child waves.
-- **Expand branch.** Unfold `Projects`. Run `rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space`. `rex capture --trim --unwrap` shows `▾ Projects`, `proj_alpha`, `#wave-auth-v2`, `author-jwt`, `migrator`, and `proj_beta`.
+- **Expand branch.** Unfold `Projects`. Run `rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space`. `rex capture --trim --unwrap` shows `▾ Projects`, `proj_alpha`, `auth-v2` (redundant `#wave-` prefix stripped under project branches), `author-jwt [codex]`, `migrator [claude]`, and `proj_beta`.
+- **Resize or hide sidebar.** Send `>`, `<`, and `\` via `rex send` (or drag the pane divider with the mouse) to widen, narrow, or hide and restore `Org Tree`.
 - **Jump to bottom DM.** Jump to the last focusable row. Run `rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+g`. After 150 ms, `rex capture --trim --unwrap` shows the `@sam` direct-message transcript on the right-hand stage.
 - **Proof.** Save folded, unfolded, and bottom-jump captures to `/tmp/rex-wave-evidence/$RUN_ID/steps/` alongside `program_status` and `modes` JSON snapshots.
 

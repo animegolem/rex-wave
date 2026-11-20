@@ -122,6 +122,7 @@ pub struct Sidebar {
     pub hover: Option<NodeKey>,
     pub scroll: u16,
     pub ctx_pct: BTreeMap<(WaveSlug, RoleName), u8>,
+    fold_level: u8,
 }
 
 impl Sidebar {
@@ -135,6 +136,7 @@ impl Sidebar {
             hover: None,
             scroll: 0,
             ctx_pct,
+            fold_level: 2,
         }
     }
 
@@ -208,6 +210,36 @@ impl Sidebar {
         {
             self.cursor = last.key;
         }
+    }
+
+    /// Org-mode style global visibility cycle: everything folded, then sections and
+    /// projects open with waves folded, then everything open.
+    pub fn cycle_fold_all(&mut self, overview: &SidebarTreeSnapshot) {
+        let mut foldables: Vec<(NodeKey, u16)> = Vec::new();
+        collect_foldables(&self.roots, 0, &mut foldables);
+        self.fold_level = (self.fold_level + 1) % 3;
+        for (key, depth) in foldables {
+            let expanded = match self.fold_level {
+                0 => false,
+                1 => depth < 2,
+                _ => true,
+            };
+            self.folds.set(key, expanded);
+        }
+        self.rebuild(overview);
+    }
+
+    /// The BB project that owns `key`, if `key` is a project or sits under one.
+    pub fn project_of(&self, key: &NodeKey) -> Option<BbProjectId> {
+        if let NodeKey::Project(p) = key {
+            return Some(p.clone());
+        }
+        ancestor_chain(&self.roots, key)?
+            .into_iter()
+            .find_map(|k| match k {
+                NodeKey::Project(p) => Some(p),
+                _ => None,
+            })
     }
 
     pub fn fold_or_parent(&mut self) {
@@ -489,10 +521,12 @@ pub fn build_with_ctx(
                             Glyph::Blocked => blocked_cnt += 1,
                             _ => {}
                         }
+                        let provider_full = worker.provider.to_string();
+                        let provider = provider_badge(&provider_full);
                         let tag =
                             match ctx_pct.get(&(wave_branch.wave.clone(), worker.role.clone())) {
-                                Some(pct) => format!("[{} · {}%]", worker.provider, pct),
-                                None => format!("[{}]", worker.provider),
+                                Some(pct) => format!("[{provider} · {pct}%]"),
+                                None => format!("[{provider}]"),
                             };
                         SidebarNode {
                             key: NodeKey::Agent {
@@ -516,7 +550,7 @@ pub fn build_with_ctx(
                 };
                 room_nodes.push(SidebarNode {
                     key: NodeKey::Room(wave_branch.room.clone()),
-                    label: format!("#wave-{}", wave_branch.wave),
+                    label: wave_branch.wave.to_string(),
                     badge: (wave_branch.unread > 0).then_some(wave_branch.unread),
                     glyph: None,
                     tag: wave_tag,
@@ -666,12 +700,27 @@ fn flatten_children(
     }
 }
 
+fn collect_foldables(nodes: &[SidebarNode], depth: u16, out: &mut Vec<(NodeKey, u16)>) {
+    for n in nodes {
+        if is_foldable(n) {
+            out.push((n.key.clone(), depth));
+        }
+        collect_foldables(&n.children, depth + 1, out);
+    }
+}
+
 fn is_foldable(node: &SidebarNode) -> bool {
     !node.children.is_empty()
         || matches!(
             node.key,
             NodeKey::ProjectsHeader | NodeKey::ChannelsHeader | NodeKey::DmsHeader
         )
+}
+
+/// Compact provider badge: `claude-code` -> `claude`, `acp-opencode` -> `opencode`.
+pub fn provider_badge(provider: &str) -> &str {
+    let p = provider.strip_prefix("acp-").unwrap_or(provider);
+    p.strip_suffix("-code").unwrap_or(p)
 }
 
 fn room_short_label(room: &RoomId) -> String {
@@ -720,4 +769,18 @@ fn ancestor_chain(nodes: &[SidebarNode], target: &NodeKey) -> Option<Vec<NodeKey
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_badges_shorten_known_prefixes_and_suffixes() {
+        assert_eq!(provider_badge("claude-code"), "claude");
+        assert_eq!(provider_badge("acp-opencode"), "opencode");
+        assert_eq!(provider_badge("codex"), "codex");
+        assert_eq!(provider_badge("acp-claude-code"), "claude");
+        assert_eq!(provider_badge("gemini"), "gemini");
+    }
 }

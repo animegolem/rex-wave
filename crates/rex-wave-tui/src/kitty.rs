@@ -549,12 +549,13 @@ fn encode_osc7501(osc: &Osc7501) -> String {
     if !osc.id.is_empty() {
         let _ = write!(body, ":id={}", sanitize_osc_val(&osc.id));
     }
-    let _ = write!(
-        body,
-        ":app=rex-wave:title={}:msg={}",
-        sanitize_osc_val(&osc.title),
-        sanitize_osc_val(&osc.msg)
-    );
+    let _ = write!(body, ":app=rex-wave");
+    if !osc.title.is_empty() {
+        let _ = write!(body, ":title={}", B64.encode(osc.title.as_bytes()));
+    }
+    if !osc.msg.is_empty() {
+        let _ = write!(body, ":msg={}", B64.encode(osc.msg.as_bytes()));
+    }
     format!("\x1b]7501;{body}\x1b\\")
 }
 
@@ -774,4 +775,57 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 
 fn lerp_f(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field<'a>(seq: &'a str, key: &str) -> Option<&'a str> {
+        let body = seq.strip_prefix("\x1b]7501;")?.strip_suffix("\x1b\\")?;
+        body.split(':')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    #[test]
+    fn osc7501_title_and_msg_are_base64_utf8() {
+        let osc = Osc7501 {
+            state: ProgramState::Blocked,
+            kind: Some(BlockKind::Permission),
+            progress: None,
+            id: "wave-auth-v2".to_owned(),
+            title: "#wave-auth-v2 · résumé".to_owned(),
+            msg: "1 worker blocked: needs approval".to_owned(),
+        };
+        let seq = encode_osc7501(&osc);
+        assert_eq!(field(&seq, "state"), Some("blocked"));
+        assert_eq!(field(&seq, "id"), Some("wave-auth-v2"));
+        let title = B64
+            .decode(field(&seq, "title").expect("title"))
+            .expect("b64");
+        let msg = B64.decode(field(&seq, "msg").expect("msg")).expect("b64");
+        assert_eq!(String::from_utf8(title).unwrap(), osc.title);
+        assert_eq!(String::from_utf8(msg).unwrap(), osc.msg);
+        for v in [field(&seq, "title").unwrap(), field(&seq, "msg").unwrap()] {
+            assert_eq!(v.len() % 4, 0, "padded standard base64");
+        }
+    }
+
+    #[test]
+    fn osc7501_short_ascii_msg_is_still_valid_base64() {
+        let osc = Osc7501 {
+            state: ProgramState::Idle,
+            kind: None,
+            progress: None,
+            id: "rex-wave".to_owned(),
+            title: "rex-wave".to_owned(),
+            msg: "ready".to_owned(),
+        };
+        let seq = encode_osc7501(&osc);
+        assert_eq!(field(&seq, "msg"), Some("cmVhZHk="));
+        assert_eq!(
+            encode_osc7501(&Osc7501::clear()),
+            "\x1b]7501;state=clear\x1b\\"
+        );
+    }
 }

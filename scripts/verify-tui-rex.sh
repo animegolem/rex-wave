@@ -717,12 +717,18 @@ jq -n \
 	}' > "$EVIDENCE_DIR/doctor.json"
 
 record_step "inbox-initial"
+assert_contains "$(cat "$STEPS_DIR/01-inbox-initial.screen.txt")" "● connected" "connected status pill in top chrome"
+assert_contains "$(cat "$STEPS_DIR/01-inbox-initial.screen.txt")" "[claude]" "shortened claude provider badge in sidebar"
 INITIAL_OSC_STATE="$(jq -er '.records[0].state' "$STEPS_DIR/01-inbox-initial.program_status.json")"
 INITIAL_OSC_KIND="$(jq -er '.records[0].kind' "$STEPS_DIR/01-inbox-initial.program_status.json")"
+INITIAL_OSC_TITLE="$(jq -er '.records[0].title // empty' "$STEPS_DIR/01-inbox-initial.program_status.json")"
+INITIAL_OSC_MSG="$(jq -er '(.records[0].msg // .records[0].message) // empty' "$STEPS_DIR/01-inbox-initial.program_status.json")"
 [[ "$INITIAL_OSC_STATE" == "blocked" && "$INITIAL_OSC_KIND" == "permission" ]] \
 	|| fail "expected initial OSC 7501 state=blocked kind=permission, got state=$INITIAL_OSC_STATE kind=$INITIAL_OSC_KIND"
+[[ "$INITIAL_OSC_TITLE" == "#wave-auth-v2" && -n "$INITIAL_OSC_MSG" ]] \
+	|| fail "expected base64-decoded OSC 7501 title='#wave-auth-v2' and non-empty msg, got title='$INITIAL_OSC_TITLE' msg='$INITIAL_OSC_MSG'"
 
-printf '==> Journey 1: Inbox 55+ card scroll + GraphicsMode [v] cycle\n'
+printf '==> Journey 1: Inbox 55+ card scroll, [r] mark-read, [?] help overlay + GraphicsMode [v] cycle\n'
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" tab
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
@@ -732,6 +738,32 @@ record_step "inbox-bottom"
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" k
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" g
 wait_screen_contains "migrator waiting on interaction" "Inbox scrolled back to top card"
+
+# Select second card (unread mention/DM) and mark read via [r] keyboard shortcut.
+UNREAD_BEFORE="$("$REX_WAVE_BIN" --socket "$SOCK" --json inbox --limit 200 | jq -er '.value.unread')"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+sleep 0.1
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" r
+MARK_READ_DEADLINE=$(( $(now_ms) + 5000 ))
+UNREAD_AFTER="$UNREAD_BEFORE"
+while (( $(now_ms) < MARK_READ_DEADLINE )); do
+	UNREAD_AFTER="$("$REX_WAVE_BIN" --socket "$SOCK" --json inbox --limit 200 | jq -er '.value.unread')"
+	if (( UNREAD_AFTER < UNREAD_BEFORE )); then
+		break
+	fi
+	sleep 0.08
+done
+(( UNREAD_AFTER < UNREAD_BEFORE )) \
+	|| fail "expected [r] keyboard mark-read to reduce unread count below $UNREAD_BEFORE, got $UNREAD_AFTER"
+wait_screen_contains "✓ " "Marked-read checkmark rendered on Inbox card"
+record_step "inbox-marked-read"
+
+# Open [?] keymap help overlay and cycle GraphicsMode [v] inside it.
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '?'
+wait_screen_contains "Keys · rex-wave" "Keymap Help Overlay opened"
+wait_screen_contains "Hybrid z=-1 + U+10EEEE" "GraphicsMode Hybrid shown in Help Overlay"
+wait_screen_contains "mark card read" "[r] mark card read documented in Help Overlay"
+record_step "help-overlay-open"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" v
 wait_screen_contains "z=-1 only" "GraphicsMode BackdropOnly"
@@ -747,6 +779,19 @@ record_step "graphics-pure-cells"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" v
 wait_screen_contains "Hybrid z=-1 + U+10EEEE" "GraphicsMode Hybrid restored"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" esc
+wait_screen_not_contains "Keys · rex-wave" "Keymap Help Overlay closed"
+
+# Resize and toggle-hide sidebar via > / < / \.
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '>'
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '<'
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '\'
+wait_screen_not_contains "Org Tree" "Sidebar hidden via backslash toggle"
+record_step "sidebar-hidden"
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '\'
+wait_screen_contains "Org Tree" "Sidebar restored via backslash toggle"
+record_step "sidebar-restored"
+
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" tab
 
 printf '==> Journey 2: Kanban board navigation, card move [m], and composer new task [i]\n'
@@ -786,18 +831,36 @@ wait_screen_contains "▾ Projects" "Projects branch expanded"
 wait_screen_contains "proj_alpha" "proj_alpha visible after unfold"
 record_step "sidebar-projects-unfolded"
 
-printf '==> Journey 4: Wave room chat compose [i + send + enter] and canon letter promote [P]\n'
+printf '==> Journey 4: Wave room wrapped markdown, collapsed brief, multiline paste/newline compose, pager, and promote [P]\n'
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" enter
 wait_screen_contains "Room · #proj_alpha/wave-auth-v2" "Wave room stage loaded"
+wait_screen_contains "brief for @author-jwt [Enter to expand]" "WaveConductor brief collapsed to 1-line summary"
 record_step "wave-room-before-post"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" i
-rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '@author-jwt Rex CUA live check passed'
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" $'\e[200~# Council Review\n@author-jwt Rex CUA live check passed with **bold** and `verify_jwt()`.\nSecond wrapped line rendered without single-line clipping.\e[201~'
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" ctrl+j
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" 'Third line via ctrl+j newline.'
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+enter
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" 'Fourth line via shift+enter.'
+record_step "wave-room-multiline-composer"
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" enter
-wait_screen_contains "@author-jwt Rex CUA live check passed" "Composed message rendered in wave room"
+wait_screen_contains "Council Review" "Markdown heading rendered in wave room"
+wait_screen_contains "Second wrapped line rendered without single-line clipping." "Wrapped second line rendered in wave room"
+wait_screen_contains "Third line via ctrl+j newline." "Third line rendered in wave room"
+wait_screen_contains "Fourth line via shift+enter." "Fourth line via shift+enter rendered without premature submit"
+record_step "wave-room-multiline-wrapped"
+
+# Select message with k and open full-message Pager overlay with enter, then close with esc.
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" k
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" enter
+wait_screen_contains "esc/q/? close" "Full-message Pager overlay opened"
+record_step "wave-room-pager"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" esc
+wait_screen_not_contains "esc/q/? close" "Full-message Pager overlay closed"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+p
 wait_screen_contains "Banked " "Room messages promoted to canon letter"
@@ -807,6 +870,7 @@ LETTER_FILE="$(find "$SANDBOX/to-owner" -maxdepth 1 -type f -name '*.md' | head 
 [[ -n "$LETTER_FILE" && -s "$LETTER_FILE" ]] || fail "expected banked canon letter in $SANDBOX/to-owner"
 cp "$LETTER_FILE" "$EVIDENCE_DIR/promoted-letter.md"
 assert_contains "$(cat "$EVIDENCE_DIR/promoted-letter.md")" "Rex CUA live check passed" "banked canon letter body"
+assert_contains "$(cat "$EVIDENCE_DIR/promoted-letter.md")" "Third line via ctrl+j newline." "multiline newline preserved in banked letter"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" tab
 
@@ -841,15 +905,18 @@ while (( $(now_ms) < OSC_WORKING_DEADLINE )); do
 	sleep 0.08
 done
 record_step "agent-inspector-resolved"
-RESOLVED_OSC_STATE="$(jq -er '.records[0].state' "$STEPS_DIR/14-agent-inspector-resolved.program_status.json")"
-[[ "$RESOLVED_OSC_STATE" == "working" ]] \
-	|| fail "expected OSC 7501 state=working after interaction approval, got $RESOLVED_OSC_STATE"
+RESOLVED_OSC_FILE="$(ls -1 "$STEPS_DIR"/*-agent-inspector-resolved.program_status.json | tail -n 1)"
+RESOLVED_OSC_STATE="$(jq -er '.records[0].state' "$RESOLVED_OSC_FILE")"
+RESOLVED_OSC_TITLE="$(jq -er '.records[0].title // empty' "$RESOLVED_OSC_FILE")"
+[[ "$RESOLVED_OSC_STATE" == "working" && "$RESOLVED_OSC_TITLE" == "#wave-auth-v2" ]] \
+	|| fail "expected OSC 7501 state=working title='#wave-auth-v2' after interaction approval, got state=$RESOLVED_OSC_STATE title=$RESOLVED_OSC_TITLE"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" tab
 
 printf '==> Journey 6: Direct Messages jump [G] and clean TUI quit [q]\n'
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+g
 wait_screen_contains "DM batch #1 from @sam" "Direct Message stage with @sam"
+wait_screen_contains "All 32 alpha shards reported nominal p99." "Wrapped second line in Direct Message stage"
 record_step "direct-message-sam"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" q
@@ -867,7 +934,8 @@ while (( $(now_ms) < QUIT_DEADLINE )); do
 done
 [[ "$EXITED_CLEAN" -eq 1 ]] || fail "expected rex-wave tui to leave alternate screen and exit 0 on q"
 record_step "after-clean-quit"
-QUIT_OSC_LEN="$(jq -er '.records | length' "$STEPS_DIR/16-after-clean-quit.program_status.json")"
+QUIT_OSC_FILE="$(ls -1 "$STEPS_DIR"/*-after-clean-quit.program_status.json | tail -n 1)"
+QUIT_OSC_LEN="$(jq -er '.records | length' "$QUIT_OSC_FILE")"
 [[ "$QUIT_OSC_LEN" == "0" ]] || fail "expected OSC 7501 records cleared on quit, got $QUIT_OSC_LEN"
 
 OSC_RECORDS_OBSERVED="$(jq -s '[.[].records | length] | add // 0' "$STEPS_DIR"/*.program_status.json)"
@@ -908,7 +976,7 @@ jq -n \
 		program_status_snapshots: $program_status_files,
 		inbox_seeded: $inbox_seeded,
 		osc7501_records_observed: $osc7501_records_observed,
-		osc7501_note: "OSC 7501 blocked->working->clear verified live; raw title/msg base64 caveat documented in features/inbox-and-osc7501.md Gotchas",
+		osc7501_note: "OSC 7501 blocked->working->clear verified live with base64-encoded UTF-8 title and msg fields",
 		verified_cleanup: {
 			scratch_removed: true,
 			rex_session_killed: true,
