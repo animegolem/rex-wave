@@ -149,6 +149,31 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
     .unwrap();
     assert_eq!(ws_json["reply"], "wave_start");
 
+    let sock_for_wait = sock_path.to_str().unwrap().to_owned();
+    let wait_out = tokio::task::spawn_blocking(move || {
+        Command::new(bin_path())
+            .args([
+                "--socket",
+                &sock_for_wait,
+                "--json",
+                "wait",
+                "#p_123/wave-auth-v2",
+                "--since",
+                "0",
+                "--timeout",
+                "0",
+            ])
+            .output()
+            .expect("run rex-wave wait")
+    })
+    .await
+    .unwrap();
+    assert_eq!(wait_out.status.code(), Some(124));
+    let wait_json: serde_json::Value =
+        serde_json::from_slice(&wait_out.stdout).expect("wait json reply");
+    assert_eq!(wait_json["reply"], "wait");
+    assert_eq!(wait_json["value"]["timed_out"], true);
+
     let cases: Vec<(&str, Vec<&str>)> = vec![
         (
             "room_post",
@@ -157,17 +182,6 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
         (
             "room_post",
             vec!["post", "@sam", "can you take the migration?"],
-        ),
-        (
-            "wait",
-            vec![
-                "wait",
-                "#p_123/wave-auth-v2",
-                "--since",
-                "0",
-                "--timeout",
-                "0",
-            ],
         ),
         (
             "wave_add_worker",

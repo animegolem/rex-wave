@@ -1338,9 +1338,11 @@ dependencies = [
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
+ "rex-wave-t3",
  "rex-wave-transport",
  "rex-wave-tui",
  "rex-wave-waves",
+ "serde",
  "serde_json",
  "tokio",
 ]

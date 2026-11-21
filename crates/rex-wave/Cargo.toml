@@ -21,10 +21,12 @@ rex-wave-waves.workspace = true
 rex-wave-notify.workspace = true
 rex-wave-mailbridge.workspace = true
 rex-wave-bb.workspace = true
+rex-wave-t3.workspace = true
 rex-wave-transport.workspace = true
 rex-wave-mcp.workspace = true
 rex-wave-tui.workspace = true
 clap.workspace = true
+serde.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 
