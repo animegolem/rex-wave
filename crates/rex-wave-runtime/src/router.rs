@@ -1,8 +1,11 @@
 use crate::read::ReadSide;
 use crate::{BoxFut, DecideCtx, Service, now};
+use rex_wave_api::room::RoomId;
+use rex_wave_api::wave::{Activity, Observation, WaveObserve, WaveView, WorkerPhase};
 use rex_wave_api::*;
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
 
 /// One authenticated connection (or in-process client): its principal and its
@@ -66,6 +69,158 @@ pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
     }
 }
 
+type ActiveWaitKey = (usize, WaveSlug, RoleName);
+
+fn active_worker_waits() -> &'static Mutex<HashMap<ActiveWaitKey, usize>> {
+    static MAP: OnceLock<Mutex<HashMap<ActiveWaitKey, usize>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn increment_active_wait(key: &ActiveWaitKey) -> usize {
+    let mut map = active_worker_waits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(key.clone()).or_insert(0);
+    *entry += 1;
+    *entry
+}
+
+fn decrement_active_wait(key: &ActiveWaitKey) -> usize {
+    let mut map = active_worker_waits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(count) = map.get_mut(key) else {
+        return 0;
+    };
+    *count = count.saturating_sub(1);
+    let remaining = *count;
+    if remaining == 0 {
+        map.remove(key);
+    }
+    remaining
+}
+
+fn parked_room_and_since(
+    worker: &Principal,
+    wait: &rex_wave_api::read::Wait,
+) -> (Option<RoomId>, Seq) {
+    match &wait.interest {
+        Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
+        {
+            Ok(id) => {
+                let since = wait.after.at(&StreamId::Room { room: id.clone() });
+                (Some(id), since)
+            }
+            Err(_) => (None, Seq::ORIGIN),
+        },
+        Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
+            StreamId::Room { room } => (Some(room.clone()), wait.after.at(&streams[0])),
+            _ => (None, Seq::ORIGIN),
+        },
+        _ => (None, Seq::ORIGIN),
+    }
+}
+
+fn system_ctx() -> DecideCtx {
+    DecideCtx {
+        by: Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+        at: now(),
+    }
+}
+
+async fn restore_worker_working(
+    wave_svc: &Arc<dyn Service<WaveCommand>>,
+    wave: &WaveSlug,
+    role: &RoleName,
+) {
+    let still_parked = match wave_svc
+        .dispatch(
+            WaveCommand::WaveView(WaveView { wave: wave.clone() }),
+            system_ctx(),
+        )
+        .await
+    {
+        Ok(WireReply::WaveView(snap)) => snap.workers.iter().any(|(r, _, phase)| {
+            r == role
+                && matches!(
+                    phase,
+                    WorkerPhase::Live {
+                        activity: Activity::Parked { .. },
+                        ..
+                    }
+                )
+        }),
+        _ => false,
+    };
+    if still_parked {
+        let _ = wave_svc
+            .dispatch(
+                WaveCommand::WaveObserve(WaveObserve {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    observation: Observation::Activity {
+                        activity: Activity::Working,
+                    },
+                }),
+                system_ctx(),
+            )
+            .await;
+    }
+}
+
+struct WorkerWaitGuard {
+    key: ActiveWaitKey,
+    wave_svc: Arc<dyn Service<WaveCommand>>,
+    wave: WaveSlug,
+    role: RoleName,
+    completed: bool,
+}
+
+impl WorkerWaitGuard {
+    fn enter(wave_svc: Arc<dyn Service<WaveCommand>>, wave: WaveSlug, role: RoleName) -> Self {
+        let key = (
+            Arc::as_ptr(&wave_svc).cast::<()>() as usize,
+            wave.clone(),
+            role.clone(),
+        );
+        increment_active_wait(&key);
+        WorkerWaitGuard {
+            key,
+            wave_svc,
+            wave,
+            role,
+            completed: false,
+        }
+    }
+
+    async fn finish(mut self) {
+        self.completed = true;
+        if decrement_active_wait(&self.key) == 0 {
+            restore_worker_working(&self.wave_svc, &self.wave, &self.role).await;
+        }
+    }
+}
+
+impl Drop for WorkerWaitGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if decrement_active_wait(&self.key) == 0
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let wave_svc = self.wave_svc.clone();
+            let wave = self.wave.clone();
+            let role = self.role.clone();
+            handle.spawn(async move {
+                restore_worker_working(&wave_svc, &wave, &role).await;
+            });
+        }
+    }
+}
+
 impl Router {
     pub async fn dispatch(&self, by: &Principal, cmd: WireCommand) -> Result<WireReply, ApiError> {
         authorize(cmd.meta().audience, by)?;
@@ -80,6 +235,36 @@ impl Router {
             Routed::Inbox(c) => self.inbox.dispatch(c, ctx).await,
             Routed::Mail(c) => self.mail.dispatch(c, ctx).await,
             Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
+            Routed::Read(ReadCommand::Wait(wait)) => {
+                let guard = if wait.timeout_ms != Some(0)
+                    && let Principal::Worker { wave, role } = by
+                {
+                    let (room, since) = parked_room_and_since(by, &wait);
+                    let guard =
+                        WorkerWaitGuard::enter(self.wave.clone(), wave.clone(), role.clone());
+                    let _ = self
+                        .wave
+                        .dispatch(
+                            WaveCommand::WaveObserve(WaveObserve {
+                                wave: wave.clone(),
+                                role: role.clone(),
+                                observation: Observation::Activity {
+                                    activity: Activity::Parked { room, since },
+                                },
+                            }),
+                            system_ctx(),
+                        )
+                        .await;
+                    Some(guard)
+                } else {
+                    None
+                };
+                let outcome = self.read.dispatch(ReadCommand::Wait(wait), ctx).await;
+                if let Some(g) = guard {
+                    g.finish().await;
+                }
+                outcome
+            }
             Routed::Read(c) => self.read.dispatch(c, ctx).await,
         }
     }

@@ -1255,3 +1255,206 @@ async fn room_filtered_watch_matches_before_or_after_labels_and_threads_causally
         Event::Room(RoomEvent::Labeled { target, .. }) if target == reply.seq
     ));
 }
+
+struct RecordingWaves {
+    observed: Arc<std::sync::Mutex<Vec<(WaveSlug, RoleName, rex_wave_api::wave::Observation)>>>,
+    activity: Arc<std::sync::Mutex<Activity>>,
+}
+
+impl Service<WaveCommand> for RecordingWaves {
+    fn dispatch(
+        &self,
+        cmd: WaveCommand,
+        _ctx: DecideCtx,
+    ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+        let observed = self.observed.clone();
+        let activity = self.activity.clone();
+        Box::pin(async move {
+            match cmd {
+                WaveCommand::WaveObserve(obs) => {
+                    if let rex_wave_api::wave::Observation::Activity { activity: ref a } =
+                        obs.observation
+                    {
+                        *activity.lock().unwrap() = a.clone();
+                    }
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((obs.wave, obs.role, obs.observation));
+                    Ok(WireReply::WaveObserve(Ack))
+                }
+                WaveCommand::WaveView(v) => {
+                    let act = activity.lock().unwrap().clone();
+                    let role = RoleName::parse("author").unwrap();
+                    let agent = rex_wave_api::wave::AgentSpec {
+                        provider: ProviderId::parse("codex").unwrap(),
+                        model: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: rex_wave_api::wave::PermissionMode::AcceptEdits,
+                        workspace: rex_wave_api::wave::Workspace::ProjectDefault,
+                    };
+                    Ok(WireReply::WaveView(rex_wave_api::wave::WaveSnapshot {
+                        spec: rex_wave_api::wave::WaveSpec {
+                            slug: v.wave,
+                            project: BbProjectId::parse("proj_1").unwrap(),
+                            goal: Body::parse("goal").unwrap(),
+                            defaults: agent.clone(),
+                            workers: vec![],
+                        },
+                        status: rex_wave_api::wave::WaveStatus::Running,
+                        workers: vec![(
+                            role,
+                            agent,
+                            rex_wave_api::wave::WorkerPhase::Live {
+                                thread: BbThreadId::parse("t3:w1:author:a1").unwrap(),
+                                activity: act,
+                            },
+                        )],
+                    }))
+                }
+                _ => Err(ApiError::Unavailable {
+                    family: Family::Wave,
+                }),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn worker_wait_emits_parked_and_working_and_restores_on_cancel() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(128);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let activity = Arc::new(std::sync::Mutex::new(Activity::Working));
+    let waves = Arc::new(RecordingWaves {
+        observed: observed.clone(),
+        activity: activity.clone(),
+    });
+    let router = Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: waves,
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<ToyInbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let wave = WaveSlug::parse("w1").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    let worker = LocalClient::new(
+        router.clone(),
+        Principal::Worker {
+            wave: wave.clone(),
+            role: role.clone(),
+        },
+    );
+    let op = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let room_ref = chan("wave-w1");
+    let room_id = room_ref.resolve(op.me()).unwrap();
+
+    let _ = worker
+        .call(Wait {
+            interest: Interest::Room {
+                room: room_ref.clone(),
+            },
+            after: Cursor::default().with(
+                StreamId::Room {
+                    room: room_id.clone(),
+                },
+                Seq(0),
+            ),
+            timeout_ms: Some(0),
+        })
+        .await
+        .unwrap();
+    assert!(observed.lock().unwrap().is_empty());
+
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        let room_id = room_id.clone();
+        async move {
+            let mut w = Wait::room(room_id, Seq(0), false);
+            w.timeout_ms = Some(2000);
+            worker.call(w).await.unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(*activity.lock().unwrap(), Activity::Parked { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker observed Parked on Wait entry");
+
+    op.call(post(room_ref.clone(), "wake up", None))
+        .await
+        .unwrap();
+    let page = waiter.await.unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(*activity.lock().unwrap(), Activity::Working);
+    {
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(matches!(
+            &log[0].2,
+            rex_wave_api::wave::Observation::Activity {
+                activity: Activity::Parked { room: Some(r), since: Seq(0) }
+            } if r == &room_id
+        ));
+        assert!(matches!(
+            &log[1].2,
+            rex_wave_api::wave::Observation::Activity {
+                activity: Activity::Working
+            }
+        ));
+    }
+
+    let cancelled = tokio::spawn({
+        let worker = worker.clone();
+        let room_id = room_id.clone();
+        async move {
+            let mut w = Wait::room(room_id, Seq(10), false);
+            w.timeout_ms = Some(30_000);
+            let _ = worker.call(w).await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(*activity.lock().unwrap(), Activity::Parked { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker observed Parked before cancel");
+    cancelled.abort();
+    let _ = cancelled.await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if *activity.lock().unwrap() == Activity::Working {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancel drop guard restored Working");
+}
