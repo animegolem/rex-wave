@@ -21,11 +21,14 @@ pub use presence::{
     format_delivery_status, is_process_alive, load_claude_session_file,
     load_claude_session_file_from, normalize_proc_start, parse_claude_session_json,
     proc_start_matches, query_process_start, seed_records_from_interchange,
-    select_binding_for_delivery, sender_delivery_notice, try_query_process_start,
+    seed_records_from_interchange_with_options, select_binding_for_delivery,
+    sender_delivery_notice, try_query_process_start,
 };
 pub use score::{
-    FixtureCoverageReport, GATE1_CASE_IDS, GATE1_CASE_TESTS, ShadowScoreReport,
-    check_gate1_fixtures, extract_shadow_aliases, score_shadow_against_acks, score_shadow_jsonl,
+    FixtureCoverageReport, GATE1_CASE_IDS, GATE1_CASE_TESTS, MailwatchComparisonReport,
+    MailwatchSeenIndex, ShadowScoreReport, check_gate1_fixtures,
+    compare_shadow_with_mailwatch_seen, extract_shadow_aliases, parse_mailwatch_seen_jsonl,
+    score_shadow_against_acks, score_shadow_jsonl,
 };
 pub use shadow::{
     DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,

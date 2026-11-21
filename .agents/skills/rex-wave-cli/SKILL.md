@@ -103,6 +103,7 @@ Legacy Kanban boards remain supported with `--board` (`rex-wave task list --boar
 Keep durable seat ownership separate from live session bindings:
 
 ```sh
+rex-wave presence seed-interchange --interchange ~/agent-folder/interchange --seats-tsv ~/.claude/seats.tsv --dry-run
 rex-wave presence claim sam --role reviewer --project rex-wave --alias sammy
 rex-wave presence bind --seat sam --from-claude-session --pid "$PPID"
 rex-wave presence bind --seat sam --self-watcher codex --ttl 15m
@@ -122,10 +123,10 @@ Inspect an interchange directory structurally read-only and score decisions agai
 ```sh
 rex-wave mail shadow --interchange ~/agent-folder/interchange --out /tmp/shadow.jsonl --once
 rex-wave mail shadow --offline --interchange ~/agent-folder/interchange --out /tmp/shadow.jsonl --once
-rex-wave mail score --shadow /tmp/shadow.jsonl --acks ~/agent-folder/interchange/state/acks.jsonl --fixtures ~/agent-folder/interchange/fixtures/mail-routing/cases.jsonl --json
+rex-wave mail score --shadow /tmp/shadow.jsonl --acks ~/agent-folder/interchange/state/acks.jsonl --mailwatch-seen ~/agent-folder/.watchers/mailwatch-state/seen.jsonl --fixtures ~/agent-folder/interchange/fixtures/mail-routing/cases.jsonl --json
 ```
 
-`mail shadow` reads live presence state from `--socket` (failing if unreachable unless `--offline` is passed), embeds active seat aliases in its JSONL output for `mail score`, and refuses to write `--out` inside `--interchange` (including via `..` or symlinks). `mail score --fixtures` exits non-zero when any Gate 1 case is missing or unknown.
+`mail shadow` reads live presence state from `--socket` (failing if unreachable unless `--offline` is passed), embeds active seat aliases in its JSONL output for `mail score`, and refuses to write `--out` inside `--interchange` (including via `..` or symlinks). `mail score --mailwatch-seen` cross-checks shadow rings against `mailwatch.py`'s `seen.jsonl` ring log, and `--fixtures` exits non-zero when any Gate 1 case is missing or unknown.
 
 ## HTTP and SSE access
 

@@ -2490,3 +2490,125 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         "mail shadow --watch must never touch or open messagingSocketPath"
     );
 }
+
+#[tokio::test]
+async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
+    let daemon = IsolatedDaemon::start("pr22-cli-soak").await;
+    let estate = daemon.dir.0.join("estate");
+    let interchange = estate.join("interchange");
+    std::fs::create_dir_all(interchange.join("state")).unwrap();
+    std::fs::create_dir_all(interchange.join("mail")).unwrap();
+    std::fs::create_dir_all(estate.join(".watchers/mailwatch-state")).unwrap();
+
+    std::fs::write(
+        interchange.join("state/bb-knock-routes.tsv"),
+        "seat\tbb_thread_id\tnote\nfathom\tthr_abc\treview\n",
+    )
+    .unwrap();
+    let seats_tsv = estate.join("seats.tsv");
+    std::fs::write(&seats_tsv, "Chroma-Session\tchroma\t/tmp/chroma\n").unwrap();
+
+    let dry_seed = daemon
+        .cli_json(&[
+            "presence",
+            "seed-interchange",
+            "--interchange",
+            interchange.to_str().unwrap(),
+            "--seats-tsv",
+            seats_tsv.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .await;
+    let seeded_seats: Vec<&str> = dry_seed["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["seat"].as_str())
+        .collect();
+    assert!(seeded_seats.contains(&"fathom"));
+    assert!(seeded_seats.contains(&"chroma"));
+    assert!(seeded_seats.contains(&"neon"));
+
+    // Score a synthetic shadow log with `--mailwatch-seen` in both `--json` and text modes.
+    let sha1 = "a".repeat(64);
+    let sha2 = "b".repeat(64);
+    let shadow_path = daemon.dir.0.join("shadow.jsonl");
+    let acks_path = daemon.dir.0.join("acks.jsonl");
+    let seen_path = estate.join(".watchers/mailwatch-state/seen.jsonl");
+    std::fs::write(
+        &shadow_path,
+        format!(
+            concat!(
+                "{{\"meta\":\"aliases\",\"aliases\":{{\"tally_votp\":\"tally\"}}}}\n",
+                "{{\"decision\":\"ring\",\"seat\":\"tally\",\"incarnation_id\":\"inc_1\",\"channel\":\"claude_messaging_socket\",\"referent\":{{\"path\":\"mail/1.md\",\"sha16\":\"{s1_16}\",\"sha256\":\"{sha1}\"}},\"time_basis\":\"letter_id_ms\"}}\n",
+                "{{\"decision\":\"ring\",\"seat\":\"crest\",\"incarnation_id\":\"inc_2\",\"channel\":\"self_watcher_lease\",\"referent\":{{\"path\":\"mail/2.md\",\"sha16\":\"{s2_16}\",\"sha256\":\"{sha2}\"}},\"time_basis\":\"letter_id_ms\"}}\n"
+            ),
+            s1_16 = &sha1[..16],
+            s2_16 = &sha2[..16],
+            sha1 = sha1,
+            sha2 = sha2,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &acks_path,
+        format!(r#"{{"acked_by":"tally","letter":"mail/1.md","sha256":"{sha1}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        &seen_path,
+        format!(
+            concat!(
+                "{{\"key\":\"shared-tally_votp:{s1_16}\",\"outcome\":\"defer:missing\",\"attempts\":1,\"ts\":\"2026-11-21T19:00:00Z\"}}\n",
+                "{{\"key\":\"shared-tally_votp:{s1_16}\",\"outcome\":\"rung\",\"attempts\":2,\"ts\":\"2026-11-21T19:01:00Z\"}}\n",
+                "{{\"key\":\"shared-crest:{s2_16}\",\"outcome\":\"own-knocker\",\"attempts\":1,\"ts\":\"2026-11-21T19:02:00Z\"}}\n"
+            ),
+            s1_16 = &sha1[..16],
+            s2_16 = &sha2[..16],
+        ),
+    )
+    .unwrap();
+
+    let score_json = daemon
+        .cli_json(&[
+            "mail",
+            "score",
+            "--shadow",
+            shadow_path.to_str().unwrap(),
+            "--acks",
+            acks_path.to_str().unwrap(),
+            "--mailwatch-seen",
+            seen_path.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(score_json["mailwatch_seen"]["seen_entries"], 2);
+    assert_eq!(score_json["mailwatch_seen"]["shadow_ring_referents"], 2);
+    assert_eq!(score_json["mailwatch_seen"]["agreed_rung"], 1);
+    assert_eq!(score_json["mailwatch_seen"]["own_knocker_in_mailwatch"], 1);
+    assert_eq!(score_json["mailwatch_seen"]["absent_in_mailwatch"], 0);
+
+    let score_text = daemon
+        .cli(
+            &[
+                "mail",
+                "score",
+                "--shadow",
+                shadow_path.to_str().unwrap(),
+                "--acks",
+                acks_path.to_str().unwrap(),
+                "--mailwatch-seen",
+                seen_path.to_str().unwrap(),
+            ],
+            &[],
+            &[],
+        )
+        .await;
+    assert!(score_text.status.success());
+    let stdout = String::from_utf8_lossy(&score_text.stdout);
+    assert!(
+        stdout.contains(
+            "mailwatch seen: entries=2 shadow_ring_referents=2 agreed_rung=1 own_knocker=1"
+        ),
+        "stdout={stdout}"
+    );
+}

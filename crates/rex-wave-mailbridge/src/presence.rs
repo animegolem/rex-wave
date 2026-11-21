@@ -337,7 +337,12 @@ pub const CANONICAL_HOUSE_ALIASES: &[(&str, &[&str])] = &[
     ),
     ("kuti-supervisor", &["kuti", "kuti-ren-sup"]),
     ("loupe", &["loupe-reviewer"]),
+    ("neon", &[]),
 ];
+
+/// Permanently excluded pane targets from `herdr-registry.tsv` (mirrors
+/// `mailwatch.py`'s `EXCLUDED_TARGETS`).
+const HERDR_EXCLUDED_TARGETS: &[&str] = &["w4:p1S"];
 
 /// Output of [`seed_records_from_interchange`]: durable [`PresenceClaim`]s ready
 /// to apply (or preview under `--dry-run`) before seats run live `presence bind`.
@@ -363,7 +368,7 @@ impl SeedInterchangePlan {
     }
 }
 
-fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
+fn read_regular_text_if_present(path: &Path) -> Result<Option<String>, ApiError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -379,6 +384,13 @@ fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>
     }
     let raw = fs::read_to_string(path)
         .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
+    Ok(Some(raw))
+}
+
+fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(raw) = read_regular_text_if_present(path)? else {
+        return Ok(None);
+    };
     let val = serde_json::from_str(&raw).map_err(|e| {
         invalid(
             "seed_json",
@@ -386,6 +398,18 @@ fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>
         )
     })?;
     Ok(Some(val))
+}
+
+fn resolve_local_or_parent(canon_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let local = canon_dir.join(rel);
+    if fs::symlink_metadata(&local).is_ok() {
+        Some(local)
+    } else {
+        canon_dir
+            .parent()
+            .map(|p| p.join(rel))
+            .filter(|p| fs::symlink_metadata(p).is_ok())
+    }
 }
 
 fn parse_seat_slug(raw: &str) -> Option<SeatName> {
@@ -396,15 +420,53 @@ fn parse_seat_slug(raw: &str) -> Option<SeatName> {
     SeatName::parse(norm).ok()
 }
 
+fn register_seed_seat<'a>(
+    raw_name: &str,
+    machine_checked: bool,
+    canonical_fold: &BTreeMap<String, SeatName>,
+    skipped_targets: &mut BTreeSet<String>,
+    machine_checked_seats: &mut BTreeSet<SeatName>,
+    seat_aliases: &'a mut BTreeMap<SeatName, BTreeSet<SeatName>>,
+) -> Option<(SeatName, &'a mut BTreeSet<SeatName>)> {
+    if is_operator_surface_seat(raw_name) || is_non_seat_target(raw_name) {
+        skipped_targets.insert(raw_name.trim().to_ascii_lowercase());
+        return None;
+    }
+    let raw_slug = parse_seat_slug(raw_name)?;
+    let canon = canonical_fold
+        .get(raw_slug.as_str())
+        .cloned()
+        .unwrap_or_else(|| raw_slug.clone());
+    if machine_checked {
+        machine_checked_seats.insert(canon.clone());
+    }
+    let set = seat_aliases.entry(canon.clone()).or_default();
+    if raw_slug != canon {
+        set.insert(raw_slug);
+    }
+    Some((canon, set))
+}
+
 /// Pure read-only helper that derives durable [`PresenceClaim`]s with aliases
 /// and provenance from an interchange directory's `postmaster/state/roster.json`,
-/// `.watchers/mailwatch-routes.json` (in `<dir>` or its parent house root), and
-/// [`CANONICAL_HOUSE_ALIASES`].
+/// `.watchers/mailwatch-routes.json`, `state/bb-knock-routes.tsv`,
+/// `state/codex-knock-routes.tsv`, `herdr-registry.tsv` (in `<dir>` or its
+/// parent house root), `state/ledger.md`, and [`CANONICAL_HOUSE_ALIASES`].
 ///
 /// Never writes to disk and never emits `Active` claims for reserved operator
 /// surfaces (`golem`) or non-seat pseudo-targets (`cc`, `desk`, etc.).
 pub fn seed_records_from_interchange(
     interchange_dir: &Path,
+) -> Result<SeedInterchangePlan, ApiError> {
+    seed_records_from_interchange_with_options(interchange_dir, None)
+}
+
+/// Extended variant of [`seed_records_from_interchange`] that also ingests an
+/// optional external `seats.tsv` (`session_name\tseat\troom_path`) file when
+/// supplied.
+pub fn seed_records_from_interchange_with_options(
+    interchange_dir: &Path,
+    seats_tsv: Option<&Path>,
 ) -> Result<SeedInterchangePlan, ApiError> {
     let canon_dir = fs::canonicalize(interchange_dir)
         .map_err(|e| invalid("interchange", format!("{}: {e}", interchange_dir.display())))?;
@@ -434,11 +496,6 @@ pub fn seed_records_from_interchange(
         }
     }
 
-    let fold_seat = |raw: &str| -> Option<SeatName> {
-        let slug = parse_seat_slug(raw)?;
-        Some(canonical_fold.get(slug.as_str()).cloned().unwrap_or(slug))
-    };
-
     // 1. Read `<interchange>/postmaster/state/roster.json` if present.
     let roster_path = canon_dir.join("postmaster/state/roster.json");
     if let Some(roster_val) = read_regular_json_if_present(&roster_path)? {
@@ -448,20 +505,16 @@ pub fn seed_records_from_interchange(
                 let Some(raw_name) = entry.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                if is_operator_surface_seat(raw_name) || is_non_seat_target(raw_name) {
-                    skipped_targets.insert(raw_name.trim().to_ascii_lowercase());
-                    continue;
-                }
-                let Some(canon) = fold_seat(raw_name) else {
+                let Some((canon, set)) = register_seed_seat(
+                    raw_name,
+                    true,
+                    &canonical_fold,
+                    &mut skipped_targets,
+                    &mut machine_checked_seats,
+                    &mut seat_aliases,
+                ) else {
                     continue;
                 };
-                machine_checked_seats.insert(canon.clone());
-                let set = seat_aliases.entry(canon.clone()).or_default();
-                if let Some(raw_slug) = parse_seat_slug(raw_name)
-                    && raw_slug != canon
-                {
-                    set.insert(raw_slug);
-                }
                 // If `box` points to `.../interchange/to-<alias>`, register `<alias>` as an alias
                 // when distinct from the canonical seat (e.g. `auburn-cepheus` -> `to-muse`).
                 if let Some(box_str) = entry.get("box").and_then(|v| v.as_str())
@@ -479,16 +532,8 @@ pub fn seed_records_from_interchange(
     }
 
     // 2. Read `.watchers/mailwatch-routes.json` under `<interchange>` or its parent house root.
-    let local_routes = canon_dir.join(".watchers/mailwatch-routes.json");
-    let routes_candidate = if fs::symlink_metadata(&local_routes).is_ok() {
-        Some(local_routes)
-    } else {
-        canon_dir
-            .parent()
-            .map(|p| p.join(".watchers/mailwatch-routes.json"))
-            .filter(|p| fs::symlink_metadata(p).is_ok())
-    };
-    if let Some(routes_path) = routes_candidate
+    if let Some(routes_path) =
+        resolve_local_or_parent(&canon_dir, ".watchers/mailwatch-routes.json")
         && let Some(routes_val) = read_regular_json_if_present(&routes_path)?
     {
         sources_read.push(routes_path);
@@ -497,20 +542,16 @@ pub fn seed_records_from_interchange(
                 if !entry.is_object() {
                     continue;
                 }
-                if is_operator_surface_seat(raw_key) || is_non_seat_target(raw_key) {
-                    skipped_targets.insert(raw_key.trim().to_ascii_lowercase());
-                    continue;
-                }
-                let Some(canon) = fold_seat(raw_key) else {
+                let Some((canon, set)) = register_seed_seat(
+                    raw_key,
+                    true,
+                    &canonical_fold,
+                    &mut skipped_targets,
+                    &mut machine_checked_seats,
+                    &mut seat_aliases,
+                ) else {
                     continue;
                 };
-                machine_checked_seats.insert(canon.clone());
-                let set = seat_aliases.entry(canon.clone()).or_default();
-                if let Some(raw_slug) = parse_seat_slug(raw_key)
-                    && raw_slug != canon
-                {
-                    set.insert(raw_slug);
-                }
                 if let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) {
                     for item in arr {
                         let Some(raw_alias) = item.as_str() else {
@@ -533,7 +574,186 @@ pub fn seed_records_from_interchange(
         }
     }
 
-    // 3. Merge canonical house alias pairs.
+    // 3. Read `<interchange>/state/bb-knock-routes.tsv` if present.
+    let bb_routes_path = canon_dir.join("state/bb-knock-routes.tsv");
+    if let Some(raw) = read_regular_text_if_present(&bb_routes_path)? {
+        sources_read.push(bb_routes_path);
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split('\t');
+            let Some(raw_seat) = cols.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let col1 = cols.next().map(str::trim).unwrap_or("");
+            if raw_seat.eq_ignore_ascii_case("seat")
+                && matches!(
+                    col1.to_ascii_lowercase().as_str(),
+                    "bb_thread_id" | "thread_id" | "thread"
+                )
+            {
+                continue;
+            }
+            let _ = register_seed_seat(
+                raw_seat,
+                true,
+                &canonical_fold,
+                &mut skipped_targets,
+                &mut machine_checked_seats,
+                &mut seat_aliases,
+            );
+        }
+    }
+
+    // 4. Read `<interchange>/state/codex-knock-routes.tsv` if present.
+    let codex_routes_path = canon_dir.join("state/codex-knock-routes.tsv");
+    if let Some(raw) = read_regular_text_if_present(&codex_routes_path)? {
+        sources_read.push(codex_routes_path);
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split('\t');
+            let Some(raw_seat) = cols.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let col1 = cols.next().map(str::trim).unwrap_or("");
+            if raw_seat.eq_ignore_ascii_case("seat")
+                && matches!(
+                    col1.to_ascii_lowercase().as_str(),
+                    "hostid" | "host_id" | "threadid" | "thread_id"
+                )
+            {
+                continue;
+            }
+            let _ = register_seed_seat(
+                raw_seat,
+                true,
+                &canonical_fold,
+                &mut skipped_targets,
+                &mut machine_checked_seats,
+                &mut seat_aliases,
+            );
+        }
+    }
+
+    // 5. Read `herdr-registry.tsv` under `<interchange>` or its parent house root.
+    if let Some(herdr_path) = resolve_local_or_parent(&canon_dir, "herdr-registry.tsv")
+        && let Some(raw) = read_regular_text_if_present(&herdr_path)?
+    {
+        sources_read.push(herdr_path);
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split('\t');
+            let Some(raw_seat) = cols.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let col1 = cols.next().map(str::trim).unwrap_or("");
+            if raw_seat.eq_ignore_ascii_case("seat")
+                && matches!(
+                    col1.to_ascii_lowercase().as_str(),
+                    "target" | "pane" | "pane_id"
+                )
+            {
+                continue;
+            }
+            if HERDR_EXCLUDED_TARGETS.contains(&col1) {
+                continue;
+            }
+            let _ = register_seed_seat(
+                raw_seat,
+                true,
+                &canonical_fold,
+                &mut skipped_targets,
+                &mut machine_checked_seats,
+                &mut seat_aliases,
+            );
+        }
+    }
+
+    // 6. Read `<interchange>/state/ledger.md` CLAIM rows if present.
+    let ledger_path = canon_dir.join("state/ledger.md");
+    if let Some(raw) = read_regular_text_if_present(&ledger_path)? {
+        sources_read.push(ledger_path);
+        for line in raw.lines() {
+            let parts: Vec<&str> = line.split('|').map(str::trim).collect();
+            if parts.len() < 3 || parts[1] != "CLAIM" {
+                continue;
+            }
+            let raw_name = parts[2];
+            if raw_name.is_empty() || raw_name.contains('/') {
+                continue;
+            }
+            let _ = register_seed_seat(
+                raw_name,
+                false,
+                &canonical_fold,
+                &mut skipped_targets,
+                &mut machine_checked_seats,
+                &mut seat_aliases,
+            );
+        }
+    }
+
+    // 7. Read optional external `seats.tsv` (`session_name\tseat\troom_path`).
+    //    When the caller explicitly supplies a path, surface `NotFound` rather
+    //    than silently dropping a mistyped `--seats-tsv` flag.
+    if let Some(seats_path) = seats_tsv {
+        let Some(raw) = read_regular_text_if_present(seats_path)? else {
+            return Err(ApiError::NotFound {
+                what: format!("seats tsv {}", seats_path.display()),
+            });
+        };
+        sources_read.push(seats_path.to_path_buf());
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split('\t');
+            let Some(raw_session) = cols.next().map(str::trim) else {
+                continue;
+            };
+            let Some(raw_seat) = cols.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if raw_session.eq_ignore_ascii_case("session_name")
+                || raw_seat.eq_ignore_ascii_case("seat")
+            {
+                continue;
+            }
+            let Some((canon, set)) = register_seed_seat(
+                raw_seat,
+                true,
+                &canonical_fold,
+                &mut skipped_targets,
+                &mut machine_checked_seats,
+                &mut seat_aliases,
+            ) else {
+                continue;
+            };
+            let session_lower = raw_session.to_ascii_lowercase();
+            let has_noise = session_lower.contains("fork")
+                || session_lower.contains("attachment")
+                || raw_session.contains('⑂');
+            if !has_noise
+                && let Some(alias_slug) = parse_seat_slug(raw_session)
+                && alias_slug != canon
+                && !is_operator_surface_seat(alias_slug.as_str())
+                && !is_non_seat_target(alias_slug.as_str())
+            {
+                set.insert(alias_slug);
+            }
+        }
+    }
+
+    // 8. Merge canonical house alias pairs.
     for &(canon_raw, alias_list) in CANONICAL_HOUSE_ALIASES {
         let Some(canon) = parse_seat_slug(canon_raw) else {
             continue;
@@ -548,7 +768,7 @@ pub fn seed_records_from_interchange(
         }
     }
 
-    // 4. Remove any alias that collides with a canonical seat or an earlier seat's alias.
+    // 9. Remove any alias that collides with a canonical seat or an earlier seat's alias.
     let canonical_seats: BTreeSet<SeatName> = seat_aliases.keys().cloned().collect();
     let mut claimed_aliases: BTreeSet<SeatName> = BTreeSet::new();
     let tally_witness = SeatName::parse("tally").expect("valid tally seat");

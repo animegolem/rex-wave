@@ -62,6 +62,16 @@ impl AliasMap {
         self.aliases.is_empty()
     }
 
+    /// Returns `true` when `raw` matches a known canonical seat or alias entry.
+    pub fn contains_known(&self, raw: &str) -> bool {
+        let norm = normalize_seat_token(raw);
+        if self.aliases.contains_key(&norm) {
+            return true;
+        }
+        norm.strip_prefix("to-")
+            .is_some_and(|stripped| self.aliases.contains_key(stripped))
+    }
+
     pub fn entries(&self) -> &BTreeMap<String, String> {
         &self.aliases
     }

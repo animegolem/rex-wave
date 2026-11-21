@@ -406,6 +406,235 @@ pub fn score_shadow_jsonl(
     Ok(report)
 }
 
+/// Parsed `.watchers/mailwatch-state/seen.jsonl` ring log indexed by normalized
+/// raw key (`<box_or_shared>:<sha16>`) and canonical `(seat, sha16)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MailwatchSeenIndex {
+    by_raw_key: BTreeMap<String, String>,
+    by_seat_sha16: BTreeMap<(String, String), String>,
+}
+
+fn mailwatch_outcome_rank(outcome: &str) -> u8 {
+    if matches!(outcome, "rung" | "unknown") {
+        4
+    } else if outcome == "own-knocker" {
+        3
+    } else if outcome.starts_with("defer") || outcome.starts_with("unrung") {
+        2
+    } else {
+        1
+    }
+}
+
+impl MailwatchSeenIndex {
+    /// Number of unique normalized keys (`<box_or_shared>:<sha16>`) in `seen.jsonl`.
+    pub fn len(&self) -> usize {
+        self.by_raw_key.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_raw_key.is_empty()
+    }
+
+    /// Returns the final `mailwatch.py` outcome for `(seat, sha16)` across
+    /// `shared-<alias>` and `to-<alias>` lanes after canonicalizing `seat`.
+    pub fn outcome_for(&self, seat: &str, sha16: &str, aliases: &AliasMap) -> Option<&str> {
+        let canon = aliases.canonicalize(seat);
+        self.by_seat_sha16
+            .get(&(canon, sha16.trim().to_ascii_lowercase()))
+            .map(String::as_str)
+    }
+}
+
+/// Cross-check summary comparing `rex-wave` shadow rings (`ring` + `ring_digest`)
+/// against `mailwatch.py`'s `.watchers/mailwatch-state/seen.jsonl`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailwatchComparisonReport {
+    pub seen_entries: usize,
+    pub shadow_ring_referents: usize,
+    pub agreed_rung: usize,
+    pub own_knocker_in_mailwatch: usize,
+    pub deferred_or_unrung_in_mailwatch: usize,
+    pub other_in_mailwatch: usize,
+    pub absent_in_mailwatch: usize,
+}
+
+impl MailwatchComparisonReport {
+    pub fn to_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "seen_entries": self.seen_entries,
+            "shadow_ring_referents": self.shadow_ring_referents,
+            "agreed_rung": self.agreed_rung,
+            "own_knocker_in_mailwatch": self.own_knocker_in_mailwatch,
+            "deferred_or_unrung_in_mailwatch": self.deferred_or_unrung_in_mailwatch,
+            "other_in_mailwatch": self.other_in_mailwatch,
+            "absent_in_mailwatch": self.absent_in_mailwatch,
+        })
+    }
+}
+
+/// Parses `.watchers/mailwatch-state/seen.jsonl` matching `mailwatch.py`'s
+/// `load_seen()` semantics: legacy `"box/file:sha16"` keys normalize to
+/// `"box:sha16"`, and later lines overwrite earlier lines for the same
+/// normalized key.
+pub fn parse_mailwatch_seen_jsonl(
+    raw: &str,
+    aliases: &AliasMap,
+) -> Result<MailwatchSeenIndex, String> {
+    let mut by_raw_key: BTreeMap<String, String> = BTreeMap::new();
+
+    for (idx, line_raw) in raw.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = line_raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("mailwatch seen line {line_no}: invalid JSON: {e}"))?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| format!("mailwatch seen line {line_no}: expected JSON object"))?;
+        let key = obj
+            .get("key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("mailwatch seen line {line_no}: missing `key` field"))?;
+        let outcome = obj
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("mailwatch seen line {line_no}: missing `outcome` field"))?;
+        let Some((left, sha_raw)) = key.rsplit_once(':') else {
+            return Err(format!(
+                "mailwatch seen line {line_no}: key `{key}` missing `:` separator"
+            ));
+        };
+        let box_part = left.split('/').next().unwrap_or(left).trim();
+        let sha16 = sha_raw.trim().to_ascii_lowercase();
+        if box_part.is_empty() || sha16.is_empty() {
+            return Err(format!(
+                "mailwatch seen line {line_no}: invalid key `{key}`"
+            ));
+        }
+        by_raw_key.insert(format!("{box_part}:{sha16}"), outcome.to_owned());
+    }
+
+    let mut by_seat_sha16: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (norm_key, outcome) in &by_raw_key {
+        let Some((box_part, sha16)) = norm_key.rsplit_once(':') else {
+            continue;
+        };
+        let Some(raw_seat) = box_part
+            .strip_prefix("shared-")
+            .or_else(|| box_part.strip_prefix("to-"))
+        else {
+            continue;
+        };
+        let canon = aliases.canonicalize(raw_seat);
+        if canon.is_empty() {
+            continue;
+        }
+        let map_key = (canon, sha16.to_owned());
+        match by_seat_sha16.get_mut(&map_key) {
+            Some(prev) => {
+                if mailwatch_outcome_rank(outcome) >= mailwatch_outcome_rank(prev) {
+                    *prev = outcome.clone();
+                }
+            }
+            None => {
+                by_seat_sha16.insert(map_key, outcome.clone());
+            }
+        }
+    }
+
+    Ok(MailwatchSeenIndex {
+        by_raw_key,
+        by_seat_sha16,
+    })
+}
+
+/// Compares `ring` and `ring_digest` referents emitted in `shadow_jsonl`
+/// against a parsed [`MailwatchSeenIndex`]. Per `mailwatch.py`, both `"rung"`
+/// and `"unknown"` count as rung (`agreed_rung`).
+pub fn compare_shadow_with_mailwatch_seen(
+    shadow_jsonl: &str,
+    seen: &MailwatchSeenIndex,
+    aliases: &AliasMap,
+) -> Result<MailwatchComparisonReport, String> {
+    let mut report = MailwatchComparisonReport {
+        seen_entries: seen.len(),
+        ..MailwatchComparisonReport::default()
+    };
+
+    let mut record = |seat: &SeatName, sha: &Sha256Hex| {
+        report.shadow_ring_referents += 1;
+        let sha16 = &sha.as_str()[..16];
+        match seen.outcome_for(seat.as_str(), sha16, aliases) {
+            Some("rung" | "unknown") => report.agreed_rung += 1,
+            Some("own-knocker") => report.own_knocker_in_mailwatch += 1,
+            Some(o) if o.starts_with("defer") || o.starts_with("unrung") => {
+                report.deferred_or_unrung_in_mailwatch += 1;
+            }
+            Some(_) => report.other_in_mailwatch += 1,
+            None => report.absent_in_mailwatch += 1,
+        }
+    };
+
+    for (idx, raw) in shadow_jsonl.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("shadow line {line_no}: invalid JSON: {e}"))?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| format!("shadow line {line_no}: expected JSON object"))?;
+        if obj.get("meta").and_then(|v| v.as_str()) == Some("aliases") {
+            continue;
+        }
+        let decision = obj
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("shadow line {line_no}: missing `decision` field"))?;
+        match decision {
+            "ring" => {
+                let seat_raw = obj
+                    .get("seat")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("shadow line {line_no}: missing `seat` field"))?;
+                let seat = SeatName::parse(seat_raw).map_err(|e| {
+                    format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}")
+                })?;
+                let ref_val = obj
+                    .get("referent")
+                    .ok_or_else(|| format!("shadow line {line_no}: missing `referent`"))?;
+                let sha = extract_referent_sha(ref_val, line_no)?;
+                record(&seat, &sha);
+            }
+            "ring_digest" => {
+                let seat_raw = obj
+                    .get("seat")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("shadow line {line_no}: missing `seat` field"))?;
+                let seat = SeatName::parse(seat_raw).map_err(|e| {
+                    format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}")
+                })?;
+                let shas = extract_referents_shas(obj, line_no)?;
+                for sha in &shas {
+                    record(&seat, sha);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +724,135 @@ mod tests {
         assert_eq!(scored.rings_emitted, 1);
         assert_eq!(scored.ring_referents_confirmed_acked, 1);
         assert_eq!(scored.ring_referents_pending_ack, 0);
+    }
+
+    #[test]
+    fn mailwatch_seen_comparison_handles_all_outcomes_overwrites_and_aliases() {
+        let sha_rung = Sha256Hex::parse(format!("{}01", "a".repeat(62))).unwrap();
+        let sha_unknown = Sha256Hex::parse(format!("{}02", "b".repeat(62))).unwrap();
+        let sha_own = Sha256Hex::parse(format!("{}03", "c".repeat(62))).unwrap();
+        let sha_unrung = Sha256Hex::parse(format!("{}04", "d".repeat(62))).unwrap();
+        let sha_defer = Sha256Hex::parse(format!("{}05", "e".repeat(62))).unwrap();
+        let sha_seeded = Sha256Hex::parse(format!("{}06", "f".repeat(62))).unwrap();
+        let sha_absent = Sha256Hex::parse(format!("{}07", "1".repeat(62))).unwrap();
+
+        let aliases = AliasMap::from_pairs([("muse", "auburn-cepheus"), ("tally_votp", "tally")]);
+        let ch = RingDeliveryChannel::ClaudeMessagingSocket {
+            socket: PathBuf::from("/tmp/cc.sock"),
+            pid: 99,
+        };
+        let inc = IncarnationId::parse("inc_1").unwrap();
+        let report = ShadowPassReport {
+            letters_scanned: 7,
+            acks_report: Default::default(),
+            decisions: vec![
+                RingDecision::Ring {
+                    seat: SeatName::parse("tally").unwrap(),
+                    incarnation_id: inc.clone(),
+                    channel: ch.clone(),
+                    referent: RingReferent::new("mail/01.md", sha_rung.clone()).unwrap(),
+                    time_basis: TimeBasis::LetterIdMs,
+                },
+                RingDecision::Ring {
+                    seat: SeatName::parse("auburn-cepheus").unwrap(),
+                    incarnation_id: inc.clone(),
+                    channel: ch.clone(),
+                    referent: RingReferent::new("to-muse/02.md", sha_unknown.clone()).unwrap(),
+                    time_basis: TimeBasis::LetterIdMs,
+                },
+                RingDecision::Ring {
+                    seat: SeatName::parse("crest").unwrap(),
+                    incarnation_id: inc.clone(),
+                    channel: ch.clone(),
+                    referent: RingReferent::new("mail/03.md", sha_own.clone()).unwrap(),
+                    time_basis: TimeBasis::LetterIdMs,
+                },
+                RingDecision::RingDigest {
+                    seat: SeatName::parse("genga").unwrap(),
+                    incarnation_id: inc,
+                    channel: ch,
+                    referents: vec![
+                        RingReferent::new("mail/04.md", sha_unrung.clone()).unwrap(),
+                        RingReferent::new("mail/05.md", sha_defer.clone()).unwrap(),
+                        RingReferent::new("mail/06.md", sha_seeded.clone()).unwrap(),
+                        RingReferent::new("mail/07.md", sha_absent.clone()).unwrap(),
+                    ],
+                    time_basis: TimeBasis::LetterIdMs,
+                },
+            ],
+        };
+        let shadow_jsonl = report.to_jsonl_with_aliases(&aliases);
+
+        let seen_raw = [
+            // Earlier defer:missing overwritten by later rung for same normalized key
+            format!(
+                r#"{{"key":"shared-tally_votp:{}","outcome":"defer:missing","attempts":1,"ts":"2026-11-21T19:00:00Z"}}"#,
+                &sha_rung.as_str()[..16]
+            ),
+            format!(
+                r#"{{"key":"shared-tally_votp:{}","outcome":"rung","attempts":2,"ts":"2026-11-21T19:02:00Z"}}"#,
+                &sha_rung.as_str()[..16]
+            ),
+            // Legacy box/file:sha16 format with alias `to-muse` + outcome `unknown` (counts as rung)
+            format!(
+                r#"{{"key":"to-muse/legacy-file.md:{}","outcome":"unknown","attempts":1,"ts":"2026-11-21T19:05:00Z"}}"#,
+                &sha_unknown.as_str()[..16]
+            ),
+            // own-knocker
+            format!(
+                r#"{{"key":"shared-crest:{}","outcome":"own-knocker","attempts":1,"ts":"2026-11-21T19:06:00Z"}}"#,
+                &sha_own.as_str()[..16]
+            ),
+            // Earlier defer:missing overwritten by unrung:gave-up
+            format!(
+                r#"{{"key":"shared-genga:{}","outcome":"defer:missing","attempts":29,"ts":"2026-11-21T19:07:00Z"}}"#,
+                &sha_unrung.as_str()[..16]
+            ),
+            format!(
+                r#"{{"key":"shared-genga:{}","outcome":"unrung:gave-up","attempts":30,"ts":"2026-11-21T19:09:00Z"}}"#,
+                &sha_unrung.as_str()[..16]
+            ),
+            // Still deferred
+            format!(
+                r#"{{"key":"shared-genga:{}","outcome":"defer:busy","attempts":3,"ts":"2026-11-21T19:10:00Z"}}"#,
+                &sha_defer.as_str()[..16]
+            ),
+            // Seeded (other)
+            format!(
+                r#"{{"key":"to-genga/old.md:{}","outcome":"seeded","attempts":0,"ts":"2026-09-27T22:27:27Z"}}"#,
+                &sha_seeded.as_str()[..16]
+            ),
+        ]
+        .join("\n");
+
+        let parsed_aliases = extract_shadow_aliases(&shadow_jsonl).unwrap();
+        let seen_idx = parse_mailwatch_seen_jsonl(&seen_raw, &parsed_aliases).unwrap();
+        // 8 raw lines collapse to 6 normalized keys (2 overwrites).
+        assert_eq!(seen_idx.len(), 6);
+        assert_eq!(
+            seen_idx.outcome_for("tally", &sha_rung.as_str()[..16], &parsed_aliases),
+            Some("rung")
+        );
+        assert_eq!(
+            seen_idx.outcome_for("genga", &sha_unrung.as_str()[..16], &parsed_aliases),
+            Some("unrung:gave-up")
+        );
+
+        let cmp =
+            compare_shadow_with_mailwatch_seen(&shadow_jsonl, &seen_idx, &parsed_aliases).unwrap();
+        assert_eq!(cmp.seen_entries, 6);
+        assert_eq!(cmp.shadow_ring_referents, 7);
+        assert_eq!(cmp.agreed_rung, 2); // rung + unknown
+        assert_eq!(cmp.own_knocker_in_mailwatch, 1);
+        assert_eq!(cmp.deferred_or_unrung_in_mailwatch, 2); // unrung:gave-up + defer:busy
+        assert_eq!(cmp.other_in_mailwatch, 1); // seeded
+        assert_eq!(cmp.absent_in_mailwatch, 1);
+
+        // Malformed seen.jsonl lines return Err.
+        assert!(parse_mailwatch_seen_jsonl("{bad", &parsed_aliases).is_err());
+        assert!(
+            parse_mailwatch_seen_jsonl(r#"{"key":"no-colon","outcome":"rung"}"#, &parsed_aliases)
+                .is_err()
+        );
     }
 }
