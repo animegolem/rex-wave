@@ -6,7 +6,7 @@
 pub use rex_kanban::{
     Assign, Assignee, BoardEnsure, BoardEvent, BoardFilter, BoardId, BoardInfo, BoardSnapshot,
     BoardView, Card, CardArchive, CardNo, CardPatch, CardRef, CardRevision, CardUpsert,
-    ExternalLink, LaneCards, LaneName, Link, Priority, Title,
+    ExternalLink, LaneCards, LaneName, Link, OrgId, Priority, Title,
 };
 
 use crate::id::{BbProjectId, Principal, RoleName, SeatName, Seq, WaveSlug};

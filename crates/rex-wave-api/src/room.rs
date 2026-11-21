@@ -2,7 +2,11 @@
 //! A DM is a room whose identity is a normalized principal pair, so there is
 //! exactly one DM per pair and one actor type for both.
 
-use crate::id::{BbProjectId, ChannelName, Handle, IdemKey, InvalidId, Principal, Seq, WaveSlug};
+use crate::board::{Priority, Title};
+use crate::id::{
+    BbProjectId, ChannelName, Handle, IdemKey, InvalidId, Label, LeaseEpoch, OrgId, Principal, Seq,
+    UnixMs, WaveSlug,
+};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -171,6 +175,85 @@ pub struct Mentions {
     pub all: bool,
 }
 
+/// Lifecycle state of a room task-thread.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Open,
+    Claimed,
+    Review,
+    Blocked,
+    Done,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub const fn org_keyword(self) -> &'static str {
+        match self {
+            TaskStatus::Open => "TODO",
+            TaskStatus::Claimed => "STRT",
+            TaskStatus::Review => "WAIT",
+            TaskStatus::Blocked => "BLKD",
+            TaskStatus::Done => "DONE",
+            TaskStatus::Cancelled => "CNCL",
+        }
+    }
+
+    pub fn from_org_keyword(keyword: &str) -> Option<Self> {
+        match keyword {
+            "TODO" | "IDEA" => Some(TaskStatus::Open),
+            "STRT" => Some(TaskStatus::Claimed),
+            "WAIT" => Some(TaskStatus::Review),
+            "BLKD" => Some(TaskStatus::Blocked),
+            "DONE" => Some(TaskStatus::Done),
+            "CNCL" => Some(TaskStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, TaskStatus::Done | TaskStatus::Cancelled)
+    }
+}
+
+/// Specification for turning a room root post into a task thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskSpec {
+    pub title: Title,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<OrgId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<Seq>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_ms: Option<UnixMs>,
+}
+
+/// Active TTL lease on a claimed task thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskLease {
+    pub holder: Principal,
+    pub epoch: LeaseEpoch,
+    pub claimed_at: UnixMs,
+    pub expires_at: UnixMs,
+}
+
+/// Compact snapshot of a newer message returned inside [`crate::ConflictData::NewerMessage`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RoomMessageSummary {
+    pub seq: Seq,
+    pub at: UnixMs,
+    pub by: Principal,
+    pub body: Body,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<Seq>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<Label>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RoomEnsure {
     pub room: RoomRef,
@@ -185,10 +268,170 @@ pub struct RoomEnsure {
 pub struct RoomPost {
     pub room: RoomRef,
     pub body: Body,
-    #[serde(default)]
-    pub reply_to: Option<Seq>,
-    #[serde(default)]
+    #[serde(default, alias = "reply_to", skip_serializing_if = "Option::is_none")]
+    pub re: Option<Seq>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Seq>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<Label>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskSpec>,
+    #[serde(default, alias = "id", skip_serializing_if = "Option::is_none")]
     pub idem: Option<IdemKey>,
+}
+
+impl RoomPost {
+    pub fn new(room: RoomRef, body: Body) -> Self {
+        Self {
+            room,
+            body,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RoomLabel {
+    pub room: RoomRef,
+    pub seq: Seq,
+    #[serde(default)]
+    pub add: Vec<Label>,
+    #[serde(default)]
+    pub remove: Vec<Label>,
+    #[serde(default, alias = "id")]
+    pub idem: Option<IdemKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Labeled {
+    pub room: RoomId,
+    pub seq: Seq,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TaskClaim {
+    pub room: RoomRef,
+    pub task: Seq,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    #[serde(default)]
+    pub expected_rev: Option<u64>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default, alias = "id")]
+    pub idem: Option<IdemKey>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TaskHeartbeat {
+    pub room: RoomRef,
+    pub task: Seq,
+    pub epoch: LeaseEpoch,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TaskTransition {
+    pub room: RoomRef,
+    pub task: Seq,
+    pub status: TaskStatus,
+    #[serde(default)]
+    pub epoch: Option<LeaseEpoch>,
+    #[serde(default)]
+    pub expected_rev: Option<u64>,
+    #[serde(default)]
+    pub note: Option<Body>,
+    #[serde(default, alias = "id")]
+    pub idem: Option<IdemKey>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TaskUpdate {
+    pub room: RoomRef,
+    pub task: Seq,
+    #[serde(default)]
+    pub expected_rev: Option<u64>,
+    #[serde(default)]
+    pub title: Option<Title>,
+    #[serde(default)]
+    pub needs_add: Vec<Seq>,
+    #[serde(default)]
+    pub needs_remove: Vec<Seq>,
+    #[serde(default)]
+    pub priority: Option<Priority>,
+    #[serde(default)]
+    pub due_ms: Option<UnixMs>,
+    #[serde(default)]
+    pub clear_due: bool,
+    #[serde(default, alias = "id")]
+    pub idem: Option<IdemKey>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskFilter {
+    #[serde(default)]
+    pub status: Option<TaskStatus>,
+    #[serde(default)]
+    pub ready_only: bool,
+    #[serde(default)]
+    pub holder: Option<Principal>,
+    #[serde(default)]
+    pub label: Option<Label>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RoomTasks {
+    pub room: RoomRef,
+    #[serde(default)]
+    pub filter: Option<TaskFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskLeaseReceipt {
+    pub room: RoomId,
+    pub task: Seq,
+    pub org_id: OrgId,
+    pub rev: u64,
+    pub epoch: LeaseEpoch,
+    pub expires_at: UnixMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskView {
+    pub room: RoomId,
+    pub seq: Seq,
+    pub org_id: OrgId,
+    pub rev: u64,
+    pub title: Title,
+    pub status: TaskStatus,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_ms: Option<UnixMs>,
+    #[serde(default)]
+    pub needs: Vec<Seq>,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<TaskLease>,
+    pub ready: bool,
+    pub lease_expired: bool,
+    pub created_by: Principal,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskListView {
+    pub room: RoomId,
+    pub head: Seq,
+    pub tasks: Vec<TaskView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -221,6 +464,12 @@ pub struct Posted {
     pub room: RoomId,
     pub seq: Seq,
     pub mentions: Mentions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<Seq>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<OrgId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -241,10 +490,60 @@ pub enum RoomEvent {
     Posted {
         body: Body,
         mentions: Mentions,
-        reply_to: Option<Seq>,
+        #[serde(default, alias = "reply_to", skip_serializing_if = "Option::is_none")]
+        re: Option<Seq>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<Seq>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        labels: Vec<Label>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<TaskSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         idem: Option<IdemKey>,
     },
     TopicSet {
         topic: String,
+    },
+    Labeled {
+        target: Seq,
+        #[serde(default)]
+        added: Vec<Label>,
+        #[serde(default)]
+        removed: Vec<Label>,
+        #[serde(default)]
+        before: Vec<Label>,
+        #[serde(default)]
+        after: Vec<Label>,
+    },
+    TaskClaimed {
+        task: Seq,
+        rev: u64,
+        lease: TaskLease,
+    },
+    TaskHeartbeat {
+        task: Seq,
+        epoch: LeaseEpoch,
+        expires_at: UnixMs,
+    },
+    TaskTransitioned {
+        task: Seq,
+        rev: u64,
+        status: TaskStatus,
+    },
+    TaskUpdated {
+        task: Seq,
+        rev: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<Title>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        needs_add: Vec<Seq>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        needs_remove: Vec<Seq>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<Priority>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due_ms: Option<UnixMs>,
+        #[serde(default)]
+        clear_due: bool,
     },
 }

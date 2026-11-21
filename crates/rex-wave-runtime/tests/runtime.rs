@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use rex_wave_api::notify::*;
+use rex_wave_api::presence::*;
 use rex_wave_api::read::*;
 use rex_wave_api::room::*;
 use rex_wave_api::stage::StageTarget;
@@ -7,7 +8,7 @@ use rex_wave_api::wave::Activity;
 use rex_wave_api::*;
 use rex_wave_runtime::*;
 use rex_wave_store::Journal;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,6 +18,7 @@ struct ToyRooms;
 #[derive(Default)]
 struct ToyRoomState {
     members: BTreeMap<Handle, Principal>,
+    labels: BTreeMap<Seq, BTreeSet<Label>>,
     posts: u64,
     head: Seq,
 }
@@ -32,6 +34,12 @@ impl Decider for ToyRooms {
             RoomCommand::RoomPost(c) => &c.room,
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
+            RoomCommand::RoomLabel(c) => &c.room,
+            RoomCommand::TaskClaim(c) => &c.room,
+            RoomCommand::TaskHeartbeat(c) => &c.room,
+            RoomCommand::TaskTransition(c) => &c.room,
+            RoomCommand::TaskUpdate(c) => &c.room,
+            RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
             room: r.resolve(&ctx.by)?,
@@ -41,6 +49,7 @@ impl Decider for ToyRooms {
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
         match cmd {
             RoomCommand::RoomPost(c) => c.idem.clone(),
+            RoomCommand::RoomLabel(c) => c.idem.clone(),
             _ => None,
         }
     }
@@ -94,10 +103,43 @@ impl Decider for ToyRooms {
                 Ok(vec![RoomEvent::Posted {
                     body: c.body.clone(),
                     mentions: Mentions { principals, all },
-                    reply_to: c.reply_to,
+                    re: c.re,
+                    after: c.after,
+                    labels: c.labels.clone(),
+                    task: c.task.clone(),
                     idem: c.idem.clone(),
                 }])
             }
+            RoomCommand::RoomLabel(c) => {
+                let before_set = state.labels.get(&c.seq).cloned().unwrap_or_default();
+                let mut after_set = before_set.clone();
+                let mut added = Vec::new();
+                let mut removed = Vec::new();
+                for lbl in &c.remove {
+                    if after_set.remove(lbl) {
+                        removed.push(lbl.clone());
+                    }
+                }
+                for lbl in &c.add {
+                    if after_set.insert(lbl.clone()) {
+                        added.push(lbl.clone());
+                    }
+                }
+                Ok(vec![RoomEvent::Labeled {
+                    target: c.seq,
+                    added,
+                    removed,
+                    before: before_set.into_iter().collect(),
+                    after: after_set.into_iter().collect(),
+                }])
+            }
+            RoomCommand::TaskClaim(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::TaskTransition(_)
+            | RoomCommand::TaskUpdate(_)
+            | RoomCommand::RoomTasks(_) => Err(ApiError::Unavailable {
+                family: Family::Room,
+            }),
         }
     }
 
@@ -108,8 +150,23 @@ impl Decider for ToyRooms {
                 state.members.insert(handle.clone(), member.clone());
             }
             RoomEvent::MemberLeft { member } => state.members.retain(|_, p| p != member),
-            RoomEvent::Posted { .. } => state.posts += 1,
-            RoomEvent::Opened { .. } | RoomEvent::TopicSet { .. } => {}
+            RoomEvent::Posted { labels, .. } => {
+                state.posts += 1;
+                state
+                    .labels
+                    .insert(meta.seq, labels.iter().cloned().collect());
+            }
+            RoomEvent::Labeled { target, after, .. } => {
+                state
+                    .labels
+                    .insert(*target, after.iter().cloned().collect());
+            }
+            RoomEvent::Opened { .. }
+            | RoomEvent::TopicSet { .. }
+            | RoomEvent::TaskClaimed { .. }
+            | RoomEvent::TaskHeartbeat { .. }
+            | RoomEvent::TaskTransitioned { .. }
+            | RoomEvent::TaskUpdated { .. } => {}
         }
     }
 
@@ -144,17 +201,41 @@ impl Decider for ToyRooms {
                 let StreamId::Room { room } = &last.stream else {
                     unreachable!()
                 };
-                let Event::Room(RoomEvent::Posted { mentions, .. }) = &last.event else {
+                let Event::Room(RoomEvent::Posted { mentions, re, .. }) = &last.event else {
                     unreachable!()
                 };
                 WireReply::RoomPost(Posted {
                     room: room.clone(),
                     seq: last.seq,
                     mentions: mentions.clone(),
+                    re: *re,
+                    org_id: None,
+                    delivery_notice: None,
+                })
+            }
+            RoomCommand::RoomLabel(c) => {
+                let last = committed.last().expect("label commits one envelope");
+                let StreamId::Room { room } = &last.stream else {
+                    unreachable!()
+                };
+                let labels = state
+                    .labels
+                    .get(&c.seq)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                WireReply::RoomLabel(Labeled {
+                    room: room.clone(),
+                    seq: c.seq,
+                    labels,
                 })
             }
             RoomCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
             RoomCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),
+            RoomCommand::TaskClaim(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::TaskTransition(_)
+            | RoomCommand::TaskUpdate(_)
+            | RoomCommand::RoomTasks(_) => unreachable!("rejected in decide"),
         }
     }
 
@@ -332,6 +413,7 @@ fn harness(idle: Duration) -> (Arc<Router>, Journal, Arc<AtomicUsize>) {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<ToyInbox>::with_idle(journal.clone(), hub.clone(), idle),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
@@ -355,7 +437,10 @@ fn post(room: RoomRef, text: &str, idem: Option<&str>) -> RoomPost {
     RoomPost {
         room,
         body: Body::parse(text).unwrap(),
-        reply_to: None,
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
         idem: idem.map(|k| IdemKey::parse(k).unwrap()),
     }
 }
@@ -851,6 +936,7 @@ async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resol
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<ToyInbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -917,4 +1003,255 @@ async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resol
     .await
     .expect("live sidebar watch emitted updated human project name");
     assert_eq!(named.projects[0].name.as_deref(), Some("pancake-work"));
+}
+
+#[tokio::test]
+async fn presence_router_slot_and_404_visibility_masking() {
+    let (router, _, _) = harness(Duration::from_secs(60));
+    let sam = Principal::Seat {
+        seat: SeatName::parse("sam").unwrap(),
+    };
+    let alice = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let eve = Principal::Seat {
+        seat: SeatName::parse("eve").unwrap(),
+    };
+    let sam_c = LocalClient::new(router.clone(), sam.clone());
+
+    let err = sam_c.call(PresenceList::default()).await.unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::Unavailable {
+            family: Family::Presence
+        }
+    );
+
+    assert!(can_read(&sam, &StreamId::Presence).is_ok());
+
+    let dm = StreamId::Room {
+        room: RoomId::Direct {
+            pair: PrincipalPair::new(sam.clone(), alice.clone()).unwrap(),
+        },
+    };
+    assert!(can_read_visible(&sam, &dm, "/v1/rooms/dm").is_ok());
+    assert_eq!(
+        can_read_visible(&eve, &dm, "/v1/rooms/dm").unwrap_err(),
+        ApiError::NotFound {
+            what: "/v1/rooms/dm".into()
+        }
+    );
+    let alice_inbox = StreamId::Inbox { owner: alice };
+    assert_eq!(
+        can_read_visible(&eve, &alice_inbox, "/v1/inbox").unwrap_err(),
+        ApiError::NotFound {
+            what: "/v1/inbox".into()
+        }
+    );
+    assert_eq!(
+        mask_unauthorized_as_not_found(ApiError::Timeout, "/v1/events"),
+        ApiError::Timeout,
+        "non-Denied errors stay intact"
+    );
+}
+
+#[tokio::test]
+async fn room_filtered_watch_matches_before_or_after_labels_and_threads_causally() {
+    let (router, _, _) = harness(Duration::from_secs(60));
+    let op = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let room_ref = chan("tasks");
+    let info = op
+        .call(RoomEnsure {
+            room: room_ref.clone(),
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+
+    let open_lbl = Label::parse("status=open").unwrap();
+    let done_lbl = Label::parse("status=done").unwrap();
+    let other_lbl = Label::parse("team=other").unwrap();
+
+    let root = op
+        .call(RoomPost {
+            room: room_ref.clone(),
+            body: Body::parse("root task").unwrap(),
+            re: None,
+            after: None,
+            labels: vec![open_lbl.clone()],
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let unrelated = op
+        .call(RoomPost {
+            room: room_ref.clone(),
+            body: Body::parse("other thread").unwrap(),
+            re: None,
+            after: None,
+            labels: vec![other_lbl.clone()],
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let reply = op
+        .call(RoomPost {
+            room: room_ref.clone(),
+            body: Body::parse("reply before wait").unwrap(),
+            re: Some(root.seq),
+            after: None,
+            labels: vec![],
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let already_landed = op
+        .call(Wait {
+            timeout_ms: Some(500),
+            ..Wait::room_filtered(info.id.clone(), root.seq, Some(root.seq), vec![])
+        })
+        .await
+        .unwrap();
+    assert!(!already_landed.timed_out);
+    assert_eq!(
+        already_landed
+            .entries
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        vec![reply.seq],
+        "reply that landed before wait started still returns immediately"
+    );
+
+    let mut watch_open = op
+        .watch(
+            Interest::RoomFiltered {
+                room: room_ref.clone(),
+                re: None,
+                labels: vec![open_lbl.clone()],
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    let mut watch_done = op
+        .watch(
+            Interest::RoomFiltered {
+                room: room_ref.clone(),
+                re: None,
+                labels: vec![done_lbl.clone()],
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    let mut watch_thread = op
+        .watch(
+            Interest::RoomFiltered {
+                room: room_ref.clone(),
+                re: Some(root.seq),
+                labels: vec![],
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        watch_open.next().await,
+        Some(Ok(Frame::CaughtUp { .. }))
+    ));
+    assert!(matches!(
+        watch_done.next().await,
+        Some(Ok(Frame::CaughtUp { .. }))
+    ));
+    assert!(matches!(
+        watch_thread.next().await,
+        Some(Ok(Frame::CaughtUp { .. }))
+    ));
+
+    op.call(RoomLabel {
+        room: room_ref.clone(),
+        seq: unrelated.seq,
+        add: vec![Label::parse("team=infra").unwrap()],
+        remove: vec![],
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    op.call(RoomLabel {
+        room: room_ref.clone(),
+        seq: root.seq,
+        add: vec![done_lbl.clone()],
+        remove: vec![open_lbl.clone()],
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    let open_ev = tokio::time::timeout(Duration::from_secs(2), watch_open.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Frame::Committed(open_env) = open_ev else {
+        panic!("expected Committed for transition-out watcher");
+    };
+    assert!(matches!(
+        open_env.event,
+        Event::Room(RoomEvent::Labeled { target, .. }) if target == root.seq
+    ));
+
+    let done_ev = tokio::time::timeout(Duration::from_secs(2), watch_done.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Frame::Committed(done_env) = done_ev else {
+        panic!("expected Committed for transition-in watcher");
+    };
+    assert_eq!(done_env.seq, open_env.seq);
+
+    let thread_ev = tokio::time::timeout(Duration::from_secs(2), watch_thread.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Frame::Committed(thread_env) = thread_ev else {
+        panic!("expected Committed for root label on thread watcher");
+    };
+    assert_eq!(thread_env.seq, open_env.seq);
+
+    op.call(RoomLabel {
+        room: room_ref.clone(),
+        seq: reply.seq,
+        add: vec![Label::parse("ack=yes").unwrap()],
+        remove: vec![],
+        idem: None,
+    })
+    .await
+    .unwrap();
+    let reply_label_ev = tokio::time::timeout(Duration::from_secs(2), watch_thread.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Frame::Committed(reply_label_env) = reply_label_ev else {
+        panic!("expected Committed for label on seeded thread reply");
+    };
+    assert!(matches!(
+        reply_label_env.event,
+        Event::Room(RoomEvent::Labeled { target, .. }) if target == reply.seq
+    ));
 }

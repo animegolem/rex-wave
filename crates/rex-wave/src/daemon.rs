@@ -219,6 +219,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             mail_writer,
             hub.clone(),
         )),
+        presence: Arc::new(rex_wave_runtime::Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,

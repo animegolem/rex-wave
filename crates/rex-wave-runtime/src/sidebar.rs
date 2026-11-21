@@ -175,7 +175,12 @@ impl World {
                             mentions: mentions.clone(),
                         });
                     }
-                    RoomEvent::TopicSet { .. } => {}
+                    RoomEvent::TopicSet { .. }
+                    | RoomEvent::Labeled { .. }
+                    | RoomEvent::TaskClaimed { .. }
+                    | RoomEvent::TaskHeartbeat { .. }
+                    | RoomEvent::TaskTransitioned { .. }
+                    | RoomEvent::TaskUpdated { .. } => {}
                 }
             }
             (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {

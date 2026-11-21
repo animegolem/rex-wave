@@ -419,3 +419,44 @@ fn standalone_engine_handles_idem_moves_and_links() {
     assert_eq!(parsed_cards.len(), 1);
     assert_eq!(parsed_cards[0].links.len(), 2);
 }
+
+#[test]
+fn org_id_validation_minting_and_legacy_card_json_replay() {
+    assert!(OrgId::parse("src-bush1951").is_ok());
+    assert!(OrgId::parse("550e8400-e29b-41d4-a716-446655440000").is_ok());
+    assert!(OrgId::parse("rw-0123456789abcdef").is_ok());
+    assert!(OrgId::parse("").is_err());
+    assert!(OrgId::parse("has space").is_err());
+    assert!(OrgId::parse("has:colon").is_err());
+    assert!(OrgId::parse("has[bracket").is_err());
+    assert!(OrgId::parse("has]bracket").is_err());
+    assert!(OrgId::parse("a".repeat(129)).is_err());
+
+    let m1 = OrgId::mint();
+    let m2 = OrgId::mint();
+    assert!(m1.is_rex_minted());
+    assert!(m2.is_rex_minted());
+    assert_ne!(m1, m2);
+
+    let b1 = BoardId::parse("project:a").unwrap();
+    let b2 = BoardId::parse("project:b").unwrap();
+    assert_ne!(
+        OrgId::for_board_card(&b1, CardNo(1)),
+        OrgId::for_board_card(&b2, CardNo(1))
+    );
+
+    let legacy_card_json = serde_json::json!({
+        "no": 1,
+        "revision": 2,
+        "title": "Legacy card",
+        "lane": "todo",
+        "assignee": null,
+        "priority": "normal",
+        "due_ms": null,
+        "labels": ["core"],
+        "links": []
+    });
+    let card: Card = serde_json::from_value(legacy_card_json).expect("legacy card JSON replays");
+    assert_eq!(card.org_id, None);
+    assert!(card.needs.is_empty());
+}

@@ -20,6 +20,7 @@ fn build_router(journal: Journal, idle: Duration) -> Arc<Router> {
         board: Registry::<Board>::with_idle(journal.clone(), hub.clone(), idle),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,

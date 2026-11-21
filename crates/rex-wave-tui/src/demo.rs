@@ -425,6 +425,7 @@ impl DemoClient {
                         Card {
                             no: CardNo(1),
                             revision: CardRevision(1),
+                            org_id: None,
                             title: Title::parse("Wire OAuth refresh endpoint").expect("title"),
                             lane: LaneName::parse("todo").expect("lane"),
                             assignee: Some(
@@ -434,10 +435,12 @@ impl DemoClient {
                             due_ms: None,
                             labels: vec!["auth-v2".to_owned()],
                             links: Vec::new(),
+                            needs: Vec::new(),
                         },
                         Card {
                             no: CardNo(2),
                             revision: CardRevision(1),
+                            org_id: None,
                             title: Title::parse("Add SQLite WAL migration 004").expect("title"),
                             lane: LaneName::parse("todo").expect("lane"),
                             assignee: Some(Assignee::parse("@auth-v2/migrator").expect("assignee")),
@@ -445,6 +448,7 @@ impl DemoClient {
                             due_ms: None,
                             labels: vec!["db".to_owned()],
                             links: Vec::new(),
+                            needs: Vec::new(),
                         },
                     ],
                 },
@@ -453,6 +457,7 @@ impl DemoClient {
                     cards: vec![Card {
                         no: CardNo(3),
                         revision: CardRevision(2),
+                        org_id: None,
                         title: Title::parse("Rotate EdDSA signing keys").expect("title"),
                         lane: LaneName::parse("doing").expect("lane"),
                         assignee: Some(Assignee::parse("@auth-v2/author-jwt").expect("assignee")),
@@ -460,6 +465,7 @@ impl DemoClient {
                         due_ms: None,
                         labels: Vec::new(),
                         links: Vec::new(),
+                        needs: Vec::new(),
                     }],
                 },
                 LaneCards {
@@ -467,6 +473,7 @@ impl DemoClient {
                     cards: vec![Card {
                         no: CardNo(4),
                         revision: CardRevision(1),
+                        org_id: None,
                         title: Title::parse("Audit token replay window").expect("title"),
                         lane: LaneName::parse("review").expect("lane"),
                         assignee: Some(Assignee::parse("@sam").expect("assignee")),
@@ -474,6 +481,7 @@ impl DemoClient {
                         due_ms: None,
                         labels: Vec::new(),
                         links: Vec::new(),
+                        needs: Vec::new(),
                     }],
                 },
                 LaneCards {
@@ -505,7 +513,10 @@ impl DemoClient {
                             principals: Vec::new(),
                             all: true,
                         },
-                        reply_to: None,
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
                         idem: None,
                     }),
                 },
@@ -523,7 +534,10 @@ impl DemoClient {
                             principals: vec![me.clone()],
                             all: false,
                         },
-                        reply_to: Some(Seq(1)),
+                        re: Some(Seq(1)),
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
                         idem: None,
                     }),
                 },
@@ -545,7 +559,10 @@ impl DemoClient {
                         principals: vec![me.clone()],
                         all: false,
                     },
-                    reply_to: None,
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
                     idem: None,
                 }),
             }],
@@ -593,7 +610,10 @@ impl DemoClient {
                 event: Event::Room(RoomEvent::Posted {
                     body: Body::parse(format!("message #{seq}")).expect("body"),
                     mentions: Mentions::default(),
-                    reply_to: None,
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
                     idem: None,
                 }),
             });
@@ -763,6 +783,7 @@ impl Client for DemoClient {
                             let card = Card {
                                 no: CardNo(next_no),
                                 revision: CardRevision(1),
+                                org_id: up.patch.org_id,
                                 title,
                                 lane: lane.clone(),
                                 assignee,
@@ -770,6 +791,7 @@ impl Client for DemoClient {
                                 due_ms: up.patch.due_ms,
                                 labels: up.patch.labels_add,
                                 links: up.patch.links_add,
+                                needs: up.patch.needs_add,
                             };
                             if let Some(target_lane) =
                                 st.board.lanes.iter_mut().find(|l| l.lane == lane)
@@ -873,7 +895,10 @@ impl Client for DemoClient {
                         event: Event::Room(RoomEvent::Posted {
                             body: post.body,
                             mentions: Mentions::default(),
-                            reply_to: post.reply_to,
+                            re: post.re,
+                            after: post.after,
+                            labels: post.labels,
+                            task: post.task,
                             idem: post.idem,
                         }),
                     });
@@ -882,6 +907,9 @@ impl Client for DemoClient {
                         room: room_id,
                         seq: next_seq,
                         mentions: Mentions::default(),
+                        re: post.re,
+                        org_id: None,
+                        delivery_notice: None,
                     })
                 }
                 WireCommand::RoomEnsure(re) => {
@@ -896,6 +924,29 @@ impl Client for DemoClient {
                 }
                 WireCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
                 WireCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),
+                WireCommand::RoomLabel(_)
+                | WireCommand::TaskClaim(_)
+                | WireCommand::TaskHeartbeat(_)
+                | WireCommand::TaskTransition(_)
+                | WireCommand::TaskUpdate(_)
+                | WireCommand::RoomTasks(_) => {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Room,
+                    });
+                }
+                WireCommand::PresenceClaim(_)
+                | WireCommand::PresenceSetStatus(_)
+                | WireCommand::PresenceBind(_)
+                | WireCommand::PresenceHeartbeat(_)
+                | WireCommand::PresenceUnbind(_)
+                | WireCommand::PresenceExpire(_)
+                | WireCommand::PresenceTransportHealth(_)
+                | WireCommand::PresenceList(_)
+                | WireCommand::PresenceResolve(_) => {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Presence,
+                    });
+                }
                 WireCommand::WaveResolve(res) => {
                     if let Some(w) = st.workers.get_mut(&res.role) {
                         w.phase = WorkerPhase::Live {

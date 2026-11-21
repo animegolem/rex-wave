@@ -46,6 +46,12 @@ impl Decider for TestRooms {
             RoomCommand::RoomPost(c) => &c.room,
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
+            RoomCommand::RoomLabel(c) => &c.room,
+            RoomCommand::TaskClaim(c) => &c.room,
+            RoomCommand::TaskHeartbeat(c) => &c.room,
+            RoomCommand::TaskTransition(c) => &c.room,
+            RoomCommand::TaskUpdate(c) => &c.room,
+            RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
             room: room_ref.resolve(&ctx.by)?,
@@ -108,7 +114,10 @@ impl Decider for TestRooms {
             RoomCommand::RoomPost(RoomPost {
                 room,
                 body,
-                reply_to,
+                re,
+                after,
+                labels,
+                task,
                 idem,
             }) => {
                 let mut events = Vec::new();
@@ -143,11 +152,17 @@ impl Decider for TestRooms {
                         principals: mentioned,
                         all,
                     },
-                    reply_to: *reply_to,
+                    re: *re,
+                    after: *after,
+                    labels: labels.clone(),
+                    task: task.clone(),
                     idem: idem.clone(),
                 });
                 Ok(events)
             }
+            _ => Err(ApiError::Unavailable {
+                family: Family::Room,
+            }),
         }
     }
 
@@ -173,6 +188,11 @@ impl Decider for TestRooms {
             RoomEvent::TopicSet { topic } => {
                 state.topic = Some(topic.clone());
             }
+            RoomEvent::Labeled { .. }
+            | RoomEvent::TaskClaimed { .. }
+            | RoomEvent::TaskHeartbeat { .. }
+            | RoomEvent::TaskTransitioned { .. }
+            | RoomEvent::TaskUpdated { .. } => {}
         }
     }
 
@@ -189,9 +209,13 @@ impl Decider for TestRooms {
                 room: state.id.clone().expect("room opened"),
                 seq: state.head,
                 mentions: state.last_mentions.clone(),
+                re: None,
+                org_id: None,
+                delivery_notice: None,
             }),
             RoomCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
             RoomCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),
+            _ => unreachable!("rejected in decide"),
         }
     }
 
@@ -290,9 +314,10 @@ impl Decider for TestBoards {
                 match card {
                     None => {
                         let next_no = CardNo((state.cards.len() as u32) + 1);
-                        let title = patch.title.clone().ok_or_else(|| ApiError::Conflict {
-                            detail: "missing card title".into(),
-                        })?;
+                        let title = patch
+                            .title
+                            .clone()
+                            .ok_or_else(|| ApiError::conflict("missing card title"))?;
                         let lane = patch
                             .lane
                             .clone()
@@ -305,6 +330,7 @@ impl Decider for TestBoards {
                             card: Card {
                                 no: next_no,
                                 revision: CardRevision(1),
+                                org_id: patch.org_id.clone(),
                                 title,
                                 lane,
                                 assignee,
@@ -312,6 +338,7 @@ impl Decider for TestBoards {
                                 due_ms: patch.due_ms,
                                 labels: patch.labels_add.clone(),
                                 links: patch.links_add.clone(),
+                                needs: patch.needs_add.clone(),
                             },
                         });
                         Ok(out)
@@ -323,12 +350,10 @@ impl Decider for TestBoards {
                         if let Some(exp) = expected
                             && &existing.revision != exp
                         {
-                            return Err(ApiError::Conflict {
-                                detail: format!(
-                                    "expected rev {}, got {}",
-                                    exp.0, existing.revision.0
-                                ),
-                            });
+                            return Err(ApiError::conflict(format!(
+                                "expected rev {}, got {}",
+                                exp.0, existing.revision.0
+                            )));
                         }
                         out.push(BoardEvent::CardPatched {
                             no: *no,
@@ -597,6 +622,7 @@ impl TestHarness {
             board: Registry::<TestBoards>::new(journal.clone(), hub),
             inbox: Arc::new(Unavailable(Family::Inbox)),
             mail: Arc::new(Unavailable(Family::Mail)),
+            presence: Arc::new(Unavailable(Family::Presence)),
             read,
         });
         TestHarness {
@@ -1301,7 +1327,10 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
                 name: ChannelName::parse("wave-mcp").unwrap(),
             },
             body: Body::parse("@sam live update arrived").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -1369,7 +1398,10 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
                 name: ChannelName::parse("wave-mcp").unwrap(),
             },
             body: Body::parse("after unsubscribe").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -1641,7 +1673,10 @@ async fn resources_read_returns_latest_200_entries_for_long_rooms() {
         sam.call(RoomPost {
             room: room.clone(),
             body: Body::parse(format!("entry-{i}")).unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await

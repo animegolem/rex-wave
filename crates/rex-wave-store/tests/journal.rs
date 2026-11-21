@@ -21,7 +21,10 @@ fn post(text: &str) -> Event {
     Event::Room(RoomEvent::Posted {
         body: Body::parse(text).unwrap(),
         mentions: Default::default(),
-        reply_to: None,
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
         idem: None,
     })
 }

@@ -1111,12 +1111,7 @@ fn submit_composer(model: &mut Model, effects: &mut Vec<Effect>) {
         ComposerTarget::Room { room } => match Body::parse(trimmed.to_owned()) {
             Ok(body) => effects.push(Effect::Call {
                 tag: ReplyTag::UserCommand,
-                cmd: WireCommand::RoomPost(RoomPost {
-                    room: RoomRef::Id { id: room },
-                    body,
-                    reply_to: None,
-                    idem: None,
-                }),
+                cmd: WireCommand::RoomPost(RoomPost::new(RoomRef::Id { id: room }, body)),
             }),
             Err(e) => model.last_error = Some(e.to_string()),
         },

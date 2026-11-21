@@ -89,9 +89,11 @@ pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
         StreamId::Room {
             room: RoomId::Direct { pair },
         } => pair.contains(viewer),
-        StreamId::Room { .. } | StreamId::Wave { .. } | StreamId::Board { .. } | StreamId::Mail => {
-            true
-        }
+        StreamId::Room { .. }
+        | StreamId::Wave { .. }
+        | StreamId::Board { .. }
+        | StreamId::Mail
+        | StreamId::Presence => true,
     };
     if allowed {
         Ok(())
@@ -101,6 +103,37 @@ pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
             action: format!("read {stream:?}"),
         })
     }
+}
+
+/// Maps `ApiError::Denied` to `ApiError::NotFound` so external/HTTP callers
+/// cannot probe whether an invisible resource (DM or another principal's Inbox) exists.
+pub fn mask_unauthorized_as_not_found(err: ApiError, resource: impl Into<String>) -> ApiError {
+    match err {
+        ApiError::Denied { .. } => ApiError::NotFound {
+            what: resource.into(),
+        },
+        other => other,
+    }
+}
+
+/// Checks stream visibility for external/HTTP callers, returning `ApiError::NotFound`
+/// (HTTP 404) instead of `ApiError::Denied` (HTTP 403) when outside caller visibility.
+pub fn can_read_visible(
+    viewer: &Principal,
+    stream: &StreamId,
+    resource: impl Into<String>,
+) -> Result<(), ApiError> {
+    can_read(viewer, stream).map_err(|err| mask_unauthorized_as_not_found(err, resource))
+}
+
+/// True when every required `key=value` label is present in `actual`.
+pub fn labels_match(required: &[Label], actual: &[Label]) -> bool {
+    required.iter().all(|req| actual.contains(req))
+}
+
+/// True when `RoomEvent::Labeled` matches `required` either `before` OR `after` the mutation.
+pub fn labeled_event_matches(required: &[Label], before: &[Label], after: &[Label]) -> bool {
+    labels_match(required, before) || labels_match(required, after)
 }
 
 /// Serves `Family::Read` and every `watch`.
@@ -291,11 +324,12 @@ impl ReadSide {
 
             let candidates: Vec<StreamId> = match &filter {
                 Filter::Exact(set) => set.iter().cloned().collect(),
+                Filter::RoomFiltered { stream, .. } => vec![stream.clone()],
                 _ => initial.keys().cloned().collect(),
             };
             for s in candidates {
-                filter.seed_stream(&journal, &s);
                 let start = start_seq(&from, &initial, &s);
+                filter.seed_stream(&journal, &s, start);
                 seen.insert(s.clone(), start);
                 cursor.advance(&s, start);
                 if from.from_head() && !from.lists(&s) {
@@ -353,11 +387,11 @@ impl ReadSide {
                         Err(RecvError::Lagged(_)) => {
                             let Ok(streams) = journal.streams() else { break };
                             for (s, head) in streams {
-                                filter.seed_stream(&journal, &s);
+                                let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq(&from, &initial, &s));
+                                filter.seed_stream(&journal, &s, cur);
                                 if !filter.considers_stream(&s) {
                                     continue;
                                 }
-                                let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq(&from, &initial, &s));
                                 if cur < head && !replay_stream(&journal, &s, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
                                     return;
                                 }
@@ -491,6 +525,14 @@ async fn replay_stream(
 
 enum Filter {
     Exact(BTreeSet<StreamId>),
+    RoomFiltered {
+        stream: StreamId,
+        re: Option<Seq>,
+        labels: Vec<Label>,
+        thread_members: BTreeSet<Seq>,
+        current_labels: BTreeMap<Seq, Vec<Label>>,
+        seeded_upto: Seq,
+    },
     Mentions {
         sidebar: Arc<SidebarProjection>,
         joined: BTreeMap<RoomId, BTreeSet<Principal>>,
@@ -522,6 +564,20 @@ impl Filter {
                 };
                 can_read(viewer, &s)?;
                 Ok(Filter::Exact(BTreeSet::from([s])))
+            }
+            Interest::RoomFiltered { room, re, labels } => {
+                let s = StreamId::Room {
+                    room: room.resolve(viewer)?,
+                };
+                can_read(viewer, &s)?;
+                Ok(Filter::RoomFiltered {
+                    stream: s,
+                    re,
+                    labels,
+                    thread_members: BTreeSet::new(),
+                    current_labels: BTreeMap::new(),
+                    seeded_upto: Seq::ORIGIN,
+                })
             }
             Interest::MyInbox => Ok(Filter::Exact(BTreeSet::from([StreamId::Inbox {
                 owner: viewer.clone(),
@@ -556,20 +612,95 @@ impl Filter {
         }
     }
 
-    /// Learn stream-header facts (like which project owns a wave) even when
-    /// `Cursor::live()` skips replaying the stream's body.
-    fn seed_stream(&mut self, journal: &Journal, stream: &StreamId) {
+    /// Learn stream-header facts (like which project owns a wave, or prior thread
+    /// membership and labels before a mid-stream resume point).
+    fn seed_stream(&mut self, journal: &Journal, stream: &StreamId, upto: Seq) {
         if let (Filter::Project { .. }, StreamId::Wave { .. }) = (&self, stream)
             && let Ok(first) = journal.read(stream, Seq::ORIGIN, 1)
         {
             for env in &first {
                 self.observe(env);
             }
+            return;
+        }
+
+        let seed_start = match self {
+            Filter::RoomFiltered {
+                stream: target,
+                re,
+                labels,
+                seeded_upto,
+                ..
+            } if stream == target
+                && (re.is_some() || !labels.is_empty())
+                && upto > *seeded_upto =>
+            {
+                Some(*seeded_upto)
+            }
+            _ => None,
+        };
+        let Some(mut after) = seed_start else {
+            return;
+        };
+        while after < upto {
+            let Ok(page) = journal.read(stream, after, REPLAY_PAGE) else {
+                break;
+            };
+            if page.is_empty() {
+                break;
+            }
+            for env in &page {
+                if env.seq > upto {
+                    if let Filter::RoomFiltered { seeded_upto, .. } = self {
+                        *seeded_upto = upto;
+                    }
+                    return;
+                }
+                self.observe(env);
+                after = env.seq;
+            }
+        }
+        if let Filter::RoomFiltered { seeded_upto, .. } = self {
+            *seeded_upto = upto;
         }
     }
 
     fn observe(&mut self, env: &Envelope) {
         match (self, &env.stream, &env.event) {
+            (
+                Filter::RoomFiltered {
+                    stream,
+                    re,
+                    thread_members,
+                    current_labels,
+                    ..
+                },
+                env_stream,
+                Event::Room(RoomEvent::Posted {
+                    re: post_re,
+                    labels,
+                    ..
+                }),
+            ) if env_stream == stream => {
+                if let Some(root) = *re
+                    && let Some(parent) = post_re
+                    && (*parent == root || thread_members.contains(parent))
+                {
+                    thread_members.insert(env.seq);
+                }
+                current_labels.insert(env.seq, labels.clone());
+            }
+            (
+                Filter::RoomFiltered {
+                    stream,
+                    current_labels,
+                    ..
+                },
+                env_stream,
+                Event::Room(RoomEvent::Labeled { target, after, .. }),
+            ) if env_stream == stream => {
+                current_labels.insert(*target, after.clone());
+            }
             (
                 Filter::Project { project, waves, .. },
                 StreamId::Wave { wave },
@@ -603,6 +734,7 @@ impl Filter {
     fn considers_stream(&self, stream: &StreamId) -> bool {
         match self {
             Filter::Exact(set) => set.contains(stream),
+            Filter::RoomFiltered { stream: target, .. } => stream == target,
             Filter::Mentions { .. } => matches!(stream, StreamId::Room { .. }),
             Filter::Project {
                 project,
@@ -630,6 +762,59 @@ impl Filter {
         }
         match self {
             Filter::Exact(_) | Filter::Project { .. } | Filter::Everything => true,
+            Filter::RoomFiltered {
+                re,
+                labels,
+                thread_members,
+                current_labels,
+                ..
+            } => match &env.event {
+                Event::Room(RoomEvent::Posted {
+                    labels: post_labels,
+                    ..
+                }) => {
+                    let re_ok = match re {
+                        Some(root) => env.seq == *root || thread_members.contains(&env.seq),
+                        None => true,
+                    };
+                    let labels_ok = labels.is_empty() || labels_match(labels, post_labels);
+                    re_ok && labels_ok
+                }
+                Event::Room(RoomEvent::Labeled {
+                    target,
+                    before,
+                    after,
+                    ..
+                }) => {
+                    let re_ok = match re {
+                        Some(root) => *target == *root || thread_members.contains(target),
+                        None => true,
+                    };
+                    let labels_ok =
+                        labels.is_empty() || labeled_event_matches(labels, before, after);
+                    re_ok && labels_ok
+                }
+                Event::Room(
+                    RoomEvent::TaskClaimed { task, .. }
+                    | RoomEvent::TaskHeartbeat { task, .. }
+                    | RoomEvent::TaskTransitioned { task, .. }
+                    | RoomEvent::TaskUpdated { task, .. },
+                ) => {
+                    let re_ok = re.is_none_or(|root| *task == root);
+                    let labels_ok = labels.is_empty()
+                        || current_labels
+                            .get(task)
+                            .is_some_and(|cur| labels_match(labels, cur));
+                    re_ok && labels_ok
+                }
+                Event::Room(
+                    RoomEvent::Opened { .. }
+                    | RoomEvent::MemberJoined { .. }
+                    | RoomEvent::MemberLeft { .. }
+                    | RoomEvent::TopicSet { .. },
+                ) => re.is_none() && labels.is_empty(),
+                _ => false,
+            },
             Filter::Mentions { sidebar, joined } => match (&env.stream, &env.event) {
                 (
                     StreamId::Room {

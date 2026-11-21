@@ -199,12 +199,10 @@ impl Decider for Waves {
                     if existing == &c.spec {
                         return Ok(vec![]);
                     }
-                    return Err(ApiError::Conflict {
-                        detail: format!(
-                            "wave {} already exists with a different spec",
-                            c.spec.slug
-                        ),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "wave {} already exists with a different spec",
+                        c.spec.slug
+                    )));
                 }
                 let room = wave_room(&c.spec.slug, &c.spec.project);
                 let board = project_board(&c.spec.project);
@@ -229,17 +227,16 @@ impl Decider for Waves {
                 let spec = state.require_started(&c.wave)?;
                 state.authorize_wave_mutation(&c.wave, &ctx.by, "add worker")?;
                 if !matches!(state.status, Some(WaveStatus::Running)) {
-                    return Err(ApiError::Conflict {
-                        detail: format!("wave {} is already finished", c.wave),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "wave {} is already finished",
+                        c.wave
+                    )));
                 }
                 if state.workers.contains_key(&c.worker.role) {
-                    return Err(ApiError::Conflict {
-                        detail: format!(
-                            "worker @{} already exists in wave {}",
-                            c.worker.role, c.wave
-                        ),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "worker @{} already exists in wave {}",
+                        c.worker.role, c.wave
+                    )));
                 }
                 let agent = c
                     .worker
@@ -293,12 +290,10 @@ impl Decider for Waves {
                         what: format!("worker @{}/{}", c.wave, c.role),
                     })?;
                 if !matches!(rec.phase, WorkerPhase::Live { .. }) {
-                    return Err(ApiError::Conflict {
-                        detail: format!(
-                            "worker @{}/{} is not live ({:?})",
-                            c.wave, c.role, rec.phase
-                        ),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "worker @{}/{} is not live ({:?})",
+                        c.wave, c.role, rec.phase
+                    )));
                 }
                 Ok(vec![WaveEvent::Told {
                     role: c.role.clone(),
@@ -326,12 +321,10 @@ impl Decider for Waves {
                         ..
                     } => {
                         if interaction.id != c.interaction {
-                            return Err(ApiError::Conflict {
-                                detail: format!(
-                                    "worker @{}/{} is blocked on {}, not {}",
-                                    c.wave, c.role, interaction.id, c.interaction
-                                ),
-                            });
+                            return Err(ApiError::conflict(format!(
+                                "worker @{}/{} is blocked on {}, not {}",
+                                c.wave, c.role, interaction.id, c.interaction
+                            )));
                         }
                         if let Some((prev_id, prev_res)) = &rec.resolved_interaction
                             && prev_id == &c.interaction
@@ -339,12 +332,10 @@ impl Decider for Waves {
                             if prev_res == &c.resolution {
                                 return Ok(vec![]);
                             }
-                            return Err(ApiError::Conflict {
-                                detail: format!(
-                                    "interaction {} was already resolved for @{}/{}",
-                                    c.interaction, c.wave, c.role
-                                ),
-                            });
+                            return Err(ApiError::conflict(format!(
+                                "interaction {} was already resolved for @{}/{}",
+                                c.interaction, c.wave, c.role
+                            )));
                         }
                         Ok(vec![WaveEvent::InteractionResolved {
                             role: c.role.clone(),
@@ -352,12 +343,10 @@ impl Decider for Waves {
                             resolution: c.resolution.clone(),
                         }])
                     }
-                    other => Err(ApiError::Conflict {
-                        detail: format!(
-                            "worker @{}/{} has no pending interaction ({other:?})",
-                            c.wave, c.role
-                        ),
-                    }),
+                    other => Err(ApiError::conflict(format!(
+                        "worker @{}/{} has no pending interaction ({other:?})",
+                        c.wave, c.role
+                    ))),
                 }
             }
             WaveCommand::WaveFinish(c) => {
@@ -367,9 +356,10 @@ impl Decider for Waves {
                     if outcome == &c.outcome {
                         return Ok(vec![]);
                     }
-                    return Err(ApiError::Conflict {
-                        detail: format!("wave {} is already finished", c.wave),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "wave {} is already finished",
+                        c.wave
+                    )));
                 }
                 let mut events = vec![WaveEvent::Finished {
                     outcome: c.outcome.clone(),
@@ -666,7 +656,13 @@ impl<H: AgentHost> WaveConductor<H> {
                         members.remove(member);
                     }
                 }
-                RoomEvent::Posted { .. } | RoomEvent::TopicSet { .. } => {}
+                RoomEvent::Posted { .. }
+                | RoomEvent::TopicSet { .. }
+                | RoomEvent::Labeled { .. }
+                | RoomEvent::TaskClaimed { .. }
+                | RoomEvent::TaskHeartbeat { .. }
+                | RoomEvent::TaskTransitioned { .. }
+                | RoomEvent::TaskUpdated { .. } => {}
             },
             (StreamId::Board { board }, Event::Board(_)) => {
                 self.opened_boards.insert(board.clone());
@@ -1026,10 +1022,8 @@ impl<H: AgentHost> WaveConductor<H> {
         };
         client
             .call(RoomPost {
-                room: RoomRef::Id { id: room.clone() },
-                body: brief_post,
-                reply_to: None,
                 idem: Some(idem),
+                ..RoomPost::new(RoomRef::Id { id: room.clone() }, brief_post)
             })
             .await?;
 
@@ -1092,10 +1086,8 @@ impl<H: AgentHost> WaveConductor<H> {
                     ));
                     let _ = client
                         .call(RoomPost {
-                            room: RoomRef::Id { id: room },
-                            body,
-                            reply_to: None,
                             idem,
+                            ..RoomPost::new(RoomRef::Id { id: room }, body)
                         })
                         .await;
                 }
@@ -1912,6 +1904,9 @@ mod tests {
                                     room: id,
                                     seq,
                                     mentions: Mentions::default(),
+                                    re: None,
+                                    org_id: None,
+                                    delivery_notice: None,
                                 }));
                             }
                             let mut principals = Vec::new();
@@ -1939,7 +1934,10 @@ mod tests {
                                 Event::Room(RoomEvent::Posted {
                                     body: c.body,
                                     mentions: mentions.clone(),
-                                    reply_to: c.reply_to,
+                                    re: c.re,
+                                    after: c.after,
+                                    labels: c.labels,
+                                    task: c.task,
                                     idem: c.idem.clone(),
                                 }),
                             );
@@ -1950,9 +1948,15 @@ mod tests {
                                 room: id,
                                 seq: env.seq,
                                 mentions,
+                                re: c.re,
+                                org_id: None,
+                                delivery_notice: None,
                             }))
                         }
                         RoomCommand::RoomLeave(_) => Ok(WireReply::RoomLeave(Ack)),
+                        _ => Err(ApiError::Unavailable {
+                            family: Family::Room,
+                        }),
                     },
                     Routed::Board(BoardCommand::BoardEnsure(c)) => {
                         g.boards.insert(c.board.clone());
@@ -2073,14 +2077,12 @@ mod tests {
         drain_conductor(&mut conductor, &sys_conductor, &bus);
         host.calls.lock().unwrap().clear();
 
-        block_on(op.call(RoomPost {
-            room: RoomRef::Id {
+        block_on(op.call(RoomPost::new(
+            RoomRef::Id {
                 id: started.room.clone(),
             },
-            body: Body::parse("@all status check").unwrap(),
-            reply_to: None,
-            idem: None,
-        }))
+            Body::parse("@all status check").unwrap(),
+        )))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
@@ -2097,17 +2099,15 @@ mod tests {
         ));
 
         host.calls.lock().unwrap().clear();
-        block_on(op.call(RoomPost {
-            room: RoomRef::Dm {
+        block_on(op.call(RoomPost::new(
+            RoomRef::Dm {
                 with: Principal::Worker {
                     wave: wave.clone(),
                     role: author.clone(),
                 },
             },
-            body: Body::parse("urgent DM").unwrap(),
-            reply_to: None,
-            idem: None,
-        }))
+            Body::parse("urgent DM").unwrap(),
+        )))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
@@ -2239,12 +2239,10 @@ mod tests {
             reason: Some("done".into()),
         }))
         .unwrap();
-        block_on(op.call(RoomPost {
-            room: RoomRef::Id { id: started.room },
-            body: Body::parse("@all historical message").unwrap(),
-            reply_to: None,
-            idem: None,
-        }))
+        block_on(op.call(RoomPost::new(
+            RoomRef::Id { id: started.room },
+            Body::parse("@all historical message").unwrap(),
+        )))
         .unwrap();
 
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -2359,12 +2357,10 @@ mod tests {
         );
         host.calls.lock().unwrap().clear();
 
-        block_on(op.call(RoomPost {
-            room: RoomRef::Id { id: started.room },
-            body: Body::parse("@acp-helper check token TTL").unwrap(),
-            reply_to: None,
-            idem: None,
-        }))
+        block_on(op.call(RoomPost::new(
+            RoomRef::Id { id: started.room },
+            Body::parse("@acp-helper check token TTL").unwrap(),
+        )))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
@@ -2553,14 +2549,12 @@ mod tests {
         );
 
         *host.reject_retire.lock().unwrap() = false;
-        block_on(op.call(RoomPost {
-            room: RoomRef::Id {
+        block_on(op.call(RoomPost::new(
+            RoomRef::Id {
                 id: started.room.clone(),
             },
-            body: Body::parse("trigger dirty reconcile").unwrap(),
-            reply_to: None,
-            idem: None,
-        }))
+            Body::parse("trigger dirty reconcile").unwrap(),
+        )))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
@@ -2602,14 +2596,12 @@ mod tests {
         .unwrap();
         drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
         for n in 1..=4 {
-            block_on(op.call(RoomPost {
-                room: RoomRef::Id {
+            block_on(op.call(RoomPost::new(
+                RoomRef::Id {
                     id: started.room.clone(),
                 },
-                body: Body::parse(format!("offline frame {n}")).unwrap(),
-                reply_to: None,
-                idem: None,
-            }))
+                Body::parse(format!("offline frame {n}")).unwrap(),
+            )))
             .unwrap();
             drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
         }
@@ -2632,14 +2624,12 @@ mod tests {
         *host.retire_attempts.lock().unwrap() = 0;
         *host.reject_retire.lock().unwrap() = true;
         for n in 1..=5 {
-            block_on(op.call(RoomPost {
-                room: RoomRef::Id {
+            block_on(op.call(RoomPost::new(
+                RoomRef::Id {
                     id: started.room.clone(),
                 },
-                body: Body::parse(format!("chat frame {n}")).unwrap(),
-                reply_to: None,
-                idem: None,
-            }))
+                Body::parse(format!("chat frame {n}")).unwrap(),
+            )))
             .unwrap();
             drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
         }

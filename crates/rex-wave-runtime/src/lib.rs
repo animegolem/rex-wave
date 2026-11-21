@@ -39,7 +39,10 @@ mod sidebar;
 pub use actor::Registry;
 pub use hub::Hub;
 pub use reactor::{Reactor, spawn_reactor};
-pub use read::{AgentFeed, NoAgentFeed, ReadSide, can_read, frame_channel};
+pub use read::{
+    AgentFeed, NoAgentFeed, ReadSide, can_read, can_read_visible, frame_channel,
+    labeled_event_matches, labels_match, mask_unauthorized_as_not_found,
+};
 pub use router::{LocalClient, Remote, Router, Session, Unavailable, authorize};
 pub use sidebar::SidebarProjection;
 
@@ -109,9 +112,7 @@ pub fn now() -> UnixMs {
 
 fn store_error(e: rex_wave_store::StoreError) -> ApiError {
     match e {
-        rex_wave_store::StoreError::HeadMoved { .. } => ApiError::Conflict {
-            detail: e.to_string(),
-        },
+        rex_wave_store::StoreError::HeadMoved { .. } => ApiError::conflict(e.to_string()),
         other => ApiError::Internal(other.to_string()),
     }
 }

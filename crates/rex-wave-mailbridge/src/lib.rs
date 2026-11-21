@@ -475,9 +475,10 @@ impl SandboxRoot {
                     });
                 }
                 Ok(m) if !m.file_type().is_dir() => {
-                    return Err(ApiError::Conflict {
-                        detail: format!("{} exists and is not a directory", cur.display()),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "{} exists and is not a directory",
+                        cur.display()
+                    )));
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -792,8 +793,10 @@ fn principal_mail_address(p: &Principal) -> String {
             SystemPart::WaveConductor => "system/wave_conductor".into(),
             SystemPart::Herald => "system/herald".into(),
             SystemPart::BbBridge => "system/bb_bridge".into(),
+            SystemPart::T3Bridge => "system/t3_bridge".into(),
             SystemPart::MailBridge => "system/mail_bridge".into(),
             SystemPart::WakeBell => "system/wake_bell".into(),
+            SystemPart::PresenceMonitor => "system/presence_monitor".into(),
         },
     }
 }
@@ -910,9 +913,9 @@ pub fn render_letter(req: &MailPromote, by: &Principal, entries: &[Envelope]) ->
     ));
 
     for env in sorted {
-        if let Event::Room(room::RoomEvent::Posted { body, reply_to, .. }) = &env.event {
+        if let Event::Room(room::RoomEvent::Posted { body, re, .. }) = &env.event {
             out.push('\n');
-            match reply_to {
+            match re {
                 Some(r) => {
                     out.push_str(&format!("> **[#{} -> #{}] {}**:\n", env.seq.0, r.0, env.by))
                 }
@@ -1177,12 +1180,10 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
             if existing == bytes {
                 return Ok(dest);
             }
-            return Err(ApiError::Conflict {
-                detail: format!(
-                    "canon file {} already exists with different bytes (BoxMonotone)",
-                    dest.display()
-                ),
-            });
+            return Err(ApiError::conflict(format!(
+                "canon file {} already exists with different bytes (BoxMonotone)",
+                dest.display()
+            )));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(ApiError::Internal(format!("stat {}: {e}", dest.display()))),
@@ -1228,12 +1229,10 @@ fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<P
             if existing == bytes {
                 Ok(dest)
             } else {
-                Err(ApiError::Conflict {
-                    detail: format!(
-                        "canon file {} already exists with different bytes (BoxMonotone)",
-                        dest.display()
-                    ),
-                })
+                Err(ApiError::conflict(format!(
+                    "canon file {} already exists with different bytes (BoxMonotone)",
+                    dest.display()
+                )))
             }
         }
         Err(e) => Err(ApiError::Internal(format!("link {}: {e}", dest.display()))),
@@ -1503,12 +1502,10 @@ impl MailBridge {
             fs::read(&abs_path).map_err(|e| ApiError::Internal(format!("read {rel_path}: {e}")))?;
         let on_disk_sha = sha256_bytes(&bytes);
         if on_disk_sha != req.sha256 {
-            return Err(ApiError::Conflict {
-                detail: format!(
-                    "sha256 mismatch for {rel_path}: expected {}, on-disk {on_disk_sha}",
-                    req.sha256
-                ),
-            });
+            return Err(ApiError::conflict(format!(
+                "sha256 mismatch for {rel_path}: expected {}, on-disk {on_disk_sha}",
+                req.sha256
+            )));
         }
 
         let ts = unix_secs_to_iso8601_utc(ctx.at.0 / 1_000);
@@ -1975,12 +1972,13 @@ async fn deliver_bell_dm(
     let body = room::Body::parse(prompt)?;
     client
         .call(room::RoomPost {
-            room: room::RoomRef::Dm {
-                with: Principal::Seat { seat },
-            },
-            body,
-            reply_to: None,
             idem: Some(idem),
+            ..room::RoomPost::new(
+                room::RoomRef::Dm {
+                    with: Principal::Seat { seat },
+                },
+                body,
+            )
         })
         .await?;
     Ok(())

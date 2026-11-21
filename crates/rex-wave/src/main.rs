@@ -464,7 +464,10 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
         } => Ok(WireCommand::RoomPost(RoomPost {
             room: parse_room_ref(room)?,
             body: Body::parse(text.clone())?,
-            reply_to: reply_to.map(Seq),
+            re: reply_to.map(Seq),
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: match idem {
                 Some(k) => Some(IdemKey::parse(k.clone())?),
                 None => None,

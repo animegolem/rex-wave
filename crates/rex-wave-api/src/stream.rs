@@ -5,9 +5,10 @@
 //! [`Cursor`], so a dropped doorbell can never lose data.
 
 use crate::board::{BoardEvent, BoardId};
-use crate::id::{BbProjectId, Principal, RoleName, Seq, UnixMs, WaveSlug};
+use crate::id::{BbProjectId, Label, Principal, RoleName, Seq, UnixMs, WaveSlug};
 use crate::mail::MailEvent;
 use crate::notify::InboxEvent;
+use crate::presence::PresenceEvent;
 use crate::read::{AgentEvent, SidebarTreeSnapshot};
 use crate::room::{RoomEvent, RoomId, RoomRef};
 use crate::stage::{FocusGeneration, StageTarget};
@@ -38,6 +39,8 @@ pub enum StreamId {
     },
     /// The mail bridge's promotion / ack ledger (sandbox only).
     Mail,
+    /// Durable seat records and ephemeral live session bindings.
+    Presence,
 }
 
 /// One committed journal entry.
@@ -61,6 +64,7 @@ pub enum Event {
     Board(BoardEvent),
     Inbox(InboxEvent),
     Mail(MailEvent),
+    Presence(PresenceEvent),
 }
 
 impl Event {
@@ -74,6 +78,7 @@ impl Event {
                 | (Event::Board(_), StreamId::Board { .. })
                 | (Event::Inbox(_), StreamId::Inbox { .. })
                 | (Event::Mail(_), StreamId::Mail)
+                | (Event::Presence(_), StreamId::Presence)
         )
     }
 }
@@ -86,6 +91,15 @@ pub enum Interest {
     Streams { streams: Vec<StreamId> },
     /// One room by reference (DM refs resolve with the session principal).
     Room { room: RoomRef },
+    /// One room filtered by optional thread root (`re`) and/or `key=value` labels
+    /// (`RoomEvent::Labeled` matches when `labels` match `before || after`).
+    RoomFiltered {
+        room: RoomRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        re: Option<Seq>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        labels: Vec<Label>,
+    },
     /// Only entries that @mention me (or @all) in rooms I belong to, plus DMs to me.
     /// This is `channel_wait(mentions_only: true)`.
     Mentions,

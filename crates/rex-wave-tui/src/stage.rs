@@ -1590,7 +1590,12 @@ fn room_feed(view: &RoomView, width: u16) -> Vec<FeedItem> {
             }),
             RoomEvent::Opened { .. }
             | RoomEvent::MemberJoined { .. }
-            | RoomEvent::MemberLeft { .. } => {}
+            | RoomEvent::MemberLeft { .. }
+            | RoomEvent::Labeled { .. }
+            | RoomEvent::TaskClaimed { .. }
+            | RoomEvent::TaskHeartbeat { .. }
+            | RoomEvent::TaskTransitioned { .. }
+            | RoomEvent::TaskUpdated { .. } => {}
         }
     }
     items
@@ -2250,10 +2255,14 @@ fn card_tone(kind: &NotifyKind) -> CardTone {
     match kind {
         NotifyKind::Interaction { .. } | NotifyKind::WorkerStuck { .. } => CardTone::Approval,
         NotifyKind::Mention { .. } | NotifyKind::DirectMessage { .. } => CardTone::Mention,
-        NotifyKind::Mail { .. } | NotifyKind::LetterBanked { .. } => CardTone::Mail,
+        NotifyKind::Mail { .. }
+        | NotifyKind::LetterBanked { .. }
+        | NotifyKind::MailUnrung { .. } => CardTone::Mail,
         NotifyKind::WaveFinished { .. }
         | NotifyKind::CardAssigned { .. }
-        | NotifyKind::Reminder { .. } => CardTone::Neutral,
+        | NotifyKind::Reminder { .. }
+        | NotifyKind::TransportDown { .. }
+        | NotifyKind::OrgConflict { .. } => CardTone::Neutral,
     }
 }
 
@@ -2268,6 +2277,9 @@ pub(crate) fn kind_label(kind: &NotifyKind) -> &'static str {
         NotifyKind::WaveFinished { .. } => "WAVE",
         NotifyKind::CardAssigned { .. } => "TASK",
         NotifyKind::Reminder { .. } => "BELL",
+        NotifyKind::MailUnrung { .. } => "UNRUNG",
+        NotifyKind::TransportDown { .. } => "TRANSPORT",
+        NotifyKind::OrgConflict { .. } => "ORG",
     }
 }
 

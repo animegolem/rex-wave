@@ -45,6 +45,7 @@ pub struct Router {
     pub board: Arc<dyn Service<BoardCommand>>,
     pub inbox: Arc<dyn Service<InboxCommand>>,
     pub mail: Arc<dyn Service<MailCommand>>,
+    pub presence: Arc<dyn Service<PresenceCommand>>,
     pub read: Arc<ReadSide>,
 }
 
@@ -78,6 +79,7 @@ impl Router {
             Routed::Board(c) => self.board.dispatch(c, ctx).await,
             Routed::Inbox(c) => self.inbox.dispatch(c, ctx).await,
             Routed::Mail(c) => self.mail.dispatch(c, ctx).await,
+            Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
             Routed::Read(c) => self.read.dispatch(c, ctx).await,
         }
     }

@@ -2,8 +2,12 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[error("invalid {what}: {reason}")]
@@ -74,9 +78,81 @@ fn opaque_bytes(s: &str, max: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn org_id_valid(s: &str) -> Result<(), &'static str> {
+    if s.is_empty() || s.chars().count() > 128 {
+        return Err("must be 1..=128 chars");
+    }
+    if s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("must not contain whitespace or control characters");
+    }
+    if s.contains(':') || s.contains('[') || s.contains(']') {
+        return Err("must not contain ':', '[', or ']'");
+    }
+    Ok(())
+}
+
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for &b in bytes {
+        hash ^= u128::from(b);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    hash
+}
+
+static ORG_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 checked_str!(
     /// Opaque board key chosen by the host (`project:p_123`, `seat:sam`).
     BoardId, "board id", |s| printable(&s, 256));
+checked_str!(
+    /// Globally unique Org `:ID:` compatible with `[[id:...]]`.
+    OrgId, "org id", |s| org_id_valid(&s));
+
+impl OrgId {
+    pub fn mint() -> Self {
+        let seq = ORG_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mut h1 = RandomState::new().build_hasher();
+        h1.write_u128(nanos);
+        h1.write_u32(pid);
+        h1.write_u64(seq);
+        let mut h2 = RandomState::new().build_hasher();
+        h2.write_u64(seq.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        h2.write_u128(nanos);
+        let hi = mix64(h1.finish());
+        let lo = mix64(h2.finish()) & 0xffff_ffff;
+        Self(format!("rw-{hi:016x}{lo:08x}"))
+    }
+
+    pub fn mint_deterministic(seed: &str) -> Self {
+        let h = fnv1a_128(seed.as_bytes());
+        let folded = mix64((h as u64) ^ ((h >> 64) as u64));
+        Self(format!("rw-{folded:016x}"))
+    }
+
+    pub fn for_board_card_scope(scope: &str, card: CardNo) -> Self {
+        Self::mint_deterministic(&format!("rex-wave:board:{scope}:card:{}", card.0))
+    }
+
+    pub fn for_board_card(board: &BoardId, card: CardNo) -> Self {
+        Self::for_board_card_scope(board.as_str(), card)
+    }
+
+    pub fn is_rex_minted(&self) -> bool {
+        self.0.starts_with("rw-")
+    }
+}
 checked_str!(
     /// A lane (`todo`, `doing`, `review`, `done`, or custom): `[a-z0-9_-]{1,32}`.
     LaneName, "lane", |s| if !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') { Ok(()) } else { Err("need [a-z0-9_-]{1,32}") });
@@ -429,6 +505,12 @@ pub struct CardPatch {
     pub labels_remove: Vec<String>,
     #[serde(default)]
     pub links_add: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<OrgId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_add: Vec<OrgId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_remove: Vec<OrgId>,
 }
 
 impl CardPatch {
@@ -442,6 +524,9 @@ impl CardPatch {
             && self.labels_add.is_empty()
             && self.labels_remove.is_empty()
             && self.links_add.is_empty()
+            && self.org_id.is_none()
+            && self.needs_add.is_empty()
+            && self.needs_remove.is_empty()
     }
 }
 
@@ -449,6 +534,8 @@ impl CardPatch {
 pub struct Card {
     pub no: CardNo,
     pub revision: CardRevision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<OrgId>,
     pub title: Title,
     pub lane: LaneName,
     pub assignee: Option<Assignee>,
@@ -456,11 +543,15 @@ pub struct Card {
     pub due_ms: Option<u64>,
     pub labels: Vec<String>,
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<OrgId>,
 }
 
 /// Full Org-backed task representation preserving body notes and unknown `:PROPERTIES:` keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<OrgId>,
     pub id: Option<CardNo>,
     pub revision: Option<CardRevision>,
     pub lane: LaneName,
@@ -471,6 +562,8 @@ pub struct TaskCard {
     pub assignee: Option<Assignee>,
     pub due_ms: Option<u64>,
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<OrgId>,
     pub properties: Vec<(String, String)>,
     pub body: String,
 }
@@ -478,6 +571,7 @@ pub struct TaskCard {
 impl TaskCard {
     pub fn new(lane: Lane, title: Title) -> Self {
         Self {
+            org_id: None,
             id: None,
             revision: None,
             lane: lane.lane_name(),
@@ -488,6 +582,7 @@ impl TaskCard {
             assignee: None,
             due_ms: None,
             links: Vec::new(),
+            needs: Vec::new(),
             properties: Vec::new(),
             body: String::new(),
         }
@@ -509,6 +604,7 @@ impl TaskCard {
         Card {
             no: self.id.unwrap_or(fallback_no),
             revision: self.revision.unwrap_or(CardRevision(1)),
+            org_id: self.org_id.clone(),
             title: self.title.clone(),
             lane: self.lane.clone(),
             assignee: self.assignee.clone(),
@@ -516,6 +612,7 @@ impl TaskCard {
             due_ms: self.due_ms,
             labels: self.tags.clone(),
             links: self.links.clone(),
+            needs: self.needs.clone(),
         }
     }
 }
@@ -523,6 +620,7 @@ impl TaskCard {
 impl From<&Card> for TaskCard {
     fn from(card: &Card) -> Self {
         Self {
+            org_id: card.org_id.clone(),
             id: Some(card.no),
             revision: Some(card.revision),
             lane: card.lane.clone(),
@@ -533,6 +631,7 @@ impl From<&Card> for TaskCard {
             assignee: card.assignee.clone(),
             due_ms: card.due_ms,
             links: card.links.clone(),
+            needs: card.needs.clone(),
             properties: Vec::new(),
             body: String::new(),
         }
@@ -763,10 +862,21 @@ impl BoardState {
                     labels.retain(|l| !cmd.patch.labels_remove.contains(l));
                 }
                 let links = dedup_vec(cmd.patch.links_add.iter().cloned());
+                let mut needs = dedup_vec(cmd.patch.needs_add.iter().cloned());
+                if !cmd.patch.needs_remove.is_empty() {
+                    needs.retain(|n| !cmd.patch.needs_remove.contains(n));
+                }
+                let org_id = Some(
+                    cmd.patch
+                        .org_id
+                        .clone()
+                        .unwrap_or_else(|| OrgId::for_board_card(&cmd.board, next_no)),
+                );
 
                 let card = Card {
                     no: next_no,
                     revision: CardRevision(1),
+                    org_id,
                     title,
                     lane: lane.clone(),
                     assignee,
@@ -774,6 +884,7 @@ impl BoardState {
                     due_ms: cmd.patch.due_ms,
                     labels,
                     links,
+                    needs,
                 };
                 let existing_in_lane = self.order.get(&lane).map_or(0, Vec::len);
                 events.push(BoardEvent::CardCreated { card });
@@ -908,6 +1019,17 @@ impl BoardState {
                 for link in &patch.links_add {
                     if !card.links.contains(link) {
                         card.links.push(link.clone());
+                    }
+                }
+                if let Some(org_id) = &patch.org_id {
+                    card.org_id = Some(org_id.clone());
+                }
+                if !patch.needs_remove.is_empty() {
+                    card.needs.retain(|n| !patch.needs_remove.contains(n));
+                }
+                for dep in &patch.needs_add {
+                    if !card.needs.contains(dep) {
+                        card.needs.push(dep.clone());
                     }
                 }
 

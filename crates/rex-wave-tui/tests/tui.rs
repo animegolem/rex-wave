@@ -181,7 +181,10 @@ fn hover_debounces_while_activate_retargets_immediately_and_filters_stale_genera
             event: Event::Room(RoomEvent::Posted {
                 body: Body::parse(text).unwrap(),
                 mentions: Mentions::default(),
-                reply_to: None,
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
                 idem: None,
             }),
         })
@@ -270,6 +273,7 @@ async fn kanban_room_and_agent_stages_dispatch_typed_wire_commands() {
     let live_card = Card {
         no: CardNo(99),
         revision: CardRevision(1),
+        org_id: None,
         title: Title::parse("Live board fold").unwrap(),
         lane: LaneName::parse("review").unwrap(),
         assignee: None,
@@ -277,6 +281,7 @@ async fn kanban_room_and_agent_stages_dispatch_typed_wire_commands() {
         due_ms: None,
         labels: Vec::new(),
         links: Vec::new(),
+        needs: Vec::new(),
     };
     let _ = update(
         &mut model,
@@ -707,9 +712,7 @@ async fn room_paging_watch_eof_state_preservation_errors_and_inbox_scroll_hold()
         &mut model,
         Msg::Reply {
             tag: ReplyTag::UserCommand,
-            result: Err(rex_wave_api::ApiError::Conflict {
-                detail: "revision mismatch".to_owned(),
-            }),
+            result: Err(rex_wave_api::ApiError::conflict("revision mismatch")),
         },
     );
     assert!(
@@ -825,7 +828,10 @@ fn room_wraps_markdown_collapses_briefs_shortens_senders_and_opens_pager() {
             )
             .unwrap(),
             mentions: Mentions::default(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: Some(rex_wave_api::IdemKey::parse("wave:auth-v2:brief:council-claude:1").unwrap()),
         }),
     };
@@ -845,7 +851,10 @@ fn room_wraps_markdown_collapses_briefs_shortens_senders_and_opens_pager() {
             )
             .unwrap(),
             mentions: Mentions::default(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         }),
     };
