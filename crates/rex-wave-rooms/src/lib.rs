@@ -643,7 +643,13 @@ impl Decider for Rooms {
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
         match cmd {
-            RoomCommand::RoomPost(c) => c.idem.clone(),
+            RoomCommand::RoomPost(c) => c.idem.as_ref().map(|k| {
+                if k.as_str().starts_with("__rw_") {
+                    scoped_idem("__rw_pst:", k)
+                } else {
+                    k.clone()
+                }
+            }),
             RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_lbl:", k)),
             RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_clm:", k)),
             RoomCommand::TaskTransition(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_trn:", k)),

@@ -652,27 +652,52 @@ fn baseline_from_tasks(tasks: &[TaskView]) -> BTreeMap<OrgId, BaselineTask> {
         .collect()
 }
 
-fn advance_applied_baselines(
+fn record_view_in_baseline(
     state: &mut OrgSyncState,
-    applied: &[OrgId],
-    fresh_tasks: &[TaskView],
+    view: &TaskView,
+    seq_to_org_id: &BTreeMap<Seq, OrgId>,
+    disk_labels: &[Label],
 ) {
-    if applied.is_empty() {
-        return;
-    }
-    let applied_set: BTreeSet<&OrgId> = applied.iter().collect();
-    let seq_to_org_id: BTreeMap<Seq, OrgId> = fresh_tasks
-        .iter()
-        .map(|t| (t.seq, t.org_id.clone()))
-        .collect();
-    for task in fresh_tasks {
-        if applied_set.contains(&task.org_id) {
-            state.tasks.insert(
-                task.org_id.clone(),
-                baseline_entry_from_view(task, &seq_to_org_id),
-            );
-        }
-    }
+    let preserved_labels = state
+        .tasks
+        .get(&view.org_id)
+        .map(|b| b.labels.clone())
+        .unwrap_or_else(|| disk_labels.to_vec());
+    let mut entry = baseline_entry_from_view(view, seq_to_org_id);
+    entry.labels = preserved_labels;
+    state.tasks.insert(view.org_id.clone(), entry);
+}
+
+fn record_claim_in_baseline(
+    state: &mut OrgSyncState,
+    room_task: &TaskView,
+    new_rev: u64,
+    seq_to_org_id: &BTreeMap<Seq, OrgId>,
+    disk_labels: &[Label],
+) {
+    let entry = state
+        .tasks
+        .entry(room_task.org_id.clone())
+        .or_insert_with(|| {
+            let mut e = baseline_entry_from_view(room_task, seq_to_org_id);
+            e.labels = disk_labels.to_vec();
+            e
+        });
+    entry.rev = new_rev;
+    entry.status = TaskStatus::Claimed;
+}
+
+fn record_labels_in_baseline(
+    state: &mut OrgSyncState,
+    room_task: &TaskView,
+    seq_to_org_id: &BTreeMap<Seq, OrgId>,
+    disk_labels: &[Label],
+) {
+    let entry = state
+        .tasks
+        .entry(room_task.org_id.clone())
+        .or_insert_with(|| baseline_entry_from_view(room_task, seq_to_org_id));
+    entry.labels = disk_labels.to_vec();
 }
 
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), OrgSyncError> {
@@ -904,19 +929,13 @@ fn card_differs_from_room(
         || info.labels != room_labels
 }
 
-fn expected_rev_for_card(
-    card: &TaskCard,
-    oid: &OrgId,
-    is_pending_reattached: bool,
-    state: &OrgSyncState,
-) -> u64 {
-    if let Some(rev) = card.revision {
-        rev.0
-    } else if is_pending_reattached {
-        state.tasks.get(oid).map_or(0, |b| b.rev)
-    } else {
-        0
-    }
+fn expected_rev_for_card(card: &TaskCard, oid: &OrgId, state: &OrgSyncState) -> u64 {
+    state
+        .tasks
+        .get(oid)
+        .map(|b| b.rev)
+        .or_else(|| card.revision.map(|r| r.0))
+        .unwrap_or(0)
 }
 
 /// Reconcile local Emacs `.org` edits into the room's task threads.
@@ -954,7 +973,7 @@ pub async fn sync_org_to_room<C: Client>(
     let infos = parse_cards_metadata(&edoc.doc)?;
 
     let (resolved_room, room_tasks) = fetch_room_tasks(client, room).await?;
-    let seq_to_org_id: BTreeMap<Seq, OrgId> = room_tasks
+    let mut seq_to_org_id: BTreeMap<Seq, OrgId> = room_tasks
         .iter()
         .map(|t| (t.seq, t.org_id.clone()))
         .collect();
@@ -967,7 +986,8 @@ pub async fn sync_org_to_room<C: Client>(
     // (due to a conflict or lock race) so retries never post duplicate tasks.
     let mut unid_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unid_keys: BTreeMap<usize, (String, usize)> = BTreeMap::new();
-    let mut pending_reattached: BTreeSet<usize> = BTreeSet::new();
+    let mut matched_pending_keys: BTreeSet<(String, usize)> = BTreeSet::new();
+    let mut unmatched_unid: Vec<(usize, (String, usize))> = Vec::new();
     for (idx, card) in edoc.doc.tasks.iter_mut().enumerate() {
         if card.org_id.is_none() {
             let title = card.title.as_str().to_owned();
@@ -982,10 +1002,26 @@ pub async fn sync_org_to_room<C: Client>(
                 && room_by_org_id.contains_key(prev_oid)
             {
                 card.org_id = Some(prev_oid.clone());
-                pending_reattached.insert(idx);
+                matched_pending_keys.insert(key);
             } else {
-                unid_keys.insert(idx, key);
+                unmatched_unid.push((idx, key));
             }
+        }
+    }
+    let leftover_pending: Vec<((String, usize), OrgId)> = state
+        .pending_created
+        .iter()
+        .filter(|(k, oid)| !matched_pending_keys.contains(*k) && room_by_org_id.contains_key(*oid))
+        .map(|(k, oid)| (k.clone(), oid.clone()))
+        .collect();
+    let mut leftover_iter = leftover_pending.into_iter();
+    for (idx, new_key) in unmatched_unid {
+        if let Some((old_key, prev_oid)) = leftover_iter.next() {
+            edoc.doc.tasks[idx].org_id = Some(prev_oid.clone());
+            state.pending_created.remove(&old_key);
+            state.pending_created.insert(new_key, prev_oid);
+        } else {
+            unid_keys.insert(idx, new_key);
         }
     }
 
@@ -1112,7 +1148,7 @@ pub async fn sync_org_to_room<C: Client>(
         let card = &edoc.doc.tasks[idx];
         let oid = card.org_id.as_ref().expect("modified task has org_id");
         let room_task = &room_by_org_id[oid];
-        let parsed_rev = expected_rev_for_card(card, oid, pending_reattached.contains(&idx), state);
+        let parsed_rev = expected_rev_for_card(card, oid, state);
         if parsed_rev != room_task.rev {
             conflicts.push(OrgSyncConflict {
                 path: path.to_path_buf(),
@@ -1257,6 +1293,7 @@ pub async fn sync_org_to_room<C: Client>(
                     .or_else(|| card.org_id.clone())
                     .expect("room task post returns org_id");
                 org_id_to_seq.insert(oid.clone(), posted.seq);
+                seq_to_org_id.insert(posted.seq, oid.clone());
                 if let Some(unid_key) = unid_keys.get(&idx) {
                     state.pending_created.insert(unid_key.clone(), oid.clone());
                 }
@@ -1334,8 +1371,7 @@ pub async fn sync_org_to_room<C: Client>(
         let card = &edoc.doc.tasks[idx];
         let oid = card.org_id.clone().expect("modified task has org_id");
         let room_task = &room_by_org_id[&oid];
-        let mut expected_rev =
-            expected_rev_for_card(card, &oid, pending_reattached.contains(&idx), state);
+        let mut expected_rev = expected_rev_for_card(card, &oid, state);
 
         let target_needs: Vec<Seq> = card
             .needs
@@ -1385,6 +1421,7 @@ pub async fn sync_org_to_room<C: Client>(
             {
                 Ok(view) => {
                     expected_rev = view.rev;
+                    record_view_in_baseline(state, &view, &seq_to_org_id, &info.labels);
                     updated.push(oid.clone());
                     applied.push(oid.clone());
                 }
@@ -1401,8 +1438,8 @@ pub async fn sync_org_to_room<C: Client>(
         }
 
         if !task_failed && info.status != room_task.status {
-            let res = if info.status == TaskStatus::Claimed {
-                client
+            if info.status == TaskStatus::Claimed {
+                match client
                     .call(TaskClaim {
                         room: room.clone(),
                         task: room_task.seq,
@@ -1412,9 +1449,32 @@ pub async fn sync_org_to_room<C: Client>(
                         idem: None,
                     })
                     .await
-                    .map(|_| ())
+                {
+                    Ok(receipt) => {
+                        record_claim_in_baseline(
+                            state,
+                            room_task,
+                            receipt.rev,
+                            &seq_to_org_id,
+                            &info.labels,
+                        );
+                        transitioned.push(oid.clone());
+                        if !applied.contains(&oid) {
+                            applied.push(oid.clone());
+                        }
+                    }
+                    Err(err) => {
+                        conflicts.push(map_api_conflict(
+                            path,
+                            oid.clone(),
+                            Some(room_task.seq),
+                            err,
+                        )?);
+                        task_failed = true;
+                    }
+                }
             } else {
-                client
+                match client
                     .call(TaskTransition {
                         room: room.clone(),
                         task: room_task.seq,
@@ -1425,23 +1485,23 @@ pub async fn sync_org_to_room<C: Client>(
                         idem: None,
                     })
                     .await
-                    .map(|_| ())
-            };
-            match res {
-                Ok(()) => {
-                    transitioned.push(oid.clone());
-                    if !applied.contains(&oid) {
-                        applied.push(oid.clone());
+                {
+                    Ok(view) => {
+                        record_view_in_baseline(state, &view, &seq_to_org_id, &info.labels);
+                        transitioned.push(oid.clone());
+                        if !applied.contains(&oid) {
+                            applied.push(oid.clone());
+                        }
                     }
-                }
-                Err(err) => {
-                    conflicts.push(map_api_conflict(
-                        path,
-                        oid.clone(),
-                        Some(room_task.seq),
-                        err,
-                    )?);
-                    task_failed = true;
+                    Err(err) => {
+                        conflicts.push(map_api_conflict(
+                            path,
+                            oid.clone(),
+                            Some(room_task.seq),
+                            err,
+                        )?);
+                        task_failed = true;
+                    }
                 }
             }
         }
@@ -1467,6 +1527,7 @@ pub async fn sync_org_to_room<C: Client>(
                         idem: None,
                     })
                     .await?;
+                record_labels_in_baseline(state, room_task, &seq_to_org_id, &info.labels);
                 labeled.push(oid.clone());
                 if !applied.contains(&oid) {
                     applied.push(oid);
@@ -1476,9 +1537,6 @@ pub async fn sync_org_to_room<C: Client>(
     }
 
     if !conflicts.is_empty() {
-        if let Ok((_, fresh_tasks)) = fetch_room_tasks(client, room).await {
-            advance_applied_baselines(state, &applied, &fresh_tasks);
-        }
         let sidecar_path = if options.write_conflict_sidecar {
             Some(write_conflict_sidecar(path, &conflicts)?)
         } else {
@@ -1509,7 +1567,6 @@ pub async fn sync_org_to_room<C: Client>(
             state.pending_created.clear();
             true
         } else {
-            advance_applied_baselines(state, &applied, &fresh_tasks);
             false
         }
     } else {

@@ -1855,7 +1855,9 @@ async fn room_post_keeps_raw_idem_keys_for_pre_upgrade_journal_dedupe() {
         .call(RoomPost {
             idem: Some(raw_key),
             ..RoomPost::new(
-                RoomRef::Id { id: room_id },
+                RoomRef::Id {
+                    id: room_id.clone(),
+                },
                 Body::parse("duplicate retry").unwrap(),
             )
         })
@@ -1866,4 +1868,53 @@ async fn room_post_keeps_raw_idem_keys_for_pre_upgrade_journal_dedupe() {
         Seq(2),
         "pre-upgrade raw RoomPost idem keys continue deduping after Phase 3"
     );
+
+    let spoofed_claim_idem = IdemKey::parse("__rw_clm:r:K").unwrap();
+    let task_post = sam
+        .call(RoomPost {
+            idem: Some(spoofed_claim_idem.clone()),
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Prefix collision guard").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(
+                RoomRef::Id {
+                    id: room_id.clone(),
+                },
+                Body::parse("spoofed prefix post").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    let claim = sam
+        .call(TaskClaim {
+            room: RoomRef::Id {
+                id: room_id.clone(),
+            },
+            task: task_post.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(1),
+            force: false,
+            idem: Some(IdemKey::parse("K").unwrap()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(claim.epoch, LeaseEpoch(1));
+
+    let post_retry = sam
+        .call(RoomPost {
+            idem: Some(spoofed_claim_idem),
+            ..RoomPost::new(
+                RoomRef::Id {
+                    id: room_id.clone(),
+                },
+                Body::parse("retry spoofed prefix").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(post_retry.seq, task_post.seq);
 }

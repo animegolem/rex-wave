@@ -853,7 +853,7 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
         "{}\n* STRT New unid task\n:PROPERTIES:\n:REX_NEEDS: dep-open\n:END:\n",
         synced_v1
             .replace("* TODO Card A", "* TODO Card A renamed")
-            .replace("* TODO Card B", "* STRT Card B")
+            .replace("* TODO Card B", "* STRT Card B renamed")
     );
     fs::write(&org_path, &edited).unwrap();
 
@@ -874,6 +874,10 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
     };
     assert_eq!(client.task_count(), 4);
     assert!(applied.contains(&OrgId::parse("card-a").unwrap()));
+    assert!(applied.contains(&OrgId::parse("card-b").unwrap()));
+    assert_eq!(client.task(Seq(3)).rev, 2);
+    assert_eq!(client.task(Seq(3)).title.as_str(), "Card B renamed");
+    assert_eq!(client.task(Seq(3)).status, TaskStatus::Open);
     assert!(
         conflicts
             .iter()
@@ -896,11 +900,14 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
         4,
         "retrying after conflict must never post a duplicate of the un-ID'd heading"
     );
-    assert!(matches!(
-        retry_while_still_blocked,
-        OrgToRoomOutcome::Conflict { ref conflicts, .. }
-            if conflicts.iter().all(|c| matches!(c.kind, OrgConflictKind::UnmetNeeds { .. }))
-    ));
+    assert!(
+        matches!(
+            retry_while_still_blocked,
+            OrgToRoomOutcome::Conflict { ref conflicts, .. }
+                if conflicts.iter().all(|c| matches!(c.kind, OrgConflictKind::UnmetNeeds { .. }))
+        ),
+        "single-card rename+STRT partial apply must not turn into RevisionConflict: {retry_while_still_blocked:?}"
+    );
 
     client.bump_task_remotely(Seq(1), None, Some(TaskStatus::Done));
     let recovered = sync_org_to_room(
@@ -928,13 +935,14 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
 
     let final_org = fs::read_to_string(&org_path).unwrap();
     assert!(final_org.contains("* TODO Card A renamed\n:PROPERTIES:\n:ID: card-a\n:REX_REV: 2\n"));
-    assert!(final_org.contains("* STRT Card B"));
+    assert!(final_org.contains("* STRT Card B renamed"));
+    assert!(final_org.contains(":ID: card-b\n:REX_REV: 3\n"));
     assert!(final_org.contains("* STRT New unid task"));
     assert!(state.pending_created.is_empty());
 
     let lock_path = emacs_lock_path(&org_path).unwrap();
     let with_another = format!(
-        "{}\n* TODO Deferred writeback task\n",
+        "{}\n* TODO Fix lgoin\n",
         final_org.replace("* TODO Card A renamed", "* TODO Card A v3")
     );
     fs::write(&org_path, &with_another).unwrap();
@@ -961,6 +969,11 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
     assert_eq!(client.task_count(), 5);
     fs::remove_file(&lock_path).unwrap();
 
+    let edited_again = with_another
+        .replace("* TODO Card A v3", "* TODO Card A v4")
+        .replace("* TODO Fix lgoin", "* TODO Fix login");
+    fs::write(&org_path, &edited_again).unwrap();
+
     let r_converged = sync_org_to_room(
         &client,
         &room,
@@ -970,15 +983,21 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
     )
     .await
     .unwrap();
-    assert!(matches!(
-        r_converged,
-        OrgToRoomOutcome::Synced {
-            ref created,
-            wrote_back: true,
-            ..
-        } if created.is_empty()
-    ));
+    assert!(
+        matches!(
+            r_converged,
+            OrgToRoomOutcome::Synced {
+                ref created,
+                ref updated,
+                wrote_back: true,
+                ..
+            } if created.is_empty() && updated.len() == 2
+        ),
+        "second edit after skipped write-back and un-ID'd typo fix converge cleanly: {r_converged:?}"
+    );
     assert_eq!(client.task_count(), 5);
+    assert_eq!(client.task(Seq(2)).title.as_str(), "Card A v4");
+    assert_eq!(client.task(Seq(5)).title.as_str(), "Fix login");
 }
 
 #[tokio::test]
