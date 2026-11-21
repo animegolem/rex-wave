@@ -16,21 +16,23 @@ pub use acks::{
     letter_paths_match, normalize_letter_path, normalize_seat_token, parse_acks_jsonl,
 };
 pub use presence::{
-    ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus, IncarnationAffinity, Presence,
-    PresenceState, current_process_start, format_delivery_status, is_process_alive,
-    load_claude_session_file, load_claude_session_file_from, normalize_proc_start,
-    parse_claude_session_json, proc_start_matches, query_process_start,
+    CANONICAL_HOUSE_ALIASES, ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus,
+    IncarnationAffinity, Presence, PresenceState, SeedInterchangePlan, current_process_start,
+    format_delivery_status, is_process_alive, load_claude_session_file,
+    load_claude_session_file_from, normalize_proc_start, parse_claude_session_json,
+    proc_start_matches, query_process_start, seed_records_from_interchange,
     select_binding_for_delivery, sender_delivery_notice, try_query_process_start,
 };
 pub use score::{
-    FixtureCoverageReport, GATE1_CASE_IDS, ShadowScoreReport, check_gate1_fixtures,
-    extract_shadow_aliases, score_shadow_against_acks, score_shadow_jsonl,
+    FixtureCoverageReport, GATE1_CASE_IDS, GATE1_CASE_TESTS, ShadowScoreReport,
+    check_gate1_fixtures, extract_shadow_aliases, score_shadow_against_acks, score_shadow_jsonl,
 };
 pub use shadow::{
     DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,
-    LetterCandidate, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
-    RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowPassReport,
-    decide_mail_ring, decide_mail_rings_for_seat, run_shadow_pass,
+    LetterCandidate, ParsedLetterTime, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
+    RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowAction, ShadowPassReport,
+    TimeBasis, decide_mail_ring, decide_mail_rings_for_seat, extract_letter_timestamp,
+    extract_letter_timestamp_detailed, parse_recorded_datetime_ms, run_shadow_pass,
 };
 
 use rex_wave_api::mail::*;
@@ -971,7 +973,11 @@ struct Frontmatter {
     topic: Option<String>,
     round: Option<u32>,
     priority: Option<String>,
+    id: Option<String>,
+    date_ms: Option<String>,
+    date: Option<String>,
     ts: Option<String>,
+    in_reply_to: Option<String>,
 }
 
 pub(crate) fn unquote_yaml(val: &str) -> String {
@@ -1015,12 +1021,12 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
         let Some((k, v)) = trimmed.split_once(':') else {
             continue;
         };
-        let key = k.trim();
+        let key = k.trim().to_ascii_lowercase();
         let val = unquote_yaml(v);
         if val.is_empty() {
             continue;
         }
-        match key {
+        match key.as_str() {
             "from" | "author" => {
                 if fm.from.is_none() || key == "from" {
                     fm.from = Some(val);
@@ -1042,7 +1048,11 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
             "topic" => fm.topic = Some(val),
             "round" => fm.round = val.parse::<u32>().ok(),
             "priority" => fm.priority = Some(val.to_ascii_lowercase()),
+            "id" => fm.id = Some(val),
+            "date_ms" => fm.date_ms = Some(val),
+            "date" => fm.date = Some(val),
             "ts" => fm.ts = Some(val),
+            "in_reply_to" => fm.in_reply_to = Some(val),
             _ => {}
         }
     }
@@ -1126,16 +1136,32 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         .filter(|s| is_valid_address(s))
         .unwrap_or_else(|| "unknown".into());
 
-    let (ts, ts_basis) = if exists
-        && let Ok(meta) = fs::metadata(&abs_path)
-        && let Ok(modified) = meta.modified()
-        && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
-    {
-        (unix_secs_to_iso8601_utc(dur.as_secs()), "mtime".to_owned())
-    } else if let Some(recorded) = fm.ts.filter(|t| is_valid_ts(t)) {
-        (recorded, "recorded".to_owned())
+    let mtime_ms = if exists {
+        fs::metadata(&abs_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|dur| UnixMs(dur.as_millis() as u64))
     } else {
+        None
+    };
+
+    let parsed_time = shadow::extract_letter_timestamp_detailed(
+        &rel_path,
+        fm.id.as_deref(),
+        fm.date_ms.as_deref(),
+        fm.date.as_deref(),
+        fm.ts.as_deref(),
+        fm.in_reply_to.as_deref(),
+        mtime_ms,
+    );
+    let (ts, ts_basis) = if parsed_time.basis == TimeBasis::FileModified && mtime_ms.is_none() {
         ("1970-01-01T00:00:00Z".to_owned(), "recorded".to_owned())
+    } else {
+        (
+            unix_secs_to_iso8601_utc(parsed_time.ts.0 / 1_000),
+            parsed_time.basis.as_mailbox_ts_basis().to_owned(),
+        )
     };
 
     let state = if is_acked_in_sandbox(root, &to, &rel_path, &sha256) {

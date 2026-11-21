@@ -3,13 +3,14 @@ use rex_wave_api::presence::*;
 use rex_wave_api::room::{Body, RoomPost, RoomRef, RoomScope};
 use rex_wave_api::*;
 use rex_wave_mailbridge::{
-    AliasMap, ClaudeSessionFile, DeferReason, DeliveryStatus, IncarnationAffinity, LetterCandidate,
-    MailBridge, Presence, PresenceState, Protection, ReadOnlyInterchange, RetryEntry, RetryState,
-    RingDecision, RingDeliveryChannel, RingPolicy, RingReferent, SandboxRoot,
-    current_process_start, decide_mail_ring, decide_mail_rings_for_seat, format_delivery_status,
-    is_process_alive, load_claude_session_file_from, parse_acks_jsonl, parse_claude_session_json,
-    project, query_process_start, run_shadow_pass, score_shadow_against_acks,
-    select_binding_for_delivery, sender_delivery_notice,
+    AliasMap, ClaudeSessionFile, DeferReason, DeliveryStatus, GATE1_CASE_IDS, GATE1_CASE_TESTS,
+    IncarnationAffinity, LetterCandidate, MailBridge, Presence, PresenceState, Protection,
+    ReadOnlyInterchange, RetryEntry, RetryState, RingDecision, RingDeliveryChannel, RingPolicy,
+    RingReferent, SandboxRoot, ShadowAction, TimeBasis, current_process_start, decide_mail_ring,
+    decide_mail_rings_for_seat, extract_letter_timestamp, format_delivery_status, is_process_alive,
+    load_claude_session_file_from, parse_acks_jsonl, parse_claude_session_json, project,
+    query_process_start, run_shadow_pass, score_shadow_against_acks, score_shadow_jsonl,
+    seed_records_from_interchange, select_binding_for_delivery, sender_delivery_notice,
 };
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
@@ -138,6 +139,29 @@ fn sample_candidate(rel_path: &str, seat: &str, body: &[u8], seen_at: UnixMs) ->
         in_reply_to: None,
         receipt_only: false,
         seen_at,
+        time_basis: TimeBasis::LetterIdMs,
+        date_only: false,
+    }
+}
+
+fn empty_claim(seat: &str) -> PresenceClaim {
+    PresenceClaim {
+        seat: SeatName::parse(seat).unwrap(),
+        status: None,
+        role: None,
+        projects: Vec::new(),
+        aliases: Vec::new(),
+        home_room: None,
+        mail_horizon_at: None,
+        work_class: None,
+        avatar: None,
+        home_dir: None,
+        start_cmd: None,
+        resume_cmd: None,
+        rex_target: None,
+        verified_how: None,
+        replace: None,
+        idem: None,
     }
 }
 
@@ -184,17 +208,14 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     // Claim crest with Operator witness provenance on projects, then update role as crest itself.
     let claimed = owner
         .call(PresenceClaim {
-            seat: SeatName::parse("crest").unwrap(),
             status: Some(SeatStatus::Active),
-            role: None,
             projects: vec!["rex-wave".into()],
             aliases: vec![SeatName::parse("crest-lead").unwrap()],
-            home_room: None,
             verified_how: Some(VerificationKind::WitnessedBy {
                 seat: SeatName::parse("tally").unwrap(),
             }),
-            replace: None,
             idem: Some(IdemKey::parse("claim-crest-1").unwrap()),
+            ..empty_claim("crest")
         })
         .await
         .unwrap();
@@ -211,15 +232,11 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     // Idempotent retry returns the exact same SeatRecord without appending again.
     let retried = owner
         .call(PresenceClaim {
-            seat: SeatName::parse("crest").unwrap(),
             status: Some(SeatStatus::Active),
-            role: None,
             projects: vec!["rex-wave".into()],
             aliases: vec![SeatName::parse("crest-lead").unwrap()],
-            home_room: None,
-            verified_how: None,
-            replace: None,
             idem: Some(IdemKey::parse("claim-crest-1").unwrap()),
+            ..empty_claim("crest")
         })
         .await
         .unwrap();
@@ -228,15 +245,8 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     // Crest updates its own role; existing project provenance stays intact.
     let updated = crest
         .call(PresenceClaim {
-            seat: SeatName::parse("crest").unwrap(),
-            status: None,
             role: Some("rex-wave-owner".into()),
-            projects: Vec::new(),
-            aliases: Vec::new(),
-            home_room: None,
-            verified_how: None,
-            replace: None,
-            idem: None,
+            ..empty_claim("crest")
         })
         .await
         .unwrap();
@@ -259,15 +269,8 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     // Tally may not claim crest's seat without explicit replacement.
     let hijack = tally
         .call(PresenceClaim {
-            seat: SeatName::parse("crest").unwrap(),
-            status: None,
             role: Some("usurper".into()),
-            projects: Vec::new(),
-            aliases: Vec::new(),
-            home_room: None,
-            verified_how: None,
-            replace: None,
-            idem: None,
+            ..empty_claim("crest")
         })
         .await
         .unwrap_err();
@@ -303,6 +306,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
             ttl_ms: Some(30_000),
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: Some(IdemKey::parse("bind-crest-1").unwrap()),
         })
         .await
@@ -360,6 +364,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         })
         .await
@@ -501,6 +506,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         }),
         is_process_alive,
@@ -533,6 +539,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         }),
         is_process_alive,
@@ -570,6 +577,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         }),
         is_process_alive,
@@ -609,6 +617,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         }),
         is_process_alive,
@@ -645,6 +654,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             ttl_ms: Some(600_000),
             takeover: true,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         }),
         is_process_alive,
@@ -668,23 +678,22 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
 
 #[test]
 fn gate1_all_10_mail_routing_cases_verified() {
+    // Verify GATE1_CASE_TESTS maps every single GATE1_CASE_IDS entry 1:1 AND
+    // every cited Rust integration test function actually exists in this file.
+    assert_eq!(GATE1_CASE_TESTS.len(), GATE1_CASE_IDS.len());
+    let expected_ids: BTreeSet<&str> = GATE1_CASE_IDS.iter().copied().collect();
+    let mapped_ids: BTreeSet<&str> = GATE1_CASE_TESTS.iter().map(|(id, _)| *id).collect();
+    assert_eq!(expected_ids, mapped_ids);
+    let this_source = include_str!("presence_and_shadow_mail.rs");
+    for &(case_id, test_fn) in GATE1_CASE_TESTS {
+        assert!(
+            this_source.contains(&format!("fn {test_fn}()")),
+            "GATE1_CASE_TESTS entry '{case_id}' cites missing function '{test_fn}'"
+        );
+    }
+
     // When running on the estate Mac where Tally's fixture file exists, verify our
     // 10-case matrix covers 100% of the case IDs in `cases.jsonl`.
-    let expected_ids: BTreeSet<&str> = [
-        "genga-stale-six-days",
-        "carbon-crest-misroute",
-        "two-tables-one-name",
-        "dry-run-marks-seen",
-        "ring-types-into-a-live-turn",
-        "a-transport-dies",
-        "two-seats-one-name",
-        "session-names-drift",
-        "own-watcher-liveness",
-        "bank-before-ring",
-    ]
-    .into_iter()
-    .collect();
-
     if let Some(root) = opt_in_interchange_dir() {
         let fixture_path = root.join("fixtures/mail-routing/cases.jsonl");
         if fixture_path.is_file() {
@@ -706,10 +715,12 @@ fn gate1_all_10_mail_routing_cases_verified() {
             );
         }
     }
+}
 
-    let owner_p = Principal::Operator {
-        seat: SeatName::parse("owner").unwrap(),
-    };
+// Case 1: `genga-stale-six-days`
+// Dead process expires -> RaiseUnrung + synchronous sender notice with exact timestamp.
+#[test]
+fn gate1_case_01_genga_stale_six_days() {
     let sys_p = Principal::System {
         part: SystemPart::PresenceMonitor,
     };
@@ -718,9 +729,6 @@ fn gate1_all_10_mail_routing_cases_verified() {
     let empty_acks = parse_acks_jsonl("", &aliases).into_index();
     let empty_retry = RetryState::new();
     let empty_affinity = IncarnationAffinity::new();
-
-    // Case 1: `genga-stale-six-days`
-    // Dead process expires -> RaiseUnrung + synchronous sender notice with exact timestamp.
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -748,6 +756,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| false,
@@ -799,9 +808,15 @@ fn gate1_all_10_mail_routing_cases_verified() {
             other => panic!("expected RaiseUnrung for genga-stale-six-days, got {other:?}"),
         }
     }
+}
 
-    // Case 2: `carbon-crest-misroute`
-    // Durable SeatRecord answers project/role queries offline; ambiguous query fails with Conflict listing all candidates.
+// Case 2: `carbon-crest-misroute`
+// Durable SeatRecord answers project/role queries offline; ambiguous query fails with Conflict listing all candidates.
+#[test]
+fn gate1_case_02_carbon_crest_misroute() {
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -817,6 +832,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 projects: vec!["rex-wave".into(), "shared-infra".into()],
                 aliases: Vec::new(),
                 home_room: None,
+                mail_horizon_at: None,
+                work_class: None,
+                avatar: None,
+                home_dir: None,
+                start_cmd: None,
+                resume_cmd: None,
+                rex_target: None,
                 verified_how: None,
                 replace: None,
                 idem: None,
@@ -836,6 +858,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 projects: vec!["shared-infra".into()],
                 aliases: Vec::new(),
                 home_room: None,
+                mail_horizon_at: None,
+                work_class: None,
+                avatar: None,
+                home_dir: None,
+                start_cmd: None,
+                resume_cmd: None,
+                rex_target: None,
                 verified_how: None,
                 replace: None,
                 idem: None,
@@ -885,9 +914,12 @@ fn gate1_all_10_mail_routing_cases_verified() {
             .unwrap_err();
         assert!(matches!(ambig_role, ApiError::Conflict { .. }));
     }
+}
 
-    // Case 3: `two-tables-one-name`
-    // Single Presence truth resolves `carbon` with its live binding cleanly.
+// Case 3: `two-tables-one-name`
+// Single Presence truth resolves `carbon` with its live binding cleanly.
+#[test]
+fn gate1_case_03_two_tables_one_name() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -911,6 +943,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -932,9 +965,16 @@ fn gate1_all_10_mail_routing_cases_verified() {
             "live binding needs no offline notice"
         );
     }
+}
 
-    // Case 4: `dry-run-marks-seen`
-    // ReadOnlyInterchange + run_shadow_pass emits decisions without touching any file on disk.
+// Case 4: `dry-run-marks-seen`
+// ReadOnlyInterchange + run_shadow_pass emits decisions without touching any file on disk.
+#[test]
+fn gate1_case_04_dry_run_marks_seen() {
+    let aliases = AliasMap::empty();
+    let policy = RingPolicy::default();
+    let empty_retry = RetryState::new();
+    let empty_affinity = IncarnationAffinity::new();
     {
         let dir = TempDirGuard::new("dry-run");
         fs::create_dir_all(dir.path().join("mail")).unwrap();
@@ -973,9 +1013,17 @@ fn gate1_all_10_mail_routing_cases_verified() {
             "shadow dry run must create zero cursor or seen files"
         );
     }
+}
 
-    // Case 5: `ring-types-into-a-live-turn`
-    // Rings always use non-intrusive queued/socket channels (never raw pane keystrokes).
+// Case 5: `ring-types-into-a-live-turn`
+// Rings always use non-intrusive queued/socket channels (never raw pane keystrokes).
+#[test]
+fn gate1_case_05_ring_types_into_a_live_turn() {
+    let aliases = AliasMap::empty();
+    let policy = RingPolicy::default();
+    let empty_acks = parse_acks_jsonl("", &aliases).into_index();
+    let empty_retry = RetryState::new();
+    let empty_affinity = IncarnationAffinity::new();
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -1004,6 +1052,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1027,6 +1076,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1069,9 +1119,15 @@ fn gate1_all_10_mail_routing_cases_verified() {
             }
         ));
     }
+}
 
-    // Case 6: `a-transport-dies`
-    // Per-binding expiry touches ONE seat only; provider TransportHealth flips ALL bindings of that TransportKind together.
+// Case 6: `a-transport-dies`
+// Per-binding expiry touches ONE seat only; provider TransportHealth flips ALL bindings of that TransportKind together.
+#[test]
+fn gate1_case_06_a_transport_dies() {
+    let sys_p = Principal::System {
+        part: SystemPart::PresenceMonitor,
+    };
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -1094,6 +1150,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                     ttl_ms: None,
                     takeover: false,
                     allow_fork: false,
+                    mail_horizon_at: None,
                     idem: None,
                 }),
                 |_, _| true,
@@ -1166,10 +1223,16 @@ fn gate1_all_10_mail_routing_cases_verified() {
             "per-binding expiry must not affect sibling bindings on the same transport"
         );
     }
+}
 
-    // Case 7: `two-seats-one-name`
-    // Refuses claiming or replacing another seat without authorization; only an operator/system
-    // may replace another seat (retiring it and unbinding its live sessions).
+// Case 7: `two-seats-one-name`
+// Refuses claiming or replacing another seat without authorization; only an operator/system
+// may replace another seat (retiring it and unbinding its live sessions).
+#[test]
+fn gate1_case_07_two_seats_one_name() {
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -1189,6 +1252,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 projects: Vec::new(),
                 aliases: Vec::new(),
                 home_room: None,
+                mail_horizon_at: None,
+                work_class: None,
+                avatar: None,
+                home_dir: None,
+                start_cmd: None,
+                resume_cmd: None,
+                rex_target: None,
                 verified_how: None,
                 replace: None,
                 idem: None,
@@ -1213,6 +1283,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1239,6 +1310,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 projects: Vec::new(),
                 aliases: Vec::new(),
                 home_room: None,
+                mail_horizon_at: None,
+                work_class: None,
+                avatar: None,
+                home_dir: None,
+                start_cmd: None,
+                resume_cmd: None,
+                rex_target: None,
                 verified_how: None,
                 replace: None,
                 idem: None,
@@ -1262,6 +1340,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                     projects: Vec::new(),
                     aliases: Vec::new(),
                     home_room: None,
+                    mail_horizon_at: None,
+                    work_class: None,
+                    avatar: None,
+                    home_dir: None,
+                    start_cmd: None,
+                    resume_cmd: None,
+                    rex_target: None,
                     verified_how: None,
                     replace: Some(plumb.clone()),
                     idem: None,
@@ -1286,6 +1371,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                     projects: Vec::new(),
                     aliases: Vec::new(),
                     home_room: None,
+                    mail_horizon_at: None,
+                    work_class: None,
+                    avatar: None,
+                    home_dir: None,
+                    start_cmd: None,
+                    resume_cmd: None,
+                    rex_target: None,
                     verified_how: None,
                     replace: Some(plumb.clone()),
                     idem: None,
@@ -1314,6 +1406,13 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 projects: Vec::new(),
                 aliases: Vec::new(),
                 home_room: None,
+                mail_horizon_at: None,
+                work_class: None,
+                avatar: None,
+                home_dir: None,
+                start_cmd: None,
+                resume_cmd: None,
+                rex_target: None,
                 verified_how: None,
                 replace: Some(plumb.clone()),
                 idem: None,
@@ -1328,9 +1427,12 @@ fn gate1_all_10_mail_routing_cases_verified() {
             SeatStatus::Active
         );
     }
+}
 
-    // Case 8: `session-names-drift`
-    // Keyed on `(pid, proc_start, session_id, socket)` + `in_reply_to` incarnation affinity.
+// Case 8: `session-names-drift`
+// Keyed on `(pid, proc_start, session_id, socket)` + `in_reply_to` incarnation affinity.
+#[test]
+fn gate1_case_08_session_names_drift() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -1359,6 +1461,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1386,6 +1489,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1413,6 +1517,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1440,9 +1545,12 @@ fn gate1_all_10_mail_routing_cases_verified() {
             select_binding_for_delivery(&st, &genga, None, None, &affinity, UnixMs(3_000)).unwrap();
         assert_eq!(picked_default.incarnation_id.as_str(), "inc-genga-main");
     }
+}
 
-    // Case 9: `own-watcher-liveness`
-    // SelfWatcher holds a TTL lease; alive while renewed, expires deterministically when missed.
+// Case 9: `own-watcher-liveness`
+// SelfWatcher holds a TTL lease; alive while renewed, expires deterministically when missed.
+#[test]
+fn gate1_case_09_own_watcher_liveness() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
@@ -1468,6 +1576,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
                 ttl_ms: Some(900_000),
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1482,9 +1591,15 @@ fn gate1_all_10_mail_routing_cases_verified() {
             DeliveryStatus::Offline { .. }
         ));
     }
+}
 
-    // Case 10: `bank-before-ring`
-    // Banking writes canon letter bytes to disk even when the recipient seat has ZERO live bindings.
+// Case 10: `bank-before-ring`
+// Banking writes canon letter bytes to disk even when the recipient seat has ZERO live bindings.
+#[test]
+fn gate1_case_10_bank_before_ring() {
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1668,6 +1783,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                mail_horizon_at: None,
                 idem: None,
             }),
             |_, _| true,
@@ -1726,6 +1842,8 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
         in_reply_to: None,
         receipt_only: false,
         seen_at: UnixMs(2_000),
+        time_basis: TimeBasis::LetterIdMs,
+        date_only: false,
     };
     let d_mut = decide_mail_ring(
         &mutated,
@@ -1946,6 +2064,13 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
             projects: Vec::new(),
             aliases: vec![SeatName::parse("loupe-review").unwrap()],
             home_room: None,
+            mail_horizon_at: None,
+            work_class: None,
+            avatar: None,
+            home_dir: None,
+            start_cmd: None,
+            resume_cmd: None,
+            rex_target: None,
             verified_how: None,
             replace: None,
             idem: None,
@@ -1972,6 +2097,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         }),
         |_, _| true,
@@ -1989,6 +2115,13 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
             projects: Vec::new(),
             aliases: Vec::new(),
             home_room: None,
+            mail_horizon_at: None,
+            work_class: None,
+            avatar: None,
+            home_dir: None,
+            start_cmd: None,
+            resume_cmd: None,
+            rex_target: None,
             verified_how: None,
             replace: None,
             idem: None,
@@ -2008,6 +2141,13 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
             projects: Vec::new(),
             aliases: Vec::new(),
             home_room: None,
+            mail_horizon_at: None,
+            work_class: None,
+            avatar: None,
+            home_dir: None,
+            start_cmd: None,
+            resume_cmd: None,
+            rex_target: None,
             verified_how: None,
             replace: None,
             idem: None,
@@ -2103,4 +2243,847 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
             );
         }
     }
+}
+
+#[test]
+fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_project() {
+    let dir = TempDirGuard::new("pr20-ts-precedence");
+    fs::write(dir.path().join(".rex-wave-sandbox"), b"ok\n").unwrap();
+    fs::create_dir_all(dir.path().join("mail")).unwrap();
+    fs::create_dir_all(dir.path().join("to-loupe")).unwrap();
+    fs::create_dir_all(dir.path().join("state")).unwrap();
+    fs::write(dir.path().join("state/acks.jsonl"), b"").unwrap();
+
+    // 1. Filename 13-digit epoch ms wins over recorded date and newer file mtime.
+    let f_epoch_name = dir.path().join("mail/1792431783570-tally-to-loupe.md");
+    let b_epoch_name =
+        b"---\nfrom: tally\nto: loupe\ndate: 2026-11-20 12:00 CST\n---\nepoch filename\n";
+    fs::write(&f_epoch_name, b_epoch_name).unwrap();
+
+    // 2. Frontmatter `id` / `date_ms` wins over recorded date and newer file mtime.
+    let f_id_ms = dir.path().join("to-loupe/id-ms-letter.md");
+    let b_id_ms = b"---\nfrom: tally\nto: loupe\nid: 1795284326392-tally-reply\ndate: 2026-11-21 12:10 CST\n---\nid ms\n";
+    fs::write(&f_id_ms, b_id_ms).unwrap();
+
+    // 3. Recorded frontmatter `date` (`YYYY-MM-DD HH:MM CST`) wins over newer file mtime.
+    let f_recorded_fm = dir.path().join("to-loupe/recorded-fm.md");
+    let b_recorded_fm =
+        b"---\nfrom: tally\nto: loupe\ndate: 2026-10-17 00:36 CDT\n---\nrecorded fm\n";
+    fs::write(&f_recorded_fm, b_recorded_fm).unwrap();
+
+    // 4. `YYYY-MM-DD-` filename prefix wins over newer file mtime when no frontmatter date.
+    let f_ymd_name = dir.path().join("to-loupe/2026-09-15-history-note.md");
+    let b_ymd_name = b"---\nfrom: tally\nto: loupe\n---\nymd filename\n";
+    fs::write(&f_ymd_name, b_ymd_name).unwrap();
+
+    // 5. Fallback to filesystem mtime only when no ID or recorded date exists.
+    let f_mtime = dir.path().join("to-loupe/bare-note.md");
+    let b_mtime = b"---\nfrom: tally\nto: loupe\n---\nmtime fallback\n";
+    fs::write(&f_mtime, b_mtime).unwrap();
+
+    let ro = ReadOnlyInterchange::open(dir.path()).unwrap();
+    let scanned = ro.scan_letters(&AliasMap::empty()).unwrap();
+    assert_eq!(scanned.len(), 5);
+    let by_path: std::collections::BTreeMap<&str, _> =
+        scanned.iter().map(|l| (l.rel_path.as_str(), l)).collect();
+
+    assert_eq!(
+        by_path["mail/1792431783570-tally-to-loupe.md"].seen_at,
+        UnixMs(1_792_431_783_570)
+    );
+    assert_eq!(
+        by_path["mail/1792431783570-tally-to-loupe.md"].time_basis,
+        TimeBasis::LetterIdMs
+    );
+
+    assert_eq!(
+        by_path["to-loupe/id-ms-letter.md"].seen_at,
+        UnixMs(1_795_284_326_392)
+    );
+    assert_eq!(
+        by_path["to-loupe/id-ms-letter.md"].time_basis,
+        TimeBasis::LetterIdMs
+    );
+
+    // 2026-10-17 00:36 CDT == 2026-10-17T05:36:00Z
+    let (expected_cdt_ms, expected_cdt_basis) = extract_letter_timestamp(
+        "to-loupe/recorded-fm.md",
+        None,
+        None,
+        Some("2026-10-17 00:36 CDT"),
+        None,
+        Some(UnixMs(1_799_999_999_999)),
+    );
+    assert_eq!(expected_cdt_basis, TimeBasis::RecordedDate);
+    assert_eq!(by_path["to-loupe/recorded-fm.md"].seen_at, expected_cdt_ms);
+    assert_eq!(
+        by_path["to-loupe/recorded-fm.md"].time_basis,
+        TimeBasis::RecordedDate
+    );
+
+    assert_eq!(
+        by_path["to-loupe/2026-09-15-history-note.md"].time_basis,
+        TimeBasis::RecordedDate
+    );
+    assert!(
+        by_path["to-loupe/2026-09-15-history-note.md"].seen_at < expected_cdt_ms,
+        "2026-09-15 filename date must sort older than 2026-10-17"
+    );
+
+    assert_eq!(
+        by_path["to-loupe/bare-note.md"].time_basis,
+        TimeBasis::FileModified
+    );
+    assert!(by_path["to-loupe/bare-note.md"].seen_at.0 > 1_700_000_000_000);
+
+    // Shadow RaiseUnrung picks the historical oldest_at (2026-09-15), NOT today's mtime!
+    let pass = run_shadow_pass(
+        &ro,
+        &PresenceState::default(),
+        &IncarnationAffinity::new(),
+        &RetryState::new(),
+        &RingPolicy::default(),
+        &AliasMap::empty(),
+        UnixMs(1_795_300_000_000),
+    )
+    .unwrap();
+    let unrung = pass
+        .decisions
+        .iter()
+        .find(|d| matches!(d, RingDecision::RaiseUnrung { seat, .. } if seat.as_str() == "loupe"))
+        .expect("loupe RaiseUnrung decision");
+    match unrung {
+        RingDecision::RaiseUnrung {
+            oldest_at,
+            time_basis,
+            ..
+        } => {
+            assert_eq!(
+                *oldest_at,
+                by_path["to-loupe/2026-09-15-history-note.md"].seen_at
+            );
+            assert_eq!(*time_basis, TimeBasis::RecordedDate);
+        }
+        _ => unreachable!(),
+    }
+    let json = unrung.to_json_value();
+    assert_eq!(json["time_basis"], "recorded_date");
+
+    // Verify `lib.rs::project()` uses the exact same precedence!
+    let sandbox = SandboxRoot::verify_with(dir.path(), &Protection::default()).unwrap();
+    let item_epoch = project(
+        &sandbox,
+        &sandbox.path().join("to-loupe/id-ms-letter.md"),
+        b_id_ms,
+    )
+    .unwrap();
+    assert_eq!(item_epoch.ts, "2026-11-21T18:05:26Z");
+    assert_eq!(item_epoch.ts_basis, "letter_id_ms");
+
+    let item_recorded = project(
+        &sandbox,
+        &sandbox.path().join("to-loupe/recorded-fm.md"),
+        b_recorded_fm,
+    )
+    .unwrap();
+    assert_eq!(item_recorded.ts, "2026-10-17T05:36:00Z");
+    assert_eq!(item_recorded.ts_basis, "recorded");
+
+    let item_ymd = project(
+        &sandbox,
+        &sandbox.path().join("to-loupe/2026-09-15-history-note.md"),
+        b_ymd_name,
+    )
+    .unwrap();
+    assert_eq!(item_ymd.ts, "2026-09-15T00:00:00Z");
+    assert_eq!(item_ymd.ts_basis, "recorded");
+
+    let item_mtime = project(
+        &sandbox,
+        &sandbox.path().join("to-loupe/bare-note.md"),
+        b_mtime,
+    )
+    .unwrap();
+    assert_eq!(item_mtime.ts_basis, "mtime");
+}
+
+#[test]
+fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_aliases() {
+    let dir = TempDirGuard::new("pr20-q1-seed");
+    let interchange = dir.path().join("interchange");
+    fs::create_dir_all(interchange.join("postmaster/state")).unwrap();
+    fs::create_dir_all(dir.path().join(".watchers")).unwrap();
+
+    fs::write(
+        interchange.join("postmaster/state/roster.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "house-roster/2",
+            "seats": {
+                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
+                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" },
+                "rd-3": { "name": "auburn-cepheus", "box": "/tmp/interchange/to-muse" },
+                "rd-4": { "name": "genga", "box": "/tmp/interchange/to-genga" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".watchers/mailwatch-routes.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "tally": { "aliases": ["tally", "tally_votp", "Tally-VampOTP-CTO", "tally desk"] },
+            "genga": { "aliases": ["genga", "genga_votp", "users-c7"] },
+            "auburn-cepheus": { "aliases": ["muse", "auburn-cepheus", "auburn-cephus"] },
+            "cc": { "aliases": ["cc"] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let plan = seed_records_from_interchange(&interchange).unwrap();
+    assert_eq!(plan.sources_read.len(), 2);
+    assert!(plan.skipped_targets.contains(&"golem".to_owned()));
+    assert!(plan.skipped_targets.contains(&"cc".to_owned()));
+
+    // Apply all seeded claims as Operator, then bind `tally` WITHOUT passing `--alias`.
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    for claim in plan.claims {
+        assert_ne!(claim.seat.as_str(), "golem");
+        assert!(matches!(
+            claim.verified_how,
+            Some(VerificationKind::MachineChecked | VerificationKind::WitnessedBy { .. })
+        ));
+        apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            owner_p.clone(),
+            UnixMs(1_000),
+            PresenceCommand::PresenceClaim(claim),
+            |_, _| true,
+        )
+        .unwrap();
+    }
+
+    // Binding as `tally` immediately covers `tally_votp` via durable seeded aliases!
+    let tally = SeatName::parse("tally").unwrap();
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        Principal::Seat {
+            seat: tally.clone(),
+        },
+        UnixMs(2_000),
+        PresenceCommand::PresenceBind(PresenceBind {
+            seat: tally.clone(),
+            incarnation_id: None,
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 5,
+                client: "tally-hook".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: false,
+            allow_fork: false,
+            mail_horizon_at: None,
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+
+    let aliases = AliasMap::from_presence(&st);
+    assert_eq!(aliases.canonicalize("tally_votp"), "tally");
+    assert_eq!(aliases.canonicalize("genga_votp"), "genga");
+    assert_eq!(aliases.canonicalize("auburn-cephus"), "auburn-cepheus");
+    assert_eq!(aliases.canonicalize("auburn-chepheus"), "auburn-cepheus");
+    assert_eq!(aliases.canonicalize("muse"), "auburn-cepheus");
+
+    let resolved = st
+        .resolve_at(
+            &PresenceResolve {
+                query: "tally_votp".into(),
+                lane: None,
+            },
+            UnixMs(2_500),
+        )
+        .unwrap();
+    assert_eq!(resolved.record.seat, tally);
+    assert_eq!(resolved.live_bindings.len(), 1);
+}
+
+#[test]
+fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override() {
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let tally = SeatName::parse("tally").unwrap();
+    let tally_p = Principal::Seat {
+        seat: tally.clone(),
+    };
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+
+    // Seed `tally` first (mail_horizon_at starts None).
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p,
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            status: Some(SeatStatus::Active),
+            aliases: vec![SeatName::parse("tally_votp").unwrap()],
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    assert_eq!(st.seat(&tally).unwrap().mail_horizon_at, None);
+
+    // First live bind at t=10_000 stamps mail_horizon_at = Some(10_000).
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        tally_p.clone(),
+        UnixMs(10_000),
+        PresenceCommand::PresenceBind(PresenceBind {
+            seat: tally.clone(),
+            incarnation_id: Some(IncarnationId::parse("inc-1").unwrap()),
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 1,
+                client: "tally".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: false,
+            allow_fork: false,
+            mail_horizon_at: None,
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    assert_eq!(
+        st.seat(&tally).unwrap().mail_horizon_at,
+        Some(UnixMs(10_000))
+    );
+
+    // Subsequent rebind at t=20_000 WITHOUT override preserves the original horizon (10_000).
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        tally_p.clone(),
+        UnixMs(20_000),
+        PresenceCommand::PresenceBind(PresenceBind {
+            seat: tally.clone(),
+            incarnation_id: Some(IncarnationId::parse("inc-2").unwrap()),
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 2,
+                client: "tally".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: true,
+            allow_fork: false,
+            mail_horizon_at: None,
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    assert_eq!(
+        st.seat(&tally).unwrap().mail_horizon_at,
+        Some(UnixMs(10_000))
+    );
+
+    let aliases = AliasMap::from_presence(&st);
+    let empty_acks = parse_acks_jsonl("", &aliases).into_index();
+    let old_letter = sample_candidate("mail/old-hist.md", "tally", b"old", UnixMs(9_999));
+    let exact_letter = sample_candidate("mail/at-horizon.md", "tally", b"at", UnixMs(10_000));
+    let new_letter = sample_candidate("mail/new-live.md", "tally", b"new", UnixMs(15_000));
+
+    let decisions = decide_mail_rings_for_seat(
+        &tally,
+        &[old_letter, exact_letter, new_letter],
+        &empty_acks,
+        &st,
+        &IncarnationAffinity::new(),
+        &RetryState::new(),
+        &RingPolicy::default(),
+        &aliases,
+        UnixMs(20_500),
+    );
+    assert!(matches!(
+        &decisions[0],
+        ShadowAction::SkipPreHorizonHistory {
+            letter_at: UnixMs(9_999),
+            horizon_at: UnixMs(10_000),
+            ..
+        }
+    ));
+    let score = score_shadow_against_acks(&decisions, &empty_acks, &aliases);
+    assert_eq!(score.skipped_pre_horizon, 1);
+    assert_eq!(score.rings_emitted, 2);
+    assert_eq!(score.unrung_alerts, 0);
+
+    // Even when tally goes offline later, pre-horizon letters NEVER raise RaiseUnrung!
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        tally_p.clone(),
+        UnixMs(25_000),
+        PresenceCommand::PresenceUnbind(PresenceUnbind {
+            seat: tally.clone(),
+            incarnation_id: IncarnationId::parse("inc-2").unwrap(),
+            reason: Some("closed".into()),
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let offline_old = decide_mail_ring(
+        &sample_candidate("mail/hist-480.md", "tally", b"hist-480", UnixMs(5_000)),
+        &empty_acks,
+        &st,
+        &IncarnationAffinity::new(),
+        &RetryState::new(),
+        &RingPolicy::default(),
+        &aliases,
+        UnixMs(60_000),
+    );
+    assert!(matches!(
+        offline_old,
+        ShadowAction::SkipPreHorizonHistory { .. }
+    ));
+
+    // Explicit `--mail-horizon` override moves the watermark cleanly.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        tally_p,
+        UnixMs(30_000),
+        PresenceCommand::PresenceBind(PresenceBind {
+            seat: tally.clone(),
+            incarnation_id: Some(IncarnationId::parse("inc-3").unwrap()),
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 3,
+                client: "tally".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: true,
+            allow_fork: false,
+            mail_horizon_at: Some(UnixMs(25_000)),
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    assert_eq!(
+        st.seat(&tally).unwrap().mail_horizon_at,
+        Some(UnixMs(25_000))
+    );
+}
+
+#[test]
+fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let golem = SeatName::parse("golem").unwrap();
+
+    // 1. PresenceBind for `golem` is structurally DENIED (even for Operator!).
+    let bind_err = apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(1_000),
+        PresenceCommand::PresenceBind(PresenceBind {
+            seat: golem.clone(),
+            incarnation_id: None,
+            lane: None,
+            endpoint: TransportEndpoint::OperatorToast {
+                command: "mail-golem.sh".into(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(60_000),
+            takeover: false,
+            allow_fork: false,
+            mail_horizon_at: None,
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap_err();
+    assert!(matches!(bind_err, ApiError::Denied { .. }), "{bind_err:?}");
+
+    // 2. PresenceClaim setting `golem` to Active (explicit or default) is DENIED.
+    let claim_active_err = apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(empty_claim("golem")),
+        |_, _| true,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(claim_active_err, ApiError::Denied { .. }),
+        "{claim_active_err:?}"
+    );
+
+    // 3. Claiming `golem` as an alias of another seat is DENIED.
+    let alias_hijack_err = apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            aliases: vec![golem.clone()],
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(alias_hijack_err, ApiError::Denied { .. }),
+        "{alias_hijack_err:?}"
+    );
+
+    // 4. Dormant metadata on `golem` is allowed, but transitioning it to Active is DENIED.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            status: Some(SeatStatus::Dormant),
+            ..empty_claim("golem")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let promote_err = apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p,
+        UnixMs(2_000),
+        PresenceCommand::PresenceSetStatus(PresenceSetStatus {
+            seat: golem.clone(),
+            status: SeatStatus::Active,
+            verified_how: None,
+            reason: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(promote_err, ApiError::Denied { .. }),
+        "{promote_err:?}"
+    );
+
+    // 5. Shadow classification: `golem` -> SkipOperatorSurface; non-seat targets -> SkipNonSeatTarget.
+    let aliases = AliasMap::empty();
+    let empty_acks = parse_acks_jsonl("", &aliases).into_index();
+    let empty_st = PresenceState::default();
+    let mut decisions = Vec::new();
+    decisions.push(decide_mail_ring(
+        &sample_candidate("mail/to-golem.md", "golem", b"hi golem", UnixMs(1_000)),
+        &empty_acks,
+        &empty_st,
+        &IncarnationAffinity::new(),
+        &RetryState::new(),
+        &RingPolicy::default(),
+        &aliases,
+        UnixMs(2_000),
+    ));
+    for pseudo in [
+        "cc",
+        "to-cc",
+        "all-seats",
+        "desk",
+        "desktop",
+        "codex",
+        "claude",
+        "unregistered-addressee",
+    ] {
+        decisions.push(decide_mail_ring(
+            &sample_candidate(
+                &format!("mail/to-{pseudo}.md"),
+                pseudo,
+                format!("hi {pseudo}").as_bytes(),
+                UnixMs(1_000),
+            ),
+            &empty_acks,
+            &empty_st,
+            &IncarnationAffinity::new(),
+            &RetryState::new(),
+            &RingPolicy::default(),
+            &aliases,
+            UnixMs(2_000),
+        ));
+    }
+
+    assert!(matches!(
+        decisions[0],
+        ShadowAction::SkipOperatorSurface { .. }
+    ));
+    assert!(
+        decisions[1..]
+            .iter()
+            .all(|d| matches!(d, ShadowAction::SkipNonSeatTarget { .. }))
+    );
+
+    let report = score_shadow_against_acks(&decisions, &empty_acks, &aliases);
+    assert_eq!(report.skipped_operator_surface, 1);
+    assert_eq!(report.skipped_non_seat_target, 8);
+    assert_eq!(report.unrung_alerts, 0);
+    assert_eq!(report.rings_emitted, 0);
+
+    // JSONL round-trip agrees identically with in-memory score.
+    let jsonl: String = decisions
+        .iter()
+        .map(|d| format!("{}\n", serde_json::to_string(&d.to_json_value()).unwrap()))
+        .collect();
+    assert_eq!(
+        score_shadow_jsonl(&jsonl, &empty_acks, &aliases).unwrap(),
+        report
+    );
+}
+
+#[test]
+fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let tally = SeatName::parse("tally").unwrap();
+
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            status: Some(SeatStatus::Active),
+            role: Some("estate-desk".into()),
+            projects: vec!["interchange".into()],
+            aliases: vec![SeatName::parse("tally_votp").unwrap()],
+            mail_horizon_at: Some(UnixMs(1_795_284_326_000)),
+            work_class: Some(WorkClass::ClassA),
+            avatar: Some("avatars/tally.png".into()),
+            home_dir: Some("/Users/golem/agent-folder/resident_memories/tally".into()),
+            start_cmd: Some("claude --name Tally-5.2".into()),
+            resume_cmd: Some("claude --resume 59e9053e".into()),
+            rex_target: Some("block:tally-desk".into()),
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+
+    // Updating only `work_class` preserves all other resident manifest fields.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p,
+        UnixMs(2_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            work_class: Some(WorkClass::ClassB),
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+
+    let rec = st.seat(&tally).unwrap();
+    assert_eq!(rec.work_class, Some(WorkClass::ClassB));
+    assert_eq!(rec.avatar.as_deref(), Some("avatars/tally.png"));
+    assert_eq!(
+        rec.home_dir.as_deref(),
+        Some("/Users/golem/agent-folder/resident_memories/tally")
+    );
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally-5.2"));
+    assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume 59e9053e"));
+    assert_eq!(rec.rex_target.as_deref(), Some("block:tally-desk"));
+    assert_eq!(rec.mail_horizon_at, Some(UnixMs(1_795_284_326_000)));
+
+    let manifest = ResidentManifest::from_records([rec]);
+    assert_eq!(manifest.schema, RESIDENT_MANIFEST_SCHEMA);
+    let json = serde_json::to_string_pretty(&manifest).unwrap();
+    let parsed: ResidentManifest = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, manifest);
+    assert_eq!(parsed.seats[0].work_class, Some(WorkClass::ClassB));
+
+    // Omitting `status` in a hand-edited manifest preserves an existing Dormant status.
+    let hand_edited: ResidentManifest = serde_json::from_value(serde_json::json!({
+        "schema": RESIDENT_MANIFEST_SCHEMA,
+        "seats": [{
+            "seat": "nodal",
+            "work_class": "class_b",
+            "rex_target": "block:nodal-card"
+        }]
+    }))
+    .unwrap();
+    assert_eq!(hand_edited.seats[0].status, None);
+    let mut st2 = PresenceState::default();
+    let mut seq2 = 0;
+    let owner2 = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    apply_presence_with_probe(
+        &mut st2,
+        &mut seq2,
+        owner2.clone(),
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            status: Some(SeatStatus::Dormant),
+            ..empty_claim("nodal")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    apply_presence_with_probe(
+        &mut st2,
+        &mut seq2,
+        owner2,
+        UnixMs(2_000),
+        PresenceCommand::PresenceClaim(hand_edited.seats[0].clone().into_claim(None)),
+        |_, _| true,
+    )
+    .unwrap();
+    let nodal = st2.seat(&SeatName::parse("nodal").unwrap()).unwrap();
+    assert_eq!(nodal.status, SeatStatus::Dormant);
+    assert_eq!(nodal.work_class, Some(WorkClass::ClassB));
+}
+
+#[test]
+fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon() {
+    let dir = TempDirGuard::new("pr20-reply-and-date-only");
+    fs::write(dir.path().join(".rex-wave-sandbox"), b"ok\n").unwrap();
+    fs::create_dir_all(dir.path().join("mail")).unwrap();
+    fs::create_dir_all(dir.path().join("to-fathom")).unwrap();
+    fs::create_dir_all(dir.path().join("state")).unwrap();
+    fs::write(dir.path().join("state/acks.jsonl"), b"").unwrap();
+
+    // Parent was written at 2026-11-20T22:56:41Z (`1795215401193`).
+    // Seat `fathom` binds at 2026-11-21 01:00 CST (`2026-11-21T07:00:00Z` = `1795244400000`).
+    // Tally replies at 2026-11-21 02:51 CST (`2026-11-21T08:51:00Z` = `1795251060000`) reusing
+    // the parent's 13-digit prefix in filename and `id`, with `in_reply_to: 1795215401193`.
+    let reply_bytes = b"---\nfrom: tally\nto: fathom\nid: 1795215401193-tally-reply\nin_reply_to: 1795215401193\ndate: 2026-11-21 02:51 CST\nsubject: Post-bind reply\n---\nreply body\n";
+    let reply_path = dir.path().join("mail/1795215401193-tally-reply.md");
+    fs::write(&reply_path, reply_bytes).unwrap();
+
+    // Date-only box letter written on the same local day (`2026-11-21`, resolves to 00:00 UTC
+    // with `date_only = true`) AND a fuzzy-minute letter (`2026-11-21 11:1x CST`) must NOT be
+    // skipped by a 2026-11-21 bind horizon, whereas an older historical date-only letter
+    // (`2026-10-18`) MUST be skipped as `SkipPreHorizonHistory`.
+    fs::write(
+        dir.path().join("to-fathom/2026-11-21-same-day.md"),
+        b"---\nfrom: tally\nto: fathom\ndate: 2026-11-21\n---\nsame-day date-only\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("to-fathom/fuzzy-same-day.md"),
+        b"---\nfrom: tally\nto: fathom\ndate: 2026-11-21 11:1x CST\n---\nfuzzy same-day\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("to-fathom/2026-10-18-old-history.md"),
+        b"---\nfrom: tally\nto: fathom\ndate: 2026-10-18\n---\nold history\n",
+    )
+    .unwrap();
+
+    // Verify `lib.rs::project()` also uses the reply's own recorded date rather than the parent's id.
+    let sandbox = SandboxRoot::verify_with(dir.path(), &Protection::default()).unwrap();
+    let proj_reply = project(
+        &sandbox,
+        &sandbox.path().join("mail/1795215401193-tally-reply.md"),
+        reply_bytes,
+    )
+    .unwrap();
+    assert_eq!(proj_reply.ts, "2026-11-21T08:51:00Z");
+    assert_eq!(proj_reply.ts_basis, "recorded");
+
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let fathom = SeatName::parse("fathom").unwrap();
+    let bind_horizon = UnixMs(1_795_244_400_000); // 2026-11-21T07:00:00Z (01:00 CST)
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        Principal::Seat {
+            seat: fathom.clone(),
+        },
+        bind_horizon,
+        PresenceCommand::PresenceBind(PresenceBind {
+            seat: fathom.clone(),
+            incarnation_id: Some(IncarnationId::parse("inc-fathom-1").unwrap()),
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 9,
+                client: "fathom".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: false,
+            allow_fork: false,
+            mail_horizon_at: None,
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+
+    let ro = ReadOnlyInterchange::open(dir.path()).unwrap();
+    let aliases = AliasMap::from_presence(&st);
+    let pass = run_shadow_pass(
+        &ro,
+        &st,
+        &IncarnationAffinity::new(),
+        &RetryState::new(),
+        &RingPolicy::default(),
+        &aliases,
+        UnixMs(1_795_260_000_000),
+    )
+    .unwrap();
+
+    let mut rung_paths = BTreeSet::new();
+    let mut skipped_pre_horizon_paths = BTreeSet::new();
+    for d in &pass.decisions {
+        match d {
+            RingDecision::Ring { referent, .. } => {
+                rung_paths.insert(referent.path().to_owned());
+            }
+            RingDecision::SkipPreHorizonHistory { referent, .. } => {
+                skipped_pre_horizon_paths.insert(referent.path().to_owned());
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+    assert!(
+        rung_paths.contains("mail/1795215401193-tally-reply.md"),
+        "post-bind reply reusing parent prefix must RING, got rung={rung_paths:?}, skipped={skipped_pre_horizon_paths:?}"
+    );
+    assert!(
+        rung_paths.contains("to-fathom/2026-11-21-same-day.md"),
+        "same-day date-only letter must RING, got rung={rung_paths:?}, skipped={skipped_pre_horizon_paths:?}"
+    );
+    assert!(
+        rung_paths.contains("to-fathom/fuzzy-same-day.md"),
+        "same-day fuzzy-time letter must RING, got rung={rung_paths:?}, skipped={skipped_pre_horizon_paths:?}"
+    );
+    assert_eq!(
+        skipped_pre_horizon_paths,
+        BTreeSet::from(["to-fathom/2026-10-18-old-history.md".to_owned()])
+    );
 }

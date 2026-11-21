@@ -319,9 +319,291 @@ impl ClaudeSessionFile {
             ttl_ms,
             takeover,
             allow_fork,
+            mail_horizon_at: None,
             idem: None,
         })
     }
+}
+
+/// Canonical house alias pairs witnessed by Tally's desk so first-live-bind hooks
+/// (`presence bind --seat tally`) automatically cover historical alias names
+/// (`tally_votp`, `genga_votp`, all three spellings of `auburn-cepheus`, etc.).
+pub const CANONICAL_HOUSE_ALIASES: &[(&str, &[&str])] = &[
+    ("tally", &["tally_votp", "tally-vampotp-cto"]),
+    ("genga", &["genga_votp", "genga-opus-5"]),
+    (
+        "auburn-cepheus",
+        &["auburn-cephus", "auburn-chepheus", "muse"],
+    ),
+    ("kuti-supervisor", &["kuti", "kuti-ren-sup"]),
+    ("loupe", &["loupe-reviewer"]),
+];
+
+/// Output of [`seed_records_from_interchange`]: durable [`PresenceClaim`]s ready
+/// to apply (or preview under `--dry-run`) before seats run live `presence bind`.
+#[derive(Clone, Debug)]
+pub struct SeedInterchangePlan {
+    pub claims: Vec<PresenceClaim>,
+    pub sources_read: Vec<PathBuf>,
+    pub skipped_targets: Vec<String>,
+}
+
+impl SeedInterchangePlan {
+    pub fn to_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sources_read": self
+                .sources_read
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            "skipped_targets": self.skipped_targets,
+            "seat_count": self.claims.len(),
+            "claims": self.claims,
+        })
+    }
+}
+
+fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(ApiError::Internal(format!("stat {}: {e}", path.display())));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(ApiError::Denied {
+            principal: "presence".into(),
+            action: format!("read non-regular seed file {}", path.display()),
+        });
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
+    let val = serde_json::from_str(&raw).map_err(|e| {
+        invalid(
+            "seed_json",
+            format!("{}: invalid JSON: {e}", path.display()),
+        )
+    })?;
+    Ok(Some(val))
+}
+
+fn parse_seat_slug(raw: &str) -> Option<SeatName> {
+    let norm = raw.trim().trim_start_matches('@').to_ascii_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+    SeatName::parse(norm).ok()
+}
+
+/// Pure read-only helper that derives durable [`PresenceClaim`]s with aliases
+/// and provenance from an interchange directory's `postmaster/state/roster.json`,
+/// `.watchers/mailwatch-routes.json` (in `<dir>` or its parent house root), and
+/// [`CANONICAL_HOUSE_ALIASES`].
+///
+/// Never writes to disk and never emits `Active` claims for reserved operator
+/// surfaces (`golem`) or non-seat pseudo-targets (`cc`, `desk`, etc.).
+pub fn seed_records_from_interchange(
+    interchange_dir: &Path,
+) -> Result<SeedInterchangePlan, ApiError> {
+    let canon_dir = fs::canonicalize(interchange_dir)
+        .map_err(|e| invalid("interchange", format!("{}: {e}", interchange_dir.display())))?;
+    if !canon_dir.is_dir() {
+        return Err(invalid(
+            "interchange",
+            format!("{} is not a directory", canon_dir.display()),
+        ));
+    }
+
+    let mut sources_read = Vec::new();
+    let mut skipped_targets = BTreeSet::new();
+    let mut seat_aliases: BTreeMap<SeatName, BTreeSet<SeatName>> = BTreeMap::new();
+    let mut machine_checked_seats: BTreeSet<SeatName> = BTreeSet::new();
+
+    // Reverse lookup for canonical pairs so roster/route entries under an alias
+    // name fold into their canonical seat (e.g., `tally_votp` -> `tally`).
+    let mut canonical_fold: BTreeMap<String, SeatName> = BTreeMap::new();
+    for &(canon_raw, alias_list) in CANONICAL_HOUSE_ALIASES {
+        if let Some(canon_seat) = parse_seat_slug(canon_raw) {
+            canonical_fold.insert(canon_seat.as_str().to_owned(), canon_seat.clone());
+            for &alias_raw in alias_list {
+                if let Some(alias_seat) = parse_seat_slug(alias_raw) {
+                    canonical_fold.insert(alias_seat.as_str().to_owned(), canon_seat.clone());
+                }
+            }
+        }
+    }
+
+    let fold_seat = |raw: &str| -> Option<SeatName> {
+        let slug = parse_seat_slug(raw)?;
+        Some(canonical_fold.get(slug.as_str()).cloned().unwrap_or(slug))
+    };
+
+    // 1. Read `<interchange>/postmaster/state/roster.json` if present.
+    let roster_path = canon_dir.join("postmaster/state/roster.json");
+    if let Some(roster_val) = read_regular_json_if_present(&roster_path)? {
+        sources_read.push(roster_path);
+        if let Some(seats_obj) = roster_val.get("seats").and_then(|v| v.as_object()) {
+            for entry in seats_obj.values() {
+                let Some(raw_name) = entry.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if is_operator_surface_seat(raw_name) || is_non_seat_target(raw_name) {
+                    skipped_targets.insert(raw_name.trim().to_ascii_lowercase());
+                    continue;
+                }
+                let Some(canon) = fold_seat(raw_name) else {
+                    continue;
+                };
+                machine_checked_seats.insert(canon.clone());
+                let set = seat_aliases.entry(canon.clone()).or_default();
+                if let Some(raw_slug) = parse_seat_slug(raw_name)
+                    && raw_slug != canon
+                {
+                    set.insert(raw_slug);
+                }
+                // If `box` points to `.../interchange/to-<alias>`, register `<alias>` as an alias
+                // when distinct from the canonical seat (e.g. `auburn-cepheus` -> `to-muse`).
+                if let Some(box_str) = entry.get("box").and_then(|v| v.as_str())
+                    && let Some(last_seg) = box_str.trim_end_matches('/').rsplit('/').next()
+                    && let Some(box_alias) = last_seg.strip_prefix("to-")
+                    && let Some(alias_slug) = parse_seat_slug(box_alias)
+                    && alias_slug != canon
+                    && !is_operator_surface_seat(alias_slug.as_str())
+                    && !is_non_seat_target(alias_slug.as_str())
+                {
+                    set.insert(alias_slug);
+                }
+            }
+        }
+    }
+
+    // 2. Read `.watchers/mailwatch-routes.json` under `<interchange>` or its parent house root.
+    let local_routes = canon_dir.join(".watchers/mailwatch-routes.json");
+    let routes_candidate = if fs::symlink_metadata(&local_routes).is_ok() {
+        Some(local_routes)
+    } else {
+        canon_dir
+            .parent()
+            .map(|p| p.join(".watchers/mailwatch-routes.json"))
+            .filter(|p| fs::symlink_metadata(p).is_ok())
+    };
+    if let Some(routes_path) = routes_candidate
+        && let Some(routes_val) = read_regular_json_if_present(&routes_path)?
+    {
+        sources_read.push(routes_path);
+        if let Some(map) = routes_val.as_object() {
+            for (raw_key, entry) in map {
+                if !entry.is_object() {
+                    continue;
+                }
+                if is_operator_surface_seat(raw_key) || is_non_seat_target(raw_key) {
+                    skipped_targets.insert(raw_key.trim().to_ascii_lowercase());
+                    continue;
+                }
+                let Some(canon) = fold_seat(raw_key) else {
+                    continue;
+                };
+                machine_checked_seats.insert(canon.clone());
+                let set = seat_aliases.entry(canon.clone()).or_default();
+                if let Some(raw_slug) = parse_seat_slug(raw_key)
+                    && raw_slug != canon
+                {
+                    set.insert(raw_slug);
+                }
+                if let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        let Some(raw_alias) = item.as_str() else {
+                            continue;
+                        };
+                        let cleaned = raw_alias
+                            .trim()
+                            .strip_prefix("to-")
+                            .unwrap_or(raw_alias.trim());
+                        if let Some(alias_slug) = parse_seat_slug(cleaned)
+                            && alias_slug != canon
+                            && !is_operator_surface_seat(alias_slug.as_str())
+                            && !is_non_seat_target(alias_slug.as_str())
+                        {
+                            set.insert(alias_slug);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Merge canonical house alias pairs.
+    for &(canon_raw, alias_list) in CANONICAL_HOUSE_ALIASES {
+        let Some(canon) = parse_seat_slug(canon_raw) else {
+            continue;
+        };
+        let set = seat_aliases.entry(canon.clone()).or_default();
+        for &alias_raw in alias_list {
+            if let Some(alias_slug) = parse_seat_slug(alias_raw)
+                && alias_slug != canon
+            {
+                set.insert(alias_slug);
+            }
+        }
+    }
+
+    // 4. Remove any alias that collides with a canonical seat or an earlier seat's alias.
+    let canonical_seats: BTreeSet<SeatName> = seat_aliases.keys().cloned().collect();
+    let mut claimed_aliases: BTreeSet<SeatName> = BTreeSet::new();
+    let tally_witness = SeatName::parse("tally").expect("valid tally seat");
+    let mut claims = Vec::with_capacity(seat_aliases.len());
+
+    for (seat, raw_aliases) in seat_aliases {
+        if is_operator_surface_seat(seat.as_str()) || is_non_seat_target(seat.as_str()) {
+            skipped_targets.insert(seat.as_str().to_owned());
+            continue;
+        }
+        let mut final_aliases = Vec::new();
+        for alias in raw_aliases {
+            if alias == seat
+                || canonical_seats.contains(&alias)
+                || is_operator_surface_seat(alias.as_str())
+                || is_non_seat_target(alias.as_str())
+            {
+                continue;
+            }
+            if claimed_aliases.insert(alias.clone()) {
+                final_aliases.push(alias);
+            }
+        }
+        let verified_how = if machine_checked_seats.contains(&seat) {
+            Some(VerificationKind::MachineChecked)
+        } else {
+            Some(VerificationKind::WitnessedBy {
+                seat: tally_witness.clone(),
+            })
+        };
+        claims.push(PresenceClaim {
+            seat,
+            status: Some(SeatStatus::Active),
+            role: None,
+            projects: Vec::new(),
+            aliases: final_aliases,
+            home_room: None,
+            mail_horizon_at: None,
+            work_class: None,
+            avatar: None,
+            home_dir: None,
+            start_cmd: None,
+            resume_cmd: None,
+            rex_target: None,
+            verified_how,
+            replace: None,
+            idem: None,
+        });
+    }
+
+    Ok(SeedInterchangePlan {
+        claims,
+        sources_read,
+        skipped_targets: skipped_targets.into_iter().collect(),
+    })
 }
 
 /// Tracks which seat incarnation authored each letter id so replies carrying
@@ -643,6 +925,17 @@ fn normalize_lane(lane: &Option<String>) -> Result<Option<String>, ApiError> {
     }
     if trimmed.len() > 64 || trimmed.chars().any(char::is_control) {
         return Err(invalid("lane", "must be 1..=64 printable characters"));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn validate_resident_field(what: &str, raw: &Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let trimmed = val.trim();
+    if trimmed.is_empty() || trimmed.len() > 1024 || trimmed.chars().any(char::is_control) {
+        return Err(invalid(what, "must be 1..=1024 printable characters"));
     }
     Ok(Some(trimmed.to_owned()))
 }
@@ -1025,6 +1318,35 @@ impl Presence {
         let replacing_self = c.replace.as_ref() == Some(&c.seat);
         let replacing_other = c.replace.as_ref().filter(|old| *old != &c.seat);
 
+        let status = c
+            .status
+            .or_else(|| existing.map(|r| r.status))
+            .unwrap_or(SeatStatus::Active);
+
+        // Structural Q3 guard: `golem` is the human operator surface and may
+        // never become an `Active` seat or be claimed as another seat's alias.
+        if is_operator_surface_seat(c.seat.as_str()) && status == SeatStatus::Active {
+            return Err(ApiError::Denied {
+                principal: ctx.by.to_string(),
+                action: format!(
+                    "claim operator surface seat '{}' as active (golem cannot become an active seat)",
+                    c.seat
+                ),
+            });
+        }
+        if c.aliases
+            .iter()
+            .any(|alias| is_operator_surface_seat(alias.as_str()))
+        {
+            return Err(ApiError::Denied {
+                principal: ctx.by.to_string(),
+                action: format!(
+                    "claim reserved operator surface '{}' as an alias of '{}'",
+                    OPERATOR_SURFACE_SEAT, c.seat
+                ),
+            });
+        }
+
         if let Some(old_seat) = replacing_other {
             let Some(old_rec) = state.seats.get(old_seat) else {
                 return Err(ApiError::NotFound {
@@ -1109,10 +1431,6 @@ impl Presence {
             }
         }
 
-        let status = c
-            .status
-            .or_else(|| existing.map(|r| r.status))
-            .unwrap_or(SeatStatus::Active);
         let status_provenance = if c.status.is_some() || existing.is_none() || replacing_self {
             Some(prov.clone())
         } else {
@@ -1190,6 +1508,42 @@ impl Presence {
             None
         };
 
+        let mail_horizon_at = match c.mail_horizon_at {
+            Some(h) => Some(h),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.mail_horizon_at),
+        };
+        let work_class = match c.work_class {
+            Some(wc) => Some(wc),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.work_class),
+        };
+        let avatar = match validate_resident_field("avatar", &c.avatar)? {
+            Some(v) => Some(v),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.avatar.clone()),
+        };
+        let home_dir = match validate_resident_field("home_dir", &c.home_dir)? {
+            Some(v) => Some(v),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.home_dir.clone()),
+        };
+        let start_cmd = match validate_resident_field("start_cmd", &c.start_cmd)? {
+            Some(v) => Some(v),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.start_cmd.clone()),
+        };
+        let resume_cmd = match validate_resident_field("resume_cmd", &c.resume_cmd)? {
+            Some(v) => Some(v),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.resume_cmd.clone()),
+        };
+        let rex_target = match validate_resident_field("rex_target", &c.rex_target)? {
+            Some(v) => Some(v),
+            None if replacing_self => None,
+            None => existing.and_then(|r| r.rex_target.clone()),
+        };
+
         let can_reassign_owner = matches!(
             ctx.by,
             Principal::Operator { .. } | Principal::System { .. }
@@ -1210,6 +1564,13 @@ impl Presence {
             projects,
             home_room,
             retired_at,
+            mail_horizon_at,
+            work_class,
+            avatar,
+            home_dir,
+            start_cmd,
+            resume_cmd,
+            rex_target,
             claimed_by,
             claimed_at,
         };
@@ -1222,6 +1583,15 @@ impl Presence {
         c: &PresenceSetStatus,
         ctx: &DecideCtx,
     ) -> Result<Vec<PresenceEvent>, ApiError> {
+        if is_operator_surface_seat(c.seat.as_str()) && c.status == SeatStatus::Active {
+            return Err(ApiError::Denied {
+                principal: ctx.by.to_string(),
+                action: format!(
+                    "set operator surface seat '{}' to active (golem cannot become an active seat)",
+                    c.seat
+                ),
+            });
+        }
         let Some(rec) = state.seats.get(&c.seat) else {
             return Err(ApiError::NotFound {
                 what: format!("seat '{}'", c.seat),
@@ -1266,6 +1636,17 @@ impl Presence {
     where
         F: Fn(u32, &str) -> bool,
     {
+        // Structural Q3 guard: `golem` is the human operator surface and may
+        // never be bound as an active seat by any hook or principal.
+        if is_operator_surface_seat(c.seat.as_str()) {
+            return Err(ApiError::Denied {
+                principal: ctx.by.to_string(),
+                action: format!(
+                    "bind operator surface seat '{}' (golem cannot be bound as an active seat)",
+                    c.seat
+                ),
+            });
+        }
         validate_endpoint(&c.endpoint, c.allow_fork)?;
         let lane = normalize_lane(&c.lane)?;
         if c.ttl_ms == Some(0) {
@@ -1391,8 +1772,19 @@ impl Presence {
             BindingStatus::Live
         };
 
+        let effective_horizon = c
+            .mail_horizon_at
+            .or_else(|| existing_seat.and_then(|r| r.mail_horizon_at))
+            .or(Some(ctx.at));
+
         let mut events = Vec::new();
-        if existing_seat.is_none() {
+        if let Some(rec) = existing_seat {
+            if rec.mail_horizon_at != effective_horizon {
+                let mut updated = rec.clone();
+                updated.mail_horizon_at = effective_horizon;
+                events.push(PresenceEvent::SeatClaimed { record: updated });
+            }
+        } else {
             let prov = make_provenance(&ctx.by, &c.seat, None, ctx.at);
             events.push(PresenceEvent::SeatClaimed {
                 record: SeatRecord {
@@ -1404,6 +1796,13 @@ impl Presence {
                     projects: Vec::new(),
                     home_room: None,
                     retired_at: None,
+                    mail_horizon_at: effective_horizon,
+                    work_class: None,
+                    avatar: None,
+                    home_dir: None,
+                    start_cmd: None,
+                    resume_cmd: None,
+                    rex_target: None,
                     claimed_by: ctx.by.clone(),
                     claimed_at: ctx.at,
                 },

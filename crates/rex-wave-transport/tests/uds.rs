@@ -871,6 +871,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            mail_horizon_at: None,
             idem: None,
         })
         .await

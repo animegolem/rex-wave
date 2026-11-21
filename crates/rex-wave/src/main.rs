@@ -14,8 +14,8 @@ use rex_wave_api::{
     notify::InboxList,
     presence::{
         LivenessMode, PresenceBind, PresenceClaim, PresenceHeartbeat, PresenceList,
-        PresenceResolve, PresenceSetStatus, PresenceUnbind, SeatStatus, TransportEndpoint,
-        VerificationKind,
+        PresenceResolve, PresenceSetStatus, PresenceUnbind, RESIDENT_MANIFEST_SCHEMA,
+        ResidentManifest, SeatStatus, TransportEndpoint, VerificationKind, WorkClass,
     },
     read::{Read, Wait},
     room::{
@@ -37,6 +37,7 @@ use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
     RingPolicy, check_gate1_fixtures, extract_shadow_aliases, load_claude_session_file,
     parse_acks_jsonl, parse_claude_session_json, run_shadow_pass, score_shadow_jsonl,
+    seed_records_from_interchange,
 };
 use rex_wave_mcp::McpServer;
 use rex_wave_runtime::{Decider, EntryMeta};
@@ -585,6 +586,27 @@ pub enum PresenceCmd {
         aliases: Vec<String>,
         #[arg(long)]
         home_room: Option<String>,
+        /// Optional mail horizon watermark (Unix milliseconds).
+        #[arg(long = "mail-horizon")]
+        mail_horizon: Option<u64>,
+        /// Resident work class (`class_a` or `class_b`, per `seat-in-a-card.org`).
+        #[arg(long = "work-class")]
+        work_class: Option<String>,
+        /// Resident portrait/avatar asset path or URI.
+        #[arg(long)]
+        avatar: Option<String>,
+        /// Resident home/working directory.
+        #[arg(long = "home-dir")]
+        home_dir: Option<String>,
+        /// Command used to start a fresh resident session.
+        #[arg(long = "start-cmd")]
+        start_cmd: Option<String>,
+        /// Command used to resume an existing resident session.
+        #[arg(long = "resume-cmd")]
+        resume_cmd: Option<String>,
+        /// Stable Rex terminal target identifier.
+        #[arg(long = "rex-target")]
+        rex_target: Option<String>,
         #[arg(long)]
         replace: Option<String>,
         #[arg(long = "id", alias = "idem")]
@@ -631,6 +653,9 @@ pub enum PresenceCmd {
         takeover: bool,
         #[arg(long)]
         allow_fork: bool,
+        /// Optional explicit mail horizon watermark override (Unix milliseconds).
+        #[arg(long = "mail-horizon")]
+        mail_horizon: Option<u64>,
         #[arg(long = "id", alias = "idem")]
         idem: Option<String>,
     },
@@ -644,8 +669,38 @@ pub enum PresenceCmd {
         incarnation: Option<String>,
         #[arg(long)]
         takeover: bool,
+        /// Optional explicit mail horizon watermark override (Unix milliseconds).
+        #[arg(long = "mail-horizon")]
+        mail_horizon: Option<u64>,
         #[arg(long, default_value = "cli-hold")]
         client: String,
+    },
+    /// Seed durable seat records and aliases from an interchange folder (read-only on interchange).
+    #[command(name = "seed-interchange")]
+    SeedInterchange {
+        /// Interchange directory containing `postmaster/state/roster.json` and/or `.watchers/mailwatch-routes.json`.
+        #[arg(long)]
+        interchange: PathBuf,
+        /// Preview the computed seed claims without connecting to or mutating the daemon.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Export durable presence seat records to a human-editable resident manifest JSON file.
+    #[command(name = "export-manifest")]
+    ExportManifest {
+        /// Destination JSON file path (`-` writes to stdout).
+        path: PathBuf,
+        #[arg(long)]
+        include_retired: bool,
+    },
+    /// Import durable seat records and resident manifest fields from a manifest JSON file.
+    #[command(name = "import-manifest")]
+    ImportManifest {
+        /// Source resident manifest JSON file path.
+        path: PathBuf,
+        /// Validate and preview the manifest without connecting to or mutating the daemon.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Renew the TTL lease on an active presence binding.
     Heartbeat {
@@ -841,6 +896,14 @@ fn parse_seat_status(s: &str) -> Result<SeatStatus, ApiError> {
         "dormant" => Ok(SeatStatus::Dormant),
         "retired" => Ok(SeatStatus::Retired),
         _ => Err(invalid("status", "expected active, dormant, or retired")),
+    }
+}
+
+fn parse_work_class(s: &str) -> Result<WorkClass, ApiError> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "class_a" | "class-a" | "a" => Ok(WorkClass::ClassA),
+        "class_b" | "class-b" | "b" => Ok(WorkClass::ClassB),
+        _ => Err(invalid("work_class", "expected class_a or class_b")),
     }
 }
 
@@ -1903,6 +1966,13 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
             projects,
             aliases,
             home_room,
+            mail_horizon,
+            work_class,
+            avatar,
+            home_dir,
+            start_cmd,
+            resume_cmd,
+            rex_target,
             replace,
             idem,
         } => Ok(WireCommand::PresenceClaim(PresenceClaim {
@@ -1921,6 +1991,16 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
                 Some(r) => Some(parse_room_ref(r)?.resolve(me)?),
                 None => None,
             },
+            mail_horizon_at: mail_horizon.map(UnixMs),
+            work_class: match work_class {
+                Some(wc) => Some(parse_work_class(wc)?),
+                None => None,
+            },
+            avatar: avatar.clone(),
+            home_dir: home_dir.clone(),
+            start_cmd: start_cmd.clone(),
+            resume_cmd: resume_cmd.clone(),
+            rex_target: rex_target.clone(),
             verified_how: Some(VerificationKind::SelfWord),
             replace: match replace {
                 Some(old) => Some(SeatName::parse(old.strip_prefix('@').unwrap_or(old))?),
@@ -1957,6 +2037,7 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
             ttl_ms,
             takeover,
             allow_fork,
+            mail_horizon,
             idem,
         } => {
             let mut chosen: Vec<(TransportEndpoint, LivenessMode)> = Vec::new();
@@ -2019,6 +2100,7 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
                 ttl_ms: resolve_ttl_ms(ttl.as_ref(), *ttl_ms)?,
                 takeover: *takeover,
                 allow_fork: *allow_fork,
+                mail_horizon_at: mail_horizon.map(UnixMs),
                 idem: match idem {
                     Some(k) => Some(IdemKey::parse(k.clone())?),
                     None => None,
@@ -2028,6 +2110,18 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
         PresenceCmd::Hold { .. } => Err(invalid(
             "presence hold",
             "handled interactively via long-lived UDS session",
+        )),
+        PresenceCmd::SeedInterchange { .. } => Err(invalid(
+            "presence seed-interchange",
+            "handled locally via client batch command",
+        )),
+        PresenceCmd::ExportManifest { .. } => Err(invalid(
+            "presence export-manifest",
+            "handled locally via client export command",
+        )),
+        PresenceCmd::ImportManifest { .. } => Err(invalid(
+            "presence import-manifest",
+            "handled locally via client import command",
         )),
         PresenceCmd::Heartbeat {
             seat,
@@ -3012,7 +3106,7 @@ fn execute_mail_score(
         );
     } else {
         println!(
-            "mail score: decisions={} rings={} referents_rung={} confirmed_acked={} pending_ack={} skipped_acked={} receipt_only={} dormant_or_retired={} mutated_after_ack={} deferred={} unrung_alerts={} unrung_caught={} unrung_already_acked={} missing_referent={}",
+            "mail score: decisions={} rings={} referents_rung={} confirmed_acked={} pending_ack={} skipped_acked={} receipt_only={} dormant_or_retired={} pre_horizon={} operator_surface={} non_seat_target={} mutated_after_ack={} deferred={} unrung_alerts={} unrung_caught={} unrung_already_acked={} missing_referent={}",
             score.total_decisions,
             score.rings_emitted,
             score.referents_rung,
@@ -3021,6 +3115,9 @@ fn execute_mail_score(
             score.skipped_already_acked,
             score.skipped_receipt_only,
             score.skipped_dormant_or_retired,
+            score.skipped_pre_horizon,
+            score.skipped_operator_surface,
+            score.skipped_non_seat_target,
             score.mutated_after_ack_flags,
             score.deferred,
             score.unrung_alerts,
@@ -3038,16 +3135,19 @@ fn execute_mail_score(
         );
         if let Some(ref fx) = fixtures {
             println!(
-                "fixtures: {}/{} Gate 1 cases covered (all_covered={}, missing={}, unknown={})",
+                "fixtures: {}/{} Gate 1 cases registered (fixture_ids_registered={}, missing={}, unknown={})",
                 fx.covered_cases,
                 fx.total_cases,
-                fx.all_covered(),
+                fx.fixture_ids_registered(),
                 fx.missing_case_ids.len(),
                 fx.unknown_case_ids.len(),
             );
         }
     }
-    if fixtures.as_ref().is_some_and(|fx| !fx.all_covered()) {
+    if fixtures
+        .as_ref()
+        .is_some_and(|fx| !fx.fixture_ids_registered())
+    {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
@@ -3097,12 +3197,14 @@ async fn execute_task_show<C: Client>(
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_presence_hold(
     client: &RemoteClient,
     seat: Option<&String>,
     lane: Option<&String>,
     incarnation: Option<&String>,
     takeover: bool,
+    mail_horizon: Option<u64>,
     client_name: &str,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
@@ -3123,6 +3225,7 @@ async fn execute_presence_hold(
             ttl_ms: None,
             takeover,
             allow_fork: false,
+            mail_horizon_at: mail_horizon.map(UnixMs),
             idem: None,
         })
         .await?;
@@ -3159,6 +3262,7 @@ async fn execute_presence_hold(
                                 ttl_ms: None,
                                 takeover: false,
                                 allow_fork: false,
+                                mail_horizon_at: None,
                                 idem: None,
                             })
                             .await?;
@@ -3174,6 +3278,328 @@ async fn execute_presence_hold(
             }
         }
     }
+}
+
+fn write_file_atomic_plain(target: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .ok_or_else(|| {
+            CliError::Msg(format!("target path {} has no file name", target.display()))
+        })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
+    let final_target = canon_parent.join(&file_name);
+    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::Msg(format!(
+            "refusing to overwrite symlink {}",
+            final_target.display()
+        )));
+    }
+    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = file_name;
+    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
+    let tmp = canon_parent.join(tmp_name);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| CliError::Msg(format!("create {}: {e}", tmp.display())))?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, &final_target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CliError::Msg(format!(
+            "rename {}: {e}",
+            final_target.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn execute_presence_seed_interchange(
+    interchange: &Path,
+    dry_run: bool,
+    endpoint: Endpoint,
+    sock_path: &Path,
+    explicit_token: Option<&str>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let plan = seed_records_from_interchange(interchange)?;
+    if dry_run {
+        if as_json {
+            let mut val = plan.to_json_value();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("dry_run".to_owned(), serde_json::Value::Bool(true));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&val).expect("seed plan json")
+            );
+        } else {
+            println!(
+                "presence seed-interchange (dry-run): {} seats from {} source(s), skipped={:?}",
+                plan.claims.len(),
+                plan.sources_read.len(),
+                plan.skipped_targets
+            );
+            for c in &plan.claims {
+                let aliases: Vec<&str> = c.aliases.iter().map(SeatName::as_str).collect();
+                println!(
+                    "  @{} aliases=[{}] verified_how={:?}",
+                    c.seat,
+                    aliases.join(", "),
+                    c.verified_how
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let cred = resolve_cli_credential(sock_path, explicit_token)?;
+    let client = RemoteClient::connect(endpoint, cred, "presence-seed").await?;
+    let existing = client
+        .call(PresenceList {
+            include_retired: true,
+            ..PresenceList::default()
+        })
+        .await?;
+    let existing_by_seat: std::collections::BTreeMap<SeatName, rex_wave_api::presence::SeatRecord> =
+        existing
+            .seats
+            .into_iter()
+            .map(|v| (v.record.seat.clone(), v.record))
+            .collect();
+    let mut existing_alias_owners: std::collections::BTreeMap<SeatName, SeatName> =
+        std::collections::BTreeMap::new();
+    for (seat, rec) in &existing_by_seat {
+        existing_alias_owners.insert(seat.clone(), seat.clone());
+        for alias in &rec.aliases {
+            existing_alias_owners.insert(alias.value.clone(), seat.clone());
+        }
+    }
+
+    let mut applied = Vec::new();
+    let mut skipped_retired = Vec::new();
+    let mut skipped_conflicts = Vec::new();
+    for mut claim in plan.claims {
+        if let Some(prev) = existing_by_seat.get(&claim.seat) {
+            if prev.status == SeatStatus::Retired {
+                skipped_retired.push(claim.seat.as_str().to_owned());
+                continue;
+            }
+            // Preserve existing status and merge existing aliases so seeding is non-destructive.
+            claim.status = Some(prev.status);
+            let mut merged: std::collections::BTreeSet<SeatName> =
+                prev.aliases.iter().map(|a| a.value.clone()).collect();
+            for a in claim.aliases {
+                if existing_alias_owners
+                    .get(&a)
+                    .is_none_or(|owner| owner == &claim.seat)
+                {
+                    merged.insert(a);
+                }
+            }
+            claim.aliases = merged.into_iter().collect();
+        } else {
+            if let Some(owner) = existing_alias_owners.get(&claim.seat)
+                && owner != &claim.seat
+            {
+                skipped_conflicts.push(format!("{} (alias of {})", claim.seat, owner));
+                continue;
+            }
+            claim.aliases.retain(|a| {
+                existing_alias_owners
+                    .get(a)
+                    .is_none_or(|owner| owner == &claim.seat)
+            });
+        }
+        let rec = client.call(claim).await?;
+        existing_alias_owners.insert(rec.seat.clone(), rec.seat.clone());
+        for alias in &rec.aliases {
+            existing_alias_owners.insert(alias.value.clone(), rec.seat.clone());
+        }
+        applied.push(rec);
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": false,
+                "sources_read": plan
+                    .sources_read
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                "skipped_targets": plan.skipped_targets,
+                "skipped_retired": skipped_retired,
+                "skipped_conflicts": skipped_conflicts,
+                "applied_count": applied.len(),
+                "seats": applied,
+            }))
+            .expect("seed applied json")
+        );
+    } else {
+        println!(
+            "presence seed-interchange: applied {} seat(s), skipped_targets={:?}, skipped_retired={:?}, skipped_conflicts={:?}",
+            applied.len(),
+            plan.skipped_targets,
+            skipped_retired,
+            skipped_conflicts
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn execute_presence_export_manifest(
+    path: &Path,
+    include_retired: bool,
+    endpoint: Endpoint,
+    sock_path: &Path,
+    explicit_token: Option<&str>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let cred = resolve_cli_credential(sock_path, explicit_token)?;
+    let client = RemoteClient::connect(endpoint, cred, "presence-export-manifest").await?;
+    let snap = client
+        .call(PresenceList {
+            include_retired,
+            ..PresenceList::default()
+        })
+        .await?;
+    let records: Vec<_> = snap.seats.iter().map(|v| &v.record).collect();
+    let manifest = ResidentManifest::from_records(records);
+    let mut pretty =
+        serde_json::to_string_pretty(&manifest).expect("resident manifest json serialization");
+    pretty.push('\n');
+
+    if path == Path::new("-") {
+        print!("{pretty}");
+        let _ = std::io::stdout().flush();
+    } else {
+        write_file_atomic_plain(path, pretty.as_bytes())?;
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": manifest.schema,
+                    "path": path.to_string_lossy(),
+                    "seat_count": manifest.seats.len(),
+                }))
+                .expect("export summary json")
+            );
+        } else {
+            println!(
+                "presence export-manifest: wrote {} seat(s) to {}",
+                manifest.seats.len(),
+                path.display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn execute_presence_import_manifest(
+    path: &Path,
+    dry_run: bool,
+    endpoint: Endpoint,
+    sock_path: &Path,
+    explicit_token: Option<&str>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| CliError::Msg(format!("stat {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(CliError::Msg(format!(
+            "refusing to read non-regular manifest file {}",
+            path.display()
+        )));
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Msg(format!("read {}: {e}", path.display())))?;
+    let manifest: ResidentManifest = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Msg(format!("parse manifest {}: {e}", path.display())))?;
+    if manifest.schema != RESIDENT_MANIFEST_SCHEMA {
+        return Err(CliError::Msg(format!(
+            "unsupported resident manifest schema '{}' (expected '{}')",
+            manifest.schema, RESIDENT_MANIFEST_SCHEMA
+        )));
+    }
+    let mut seen_seats = std::collections::BTreeSet::new();
+    for entry in &manifest.seats {
+        if !seen_seats.insert(entry.seat.clone()) {
+            return Err(CliError::Msg(format!(
+                "duplicate seat '{}' in manifest {}",
+                entry.seat,
+                path.display()
+            )));
+        }
+    }
+
+    if dry_run {
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": true,
+                    "schema": manifest.schema,
+                    "path": path.to_string_lossy(),
+                    "seat_count": manifest.seats.len(),
+                    "seats": manifest.seats,
+                }))
+                .expect("import dry-run json")
+            );
+        } else {
+            println!(
+                "presence import-manifest (dry-run): {} seat(s) validated from {}",
+                manifest.seats.len(),
+                path.display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let cred = resolve_cli_credential(sock_path, explicit_token)?;
+    let client = RemoteClient::connect(endpoint, cred, "presence-import-manifest").await?;
+    let mut imported = Vec::with_capacity(manifest.seats.len());
+    for entry in manifest.seats {
+        let rec = client.call(entry.into_claim(None)).await?;
+        imported.push(rec);
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": false,
+                "schema": manifest.schema,
+                "path": path.to_string_lossy(),
+                "imported_count": imported.len(),
+                "seats": imported,
+            }))
+            .expect("import summary json")
+        );
+    } else {
+        println!(
+            "presence import-manifest: imported {} seat(s) from {}",
+            imported.len(),
+            path.display()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn execute_remote<C: Client>(
@@ -3411,6 +3837,7 @@ async fn main() -> ExitCode {
             lane,
             incarnation,
             takeover,
+            mail_horizon,
             client: client_name,
         }) => match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
             Ok(cred) => match RemoteClient::connect(endpoint, cred, &client_name).await {
@@ -3421,6 +3848,7 @@ async fn main() -> ExitCode {
                         lane.as_ref(),
                         incarnation.as_ref(),
                         takeover,
+                        mail_horizon,
                         &client_name,
                         cli.json,
                     )
@@ -3430,6 +3858,45 @@ async fn main() -> ExitCode {
             },
             Err(e) => Err(CliError::Msg(e)),
         },
+        Cmd::Presence(PresenceCmd::SeedInterchange {
+            interchange,
+            dry_run,
+        }) => {
+            execute_presence_seed_interchange(
+                &interchange,
+                dry_run,
+                endpoint,
+                &sock_path,
+                cli.token.as_deref(),
+                cli.json,
+            )
+            .await
+        }
+        Cmd::Presence(PresenceCmd::ExportManifest {
+            path,
+            include_retired,
+        }) => {
+            execute_presence_export_manifest(
+                &path,
+                include_retired,
+                endpoint,
+                &sock_path,
+                cli.token.as_deref(),
+                cli.json,
+            )
+            .await
+        }
+        Cmd::Presence(PresenceCmd::ImportManifest { path, dry_run }) => {
+            execute_presence_import_manifest(
+                &path,
+                dry_run,
+                endpoint,
+                &sock_path,
+                cli.token.as_deref(),
+                cli.json,
+            )
+            .await
+        }
         other => match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
             Ok(cred) => match RemoteClient::connect(endpoint, cred, "cli").await {
                 Ok(client) => execute_remote(&client, &other, cli.json).await,

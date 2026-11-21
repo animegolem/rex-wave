@@ -1392,6 +1392,7 @@ dependencies = [
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.21",

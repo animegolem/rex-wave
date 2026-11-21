@@ -4673,6 +4673,12 @@
           ],
           "type": "string"
         },
+        "UnixMs": {
+          "description": "Wall-clock milliseconds since the Unix epoch, stamped by the daemon only.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "VerificationKind": {
           "description": "How an asserted field on [`SeatRecord`] was checked.",
           "oneOf": [
@@ -4718,6 +4724,14 @@
               "type": "object"
             }
           ]
+        },
+        "WorkClass": {
+          "description": "Where a resident seat's primary terminal window lives (`seat-in-a-card.org`).\nChanging `work_class` moves the window without restarting the underlying Rex terminal.",
+          "enum": [
+            "class_a",
+            "class_b"
+          ],
+          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4729,6 +4743,20 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "avatar": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "home_dir": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "home_room": {
           "anyOf": [
@@ -4749,6 +4777,17 @@
             "null"
           ]
         },
+        "mail_horizon_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "projects": {
           "default": [],
           "items": {
@@ -4759,6 +4798,20 @@
         "replace": {
           "default": null,
           "description": "seat",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resume_cmd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rex_target": {
+          "default": null,
           "type": [
             "string",
             "null"
@@ -4775,6 +4828,13 @@
           "description": "seat",
           "type": "string"
         },
+        "start_cmd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "anyOf": [
             {
@@ -4790,6 +4850,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VerificationKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "work_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkClass"
             },
             {
               "type": "null"
@@ -5080,6 +5151,12 @@
               "type": "object"
             }
           ]
+        },
+        "UnixMs": {
+          "description": "Wall-clock milliseconds since the Unix epoch, stamped by the daemon only.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5116,6 +5193,17 @@
         },
         "liveness": {
           "$ref": "#/$defs/LivenessMode"
+        },
+        "mail_horizon_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional explicit mail-horizon watermark override (`--mail-horizon <ms>`).\nWhen omitted on a seat's first live bind, the daemon stamps `ctx.at` automatically."
         },
         "seat": {
           "description": "seat",
