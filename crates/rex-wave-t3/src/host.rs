@@ -1080,7 +1080,10 @@ impl T3Bridge {
         let post_cmd = RoomPost {
             room: RoomRef::Id { id: room.clone() },
             body,
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: Some(idem_key),
         };
         let first_try = backend

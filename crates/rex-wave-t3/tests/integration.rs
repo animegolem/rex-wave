@@ -732,6 +732,7 @@ fn build_test_router(dir: &std::path::Path, agents: Arc<dyn AgentFeed>) -> Arc<R
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Arc::new(rex_wave_runtime::Unavailable(Family::Inbox)),
         mail: Arc::new(rex_wave_runtime::Unavailable(Family::Mail)),
+        presence: Arc::new(rex_wave_runtime::Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -2269,7 +2270,10 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
         .call(rex_wave_api::room::RoomPost {
             room: rex_wave_api::room::RoomRef::Id { id: room.clone() },
             body: Body::parse("Posted directly via rex-wave CLI").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
