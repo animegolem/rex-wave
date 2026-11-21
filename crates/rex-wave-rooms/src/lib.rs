@@ -1,15 +1,59 @@
 //! # rex-wave-rooms
 //!
-//! Public surface: [`Rooms`], [`resolve_mentions`], [`RoomMessage`], and [`room_history`].
-//! State fields remain private so rooms are mutated exclusively through commands.
+//! Public surface: [`Rooms`], [`RoomState`], [`resolve_mentions`], [`RoomMessage`],
+//! and [`room_history`]. State fields remain private so rooms are mutated
+//! exclusively through commands.
 
+use rex_wave_api::board::{Priority, Title};
 use rex_wave_api::read::Read;
 use rex_wave_api::room::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
 use std::collections::{BTreeMap, BTreeSet};
 
+const DEFAULT_TASK_LEASE_TTL_MS: u64 = 300_000;
+
 pub struct Rooms;
+
+#[derive(Clone, Debug)]
+struct PostRecord {
+    seq: Seq,
+    at: UnixMs,
+    by: Principal,
+    body: Body,
+    re: Option<Seq>,
+    labels: BTreeSet<Label>,
+}
+
+impl PostRecord {
+    fn to_summary(&self) -> RoomMessageSummary {
+        RoomMessageSummary {
+            seq: self.seq,
+            at: self.at,
+            by: self.by.clone(),
+            body: self.body.clone(),
+            re: self.re,
+            labels: self.labels.iter().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TaskRecord {
+    seq: Seq,
+    org_id: OrgId,
+    rev: u64,
+    title: Title,
+    status: TaskStatus,
+    priority: Priority,
+    due_ms: Option<UnixMs>,
+    needs: Vec<Seq>,
+    lease: Option<TaskLease>,
+    last_epoch: LeaseEpoch,
+    created_by: Principal,
+    created_at: UnixMs,
+    updated_at: UnixMs,
+}
 
 #[derive(Default)]
 pub struct RoomState {
@@ -17,13 +61,126 @@ pub struct RoomState {
     opener: Option<Principal>,
     topic: Option<String>,
     members: BTreeMap<Handle, Principal>,
-    posts: BTreeSet<Seq>,
+    posts: BTreeMap<Seq, PostRecord>,
+    last_post_seq: Option<Seq>,
+    thread_tails: BTreeMap<Seq, Seq>,
+    tasks: BTreeMap<Seq, TaskRecord>,
+    org_ids: BTreeMap<OrgId, Seq>,
     head: Seq,
 }
 
 impl RoomState {
     fn has_member(&self, who: &Principal) -> bool {
         self.members.values().any(|p| p == who)
+    }
+
+    /// Project a single task thread at timestamp `at` (evaluating lease expiry
+    /// and dependency readiness purely from `at`).
+    pub fn task_view_at(&self, seq: Seq, at: UnixMs) -> Option<TaskView> {
+        let (room, _) = self.opened.as_ref()?;
+        let rec = self.tasks.get(&seq)?;
+        let labels = self
+            .posts
+            .get(&seq)
+            .map(|p| p.labels.iter().cloned().collect())
+            .unwrap_or_default();
+        let lease_expired = rec.status == TaskStatus::Claimed
+            && rec.lease.as_ref().is_some_and(|l| l.expires_at <= at);
+        let all_needs_done = rec.needs.iter().all(|dep| {
+            self.tasks
+                .get(dep)
+                .is_some_and(|t| t.status == TaskStatus::Done)
+        });
+        let unheld_or_expired = rec.status == TaskStatus::Open
+            || (rec.status == TaskStatus::Claimed && (rec.lease.is_none() || lease_expired));
+        Some(TaskView {
+            room: room.clone(),
+            seq: rec.seq,
+            org_id: rec.org_id.clone(),
+            rev: rec.rev,
+            title: rec.title.clone(),
+            status: rec.status,
+            priority: rec.priority,
+            due_ms: rec.due_ms,
+            needs: rec.needs.clone(),
+            labels,
+            lease: rec.lease.clone(),
+            ready: all_needs_done && unheld_or_expired,
+            lease_expired,
+            created_by: rec.created_by.clone(),
+            created_at: rec.created_at,
+            updated_at: rec.updated_at,
+        })
+    }
+
+    /// Project the filtered task list of an opened room at timestamp `at`.
+    pub fn task_list_at(&self, filter: Option<&TaskFilter>, at: UnixMs) -> Option<TaskListView> {
+        let (room, _) = self.opened.as_ref()?;
+        let mut tasks = Vec::new();
+        for &seq in self.tasks.keys() {
+            let Some(view) = self.task_view_at(seq, at) else {
+                continue;
+            };
+            if let Some(f) = filter {
+                if let Some(want_status) = f.status
+                    && view.status != want_status
+                {
+                    continue;
+                }
+                if f.ready_only && !view.ready {
+                    continue;
+                }
+                if let Some(want_holder) = &f.holder {
+                    let held = view
+                        .lease
+                        .as_ref()
+                        .is_some_and(|l| &l.holder == want_holder && !view.lease_expired);
+                    if !held {
+                        continue;
+                    }
+                }
+                if let Some(want_label) = &f.label
+                    && !view.labels.contains(want_label)
+                {
+                    continue;
+                }
+            }
+            tasks.push(view);
+        }
+        Some(TaskListView {
+            room: room.clone(),
+            head: self.head,
+            tasks,
+        })
+    }
+
+    fn creates_cycle(&self, task: Seq, candidate_needs: &[Seq]) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut stack: Vec<Seq> = candidate_needs.to_vec();
+        while let Some(node) = stack.pop() {
+            if node == task {
+                return true;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(rec) = self.tasks.get(&node) {
+                stack.extend(rec.needs.iter().copied());
+            }
+        }
+        false
+    }
+
+    fn unmet_needs(&self, task: &TaskRecord) -> Vec<Seq> {
+        task.needs
+            .iter()
+            .copied()
+            .filter(|dep| {
+                self.tasks
+                    .get(dep)
+                    .is_none_or(|t| t.status != TaskStatus::Done)
+            })
+            .collect()
     }
 }
 
@@ -215,6 +372,87 @@ fn system_slug(part: SystemPart) -> &'static str {
     }
 }
 
+fn principal_seed(p: &Principal) -> String {
+    match p {
+        Principal::Operator { seat } => format!("op:{seat}"),
+        Principal::Seat { seat } => format!("seat:{seat}"),
+        Principal::Worker { wave, role } => format!("worker:{wave}/{role}"),
+        Principal::System { part } => format!("sys:{}", system_slug(*part)),
+    }
+}
+
+fn room_id_seed(id: &RoomId) -> String {
+    match id {
+        RoomId::Channel {
+            scope: RoomScope::Global,
+            name,
+        } => format!("channel:global:{name}"),
+        RoomId::Channel {
+            scope: RoomScope::Project { project },
+            name,
+        } => format!("channel:project:{project}:{name}"),
+        RoomId::Direct { pair } => {
+            let (lo, hi): (Principal, Principal) = pair.clone().into();
+            format!("dm:{}:{}", principal_seed(&lo), principal_seed(&hi))
+        }
+    }
+}
+
+fn mint_task_org_id(room_id: &RoomId, seq: Seq, existing: &BTreeMap<OrgId, Seq>) -> OrgId {
+    let room_key = room_id_seed(room_id);
+    for attempt in 0u64.. {
+        let seed = if attempt == 0 {
+            format!("rex-wave:room:{room_key}:task:{}", seq.0)
+        } else {
+            format!("rex-wave:room:{room_key}:task:{}:{attempt}", seq.0)
+        };
+        let candidate = OrgId::mint_deterministic(&seed);
+        if !existing.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("deterministic OrgId namespace exhausted")
+}
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for &b in bytes {
+        hash ^= u128::from(b);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    hash
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Namespace idempotency keys for Phase 3 room commands so reusing the same raw
+/// key across different command variants never collides in the per-stream journal
+/// lookup table, while keeping `RoomPost` keys raw for pre-upgrade compatibility.
+fn scoped_idem(prefix: &str, key: &IdemKey) -> IdemKey {
+    let raw = key.as_str();
+    let max_raw = 256 - prefix.len() - 2;
+    let encoded = if raw.len() <= max_raw {
+        format!("{prefix}r:{raw}")
+    } else {
+        let h_fwd = fnv1a_128(raw.as_bytes());
+        let rev_bytes: Vec<u8> = raw.as_bytes().iter().rev().copied().collect();
+        let h_rev = fnv1a_128(&rev_bytes) as u64;
+        let max_prefix = 256 - prefix.len() - 2 - 48 - 1;
+        let head = truncate_utf8(raw, max_prefix);
+        format!("{prefix}h:{h_fwd:032x}{h_rev:016x}:{head}")
+    };
+    IdemKey::parse(encoded).expect("scoped idempotency key is valid printable <= 256 bytes")
+}
+
 fn sanitize_handle_prefix(raw: &str, max_len: usize) -> String {
     let mut s: String = raw
         .bytes()
@@ -305,6 +543,59 @@ fn ensure_wave_name_policy(
     Ok(())
 }
 
+fn ensure_existing_room_write_access(
+    state: &RoomState,
+    id: &RoomId,
+    by: &Principal,
+    action: &str,
+) -> Result<(), ApiError> {
+    if let RoomId::Direct { pair } = id {
+        ensure_dm_access(pair, by)?;
+    }
+    let Some((_, origin)) = &state.opened else {
+        return Err(ApiError::NotFound {
+            what: format!("room {id:?}"),
+        });
+    };
+    if let RoomOrigin::Wave { wave } = origin {
+        let allowed = state.has_member(by)
+            || matches!(by, Principal::Operator { .. } | Principal::System { .. });
+        if !allowed {
+            return Err(ApiError::Denied {
+                principal: by.to_string(),
+                action: format!("{action} in wave room #wave-{wave} without membership"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn resolve_mentions_for_room(
+    id: &RoomId,
+    by: &Principal,
+    body: &Body,
+    members: &BTreeMap<Handle, Principal>,
+) -> Mentions {
+    let mut mentions = resolve_mentions(body, members);
+    if matches!(by, Principal::System { .. }) && matches!(id, RoomId::Channel { .. }) {
+        mentions
+            .principals
+            .retain(|p| !matches!(p, Principal::Operator { .. }));
+    }
+    mentions
+}
+
+fn validate_ttl(ttl_ms: Option<u64>) -> Result<u64, ApiError> {
+    match ttl_ms {
+        Some(0) => Err(ApiError::Invalid(InvalidId {
+            what: "ttl_ms".into(),
+            reason: "must be >= 1 ms".into(),
+        })),
+        Some(ms) => Ok(ms),
+        None => Ok(DEFAULT_TASK_LEASE_TTL_MS),
+    }
+}
+
 fn open_dm_events(
     id: RoomId,
     pair: &PrincipalPair,
@@ -352,8 +643,22 @@ impl Decider for Rooms {
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
         match cmd {
-            RoomCommand::RoomPost(c) => c.idem.clone(),
-            _ => None,
+            RoomCommand::RoomPost(c) => c.idem.as_ref().map(|k| {
+                if k.as_str().starts_with("__rw_") {
+                    scoped_idem("__rw_pst:", k)
+                } else {
+                    k.clone()
+                }
+            }),
+            RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_lbl:", k)),
+            RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_clm:", k)),
+            RoomCommand::TaskTransition(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_trn:", k)),
+            RoomCommand::TaskUpdate(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_upd:", k)),
+            RoomCommand::RoomEnsure(_)
+            | RoomCommand::RoomJoin(_)
+            | RoomCommand::RoomLeave(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::RoomTasks(_) => None,
         }
     }
 
@@ -528,23 +833,12 @@ impl Decider for Rooms {
             }
 
             RoomCommand::RoomPost(c) => {
-                if c.after.is_some() || c.task.is_some() {
-                    return Err(ApiError::Unavailable {
-                        family: Family::Room,
-                    });
-                }
                 let id = c.room.resolve(&ctx.by)?;
-                if let Some(reply_seq) = c.re
-                    && !state.posts.contains(&reply_seq)
-                {
-                    return Err(ApiError::NotFound {
-                        what: format!("message seq {} in room", reply_seq.0),
-                    });
-                }
 
+                // Authorize room access before inspecting `re` or `after` so unauthorized
+                // callers cannot probe message existence or read newer bodies via ConflictData.
                 let mut events = Vec::new();
                 let mut members = state.members.clone();
-
                 match &id {
                     RoomId::Direct { pair } => {
                         ensure_dm_access(pair, &ctx.by)?;
@@ -609,34 +903,479 @@ impl Decider for Rooms {
                     },
                 }
 
-                let mut mentions = resolve_mentions(&c.body, &members);
-                if matches!(ctx.by, Principal::System { .. })
-                    && matches!(id, RoomId::Channel { .. })
-                {
-                    mentions
-                        .principals
-                        .retain(|p| !matches!(p, Principal::Operator { .. }));
+                if c.task.is_some() && c.re.is_some() {
+                    return Err(ApiError::Invalid(InvalidId {
+                        what: "task".into(),
+                        reason: "a task must be a thread root (re must be omitted)".into(),
+                    }));
                 }
+
+                let canonical_re = match c.re {
+                    Some(reply_seq) => {
+                        let Some(target) = state.posts.get(&reply_seq) else {
+                            return Err(ApiError::NotFound {
+                                what: format!("message seq {} in room", reply_seq.0),
+                            });
+                        };
+                        Some(target.re.unwrap_or(target.seq))
+                    }
+                    None => None,
+                };
+
+                if let Some(expected_after) = c.after {
+                    let latest_seq = match canonical_re {
+                        Some(root) => state.thread_tails.get(&root).copied().unwrap_or(root),
+                        None => state.last_post_seq.unwrap_or(Seq::ORIGIN),
+                    };
+                    if latest_seq > expected_after {
+                        let newer = &state.posts[&latest_seq];
+                        return Err(ApiError::conflict_with(
+                            format!(
+                                "newer message seq {} arrived after expected seq {}",
+                                latest_seq.0, expected_after.0
+                            ),
+                            ConflictData::NewerMessage {
+                                expected: expected_after,
+                                latest: latest_seq,
+                                newer_message: Box::new(newer.to_summary()),
+                            },
+                        ));
+                    }
+                }
+
+                let post_seq = Seq(state.head.0 + events.len() as u64 + 1);
+                let normalized_task = match &c.task {
+                    Some(spec) => {
+                        let mut needs = Vec::with_capacity(spec.needs.len());
+                        for &dep in &spec.needs {
+                            if dep == post_seq {
+                                return Err(ApiError::Invalid(InvalidId {
+                                    what: "needs".into(),
+                                    reason: format!("task seq {} cannot depend on itself", dep.0),
+                                }));
+                            }
+                            if !state.tasks.contains_key(&dep) {
+                                if state.posts.contains_key(&dep) {
+                                    return Err(ApiError::Invalid(InvalidId {
+                                        what: "needs".into(),
+                                        reason: format!(
+                                            "seq {} is a message, not a task root in this room",
+                                            dep.0
+                                        ),
+                                    }));
+                                }
+                                return Err(ApiError::NotFound {
+                                    what: format!("task seq {} in room", dep.0),
+                                });
+                            }
+                            if !needs.contains(&dep) {
+                                needs.push(dep);
+                            }
+                        }
+                        let org_id = match &spec.org_id {
+                            Some(oid) => {
+                                if state.org_ids.contains_key(oid) {
+                                    return Err(ApiError::conflict(format!(
+                                        "org id `{oid}` is already used by another task in this room"
+                                    )));
+                                }
+                                oid.clone()
+                            }
+                            None => mint_task_org_id(&id, post_seq, &state.org_ids),
+                        };
+                        Some(TaskSpec {
+                            title: spec.title.clone(),
+                            org_id: Some(org_id),
+                            needs,
+                            priority: spec.priority,
+                            due_ms: spec.due_ms,
+                        })
+                    }
+                    None => None,
+                };
+
+                let labels: Vec<Label> = c
+                    .labels
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let mentions = resolve_mentions_for_room(&id, &ctx.by, &c.body, &members);
                 events.push(RoomEvent::Posted {
                     body: c.body.clone(),
                     mentions,
-                    re: c.re,
+                    re: canonical_re,
                     after: c.after,
-                    labels: c.labels.clone(),
-                    task: c.task.clone(),
+                    labels,
+                    task: normalized_task,
                     idem: c.idem.clone(),
                 });
                 Ok(events)
             }
 
-            RoomCommand::RoomLabel(_)
-            | RoomCommand::TaskClaim(_)
-            | RoomCommand::TaskHeartbeat(_)
-            | RoomCommand::TaskTransition(_)
-            | RoomCommand::TaskUpdate(_)
-            | RoomCommand::RoomTasks(_) => Err(ApiError::Unavailable {
-                family: Family::Room,
-            }),
+            RoomCommand::RoomLabel(c) => {
+                let id = c.room.resolve(&ctx.by)?;
+                ensure_existing_room_write_access(state, &id, &ctx.by, "label message")?;
+                let Some(post) = state.posts.get(&c.seq) else {
+                    return Err(ApiError::NotFound {
+                        what: format!("message seq {} in room", c.seq.0),
+                    });
+                };
+                let before_set = &post.labels;
+                let mut after_set = before_set.clone();
+                for lbl in &c.remove {
+                    after_set.remove(lbl);
+                }
+                for lbl in &c.add {
+                    after_set.insert(lbl.clone());
+                }
+                let added: Vec<Label> = after_set.difference(before_set).cloned().collect();
+                let removed: Vec<Label> = before_set.difference(&after_set).cloned().collect();
+                if added.is_empty() && removed.is_empty() {
+                    return Ok(vec![]);
+                }
+                Ok(vec![RoomEvent::Labeled {
+                    target: c.seq,
+                    added,
+                    removed,
+                    before: before_set.iter().cloned().collect(),
+                    after: after_set.into_iter().collect(),
+                }])
+            }
+
+            RoomCommand::TaskClaim(c) => {
+                let id = c.room.resolve(&ctx.by)?;
+                ensure_existing_room_write_access(state, &id, &ctx.by, "claim task")?;
+                if c.force && !matches!(ctx.by, Principal::Operator { .. }) {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by.to_string(),
+                        action: format!("force-claim task seq {}", c.task.0),
+                    });
+                }
+                let ttl_ms = validate_ttl(c.ttl_ms)?;
+                let Some(task) = state.tasks.get(&c.task) else {
+                    return Err(ApiError::NotFound {
+                        what: format!("task seq {} in room", c.task.0),
+                    });
+                };
+                if let Some(expected) = c.expected_rev
+                    && expected != task.rev
+                {
+                    return Err(ApiError::conflict_with(
+                        format!(
+                            "task seq {} is at rev {}, expected {expected}",
+                            c.task.0, task.rev
+                        ),
+                        ConflictData::RevisionConflict {
+                            expected,
+                            actual: task.rev,
+                        },
+                    ));
+                }
+
+                match task.status {
+                    TaskStatus::Open | TaskStatus::Review | TaskStatus::Blocked => {}
+                    TaskStatus::Claimed => {
+                        if let Some(lease) = &task.lease
+                            && lease.expires_at > ctx.at
+                        {
+                            return Err(ApiError::conflict_with(
+                                format!(
+                                    "task seq {} is actively claimed by {} at epoch {}",
+                                    c.task.0, lease.holder, lease.epoch.0
+                                ),
+                                ConflictData::LeaseFenced {
+                                    expected: LeaseEpoch(0),
+                                    actual: lease.epoch,
+                                    holder: Some(lease.holder.clone()),
+                                },
+                            ));
+                        }
+                    }
+                    TaskStatus::Done | TaskStatus::Cancelled => {
+                        return Err(ApiError::conflict(format!(
+                            "cannot claim terminal task seq {} in status {:?}",
+                            c.task.0, task.status
+                        )));
+                    }
+                }
+
+                let unmet = state.unmet_needs(task);
+                let force_allowed = c.force && matches!(ctx.by, Principal::Operator { .. });
+                if !unmet.is_empty() && !force_allowed {
+                    return Err(ApiError::conflict_with(
+                        format!("task seq {} has unmet dependencies: {:?}", c.task.0, unmet),
+                        ConflictData::UnmetNeeds { unmet },
+                    ));
+                }
+
+                let lease = TaskLease {
+                    holder: ctx.by.clone(),
+                    epoch: task.last_epoch.next(),
+                    claimed_at: ctx.at,
+                    expires_at: UnixMs(ctx.at.0.saturating_add(ttl_ms)),
+                };
+                Ok(vec![RoomEvent::TaskClaimed {
+                    task: c.task,
+                    rev: task.rev + 1,
+                    lease,
+                }])
+            }
+
+            RoomCommand::TaskHeartbeat(c) => {
+                let id = c.room.resolve(&ctx.by)?;
+                ensure_existing_room_write_access(state, &id, &ctx.by, "heartbeat task")?;
+                let ttl_ms = validate_ttl(c.ttl_ms)?;
+                let Some(task) = state.tasks.get(&c.task) else {
+                    return Err(ApiError::NotFound {
+                        what: format!("task seq {} in room", c.task.0),
+                    });
+                };
+                let valid_lease = task.status == TaskStatus::Claimed
+                    && task.lease.as_ref().is_some_and(|l| {
+                        l.holder == ctx.by && l.epoch == c.epoch && l.expires_at > ctx.at
+                    });
+                if !valid_lease {
+                    let (actual, holder) = match &task.lease {
+                        Some(l) => (l.epoch, Some(l.holder.clone())),
+                        None => (task.last_epoch, None),
+                    };
+                    return Err(ApiError::conflict_with(
+                        format!(
+                            "task seq {} lease fenced for {} at epoch {} (current epoch {})",
+                            c.task.0, ctx.by, c.epoch.0, actual.0
+                        ),
+                        ConflictData::LeaseFenced {
+                            expected: c.epoch,
+                            actual,
+                            holder,
+                        },
+                    ));
+                }
+                Ok(vec![RoomEvent::TaskHeartbeat {
+                    task: c.task,
+                    epoch: c.epoch,
+                    expires_at: UnixMs(ctx.at.0.saturating_add(ttl_ms)),
+                }])
+            }
+
+            RoomCommand::TaskTransition(c) => {
+                let id = c.room.resolve(&ctx.by)?;
+                ensure_existing_room_write_access(state, &id, &ctx.by, "transition task")?;
+                if c.status == TaskStatus::Claimed {
+                    return Err(ApiError::Invalid(InvalidId {
+                        what: "status".into(),
+                        reason: "use task_claim to claim a task with a TTL lease".into(),
+                    }));
+                }
+                let Some(task) = state.tasks.get(&c.task) else {
+                    return Err(ApiError::NotFound {
+                        what: format!("task seq {} in room", c.task.0),
+                    });
+                };
+                if let Some(expected) = c.expected_rev
+                    && expected != task.rev
+                {
+                    return Err(ApiError::conflict_with(
+                        format!(
+                            "task seq {} is at rev {}, expected {expected}",
+                            c.task.0, task.rev
+                        ),
+                        ConflictData::RevisionConflict {
+                            expected,
+                            actual: task.rev,
+                        },
+                    ));
+                }
+
+                let is_operator = matches!(ctx.by, Principal::Operator { .. });
+                let active_lease = task
+                    .lease
+                    .as_ref()
+                    .filter(|l| task.status == TaskStatus::Claimed && l.expires_at > ctx.at);
+
+                if let Some(req_epoch) = c.epoch {
+                    let matches_active = active_lease.is_some_and(|l| {
+                        l.epoch == req_epoch && (is_operator || l.holder == ctx.by)
+                    });
+                    if !matches_active {
+                        let (actual, holder) = match &task.lease {
+                            Some(l) => (l.epoch, Some(l.holder.clone())),
+                            None => (task.last_epoch, None),
+                        };
+                        return Err(ApiError::conflict_with(
+                            format!(
+                                "task seq {} lease fenced at epoch {} (current epoch {})",
+                                c.task.0, req_epoch.0, actual.0
+                            ),
+                            ConflictData::LeaseFenced {
+                                expected: req_epoch,
+                                actual,
+                                holder,
+                            },
+                        ));
+                    }
+                } else if !is_operator && let Some(lease) = active_lease {
+                    return Err(ApiError::conflict_with(
+                        format!(
+                            "task seq {} is actively claimed by {} at epoch {}; matching epoch required",
+                            c.task.0, lease.holder, lease.epoch.0
+                        ),
+                        ConflictData::LeaseFenced {
+                            expected: LeaseEpoch(0),
+                            actual: lease.epoch,
+                            holder: Some(lease.holder.clone()),
+                        },
+                    ));
+                }
+
+                if task.status == c.status && c.note.is_none() {
+                    return Ok(vec![]);
+                }
+
+                let mut events = vec![RoomEvent::TaskTransitioned {
+                    task: c.task,
+                    rev: task.rev + 1,
+                    status: c.status,
+                }];
+                if let Some(note) = &c.note {
+                    let mentions = resolve_mentions_for_room(&id, &ctx.by, note, &state.members);
+                    events.push(RoomEvent::Posted {
+                        body: note.clone(),
+                        mentions,
+                        re: Some(c.task),
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    });
+                }
+                Ok(events)
+            }
+
+            RoomCommand::TaskUpdate(c) => {
+                let id = c.room.resolve(&ctx.by)?;
+                ensure_existing_room_write_access(state, &id, &ctx.by, "update task")?;
+                if c.due_ms.is_some() && c.clear_due {
+                    return Err(ApiError::Invalid(InvalidId {
+                        what: "due_ms".into(),
+                        reason: "cannot set both due_ms and clear_due".into(),
+                    }));
+                }
+                let Some(task) = state.tasks.get(&c.task) else {
+                    return Err(ApiError::NotFound {
+                        what: format!("task seq {} in room", c.task.0),
+                    });
+                };
+                if let Some(expected) = c.expected_rev
+                    && expected != task.rev
+                {
+                    return Err(ApiError::conflict_with(
+                        format!(
+                            "task seq {} is at rev {}, expected {expected}",
+                            c.task.0, task.rev
+                        ),
+                        ConflictData::RevisionConflict {
+                            expected,
+                            actual: task.rev,
+                        },
+                    ));
+                }
+
+                for &dep in &c.needs_add {
+                    if dep == c.task {
+                        return Err(ApiError::Invalid(InvalidId {
+                            what: "needs_add".into(),
+                            reason: format!("task seq {} cannot depend on itself", c.task.0),
+                        }));
+                    }
+                    if !state.tasks.contains_key(&dep) {
+                        if state.posts.contains_key(&dep) {
+                            return Err(ApiError::Invalid(InvalidId {
+                                what: "needs_add".into(),
+                                reason: format!(
+                                    "seq {} is a message, not a task root in this room",
+                                    dep.0
+                                ),
+                            }));
+                        }
+                        return Err(ApiError::NotFound {
+                            what: format!("task seq {} in room", dep.0),
+                        });
+                    }
+                }
+
+                let mut new_needs = task.needs.clone();
+                if !c.needs_remove.is_empty() {
+                    new_needs.retain(|d| !c.needs_remove.contains(d));
+                }
+                for &dep in &c.needs_add {
+                    if !new_needs.contains(&dep) {
+                        new_needs.push(dep);
+                    }
+                }
+
+                if state.creates_cycle(c.task, &new_needs) {
+                    return Err(ApiError::Invalid(InvalidId {
+                        what: "needs".into(),
+                        reason: format!(
+                            "dependency cycle detected involving task seq {}",
+                            c.task.0
+                        ),
+                    }));
+                }
+
+                let eff_title = c.title.as_ref().filter(|t| *t != &task.title).cloned();
+                let eff_priority = c.priority.filter(|p| *p != task.priority);
+                let eff_clear_due = c.clear_due && task.due_ms.is_some();
+                let eff_due_ms = c.due_ms.filter(|d| Some(*d) != task.due_ms);
+                let eff_needs_remove: Vec<Seq> = task
+                    .needs
+                    .iter()
+                    .copied()
+                    .filter(|d| !new_needs.contains(d))
+                    .collect();
+                let eff_needs_add: Vec<Seq> = new_needs
+                    .iter()
+                    .copied()
+                    .filter(|d| !task.needs.contains(d))
+                    .collect();
+
+                if eff_title.is_none()
+                    && eff_priority.is_none()
+                    && !eff_clear_due
+                    && eff_due_ms.is_none()
+                    && eff_needs_add.is_empty()
+                    && eff_needs_remove.is_empty()
+                {
+                    return Ok(vec![]);
+                }
+
+                Ok(vec![RoomEvent::TaskUpdated {
+                    task: c.task,
+                    rev: task.rev + 1,
+                    title: eff_title,
+                    needs_add: eff_needs_add,
+                    needs_remove: eff_needs_remove,
+                    priority: eff_priority,
+                    due_ms: eff_due_ms,
+                    clear_due: eff_clear_due,
+                }])
+            }
+
+            RoomCommand::RoomTasks(c) => {
+                let id = c.room.resolve(&ctx.by)?;
+                if let RoomId::Direct { pair } = &id {
+                    ensure_dm_access(pair, &ctx.by)?;
+                }
+                if state.opened.is_none() {
+                    return Err(ApiError::NotFound {
+                        what: format!("room {id:?}"),
+                    });
+                }
+                Ok(vec![])
+            }
         }
     }
 
@@ -653,15 +1392,140 @@ impl Decider for Rooms {
                 state.members.insert(handle.clone(), member.clone());
             }
             RoomEvent::MemberLeft { member } => state.members.retain(|_, p| p != member),
-            RoomEvent::Posted { .. } => {
-                state.posts.insert(meta.seq);
+            RoomEvent::Posted {
+                body,
+                re,
+                labels,
+                task,
+                ..
+            } => {
+                let root = re.and_then(|parent| {
+                    state
+                        .posts
+                        .get(&parent)
+                        .map(|p| p.re.unwrap_or(p.seq))
+                        .or(Some(parent))
+                });
+                state.posts.insert(
+                    meta.seq,
+                    PostRecord {
+                        seq: meta.seq,
+                        at: meta.at,
+                        by: meta.by.clone(),
+                        body: body.clone(),
+                        re: root,
+                        labels: labels.iter().cloned().collect(),
+                    },
+                );
+                state.last_post_seq = Some(meta.seq);
+                match root {
+                    Some(thread_root) => {
+                        state.thread_tails.insert(thread_root, meta.seq);
+                    }
+                    None => {
+                        state.thread_tails.insert(meta.seq, meta.seq);
+                    }
+                }
+                if let Some(spec) = task {
+                    let org_id = spec.org_id.clone().unwrap_or_else(|| {
+                        OrgId::mint_deterministic(&format!("room-task:{}", meta.seq.0))
+                    });
+                    state.org_ids.insert(org_id.clone(), meta.seq);
+                    state.tasks.insert(
+                        meta.seq,
+                        TaskRecord {
+                            seq: meta.seq,
+                            org_id,
+                            rev: 1,
+                            title: spec.title.clone(),
+                            status: TaskStatus::Open,
+                            priority: spec.priority.unwrap_or(Priority::Normal),
+                            due_ms: spec.due_ms,
+                            needs: spec.needs.clone(),
+                            lease: None,
+                            last_epoch: LeaseEpoch(0),
+                            created_by: meta.by.clone(),
+                            created_at: meta.at,
+                            updated_at: meta.at,
+                        },
+                    );
+                }
             }
             RoomEvent::TopicSet { topic } => state.topic = Some(topic.clone()),
-            RoomEvent::Labeled { .. }
-            | RoomEvent::TaskClaimed { .. }
-            | RoomEvent::TaskHeartbeat { .. }
-            | RoomEvent::TaskTransitioned { .. }
-            | RoomEvent::TaskUpdated { .. } => {}
+            RoomEvent::Labeled { target, after, .. } => {
+                if let Some(post) = state.posts.get_mut(target) {
+                    post.labels = after.iter().cloned().collect();
+                }
+                if let Some(task) = state.tasks.get_mut(target) {
+                    task.updated_at = meta.at;
+                }
+            }
+            RoomEvent::TaskClaimed { task, rev, lease } => {
+                if let Some(rec) = state.tasks.get_mut(task) {
+                    rec.status = TaskStatus::Claimed;
+                    rec.rev = *rev;
+                    rec.last_epoch = rec.last_epoch.max(lease.epoch);
+                    rec.lease = Some(lease.clone());
+                    rec.updated_at = meta.at;
+                }
+            }
+            RoomEvent::TaskHeartbeat {
+                task,
+                epoch,
+                expires_at,
+            } => {
+                if let Some(rec) = state.tasks.get_mut(task)
+                    && let Some(lease) = &mut rec.lease
+                    && lease.epoch == *epoch
+                {
+                    lease.expires_at = *expires_at;
+                    rec.updated_at = meta.at;
+                }
+            }
+            RoomEvent::TaskTransitioned { task, rev, status } => {
+                if let Some(rec) = state.tasks.get_mut(task) {
+                    rec.status = *status;
+                    rec.rev = *rev;
+                    if *status != TaskStatus::Claimed {
+                        rec.lease = None;
+                    }
+                    rec.updated_at = meta.at;
+                }
+            }
+            RoomEvent::TaskUpdated {
+                task,
+                rev,
+                title,
+                needs_add,
+                needs_remove,
+                priority,
+                due_ms,
+                clear_due,
+            } => {
+                if let Some(rec) = state.tasks.get_mut(task) {
+                    rec.rev = *rev;
+                    if let Some(t) = title {
+                        rec.title = t.clone();
+                    }
+                    if !needs_remove.is_empty() {
+                        rec.needs.retain(|d| !needs_remove.contains(d));
+                    }
+                    for dep in needs_add {
+                        if !rec.needs.contains(dep) {
+                            rec.needs.push(*dep);
+                        }
+                    }
+                    if let Some(p) = priority {
+                        rec.priority = *p;
+                    }
+                    if *clear_due {
+                        rec.due_ms = None;
+                    } else if let Some(due) = due_ms {
+                        rec.due_ms = Some(*due);
+                    }
+                    rec.updated_at = meta.at;
+                }
+            }
         }
     }
 
@@ -710,12 +1574,129 @@ impl Decider for Rooms {
             }
             RoomCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
             RoomCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),
-            RoomCommand::RoomLabel(_)
-            | RoomCommand::TaskClaim(_)
-            | RoomCommand::TaskHeartbeat(_)
-            | RoomCommand::TaskTransition(_)
-            | RoomCommand::TaskUpdate(_)
-            | RoomCommand::RoomTasks(_) => unreachable!("rejected in decide"),
+            RoomCommand::RoomLabel(c) => {
+                if let Some(env) = committed
+                    .iter()
+                    .rev()
+                    .find(|e| matches!(e.event, Event::Room(RoomEvent::Labeled { .. })))
+                {
+                    let StreamId::Room { room } = &env.stream else {
+                        unreachable!()
+                    };
+                    let Event::Room(RoomEvent::Labeled { target, after, .. }) = &env.event else {
+                        unreachable!()
+                    };
+                    return WireReply::RoomLabel(Labeled {
+                        room: room.clone(),
+                        seq: *target,
+                        labels: after.clone(),
+                    });
+                }
+                let (room, _) = state
+                    .opened
+                    .as_ref()
+                    .expect("RoomLabel verified room is open");
+                let labels = state
+                    .posts
+                    .get(&c.seq)
+                    .map(|p| p.labels.iter().cloned().collect())
+                    .unwrap_or_default();
+                WireReply::RoomLabel(Labeled {
+                    room: room.clone(),
+                    seq: c.seq,
+                    labels,
+                })
+            }
+            RoomCommand::TaskClaim(_) => {
+                let env = committed
+                    .iter()
+                    .rev()
+                    .find(|e| matches!(e.event, Event::Room(RoomEvent::TaskClaimed { .. })))
+                    .expect("TaskClaim commits or replays a TaskClaimed event");
+                let StreamId::Room { room } = &env.stream else {
+                    unreachable!()
+                };
+                let Event::Room(RoomEvent::TaskClaimed { task, rev, lease }) = &env.event else {
+                    unreachable!()
+                };
+                let org_id = state.tasks[task].org_id.clone();
+                WireReply::TaskClaim(TaskLeaseReceipt {
+                    room: room.clone(),
+                    task: *task,
+                    org_id,
+                    rev: *rev,
+                    epoch: lease.epoch,
+                    expires_at: lease.expires_at,
+                })
+            }
+            RoomCommand::TaskHeartbeat(_) => {
+                let env = committed
+                    .iter()
+                    .rev()
+                    .find(|e| matches!(e.event, Event::Room(RoomEvent::TaskHeartbeat { .. })))
+                    .expect("TaskHeartbeat commits a TaskHeartbeat event");
+                let StreamId::Room { room } = &env.stream else {
+                    unreachable!()
+                };
+                let Event::Room(RoomEvent::TaskHeartbeat {
+                    task,
+                    epoch,
+                    expires_at,
+                }) = &env.event
+                else {
+                    unreachable!()
+                };
+                let rec = &state.tasks[task];
+                WireReply::TaskHeartbeat(TaskLeaseReceipt {
+                    room: room.clone(),
+                    task: *task,
+                    org_id: rec.org_id.clone(),
+                    rev: rec.rev,
+                    epoch: *epoch,
+                    expires_at: *expires_at,
+                })
+            }
+            RoomCommand::TaskTransition(c) => {
+                let task_seq = committed
+                    .iter()
+                    .find_map(|e| match &e.event {
+                        Event::Room(RoomEvent::TaskTransitioned { task, .. }) => Some(*task),
+                        _ => None,
+                    })
+                    .unwrap_or(c.task);
+                let at = committed
+                    .last()
+                    .map(|e| e.at)
+                    .unwrap_or_else(rex_wave_runtime::now);
+                WireReply::TaskTransition(
+                    state
+                        .task_view_at(task_seq, at)
+                        .expect("TaskTransition verified task exists"),
+                )
+            }
+            RoomCommand::TaskUpdate(c) => {
+                let task_seq = committed
+                    .iter()
+                    .find_map(|e| match &e.event {
+                        Event::Room(RoomEvent::TaskUpdated { task, .. }) => Some(*task),
+                        _ => None,
+                    })
+                    .unwrap_or(c.task);
+                let at = committed
+                    .last()
+                    .map(|e| e.at)
+                    .unwrap_or_else(rex_wave_runtime::now);
+                WireReply::TaskUpdate(
+                    state
+                        .task_view_at(task_seq, at)
+                        .expect("TaskUpdate verified task exists"),
+                )
+            }
+            RoomCommand::RoomTasks(c) => WireReply::RoomTasks(
+                state
+                    .task_list_at(c.filter.as_ref(), rex_wave_runtime::now())
+                    .expect("RoomTasks verified room is open"),
+            ),
         }
     }
 

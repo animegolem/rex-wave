@@ -703,81 +703,1218 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
 }
 
 #[tokio::test]
-async fn stubbed_phase3_room_commands_do_not_panic_on_reused_idem_or_persist_unvalidated_tasks() {
+async fn flat_thread_normalization_after_cas_idempotency_and_auth_isolation() {
     let journal = Journal::in_memory().unwrap();
     let router = build_harness(journal, Duration::from_secs(60));
     let sam = LocalClient::new(router.clone(), seat("sam"));
+    let alice = LocalClient::new(router.clone(), seat("alice"));
+    let eve = LocalClient::new(router.clone(), seat("eve"));
     let room = RoomRef::Channel {
         scope: RoomScope::Global,
-        name: ChannelName::parse("stubs").unwrap(),
+        name: ChannelName::parse("threads").unwrap(),
     };
-    let idem = IdemKey::parse("shared-k1").unwrap();
 
-    let first = sam
+    let r1 = sam
         .call(RoomPost {
-            idem: Some(idem.clone()),
-            ..RoomPost::new(room.clone(), Body::parse("hello").unwrap())
+            after: Some(Seq::ORIGIN),
+            labels: vec![
+                Label::parse("z=2").unwrap(),
+                Label::parse("a=1").unwrap(),
+                Label::parse("a=1").unwrap(),
+            ],
+            ..RoomPost::new(room.clone(), Body::parse("root one").unwrap())
         })
         .await
         .unwrap();
+    assert_eq!(r1.re, None);
 
-    let reused = sam
-        .call(RoomLabel {
-            room: room.clone(),
-            seq: first.seq,
-            add: vec![Label::parse("k=v").unwrap()],
-            remove: vec![],
-            idem: Some(idem),
+    let r2 = alice
+        .call(RoomPost::new(
+            room.clone(),
+            Body::parse("root two").unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let p1 = alice
+        .call(RoomPost {
+            re: Some(r1.seq),
+            after: Some(r1.seq),
+            ..RoomPost::new(room.clone(), Body::parse("first reply on r1").unwrap())
         })
         .await
-        .unwrap_err();
-    assert_eq!(
-        reused,
-        ApiError::Unavailable {
-            family: Family::Room
-        }
-    );
+        .unwrap();
+    assert_eq!(p1.re, Some(r1.seq));
 
-    let with_after = sam
+    let p2 = sam
         .call(RoomPost {
-            after: Some(first.seq),
-            ..RoomPost::new(room.clone(), Body::parse("guarded").unwrap())
+            re: Some(p1.seq),
+            after: Some(p1.seq),
+            ..RoomPost::new(room.clone(), Body::parse("reply to reply").unwrap())
         })
         .await
-        .unwrap_err();
+        .unwrap();
     assert_eq!(
-        with_after,
-        ApiError::Unavailable {
-            family: Family::Room
-        }
+        p2.re,
+        Some(r1.seq),
+        "replying to a reply normalizes re to canonical thread root"
     );
 
-    let with_task = sam
+    let task_with_re = sam
         .call(RoomPost {
+            re: Some(r1.seq),
             task: Some(TaskSpec {
-                title: rex_wave_api::board::Title::parse("Unvalidated task").unwrap(),
+                title: rex_wave_api::board::Title::parse("Illegal child task").unwrap(),
                 org_id: None,
                 needs: vec![],
                 priority: None,
                 due_ms: None,
             }),
-            ..RoomPost::new(room.clone(), Body::parse("task body").unwrap())
+            ..RoomPost::new(room.clone(), Body::parse("nope").unwrap())
         })
         .await
         .unwrap_err();
+    assert!(matches!(task_with_re, ApiError::Invalid(_)));
+
+    let stale_room_after = sam
+        .call(RoomPost {
+            after: Some(r1.seq),
+            ..RoomPost::new(room.clone(), Body::parse("stale top-level").unwrap())
+        })
+        .await
+        .unwrap_err();
+    let ApiError::Conflict {
+        data:
+            Some(ConflictData::NewerMessage {
+                expected,
+                latest,
+                newer_message,
+            }),
+        ..
+    } = stale_room_after
+    else {
+        panic!("expected NewerMessage conflict, got {stale_room_after:?}");
+    };
+    assert_eq!(expected, r1.seq);
+    assert_eq!(latest, p2.seq);
+    assert_eq!(newer_message.seq, p2.seq);
+    assert_eq!(newer_message.body.as_str(), "reply to reply");
+    assert_eq!(newer_message.re, Some(r1.seq));
+
+    let r2_reply = alice
+        .call(RoomPost {
+            re: Some(r2.seq),
+            ..RoomPost::new(room.clone(), Body::parse("chatter in r2").unwrap())
+        })
+        .await
+        .unwrap();
+    let p3_idem = IdemKey::parse("retry-after-r1").unwrap();
+    let p3 = sam
+        .call(RoomPost {
+            re: Some(p2.seq),
+            after: Some(p2.seq),
+            idem: Some(p3_idem.clone()),
+            ..RoomPost::new(room.clone(), Body::parse("guarded reply on r1").unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(p3.re, Some(r1.seq));
+    assert!(p3.seq > r2_reply.seq);
+
+    let p4 = alice
+        .call(RoomPost {
+            re: Some(r1.seq),
+            after: Some(p3.seq),
+            ..RoomPost::new(room.clone(), Body::parse("later reply on r1").unwrap())
+        })
+        .await
+        .unwrap();
+
+    let stale_thread_after = sam
+        .call(RoomPost {
+            re: Some(r1.seq),
+            after: Some(p3.seq),
+            ..RoomPost::new(room.clone(), Body::parse("missed p4").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_thread_after,
+        ApiError::Conflict {
+            data: Some(ConflictData::NewerMessage { latest, .. }),
+            ..
+        } if latest == p4.seq
+    ));
+
+    let replayed = sam
+        .call(RoomPost {
+            re: Some(p2.seq),
+            after: Some(p2.seq),
+            idem: Some(p3_idem),
+            ..RoomPost::new(room.clone(), Body::parse("retried body").unwrap())
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        with_task,
-        ApiError::Unavailable {
-            family: Family::Room
-        }
+        replayed.seq, p3.seq,
+        "idempotent retry with stale `after` replays original receipt without false conflict"
     );
 
-    let second = sam
+    let shared_idem = IdemKey::parse("shared-cross-cmd-k1").unwrap();
+    let task_post = sam
+        .call(RoomPost {
+            idem: Some(shared_idem.clone()),
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Cross-cmd idem task").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("task root").unwrap())
+        })
+        .await
+        .unwrap();
+    let lbl_res = sam
+        .call(RoomLabel {
+            room: room.clone(),
+            seq: task_post.seq,
+            add: vec![Label::parse("tier=p1").unwrap()],
+            remove: vec![],
+            idem: Some(shared_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(lbl_res.labels, vec![Label::parse("tier=p1").unwrap()]);
+    let claim_res = sam
+        .call(TaskClaim {
+            room: room.clone(),
+            task: task_post.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(1),
+            force: false,
+            idem: Some(shared_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(claim_res.epoch, LeaseEpoch(1));
+    let upd_res = sam
+        .call(TaskUpdate {
+            room: room.clone(),
+            task: task_post.seq,
+            expected_rev: Some(2),
+            title: Some(rex_wave_api::board::Title::parse("Renamed idem task").unwrap()),
+            needs_add: vec![],
+            needs_remove: vec![],
+            priority: None,
+            due_ms: None,
+            clear_due: false,
+            idem: Some(shared_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(upd_res.rev, 3);
+    let trans_res = sam
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_post.seq,
+            status: TaskStatus::Done,
+            epoch: Some(claim_res.epoch),
+            expected_rev: Some(3),
+            note: Some(Body::parse("closed cleanly").unwrap()),
+            idem: Some(shared_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(trans_res.status, TaskStatus::Done);
+    let trans_replay = sam
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_post.seq,
+            status: TaskStatus::Done,
+            epoch: Some(claim_res.epoch),
+            expected_rev: Some(3),
+            note: Some(Body::parse("closed cleanly").unwrap()),
+            idem: Some(shared_idem),
+        })
+        .await
+        .unwrap();
+    assert_eq!(trans_replay.rev, trans_res.rev);
+
+    let dm = sam
         .call(RoomPost::new(
-            room,
-            Body::parse("actor still alive").unwrap(),
+            RoomRef::Dm {
+                with: seat("alice"),
+            },
+            Body::parse("top secret dm payload").unwrap(),
         ))
         .await
         .unwrap();
-    assert_eq!(second.seq, first.seq.next());
+    let probe = eve
+        .call(RoomPost {
+            after: Some(Seq::ORIGIN),
+            ..RoomPost::new(RoomRef::Id { id: dm.room }, Body::parse("probe").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(probe, ApiError::Denied { .. }),
+        "unauthorized DM post must fail with Denied, never leaking NewerMessage"
+    );
+}
+
+#[tokio::test]
+async fn room_label_before_after_watch_delivery_noop_and_idem() {
+    let journal = Journal::in_memory().unwrap();
+    let router = build_harness(journal, Duration::from_secs(60));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let room = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("labels").unwrap(),
+    };
+
+    let open = Label::parse("status=open").unwrap();
+    let done = Label::parse("status=done").unwrap();
+    let area = Label::parse("area=rooms").unwrap();
+
+    let post = sam
+        .call(RoomPost {
+            labels: vec![area.clone(), open.clone(), open.clone()],
+            ..RoomPost::new(room.clone(), Body::parse("labeled root").unwrap())
+        })
+        .await
+        .unwrap();
+
+    let mut watch_open = sam
+        .watch(
+            Interest::RoomFiltered {
+                room: room.clone(),
+                re: None,
+                labels: vec![open.clone()],
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    let mut watch_done = sam
+        .watch(
+            Interest::RoomFiltered {
+                room: room.clone(),
+                re: None,
+                labels: vec![done.clone()],
+            },
+            Cursor::live(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        watch_open.next().await,
+        Some(Ok(Frame::CaughtUp { .. }))
+    ));
+    assert!(matches!(
+        watch_done.next().await,
+        Some(Ok(Frame::CaughtUp { .. }))
+    ));
+
+    let label_idem = IdemKey::parse("lbl-transition-1").unwrap();
+    let res = sam
+        .call(RoomLabel {
+            room: room.clone(),
+            seq: post.seq,
+            add: vec![done.clone()],
+            remove: vec![open.clone()],
+            idem: Some(label_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(res.labels, vec![area.clone(), done.clone()]);
+
+    let ev_open = tokio::time::timeout(Duration::from_secs(2), watch_open.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let ev_done = tokio::time::timeout(Duration::from_secs(2), watch_done.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let (Frame::Committed(env_open), Frame::Committed(env_done)) = (ev_open, ev_done) else {
+        panic!("expected Committed frames for both before and after label watchers");
+    };
+    assert_eq!(env_open.seq, env_done.seq);
+    let Event::Room(RoomEvent::Labeled {
+        target,
+        added,
+        removed,
+        before,
+        after,
+    }) = env_open.event
+    else {
+        panic!("expected RoomEvent::Labeled");
+    };
+    assert_eq!(target, post.seq);
+    assert_eq!(added, vec![done.clone()]);
+    assert_eq!(removed, vec![open.clone()]);
+    assert_eq!(before, vec![area.clone(), open.clone()]);
+    assert_eq!(after, vec![area.clone(), done.clone()]);
+
+    let head_before_noop = sam
+        .call(RoomEnsure {
+            room: room.clone(),
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap()
+        .head;
+    let noop = sam
+        .call(RoomLabel {
+            room: room.clone(),
+            seq: post.seq,
+            add: vec![done.clone()],
+            remove: vec![open.clone()],
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(noop.labels, vec![area.clone(), done.clone()]);
+    let head_after_noop = sam
+        .call(RoomEnsure {
+            room: room.clone(),
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap()
+        .head;
+    assert_eq!(
+        head_before_noop, head_after_noop,
+        "no-op RoomLabel appends no journal entry"
+    );
+
+    let extra = Label::parse("review=yes").unwrap();
+    sam.call(RoomLabel {
+        room: room.clone(),
+        seq: post.seq,
+        add: vec![extra.clone()],
+        remove: vec![],
+        idem: None,
+    })
+    .await
+    .unwrap();
+    let replayed = sam
+        .call(RoomLabel {
+            room,
+            seq: post.seq,
+            add: vec![done.clone()],
+            remove: vec![open],
+            idem: Some(label_idem),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.labels,
+        vec![area, done],
+        "idempotent RoomLabel replay returns the original Labeled snapshot"
+    );
+}
+
+#[tokio::test]
+async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("tasks.sqlite3")).unwrap();
+    let router = build_harness(journal, Duration::from_millis(30));
+
+    let op = LocalClient::new(router.clone(), operator("owner"));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let w1 = LocalClient::new(router.clone(), worker("w3", "author"));
+    let w2 = LocalClient::new(router.clone(), worker("w3", "verifier"));
+
+    let room = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("tasks").unwrap(),
+    };
+    let chat_msg = sam
+        .call(RoomPost::new(
+            room.clone(),
+            Body::parse("plain chat").unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let task_a = op
+        .call(RoomPost {
+            labels: vec![Label::parse("area=core").unwrap()],
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Task A foundation").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: Some(rex_wave_api::board::Priority::High),
+                due_ms: Some(UnixMs(1_900_000_000_000)),
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("build foundation").unwrap())
+        })
+        .await
+        .unwrap();
+    let org_a = task_a
+        .org_id
+        .clone()
+        .expect("omitted org_id deterministically minted");
+    assert!(org_a.is_rex_minted());
+
+    let emacs_id = OrgId::parse("src-bush1951").unwrap();
+    let task_b = op
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Task B depends on A").unwrap(),
+                org_id: Some(emacs_id.clone()),
+                needs: vec![task_a.seq],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("depends on A").unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        task_b.org_id.as_ref(),
+        Some(&emacs_id),
+        "Emacs-supplied OrgId is preserved verbatim"
+    );
+
+    let dup_org = op
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Duplicate org id").unwrap(),
+                org_id: Some(emacs_id.clone()),
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("dup").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(dup_org, ApiError::Conflict { .. }));
+
+    let non_task_dep = op
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Bad dep").unwrap(),
+                org_id: None,
+                needs: vec![chat_msg.seq],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("bad dep").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(non_task_dep, ApiError::Invalid(_)));
+
+    let missing_dep = op
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Missing dep").unwrap(),
+                org_id: None,
+                needs: vec![Seq(999)],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("missing dep").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_dep, ApiError::NotFound { .. }));
+
+    let ready_initial = op
+        .call(RoomTasks {
+            room: room.clone(),
+            filter: Some(TaskFilter {
+                ready_only: true,
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_initial
+            .tasks
+            .iter()
+            .map(|t| t.seq)
+            .collect::<Vec<_>>(),
+        vec![task_a.seq],
+        "only Task A is ready while Task B waits on Task A"
+    );
+
+    let unmet = w1
+        .call(TaskClaim {
+            room: room.clone(),
+            task: task_b.seq,
+            ttl_ms: Some(10_000),
+            expected_rev: None,
+            force: false,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        unmet,
+        ApiError::Conflict {
+            data: Some(ConflictData::UnmetNeeds { ref unmet }),
+            ..
+        } if unmet == &vec![task_a.seq]
+    ));
+
+    let non_op_force = w1
+        .call(TaskClaim {
+            room: room.clone(),
+            task: task_b.seq,
+            ttl_ms: Some(10_000),
+            expected_rev: None,
+            force: true,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(non_op_force, ApiError::Denied { .. }));
+
+    let (r_w1, r_w2) = tokio::join!(
+        w1.call(TaskClaim {
+            room: room.clone(),
+            task: task_a.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(1),
+            force: false,
+            idem: None,
+        }),
+        w2.call(TaskClaim {
+            room: room.clone(),
+            task: task_a.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(1),
+            force: false,
+            idem: None,
+        }),
+    );
+    let (winner_client, loser_client, winner_receipt) = match (r_w1, r_w2) {
+        (Ok(win), Err(err)) => {
+            assert!(matches!(
+                err,
+                ApiError::Conflict {
+                    data: Some(
+                        ConflictData::RevisionConflict { .. } | ConflictData::LeaseFenced { .. }
+                    ),
+                    ..
+                }
+            ));
+            (w1.clone(), w2.clone(), win)
+        }
+        (Err(err), Ok(win)) => {
+            assert!(matches!(
+                err,
+                ApiError::Conflict {
+                    data: Some(
+                        ConflictData::RevisionConflict { .. } | ConflictData::LeaseFenced { .. }
+                    ),
+                    ..
+                }
+            ));
+            (w2.clone(), w1.clone(), win)
+        }
+        other => panic!("expected exactly one winner and one conflict, got {other:?}"),
+    };
+    assert_eq!(winner_receipt.epoch, LeaseEpoch(1));
+    assert_eq!(winner_receipt.rev, 2);
+
+    let mine_tasks = winner_client
+        .call(RoomTasks {
+            room: room.clone(),
+            filter: Some(TaskFilter {
+                holder: Some(winner_client.me().clone()),
+                label: Some(Label::parse("area=core").unwrap()),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(mine_tasks.tasks.len(), 1);
+    assert_eq!(mine_tasks.tasks[0].seq, task_a.seq);
+
+    let hb_ok = winner_client
+        .call(TaskHeartbeat {
+            room: room.clone(),
+            task: task_a.seq,
+            epoch: winner_receipt.epoch,
+            ttl_ms: Some(40),
+        })
+        .await
+        .unwrap();
+    assert_eq!(hb_ok.rev, 2, "heartbeat does not bump rev");
+
+    let hb_fenced = loser_client
+        .call(TaskHeartbeat {
+            room: room.clone(),
+            task: task_a.seq,
+            epoch: winner_receipt.epoch,
+            ttl_ms: Some(60_000),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        hb_fenced,
+        ApiError::Conflict {
+            data: Some(ConflictData::LeaseFenced { .. }),
+            ..
+        }
+    ));
+
+    let trans_unauthenticated_epoch = loser_client
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_a.seq,
+            status: TaskStatus::Done,
+            epoch: None,
+            expected_rev: None,
+            note: None,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        trans_unauthenticated_epoch,
+        ApiError::Conflict {
+            data: Some(ConflictData::LeaseFenced { .. }),
+            ..
+        }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let takeover = loser_client
+        .call(TaskClaim {
+            room: room.clone(),
+            task: task_a.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: None,
+            force: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(takeover.epoch, LeaseEpoch(2));
+    assert_eq!(takeover.rev, 3);
+
+    let stale_hb = winner_client
+        .call(TaskHeartbeat {
+            room: room.clone(),
+            task: task_a.seq,
+            epoch: LeaseEpoch(1),
+            ttl_ms: Some(60_000),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_hb,
+        ApiError::Conflict {
+            data: Some(ConflictData::LeaseFenced {
+                expected: LeaseEpoch(1),
+                actual: LeaseEpoch(2),
+                ..
+            }),
+            ..
+        }
+    ));
+    let stale_trans = winner_client
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_a.seq,
+            status: TaskStatus::Done,
+            epoch: Some(LeaseEpoch(1)),
+            expected_rev: None,
+            note: None,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_trans,
+        ApiError::Conflict {
+            data: Some(ConflictData::LeaseFenced { .. }),
+            ..
+        }
+    ));
+
+    let op_reset = op
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_a.seq,
+            status: TaskStatus::Open,
+            epoch: None,
+            expected_rev: Some(3),
+            note: Some(Body::parse("reopening for @sam").unwrap()),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(op_reset.status, TaskStatus::Open);
+    assert_eq!(op_reset.rev, 4);
+    assert!(op_reset.lease.is_none());
+
+    let fenced_after_op = loser_client
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_a.seq,
+            status: TaskStatus::Done,
+            epoch: Some(LeaseEpoch(2)),
+            expected_rev: None,
+            note: None,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        fenced_after_op,
+        ApiError::Conflict {
+            data: Some(ConflictData::LeaseFenced { .. }),
+            ..
+        }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let third_claim = w1
+        .call(TaskClaim {
+            room: room.clone(),
+            task: task_a.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(4),
+            force: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(third_claim.epoch, LeaseEpoch(3));
+    assert_eq!(third_claim.rev, 5);
+
+    let bad_claimed_transition = op
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_a.seq,
+            status: TaskStatus::Claimed,
+            epoch: None,
+            expected_rev: None,
+            note: None,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(bad_claimed_transition, ApiError::Invalid(_)));
+
+    let done_a = w1
+        .call(TaskTransition {
+            room: room.clone(),
+            task: task_a.seq,
+            status: TaskStatus::Done,
+            epoch: Some(third_claim.epoch),
+            expected_rev: Some(5),
+            note: Some(Body::parse("foundation shipped @sam").unwrap()),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(done_a.status, TaskStatus::Done);
+    assert_eq!(done_a.rev, 6);
+
+    let msgs = room_history(&op, room.clone(), Seq::ORIGIN, Some(50))
+        .await
+        .unwrap();
+    let transition_note = msgs
+        .iter()
+        .find(|m| m.body.as_str() == "foundation shipped @sam")
+        .expect("atomic transition note logged into task thread");
+    assert_eq!(transition_note.reply_to, Some(task_a.seq));
+    assert_eq!(transition_note.mentions.principals, vec![seat("sam")]);
+
+    let ready_after_a = op
+        .call(RoomTasks {
+            room: room.clone(),
+            filter: Some(TaskFilter {
+                ready_only: true,
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_after_a
+            .tasks
+            .iter()
+            .map(|t| t.seq)
+            .collect::<Vec<_>>(),
+        vec![task_b.seq]
+    );
+
+    let task_c = op
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Task C depends on B").unwrap(),
+                org_id: None,
+                needs: vec![task_b.seq],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("depends on B").unwrap())
+        })
+        .await
+        .unwrap();
+    let op_force = op
+        .call(TaskClaim {
+            room: room.clone(),
+            task: task_c.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(1),
+            force: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(op_force.epoch, LeaseEpoch(1));
+
+    let stale_update = op
+        .call(TaskUpdate {
+            room: room.clone(),
+            task: task_a.seq,
+            expected_rev: Some(1),
+            title: Some(rex_wave_api::board::Title::parse("Stale").unwrap()),
+            needs_add: vec![],
+            needs_remove: vec![],
+            priority: None,
+            due_ms: None,
+            clear_due: false,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_update,
+        ApiError::Conflict {
+            data: Some(ConflictData::RevisionConflict {
+                expected: 1,
+                actual: 6,
+            }),
+            ..
+        }
+    ));
+
+    let cycle_3 = op
+        .call(TaskUpdate {
+            room: room.clone(),
+            task: task_a.seq,
+            expected_rev: Some(6),
+            title: None,
+            needs_add: vec![task_c.seq],
+            needs_remove: vec![],
+            priority: None,
+            due_ms: None,
+            clear_due: false,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(cycle_3, ApiError::Invalid(_)),
+        "3-cycle A -> C -> B -> A rejected"
+    );
+
+    let self_cycle = op
+        .call(TaskUpdate {
+            room: room.clone(),
+            task: task_b.seq,
+            expected_rev: Some(1),
+            title: None,
+            needs_add: vec![task_b.seq],
+            needs_remove: vec![],
+            priority: None,
+            due_ms: None,
+            clear_due: false,
+            idem: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(self_cycle, ApiError::Invalid(_)));
+
+    let updated = op
+        .call(TaskUpdate {
+            room: room.clone(),
+            task: task_a.seq,
+            expected_rev: Some(6),
+            title: Some(rex_wave_api::board::Title::parse("Task A updated").unwrap()),
+            needs_add: vec![],
+            needs_remove: vec![],
+            priority: Some(rex_wave_api::board::Priority::Blocking),
+            due_ms: None,
+            clear_due: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.rev, 7);
+    assert_eq!(updated.title.as_str(), "Task A updated");
+    assert_eq!(updated.priority, rex_wave_api::board::Priority::Blocking);
+    assert_eq!(updated.due_ms, None);
+}
+
+#[test]
+fn pure_clock_lease_expiry_and_readiness_evaluation() {
+    use rex_wave_rooms::RoomState;
+    use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
+
+    let room = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("clock").unwrap(),
+    };
+    let w1 = worker("w", "one");
+    let w2 = worker("w", "two");
+    let mut state = RoomState::default();
+    let mut seq = Seq::ORIGIN;
+
+    let apply =
+        |state: &mut RoomState, seq: &mut Seq, by: &Principal, at: UnixMs, evs: Vec<RoomEvent>| {
+            for ev in evs {
+                *seq = seq.next();
+                Rooms::evolve(
+                    state,
+                    &ev,
+                    &EntryMeta {
+                        seq: *seq,
+                        at,
+                        by: by.clone(),
+                    },
+                );
+            }
+        };
+
+    let post_evs = Rooms::decide(
+        &state,
+        &RoomCommand::RoomPost(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Clocked task").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("clock body").unwrap())
+        }),
+        &DecideCtx {
+            by: w1.clone(),
+            at: UnixMs(1_000),
+        },
+    )
+    .unwrap();
+    apply(&mut state, &mut seq, &w1, UnixMs(1_000), post_evs);
+    let task_seq = seq;
+
+    let claim_evs = Rooms::decide(
+        &state,
+        &RoomCommand::TaskClaim(TaskClaim {
+            room: room.clone(),
+            task: task_seq,
+            ttl_ms: Some(500),
+            expected_rev: Some(1),
+            force: false,
+            idem: None,
+        }),
+        &DecideCtx {
+            by: w1.clone(),
+            at: UnixMs(1_000),
+        },
+    )
+    .unwrap();
+    apply(&mut state, &mut seq, &w1, UnixMs(1_000), claim_evs);
+
+    let before_expiry = state.task_view_at(task_seq, UnixMs(1_499)).unwrap();
+    assert!(!before_expiry.lease_expired);
+    assert!(!before_expiry.ready);
+
+    let at_expiry = state.task_view_at(task_seq, UnixMs(1_500)).unwrap();
+    assert!(at_expiry.lease_expired);
+    assert!(at_expiry.ready);
+
+    let ready_list = state
+        .task_list_at(
+            Some(&TaskFilter {
+                ready_only: true,
+                ..Default::default()
+            }),
+            UnixMs(1_500),
+        )
+        .unwrap();
+    assert_eq!(ready_list.tasks.len(), 1);
+
+    let held_list = state
+        .task_list_at(
+            Some(&TaskFilter {
+                holder: Some(w1.clone()),
+                ..Default::default()
+            }),
+            UnixMs(1_500),
+        )
+        .unwrap();
+    assert!(
+        held_list.tasks.is_empty(),
+        "expired lease is no longer actively held by w1"
+    );
+
+    let early_takeover = Rooms::decide(
+        &state,
+        &RoomCommand::TaskClaim(TaskClaim {
+            room: room.clone(),
+            task: task_seq,
+            ttl_ms: Some(500),
+            expected_rev: None,
+            force: false,
+            idem: None,
+        }),
+        &DecideCtx {
+            by: w2.clone(),
+            at: UnixMs(1_499),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        early_takeover,
+        ApiError::Conflict {
+            data: Some(ConflictData::LeaseFenced { .. }),
+            ..
+        }
+    ));
+
+    let takeover_evs = Rooms::decide(
+        &state,
+        &RoomCommand::TaskClaim(TaskClaim {
+            room,
+            task: task_seq,
+            ttl_ms: Some(500),
+            expected_rev: None,
+            force: false,
+            idem: None,
+        }),
+        &DecideCtx {
+            by: w2.clone(),
+            at: UnixMs(1_500),
+        },
+    )
+    .unwrap();
+    apply(&mut state, &mut seq, &w2, UnixMs(1_500), takeover_evs);
+    let after_takeover = state.task_view_at(task_seq, UnixMs(1_500)).unwrap();
+    assert_eq!(after_takeover.lease.unwrap().epoch, LeaseEpoch(2));
+}
+
+#[tokio::test]
+async fn room_post_keeps_raw_idem_keys_for_pre_upgrade_journal_dedupe() {
+    let journal = Journal::in_memory().unwrap();
+    let room_id = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("legacy-idem").unwrap(),
+    };
+    let stream = StreamId::Room {
+        room: room_id.clone(),
+    };
+    let raw_key = IdemKey::parse("wave:auth-v2:brief:verifier").unwrap();
+    {
+        let mut writer = journal.claim(stream).unwrap();
+        writer
+            .append(
+                &seat("sam"),
+                UnixMs(1_000),
+                Some(&raw_key),
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: room_id.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("pre-upgrade brief").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: vec![],
+                        task: None,
+                        idem: Some(raw_key.clone()),
+                    }),
+                ],
+            )
+            .unwrap();
+    }
+
+    let router = build_harness(journal, Duration::from_secs(60));
+    let sam = LocalClient::new(router, seat("sam"));
+    let retried = sam
+        .call(RoomPost {
+            idem: Some(raw_key),
+            ..RoomPost::new(
+                RoomRef::Id {
+                    id: room_id.clone(),
+                },
+                Body::parse("duplicate retry").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.seq,
+        Seq(2),
+        "pre-upgrade raw RoomPost idem keys continue deduping after Phase 3"
+    );
+
+    let spoofed_claim_idem = IdemKey::parse("__rw_clm:r:K").unwrap();
+    let task_post = sam
+        .call(RoomPost {
+            idem: Some(spoofed_claim_idem.clone()),
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Prefix collision guard").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(
+                RoomRef::Id {
+                    id: room_id.clone(),
+                },
+                Body::parse("spoofed prefix post").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    let claim = sam
+        .call(TaskClaim {
+            room: RoomRef::Id {
+                id: room_id.clone(),
+            },
+            task: task_post.seq,
+            ttl_ms: Some(60_000),
+            expected_rev: Some(1),
+            force: false,
+            idem: Some(IdemKey::parse("K").unwrap()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(claim.epoch, LeaseEpoch(1));
+
+    let post_retry = sam
+        .call(RoomPost {
+            idem: Some(spoofed_claim_idem),
+            ..RoomPost::new(
+                RoomRef::Id {
+                    id: room_id.clone(),
+                },
+                Body::parse("retry spoofed prefix").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(post_retry.seq, task_post.seq);
 }
