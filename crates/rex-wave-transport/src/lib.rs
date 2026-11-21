@@ -370,11 +370,38 @@ fn verify_private_file(
     Ok(true)
 }
 
+/// Verifies that `path` (if it exists) is a regular, non-symlink file owned by
+/// `expected_uid` (when supplied) with mode `0600`. Returns `Ok(false)` when missing.
+pub fn check_private_file(
+    path: &Path,
+    expected_uid: Option<u32>,
+    what: &str,
+) -> Result<bool, ApiError> {
+    verify_private_file(path, expected_uid, what)
+}
+
+/// Validates a single safe filename for `<state_dir>/worker-tokens/<id>`.
+pub fn is_safe_worker_token_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && !id.chars().any(char::is_control)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum TokenMapValue {
     Seat(SeatName),
     Principal(Principal),
+    LegacyWorker {
+        wave: WaveSlug,
+        role: RoleName,
+        #[serde(default)]
+        #[allow(dead_code)]
+        thread_id: Option<String>,
+    },
 }
 
 impl TokenMapValue {
@@ -395,6 +422,7 @@ impl TokenMapValue {
         match self {
             TokenMapValue::Seat(seat) => Principal::Seat { seat },
             TokenMapValue::Principal(p) => p,
+            TokenMapValue::LegacyWorker { wave, role, .. } => Principal::Worker { wave, role },
         }
     }
 }
@@ -623,6 +651,12 @@ impl PrincipalTokenTable {
                     continue;
                 }
             };
+            if !matches!(file.principal, Principal::Worker { .. }) {
+                daemon_log!(
+                    "skipping {label}: worker-tokens directory only allows Principal::Worker"
+                );
+                continue;
+            }
             if let Err(e) = table.insert(file.token, file.principal) {
                 daemon_log!("skipping {label}: {e}");
             }
@@ -659,15 +693,16 @@ pub fn write_worker_token_file(
     token: &str,
     principal: &Principal,
 ) -> io::Result<PathBuf> {
-    if id.is_empty()
-        || id.starts_with('.')
-        || id.contains('/')
-        || id.contains('\\')
-        || id.chars().any(char::is_control)
-    {
+    if !is_safe_worker_token_id(id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "worker token file id must be a single safe filename",
+        ));
+    }
+    if !matches!(principal, Principal::Worker { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker token file only allows Principal::Worker",
         ));
     }
     validate_token_principal(token, principal)
@@ -1440,6 +1475,7 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
 /// socket error, protocol violation, and server cancellation alike.
 pub trait ConnectionHooks: Send + Sync + 'static {
     fn on_connect(&self, _conn_id: u64, _principal: &Principal, _client: &str) {}
+    fn on_uds_presence_bind(&self, _conn_id: u64) {}
     fn on_disconnect(&self, _conn_id: u64, _principal: &Principal) {}
 }
 
@@ -1647,6 +1683,7 @@ async fn handle_conn(
                     } = bind.endpoint
                 {
                     *conn_id = conn;
+                    disconnect_guard.hooks.on_uds_presence_bind(conn);
                 }
                 let router = router.clone();
                 let by = session.me().clone();

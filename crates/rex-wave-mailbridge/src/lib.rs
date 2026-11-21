@@ -24,7 +24,7 @@ pub use presence::{
 };
 pub use score::{
     FixtureCoverageReport, GATE1_CASE_IDS, ShadowScoreReport, check_gate1_fixtures,
-    score_shadow_against_acks, score_shadow_jsonl,
+    extract_shadow_aliases, score_shadow_against_acks, score_shadow_jsonl,
 };
 pub use shadow::{
     DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,

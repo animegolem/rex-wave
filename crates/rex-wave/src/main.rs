@@ -35,8 +35,8 @@ use rex_wave_board::task_org::{
 };
 use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
-    RingPolicy, check_gate1_fixtures, load_claude_session_file, parse_acks_jsonl,
-    parse_claude_session_json, run_shadow_pass, score_shadow_jsonl,
+    RingPolicy, check_gate1_fixtures, extract_shadow_aliases, load_claude_session_file,
+    parse_acks_jsonl, parse_claude_session_json, run_shadow_pass, score_shadow_jsonl,
 };
 use rex_wave_mcp::McpServer;
 use rex_wave_runtime::{Decider, EntryMeta};
@@ -1036,7 +1036,21 @@ fn load_claude_session_endpoint(
     claude_pid_arg: Option<u32>,
     allow_fork: bool,
 ) -> Result<TransportEndpoint, ApiError> {
+    if let (Some(a), Some(b)) = (pid_arg, claude_pid_arg)
+        && a != b
+    {
+        return Err(invalid(
+            "pid",
+            format!("--pid ({a}) and --claude-pid ({b}) disagree"),
+        ));
+    }
     let session = if !path_arg.trim().is_empty() {
+        if pid_arg.is_some() || claude_pid_arg.is_some() {
+            return Err(invalid(
+                "from-claude-session",
+                "pass either a session JSON path or --pid/--claude-pid, not both",
+            ));
+        }
         let path = PathBuf::from(path_arg.trim());
         let meta = std::fs::symlink_metadata(&path).map_err(|e| {
             invalid(
@@ -1067,7 +1081,14 @@ fn load_claude_session_endpoint(
             })
             .or_else(|| {
                 let ppid = std::os::unix::process::parent_id();
-                (ppid > 0).then_some(ppid)
+                if ppid > 0 {
+                    eprintln!(
+                        "rex-wave presence bind: no --pid or CLAUDE_PID set; using parent PID {ppid}"
+                    );
+                    Some(ppid)
+                } else {
+                    None
+                }
             })
             .ok_or_else(|| {
                 invalid(
@@ -2600,27 +2621,65 @@ async fn execute_tasks_org_sync<C: Client>(
         return Ok(ExitCode::SUCCESS);
     }
 
+    const MAX_WATCH_CONSECUTIVE_ERRORS: u32 = 20;
     let sleep_dur = Duration::from_millis(interval_ms.max(50));
+    let mut consecutive_errors: u32 = 0;
+    let mut last_conflict_bytes: Option<Vec<u8>> = None;
     loop {
-        let step = run_org_sync_step(client, &room_ref, file, &mut state, &options).await?;
-        let (payload, summary, is_conflict) = format_org_sync_step(&step);
-        if is_conflict {
-            if as_json {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string(&payload).expect("conflict json")
-                );
-            } else {
-                eprintln!("error: conflict: {summary}");
+        let skip_same_conflict = if let Some(ref prev_conflict) = last_conflict_bytes {
+            match std::fs::read(file) {
+                Ok(cur) if cur == *prev_conflict => true,
+                Ok(_) => {
+                    last_conflict_bytes = None;
+                    false
+                }
+                Err(_) => false,
             }
-        } else if !matches!(step, OrgSyncStep::RoomToOrg(RoomToOrgOutcome::Unchanged)) {
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&payload).expect("org sync json")
-                );
-            } else {
-                println!("{summary}");
+        } else {
+            false
+        };
+
+        if !skip_same_conflict {
+            match run_org_sync_step(client, &room_ref, file, &mut state, &options).await {
+                Ok(step) => {
+                    consecutive_errors = 0;
+                    let (payload, summary, is_conflict) = format_org_sync_step(&step);
+                    if is_conflict {
+                        last_conflict_bytes = std::fs::read(file).ok();
+                        if as_json {
+                            eprintln!(
+                                "{}",
+                                serde_json::to_string(&payload).expect("conflict json")
+                            );
+                        } else {
+                            eprintln!("error: conflict: {summary}");
+                        }
+                    } else {
+                        last_conflict_bytes = None;
+                        if !matches!(step, OrgSyncStep::RoomToOrg(RoomToOrgOutcome::Unchanged)) {
+                            if as_json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(&payload).expect("org sync json")
+                                );
+                            } else {
+                                println!("{summary}");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    consecutive_errors += 1;
+                    if !as_json {
+                        eprintln!(
+                            "rex-wave tasks org-sync: watch error ({consecutive_errors}/{MAX_WATCH_CONSECUTIVE_ERRORS})"
+                        );
+                    }
+                    print_error(&err, as_json);
+                    if consecutive_errors >= MAX_WATCH_CONSECUTIVE_ERRORS {
+                        return Err(err);
+                    }
+                }
             }
         }
         tokio::select! {
@@ -2630,25 +2689,12 @@ async fn execute_tasks_org_sync<C: Client>(
     }
 }
 
-fn canonicalize_deepest_existing(path: &Path) -> PathBuf {
+fn canonicalize_deepest_existing_no_parent(path: &Path) -> PathBuf {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return canon;
     }
-    let mut normalized = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    if let Ok(canon) = std::fs::canonicalize(&normalized) {
-        return canon;
-    }
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cursor = normalized.as_path();
+    let mut cursor = path;
     while let Some(name) = cursor.file_name() {
         tail.push(name.to_os_string());
         let Some(parent) = cursor.parent() else {
@@ -2663,12 +2709,21 @@ fn canonicalize_deepest_existing(path: &Path) -> PathBuf {
         }
         cursor = parent;
     }
-    normalized
+    path.to_path_buf()
 }
 
 fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result<(), CliError> {
     if out == Path::new("-") {
         return Ok(());
+    }
+    if out
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(CliError::Msg(format!(
+            "refusing shadow output {} containing '..' parent traversal",
+            out.display()
+        )));
     }
     let abs = if out.is_absolute() {
         out.to_path_buf()
@@ -2677,7 +2732,15 @@ fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result
             .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
             .join(out)
     };
-    let candidate = canonicalize_deepest_existing(&abs);
+    if let Ok(meta) = std::fs::symlink_metadata(&abs)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output through symlink {}",
+            out.display()
+        )));
+    }
+    let candidate = canonicalize_deepest_existing_no_parent(&abs);
     if candidate.starts_with(interchange_root) {
         return Err(CliError::Msg(format!(
             "refusing to write shadow output {} inside read-only interchange {}",
@@ -2690,20 +2753,69 @@ fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result
 
 static SHADOW_OUT_NONCE: AtomicU64 = AtomicU64::new(1);
 
-fn write_file_atomic(target: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
-    }
-    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let mut tmp_name = target
+fn write_file_atomic_outside(
+    target: &Path,
+    interchange_root: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    ensure_out_outside_interchange(target, interchange_root)?;
+    let abs = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
+            .join(target)
+    };
+    let file_name = abs
         .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| std::ffi::OsString::from("shadow"));
+        .ok_or_else(|| {
+            CliError::Msg(format!(
+                "shadow output {} has no file name",
+                target.display()
+            ))
+        })?
+        .to_os_string();
+    let parent = abs
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            CliError::Msg(format!(
+                "shadow output {} has no parent directory",
+                target.display()
+            ))
+        })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
+    if canon_parent.starts_with(interchange_root) {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output {} inside read-only interchange {}",
+            target.display(),
+            interchange_root.display()
+        )));
+    }
+    let final_target = canon_parent.join(&file_name);
+    if final_target.starts_with(interchange_root) {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output {} inside read-only interchange {}",
+            target.display(),
+            interchange_root.display()
+        )));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::Msg(format!(
+            "refusing to overwrite symlink {}",
+            final_target.display()
+        )));
+    }
+
+    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = file_name;
     tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
-    let tmp = target.with_file_name(tmp_name);
+    let tmp = canon_parent.join(tmp_name);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2715,9 +2827,12 @@ fn write_file_atomic(target: &Path, bytes: &[u8]) -> Result<(), CliError> {
         return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
     }
     drop(f);
-    if let Err(e) = std::fs::rename(&tmp, target) {
+    if let Err(e) = std::fs::rename(&tmp, &final_target) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!("rename {}: {e}", target.display())));
+        return Err(CliError::Msg(format!(
+            "rename {}: {e}",
+            final_target.display()
+        )));
     }
     Ok(())
 }
@@ -2739,12 +2854,11 @@ async fn load_live_presence_state(
     .await
     {
         Ok(c) => c,
-        Err(ApiError::Transport(_)) => {
-            eprintln!(
-                "rex-wave mail shadow: daemon socket {} unreachable; falling back to empty presence state",
+        Err(ApiError::Transport(msg)) => {
+            return Err(CliError::Msg(format!(
+                "mail shadow: daemon socket {} unreachable ({msg}); start the daemon or pass --offline for empty presence",
                 sock_path.display()
-            );
-            return Ok((PresenceState::default(), false));
+            )));
         }
         Err(e) => return Err(CliError::Api(e)),
     };
@@ -2810,12 +2924,12 @@ async fn execute_mail_shadow(
             now,
         )
         .map_err(|e| CliError::Msg(format!("shadow pass: {e}")))?;
-        let jsonl = report.to_jsonl();
+        let jsonl = report.to_jsonl_with_aliases(&aliases);
         if out == Path::new("-") {
             print!("{jsonl}");
             let _ = std::io::stdout().flush();
         } else {
-            write_file_atomic(out, jsonl.as_bytes())?;
+            write_file_atomic_outside(out, ro.root(), jsonl.as_bytes())?;
             if as_json {
                 println!(
                     "{}",
@@ -2862,7 +2976,7 @@ fn execute_mail_score(
         .map_err(|e| CliError::Msg(format!("read shadow {}: {e}", shadow_path.display())))?;
     let acks_text = std::fs::read_to_string(acks_path)
         .map_err(|e| CliError::Msg(format!("read acks {}: {e}", acks_path.display())))?;
-    let aliases = AliasMap::empty();
+    let aliases = extract_shadow_aliases(&shadow_text).map_err(CliError::Msg)?;
     let acks_report = parse_acks_jsonl(&acks_text, &aliases);
     let ack_index = acks_report.index();
     let score = score_shadow_jsonl(&shadow_text, &ack_index, &aliases).map_err(CliError::Msg)?;
@@ -2924,12 +3038,17 @@ fn execute_mail_score(
         );
         if let Some(ref fx) = fixtures {
             println!(
-                "fixtures: {}/{} Gate 1 cases covered (all_covered={})",
+                "fixtures: {}/{} Gate 1 cases covered (all_covered={}, missing={}, unknown={})",
                 fx.covered_cases,
                 fx.total_cases,
-                fx.all_covered()
+                fx.all_covered(),
+                fx.missing_case_ids.len(),
+                fx.unknown_case_ids.len(),
             );
         }
+    }
+    if fixtures.as_ref().is_some_and(|fx| !fx.all_covered()) {
+        return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2978,8 +3097,8 @@ async fn execute_task_show<C: Client>(
     Ok(ExitCode::SUCCESS)
 }
 
-async fn execute_presence_hold<C: Client>(
-    client: &C,
+async fn execute_presence_hold(
+    client: &RemoteClient,
     seat: Option<&String>,
     lane: Option<&String>,
     incarnation: Option<&String>,
@@ -2988,7 +3107,7 @@ async fn execute_presence_hold<C: Client>(
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
     let seat_name = resolve_seat_arg(seat, client.me())?;
-    let binding = client
+    let mut binding = client
         .call(PresenceBind {
             seat: seat_name.clone(),
             incarnation_id: match incarnation {
@@ -3009,15 +3128,52 @@ async fn execute_presence_hold<C: Client>(
         .await?;
     print_reply(&WireReply::PresenceBind(binding.clone()), as_json);
     let _ = std::io::stdout().flush();
-    let _ = tokio::signal::ctrl_c().await;
-    let _ = client
-        .call(PresenceUnbind {
-            seat: seat_name,
-            incarnation_id: binding.incarnation_id,
-            reason: Some("hold interrupted".into()),
-        })
-        .await;
-    Ok(ExitCode::SUCCESS)
+
+    let mut conn_rx = client.watch_connection();
+    let _ = conn_rx.borrow_and_update();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                let _ = client
+                    .call(PresenceUnbind {
+                        seat: seat_name,
+                        incarnation_id: binding.incarnation_id,
+                        reason: Some("hold interrupted".into()),
+                    })
+                    .await;
+                return Ok(ExitCode::SUCCESS);
+            }
+            changed = conn_rx.changed() => match changed {
+                Ok(()) => {
+                    if *conn_rx.borrow_and_update() {
+                        binding = client
+                            .call(PresenceBind {
+                                seat: seat_name.clone(),
+                                incarnation_id: Some(binding.incarnation_id.clone()),
+                                lane: lane.cloned(),
+                                endpoint: TransportEndpoint::UdsSession {
+                                    conn_id: 0,
+                                    client: client_name.to_owned(),
+                                },
+                                liveness: LivenessMode::SocketLifetime,
+                                ttl_ms: None,
+                                takeover: true,
+                                allow_fork: false,
+                                idem: None,
+                            })
+                            .await?;
+                        print_reply(&WireReply::PresenceBind(binding.clone()), as_json);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                Err(_) => {
+                    return Err(CliError::Msg(
+                        "presence hold: daemon connection closed permanently".into(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn execute_remote<C: Client>(
@@ -3044,25 +3200,6 @@ async fn execute_remote<C: Client>(
             *watch,
             *interval_ms,
             *conflict_sidecar,
-            as_json,
-        )
-        .await;
-    }
-    if let Cmd::Presence(PresenceCmd::Hold {
-        seat,
-        lane,
-        incarnation,
-        takeover,
-        client: client_name,
-    }) = cmd
-    {
-        return execute_presence_hold(
-            client,
-            seat.as_ref(),
-            lane.as_ref(),
-            incarnation.as_ref(),
-            *takeover,
-            client_name,
             as_json,
         )
         .await;
@@ -3269,6 +3406,30 @@ async fn main() -> ExitCode {
                 Err(e) => Err(CliError::Msg(e)),
             }
         }
+        Cmd::Presence(PresenceCmd::Hold {
+            seat,
+            lane,
+            incarnation,
+            takeover,
+            client: client_name,
+        }) => match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
+            Ok(cred) => match RemoteClient::connect(endpoint, cred, &client_name).await {
+                Ok(client) => {
+                    execute_presence_hold(
+                        &client,
+                        seat.as_ref(),
+                        lane.as_ref(),
+                        incarnation.as_ref(),
+                        takeover,
+                        &client_name,
+                        cli.json,
+                    )
+                    .await
+                }
+                Err(e) => Err(CliError::Api(e)),
+            },
+            Err(e) => Err(CliError::Msg(e)),
+        },
         other => match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
             Ok(cred) => match RemoteClient::connect(endpoint, cred, "cli").await {
                 Ok(client) => execute_remote(&client, &other, cli.json).await,

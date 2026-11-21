@@ -851,6 +851,24 @@ async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_
     assert_eq!(call_res.status, 200);
     assert_eq!(call_res.json()["reply"], "room_post");
 
+    let forged_uds_bind = send_raw(
+        addr,
+        &build_request(
+            "POST",
+            "/v1/call/presence_bind",
+            addr,
+            &[("Content-Type", "application/json")],
+            Some(
+                r#"{"seat":"sam","endpoint":{"kind":"uds_session","conn_id":42,"client":"forged"},"liveness":"socket_lifetime"}"#,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        forged_uds_bind.status, 400,
+        "HTTP /v1/call/presence_bind must refuse UdsSession endpoints"
+    );
+
     server.abort();
 }
 

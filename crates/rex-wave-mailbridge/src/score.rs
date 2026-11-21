@@ -27,12 +27,15 @@ pub struct FixtureCoverageReport {
     pub total_cases: usize,
     pub covered_cases: usize,
     pub case_ids: Vec<String>,
-    pub uncovered_case_ids: Vec<String>,
+    pub missing_case_ids: Vec<String>,
+    pub unknown_case_ids: Vec<String>,
 }
 
 impl FixtureCoverageReport {
     pub fn all_covered(&self) -> bool {
-        self.total_cases > 0 && self.uncovered_case_ids.is_empty()
+        self.total_cases == GATE1_CASE_IDS.len()
+            && self.missing_case_ids.is_empty()
+            && self.unknown_case_ids.is_empty()
     }
 
     pub fn to_json_value(&self) -> serde_json::Value {
@@ -41,17 +44,19 @@ impl FixtureCoverageReport {
             "covered_cases": self.covered_cases,
             "all_covered": self.all_covered(),
             "case_ids": self.case_ids,
-            "uncovered_case_ids": self.uncovered_case_ids,
+            "missing_case_ids": self.missing_case_ids,
+            "unknown_case_ids": self.unknown_case_ids,
         })
     }
 }
 
-/// Parses a Gate 1 `cases.jsonl` fixture document and reports coverage against [`GATE1_CASE_IDS`].
+/// Parses a Gate 1 `cases.jsonl` fixture document and verifies bidirectional
+/// coverage against [`GATE1_CASE_IDS`] (`missing_case_ids` and `unknown_case_ids`).
 pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, String> {
-    let known: BTreeSet<&str> = GATE1_CASE_IDS.iter().copied().collect();
+    let expected: BTreeSet<&str> = GATE1_CASE_IDS.iter().copied().collect();
     let mut case_ids = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut uncovered = Vec::new();
+    let mut unknown_case_ids = Vec::new();
 
     for (idx, raw) in cases_jsonl.lines().enumerate() {
         let line = raw.trim();
@@ -68,19 +73,25 @@ pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, 
             .ok_or_else(|| format!("fixtures line {}: missing non-empty `id`", idx + 1))?;
         if seen.insert(id.to_owned()) {
             case_ids.push(id.to_owned());
-            if !known.contains(id) {
-                uncovered.push(id.to_owned());
+            if !expected.contains(id) {
+                unknown_case_ids.push(id.to_owned());
             }
         }
     }
 
-    let total_cases = case_ids.len();
-    let covered_cases = total_cases.saturating_sub(uncovered.len());
+    let missing_case_ids: Vec<String> = GATE1_CASE_IDS
+        .iter()
+        .filter(|id| !seen.contains(**id))
+        .map(|id| (*id).to_owned())
+        .collect();
+    let total_cases = GATE1_CASE_IDS.len();
+    let covered_cases = total_cases.saturating_sub(missing_case_ids.len());
     Ok(FixtureCoverageReport {
         total_cases,
         covered_cases,
         case_ids,
-        uncovered_case_ids: uncovered,
+        missing_case_ids,
+        unknown_case_ids,
     })
 }
 
@@ -231,8 +242,40 @@ fn extract_referents_shas(
     Ok(shas)
 }
 
-/// Scores a JSONL shadow log produced by `ShadowPassReport::to_jsonl` against
-/// ground-truth `acks.jsonl`, matching [`score_shadow_against_acks`] exactly.
+/// Extracts any `{"meta":"aliases","aliases":{...}}` header lines emitted by
+/// `ShadowPassReport::to_jsonl_with_aliases` into an [`AliasMap`].
+pub fn extract_shadow_aliases(shadow_jsonl: &str) -> Result<AliasMap, String> {
+    let mut aliases = AliasMap::empty();
+    for (idx, raw) in shadow_jsonl.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("shadow line {line_no}: invalid JSON: {e}"))?;
+        let Some(obj) = val.as_object() else {
+            return Err(format!("shadow line {line_no}: expected JSON object"));
+        };
+        if obj.get("meta").and_then(|v| v.as_str()) == Some("aliases") {
+            let map = obj
+                .get("aliases")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| format!("shadow line {line_no}: missing `aliases` object"))?;
+            for (k, v) in map {
+                let canon = v.as_str().ok_or_else(|| {
+                    format!("shadow line {line_no}: alias target for `{k}` must be a string")
+                })?;
+                aliases.insert(k, canon);
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+/// Scores a JSONL shadow log produced by `ShadowPassReport::to_jsonl` or
+/// `ShadowPassReport::to_jsonl_with_aliases` against ground-truth `acks.jsonl`,
+/// matching [`score_shadow_against_acks`] exactly.
 pub fn score_shadow_jsonl(
     shadow_jsonl: &str,
     acks: &AckIndex,
@@ -252,6 +295,9 @@ pub fn score_shadow_jsonl(
         let obj = val
             .as_object()
             .ok_or_else(|| format!("shadow line {line_no}: expected JSON object"))?;
+        if obj.get("meta").and_then(|v| v.as_str()) == Some("aliases") {
+            continue;
+        }
         let decision = obj
             .get("decision")
             .and_then(|v| v.as_str())
@@ -304,4 +350,76 @@ pub fn score_shadow_jsonl(
 
     report.seats_with_unrung = unrung_seats.into_iter().collect();
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acks::parse_acks_jsonl;
+    use crate::shadow::{RingDeliveryChannel, RingReferent, ShadowPassReport};
+    use rex_wave_api::IncarnationId;
+    use std::path::PathBuf;
+
+    #[test]
+    fn check_gate1_fixtures_reports_missing_and_unknown_cases_bidirectionally() {
+        let all_ten: String = GATE1_CASE_IDS
+            .iter()
+            .map(|id| format!(r#"{{"id":"{id}"}}"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full = check_gate1_fixtures(&all_ten).unwrap();
+        assert!(full.all_covered());
+        assert_eq!(full.total_cases, 10);
+        assert_eq!(full.covered_cases, 10);
+        assert!(full.missing_case_ids.is_empty());
+        assert!(full.unknown_case_ids.is_empty());
+
+        let one_line = r#"{"id":"genga-stale-six-days"}"#;
+        let subset = check_gate1_fixtures(one_line).unwrap();
+        assert!(!subset.all_covered());
+        assert_eq!(subset.total_cases, 10);
+        assert_eq!(subset.covered_cases, 1);
+        assert_eq!(subset.missing_case_ids.len(), 9);
+        assert!(subset.unknown_case_ids.is_empty());
+
+        let with_unknown = format!("{all_ten}\n{{\"id\":\"surprise-case\"}}");
+        let extra = check_gate1_fixtures(&with_unknown).unwrap();
+        assert!(!extra.all_covered());
+        assert_eq!(extra.covered_cases, 10);
+        assert!(extra.missing_case_ids.is_empty());
+        assert_eq!(extra.unknown_case_ids, vec!["surprise-case".to_owned()]);
+
+        assert!(check_gate1_fixtures("{not-json").is_err());
+        assert!(check_gate1_fixtures(r#"{"id":"   "}"#).is_err());
+    }
+
+    #[test]
+    fn shadow_alias_header_propagates_to_offline_score() {
+        let sha = Sha256Hex::parse("a".repeat(64)).unwrap();
+        let aliases = AliasMap::from_pairs([("tally-5.2", "tally")]);
+        let report = ShadowPassReport {
+            letters_scanned: 1,
+            acks_report: Default::default(),
+            decisions: vec![RingDecision::Ring {
+                seat: SeatName::parse("tally").unwrap(),
+                incarnation_id: IncarnationId::parse("inc_1").unwrap(),
+                channel: RingDeliveryChannel::ClaudeMessagingSocket {
+                    socket: PathBuf::from("/tmp/cc.sock"),
+                    pid: 42,
+                },
+                referent: RingReferent::new("mail/01.md", sha.clone()).unwrap(),
+            }],
+        };
+        let jsonl = report.to_jsonl_with_aliases(&aliases);
+        let parsed_aliases = extract_shadow_aliases(&jsonl).unwrap();
+        assert_eq!(parsed_aliases.canonicalize("Tally-5.2"), "tally");
+
+        let acks_raw =
+            format!(r#"{{"acked_by":"Tally-5.2","letter":"mail/01.md","sha256":"{sha}"}}"#);
+        let ack_idx = parse_acks_jsonl(&acks_raw, &parsed_aliases).index();
+        let scored = score_shadow_jsonl(&jsonl, &ack_idx, &parsed_aliases).unwrap();
+        assert_eq!(scored.rings_emitted, 1);
+        assert_eq!(scored.ring_referents_confirmed_acked, 1);
+        assert_eq!(scored.ring_referents_pending_ack, 0);
+    }
 }

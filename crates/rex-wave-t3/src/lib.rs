@@ -43,5 +43,5 @@ pub use rpc::{
 pub use worker_tokens::{
     ProvisionedWorkerToken, WORKER_TOKENS_DIR, WorkerTokenMinter, provision_worker_token,
     read_worker_token_file, remove_worker_token_file, worker_token_path, worker_tokens_dir,
-    write_worker_token_file, write_worker_token_record,
+    write_worker_token_record,
 };

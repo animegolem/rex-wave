@@ -26,12 +26,11 @@ pub type WorkerTokenMinter =
 
 fn validate_thread_filename(thread_id: &str) -> io::Result<()> {
     if thread_id.is_empty()
+        || thread_id.starts_with('.')
         || thread_id.contains('/')
         || thread_id.contains('\\')
-        || thread_id.contains('\0')
-        || thread_id == "."
-        || thread_id == ".."
         || thread_id.contains("..")
+        || thread_id.chars().any(char::is_control)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -107,18 +106,6 @@ fn write_worker_token_bytes(
     Ok(target)
 }
 
-/// Atomically writes `token` to `<state_dir>/worker-tokens/<thread_id>` with mode `0600`.
-pub fn write_worker_token_file(
-    state_dir: &Path,
-    thread_id: &str,
-    token: &str,
-) -> io::Result<PathBuf> {
-    let mut bytes = Vec::with_capacity(token.len() + 1);
-    bytes.extend_from_slice(token.as_bytes());
-    bytes.push(b'\n');
-    write_worker_token_bytes(state_dir, thread_id, &bytes)
-}
-
 /// Atomically writes a structured `WorkerTokenFile` JSON record (`{token, principal}`)
 /// readable by both `StateDirAuthenticator` and `read_worker_token_file`.
 pub fn write_worker_token_record(
@@ -133,10 +120,10 @@ pub fn write_worker_token_record(
             "worker token must be non-empty without control characters",
         ));
     }
-    if matches!(principal, Principal::System { .. }) {
+    if !matches!(principal, Principal::Worker { .. }) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "worker token file may not bind Principal::System",
+            "worker token file only allows Principal::Worker",
         ));
     }
     let record = WorkerTokenRecord {
@@ -249,22 +236,27 @@ pub fn provision_worker_token(
         && let Ok(Some(existing)) = read_worker_token_file(state_dir, thread.as_str())
     {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        if let Ok(rec) = serde_json::from_str::<WorkerTokenRecord>(raw.trim())
-            && rec.principal == principal
-        {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(rec) = serde_json::from_str::<WorkerTokenRecord>(trimmed)
+                && rec.principal == principal
+            {
+                return Ok(ProvisionedWorkerToken {
+                    path,
+                    token: existing,
+                    created: false,
+                });
+            }
+        } else {
+            let upgraded =
+                write_worker_token_record(state_dir, thread.as_str(), &existing, &principal)
+                    .map_err(|e| HostError::Unreachable(format!("upgrade worker token: {e}")))?;
             return Ok(ProvisionedWorkerToken {
-                path,
+                path: upgraded,
                 token: existing,
                 created: false,
             });
         }
-        let upgraded = write_worker_token_record(state_dir, thread.as_str(), &existing, &principal)
-            .map_err(|e| HostError::Unreachable(format!("upgrade worker token: {e}")))?;
-        return Ok(ProvisionedWorkerToken {
-            path: upgraded,
-            token: existing,
-            created: false,
-        });
     }
 
     let token = mint_random_worker_token()
@@ -318,6 +310,15 @@ mod tests {
             serde_json::json!({ "kind": "worker", "wave": "w1", "role": "author" })
         );
 
+        let other_role = RoleName::parse("reviewer").unwrap();
+        let rotated =
+            provision_worker_token(tmp.path(), &wave, &other_role, &thread, None).unwrap();
+        assert!(rotated.created);
+        assert_ne!(
+            rotated.token, first.token,
+            "different principal on same thread id must mint a fresh token"
+        );
+
         remove_worker_token_file(tmp.path(), thread.as_str()).unwrap();
         remove_worker_token_file(tmp.path(), thread.as_str()).unwrap();
         assert_eq!(
@@ -326,6 +327,19 @@ mod tests {
         );
 
         assert!(worker_token_path(tmp.path(), "../escape").is_err());
+        assert!(worker_token_path(tmp.path(), ".hidden").is_err());
+        assert!(worker_token_path(tmp.path(), "a..b").is_err());
         assert!(worker_token_path(tmp.path(), "a/b").is_err());
+        assert!(
+            write_worker_token_record(
+                tmp.path(),
+                "seat-bad",
+                "tok_seat",
+                &Principal::Seat {
+                    seat: rex_wave_api::SeatName::parse("sam").unwrap(),
+                },
+            )
+            .is_err()
+        );
     }
 }

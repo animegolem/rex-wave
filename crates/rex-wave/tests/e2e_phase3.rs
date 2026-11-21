@@ -1,4 +1,4 @@
-use rex_wave_mailbridge::current_process_start;
+use rex_wave_mailbridge::{GATE1_CASE_IDS, current_process_start};
 use rex_wave_t3::transport::ws_accept;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -29,6 +29,28 @@ impl Drop for DirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    fn walk(base: &Path, cur: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(cur)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let rel = path.strip_prefix(base).unwrap().to_path_buf();
+            out.push((rel, meta.len(), meta.modified().unwrap()));
+            if meta.file_type().is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
 }
 
 fn fresh_dir(label: &str) -> DirGuard {
@@ -991,6 +1013,10 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     )
     .unwrap();
 
+    daemon
+        .cli_json(&["presence", "claim", "tally", "--alias", "tally-desk"])
+        .await;
+
     let bind_bg = daemon
         .cli(
             &[
@@ -1012,6 +1038,15 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         "bg Claude session bind failed: {}",
         String::from_utf8_lossy(&bind_bg.stderr)
     );
+    let bind_bg_json: Value = serde_json::from_slice(&bind_bg.stdout).unwrap();
+    assert_eq!(bind_bg_json["reply"], "presence_bind");
+    assert_eq!(
+        bind_bg_json["value"]["endpoint"]["transport"],
+        "claude_session"
+    );
+    assert_eq!(bind_bg_json["value"]["endpoint"]["pid"], my_pid);
+    assert_eq!(bind_bg_json["value"]["endpoint"]["session_id"], "sess-bg-1");
+    assert_eq!(bind_bg_json["value"]["endpoint"]["kind"], "bg");
 
     let fork_path = daemon.dir.0.join("fork-session.json");
     std::fs::write(
@@ -1046,21 +1081,88 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         !fork_denied.status.success(),
         "forked Claude session must fail without --allow-fork"
     );
+    let fork_err = String::from_utf8_lossy(&fork_denied.stderr);
+    assert!(
+        fork_err.contains("fork") || fork_err.contains("⑂") || fork_err.contains("allow-fork"),
+        "expected fork refusal message, got: {fork_err}"
+    );
 
     let synth_interchange = daemon.dir.0.join("synth-interchange");
     std::fs::create_dir_all(synth_interchange.join("mail")).unwrap();
     std::fs::create_dir_all(synth_interchange.join("state")).unwrap();
-    std::fs::write(
-        synth_interchange.join("mail/01-to-tally.md"),
-        "---\nfrom: crest\nto: tally\nsubject: Live shadow check\n---\nping\n",
-    )
-    .unwrap();
+    let letter1_bytes = b"---\nfrom: crest\nto: tally\nsubject: Live shadow check\n---\nping\n";
+    std::fs::write(synth_interchange.join("mail/01-to-tally.md"), letter1_bytes).unwrap();
     std::fs::write(
         synth_interchange.join("mail/02-to-genga.md"),
         "---\nfrom: crest\nto: genga\nsubject: Offline shadow check\n---\nping\n",
     )
     .unwrap();
     std::fs::write(synth_interchange.join("state/acks.jsonl"), "").unwrap();
+
+    let tree_before = snapshot_tree(&synth_interchange);
+
+    let outside_dir = daemon.dir.0.join("outside-link-test");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::os::unix::fs::symlink(&synth_interchange, outside_dir.join("link")).unwrap();
+    let escape_dotdot = outside_dir.join("link/../synth-interchange/escaped.jsonl");
+    let escape_direct = outside_dir.join("link/escaped.jsonl");
+    for escaped in [&escape_dotdot, &escape_direct] {
+        let refused = daemon
+            .cli(
+                &[
+                    "mail",
+                    "shadow",
+                    "--interchange",
+                    synth_interchange.to_str().unwrap(),
+                    "--out",
+                    escaped.to_str().unwrap(),
+                    "--once",
+                ],
+                &[],
+                &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+            )
+            .await;
+        assert!(
+            !refused.status.success(),
+            "mail shadow must refuse --out escaping into interchange via {}",
+            escaped.display()
+        );
+    }
+    assert!(
+        !synth_interchange.join("escaped.jsonl").exists(),
+        "refused shadow escape must never write into interchange"
+    );
+
+    let unreachable_sock = daemon.dir.0.join("no-such-daemon.sock");
+    let unreachable_out = tokio::task::spawn_blocking({
+        let sock = unreachable_sock.clone();
+        let interchange = synth_interchange.clone();
+        let out_file = daemon.dir.0.join("unreachable-shadow.jsonl");
+        move || {
+            Command::new(bin_path())
+                .env_remove("REX_WAVE_TOKEN")
+                .env_remove("T3CODE_THREAD_ID")
+                .args([
+                    "--socket",
+                    sock.to_str().unwrap(),
+                    "mail",
+                    "shadow",
+                    "--interchange",
+                    interchange.to_str().unwrap(),
+                    "--out",
+                    out_file.to_str().unwrap(),
+                    "--once",
+                ])
+                .output()
+                .expect("run unreachable mail shadow")
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !unreachable_out.status.success(),
+        "mail shadow without --offline must fail when daemon socket is unreachable"
+    );
 
     let shadow_out_path = daemon.dir.0.join("shadow.jsonl");
     let shadow_summary = daemon
@@ -1076,6 +1178,33 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         .await;
     assert_eq!(shadow_summary["live_presence"], true);
     assert_eq!(shadow_summary["letters_scanned"], 2);
+    assert_eq!(
+        snapshot_tree(&synth_interchange),
+        tree_before,
+        "mail shadow must leave the entire interchange directory tree untouched"
+    );
+
+    let shadow_raw = std::fs::read_to_string(&shadow_out_path).unwrap();
+    let sha1 = shadow_raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v["decision"] == "ring" && v["seat"] == "tally")
+        .and_then(|v| v["referent"]["sha256"].as_str().map(str::to_owned))
+        .expect("shadow.jsonl must contain ring referent sha256 for tally");
+    let alias_acks_path = daemon.dir.0.join("alias-acks.jsonl");
+    std::fs::write(
+        &alias_acks_path,
+        format!("{{\"acked_by\":\"Tally-Desk\",\"letter\":\"mail/01-to-tally.md\",\"sha256\":\"{sha1}\"}}\n"),
+    )
+    .unwrap();
+
+    let all_fixtures_path = daemon.dir.0.join("gate1-full.jsonl");
+    let all_fixtures_text: String = GATE1_CASE_IDS
+        .iter()
+        .map(|id| format!(r#"{{"id":"{id}"}}"#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&all_fixtures_path, &all_fixtures_text).unwrap();
 
     let score_summary = daemon
         .cli_json(&[
@@ -1084,18 +1213,55 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
             "--shadow",
             shadow_out_path.to_str().unwrap(),
             "--acks",
-            synth_interchange.join("state/acks.jsonl").to_str().unwrap(),
+            alias_acks_path.to_str().unwrap(),
+            "--fixtures",
+            all_fixtures_path.to_str().unwrap(),
         ])
         .await;
     assert_eq!(score_summary["shadow_score"]["rings_emitted"], 1);
+    assert_eq!(
+        score_summary["shadow_score"]["ring_referents_confirmed_acked"], 1,
+        "mail score must honor aliases embedded from live presence when matching acks"
+    );
     assert_eq!(score_summary["shadow_score"]["unrung_alerts"], 1);
     assert_eq!(score_summary["shadow_score"]["unrung_referents_caught"], 1);
+    assert_eq!(score_summary["fixtures"]["all_covered"], true);
+    assert_eq!(score_summary["fixtures"]["covered_cases"], 10);
+    assert_eq!(score_summary["fixtures"]["missing_case_ids"], json!([]));
+    assert_eq!(score_summary["fixtures"]["unknown_case_ids"], json!([]));
+
+    let partial_fixtures_path = daemon.dir.0.join("gate1-partial.jsonl");
+    std::fs::write(&partial_fixtures_path, r#"{"id":"genga-stale-six-days"}"#).unwrap();
+    let partial_score = daemon
+        .cli(
+            &[
+                "--json",
+                "mail",
+                "score",
+                "--shadow",
+                shadow_out_path.to_str().unwrap(),
+                "--acks",
+                alias_acks_path.to_str().unwrap(),
+                "--fixtures",
+                partial_fixtures_path.to_str().unwrap(),
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
     assert_eq!(
-        std::fs::read_dir(synth_interchange.join("state"))
+        partial_score.status.code(),
+        Some(1),
+        "incomplete Gate 1 fixture file must exit non-zero"
+    );
+    let partial_json: Value = serde_json::from_slice(&partial_score.stdout).unwrap();
+    assert_eq!(partial_json["fixtures"]["all_covered"], false);
+    assert_eq!(
+        partial_json["fixtures"]["missing_case_ids"]
+            .as_array()
             .unwrap()
-            .count(),
-        1,
-        "mail shadow must never write into the interchange directory"
+            .len(),
+        9
     );
 }
 
@@ -1162,6 +1328,7 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
 
     let _ = hold_child.kill();
     let _ = hold_child.wait();
+    let unbind_instant = Instant::now();
 
     tokio::time::timeout(Duration::from_secs(4), async {
         loop {
@@ -1245,6 +1412,11 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
     })
     .await
     .expect("HeraldHandle grace timer flushed MailUnrung after 15 s with zero extra events");
+    let grace_elapsed = unbind_instant.elapsed();
+    assert!(
+        grace_elapsed >= Duration::from_millis(14_500),
+        "MailUnrung must wait for the 15 s reconnect grace window, fired after {grace_elapsed:?}"
+    );
     assert_eq!(raised_card["draft"]["kind"]["kind"], "mail_unrung");
     assert_eq!(raised_card["draft"]["kind"]["unread_count"], 1);
     assert_eq!(raised_card["state"], "unread");

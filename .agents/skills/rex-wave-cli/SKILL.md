@@ -125,7 +125,7 @@ rex-wave mail shadow --offline --interchange ~/agent-folder/interchange --out /t
 rex-wave mail score --shadow /tmp/shadow.jsonl --acks ~/agent-folder/interchange/state/acks.jsonl --fixtures ~/agent-folder/interchange/fixtures/mail-routing/cases.jsonl --json
 ```
 
-`mail shadow` uses live presence state from `--socket` when reachable, or an empty offline presence table when `--offline` is passed, and refuses to write `--out` inside `--interchange`.
+`mail shadow` reads live presence state from `--socket` (failing if unreachable unless `--offline` is passed), embeds active seat aliases in its JSONL output for `mail score`, and refuses to write `--out` inside `--interchange` (including via `..` or symlinks). `mail score --fixtures` exits non-zero when any Gate 1 case is missing or unknown.
 
 ## HTTP and SSE access
 

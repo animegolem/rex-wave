@@ -1998,12 +1998,49 @@ impl ReplayBuffer {
     }
 }
 
+#[derive(Default)]
+struct GraceSignal {
+    notified: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl GraceSignal {
+    fn notify(&self) {
+        self.notified
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(w) = self.waker.lock().expect("grace waker lock").take() {
+            w.wake();
+        }
+    }
+
+    fn notified(&self) -> impl Future<Output = ()> + Send + '_ {
+        std::future::poll_fn(|cx| {
+            if self
+                .notified
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return std::task::Poll::Ready(());
+            }
+            let mut slot = self.waker.lock().expect("grace waker lock");
+            if self
+                .notified
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return std::task::Poll::Ready(());
+            }
+            *slot = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+    }
+}
+
 /// Cloneable handle to a running [`Herald`] reactor's view, allowing a daemon
 /// timer task to query [`HeraldHandle::next_grace_deadline`] and call
 /// [`HeraldHandle::flush_due_at`] after `spawn_reactor` takes ownership of `Herald`.
 #[derive(Clone)]
 pub struct HeraldHandle {
     view: std::sync::Arc<std::sync::Mutex<HeraldView>>,
+    grace_signal: std::sync::Arc<GraceSignal>,
 }
 
 impl HeraldHandle {
@@ -2012,6 +2049,11 @@ impl HeraldHandle {
             .lock()
             .expect("herald view lock")
             .next_grace_deadline(now)
+    }
+
+    /// Resolves when [`Herald`] updates its grace view after a committed event or replay catch-up.
+    pub fn notified(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.grace_signal.notified()
     }
 
     pub fn flush_due_at(
@@ -2048,6 +2090,7 @@ impl HeraldHandle {
 
 pub struct Herald {
     view: std::sync::Arc<std::sync::Mutex<HeraldView>>,
+    grace_signal: std::sync::Arc<GraceSignal>,
     caught_up: bool,
     replay: std::sync::Arc<std::sync::Mutex<ReplayBuffer>>,
 }
@@ -2056,6 +2099,7 @@ impl Herald {
     pub fn new() -> Self {
         Herald {
             view: std::sync::Arc::new(std::sync::Mutex::new(HeraldView::default())),
+            grace_signal: std::sync::Arc::new(GraceSignal::default()),
             caught_up: false,
             replay: std::sync::Arc::new(std::sync::Mutex::new(ReplayBuffer::default())),
         }
@@ -2072,6 +2116,7 @@ impl Herald {
     pub fn handle(&self) -> HeraldHandle {
         HeraldHandle {
             view: self.view.clone(),
+            grace_signal: self.grace_signal.clone(),
         }
     }
 
@@ -2113,9 +2158,12 @@ impl Reactor for Herald {
         match frame {
             Frame::Committed(env) => {
                 if self.caught_up {
-                    let mut view = self.view.lock().expect("herald view lock");
-                    view.observe(&env);
-                    live_raises = classify(&env, &view);
+                    {
+                        let mut view = self.view.lock().expect("herald view lock");
+                        view.observe(&env);
+                        live_raises = classify(&env, &view);
+                    }
+                    self.grace_signal.notify();
                     flush_replay = true;
                 } else {
                     let drafts = {
@@ -2137,6 +2185,7 @@ impl Reactor for Herald {
                     let now = view.latest_at;
                     view.due_mail_unrung(now)
                 };
+                self.grace_signal.notify();
                 if !due.is_empty() {
                     let mut buf = self.replay.lock().expect("herald replay buffer");
                     for (to, draft) in due {

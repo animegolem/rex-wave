@@ -25,14 +25,15 @@ use rex_wave_t3::{
     T3Feed, T3Host, T3Origin, ThreadIdResolver, runtime_file_path, worker_tokens_dir,
 };
 use rex_wave_transport::{
-    Authenticator, ConnectionHooks, Endpoint, FnConnectionHooks, PrincipalTokenTable,
-    StateDirAuthenticator, WorkerTokenFile, bind_unix, serve_listener_with_hooks,
-    write_worker_token_file,
+    Authenticator, ConnectionHooks, Endpoint, PrincipalTokenTable, StateDirAuthenticator,
+    WorkerTokenFile, bind_unix, check_private_file, is_safe_worker_token_id,
+    serve_listener_with_hooks, write_worker_token_file,
 };
 use rex_wave_waves::{WaveConductor, Waves};
+use std::collections::HashSet;
 use std::io::{self, Read as _};
 use std::net::SocketAddr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -223,10 +224,13 @@ pub fn mint_principal_token(
     principal: &Principal,
     thread_id: Option<&str>,
 ) -> io::Result<String> {
-    if matches!(principal, Principal::System { .. }) {
+    if matches!(
+        principal,
+        Principal::System { .. } | Principal::Operator { .. }
+    ) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "cannot mint bearer token for Principal::System",
+            "cannot mint bearer token for Operator or System principals",
         ));
     }
 
@@ -235,11 +239,29 @@ pub fn mint_principal_token(
         _ => "rw_",
     };
 
+    let tokens_path = tokens_path_for(sock_path);
+    let _guard = lock_token_store(&tokens_path)?;
+
     if let Some(tid) = thread_id {
+        if !matches!(principal, Principal::Worker { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "thread-scoped worker token files only allow Principal::Worker",
+            ));
+        }
+        if !is_safe_worker_token_id(tid) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker token thread id must be a single safe filename",
+            ));
+        }
         let state_dir = state_dir_for(sock_path);
         let dir = worker_tokens_dir(&state_dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let path = dir.join(tid);
-        if let Ok(raw) = std::fs::read(&path)
+        if check_private_file(&path, None, "worker token file").unwrap_or(false)
+            && let Ok(raw) = std::fs::read(&path)
             && let Ok(existing) = serde_json::from_slice::<WorkerTokenFile>(&raw)
             && existing.principal == *principal
             && !existing.token.is_empty()
@@ -251,8 +273,6 @@ pub fn mint_principal_token(
         return Ok(token);
     }
 
-    let tokens_path = tokens_path_for(sock_path);
-    let _guard = lock_token_store(&tokens_path)?;
     let mut table = PrincipalTokenTable::load_tokens_file(&tokens_path, None)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let token = random_token(prefix)?;
@@ -292,45 +312,50 @@ pub fn mint_worker_token(
 fn spawn_herald_grace_timer(
     handle: HeraldHandle,
     client: LocalClient,
-    mut hub_rx: tokio::sync::broadcast::Receiver<Arc<Envelope>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        const IDLE_POLL: Duration = Duration::from_millis(250);
-        const EVENT_SETTLE: Duration = Duration::from_millis(50);
+        let mut logged_err = false;
         loop {
             let now = rex_wave_runtime::now();
-            let _ = handle.flush_due_at(now, &client).await;
-            let wait = match handle.next_grace_deadline(now) {
+            match handle.flush_due_at(now, &client).await {
+                Ok(()) => logged_err = false,
+                Err(err) => {
+                    if !logged_err {
+                        eprintln!("rex-wave daemon: herald grace flush failed: {err}");
+                        logged_err = true;
+                    }
+                }
+            }
+            match handle.next_grace_deadline(now) {
                 Some(deadline) => {
                     let rem_ms = deadline.0.saturating_sub(now.0).saturating_add(5);
-                    Duration::from_millis(rem_ms)
-                }
-                None => IDLE_POLL,
-            };
-            tokio::select! {
-                () = tokio::time::sleep(wait) => {}
-                res = hub_rx.recv() => match res {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        tokio::time::sleep(EVENT_SETTLE).await;
-                        while hub_rx.try_recv().is_ok() {}
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(rem_ms)) => {}
+                        () = handle.notified() => {}
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
+                }
+                None => {
+                    handle.notified().await;
+                }
             }
         }
     })
 }
 
 async fn unbind_uds_sessions(monitor: &LocalClient, target_conn: Option<u64>) {
-    let Ok(snap) = monitor
+    let snap = match monitor
         .call(PresenceList {
             project: None,
             live_only: false,
             include_retired: true,
         })
         .await
-    else {
-        return;
+    {
+        Ok(snap) => snap,
+        Err(err) => {
+            eprintln!("rex-wave daemon: presence list during UDS unbind failed: {err}");
+            return;
+        }
     };
     for seat_view in snap.seats {
         for binding in seat_view.bindings {
@@ -350,20 +375,51 @@ async fn unbind_uds_sessions(monitor: &LocalClient, target_conn: Option<u64>) {
                 Some(id) => format!("uds connection #{id} disconnected"),
                 None => format!("orphaned uds connection #{conn_id} swept on daemon start"),
             };
-            let _ = monitor
+            if let Err(err) = monitor
                 .call(PresenceUnbind {
-                    seat: binding.seat,
-                    incarnation_id: binding.incarnation_id,
+                    seat: binding.seat.clone(),
+                    incarnation_id: binding.incarnation_id.clone(),
                     reason: Some(reason),
                 })
-                .await;
+                .await
+            {
+                eprintln!(
+                    "rex-wave daemon: presence unbind failed for {} ({}): {err}",
+                    binding.seat, binding.incarnation_id
+                );
+            }
+        }
+    }
+}
+
+struct PresenceDisconnectHooks {
+    tracked: Mutex<HashSet<u64>>,
+    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
+}
+
+impl ConnectionHooks for PresenceDisconnectHooks {
+    fn on_uds_presence_bind(&self, conn_id: u64) {
+        self.tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conn_id);
+    }
+
+    fn on_disconnect(&self, conn_id: u64, _principal: &Principal) {
+        let had_binding = self
+            .tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conn_id);
+        if had_binding && let Err(err) = self.disconnect_tx.try_send(conn_id) {
+            eprintln!("rex-wave daemon: disconnect queue full for conn #{conn_id}: {err}");
         }
     }
 }
 
 fn spawn_presence_disconnect_worker(
     monitor: LocalClient,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+    mut rx: tokio::sync::mpsc::Receiver<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(conn_id) = rx.recv().await {
@@ -438,7 +494,6 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let journal = Journal::open(&journal_path).map_err(|e| format!("open journal: {e}"))?;
     let hub = Hub::new(4096);
-    let herald_hub_rx = hub.tap();
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let sandbox =
         SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
@@ -519,7 +574,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let (herald, herald_handle) = Herald::with_handle();
     let herald_client = system(SystemPart::Herald);
     let herald_task = spawn_reactor(herald, herald_client.clone());
-    let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client, herald_hub_rx);
+    let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client);
     let bell_task = spawn_reactor(BellCourier, system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
@@ -530,15 +585,13 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let presence_monitor = system(SystemPart::PresenceMonitor);
     unbind_uds_sessions(&presence_monitor, None).await;
-    let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::channel(256);
     let presence_disconnect_task =
         spawn_presence_disconnect_worker(presence_monitor, disconnect_rx);
-    let hooks: Arc<dyn ConnectionHooks> = Arc::new(FnConnectionHooks::new(
-        |_, _, _| {},
-        move |conn_id, _| {
-            let _ = disconnect_tx.send(conn_id);
-        },
-    ));
+    let hooks: Arc<dyn ConnectionHooks> = Arc::new(PresenceDisconnectHooks {
+        tracked: Mutex::new(HashSet::new()),
+        disconnect_tx,
+    });
 
     let (listener, daemon_uid) =
         bind_unix(&sock_path).map_err(|e| format!("bind {}: {e}", sock_path.display()))?;

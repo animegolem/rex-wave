@@ -1586,3 +1586,93 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
 
     server.abort();
 }
+
+#[test]
+fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tokens_path = tmp.path().join("tokens.json");
+    let legacy_json = serde_json::json!({
+        "tok_sam": "sam",
+        "tok_legacy_worker": {
+            "wave": "auth-v2",
+            "role": "author",
+            "thread_id": "t3:auth-v2:author:a1"
+        },
+        "tok_legacy_worker_no_tid": {
+            "wave": "auth-v2",
+            "role": "reviewer"
+        }
+    });
+    std::fs::write(&tokens_path, serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+    std::fs::set_permissions(&tokens_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let loaded = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert_eq!(
+        loaded.get("tok_sam"),
+        Some(&Principal::Seat {
+            seat: SeatName::parse("sam").unwrap()
+        })
+    );
+    assert_eq!(
+        loaded.get("tok_legacy_worker"),
+        Some(&Principal::Worker {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("author").unwrap(),
+        })
+    );
+    assert_eq!(
+        loaded.get("tok_legacy_worker_no_tid"),
+        Some(&Principal::Worker {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("reviewer").unwrap(),
+        })
+    );
+
+    let worker_dir = tmp.path().join("worker-tokens");
+    std::fs::create_dir_all(&worker_dir).unwrap();
+    std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!rex_wave_transport::is_safe_worker_token_id("a..b"));
+    assert!(rex_wave_transport::is_safe_worker_token_id(
+        "t3:auth-v2:author:a1"
+    ));
+
+    let op_principal = Principal::Operator {
+        seat: SeatName::parse("golem").unwrap(),
+    };
+    let seat_principal = Principal::Seat {
+        seat: SeatName::parse("sam").unwrap(),
+    };
+    assert!(write_worker_token_file(&worker_dir, "op_bad", "tok_op", &op_principal).is_err());
+    assert!(write_worker_token_file(&worker_dir, "seat_bad", "tok_seat", &seat_principal).is_err());
+
+    let forged_op = worker_dir.join("forged_op");
+    std::fs::write(
+        &forged_op,
+        serde_json::to_vec(&serde_json::json!({
+            "token": "tok_forged_op",
+            "principal": { "kind": "operator", "seat": "golem" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&forged_op, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let forged_seat = worker_dir.join("forged_seat");
+    std::fs::write(
+        &forged_seat,
+        serde_json::to_vec(&serde_json::json!({
+            "token": "tok_forged_seat",
+            "principal": { "kind": "seat", "seat": "sam" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&forged_seat, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let workers_loaded = PrincipalTokenTable::load_worker_tokens_dir(&worker_dir, None).unwrap();
+    assert!(workers_loaded.get("tok_forged_op").is_none());
+    assert!(workers_loaded.get("tok_forged_seat").is_none());
+}
