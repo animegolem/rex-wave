@@ -11,9 +11,17 @@ Use `rex-wave` directly in bash from any coding agent (`Codex`, `Gemini`, `DeepS
 
 Every CLI command resolves identity in this order:
 
-1. `--token <tok>` or `REX_WAVE_TOKEN` authenticates as a minted seat or worker token.
-2. When `T3CODE_THREAD_ID` is set, `rex-wave` reads `<state_dir>/worker-tokens/$T3CODE_THREAD_ID` (mode `0600`) automatically. Do not pass or echo worker tokens in prompts or chat messages.
+1. `--token <tok>` or `REX_WAVE_TOKEN` authenticates as a minted seat or worker token stored in `<state_dir>/tokens.json` or `<state_dir>/worker-tokens/`.
+2. When `T3CODE_THREAD_ID` is set, `rex-wave` reads `<state_dir>/worker-tokens/$T3CODE_THREAD_ID` (mode `0600` JSON `WorkerTokenFile`) automatically. Do not pass or echo worker tokens in prompts or chat messages.
 3. Without a token or T3 wave thread, `rex-wave` uses Unix socket peer UID authentication as the operator seat.
+
+Operators mint principal-scoped tokens via `PrincipalTokenTable`:
+
+```sh
+rex-wave token --seat sam
+rex-wave token --worker auth-v2/author
+rex-wave token --worker auth-v2/author --thread t3:auth-v2:author:a1
+```
 
 Never spoof caller identity in message bodies or headers. The daemon stamps the authenticated principal on every event.
 
@@ -80,7 +88,13 @@ rex-wave tasks release '#general' 9 --epoch 1 --note 'Handing off'
 # Update metadata or labels
 rex-wave tasks update '#general' 9 --expected-rev 2 --needs-add 5 --priority blocking
 rex-wave tasks label '#general' 9 --add review=approved --rm status=wip
+
+# Reconcile room task-threads two-way with an Emacs .org file
+rex-wave tasks org-sync '#general' ./tasks.org --once
+rex-wave tasks org-sync '#general' ./tasks.org --watch --interval-ms 1000
 ```
+
+`tasks org-sync` writes string `:ID:` (`rw-...`), `:REX_SEQ:`, and `:REX_REV:` properties, preserves Emacs-authored `:ID:` values and planning lines, defers writes while `.#<file.org>` exists (`ABI-0.md` Clause B-4), and exits with code `3` on stale `:REX_REV:` conflicts without clobbering the file.
 
 Legacy Kanban boards remain supported with `--board` (`rex-wave task list --board project:<id>`, `rex-wave task add "<title>" --board project:<id>`).
 
@@ -90,6 +104,7 @@ Keep durable seat ownership separate from live session bindings:
 
 ```sh
 rex-wave presence claim sam --role reviewer --project rex-wave --alias sammy
+rex-wave presence bind --seat sam --from-claude-session --pid "$PPID"
 rex-wave presence bind --seat sam --self-watcher codex --ttl 15m
 rex-wave presence heartbeat --seat sam --incarnation inc_1 --ttl 15m
 rex-wave presence hold --seat sam --lane primary
@@ -97,6 +112,20 @@ rex-wave presence unbind --seat sam --incarnation inc_1
 rex-wave presence list --live-only
 rex-wave presence resolve rex-wave
 ```
+
+`--from-claude-session` reads `~/.claude/sessions/<pid>.json` (defaulting to `--pid`, `--claude-pid`, `CLAUDE_PID`, or parent PID), allows only `interactive` and `bg` kinds, and rejects forked sessions (`⑂`) unless `--allow-fork` is passed. `presence hold` keeps a `UdsSession` binding live for the socket lifetime. When the socket closes or the process dies, the daemon dispatches `PresenceUnbind` automatically as `System(PresenceMonitor)`.
+
+## Run read-only shadow house mail and score
+
+Inspect an interchange directory structurally read-only and score decisions against `acks.jsonl` and Gate 1 fixtures:
+
+```sh
+rex-wave mail shadow --interchange ~/agent-folder/interchange --out /tmp/shadow.jsonl --once
+rex-wave mail shadow --offline --interchange ~/agent-folder/interchange --out /tmp/shadow.jsonl --once
+rex-wave mail score --shadow /tmp/shadow.jsonl --acks ~/agent-folder/interchange/state/acks.jsonl --fixtures ~/agent-folder/interchange/fixtures/mail-routing/cases.jsonl --json
+```
+
+`mail shadow` reads live presence state from `--socket` (failing if unreachable unless `--offline` is passed), embeds active seat aliases in its JSONL output for `mail score`, and refuses to write `--out` inside `--interchange` (including via `..` or symlinks). `mail score --fixtures` exits non-zero when any Gate 1 case is missing or unknown.
 
 ## HTTP and SSE access
 

@@ -370,19 +370,123 @@ fn verify_private_file(
     Ok(true)
 }
 
-#[derive(Deserialize)]
+/// Verifies that `path` (if it exists) is a regular, non-symlink file owned by
+/// `expected_uid` (when supplied) with mode `0600`. Returns `Ok(false)` when missing.
+pub fn check_private_file(
+    path: &Path,
+    expected_uid: Option<u32>,
+    what: &str,
+) -> Result<bool, ApiError> {
+    verify_private_file(path, expected_uid, what)
+}
+
+/// Validates a single safe filename for `<state_dir>/worker-tokens/<id>`.
+pub fn is_safe_worker_token_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && !id.chars().any(char::is_control)
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum TokenMapValue {
     Seat(SeatName),
     Principal(Principal),
+    LegacyWorker {
+        wave: WaveSlug,
+        role: RoleName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
 }
 
 impl TokenMapValue {
-    fn into_principal(self) -> Principal {
-        match self {
-            TokenMapValue::Seat(seat) => Principal::Seat { seat },
-            TokenMapValue::Principal(p) => p,
+    fn from_principal(
+        principal: &Principal,
+        legacy_thread_id: Option<&str>,
+    ) -> Result<Self, ApiError> {
+        match principal {
+            Principal::Seat { seat } => Ok(TokenMapValue::Seat(seat.clone())),
+            Principal::Worker { wave, role } if legacy_thread_id.is_some() => {
+                Ok(TokenMapValue::LegacyWorker {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread_id: legacy_thread_id.map(str::to_owned),
+                })
+            }
+            Principal::Operator { .. } | Principal::Worker { .. } => {
+                Ok(TokenMapValue::Principal(principal.clone()))
+            }
+            Principal::System { .. } => Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: "bearer tokens may not authenticate as system".into(),
+            }),
         }
+    }
+
+    fn into_principal_and_thread(self) -> (Principal, Option<String>) {
+        match self {
+            TokenMapValue::Seat(seat) => (Principal::Seat { seat }, None),
+            TokenMapValue::Principal(p) => (p, None),
+            TokenMapValue::LegacyWorker {
+                wave,
+                role,
+                thread_id,
+            } => (Principal::Worker { wave, role }, thread_id),
+        }
+    }
+}
+
+fn verify_legacy_worker_thread_token(
+    tokens_path: &Path,
+    thread_id: &str,
+    expected_token: &str,
+    expected_principal: &Principal,
+    expected_uid: Option<u32>,
+) -> bool {
+    if !is_safe_worker_token_id(thread_id) {
+        return false;
+    }
+    let dir = tokens_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("worker-tokens");
+    let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
+        return false;
+    };
+    if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+        return false;
+    }
+    if let Some(uid) = expected_uid
+        && dir_meta.uid() != uid
+    {
+        return false;
+    }
+    if dir_meta.permissions().mode() & 0o077 != 0 {
+        return false;
+    }
+    let file_path = dir.join(thread_id);
+    if !verify_private_file(&file_path, expected_uid, "legacy worker token").unwrap_or(false) {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(&file_path) else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('{') {
+        let Ok(parsed) = serde_json::from_str::<WorkerTokenFile>(trimmed) else {
+            return false;
+        };
+        parsed.principal == *expected_principal
+            && constant_time_eq(parsed.token.as_bytes(), expected_token.as_bytes())
+    } else {
+        constant_time_eq(trimmed.as_bytes(), expected_token.as_bytes())
     }
 }
 
@@ -399,6 +503,7 @@ pub struct WorkerTokenFile {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrincipalTokenTable {
     tokens: BTreeMap<String, Principal>,
+    legacy_thread_ids: BTreeMap<String, String>,
 }
 
 impl PrincipalTokenTable {
@@ -458,7 +563,10 @@ impl PrincipalTokenTable {
 
     pub fn merge(&mut self, other: PrincipalTokenTable) -> Result<(), ApiError> {
         for (token, principal) in other.tokens {
-            self.insert(token, principal)?;
+            self.insert(token.clone(), principal)?;
+            if let Some(tid) = other.legacy_thread_ids.get(&token) {
+                self.legacy_thread_ids.insert(token, tid.clone());
+            }
         }
         Ok(())
     }
@@ -481,8 +589,62 @@ impl PrincipalTokenTable {
         self.tokens.is_empty()
     }
 
-    /// Loads `tokens.json` in either legacy `{token: "seat"}` or principal-scoped
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Principal)> {
+        self.tokens.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub fn remove_principal(&mut self, principal: &Principal) {
+        let legacy = &self.legacy_thread_ids;
+        self.tokens
+            .retain(|tok, existing| existing != principal || legacy.contains_key(tok));
+    }
+
+    /// Atomically persists the table to `tokens.json` with mode `0600`.
+    /// Seats serialize as bare strings for backward compatibility while workers
+    /// and operators serialize as tagged [`Principal`] objects; thread-scoped
+    /// legacy worker entries retain their `thread_id`; `System` is refused.
+    pub fn save_tokens_file(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out: BTreeMap<&str, TokenMapValue> = BTreeMap::new();
+        for (tok, principal) in &self.tokens {
+            validate_token_principal(tok, principal)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            let val = TokenMapValue::from_principal(
+                principal,
+                self.legacy_thread_ids.get(tok).map(String::as_str),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            out.insert(tok.as_str(), val);
+        }
+        let encoded = serde_json::to_vec_pretty(&out)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let nonce = WORKER_TOKEN_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(&encoded)?;
+            file.sync_all()?;
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Loads `tokens.json` in either legacy `{token: "seat"}`, legacy
+    /// `{token: {wave, role, thread_id?}}`, or principal-scoped
     /// `{token: {kind: ...}}` form, enforcing mode `0600` and matching UID.
+    /// Legacy worker entries carrying `thread_id` are accepted only while a
+    /// matching private `<state_dir>/worker-tokens/<thread_id>` file exists.
     pub fn load_tokens_file(path: &Path, expected_uid: Option<u32>) -> Result<Self, ApiError> {
         if !verify_private_file(path, expected_uid, "token store")? {
             return Ok(Self::new());
@@ -493,7 +655,17 @@ impl PrincipalTokenTable {
             .map_err(|e| ApiError::Internal(format!("decode tokens: {e}")))?;
         let mut table = Self::new();
         for (token, entry) in decoded {
-            table.insert(token, entry.into_principal())?;
+            let (principal, legacy_tid) = entry.into_principal_and_thread();
+            if let Some(tid) = legacy_tid {
+                if !verify_legacy_worker_thread_token(path, &tid, &token, &principal, expected_uid)
+                {
+                    continue;
+                }
+                table.insert(token.clone(), principal)?;
+                table.legacy_thread_ids.insert(token, tid);
+            } else {
+                table.insert(token, principal)?;
+            }
         }
         Ok(table)
     }
@@ -565,6 +737,12 @@ impl PrincipalTokenTable {
                     continue;
                 }
             };
+            if !matches!(file.principal, Principal::Worker { .. }) {
+                daemon_log!(
+                    "skipping {label}: worker-tokens directory only allows Principal::Worker"
+                );
+                continue;
+            }
             if let Err(e) = table.insert(file.token, file.principal) {
                 daemon_log!("skipping {label}: {e}");
             }
@@ -601,15 +779,16 @@ pub fn write_worker_token_file(
     token: &str,
     principal: &Principal,
 ) -> io::Result<PathBuf> {
-    if id.is_empty()
-        || id.starts_with('.')
-        || id.contains('/')
-        || id.contains('\\')
-        || id.chars().any(char::is_control)
-    {
+    if !is_safe_worker_token_id(id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "worker token file id must be a single safe filename",
+        ));
+    }
+    if !matches!(principal, Principal::Worker { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker token file only allows Principal::Worker",
         ));
     }
     validate_token_principal(token, principal)
@@ -1382,6 +1561,7 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
 /// socket error, protocol violation, and server cancellation alike.
 pub trait ConnectionHooks: Send + Sync + 'static {
     fn on_connect(&self, _conn_id: u64, _principal: &Principal, _client: &str) {}
+    fn on_uds_presence_bind(&self, _conn_id: u64) {}
     fn on_disconnect(&self, _conn_id: u64, _principal: &Principal) {}
 }
 
@@ -1580,8 +1760,17 @@ async fn handle_conn(
         };
         match frame {
             wire::ClientFrame::Hello { .. } => break "second hello".to_owned(),
-            wire::ClientFrame::Call { id, cmd } => {
+            wire::ClientFrame::Call { id, mut cmd } => {
                 while in_flight_calls.try_join_next().is_some() {}
+                if let WireCommand::PresenceBind(ref mut bind) = cmd
+                    && let rex_wave_api::presence::TransportEndpoint::UdsSession {
+                        ref mut conn_id,
+                        ..
+                    } = bind.endpoint
+                {
+                    *conn_id = conn;
+                    disconnect_guard.hooks.on_uds_presence_bind(conn);
+                }
                 let router = router.clone();
                 let by = session.me().clone();
                 let out_tx = out_tx.clone();

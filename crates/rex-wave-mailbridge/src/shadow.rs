@@ -947,6 +947,25 @@ impl ShadowPassReport {
         }
         out
     }
+
+    /// Formats shadow output as JSONL, prepending a `{"meta":"aliases","aliases":{...}}`
+    /// header line whenever `aliases` is non-empty so offline `mail score` preserves
+    /// the exact seat-alias mapping from live presence.
+    pub fn to_jsonl_with_aliases(&self, aliases: &AliasMap) -> String {
+        let mut out = String::new();
+        if !aliases.is_empty() {
+            let header = serde_json::json!({
+                "meta": "aliases",
+                "aliases": aliases.entries(),
+            });
+            if let Ok(line) = serde_json::to_string(&header) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        out.push_str(&self.to_jsonl());
+        out
+    }
 }
 
 /// Runs one structurally read-only shadow pass over `interchange`. Never writes

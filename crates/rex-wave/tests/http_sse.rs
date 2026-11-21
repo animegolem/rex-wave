@@ -1,6 +1,4 @@
-use rex_wave::daemon::{
-    TokenFileAuthenticator, mint_seat_token, mint_worker_token, tokens_path_for,
-};
+use rex_wave::daemon::{mint_seat_token, mint_worker_token};
 use rex_wave::http::{HttpConfig, bind_http, serve_http_listener};
 use rex_wave_api::board::{Priority, Title};
 use rex_wave_api::presence::{
@@ -19,7 +17,7 @@ use rex_wave_runtime::{
     Unavailable,
 };
 use rex_wave_store::Journal;
-use rex_wave_transport::Authenticator;
+use rex_wave_transport::{Authenticator, StateDirAuthenticator};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -165,13 +163,12 @@ async fn bind_http_refuses_non_loopback_addresses() {
 #[tokio::test]
 async fn http_security_guards_reject_bad_host_origin_sec_fetch_site_and_csrf() {
     let dir = fresh_dir("guards");
-    let sock = dir.0.join("daemon.sock");
     let op = SeatName::parse("owner").unwrap();
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: op.clone(),
-        daemon_uid: None,
-        tokens_path: tokens_path_for(&sock),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        op.clone(),
+        None,
+        &dir.0,
+    ));
     let listener = bind_http("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_http_listener(
@@ -314,15 +311,14 @@ async fn http_auth_pins_unauthenticated_to_operator_and_returns_404_on_invisible
         &WaveSlug::parse("w1").unwrap(),
         &RoleName::parse("author").unwrap(),
         None,
-        false,
     )
     .unwrap();
 
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: op.clone(),
-        daemon_uid: None,
-        tokens_path: tokens_path_for(&sock),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        op.clone(),
+        None,
+        &dir.0,
+    ));
     let listener = bind_http("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_http_listener(
@@ -669,7 +665,6 @@ impl Service<PresenceCommand> for StubPresence {
 #[tokio::test]
 async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_call() {
     let dir = fresh_dir("routes");
-    let sock = dir.0.join("daemon.sock");
     let op = SeatName::parse("owner").unwrap();
     let journal = Journal::in_memory().unwrap();
     let hub = Hub::new(128);
@@ -688,11 +683,11 @@ async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_
             agents: Arc::new(NoAgentFeed),
         }),
     });
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: op.clone(),
-        daemon_uid: None,
-        tokens_path: tokens_path_for(&sock),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        op.clone(),
+        None,
+        &dir.0,
+    ));
     let listener = bind_http("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_http_listener(
@@ -856,6 +851,32 @@ async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_
     assert_eq!(call_res.status, 200);
     assert_eq!(call_res.json()["reply"], "room_post");
 
+    let forged_uds_bind = send_raw(
+        addr,
+        &build_request(
+            "POST",
+            "/v1/call/presence_bind",
+            addr,
+            &[("Content-Type", "application/json")],
+            Some(
+                r#"{"seat":"sam","endpoint":{"transport":"uds_session","conn_id":42,"client":"forged"},"liveness":"socket_lifetime"}"#,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        forged_uds_bind.status, 400,
+        "HTTP /v1/call/presence_bind must refuse UdsSession endpoints"
+    );
+    let forged_msg = forged_uds_bind.json()["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        forged_msg.contains("Unix socket connection"),
+        "expected UdsSession guard refusal, got: {forged_msg}"
+    );
+
     server.abort();
 }
 
@@ -893,14 +914,13 @@ async fn read_sse_event(
 #[tokio::test]
 async fn http_sse_streams_keepalive_and_resumes_seamlessly_via_last_event_id() {
     let dir = fresh_dir("sse");
-    let sock = dir.0.join("daemon.sock");
     let op = SeatName::parse("owner").unwrap();
     let router = real_router();
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: op.clone(),
-        daemon_uid: None,
-        tokens_path: tokens_path_for(&sock),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        op.clone(),
+        None,
+        &dir.0,
+    ));
     let listener = bind_http("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_http_listener(
@@ -1063,7 +1083,7 @@ async fn http_disconnect_cancels_worker_wait_and_restores_working() {
     let op = SeatName::parse("owner").unwrap();
     let wave = WaveSlug::parse("w1").unwrap();
     let role = RoleName::parse("author").unwrap();
-    let worker_tok = mint_worker_token(&sock, &wave, &role, None, false).unwrap();
+    let worker_tok = mint_worker_token(&sock, &wave, &role, None).unwrap();
 
     let journal = Journal::in_memory().unwrap();
     let hub = Hub::new(128);
@@ -1127,11 +1147,11 @@ async fn http_disconnect_cancels_worker_wait_and_restores_working() {
         .await
         .unwrap();
 
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: op.clone(),
-        daemon_uid: None,
-        tokens_path: tokens_path_for(&sock),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        op.clone(),
+        None,
+        &dir.0,
+    ));
     let listener = bind_http("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_http_listener(

@@ -1410,6 +1410,18 @@ async fn dispatch_json_route(
             if let WireCommand::Read(ref r) = cmd {
                 can_read_visible(&principal, &r.stream, &tool).map_err(HttpError::from_api)?;
             }
+            if let WireCommand::PresenceBind(ref b) = cmd
+                && matches!(
+                    b.endpoint,
+                    rex_wave_api::presence::TransportEndpoint::UdsSession { .. }
+                )
+            {
+                return Err(HttpError::new(
+                    "400 Bad Request",
+                    "invalid",
+                    "UdsSession presence bindings are only allowed over a Unix socket connection",
+                ));
+            }
             let reply = client
                 .call_wire(cmd)
                 .await

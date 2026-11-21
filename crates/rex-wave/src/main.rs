@@ -29,12 +29,24 @@ use rex_wave_api::{
     },
     *,
 };
+use rex_wave_board::task_org::{
+    OrgConflictKind, OrgSyncConflict, OrgSyncOptions, OrgSyncState, OrgToRoomOutcome,
+    RoomToOrgOutcome, sync_org_to_room, sync_room_to_org,
+};
+use rex_wave_mailbridge::{
+    AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
+    RingPolicy, check_gate1_fixtures, extract_shadow_aliases, load_claude_session_file,
+    parse_acks_jsonl, parse_claude_session_json, run_shadow_pass, score_shadow_jsonl,
+};
 use rex_wave_mcp::McpServer;
+use rex_wave_runtime::{Decider, EntryMeta};
 use rex_wave_transport::{Credential, Endpoint, RemoteClient};
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const EXIT_CONFLICT: u8 = 3;
 const EXIT_TIMEOUT: u8 = 124;
@@ -160,6 +172,9 @@ pub enum Cmd {
     /// Manage durable seat records and ephemeral session bindings.
     #[command(subcommand)]
     Presence(PresenceCmd),
+    /// Run the read-only shadow mail reactor and Gate 2 shadow scorer.
+    #[command(subcommand)]
+    Mail(MailCmd),
     /// List ranked inbox notifications.
     Inbox {
         #[arg(long)]
@@ -493,8 +508,66 @@ pub enum TaskCmd {
         #[arg(long = "id", alias = "idem")]
         idem: Option<String>,
     },
+    /// Reconcile a room's task-threads two-way with an Emacs `.org` file.
+    #[command(name = "org-sync")]
+    OrgSync {
+        room: String,
+        file: PathBuf,
+        /// Run one reconciliation pass and exit (default when `--watch` is omitted).
+        #[arg(long, conflicts_with = "watch")]
+        once: bool,
+        /// Keep reconciling on a loop until interrupted.
+        #[arg(long, conflicts_with = "once")]
+        watch: bool,
+        /// Poll interval in milliseconds for `--watch` mode.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Write a `<file>.rex-conflict` sidecar on revision or dependency conflicts.
+        #[arg(long)]
+        conflict_sidecar: bool,
+    },
     /// Archive a Kanban card.
     Archive { board: String, no: u32 },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MailCmd {
+    /// Run the structurally read-only shadow mail reactor over an interchange folder.
+    Shadow {
+        /// Interchange root directory (opened read-only).
+        #[arg(long)]
+        interchange: PathBuf,
+        /// Output JSONL file path (`-` writes stdout; refused inside `--interchange`).
+        #[arg(long)]
+        out: PathBuf,
+        /// Run one read-only shadow pass and exit (default when `--watch` is omitted).
+        #[arg(long, conflicts_with = "watch")]
+        once: bool,
+        /// Re-scan periodically until interrupted.
+        #[arg(long, conflicts_with = "once")]
+        watch: bool,
+        /// Poll interval in milliseconds for `--watch` mode.
+        #[arg(long, default_value_t = 5000)]
+        interval_ms: u64,
+        /// Use an empty offline presence table without querying `--socket`.
+        #[arg(long)]
+        offline: bool,
+        /// Explicit read-only marker flag (shadow is always structurally read-only).
+        #[arg(long = "shadow-read-only")]
+        shadow_read_only: bool,
+    },
+    /// Score a shadow JSONL decision log against ground-truth `acks.jsonl`.
+    Score {
+        /// Shadow JSONL output file produced by `rex-wave mail shadow`.
+        #[arg(long)]
+        shadow: PathBuf,
+        /// Ground-truth `acks.jsonl` file (opened read-only).
+        #[arg(long)]
+        acks: PathBuf,
+        /// Optional Gate 1 fixture file (`cases.jsonl`) to check case coverage.
+        #[arg(long)]
+        fixtures: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -614,13 +687,19 @@ pub enum PresenceCmd {
 #[derive(Debug)]
 enum CliError {
     Api(ApiError),
+    ConflictValue {
+        summary: String,
+        payload: serde_json::Value,
+    },
     Msg(String),
 }
 
 impl CliError {
     fn exit_code(&self) -> ExitCode {
         match self {
-            CliError::Api(ApiError::Conflict { .. }) => ExitCode::from(EXIT_CONFLICT),
+            CliError::Api(ApiError::Conflict { .. }) | CliError::ConflictValue { .. } => {
+                ExitCode::from(EXIT_CONFLICT)
+            }
             CliError::Api(ApiError::Timeout) => ExitCode::from(EXIT_TIMEOUT),
             _ => ExitCode::FAILURE,
         }
@@ -951,89 +1030,76 @@ pub fn resolve_cli_credential(
     Ok(Credential::PeerUid)
 }
 
-#[derive(serde::Deserialize)]
-struct ClaudeSessionFile {
-    pid: u32,
-    #[serde(alias = "procStart", alias = "proc_start")]
-    proc_start: String,
-    #[serde(alias = "startedAt", alias = "started_at_ms", default)]
-    started_at_ms: u64,
-    #[serde(alias = "sessionId", alias = "session_id")]
-    session_id: String,
-    #[serde(alias = "messagingSocketPath", alias = "messaging_socket")]
-    messaging_socket: PathBuf,
-    kind: String,
-    #[serde(alias = "nameSource", alias = "name_source", default)]
-    name_source: Option<String>,
-    #[serde(alias = "name", alias = "display_name", default)]
-    display_name: Option<String>,
-}
-
 fn load_claude_session_endpoint(
     path_arg: &str,
-    claude_pid: Option<u32>,
+    pid_arg: Option<u32>,
+    claude_pid_arg: Option<u32>,
     allow_fork: bool,
 ) -> Result<TransportEndpoint, ApiError> {
-    let path = if !path_arg.trim().is_empty() {
-        PathBuf::from(path_arg.trim())
+    if let (Some(a), Some(b)) = (pid_arg, claude_pid_arg)
+        && a != b
+    {
+        return Err(invalid(
+            "pid",
+            format!("--pid ({a}) and --claude-pid ({b}) disagree"),
+        ));
+    }
+    let session = if !path_arg.trim().is_empty() {
+        if pid_arg.is_some() || claude_pid_arg.is_some() {
+            return Err(invalid(
+                "from-claude-session",
+                "pass either a session JSON path or --pid/--claude-pid, not both",
+            ));
+        }
+        let path = PathBuf::from(path_arg.trim());
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            invalid(
+                "from-claude-session",
+                format!("failed statting {}: {e}", path.display()),
+            )
+        })?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err(ApiError::Denied {
+                principal: "presence".into(),
+                action: format!("read non-regular session file {}", path.display()),
+            });
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            invalid(
+                "from-claude-session",
+                format!("failed reading {}: {e}", path.display()),
+            )
+        })?;
+        parse_claude_session_json(&raw)?
     } else {
-        let pid = claude_pid
+        let resolved_pid = pid_arg
+            .or(claude_pid_arg)
             .or_else(|| {
                 std::env::var("CLAUDE_PID")
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok())
             })
+            .or_else(|| {
+                let ppid = std::os::unix::process::parent_id();
+                if ppid > 0 {
+                    eprintln!(
+                        "rex-wave presence bind: no --pid or CLAUDE_PID set; using parent PID {ppid}"
+                    );
+                    Some(ppid)
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| {
                 invalid(
                     "from-claude-session",
-                    "pass a session JSON path or --claude-pid <pid>",
+                    "pass a session JSON path, --pid <pid>, or set CLAUDE_PID",
                 )
             })?;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| invalid("from-claude-session", "HOME is unset"))?;
-        home.join(".claude/sessions").join(format!("{pid}.json"))
+        load_claude_session_file(resolved_pid)?
     };
 
-    let raw = std::fs::read(&path).map_err(|e| {
-        invalid(
-            "from-claude-session",
-            format!("failed reading {}: {e}", path.display()),
-        )
-    })?;
-    let info: ClaudeSessionFile = serde_json::from_slice(&raw).map_err(|e| {
-        invalid(
-            "from-claude-session",
-            format!("invalid Claude session JSON {}: {e}", path.display()),
-        )
-    })?;
-    if !TransportEndpoint::is_allowed_claude_kind(&info.kind) {
-        return Err(invalid(
-            "from-claude-session",
-            format!("unsupported Claude session kind '{}'", info.kind),
-        ));
-    }
-    if !allow_fork
-        && info
-            .display_name
-            .as_deref()
-            .is_some_and(TransportEndpoint::is_fork_display_name)
-    {
-        return Err(invalid(
-            "from-claude-session",
-            "refusing to bind forked Claude session (⑂); pass --allow-fork to override",
-        ));
-    }
-    Ok(TransportEndpoint::ClaudeSession {
-        pid: info.pid,
-        proc_start: info.proc_start,
-        started_at_ms: info.started_at_ms,
-        session_id: info.session_id,
-        messaging_socket: info.messaging_socket,
-        kind: info.kind,
-        name_source: info.name_source,
-        display_name: info.display_name,
-    })
+    session.into_endpoint(allow_fork)
 }
 
 pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError> {
@@ -1259,6 +1325,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
         | Cmd::Tui { .. }
         | Cmd::Mcp { .. }
         | Cmd::Token(_)
+        | Cmd::Mail(_)
         | Cmd::Watch { .. }
         | Cmd::Schema { .. } => Err(invalid(
             "command",
@@ -1815,6 +1882,10 @@ fn task_to_command(cmd: &TaskCmd, me: &Principal) -> Result<WireCommand, ApiErro
                 },
             }))
         }
+        TaskCmd::OrgSync { .. } => Err(invalid(
+            "tasks org-sync",
+            "handled locally via two-way org reconciler",
+        )),
         TaskCmd::Archive { board, no } => Ok(WireCommand::CardArchive(CardArchive {
             board: map_board_val("board", BoardId::parse(board.clone()))?,
             card: CardNo(*no),
@@ -1890,7 +1961,8 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
         } => {
             let mut chosen: Vec<(TransportEndpoint, LivenessMode)> = Vec::new();
             if let Some(session_path) = from_claude_session {
-                let ep = load_claude_session_endpoint(session_path, *claude_pid, *allow_fork)?;
+                let ep =
+                    load_claude_session_endpoint(session_path, *pid, *claude_pid, *allow_fork)?;
                 chosen.push((ep, LivenessMode::ProcessAndLease));
             }
             if let Some(tid) = bb_thread {
@@ -2321,6 +2393,15 @@ fn print_error(err: &CliError, as_json: bool) {
                 serde_json::to_string_pretty(api_err).expect("api error json")
             );
         }
+        CliError::ConflictValue { payload, .. } if as_json => {
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(payload).expect("conflict error json")
+            );
+        }
+        CliError::ConflictValue { summary, .. } => {
+            eprintln!("error: conflict: {summary}");
+        }
         CliError::Api(ApiError::Conflict { detail, data }) => {
             eprintln!("error: conflict: {detail}");
             if let Some(ConflictData::NewerMessage {
@@ -2347,6 +2428,629 @@ fn print_error(err: &CliError, as_json: bool) {
         CliError::Api(api_err) => eprintln!("error: {api_err}"),
         CliError::Msg(msg) => eprintln!("error: {msg}"),
     }
+}
+
+fn org_conflict_to_json(c: &OrgSyncConflict) -> serde_json::Value {
+    let kind = match &c.kind {
+        OrgConflictKind::RevisionConflict { expected, actual } => serde_json::json!({
+            "kind": "revision_conflict",
+            "expected": expected,
+            "actual": actual,
+        }),
+        OrgConflictKind::LeaseFenced {
+            expected,
+            actual,
+            holder,
+        } => serde_json::json!({
+            "kind": "lease_fenced",
+            "expected": expected.0,
+            "actual": actual.0,
+            "holder": holder.as_ref().map(ToString::to_string),
+        }),
+        OrgConflictKind::UnmetNeeds { unmet } => serde_json::json!({
+            "kind": "unmet_needs",
+            "unmet": unmet.iter().map(|s| s.0).collect::<Vec<_>>(),
+        }),
+        OrgConflictKind::UnresolvedDependency { missing } => serde_json::json!({
+            "kind": "unresolved_dependency",
+            "missing": missing.as_str(),
+        }),
+        OrgConflictKind::DependencyCycle => serde_json::json!({
+            "kind": "dependency_cycle",
+        }),
+        OrgConflictKind::Other => serde_json::json!({
+            "kind": "other",
+        }),
+    };
+    serde_json::json!({
+        "path": c.path.to_string_lossy(),
+        "org_id": c.org_id.as_str(),
+        "seq": c.seq.map(|s| s.0),
+        "kind": kind,
+        "detail": c.detail,
+    })
+}
+
+enum OrgSyncStep {
+    OrgToRoom(OrgToRoomOutcome),
+    RoomToOrg(RoomToOrgOutcome),
+}
+
+async fn run_org_sync_step<C: Client>(
+    client: &C,
+    room: &rex_wave_api::room::RoomRef,
+    file: &Path,
+    state: &mut OrgSyncState,
+    options: &OrgSyncOptions,
+) -> Result<OrgSyncStep, CliError> {
+    let use_org_to_room = if !file.exists() {
+        false
+    } else if let Some(ref synced) = state.last_synced_bytes {
+        std::fs::read(file)
+            .map(|cur| cur != *synced)
+            .unwrap_or(true)
+    } else {
+        true
+    };
+    if use_org_to_room {
+        let outcome = sync_org_to_room(client, room, file, state, options)
+            .await
+            .map_err(|e| CliError::Msg(e.to_string()))?;
+        Ok(OrgSyncStep::OrgToRoom(outcome))
+    } else {
+        let outcome = sync_room_to_org(client, room, file, state)
+            .await
+            .map_err(|e| CliError::Msg(e.to_string()))?;
+        Ok(OrgSyncStep::RoomToOrg(outcome))
+    }
+}
+
+fn format_org_sync_step(step: &OrgSyncStep) -> (serde_json::Value, String, bool) {
+    match step {
+        OrgSyncStep::OrgToRoom(OrgToRoomOutcome::IgnoredEphemeral)
+        | OrgSyncStep::RoomToOrg(RoomToOrgOutcome::IgnoredEphemeral) => (
+            serde_json::json!({ "outcome": "ignored_ephemeral" }),
+            "org-sync: ignored Emacs lock or autosave path".into(),
+            false,
+        ),
+        OrgSyncStep::OrgToRoom(OrgToRoomOutcome::DeferredLock { lock_path })
+        | OrgSyncStep::RoomToOrg(RoomToOrgOutcome::DeferredLock { lock_path }) => (
+            serde_json::json!({
+                "outcome": "deferred_lock",
+                "lock_path": lock_path.to_string_lossy(),
+            }),
+            format!(
+                "org-sync: deferred while Emacs lock {} exists",
+                lock_path.display()
+            ),
+            false,
+        ),
+        OrgSyncStep::RoomToOrg(RoomToOrgOutcome::DeferredLocalEdits) => (
+            serde_json::json!({ "outcome": "deferred_local_edits" }),
+            "org-sync: deferred write-back due to local edits".into(),
+            false,
+        ),
+        OrgSyncStep::RoomToOrg(RoomToOrgOutcome::Unchanged) => (
+            serde_json::json!({ "outcome": "unchanged" }),
+            "org-sync: unchanged".into(),
+            false,
+        ),
+        OrgSyncStep::RoomToOrg(RoomToOrgOutcome::Written { tasks_synced }) => (
+            serde_json::json!({
+                "outcome": "written",
+                "tasks_synced": tasks_synced,
+            }),
+            format!("org-sync: wrote {tasks_synced} task(s) from room to org"),
+            false,
+        ),
+        OrgSyncStep::OrgToRoom(OrgToRoomOutcome::Synced {
+            created,
+            updated,
+            transitioned,
+            labeled,
+            wrote_back,
+        }) => (
+            serde_json::json!({
+                "outcome": "synced",
+                "created": created.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "updated": updated.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "transitioned": transitioned.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "labeled": labeled.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "wrote_back": wrote_back,
+            }),
+            format!(
+                "org-sync: created={} updated={} transitioned={} labeled={} wrote_back={}",
+                created.len(),
+                updated.len(),
+                transitioned.len(),
+                labeled.len(),
+                wrote_back
+            ),
+            false,
+        ),
+        OrgSyncStep::OrgToRoom(OrgToRoomOutcome::Conflict {
+            applied,
+            conflicts,
+            sidecar_path,
+        }) => {
+            let details: Vec<String> = conflicts
+                .iter()
+                .map(|c| format!("{} ({})", c.org_id, c.detail))
+                .collect();
+            let payload = serde_json::json!({
+                "outcome": "conflict",
+                "applied": applied.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "conflicts": conflicts.iter().map(org_conflict_to_json).collect::<Vec<_>>(),
+                "sidecar_path": sidecar_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            });
+            (payload, details.join("; "), true)
+        }
+    }
+}
+
+async fn execute_tasks_org_sync<C: Client>(
+    client: &C,
+    room: &str,
+    file: &Path,
+    watch: bool,
+    interval_ms: u64,
+    conflict_sidecar: bool,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let room_ref = parse_room_ref(room)?;
+    let options = OrgSyncOptions {
+        write_conflict_sidecar: conflict_sidecar,
+        notify_principal: None,
+    };
+    let mut state = OrgSyncState::default();
+
+    if !watch {
+        let step = run_org_sync_step(client, &room_ref, file, &mut state, &options).await?;
+        let (payload, summary, is_conflict) = format_org_sync_step(&step);
+        if is_conflict {
+            return Err(CliError::ConflictValue { summary, payload });
+        }
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).expect("org sync json")
+            );
+        } else {
+            println!("{summary}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    const MAX_WATCH_CONSECUTIVE_ERRORS: u32 = 20;
+    let sleep_dur = Duration::from_millis(interval_ms.max(50));
+    let mut consecutive_errors: u32 = 0;
+    let mut last_conflict_bytes: Option<Vec<u8>> = None;
+    loop {
+        let skip_same_conflict = if let Some(ref prev_conflict) = last_conflict_bytes {
+            match std::fs::read(file) {
+                Ok(cur) if cur == *prev_conflict => true,
+                Ok(_) => {
+                    last_conflict_bytes = None;
+                    false
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        if !skip_same_conflict {
+            match run_org_sync_step(client, &room_ref, file, &mut state, &options).await {
+                Ok(step) => {
+                    consecutive_errors = 0;
+                    let (payload, summary, is_conflict) = format_org_sync_step(&step);
+                    if is_conflict {
+                        last_conflict_bytes = std::fs::read(file).ok();
+                        if as_json {
+                            eprintln!(
+                                "{}",
+                                serde_json::to_string(&payload).expect("conflict json")
+                            );
+                        } else {
+                            eprintln!("error: conflict: {summary}");
+                        }
+                    } else {
+                        last_conflict_bytes = None;
+                        if !matches!(step, OrgSyncStep::RoomToOrg(RoomToOrgOutcome::Unchanged)) {
+                            if as_json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(&payload).expect("org sync json")
+                                );
+                            } else {
+                                println!("{summary}");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    consecutive_errors += 1;
+                    if !as_json {
+                        eprintln!(
+                            "rex-wave tasks org-sync: watch error ({consecutive_errors}/{MAX_WATCH_CONSECUTIVE_ERRORS})"
+                        );
+                    }
+                    print_error(&err, as_json);
+                    if consecutive_errors >= MAX_WATCH_CONSECUTIVE_ERRORS {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
+            () = tokio::time::sleep(sleep_dur) => {}
+        }
+    }
+}
+
+fn canonicalize_deepest_existing_no_parent(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    while let Some(name) = cursor.file_name() {
+        tail.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            let mut resolved = canon_parent;
+            for part in tail.into_iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
+fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result<(), CliError> {
+    if out == Path::new("-") {
+        return Ok(());
+    }
+    if out
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(CliError::Msg(format!(
+            "refusing shadow output {} containing '..' parent traversal",
+            out.display()
+        )));
+    }
+    let abs = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
+            .join(out)
+    };
+    if let Ok(meta) = std::fs::symlink_metadata(&abs)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output through symlink {}",
+            out.display()
+        )));
+    }
+    let candidate = canonicalize_deepest_existing_no_parent(&abs);
+    if candidate.starts_with(interchange_root) {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output {} inside read-only interchange {}",
+            out.display(),
+            interchange_root.display()
+        )));
+    }
+    Ok(())
+}
+
+static SHADOW_OUT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn write_file_atomic_outside(
+    target: &Path,
+    interchange_root: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    ensure_out_outside_interchange(target, interchange_root)?;
+    let abs = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
+            .join(target)
+    };
+    let file_name = abs
+        .file_name()
+        .ok_or_else(|| {
+            CliError::Msg(format!(
+                "shadow output {} has no file name",
+                target.display()
+            ))
+        })?
+        .to_os_string();
+    let parent = abs
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            CliError::Msg(format!(
+                "shadow output {} has no parent directory",
+                target.display()
+            ))
+        })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
+    if canon_parent.starts_with(interchange_root) {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output {} inside read-only interchange {}",
+            target.display(),
+            interchange_root.display()
+        )));
+    }
+    let final_target = canon_parent.join(&file_name);
+    if final_target.starts_with(interchange_root) {
+        return Err(CliError::Msg(format!(
+            "refusing to write shadow output {} inside read-only interchange {}",
+            target.display(),
+            interchange_root.display()
+        )));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::Msg(format!(
+            "refusing to overwrite symlink {}",
+            final_target.display()
+        )));
+    }
+
+    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = file_name;
+    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
+    let tmp = canon_parent.join(tmp_name);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| CliError::Msg(format!("create {}: {e}", tmp.display())))?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, &final_target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CliError::Msg(format!(
+            "rename {}: {e}",
+            final_target.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn load_live_presence_state(
+    sock_path: &Path,
+    explicit_token: Option<&str>,
+    offline: bool,
+) -> Result<(PresenceState, bool), CliError> {
+    if offline {
+        return Ok((PresenceState::default(), false));
+    }
+    let cred = resolve_cli_credential(sock_path, explicit_token)?;
+    let client = match RemoteClient::connect(
+        Endpoint::Unix(sock_path.to_path_buf()),
+        cred,
+        "mail-shadow",
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(ApiError::Transport(msg)) => {
+            return Err(CliError::Msg(format!(
+                "mail shadow: daemon socket {} unreachable ({msg}); start the daemon or pass --offline for empty presence",
+                sock_path.display()
+            )));
+        }
+        Err(e) => return Err(CliError::Api(e)),
+    };
+    let mut state = PresenceState::default();
+    let mut after = Seq::ORIGIN;
+    loop {
+        let page = client
+            .call(Read {
+                stream: StreamId::Presence,
+                after,
+                limit: Some(1000),
+            })
+            .await?;
+        if page.entries.is_empty() {
+            break;
+        }
+        for env in page.entries {
+            after = env.seq;
+            if let Event::Presence(ev) = &env.event {
+                let meta = EntryMeta {
+                    seq: env.seq,
+                    at: env.at,
+                    by: env.by.clone(),
+                };
+                Presence::evolve(&mut state, ev, &meta);
+            }
+        }
+    }
+    Ok((state, true))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_mail_shadow(
+    interchange: &Path,
+    out: &Path,
+    watch: bool,
+    interval_ms: u64,
+    offline: bool,
+    sock_path: &Path,
+    explicit_token: Option<&str>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let ro = ReadOnlyInterchange::open(interchange)
+        .map_err(|e| CliError::Msg(format!("open read-only interchange: {e}")))?;
+    ensure_out_outside_interchange(out, ro.root())?;
+    let policy = RingPolicy::default();
+    let affinity = IncarnationAffinity::new();
+    let retry_state = RetryState::new();
+    let sleep_dur = Duration::from_millis(interval_ms.max(100));
+
+    loop {
+        let (presence, live_presence) =
+            load_live_presence_state(sock_path, explicit_token, offline).await?;
+        let aliases = AliasMap::from_presence(&presence);
+        let now = rex_wave_runtime::now();
+        let report = run_shadow_pass(
+            &ro,
+            &presence,
+            &affinity,
+            &retry_state,
+            &policy,
+            &aliases,
+            now,
+        )
+        .map_err(|e| CliError::Msg(format!("shadow pass: {e}")))?;
+        let jsonl = report.to_jsonl_with_aliases(&aliases);
+        if out == Path::new("-") {
+            print!("{jsonl}");
+            let _ = std::io::stdout().flush();
+        } else {
+            write_file_atomic_outside(out, ro.root(), jsonl.as_bytes())?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "interchange": ro.root().to_string_lossy(),
+                        "out": out.to_string_lossy(),
+                        "live_presence": live_presence,
+                        "letters_scanned": report.letters_scanned,
+                        "acks_records": report.acks_report.records.len(),
+                        "acks_skipped_lines": report.acks_report.skipped_lines.len(),
+                        "decisions": report.decisions.len(),
+                    }))
+                    .expect("shadow summary json")
+                );
+            } else {
+                println!(
+                    "mail shadow: scanned={} acks={} skipped_ack_lines={} decisions={} live_presence={} out={}",
+                    report.letters_scanned,
+                    report.acks_report.records.len(),
+                    report.acks_report.skipped_lines.len(),
+                    report.decisions.len(),
+                    live_presence,
+                    out.display()
+                );
+            }
+        }
+        if !watch {
+            return Ok(ExitCode::SUCCESS);
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
+            () = tokio::time::sleep(sleep_dur) => {}
+        }
+    }
+}
+
+fn execute_mail_score(
+    shadow_path: &Path,
+    acks_path: &Path,
+    fixtures_path: Option<&Path>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let shadow_text = std::fs::read_to_string(shadow_path)
+        .map_err(|e| CliError::Msg(format!("read shadow {}: {e}", shadow_path.display())))?;
+    let acks_text = std::fs::read_to_string(acks_path)
+        .map_err(|e| CliError::Msg(format!("read acks {}: {e}", acks_path.display())))?;
+    let aliases = extract_shadow_aliases(&shadow_text).map_err(CliError::Msg)?;
+    let acks_report = parse_acks_jsonl(&acks_text, &aliases);
+    let ack_index = acks_report.index();
+    let score = score_shadow_jsonl(&shadow_text, &ack_index, &aliases).map_err(CliError::Msg)?;
+
+    let fixtures = match fixtures_path {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| CliError::Msg(format!("read fixtures {}: {e}", path.display())))?;
+            Some(check_gate1_fixtures(&raw).map_err(CliError::Msg)?)
+        }
+        None => None,
+    };
+
+    if as_json {
+        let mut root = serde_json::json!({
+            "shadow_score": score.to_json_value(),
+            "acks": {
+                "total_lines": acks_report.total_lines,
+                "blank_lines": acks_report.blank_lines,
+                "non_ack_rows": acks_report.non_ack_rows,
+                "records_parsed": acks_report.records.len(),
+                "skipped_lines": acks_report.skipped_lines.len(),
+            },
+        });
+        if let Some(ref fx) = fixtures
+            && let Some(obj) = root.as_object_mut()
+        {
+            obj.insert("fixtures".to_owned(), fx.to_json_value());
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&root).expect("score json")
+        );
+    } else {
+        println!(
+            "mail score: decisions={} rings={} referents_rung={} confirmed_acked={} pending_ack={} skipped_acked={} receipt_only={} dormant_or_retired={} mutated_after_ack={} deferred={} unrung_alerts={} unrung_caught={} unrung_already_acked={} missing_referent={}",
+            score.total_decisions,
+            score.rings_emitted,
+            score.referents_rung,
+            score.ring_referents_confirmed_acked,
+            score.ring_referents_pending_ack,
+            score.skipped_already_acked,
+            score.skipped_receipt_only,
+            score.skipped_dormant_or_retired,
+            score.mutated_after_ack_flags,
+            score.deferred,
+            score.unrung_alerts,
+            score.unrung_referents_caught,
+            score.unrung_referents_already_acked,
+            score.missing_referent_refusals,
+        );
+        println!(
+            "acks: lines={} blank={} non_ack={} records={} skipped={}",
+            acks_report.total_lines,
+            acks_report.blank_lines,
+            acks_report.non_ack_rows,
+            acks_report.records.len(),
+            acks_report.skipped_lines.len(),
+        );
+        if let Some(ref fx) = fixtures {
+            println!(
+                "fixtures: {}/{} Gate 1 cases covered (all_covered={}, missing={}, unknown={})",
+                fx.covered_cases,
+                fx.total_cases,
+                fx.all_covered(),
+                fx.missing_case_ids.len(),
+                fx.unknown_case_ids.len(),
+            );
+        }
+    }
+    if fixtures.as_ref().is_some_and(|fx| !fx.all_covered()) {
+        return Ok(ExitCode::from(1));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn execute_task_show<C: Client>(
@@ -2393,8 +3097,8 @@ async fn execute_task_show<C: Client>(
     Ok(ExitCode::SUCCESS)
 }
 
-async fn execute_presence_hold<C: Client>(
-    client: &C,
+async fn execute_presence_hold(
+    client: &RemoteClient,
     seat: Option<&String>,
     lane: Option<&String>,
     incarnation: Option<&String>,
@@ -2403,7 +3107,7 @@ async fn execute_presence_hold<C: Client>(
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
     let seat_name = resolve_seat_arg(seat, client.me())?;
-    let binding = client
+    let mut binding = client
         .call(PresenceBind {
             seat: seat_name.clone(),
             incarnation_id: match incarnation {
@@ -2423,15 +3127,53 @@ async fn execute_presence_hold<C: Client>(
         })
         .await?;
     print_reply(&WireReply::PresenceBind(binding.clone()), as_json);
-    let _ = tokio::signal::ctrl_c().await;
-    let _ = client
-        .call(PresenceUnbind {
-            seat: seat_name,
-            incarnation_id: binding.incarnation_id,
-            reason: Some("hold interrupted".into()),
-        })
-        .await;
-    Ok(ExitCode::SUCCESS)
+    let _ = std::io::stdout().flush();
+
+    let mut conn_rx = client.watch_connection();
+    let _ = conn_rx.borrow_and_update();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                let _ = client
+                    .call(PresenceUnbind {
+                        seat: seat_name,
+                        incarnation_id: binding.incarnation_id,
+                        reason: Some("hold interrupted".into()),
+                    })
+                    .await;
+                return Ok(ExitCode::SUCCESS);
+            }
+            changed = conn_rx.changed() => match changed {
+                Ok(()) => {
+                    if *conn_rx.borrow_and_update() {
+                        binding = client
+                            .call(PresenceBind {
+                                seat: seat_name.clone(),
+                                incarnation_id: Some(binding.incarnation_id.clone()),
+                                lane: lane.cloned(),
+                                endpoint: TransportEndpoint::UdsSession {
+                                    conn_id: 0,
+                                    client: client_name.to_owned(),
+                                },
+                                liveness: LivenessMode::SocketLifetime,
+                                ttl_ms: None,
+                                takeover: false,
+                                allow_fork: false,
+                                idem: None,
+                            })
+                            .await?;
+                        print_reply(&WireReply::PresenceBind(binding.clone()), as_json);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                Err(_) => {
+                    return Err(CliError::Msg(
+                        "presence hold: daemon connection closed permanently".into(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn execute_remote<C: Client>(
@@ -2442,21 +3184,22 @@ async fn execute_remote<C: Client>(
     if let Cmd::Tasks(TaskCmd::Show { room, seq }) = cmd {
         return execute_task_show(client, room, *seq, as_json).await;
     }
-    if let Cmd::Presence(PresenceCmd::Hold {
-        seat,
-        lane,
-        incarnation,
-        takeover,
-        client: client_name,
+    if let Cmd::Tasks(TaskCmd::OrgSync {
+        room,
+        file,
+        once: _,
+        watch,
+        interval_ms,
+        conflict_sidecar,
     }) = cmd
     {
-        return execute_presence_hold(
+        return execute_tasks_org_sync(
             client,
-            seat.as_ref(),
-            lane.as_ref(),
-            incarnation.as_ref(),
-            *takeover,
-            client_name,
+            room,
+            file,
+            *watch,
+            *interval_ms,
+            *conflict_sidecar,
             as_json,
         )
         .await;
@@ -2578,13 +3321,7 @@ async fn main() -> ExitCode {
                 wave,
                 role,
                 thread_id,
-            }) => match daemon::mint_worker_token(
-                &sock_path,
-                &wave,
-                &role,
-                thread_id.as_deref(),
-                true,
-            ) {
+            }) => match daemon::mint_worker_token(&sock_path, &wave, &role, thread_id.as_deref()) {
                 Ok(tok) => {
                     if cli.json {
                         println!(
@@ -2605,6 +3342,32 @@ async fn main() -> ExitCode {
             },
             Err(e) => Err(CliError::Api(e)),
         },
+        Cmd::Mail(MailCmd::Shadow {
+            interchange,
+            out,
+            once: _,
+            watch,
+            interval_ms,
+            offline,
+            shadow_read_only: _,
+        }) => {
+            execute_mail_shadow(
+                &interchange,
+                &out,
+                watch,
+                interval_ms,
+                offline,
+                &sock_path,
+                cli.token.as_deref(),
+                cli.json,
+            )
+            .await
+        }
+        Cmd::Mail(MailCmd::Score {
+            shadow,
+            acks,
+            fixtures,
+        }) => execute_mail_score(&shadow, &acks, fixtures.as_deref(), cli.json),
         Cmd::Schema { bb } => {
             let out = if bb {
                 rex_wave_bb::bb_tool_catalog()
@@ -2643,6 +3406,30 @@ async fn main() -> ExitCode {
                 Err(e) => Err(CliError::Msg(e)),
             }
         }
+        Cmd::Presence(PresenceCmd::Hold {
+            seat,
+            lane,
+            incarnation,
+            takeover,
+            client: client_name,
+        }) => match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
+            Ok(cred) => match RemoteClient::connect(endpoint, cred, &client_name).await {
+                Ok(client) => {
+                    execute_presence_hold(
+                        &client,
+                        seat.as_ref(),
+                        lane.as_ref(),
+                        incarnation.as_ref(),
+                        takeover,
+                        &client_name,
+                        cli.json,
+                    )
+                    .await
+                }
+                Err(e) => Err(CliError::Api(e)),
+            },
+            Err(e) => Err(CliError::Msg(e)),
+        },
         other => match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
             Ok(cred) => match RemoteClient::connect(endpoint, cred, "cli").await {
                 Ok(client) => execute_remote(&client, &other, cli.json).await,
@@ -3130,11 +3917,11 @@ mod tests {
         let mode = std::fs::metadata(&tok_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        let auth = daemon::TokenFileAuthenticator {
-            operator: SeatName::parse("owner").unwrap(),
-            daemon_uid: None,
-            tokens_path: tok_path,
-        };
+        let auth = rex_wave_transport::StateDirAuthenticator::from_state_dir(
+            SeatName::parse("owner").unwrap(),
+            None,
+            &dir,
+        );
         let principal = auth
             .authenticate(None, &Credential::Token { token: minted })
             .unwrap();
@@ -3142,9 +3929,24 @@ mod tests {
 
         let wave = WaveSlug::parse("auth-v2").unwrap();
         let role = RoleName::parse("author").unwrap();
+        let standalone_wtok = daemon::mint_worker_token(&sock, &wave, &role, None).unwrap();
+        assert!(standalone_wtok.starts_with("rw_w_"));
+        assert_eq!(
+            auth.authenticate(
+                None,
+                &Credential::Token {
+                    token: standalone_wtok,
+                },
+            )
+            .unwrap(),
+            Principal::Worker {
+                wave: wave.clone(),
+                role: role.clone(),
+            }
+        );
+
         let wtok =
-            daemon::mint_worker_token(&sock, &wave, &role, Some("t3:auth-v2:author:a1"), true)
-                .unwrap();
+            daemon::mint_worker_token(&sock, &wave, &role, Some("t3:auth-v2:author:a1")).unwrap();
         assert!(wtok.starts_with("rw_w_"));
         let wprincipal = auth
             .authenticate(
@@ -3167,6 +3969,65 @@ mod tests {
                 .is_err(),
             "unlinked worker token file must revoke authentication"
         );
+
+        let org_sync_cli = parse_cli(&[
+            "rex-wave",
+            "tasks",
+            "org-sync",
+            "#general",
+            "/tmp/tasks.org",
+            "--once",
+        ]);
+        assert!(matches!(
+            org_sync_cli.cmd,
+            Cmd::Tasks(TaskCmd::OrgSync {
+                once: true,
+                watch: false,
+                ..
+            })
+        ));
+
+        let shadow_cli = parse_cli(&[
+            "rex-wave",
+            "mail",
+            "shadow",
+            "--offline",
+            "--interchange",
+            "/tmp/interchange",
+            "--out",
+            "/tmp/shadow.jsonl",
+            "--once",
+        ]);
+        assert!(matches!(
+            shadow_cli.cmd,
+            Cmd::Mail(MailCmd::Shadow {
+                offline: true,
+                once: true,
+                watch: false,
+                ..
+            })
+        ));
+
+        let score_cli = parse_cli(&[
+            "rex-wave",
+            "mail",
+            "score",
+            "--shadow",
+            "/tmp/shadow.jsonl",
+            "--acks",
+            "/tmp/acks.jsonl",
+            "--fixtures",
+            "/tmp/cases.jsonl",
+            "--json",
+        ]);
+        assert!(score_cli.json);
+        assert!(matches!(
+            score_cli.cmd,
+            Cmd::Mail(MailCmd::Score {
+                fixtures: Some(_),
+                ..
+            })
+        ));
 
         let client = DemoClient::new();
         let status_cli = parse_cli(&["rex-wave", "wave", "status", "auth-v2"]);

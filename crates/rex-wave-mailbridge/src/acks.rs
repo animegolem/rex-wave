@@ -58,6 +58,14 @@ impl AliasMap {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.aliases.is_empty()
+    }
+
+    pub fn entries(&self) -> &BTreeMap<String, String> {
+        &self.aliases
+    }
+
     pub fn canonicalize(&self, raw: &str) -> String {
         let norm = normalize_seat_token(raw);
         if let Some(mapped) = self.aliases.get(&norm) {

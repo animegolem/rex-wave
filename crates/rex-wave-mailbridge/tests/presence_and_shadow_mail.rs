@@ -2066,6 +2066,11 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     assert_eq!(parsed_kinds.len(), pass.decisions.len());
     assert!(parsed_kinds.iter().any(|k| k == "ring"));
     assert!(parsed_kinds.iter().any(|k| k == "raise_unrung"));
+    assert_eq!(
+        rex_wave_mailbridge::score_shadow_jsonl(&jsonl, &acks_before, &aliases).unwrap(),
+        snap_score,
+        "JSONL shadow scorer must agree identically with in-memory decision scorer"
+    );
 
     // Opt-in read-only smoke test against a real interchange directory when
     // `REX_WAVE_INTERCHANGE_DIR` is set in the environment.

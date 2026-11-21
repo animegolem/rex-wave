@@ -768,6 +768,124 @@ async fn every_api_error_crosses_the_socket_without_dropping_it() {
     server.abort();
 }
 
+#[tokio::test]
+async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_principal_tokens() {
+    use rex_wave_api::presence::*;
+    use std::sync::Mutex;
+
+    struct CapturePresence(Arc<Mutex<Vec<u64>>>);
+    impl Service<PresenceCommand> for CapturePresence {
+        fn dispatch(
+            &self,
+            cmd: PresenceCommand,
+            ctx: DecideCtx,
+        ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+            let seen = self.0.clone();
+            Box::pin(async move {
+                let PresenceCommand::PresenceBind(bind) = cmd else {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Presence,
+                    });
+                };
+                if let TransportEndpoint::UdsSession { conn_id, .. } = &bind.endpoint {
+                    seen.lock().unwrap().push(*conn_id);
+                }
+                Ok(WireReply::PresenceBind(SeatBinding {
+                    seat: bind.seat,
+                    incarnation_id: IncarnationId::parse("inc-1").unwrap(),
+                    epoch: 1,
+                    lane: bind.lane,
+                    endpoint: bind.endpoint,
+                    liveness: bind.liveness,
+                    bound_at: ctx.at,
+                    expires_at: None,
+                    status: BindingStatus::Live,
+                }))
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tokens_path = tmp.path().join("tokens.json");
+    let mut table = PrincipalTokenTable::new();
+    table
+        .insert_seat("tok_sam", SeatName::parse("sam").unwrap())
+        .unwrap();
+    table
+        .insert_worker(
+            "tok_worker",
+            WaveSlug::parse("w1").unwrap(),
+            RoleName::parse("author").unwrap(),
+        )
+        .unwrap();
+    table.save_tokens_file(&tokens_path).unwrap();
+    let reloaded = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert_eq!(reloaded, table);
+
+    let sock = tmp.path().join("daemon.sock");
+    let (listener, uid) = bind_unix(&sock).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(CapturePresence(seen.clone())),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        SeatName::parse("owner").unwrap(),
+        Some(uid),
+        tmp.path(),
+    ));
+    let server = tokio::spawn(serve_listener(listener, router, auth));
+
+    let sam = RemoteClient::connect(
+        Endpoint::Unix(sock),
+        Credential::Token {
+            token: "tok_sam".into(),
+        },
+        "hold",
+    )
+    .await
+    .unwrap();
+    let bound = sam
+        .call(PresenceBind {
+            seat: SeatName::parse("sam").unwrap(),
+            incarnation_id: None,
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 0,
+                client: "hold".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: false,
+            allow_fork: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let stamped = match bound.endpoint {
+        TransportEndpoint::UdsSession { conn_id, .. } => conn_id,
+        other => panic!("expected UdsSession, got {other:?}"),
+    };
+    assert_ne!(stamped, 0, "transport must stamp non-zero server conn_id");
+    assert_eq!(*seen.lock().unwrap(), vec![stamped]);
+
+    drop(sam);
+    server.abort();
+}
+
 /// A daemon restart unlinks and rebinds the socket. The client must redial,
 /// re-open its watches from the last frame it delivered, and serve calls again,
 /// so a TUI never freezes on a dead connection.
@@ -1467,4 +1585,123 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
     );
 
     server.abort();
+}
+
+#[test]
+fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tokens_path = tmp.path().join("tokens.json");
+    let legacy_json = serde_json::json!({
+        "tok_sam": "sam",
+        "tok_legacy_worker": {
+            "wave": "auth-v2",
+            "role": "author",
+            "thread_id": "t3:auth-v2:author:a1"
+        },
+        "tok_legacy_worker_no_tid": {
+            "wave": "auth-v2",
+            "role": "reviewer"
+        }
+    });
+    std::fs::write(&tokens_path, serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+    std::fs::set_permissions(&tokens_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let loaded_revoked = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert_eq!(
+        loaded_revoked.get("tok_sam"),
+        Some(&Principal::Seat {
+            seat: SeatName::parse("sam").unwrap()
+        })
+    );
+    assert!(
+        loaded_revoked.get("tok_legacy_worker").is_none(),
+        "thread-scoped legacy worker token must be refused when worker-tokens/<tid> is absent"
+    );
+    assert_eq!(
+        loaded_revoked.get("tok_legacy_worker_no_tid"),
+        Some(&Principal::Worker {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("reviewer").unwrap(),
+        })
+    );
+
+    let worker_dir = tmp.path().join("worker-tokens");
+    std::fs::create_dir_all(&worker_dir).unwrap();
+    std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let legacy_tid_file = worker_dir.join("t3:auth-v2:author:a1");
+    std::fs::write(&legacy_tid_file, "tok_legacy_worker\n").unwrap();
+    std::fs::set_permissions(&legacy_tid_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut loaded_active = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert_eq!(
+        loaded_active.get("tok_legacy_worker"),
+        Some(&Principal::Worker {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("author").unwrap(),
+        }),
+        "thread-scoped legacy worker token authenticates while worker-tokens/<tid> exists and matches"
+    );
+
+    loaded_active
+        .insert_seat("tok_alice", SeatName::parse("alice").unwrap())
+        .unwrap();
+    loaded_active.save_tokens_file(&tokens_path).unwrap();
+    let saved_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&tokens_path).unwrap()).unwrap();
+    assert_eq!(
+        saved_json["tok_legacy_worker"]["thread_id"], "t3:auth-v2:author:a1",
+        "save_tokens_file must preserve legacy thread_id instead of promoting to permanent worker"
+    );
+
+    std::fs::remove_file(&legacy_tid_file).unwrap();
+    let after_unlink = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert!(
+        after_unlink.get("tok_legacy_worker").is_none(),
+        "unlinking worker-tokens/<tid> must immediately revoke legacy thread-scoped token"
+    );
+
+    assert!(!rex_wave_transport::is_safe_worker_token_id("a..b"));
+    assert!(rex_wave_transport::is_safe_worker_token_id(
+        "t3:auth-v2:author:a1"
+    ));
+
+    let op_principal = Principal::Operator {
+        seat: SeatName::parse("golem").unwrap(),
+    };
+    let seat_principal = Principal::Seat {
+        seat: SeatName::parse("sam").unwrap(),
+    };
+    assert!(write_worker_token_file(&worker_dir, "op_bad", "tok_op", &op_principal).is_err());
+    assert!(write_worker_token_file(&worker_dir, "seat_bad", "tok_seat", &seat_principal).is_err());
+
+    let forged_op = worker_dir.join("forged_op");
+    std::fs::write(
+        &forged_op,
+        serde_json::to_vec(&serde_json::json!({
+            "token": "tok_forged_op",
+            "principal": { "kind": "operator", "seat": "golem" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&forged_op, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let forged_seat = worker_dir.join("forged_seat");
+    std::fs::write(
+        &forged_seat,
+        serde_json::to_vec(&serde_json::json!({
+            "token": "tok_forged_seat",
+            "principal": { "kind": "seat", "seat": "sam" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&forged_seat, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let workers_loaded = PrincipalTokenTable::load_worker_tokens_dir(&worker_dir, None).unwrap();
+    assert!(workers_loaded.get("tok_forged_op").is_none());
+    assert!(workers_loaded.get("tok_forged_seat").is_none());
 }
