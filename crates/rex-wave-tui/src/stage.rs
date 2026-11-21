@@ -1,6 +1,7 @@
 //! Context-sensitive right-pane main stage driven by the focused or hovered
 //! sidebar node, stamped with server `FocusGeneration`.
 
+use crate::ConnectionState;
 use crate::composer::Composer;
 use crate::input::{HitMap, Target};
 use crate::kitty::{Badge, CONTEXT_BAR_IMAGE, CardPlacement, CardTone, GraphicsMode};
@@ -76,7 +77,12 @@ pub fn default_board_id(overview: &SidebarTreeSnapshot, me: &Principal) -> Board
     if let Some(first) = overview.kanban.first() {
         return first.board.clone();
     }
-    if let Some(proj) = overview.projects.first() {
+    if let Some(proj) = overview
+        .projects
+        .iter()
+        .find(|p| !p.archived)
+        .or_else(|| overview.projects.first())
+    {
         return project_board(&proj.project);
     }
     match me {
@@ -539,7 +545,7 @@ pub struct StageRenderCtx<'a> {
     pub graphics: GraphicsMode,
     pub stage_focused: bool,
     pub composing: bool,
-    pub connected: bool,
+    pub connection: ConnectionState,
     pub last_error: Option<&'a str>,
     pub cursor_out: &'a std::cell::Cell<Option<(u16, u16)>>,
 }
@@ -667,10 +673,10 @@ fn draw_stage_frame(title: String, area: Rect, buf: &mut Buffer, ctx: &StageRend
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let (status, status_fg) = if ctx.connected {
-        ("● connected", C_MINT)
-    } else {
-        ("○ disconnected", C_ROSE)
+    let (status, status_fg) = match ctx.connection {
+        ConnectionState::Connected => ("● connected", C_MINT),
+        ConnectionState::Reconnecting => ("○ reconnecting", C_AMBER),
+        ConnectionState::Disconnected => ("○ disconnected", C_ROSE),
     };
     let pill = Line::from(vec![
         Span::raw(" "),
@@ -694,19 +700,50 @@ fn draw_stage_frame(title: String, area: Rect, buf: &mut Buffer, ctx: &StageRend
     inner
 }
 
+pub fn project_display_name<'a>(
+    overview: &'a SidebarTreeSnapshot,
+    project: &'a BbProjectId,
+) -> &'a str {
+    overview
+        .projects
+        .iter()
+        .find(|b| &b.project == project)
+        .and_then(|b| b.name.as_deref())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(project.as_str())
+}
+
+fn board_display_label(board: &BoardId, overview: &SidebarTreeSnapshot) -> String {
+    if let Some(proj_id) = board.as_str().strip_prefix("project:")
+        && let Some(name) = overview
+            .projects
+            .iter()
+            .find(|b| b.project.as_str() == proj_id)
+            .and_then(|b| b.name.as_deref())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+    {
+        return name.to_owned();
+    }
+    board.to_string()
+}
+
 /// Human label for a stage target (`#proj/room`, `@wave/role`, `Inbox`).
-pub fn target_label(target: &StageTarget) -> String {
+pub fn target_label(target: &StageTarget, overview: &SidebarTreeSnapshot) -> String {
     match target {
         StageTarget::Inbox => "Inbox".to_owned(),
-        StageTarget::Kanban { board: Some(b) } => format!("Kanban {b}"),
+        StageTarget::Kanban { board: Some(b) } => {
+            format!("Kanban {}", board_display_label(b, overview))
+        }
         StageTarget::Kanban { board: None } => "Kanban".to_owned(),
-        StageTarget::Room { room } => room_label(room),
+        StageTarget::Room { room } => room_label_in(room, overview),
         StageTarget::Agent { wave, role } => format!("@{wave}/{role}"),
-        StageTarget::Summary { key } => node_label(key),
+        StageTarget::Summary { key } => node_label_in(key, overview),
     }
 }
 
-fn room_label(room: &RoomId) -> String {
+fn room_label_in(room: &RoomId, overview: &SidebarTreeSnapshot) -> String {
     match room {
         RoomId::Channel {
             scope: room::RoomScope::Global,
@@ -715,7 +752,7 @@ fn room_label(room: &RoomId) -> String {
         RoomId::Channel {
             scope: room::RoomScope::Project { project },
             name,
-        } => format!("#{project}/{name}"),
+        } => format!("#{}/{name}", project_display_name(overview, project)),
         RoomId::Direct { pair } => {
             let (a, b) = pair.clone().into();
             format!("{a} ↔ {b}")
@@ -723,14 +760,14 @@ fn room_label(room: &RoomId) -> String {
     }
 }
 
-fn node_label(key: &NodeKey) -> String {
+fn node_label_in(key: &NodeKey, overview: &SidebarTreeSnapshot) -> String {
     match key {
         NodeKey::Inbox => "Inbox".to_owned(),
         NodeKey::Kanban => "Kanban".to_owned(),
         NodeKey::Divider => "Overview".to_owned(),
         NodeKey::ProjectsHeader => "Projects".to_owned(),
-        NodeKey::Project(p) => format!("Project {p}"),
-        NodeKey::Room(r) | NodeKey::Dm(r) => room_label(r),
+        NodeKey::Project(p) => format!("Project {}", project_display_name(overview, p)),
+        NodeKey::Room(r) | NodeKey::Dm(r) => room_label_in(r, overview),
         NodeKey::Agent { wave, role } => format!("@{wave}/{role}"),
         NodeKey::ChannelsHeader => "Channels".to_owned(),
         NodeKey::DmsHeader => "Direct Messages".to_owned(),
@@ -999,7 +1036,10 @@ fn render_kanban(
     ctx: &StageRenderCtx<'_>,
 ) {
     let total_cards: usize = view.snapshot.lanes.iter().map(|l| l.cards.len()).sum();
-    let title = format!("Kanban · {} ({total_cards} cards)", view.snapshot.board);
+    let title = format!(
+        "Kanban · {} ({total_cards} cards)",
+        board_display_label(&view.snapshot.board, ctx.overview)
+    );
     let inner = draw_stage_frame(title, area, buf, ctx);
     if inner.height < 4 || inner.width < 16 {
         return;
@@ -1179,7 +1219,7 @@ fn render_room(
     hits: &mut HitMap,
     ctx: &StageRenderCtx<'_>,
 ) {
-    let room_label = format_room_title(&view.room);
+    let room_label = format_room_title(&view.room, ctx.overview);
     let inner = draw_stage_frame(room_label, area, buf, ctx);
     if inner.height < 4 || inner.width < 16 {
         return;
@@ -1569,6 +1609,9 @@ fn render_agent(
         return;
     }
 
+    let phase = find_worker_phase(ctx.overview, &inspector.wave, &inspector.role);
+    let error_detail = agent_error_detail(phase, &inspector.page.activity);
+    let error_h = u16::from(error_detail.is_some());
     let pending = inspector.active_pending();
     let pending_h = if pending.is_some() { 2 } else { 0 };
     let composer_h = composer_height(&inspector.composer, inner.width, ctx.composing, " Steer > ");
@@ -1576,6 +1619,7 @@ fn render_agent(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
+            Constraint::Length(error_h),
             Constraint::Length(pending_h),
             Constraint::Min(2),
             Constraint::Length(composer_h),
@@ -1583,11 +1627,12 @@ fn render_agent(
         .split(inner);
 
     let ctx_area = chunks[0];
-    let pending_area = chunks[1];
-    let log_area = chunks[2];
-    let composer_area = chunks[3];
+    let error_area = chunks[1];
+    let pending_area = chunks[2];
+    let log_area = chunks[3];
+    let composer_area = chunks[4];
 
-    let (act_label, act_color) = activity_badge(&inspector.page.activity);
+    let (act_label, act_color) = agent_status_badge(phase, &inspector.page.activity);
     let line0 = Line::from(vec![
         Span::styled(
             format!(" {act_label} "),
@@ -1695,6 +1740,24 @@ fn render_agent(
         Rect::new(ctx_area.x, ctx_area.y + 3, ctx_area.width, 1),
         buf,
     );
+
+    if let Some(err_text) = error_detail
+        && error_area.height >= 1
+    {
+        let label = " ✕ Error: ";
+        let max_err = (error_area.width as usize).saturating_sub(display_width(label));
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                label,
+                Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_chars(err_text, max_err),
+                Style::default().fg(Color::White),
+            ),
+        ]))
+        .render(error_area, buf);
+    }
 
     if let Some(inter) = pending
         && pending_area.height >= 2
@@ -1831,6 +1894,7 @@ fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRender
             ),
         ),
         NodeKey::Project(p) => {
+            let display = project_display_name(ctx.overview, p);
             let counts = ctx
                 .overview
                 .projects
@@ -1838,10 +1902,15 @@ fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRender
                 .find(|b| &b.project == p)
                 .map(|b| (b.channels.len(), b.waves.len()))
                 .unwrap_or((0, 0));
+            let id_prefix = if display == p.as_str() {
+                String::new()
+            } else {
+                format!("{p} · ")
+            };
             (
-                format!("Project · {p}"),
+                format!("Project · {display}"),
                 format!(
-                    "  {} channel(s), {} wave(s). Expand with l or Space. Kanban now opens this project's board.",
+                    "  {id_prefix}{} channel(s), {} wave(s). Expand with l/Space; B opens this project's Kanban.",
                     counts.0, counts.1
                 ),
             )
@@ -1858,7 +1927,7 @@ fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRender
             ),
         ),
         other => (
-            node_label(other),
+            node_label_in(other, ctx.overview),
             "  Select a leaf node to inspect.".to_owned(),
         ),
     };
@@ -1873,7 +1942,7 @@ fn render_loading(target: &StageTarget, area: Rect, buf: &mut Buffer, ctx: &Stag
     let inner = draw_stage_frame("Loading".to_owned(), area, buf, ctx);
     if inner.height >= 1 {
         Paragraph::new(Line::from(Span::styled(
-            format!("  ◌ Loading {}…", target_label(target)),
+            format!("  ◌ Loading {}…", target_label(target, ctx.overview)),
             Style::default().fg(C_DIM),
         )))
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
@@ -1892,12 +1961,26 @@ fn render_error(
         Paragraph::new(Line::from(Span::styled(
             format!(
                 "  ✕ {}: {}",
-                target_label(target),
+                target_label(target, ctx.overview),
                 truncate_chars(error, inner.width.saturating_sub(8) as usize)
             ),
             Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
         )))
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
+    }
+    if inner.height >= 2
+        && let StageTarget::Agent { wave, role } = target
+        && let Some(worker_err) =
+            find_worker_phase(ctx.overview, wave, role).and_then(WorkerPhase::error)
+    {
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "  Worker error: {}",
+                truncate_chars(worker_err, inner.width.saturating_sub(18) as usize)
+            ),
+            Style::default().fg(C_ROSE),
+        )))
+        .render(Rect::new(inner.x, inner.y + 1, inner.width, 1), buf);
     }
 }
 
@@ -2196,6 +2279,50 @@ fn interaction_kind_tag(kind: &InteractionKind) -> &'static str {
     }
 }
 
+fn find_worker_phase<'a>(
+    overview: &'a SidebarTreeSnapshot,
+    wave: &WaveSlug,
+    role: &RoleName,
+) -> Option<&'a WorkerPhase> {
+    overview
+        .projects
+        .iter()
+        .flat_map(|p| p.waves.iter())
+        .find(|w| &w.wave == wave)
+        .and_then(|w| w.workers.iter().find(|wk| &wk.role == role))
+        .map(|wk| &wk.phase)
+}
+
+fn agent_error_detail<'a>(
+    phase: Option<&'a WorkerPhase>,
+    activity: &'a Activity,
+) -> Option<&'a str> {
+    phase
+        .and_then(WorkerPhase::error)
+        .or_else(|| activity.error())
+}
+
+fn agent_status_badge(phase: Option<&WorkerPhase>, activity: &Activity) -> (&'static str, Color) {
+    match phase {
+        Some(WorkerPhase::Retired { errored, .. }) => {
+            if errored.is_some() || activity.error().is_some() {
+                ("✕ RETIRED (ERRORED)", C_ROSE)
+            } else {
+                ("✓ RETIRED", C_DIM)
+            }
+        }
+        Some(WorkerPhase::Retiring { errored, .. }) => {
+            if errored.is_some() || activity.error().is_some() {
+                ("✕ RETIRING (ERRORED)", C_ROSE)
+            } else {
+                ("✓ RETIRING", C_DIM)
+            }
+        }
+        Some(WorkerPhase::Failed { .. }) => ("✕ FAILED", C_ROSE),
+        _ => activity_badge(activity),
+    }
+}
+
 fn activity_badge(activity: &Activity) -> (&'static str, Color) {
     match activity {
         Activity::Working => ("● WORKING", C_MINT),
@@ -2206,10 +2333,10 @@ fn activity_badge(activity: &Activity) -> (&'static str, Color) {
     }
 }
 
-fn format_room_title(room: &RoomId) -> String {
+fn format_room_title(room: &RoomId, overview: &SidebarTreeSnapshot) -> String {
     match room {
-        RoomId::Direct { .. } => format!("Direct Message · {}", room_label(room)),
-        RoomId::Channel { .. } => format!("Room · {}", room_label(room)),
+        RoomId::Direct { .. } => format!("Direct Message · {}", room_label_in(room, overview)),
+        RoomId::Channel { .. } => format!("Room · {}", room_label_in(room, overview)),
     }
 }
 

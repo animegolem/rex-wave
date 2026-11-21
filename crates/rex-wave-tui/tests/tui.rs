@@ -1182,7 +1182,10 @@ async fn async_stage_retarget_cancels_slow_room_without_stealing_single_stage_sl
             error: None,
         },
     );
-    assert!(!model.connected);
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Disconnected
+    );
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .unwrap();
     assert!(screen_text(&term).contains("○ disconnected"));
@@ -1201,6 +1204,8 @@ async fn inbox_keys_help_overlay_sidebar_resize_project_kanban_and_multiline_com
     let proj_beta = BbProjectId::parse("proj_beta").unwrap();
     overview.projects.push(rex_wave_api::read::ProjectBranch {
         project: proj_beta.clone(),
+        name: None,
+        archived: false,
         channels: vec![rex_wave_api::read::ChannelLeaf {
             room: RoomId::Channel {
                 scope: RoomScope::Project {
@@ -1210,6 +1215,7 @@ async fn inbox_keys_help_overlay_sidebar_resize_project_kanban_and_multiline_com
             },
             unread: 0,
             mentions: 0,
+            archived: false,
         }],
         waves: Vec::new(),
     });
@@ -1473,4 +1479,454 @@ async fn inbox_keys_help_overlay_sidebar_resize_project_kanban_and_multiline_com
         Effect::Call { cmd: WireCommand::RoomPost(rp), .. }
             if rp.body.as_str() == "first line\nsecond line"
     )));
+}
+
+#[test]
+fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
+    let me = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let sam = Principal::Seat {
+        seat: SeatName::parse("sam").unwrap(),
+    };
+    let proj = BbProjectId::parse("proj_edaym59nyn").unwrap();
+    let active_wave = WaveSlug::parse("auth-v2").unwrap();
+    let done_wave = WaveSlug::parse("release-v1").unwrap();
+    let active_room = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: proj.clone(),
+        },
+        name: ChannelName::parse("wave-auth-v2").unwrap(),
+    };
+    let done_room = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: proj.clone(),
+        },
+        name: ChannelName::parse("wave-release-v1").unwrap(),
+    };
+    let proj_chan = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: proj.clone(),
+        },
+        name: ChannelName::parse("general").unwrap(),
+    };
+    let dm_room = RoomId::Direct {
+        pair: rex_wave_api::room::PrincipalPair::new(me.clone(), sam.clone()).unwrap(),
+    };
+
+    let mut overview = SidebarTreeSnapshot {
+        projects: vec![rex_wave_api::read::ProjectBranch {
+            project: proj.clone(),
+            name: Some("pancake-work".to_owned()),
+            archived: false,
+            channels: vec![rex_wave_api::read::ChannelLeaf {
+                room: proj_chan.clone(),
+                unread: 0,
+                mentions: 0,
+                archived: false,
+            }],
+            waves: vec![
+                rex_wave_api::read::WaveRoomBranch {
+                    wave: active_wave.clone(),
+                    room: active_room.clone(),
+                    unread: 0,
+                    mentions: 0,
+                    finished: None,
+                    archived: false,
+                    workers: vec![rex_wave_api::read::WaveWorkerLeaf {
+                        role: RoleName::parse("builder").unwrap(),
+                        provider: rex_wave_api::ProviderId::parse("codex").unwrap(),
+                        model: None,
+                        phase: rex_wave_api::wave::WorkerPhase::Live {
+                            thread: rex_wave_api::BbThreadId::parse("thr_build").unwrap(),
+                            activity: rex_wave_api::wave::Activity::Working,
+                        },
+                    }],
+                },
+                rex_wave_api::read::WaveRoomBranch {
+                    wave: done_wave.clone(),
+                    room: done_room.clone(),
+                    unread: 0,
+                    mentions: 0,
+                    finished: Some(rex_wave_api::wave::WaveOutcome::Completed {
+                        summary: Body::parse("done").unwrap(),
+                    }),
+                    archived: false,
+                    workers: vec![
+                        rex_wave_api::read::WaveWorkerLeaf {
+                            role: RoleName::parse("clean-bot").unwrap(),
+                            provider: rex_wave_api::ProviderId::parse("codex").unwrap(),
+                            model: None,
+                            phase: rex_wave_api::wave::WorkerPhase::Retired {
+                                thread: Some(rex_wave_api::BbThreadId::parse("thr_clean").unwrap()),
+                                errored: None,
+                            },
+                        },
+                        rex_wave_api::read::WaveWorkerLeaf {
+                            role: RoleName::parse("crash-bot").unwrap(),
+                            provider: rex_wave_api::ProviderId::parse("claude-code").unwrap(),
+                            model: None,
+                            phase: rex_wave_api::wave::WorkerPhase::Retired {
+                                thread: Some(rex_wave_api::BbThreadId::parse("thr_crash").unwrap()),
+                                errored: Some("Insufficient balance (402)".to_owned()),
+                            },
+                        },
+                    ],
+                },
+            ],
+        }],
+        direct_messages: vec![rex_wave_api::read::DmLeaf {
+            room: dm_room.clone(),
+            with: sam,
+            unread: 0,
+            archived: false,
+        }],
+        ..Default::default()
+    };
+
+    let mut model = Model::new(me, overview.clone());
+    let rows = flatten(&model.sidebar.roots, &model.sidebar.folds);
+    assert!(
+        rows.iter().any(|r| r.node.label == "pancake-work"),
+        "sidebar must render human BB project name"
+    );
+    assert!(
+        !rows.iter().any(|r| r.node.label == "proj_edaym59nyn"),
+        "raw project id must not replace human project name in sidebar"
+    );
+    assert!(
+        rows.iter().any(|r| r.node.label == "builder"),
+        "running wave starts expanded"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.node.label == "clean-bot" || r.node.label == "crash-bot"),
+        "finished wave must auto-fold on first sight"
+    );
+
+    let done_key = NodeKey::Room(done_room.clone());
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::ToggleFold(done_key.clone())),
+    );
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::new(overview.clone())),
+        },
+    );
+    let mut term = Terminal::new(TestBackend::new(132, 36)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let unfolded = screen_text(&term);
+    assert!(unfolded.contains("✓ clean-bot [codex]"));
+    assert!(unfolded.contains("✕ crash-bot [claude]"));
+
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Activate(NodeKey::Project(proj.clone()))),
+    );
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("Project · pancake-work"));
+
+    let _ = update(&mut model, Msg::Action(Action::Activate(done_key.clone())));
+    let room_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(room_seq),
+            result: Ok(WireReply::Read(rex_wave_api::read::Page {
+                entries: Vec::new(),
+                cursor: Cursor::live(),
+                timed_out: false,
+            })),
+        },
+    );
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("Room · #pancake-work/wave-release-v1"));
+
+    let _ = update(&mut model, Msg::Action(Action::Activate(NodeKey::Kanban)));
+    let board_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(board_seq),
+            result: Ok(WireReply::BoardView(rex_wave_api::board::BoardSnapshot {
+                board: rex_wave_api::board::project_board(&proj),
+                head: 0,
+                lanes: Vec::new(),
+            })),
+        },
+    );
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("Kanban · pancake-work"));
+
+    let crash_key = NodeKey::Agent {
+        wave: done_wave.clone(),
+        role: RoleName::parse("crash-bot").unwrap(),
+    };
+    let _ = update(&mut model, Msg::Action(Action::Activate(crash_key)));
+    let crash_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(crash_seq),
+            result: Ok(WireReply::ThreadPage(rex_wave_api::read::ThreadPageView {
+                thread: rex_wave_api::BbThreadId::parse("thr_crash").unwrap(),
+                activity: rex_wave_api::wave::Activity::Idle,
+                events: Vec::new(),
+                usage: None,
+                pending: None,
+                next: None,
+            })),
+        },
+    );
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let crash_screen = screen_text(&term);
+    assert!(crash_screen.contains("✕ RETIRED (ERRORED)"));
+    assert!(crash_screen.contains("Insufficient balance (402)"));
+
+    model.focus = Pane::Sidebar;
+    model.sidebar.cursor = done_key.clone();
+    let wave_arch_fx = press(&mut model, Pane::Sidebar, KeyCode::Char('z'));
+    assert!(wave_arch_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::SetArchived(sa), .. }
+            if sa.archived && sa.target == rex_wave_api::ArchiveTarget::Wave { wave: done_wave.clone() }
+    )));
+
+    model.sidebar.cursor = NodeKey::Project(proj.clone());
+    let proj_arch_fx = press(&mut model, Pane::Sidebar, KeyCode::Char('z'));
+    assert!(proj_arch_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::SetArchived(sa), .. }
+            if sa.archived && sa.target == rex_wave_api::ArchiveTarget::Project { project: proj.clone() }
+    )));
+
+    model.sidebar.cursor = NodeKey::Room(proj_chan.clone());
+    let chan_arch_fx = press(&mut model, Pane::Sidebar, KeyCode::Char('z'));
+    assert!(chan_arch_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::SetArchived(sa), .. }
+            if sa.archived && sa.target == rex_wave_api::ArchiveTarget::Room { room: proj_chan.clone() }
+    )));
+
+    model.sidebar.cursor = NodeKey::Dm(dm_room.clone());
+    let dm_arch_fx = press(&mut model, Pane::Sidebar, KeyCode::Char('z'));
+    assert!(dm_arch_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::SetArchived(sa), .. }
+            if sa.archived && sa.target == rex_wave_api::ArchiveTarget::Room { room: dm_room.clone() }
+    )));
+
+    model.sidebar.cursor = done_key.clone();
+    overview.projects[0].waves[1].archived = true;
+    let hide_fx = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::new(overview.clone())),
+        },
+    );
+    assert_eq!(model.sidebar.cursor, NodeKey::Project(proj.clone()));
+    assert!(
+        hide_fx
+            .iter()
+            .any(|e| matches!(e, Effect::DebounceHover(NodeKey::Project(p)) if p == &proj))
+    );
+    let _ = update(
+        &mut model,
+        Msg::HoverSettled(NodeKey::Project(proj.clone())),
+    );
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let hidden_screen = screen_text(&term);
+    assert!(!hidden_screen.contains("release-v1"));
+
+    let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('A'));
+    assert!(model.sidebar.show_archived);
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let shown_screen = screen_text(&term);
+    assert!(shown_screen.contains("Org Tree [archived]"));
+    assert!(shown_screen.contains("release-v1"));
+    assert!(shown_screen.contains("[archived]"));
+
+    model.sidebar.cursor = done_key;
+    let unarchive_fx = press(&mut model, Pane::Sidebar, KeyCode::Char('z'));
+    assert!(unarchive_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call { cmd: WireCommand::SetArchived(sa), .. }
+            if !sa.archived && sa.target == rex_wave_api::ArchiveTarget::Wave { wave: done_wave.clone() }
+    )));
+
+    let builder_key = NodeKey::Agent {
+        wave: active_wave.clone(),
+        role: RoleName::parse("builder").unwrap(),
+    };
+    model.sidebar.cursor = builder_key.clone();
+    overview.projects[0].waves[0].finished = Some(rex_wave_api::wave::WaveOutcome::Completed {
+        summary: Body::parse("finished while inspecting").unwrap(),
+    });
+    let finish_fx = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::new(overview.clone())),
+        },
+    );
+    assert_eq!(model.sidebar.cursor, builder_key);
+    assert!(
+        model
+            .sidebar
+            .folds
+            .is_expanded(&NodeKey::Room(active_room.clone()))
+    );
+    assert!(
+        !finish_fx
+            .iter()
+            .any(|e| matches!(e, Effect::DebounceHover(_)))
+    );
+
+    model.sidebar.cursor = NodeKey::Project(proj);
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::new(overview)),
+        },
+    );
+    assert!(model.sidebar.folds.is_expanded(&NodeKey::Room(active_room)));
+}
+
+#[tokio::test]
+async fn watch_connection_drives_reconnecting_badge_and_recovers_stage_on_reconnect() {
+    let me = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let mut model = Model::new(me, SidebarTreeSnapshot::default());
+    model.has_connection_watch = true;
+    let (conn_tx, conn_rx) = tokio::sync::watch::channel(true);
+    let mut conn_slot = Some(conn_rx);
+
+    let mut term = Terminal::new(TestBackend::new(124, 24)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("● connected"));
+
+    conn_tx.send(false).unwrap();
+    let drop_msg = rex_wave_tui::poll_connection(&mut conn_slot).await;
+    assert!(matches!(drop_msg, Msg::ConnectionChanged(false)));
+    let _ = update(&mut model, drop_msg);
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Reconnecting
+    );
+
+    let err_seq = model.stage_req_seq;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(err_seq),
+            result: Err(rex_wave_api::ApiError::Transport(
+                "reconnecting to daemon".to_owned(),
+            )),
+        },
+    );
+    assert!(matches!(model.stage, Stage::Error { .. }));
+
+    let buffered_frame_fx = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::default()),
+        },
+    );
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Reconnecting
+    );
+    assert!(matches!(model.stage, Stage::Error { .. }));
+    assert!(
+        !buffered_frame_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(_)))
+    );
+
+    let buffered_reply_fx = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::Sidebar,
+            result: Ok(WireReply::Sidebar(SidebarTreeSnapshot::default())),
+        },
+    );
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Reconnecting
+    );
+    assert!(matches!(model.stage, Stage::Error { .. }));
+    assert!(
+        !buffered_reply_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(_)))
+    );
+
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("○ reconnecting"));
+
+    conn_tx.send(true).unwrap();
+    let up_msg = rex_wave_tui::poll_connection(&mut conn_slot).await;
+    assert!(matches!(up_msg, Msg::ConnectionChanged(true)));
+    let recover_fx = update(&mut model, up_msg);
+    assert_eq!(model.connection, rex_wave_tui::ConnectionState::Connected);
+    assert!(matches!(model.stage, Stage::Loading(StageTarget::Inbox)));
+    assert!(
+        recover_fx
+            .iter()
+            .any(|e| matches!(e, Effect::EnsureTreeWatch))
+    );
+    assert!(recover_fx.iter().any(|e| matches!(
+        e,
+        Effect::Call {
+            tag: ReplyTag::Sidebar,
+            cmd: WireCommand::Sidebar(_),
+        }
+    )));
+    assert!(
+        recover_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(StageTarget::Inbox)))
+    );
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    assert!(screen_text(&term).contains("● connected"));
+
+    drop(conn_tx);
+    let closed_msg = rex_wave_tui::poll_connection(&mut conn_slot).await;
+    assert!(conn_slot.is_none());
+    assert!(matches!(closed_msg, Msg::ConnectionClosed));
+    let _ = update(&mut model, closed_msg);
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Disconnected
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            rex_wave_tui::poll_connection(&mut conn_slot),
+        )
+        .await
+        .is_err()
+    );
 }

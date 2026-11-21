@@ -13,6 +13,7 @@ SOCK="$SCRATCH_DIR/daemon.sock"
 JOURNAL="$SCRATCH_DIR/journal.sqlite3"
 SANDBOX="$SCRATCH_DIR/mail-sandbox"
 CONFIG_DIR="$SCRATCH_DIR/config"
+BB_DATA_DIR="$SCRATCH_DIR/bb-data"
 MOCK_BB_STATE="$SCRATCH_DIR/mock-bb-state.json"
 
 DAEMON_PID=""
@@ -425,6 +426,17 @@ function handleDown(sock, down) {
 						},
 					});
 				}, 100);
+			} else if (meta.role === "crash-bot") {
+				setTimeout(() => {
+					sendJson(sock, {
+						t: "thread",
+						signal: "failed",
+						thread_id: tid,
+						project_id: args.projectId,
+						meta,
+						error: "Insufficient balance (402)",
+					});
+				}, 80);
 			}
 			break;
 		}
@@ -506,6 +518,48 @@ seed_workspace_via_cli_and_mcp() {
 		--project proj_beta \
 		--goal "Build incremental Tantivy segment merger" \
 		--worker indexer=codex/gpt-6.1-sol >/dev/null
+
+	"$bin" --socket "$SOCK" wave start release-v1 \
+		--project proj_beta \
+		--goal "Verify terminal outcome glyphs and auto-fold" \
+		--worker clean-bot=codex/gpt-6.1-sol \
+		--worker crash-bot=claude-code/claude-opus-5-5 >/dev/null
+
+	local rel_deadline=$(( $(now_ms) + 8000 ))
+	local rel_ready=0
+	while (( $(now_ms) < rel_deadline )); do
+		local st
+		st="$("$bin" --socket "$SOCK" --json wave status release-v1 2>/dev/null || true)"
+		if printf '%s' "$st" | jq -e '
+			(.value.workers | any(.[0] == "clean-bot" and .[2].phase == "live")) and
+			(.value.workers | any(.[0] == "crash-bot" and .[2].phase == "live" and .[2].activity.activity == "errored"))
+		' >/dev/null 2>&1; then
+			rel_ready=1
+			break
+		fi
+		sleep 0.08
+	done
+	(( rel_ready == 1 )) || fail "release-v1 workers did not reach live + errored before finish"
+
+	"$bin" --socket "$SOCK" wave finish release-v1 \
+		--summary "Release smoke finished with crash-bot provider error" >/dev/null
+
+	local ret_deadline=$(( $(now_ms) + 8000 ))
+	local ret_ready=0
+	while (( $(now_ms) < ret_deadline )); do
+		local st
+		st="$("$bin" --socket "$SOCK" --json wave status release-v1 2>/dev/null || true)"
+		if printf '%s' "$st" | jq -e '
+			.value.status.status == "finished" and
+			(.value.workers | any(.[0] == "clean-bot" and .[2].phase == "retired" and (.[2].errored == null))) and
+			(.value.workers | any(.[0] == "crash-bot" and .[2].phase == "retired" and .[2].errored == "Insufficient balance (402)"))
+		' >/dev/null 2>&1; then
+			ret_ready=1
+			break
+		fi
+		sleep 0.08
+	done
+	(( ret_ready == 1 )) || fail "release-v1 workers did not retire cleanly/errored after wave finish"
 
 	"$bin" --socket "$SOCK" task add "Implement EdDSA refresh rotation" \
 		--board project:proj_alpha --lane todo --assign @auth-v2/author-jwt --priority high >/dev/null
@@ -628,9 +682,17 @@ rm -rf "$SCRATCH_DIR"
 if [[ -d "$STEPS_DIR" ]] && [[ -n "$(ls -A "$STEPS_DIR" 2>/dev/null)" ]]; then
 	fail "evidence steps dir $STEPS_DIR already contains files; choose a fresh REX_VERIFY_RUN_ID"
 fi
-mkdir -p "$SCRATCH_DIR" "$SANDBOX" "$CONFIG_DIR/rex-wave" "$STEPS_DIR"
+mkdir -p "$SCRATCH_DIR" "$SANDBOX" "$CONFIG_DIR/rex-wave" "$BB_DATA_DIR" "$STEPS_DIR"
 printf 'rex-verify-sandbox\n' > "$SANDBOX/.rex-wave-sandbox"
 : > "$CONFIG_DIR/rex-wave/protected-roots"
+cat > "$BB_DATA_DIR/projects.json" <<'EOF'
+{
+  "projects": [
+    { "id": "proj_alpha", "name": "auth-platform" },
+    { "id": "proj_beta", "name": "search-engine" }
+  ]
+}
+EOF
 
 REX_WAVE_BIN="$(resolve_rex_wave_bin)"
 printf '==> Using rex-wave binary: %s\n' "$REX_WAVE_BIN"
@@ -645,23 +707,27 @@ write_mock_bb_server
 node "$SCRATCH_DIR/mock-bb.mjs" "$BB_PORT" "$BB_TOKEN" "$MOCK_BB_STATE" &
 MOCK_BB_PID="$!"
 
-XDG_CONFIG_HOME="$CONFIG_DIR" "$REX_WAVE_BIN" --socket "$SOCK" daemon \
-	--journal "$JOURNAL" \
-	--mail-sandbox "$SANDBOX" \
-	--bb-url "ws://127.0.0.1:${BB_PORT}/api/v1/plugins/rex-wave/http/bridge" \
-	--bb-token "$BB_TOKEN" \
-	--operator owner \
-	--wake-bell "127.0.0.1:${BELL_PORT}" \
-	>"$SCRATCH_DIR/daemon.stdout.log" 2>"$SCRATCH_DIR/daemon.stderr.log" &
-DAEMON_PID="$!"
+start_daemon() {
+	XDG_CONFIG_HOME="$CONFIG_DIR" BB_DATA_DIR="$BB_DATA_DIR" "$REX_WAVE_BIN" --socket "$SOCK" daemon \
+		--journal "$JOURNAL" \
+		--mail-sandbox "$SANDBOX" \
+		--bb-url "ws://127.0.0.1:${BB_PORT}/api/v1/plugins/rex-wave/http/bridge" \
+		--bb-token "$BB_TOKEN" \
+		--operator owner \
+		--wake-bell "127.0.0.1:${BELL_PORT}" \
+		>>"$SCRATCH_DIR/daemon.stdout.log" 2>>"$SCRATCH_DIR/daemon.stderr.log" &
+	DAEMON_PID="$!"
 
-SOCK_DEADLINE=$(( $(now_ms) + 6000 ))
-while [[ ! -S "$SOCK" ]]; do
-	if (( $(now_ms) >= SOCK_DEADLINE )); then
-		fail "daemon socket $SOCK did not appear"
-	fi
-	sleep 0.05
-done
+	local sock_deadline=$(( $(now_ms) + 6000 ))
+	while [[ ! -S "$SOCK" ]]; do
+		if (( $(now_ms) >= sock_deadline )); then
+			fail "daemon socket $SOCK did not appear"
+		fi
+		sleep 0.05
+	done
+}
+
+start_daemon
 
 printf '==> Seeding waves, 55+ inbox cards, rooms, Kanban tasks, and DMs\n'
 seed_workspace_via_cli_and_mcp "$REX_WAVE_BIN"
@@ -717,8 +783,14 @@ jq -n \
 	}' > "$EVIDENCE_DIR/doctor.json"
 
 record_step "inbox-initial"
-assert_contains "$(cat "$STEPS_DIR/01-inbox-initial.screen.txt")" "● connected" "connected status pill in top chrome"
-assert_contains "$(cat "$STEPS_DIR/01-inbox-initial.screen.txt")" "[claude]" "shortened claude provider badge in sidebar"
+INITIAL_SCREEN="$(cat "$STEPS_DIR/01-inbox-initial.screen.txt")"
+assert_contains "$INITIAL_SCREEN" "● connected" "connected status pill in top chrome"
+assert_contains "$INITIAL_SCREEN" "[claude]" "shortened claude provider badge in sidebar"
+assert_contains "$INITIAL_SCREEN" "auth-platform" "human BB project name for proj_alpha in sidebar"
+assert_contains "$INITIAL_SCREEN" "search-engine" "human BB project name for proj_beta in sidebar"
+assert_contains "$INITIAL_SCREEN" "▸ ✕ release-v1" "finished wave auto-folded on first sight with error glyph"
+assert_not_contains "$INITIAL_SCREEN" "clean-bot" "auto-folded finished wave hides clean-bot worker"
+assert_not_contains "$INITIAL_SCREEN" "crash-bot" "auto-folded finished wave hides crash-bot worker"
 INITIAL_OSC_STATE="$(jq -er '.records[0].state' "$STEPS_DIR/01-inbox-initial.program_status.json")"
 INITIAL_OSC_KIND="$(jq -er '.records[0].kind' "$STEPS_DIR/01-inbox-initial.program_status.json")"
 INITIAL_OSC_TITLE="$(jq -er '.records[0].title // empty' "$STEPS_DIR/01-inbox-initial.program_status.json")"
@@ -763,6 +835,8 @@ rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" '?'
 wait_screen_contains "Keys · rex-wave" "Keymap Help Overlay opened"
 wait_screen_contains "Hybrid z=-1 + U+10EEEE" "GraphicsMode Hybrid shown in Help Overlay"
 wait_screen_contains "mark card read" "[r] mark card read documented in Help Overlay"
+wait_screen_contains "archive / unarchive node" "[z] archive documented in Help Overlay"
+wait_screen_contains "show / hide archived" "[A] show archived documented in Help Overlay"
 record_step "help-overlay-open"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" v
@@ -796,7 +870,7 @@ rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" tab
 
 printf '==> Journey 2: Kanban board navigation, card move [m], and composer new task [i]\n'
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
-wait_screen_contains "Kanban · project:proj_alpha" "Kanban stage loaded"
+wait_screen_contains "Kanban · auth-platform" "Kanban stage loaded with human project name"
 record_step "kanban-initial"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" enter
@@ -823,12 +897,12 @@ rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 sleep 0.1
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space
 wait_screen_contains "▸ Projects" "Projects branch collapsed"
-wait_screen_not_contains "proj_alpha" "proj_alpha hidden while collapsed"
+wait_screen_not_contains "auth-platform" "auth-platform hidden while collapsed"
 record_step "sidebar-projects-folded"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space
 wait_screen_contains "▾ Projects" "Projects branch expanded"
-wait_screen_contains "proj_alpha" "proj_alpha visible after unfold"
+wait_screen_contains "auth-platform" "auth-platform visible after unfold"
 record_step "sidebar-projects-unfolded"
 
 printf '==> Journey 4: Wave room wrapped markdown, collapsed brief, multiline paste/newline compose, pager, and promote [P]\n'
@@ -836,7 +910,7 @@ rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" enter
-wait_screen_contains "Room · #proj_alpha/wave-auth-v2" "Wave room stage loaded"
+wait_screen_contains "Room · #auth-platform/wave-auth-v2" "Wave room stage loaded with human project name"
 wait_screen_contains "brief for @author-jwt [Enter to expand]" "WaveConductor brief collapsed to 1-line summary"
 record_step "wave-room-before-post"
 
@@ -913,11 +987,75 @@ RESOLVED_OSC_TITLE="$(jq -er '.records[0].title // empty' "$RESOLVED_OSC_FILE")"
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" tab
 
-printf '==> Journey 6: Direct Messages jump [G] and clean TUI quit [q]\n'
+printf '==> Journey 6: Human project summary, retired-clean/errored glyphs, auto-fold unfold, and [z]/[A] archive round-trip\n'
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+wait_screen_contains "Project · search-engine" "Project summary header renders human BB project name"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+wait_screen_contains "Room · #search-engine/wave-release-v1" "Finished wave room loaded on stage"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space
+wait_screen_contains "✓ clean-bot [codex]" "Retired-clean worker renders checkmark glyph"
+wait_screen_contains "✕ crash-bot [claude]" "Retired-errored worker renders error glyph"
+record_step "finished-wave-unfolded"
+
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+wait_screen_contains "✓ RETIRED" "Agent Inspector shows clean retired status for clean-bot"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+wait_screen_contains "✕ RETIRED (ERRORED)" "Agent Inspector shows errored retired status for crash-bot"
+wait_screen_contains "Insufficient balance (402)" "Agent Inspector preserves worker error detail"
+record_step "retired-errored-inspector"
+
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" k
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" k
+wait_screen_contains "Room · #search-engine/wave-release-v1" "Returned to release-v1 wave node"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" z
+wait_screen_not_contains "release-v1" "Archived wave hidden from sidebar and stage"
+ARCH_STATE="$("$REX_WAVE_BIN" --socket "$SOCK" --json call sidebar '{}' | jq -r '.value.projects[] | select(.project=="proj_beta") | .waves[] | select(.wave=="release-v1") | .archived')"
+[[ "$ARCH_STATE" == "true" ]] || fail "expected release-v1 archived=true in sidebar snapshot, got $ARCH_STATE"
+record_step "wave-archived-hidden"
+
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+a
+wait_screen_contains "Org Tree [archived]" "Sidebar header displays active archived filter"
+wait_screen_contains "release-v1" "Archived wave reappears when show_archived is toggled ON"
+wait_screen_contains "[archived]" "Archived wave displays [archived] tag"
+record_step "wave-show-archived"
+
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" j
+sleep 0.1
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" z
+UNARCH_DEADLINE=$(( $(now_ms) + 5000 ))
+UNARCH_STATE="true"
+while (( $(now_ms) < UNARCH_DEADLINE )); do
+	UNARCH_STATE="$("$REX_WAVE_BIN" --socket "$SOCK" --json call sidebar '{}' | jq -r '.value.projects[] | select(.project=="proj_beta") | .waves[] | select(.wave=="release-v1") | .archived')"
+	if [[ "$UNARCH_STATE" == "false" ]]; then
+		break
+	fi
+	sleep 0.08
+done
+[[ "$UNARCH_STATE" == "false" ]] || fail "expected release-v1 archived=false after second z press, got $UNARCH_STATE"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+a
+wait_screen_not_contains "Org Tree [archived]" "Sidebar archived filter toggled OFF"
+wait_screen_contains "release-v1" "Unarchived wave stays visible after hiding archived items"
+record_step "wave-unarchived-visible"
+
+printf '==> Journey 7: Live daemon disconnect -> reconnecting badge + stage error -> restart -> auto StageLoader recovery\n'
+kill "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+wait_screen_contains "○ reconnecting" "Top-chrome badge transitions live to reconnecting on daemon drop"
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+g
-wait_screen_contains "DM batch #1 from @sam" "Direct Message stage with @sam"
-wait_screen_contains "All 32 alpha shards reported nominal p99." "Wrapped second line in Direct Message stage"
-record_step "direct-message-sam"
+wait_screen_contains "Stage Error" "Stage enters error state when retargeted during daemon outage"
+wait_screen_contains "reconnecting to daemon" "Stage error surfaces reconnecting transport cause"
+record_step "daemon-reconnecting"
+
+start_daemon
+wait_screen_contains "● connected" "Top-chrome badge transitions back to connected on daemon restart"
+wait_screen_contains "DM batch #1 from @sam" "StageLoader automatically recovers Direct Message stage with zero keypresses"
+wait_screen_contains "All 32 alpha shards reported nominal p99." "Wrapped second line in recovered Direct Message stage"
+record_step "daemon-reconnected"
+
+printf '==> Journey 8: Clean TUI quit [q] and OSC 7501 clear\n'
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" q
 QUIT_DEADLINE=$(( $(now_ms) + 5000 ))

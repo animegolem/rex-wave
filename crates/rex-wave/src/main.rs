@@ -967,7 +967,12 @@ async fn main() -> ExitCode {
             .map_err(|e| e.to_string()),
         Cmd::Tui { self_test: false } => {
             match RemoteClient::connect(endpoint, Credential::PeerUid, "tui").await {
-                Ok(client) => rex_wave_tui::run(client).await.map_err(|e| e.to_string()),
+                Ok(client) => {
+                    let connection = client.watch_connection();
+                    rex_wave_tui::run_with_connection(client, connection)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
                 Err(e) => Err(e.to_string()),
             }
         }

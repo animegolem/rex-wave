@@ -46,7 +46,7 @@ use rex_wave_api::{
     *,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io,
     sync::{Arc, Mutex},
@@ -73,6 +73,9 @@ struct DemoState {
     inbox: InboxPage,
     rooms: BTreeMap<RoomId, Vec<Envelope>>,
     workers: BTreeMap<RoleName, WorkerRecord>,
+    archived_projects: BTreeSet<BbProjectId>,
+    archived_waves: BTreeSet<WaveSlug>,
+    archived_rooms: BTreeSet<RoomId>,
     generation: FocusGeneration,
 }
 
@@ -563,6 +566,9 @@ impl DemoClient {
             inbox,
             rooms,
             workers,
+            archived_projects: BTreeSet::new(),
+            archived_waves: BTreeSet::new(),
+            archived_rooms: BTreeSet::new(),
             generation: FocusGeneration::default(),
         };
         let initial_snap = state.sidebar_snapshot(&me);
@@ -647,13 +653,13 @@ impl DemoState {
             kanban,
             projects: vec![ProjectBranch {
                 project: self.project.clone(),
-                name: None,
-                archived: false,
+                name: Some("auth-platform".to_owned()),
+                archived: self.archived_projects.contains(&self.project),
                 channels: vec![ChannelLeaf {
                     room: self.general_room.clone(),
                     unread: 1,
                     mentions: 0,
-                    archived: false,
+                    archived: self.archived_rooms.contains(&self.general_room),
                 }],
                 waves: vec![WaveRoomBranch {
                     wave: self.wave.clone(),
@@ -661,7 +667,7 @@ impl DemoState {
                     unread: 1,
                     mentions: 1,
                     finished: None,
-                    archived: false,
+                    archived: self.archived_waves.contains(&self.wave),
                     workers,
                 }],
             }],
@@ -669,20 +675,20 @@ impl DemoState {
                 room: self.lounge_room.clone(),
                 unread: 0,
                 mentions: 0,
-                archived: false,
+                archived: self.archived_rooms.contains(&self.lounge_room),
             }],
             direct_messages: vec![
                 DmLeaf {
                     room: self.sam_dm.clone(),
                     with: sam,
                     unread: 1,
-                    archived: false,
+                    archived: self.archived_rooms.contains(&self.sam_dm),
                 },
                 DmLeaf {
                     room: self.alice_dm.clone(),
                     with: alice,
                     unread: 0,
-                    archived: false,
+                    archived: self.archived_rooms.contains(&self.alice_dm),
                 },
             ],
             osc7501,
@@ -1004,7 +1010,33 @@ impl Client for DemoClient {
                 WireCommand::MailAck(_) => WireReply::MailAck(Ack),
                 WireCommand::MailWakeBell(_) => WireReply::MailWakeBell(Ack),
                 WireCommand::InboxRaise(_) => WireReply::InboxRaise(Ack),
-                WireCommand::SetArchived(_) => WireReply::SetArchived(Ack),
+                WireCommand::SetArchived(sa) => {
+                    match sa.target {
+                        ArchiveTarget::Project { project } => {
+                            if sa.archived {
+                                st.archived_projects.insert(project);
+                            } else {
+                                st.archived_projects.remove(&project);
+                            }
+                        }
+                        ArchiveTarget::Wave { wave } => {
+                            if sa.archived {
+                                st.archived_waves.insert(wave);
+                            } else {
+                                st.archived_waves.remove(&wave);
+                            }
+                        }
+                        ArchiveTarget::Room { room } => {
+                            if sa.archived {
+                                st.archived_rooms.insert(room);
+                            } else {
+                                st.archived_rooms.remove(&room);
+                            }
+                        }
+                    }
+                    let _ = sidebar_tx.send(st.sidebar_snapshot(&me));
+                    WireReply::SetArchived(Ack)
+                }
             };
             Ok(reply)
         }

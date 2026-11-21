@@ -6,6 +6,7 @@ The `Agent Inspector` streams a wave worker's BB turn events (`TurnStarted`, `Us
 
 - `inspector-events-and-usage` displays the worker's provider thread ID, activity state, turn log, token usage breakdown, and 24-cell `U+10EEEE` bar, updating `[<provider> · <pct>%]` in `Org Tree`.
 - `inspector-resolve` approves (`a`) or denies (`d`) a blocked worker's `PendingInteraction` and forwards the resolution to `AgentHost::resolve`.
+- `inspector-terminal-errors` renders `✕` (instead of `✓`) for `Retiring` / `Retired` workers with preserved errors (`WorkerPhase::error().is_some()`), shows `✕ RETIRED (ERRORED)` plus the preserved error detail in `Agent Inspector`, and renders `✓` / `✓ RETIRED` for cleanly retired workers.
 - `inspector-steer` sends a `WaveTell` message (`mode: auto`) from the TUI composer (`i`) or `rex-wave wave steer`.
 
 ## How to get to it (user POV)

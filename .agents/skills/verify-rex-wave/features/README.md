@@ -6,8 +6,8 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - Build `rex-wave` and resolve its binary path from Cargo metadata or `REX_WAVE_BIN`.
 - Create `/tmp/rex-verify-$$` with `mail-sandbox/.rex-wave-sandbox`, `config/rex-wave/protected-roots`, and dynamic loopback ports for `--wake-bell` and `--bb-url`.
-- Start an isolated `XDG_CONFIG_HOME=/tmp/rex-verify-$$/config rex-wave daemon --socket /tmp/rex-verify-$$/daemon.sock` owned by this run.
-- Seed `proj_alpha` (`#general`, `#wave-auth-v2` with `author-jwt` and `migrator`), `proj_beta` (`#ops`, `#wave-search-idx` with `indexer`), `#lounge`, `@sam` and `@alice` DMs, `project:proj_alpha` Kanban cards, and 58+ unread `Inbox` notifications.
+- Start an isolated `XDG_CONFIG_HOME=/tmp/rex-verify-$$/config BB_DATA_DIR=/tmp/rex-verify-$$/bb-data rex-wave daemon --socket /tmp/rex-verify-$$/daemon.sock` owned by this run, with `bb-data/projects.json` mapping `proj_alpha` -> `auth-platform` and `proj_beta` -> `search-engine`.
+- Seed `proj_alpha` (`#general`, `#wave-auth-v2` with `author-jwt` and `migrator`), `proj_beta` (`#ops`, `#wave-search-idx` with `indexer`, finished `#wave-release-v1` with retired-clean `clean-bot` and retired-errored `crash-bot`), `#lounge`, `@sam` and `@alice` DMs, `project:proj_alpha` Kanban cards, and 58+ unread `Inbox` notifications.
 - Create an unattached `Rex` session (`rex new "rex-verify-$$" --window "harness" --json -- sleep 300`), start `rex-wave tui` via `rex run -s "$REX_VERIFY_SESSION" --focus=false --keep-open --json -- ...`, and resize `$REX_VERIFY_BLOCK` to `132x38`.
 - Pass the `Doctor` check in [`../SKILL.md`](../SKILL.md) before sending keys.
 - Never drive the operator's `~/.local/state/rex-wave/daemon.sock` or switch focus in `Rex.app`.

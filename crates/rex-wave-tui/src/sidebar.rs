@@ -10,10 +10,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
 use rex_wave_api::{
-    BbProjectId, RoleName, WaveSlug,
+    ArchiveTarget, BbProjectId, RoleName, WaveSlug,
     read::{SidebarTreeSnapshot, WaveWorkerLeaf},
     room::RoomId,
-    wave::{Activity, WorkerPhase},
+    wave::{Activity, WaveOutcome, WorkerPhase},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -78,6 +78,7 @@ pub struct SidebarNode {
     pub badge: Option<u32>,
     pub glyph: Option<Glyph>,
     pub tag: Option<String>,
+    pub archived: bool,
     pub children: Vec<SidebarNode>,
 }
 
@@ -122,21 +123,40 @@ pub struct Sidebar {
     pub hover: Option<NodeKey>,
     pub scroll: u16,
     pub ctx_pct: BTreeMap<(WaveSlug, RoleName), u8>,
+    pub show_archived: bool,
+    auto_folded_waves: BTreeSet<WaveSlug>,
     fold_level: u8,
 }
 
 impl Sidebar {
     pub fn new(overview: &SidebarTreeSnapshot) -> Self {
-        let ctx_pct = BTreeMap::new();
-        let roots = build_with_ctx(overview, &ctx_pct);
-        Self {
-            roots,
+        let mut sidebar = Self {
+            roots: Vec::new(),
             folds: FoldState::default(),
             cursor: NodeKey::Inbox,
             hover: None,
             scroll: 0,
-            ctx_pct,
+            ctx_pct: BTreeMap::new(),
+            show_archived: false,
+            auto_folded_waves: BTreeSet::new(),
             fold_level: 2,
+        };
+        sidebar.apply_auto_folds(overview);
+        sidebar.roots = build_with_ctx(overview, &sidebar.ctx_pct, sidebar.show_archived);
+        sidebar
+    }
+
+    fn apply_auto_folds(&mut self, overview: &SidebarTreeSnapshot) {
+        for proj in &overview.projects {
+            for wave in &proj.waves {
+                if wave.finished.is_some() && self.auto_folded_waves.insert(wave.wave.clone()) {
+                    let cursor_in_wave = self.cursor == NodeKey::Room(wave.room.clone())
+                        || matches!(&self.cursor, NodeKey::Agent { wave: w, .. } if w == &wave.wave);
+                    if !cursor_in_wave {
+                        self.folds.set(NodeKey::Room(wave.room.clone()), false);
+                    }
+                }
+            }
         }
     }
 
@@ -154,7 +174,8 @@ impl Sidebar {
 
     pub fn rebuild(&mut self, overview: &SidebarTreeSnapshot) {
         let prev_ancestors = ancestor_chain(&self.roots, &self.cursor).unwrap_or_default();
-        self.roots = build_with_ctx(overview, &self.ctx_pct);
+        self.apply_auto_folds(overview);
+        self.roots = build_with_ctx(overview, &self.ctx_pct, self.show_archived);
 
         if find_node(&self.roots, &self.cursor).is_none() {
             self.cursor = prev_ancestors
@@ -173,6 +194,11 @@ impl Sidebar {
                 .find(|k| visible.iter().any(|r| &r.key == k))
         {
             self.cursor = vis_anc;
+        }
+        if let Some(hover) = &self.hover
+            && !visible.iter().any(|r| &r.key == hover)
+        {
+            self.hover = None;
         }
     }
 
@@ -274,16 +300,23 @@ impl Sidebar {
         }
         hits.push(area, Target::SidebarBody);
 
+        let mut title_spans = vec![Span::styled(
+            " Org Tree ",
+            Style::default()
+                .fg(if focused { C_ACCENT } else { C_TEXT })
+                .add_modifier(Modifier::BOLD),
+        )];
+        if self.show_archived {
+            title_spans.push(Span::styled(
+                "[archived] ",
+                Style::default().fg(C_AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(if focused { C_PANEL_FOCUS } else { C_PANEL_IDLE }))
-            .title(Span::styled(
-                " Org Tree ",
-                Style::default()
-                    .fg(if focused { C_ACCENT } else { C_TEXT })
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .title(Line::from(title_spans));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -375,19 +408,31 @@ impl Sidebar {
                 row.key,
                 NodeKey::ProjectsHeader | NodeKey::ChannelsHeader | NodeKey::DmsHeader
             );
-            let label_fg = if is_cursor {
+            let label_fg = if row.node.archived {
+                if is_cursor {
+                    Color::Rgb(172, 182, 204)
+                } else {
+                    C_DIM
+                }
+            } else if is_cursor {
                 Color::White
             } else if is_section {
                 C_DIM
             } else {
                 C_TEXT
             };
-            let label_mod =
-                if is_cursor || is_section || matches!(row.key, NodeKey::Inbox | NodeKey::Kanban) {
+            let label_mod = if row.node.archived {
+                if is_cursor {
                     Modifier::BOLD
                 } else {
-                    Modifier::empty()
-                };
+                    Modifier::DIM
+                }
+            } else if is_cursor || is_section || matches!(row.key, NodeKey::Inbox | NodeKey::Kanban)
+            {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            };
             col_used += row.node.label.chars().count() as u16;
             spans.push(Span::styled(
                 row.node.label.clone(),
@@ -397,8 +442,28 @@ impl Sidebar {
             if let Some(tag) = &row.node.tag {
                 let tag_str = format!(" {tag}");
                 col_used += tag_str.chars().count() as u16;
-                let tag_color = if tag.contains('◐') { C_AMBER } else { C_DIM };
+                let tag_color = if row.node.archived {
+                    C_DIM
+                } else if tag.contains('◐') {
+                    C_AMBER
+                } else if tag.contains('✕') {
+                    C_ROSE
+                } else {
+                    C_DIM
+                };
                 spans.push(Span::styled(tag_str, Style::default().fg(tag_color).bg(bg)));
+            }
+
+            if row.node.archived {
+                let arch_str = " [archived]";
+                col_used += arch_str.len() as u16;
+                spans.push(Span::styled(
+                    arch_str,
+                    Style::default()
+                        .fg(C_DIM)
+                        .bg(bg)
+                        .add_modifier(Modifier::DIM),
+                ));
             }
 
             if let Some(badge) = row.node.badge
@@ -451,6 +516,7 @@ impl Sidebar {
 pub fn build_with_ctx(
     overview: &SidebarTreeSnapshot,
     ctx_pct: &BTreeMap<(WaveSlug, RoleName), u8>,
+    show_archived: bool,
 ) -> Vec<SidebarNode> {
     let inbox_glyph = if overview.inbox.blocking > 0 {
         Some(Glyph::Blocked)
@@ -468,6 +534,7 @@ pub fn build_with_ctx(
         badge: (overview.inbox.unread > 0).then_some(overview.inbox.unread),
         glyph: inbox_glyph,
         tag: inbox_tag,
+        archived: false,
         children: Vec::new(),
     };
 
@@ -479,6 +546,7 @@ pub fn build_with_ctx(
         badge: (open_tasks > 0).then_some(open_tasks),
         glyph: None,
         tag: (mine_tasks > 0).then(|| format!("@{mine_tasks}")),
+        archived: false,
         children: Vec::new(),
     };
 
@@ -488,29 +556,38 @@ pub fn build_with_ctx(
         badge: None,
         glyph: None,
         tag: None,
+        archived: false,
         children: Vec::new(),
     };
 
     let project_children: Vec<SidebarNode> = overview
         .projects
         .iter()
+        .filter(|proj| show_archived || !proj.archived)
         .map(|proj| {
             let mut room_nodes: Vec<SidebarNode> = proj
                 .channels
                 .iter()
+                .filter(|ch| show_archived || !ch.archived)
                 .map(|ch| SidebarNode {
                     key: NodeKey::Room(ch.room.clone()),
                     label: room_short_label(&ch.room),
                     badge: (ch.unread > 0).then_some(ch.unread),
                     glyph: None,
                     tag: (ch.mentions > 0).then(|| format!("@{}", ch.mentions)),
+                    archived: ch.archived,
                     children: Vec::new(),
                 })
                 .collect();
 
-            for wave_branch in &proj.waves {
+            for wave_branch in proj
+                .waves
+                .iter()
+                .filter(|wave| show_archived || !wave.archived)
+            {
                 let mut working_cnt = 0u32;
                 let mut blocked_cnt = 0u32;
+                let mut errored_cnt = 0u32;
                 let worker_nodes: Vec<SidebarNode> = wave_branch
                     .workers
                     .iter()
@@ -519,6 +596,7 @@ pub fn build_with_ctx(
                         match g {
                             Glyph::Working => working_cnt += 1,
                             Glyph::Blocked => blocked_cnt += 1,
+                            Glyph::Errored => errored_cnt += 1,
                             _ => {}
                         }
                         let provider_full = worker.provider.to_string();
@@ -537,33 +615,54 @@ pub fn build_with_ctx(
                             badge: None,
                             glyph: Some(g),
                             tag: Some(tag),
+                            archived: false,
                             children: Vec::new(),
                         }
                     })
                     .collect();
 
-                let wave_tag = match (working_cnt > 0, blocked_cnt > 0) {
-                    (true, true) => Some(format!("●{working_cnt} ◐{blocked_cnt}")),
-                    (true, false) => Some(format!("●{working_cnt}")),
-                    (false, true) => Some(format!("◐{blocked_cnt}")),
-                    (false, false) => None,
-                };
+                let mut wave_parts = Vec::new();
+                if working_cnt > 0 {
+                    wave_parts.push(format!("●{working_cnt}"));
+                }
+                if blocked_cnt > 0 {
+                    wave_parts.push(format!("◐{blocked_cnt}"));
+                }
+                if errored_cnt > 0 {
+                    wave_parts.push(format!("✕{errored_cnt}"));
+                }
+                let wave_tag = (!wave_parts.is_empty()).then(|| wave_parts.join(" "));
+                let wave_glyph = wave_branch.finished.as_ref().map(|outcome| {
+                    if matches!(outcome, WaveOutcome::Failed { .. }) || errored_cnt > 0 {
+                        Glyph::Errored
+                    } else {
+                        Glyph::Done
+                    }
+                });
                 room_nodes.push(SidebarNode {
                     key: NodeKey::Room(wave_branch.room.clone()),
                     label: wave_branch.wave.to_string(),
                     badge: (wave_branch.unread > 0).then_some(wave_branch.unread),
-                    glyph: None,
+                    glyph: wave_glyph,
                     tag: wave_tag,
+                    archived: wave_branch.archived,
                     children: worker_nodes,
                 });
             }
 
             SidebarNode {
                 key: NodeKey::Project(proj.project.clone()),
-                label: proj.project.to_string(),
+                label: proj
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or(proj.project.as_str())
+                    .to_owned(),
                 badge: None,
                 glyph: None,
                 tag: None,
+                archived: proj.archived,
                 children: room_nodes,
             }
         })
@@ -575,18 +674,21 @@ pub fn build_with_ctx(
         badge: None,
         glyph: None,
         tag: None,
+        archived: false,
         children: project_children,
     };
 
     let channel_children: Vec<SidebarNode> = overview
         .channels
         .iter()
+        .filter(|ch| show_archived || !ch.archived)
         .map(|ch| SidebarNode {
             key: NodeKey::Room(ch.room.clone()),
             label: room_short_label(&ch.room),
             badge: (ch.unread > 0).then_some(ch.unread),
             glyph: None,
             tag: (ch.mentions > 0).then(|| format!("@{}", ch.mentions)),
+            archived: ch.archived,
             children: Vec::new(),
         })
         .collect();
@@ -597,18 +699,21 @@ pub fn build_with_ctx(
         badge: None,
         glyph: None,
         tag: None,
+        archived: false,
         children: channel_children,
     };
 
     let dm_children: Vec<SidebarNode> = overview
         .direct_messages
         .iter()
+        .filter(|dm| show_archived || !dm.archived)
         .map(|dm| SidebarNode {
             key: NodeKey::Dm(dm.room.clone()),
             label: dm.with.to_string(),
             badge: (dm.unread > 0).then_some(dm.unread),
             glyph: None,
             tag: None,
+            archived: dm.archived,
             children: Vec::new(),
         })
         .collect();
@@ -619,6 +724,7 @@ pub fn build_with_ctx(
         badge: None,
         glyph: None,
         tag: None,
+        archived: false,
         children: dm_children,
     };
 
@@ -632,7 +738,73 @@ pub fn build_with_ctx(
     ]
 }
 
+/// Resolves the archivable target and its current archived flag for a sidebar row.
+pub fn archive_target_for(
+    overview: &SidebarTreeSnapshot,
+    key: &NodeKey,
+) -> Option<(ArchiveTarget, bool)> {
+    match key {
+        NodeKey::Project(project) => overview
+            .projects
+            .iter()
+            .find(|p| &p.project == project)
+            .map(|p| {
+                (
+                    ArchiveTarget::Project {
+                        project: p.project.clone(),
+                    },
+                    p.archived,
+                )
+            }),
+        NodeKey::Room(room) => {
+            if let Some(wave) = overview
+                .projects
+                .iter()
+                .flat_map(|p| p.waves.iter())
+                .find(|w| &w.room == room)
+            {
+                return Some((
+                    ArchiveTarget::Wave {
+                        wave: wave.wave.clone(),
+                    },
+                    wave.archived,
+                ));
+            }
+            overview
+                .projects
+                .iter()
+                .flat_map(|p| p.channels.iter())
+                .chain(overview.channels.iter())
+                .find(|ch| &ch.room == room)
+                .map(|ch| {
+                    (
+                        ArchiveTarget::Room {
+                            room: ch.room.clone(),
+                        },
+                        ch.archived,
+                    )
+                })
+        }
+        NodeKey::Dm(room) => overview
+            .direct_messages
+            .iter()
+            .find(|dm| &dm.room == room)
+            .map(|dm| {
+                (
+                    ArchiveTarget::Room {
+                        room: dm.room.clone(),
+                    },
+                    dm.archived,
+                )
+            }),
+        _ => None,
+    }
+}
+
 pub fn agent_glyph(agent: &WaveWorkerLeaf) -> Glyph {
+    if agent.phase.error().is_some() {
+        return Glyph::Errored;
+    }
     match &agent.phase {
         WorkerPhase::Requested { .. } => Glyph::Working,
         WorkerPhase::Live { activity, .. } => match activity {
@@ -782,5 +954,50 @@ mod tests {
         assert_eq!(provider_badge("codex"), "codex");
         assert_eq!(provider_badge("acp-claude-code"), "claude");
         assert_eq!(provider_badge("gemini"), "gemini");
+    }
+
+    #[test]
+    fn agent_glyph_preserves_error_across_retiring_and_retired() {
+        let leaf = |phase| WaveWorkerLeaf {
+            role: RoleName::parse("worker").unwrap(),
+            provider: rex_wave_api::ProviderId::parse("codex").unwrap(),
+            model: None,
+            phase,
+        };
+        let tid = rex_wave_api::BbThreadId::parse("thr_1").unwrap();
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Retiring {
+                thread: tid.clone(),
+                errored: Some("402 balance".into()),
+            })),
+            Glyph::Errored
+        );
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Retired {
+                thread: Some(tid.clone()),
+                errored: Some("ServiceUnavailableError".into()),
+            })),
+            Glyph::Errored
+        );
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Retiring {
+                thread: tid.clone(),
+                errored: None,
+            })),
+            Glyph::Done
+        );
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Retired {
+                thread: Some(tid),
+                errored: None,
+            })),
+            Glyph::Done
+        );
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Failed {
+                error: "spawn failed".into(),
+            })),
+            Glyph::Errored
+        );
     }
 }
