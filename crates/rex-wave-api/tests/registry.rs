@@ -563,6 +563,13 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
         }],
         home_room: None,
         retired_at: None,
+        mail_horizon_at: Some(UnixMs(1_795_261_555_000)),
+        work_class: Some(WorkClass::ClassA),
+        avatar: Some("avatars/crest.png".into()),
+        home_dir: Some("/Users/golem/agent-folder/resident_memories/crest".into()),
+        start_cmd: Some("claude --seat crest".into()),
+        resume_cmd: Some("claude --resume".into()),
+        rex_target: Some("block:crest-main".into()),
         claimed_by: by_crest,
         claimed_at: UnixMs(1_795_261_554_000),
     };

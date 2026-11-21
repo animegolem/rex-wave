@@ -378,6 +378,7 @@ pub struct HeraldView {
     blocked: BTreeMap<(WaveSlug, RoleName), (BbInteractionId, String)>,
     cleared_interactions: Vec<(WaveSlug, RoleName, BbInteractionId, String)>,
     seat_status: BTreeMap<SeatName, presence::SeatStatus>,
+    seat_mail_horizon: BTreeMap<SeatName, UnixMs>,
     live_bindings: BTreeMap<SeatName, BTreeMap<IncarnationId, presence::SeatBinding>>,
     ever_bound: BTreeSet<SeatName>,
     last_bound_at: BTreeMap<SeatName, UnixMs>,
@@ -540,6 +541,17 @@ impl HeraldView {
             (StreamId::Presence, Event::Presence(ev)) => match ev {
                 presence::PresenceEvent::SeatClaimed { record } => {
                     self.seat_status.insert(record.seat.clone(), record.status);
+                    if let Some(horizon) = record.mail_horizon_at {
+                        self.seat_mail_horizon.insert(record.seat.clone(), horizon);
+                        if let Some(map) = self.pending_mail.get_mut(&record.seat) {
+                            map.retain(|_, letter| letter.at >= horizon);
+                        }
+                        if let Some(map) = self.unrung_mail.get_mut(&record.seat) {
+                            map.retain(|_, letter| letter.at >= horizon);
+                        }
+                    } else {
+                        self.seat_mail_horizon.remove(&record.seat);
+                    }
                     check_seats.insert(record.seat.clone());
                 }
                 presence::PresenceEvent::SeatStatusSet { seat, status, .. } => {
@@ -822,6 +834,13 @@ impl HeraldView {
         if self.acked_mail.contains(&(seat.clone(), sha256.clone())) {
             return;
         }
+        if self
+            .seat_mail_horizon
+            .get(&seat)
+            .is_some_and(|&horizon| at < horizon)
+        {
+            return;
+        }
         let letter = PendingLetter { path, at };
         self.pending_mail
             .entry(seat.clone())
@@ -906,8 +925,15 @@ impl HeraldView {
         now: UnixMs,
         grace_ms: u64,
     ) -> MailUnrungEval {
-        if self.is_operator_seat(seat) {
-            return MailUnrungEval::Suppress;
+        if self.is_operator_seat(seat)
+            || presence::is_operator_surface_seat(seat.as_str())
+            || presence::is_non_seat_target(seat.as_str())
+        {
+            return if self.raised_mail_unrung.contains_key(seat) {
+                MailUnrungEval::Resolve
+            } else {
+                MailUnrungEval::Suppress
+            };
         }
         let status = self
             .seat_status

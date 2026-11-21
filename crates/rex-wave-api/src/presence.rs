@@ -7,6 +7,53 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Reserved human operator surface seat name that must never become an `Active`
+/// bound seat via hooks or receive mail rings / `MailUnrung` alerts.
+pub const OPERATOR_SURFACE_SEAT: &str = "golem";
+
+/// Reserved non-seat group/lane/pseudo-target names that appear in historical
+/// interchange headers (`to:`/`cc:` or `to-cc/`) but are not bindable seats.
+pub const NON_SEAT_TARGETS: &[&str] = &[
+    "cc",
+    "to-cc",
+    "all-seats",
+    "desk",
+    "desktop",
+    "codex",
+    "claude",
+    "unregistered-addressee",
+];
+
+/// Returns `true` when `seat` names the reserved human operator surface (`golem`).
+pub fn is_operator_surface_seat(seat: &str) -> bool {
+    seat.trim()
+        .trim_start_matches('@')
+        .eq_ignore_ascii_case(OPERATOR_SURFACE_SEAT)
+}
+
+/// Returns `true` when `seat` names a reserved non-seat group/lane pseudo-target.
+pub fn is_non_seat_target(seat: &str) -> bool {
+    let cleaned = seat.trim().trim_start_matches('@');
+    NON_SEAT_TARGETS
+        .iter()
+        .any(|reserved| cleaned.eq_ignore_ascii_case(reserved))
+}
+
+/// Schema version tag for human-editable shared resident manifest JSON files
+/// (`seat-in-a-card.org`).
+pub const RESIDENT_MANIFEST_SCHEMA: &str = "rex-wave-resident-manifest/1";
+
+/// Where a resident seat's primary terminal window lives (`seat-in-a-card.org`).
+/// Changing `work_class` moves the window without restarting the underlying Rex terminal.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkClass {
+    ClassA,
+    ClassB,
+}
+
 /// Lifecycle state of a durable seat record. Letters to `Dormant` or `Retired`
 /// seats never raise Operator inbox cards.
 #[derive(
@@ -80,6 +127,29 @@ pub struct SeatRecord {
     pub home_room: Option<Attested<RoomId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<UnixMs>,
+    /// First-live-bind mail horizon watermark: letters whose timestamp is strictly
+    /// older than `mail_horizon_at` are treated as historical (`SkipPreHorizonHistory`)
+    /// and never rung or included in `MailUnrung` alerts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_horizon_at: Option<UnixMs>,
+    /// Resident work class (`class_a` main workspace vs `class_b` card-only) per `seat-in-a-card.org`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_class: Option<WorkClass>,
+    /// Resident portrait/avatar asset path or URI (`seat-in-a-card.org`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    /// Resident home directory / working folder (`seat-in-a-card.org`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_dir: Option<String>,
+    /// Command used to start a fresh resident session (`seat-in-a-card.org`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cmd: Option<String>,
+    /// Command used to resume an existing resident session (`seat-in-a-card.org`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cmd: Option<String>,
+    /// Stable Rex terminal target identifier (`seat-in-a-card.org`, `<house-terminal seat="...">`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_target: Option<String>,
     pub claimed_by: Principal,
     pub claimed_at: UnixMs,
 }
@@ -216,6 +286,20 @@ pub struct PresenceClaim {
     #[serde(default)]
     pub home_room: Option<RoomId>,
     #[serde(default)]
+    pub mail_horizon_at: Option<UnixMs>,
+    #[serde(default)]
+    pub work_class: Option<WorkClass>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub home_dir: Option<String>,
+    #[serde(default)]
+    pub start_cmd: Option<String>,
+    #[serde(default)]
+    pub resume_cmd: Option<String>,
+    #[serde(default)]
+    pub rex_target: Option<String>,
+    #[serde(default)]
     pub verified_how: Option<VerificationKind>,
     #[serde(default)]
     pub replace: Option<SeatName>,
@@ -248,6 +332,10 @@ pub struct PresenceBind {
     pub takeover: bool,
     #[serde(default)]
     pub allow_fork: bool,
+    /// Optional explicit mail-horizon watermark override (`--mail-horizon <ms>`).
+    /// When omitted on a seat's first live bind, the daemon stamps `ctx.at` automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_horizon_at: Option<UnixMs>,
     #[serde(default, alias = "id")]
     pub idem: Option<IdemKey>,
 }
@@ -361,4 +449,103 @@ pub enum PresenceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+/// One seat entry in a human-editable shared resident manifest (`seat-in-a-card.org`),
+/// readable by Hearth (`<house-terminal seat="...">`), T3 Code's dock, and `rex-wave` Presence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResidentManifestEntry {
+    pub seat: SeatName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SeatStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<SeatName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_room: Option<RoomId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_horizon_at: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_class: Option<WorkClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_target: Option<String>,
+}
+
+impl ResidentManifestEntry {
+    pub fn from_record(rec: &SeatRecord) -> Self {
+        Self {
+            seat: rec.seat.clone(),
+            status: Some(rec.status),
+            aliases: rec.aliases.iter().map(|a| a.value.clone()).collect(),
+            role: rec.role.as_ref().map(|r| r.value.clone()),
+            projects: rec.projects.iter().map(|p| p.value.clone()).collect(),
+            home_room: rec.home_room.as_ref().map(|r| r.value.clone()),
+            mail_horizon_at: rec.mail_horizon_at,
+            work_class: rec.work_class,
+            avatar: rec.avatar.clone(),
+            home_dir: rec.home_dir.clone(),
+            start_cmd: rec.start_cmd.clone(),
+            resume_cmd: rec.resume_cmd.clone(),
+            rex_target: rec.rex_target.clone(),
+        }
+    }
+
+    pub fn into_claim(self, verified_how: Option<VerificationKind>) -> PresenceClaim {
+        PresenceClaim {
+            seat: self.seat,
+            status: self.status,
+            role: self.role,
+            projects: self.projects,
+            aliases: self.aliases,
+            home_room: self.home_room,
+            mail_horizon_at: self.mail_horizon_at,
+            work_class: self.work_class,
+            avatar: self.avatar,
+            home_dir: self.home_dir,
+            start_cmd: self.start_cmd,
+            resume_cmd: self.resume_cmd,
+            rex_target: self.rex_target,
+            verified_how,
+            replace: None,
+            idem: None,
+        }
+    }
+}
+
+/// Shared human-editable resident manifest (`seat-in-a-card.org`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResidentManifest {
+    #[serde(default = "default_resident_manifest_schema")]
+    pub schema: String,
+    #[serde(default)]
+    pub seats: Vec<ResidentManifestEntry>,
+}
+
+fn default_resident_manifest_schema() -> String {
+    RESIDENT_MANIFEST_SCHEMA.to_owned()
+}
+
+impl ResidentManifest {
+    pub fn from_records<'a>(records: impl IntoIterator<Item = &'a SeatRecord>) -> Self {
+        let mut seats: Vec<ResidentManifestEntry> = records
+            .into_iter()
+            .map(ResidentManifestEntry::from_record)
+            .collect();
+        seats.sort_by(|a, b| a.seat.cmp(&b.seat));
+        Self {
+            schema: RESIDENT_MANIFEST_SCHEMA.to_owned(),
+            seats,
+        }
+    }
 }

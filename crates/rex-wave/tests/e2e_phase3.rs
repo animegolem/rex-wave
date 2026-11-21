@@ -1349,10 +1349,14 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     );
     assert_eq!(score_summary["shadow_score"]["unrung_alerts"], 1);
     assert_eq!(score_summary["shadow_score"]["unrung_referents_caught"], 1);
-    assert_eq!(score_summary["fixtures"]["all_covered"], true);
+    assert_eq!(score_summary["fixtures"]["fixture_ids_registered"], true);
     assert_eq!(score_summary["fixtures"]["covered_cases"], 10);
     assert_eq!(score_summary["fixtures"]["missing_case_ids"], json!([]));
     assert_eq!(score_summary["fixtures"]["unknown_case_ids"], json!([]));
+    assert_eq!(
+        score_summary["fixtures"]["case_test_map"]["dry-run-marks-seen"],
+        "gate1_case_04_dry_run_marks_seen"
+    );
 
     let partial_fixtures_path = daemon.dir.0.join("gate1-partial.jsonl");
     std::fs::write(&partial_fixtures_path, r#"{"id":"genga-stale-six-days"}"#).unwrap();
@@ -1379,7 +1383,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         "incomplete Gate 1 fixture file must exit non-zero"
     );
     let partial_json: Value = serde_json::from_slice(&partial_score.stdout).unwrap();
-    assert_eq!(partial_json["fixtures"]["all_covered"], false);
+    assert_eq!(partial_json["fixtures"]["fixture_ids_registered"], false);
     assert_eq!(
         partial_json["fixtures"]["missing_case_ids"]
             .as_array()
@@ -1736,5 +1740,248 @@ async fn e2e_phase3_presence_hold_restart_rebinds_until_replaced() {
     assert_eq!(
         live_bindings[0]["endpoint"]["transport"], "self_watcher",
         "restarted hold must not overwrite the newer self_watcher binding"
+    );
+}
+
+#[tokio::test]
+async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
+    let daemon = IsolatedDaemon::start("pr20-soak").await;
+
+    // 1. Build a synthetic interchange dir with roster.json, sibling .watchers/mailwatch-routes.json,
+    //    and historical + post-horizon letters plus golem/cc letters.
+    let estate = daemon.dir.0.join("estate");
+    let interchange = estate.join("interchange");
+    std::fs::create_dir_all(interchange.join("postmaster/state")).unwrap();
+    std::fs::create_dir_all(estate.join(".watchers")).unwrap();
+    std::fs::create_dir_all(interchange.join("mail")).unwrap();
+    std::fs::create_dir_all(interchange.join("state")).unwrap();
+
+    std::fs::write(
+        interchange.join("postmaster/state/roster.json"),
+        serde_json::to_vec(&json!({
+            "schema": "house-roster/2",
+            "seats": {
+                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
+                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" },
+                "rd-3": { "name": "auburn-cepheus", "box": "/tmp/interchange/to-muse" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        estate.join(".watchers/mailwatch-routes.json"),
+        serde_json::to_vec(&json!({
+            "tally": { "aliases": ["tally", "tally_votp", "Tally-VampOTP-CTO"] },
+            "auburn-cepheus": { "aliases": ["muse", "auburn-cephus"] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(interchange.join("state/acks.jsonl"), "").unwrap();
+
+    // 2. Dry-run seed-interchange works offline and skips `golem`.
+    let dry_seed = daemon
+        .cli_json(&[
+            "presence",
+            "seed-interchange",
+            "--interchange",
+            interchange.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .await;
+    assert_eq!(dry_seed["dry_run"], true);
+    assert!(
+        dry_seed["skipped_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "golem")
+    );
+
+    // 3. Live seed-interchange applies durable aliases BEFORE any seat binds.
+    let live_seed = daemon
+        .cli_json(&[
+            "presence",
+            "seed-interchange",
+            "--interchange",
+            interchange.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(live_seed["dry_run"], false);
+    assert!(live_seed["applied_count"].as_u64().unwrap() >= 3);
+
+    // 4. Q3 structural guard: binding or claiming `golem` as Active is denied by the daemon.
+    let golem_bind = daemon
+        .cli(
+            &[
+                "presence",
+                "bind",
+                "--seat",
+                "golem",
+                "--self-watcher",
+                "desktop",
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert!(!golem_bind.status.success(), "golem bind must be denied");
+
+    let golem_claim = daemon
+        .cli(
+            &["presence", "claim", "golem", "--status", "active"],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert!(
+        !golem_claim.status.success(),
+        "golem active claim must be denied"
+    );
+
+    // 5. Bind `tally` with explicit `--mail-horizon` (no `--alias` needed; seeded aliases remain!).
+    let horizon_ms: u64 = 1_795_000_000_000;
+    let tally_bind = daemon
+        .cli_json(&[
+            "presence",
+            "bind",
+            "--seat",
+            "tally",
+            "--self-watcher",
+            "claude-hook",
+            "--mail-horizon",
+            &horizon_ms.to_string(),
+        ])
+        .await;
+    assert_eq!(tally_bind["value"]["seat"], "tally");
+
+    let resolved_alias = daemon
+        .cli_json(&["presence", "resolve", "tally_votp"])
+        .await;
+    assert_eq!(resolved_alias["value"]["record"]["seat"], "tally");
+    assert_eq!(
+        resolved_alias["value"]["record"]["mail_horizon_at"],
+        horizon_ms
+    );
+
+    // 6. Write pre-horizon letter to `tally_votp`, post-horizon letter to `tally_votp`,
+    //    plus letters to `golem` and `cc`.
+    std::fs::write(
+        interchange.join("mail/1792431783570-old-to-tally-votp.md"),
+        "---\nfrom: genga\nto: tally_votp\nsubject: Old history\n---\nold\n",
+    )
+    .unwrap();
+    std::fs::write(
+        interchange.join("mail/1795284326392-new-to-tally-votp.md"),
+        "---\nfrom: genga\nto: tally_votp\nsubject: Post horizon\n---\nnew\n",
+    )
+    .unwrap();
+    std::fs::write(
+        interchange.join("mail/1795284326400-to-golem.md"),
+        "---\nfrom: tally\nto: golem\nsubject: Operator note\n---\noperator\n",
+    )
+    .unwrap();
+    std::fs::write(
+        interchange.join("mail/1795284326401-to-cc.md"),
+        "---\nfrom: tally\nto: cc\nsubject: Group note\n---\ncc\n",
+    )
+    .unwrap();
+
+    let shadow_out = daemon.dir.0.join("pr20-shadow.jsonl");
+    daemon
+        .cli_json(&[
+            "mail",
+            "shadow",
+            "--interchange",
+            interchange.to_str().unwrap(),
+            "--out",
+            shadow_out.to_str().unwrap(),
+            "--once",
+        ])
+        .await;
+    let score = daemon
+        .cli_json(&[
+            "mail",
+            "score",
+            "--shadow",
+            shadow_out.to_str().unwrap(),
+            "--acks",
+            interchange.join("state/acks.jsonl").to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(score["shadow_score"]["skipped_pre_horizon"], 1);
+    assert_eq!(score["shadow_score"]["rings_emitted"], 1);
+    assert_eq!(score["shadow_score"]["skipped_operator_surface"], 1);
+    assert_eq!(score["shadow_score"]["skipped_non_seat_target"], 1);
+    assert_eq!(score["shadow_score"]["unrung_alerts"], 0);
+
+    // 7. Resident manifest (`seat-in-a-card.org`) claim -> export-manifest -> import-manifest on a fresh daemon!
+    let claimed = daemon
+        .cli_json(&[
+            "presence",
+            "claim",
+            "fathom",
+            "--role",
+            "card-resident",
+            "--work-class",
+            "class_b",
+            "--avatar",
+            "avatars/fathom.png",
+            "--home-dir",
+            "/Users/golem/agent-folder/resident_memories/fathom",
+            "--start-cmd",
+            "claude --seat fathom",
+            "--resume-cmd",
+            "claude --resume fathom",
+            "--rex-target",
+            "block:fathom-card",
+        ])
+        .await;
+    assert_eq!(claimed["value"]["work_class"], "class_b");
+    assert_eq!(claimed["value"]["rex_target"], "block:fathom-card");
+
+    let manifest_path = daemon.dir.0.join("residents.json");
+    let exported = daemon
+        .cli_json(&[
+            "presence",
+            "export-manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(exported["schema"], "rex-wave-resident-manifest/1");
+    assert!(exported["seat_count"].as_u64().unwrap() >= 4);
+
+    let daemon2 = IsolatedDaemon::start("pr20-import").await;
+    let imported = daemon2
+        .cli_json(&[
+            "presence",
+            "import-manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(imported["imported_count"], exported["seat_count"]);
+
+    let fathom_res = daemon2.cli_json(&["presence", "resolve", "fathom"]).await;
+    assert_eq!(fathom_res["value"]["record"]["work_class"], "class_b");
+    assert_eq!(
+        fathom_res["value"]["record"]["avatar"],
+        "avatars/fathom.png"
+    );
+    assert_eq!(
+        fathom_res["value"]["record"]["home_dir"],
+        "/Users/golem/agent-folder/resident_memories/fathom"
+    );
+    assert_eq!(
+        fathom_res["value"]["record"]["start_cmd"],
+        "claude --seat fathom"
+    );
+    assert_eq!(
+        fathom_res["value"]["record"]["resume_cmd"],
+        "claude --resume fathom"
+    );
+    assert_eq!(
+        fathom_res["value"]["record"]["rex_target"],
+        "block:fathom-card"
     );
 }

@@ -619,6 +619,13 @@ impl Service<PresenceCommand> for StubPresence {
                 projects: vec![],
                 home_room: None,
                 retired_at: None,
+                mail_horizon_at: None,
+                work_class: None,
+                avatar: None,
+                home_dir: None,
+                start_cmd: None,
+                resume_cmd: None,
+                rex_target: None,
                 claimed_by: ctx.by,
                 claimed_at: UnixMs(10),
             };

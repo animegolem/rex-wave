@@ -1480,6 +1480,13 @@ fn sample_seat_record(seat: &str, status: SeatStatus, at: UnixMs) -> SeatRecord 
         } else {
             None
         },
+        mail_horizon_at: None,
+        work_class: None,
+        avatar: None,
+        home_dir: None,
+        start_cmd: None,
+        resume_cmd: None,
+        rex_target: None,
         claimed_by: by,
         claimed_at: at,
     }
@@ -2443,4 +2450,84 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
     );
 
     herald_task.abort();
+}
+
+#[test]
+fn mail_unrung_suppresses_golem_non_seat_targets_and_pre_horizon_history() {
+    let mut view = HeraldView::default();
+    let owner = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let mut tally_rec = sample_seat_record("tally", SeatStatus::Active, UnixMs(10_000));
+    tally_rec.mail_horizon_at = Some(UnixMs(10_000));
+
+    // Claim tally with mail_horizon_at = 10_000.
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(10_000),
+        by: owner.clone(),
+        event: Event::Presence(PresenceEvent::SeatClaimed { record: tally_rec }),
+    });
+
+    // Letters to `golem`, `cc`, and pre-horizon letter to `tally` (at 5_000 < 10_000).
+    for (idx, (to, sha_ch, at)) in [
+        ("golem", '1', UnixMs(20_000)),
+        ("cc", '2', UnixMs(20_000)),
+        ("all-seats", '3', UnixMs(20_000)),
+        ("tally", '4', UnixMs(5_000)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let env = Envelope {
+            stream: StreamId::Mail,
+            seq: Seq(idx as u64 + 1),
+            at,
+            by: owner.clone(),
+            event: Event::Mail(MailEvent::Projected {
+                item: letter_ref_for(to, "msg.md", sha_ch).item,
+            }),
+        };
+        view.observe(&env);
+        assert!(
+            !classify(&env, &view)
+                .iter()
+                .any(|(_, d)| matches!(d.kind, NotifyKind::MailUnrung { .. })),
+            "must never raise MailUnrung for target '{to}' at {}",
+            at.0
+        );
+    }
+
+    assert_eq!(
+        view.evaluate_mail_unrung(&SeatName::parse("golem").unwrap(), UnixMs(30_000)),
+        MailUnrungEval::Suppress
+    );
+    assert_eq!(
+        view.evaluate_mail_unrung(&SeatName::parse("cc").unwrap(), UnixMs(30_000)),
+        MailUnrungEval::Suppress
+    );
+    assert_eq!(
+        view.evaluate_mail_unrung(&SeatName::parse("tally").unwrap(), UnixMs(30_000)),
+        MailUnrungEval::Suppress
+    );
+
+    // Post-horizon letter to offline `tally` (at 12_000 >= 10_000) DOES raise MailUnrung.
+    let fresh_env = Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(10),
+        at: UnixMs(12_000),
+        by: owner,
+        event: Event::Mail(MailEvent::Projected {
+            item: letter_ref_for("tally", "fresh.md", '5').item,
+        }),
+    };
+    view.observe(&fresh_env);
+    assert_eq!(
+        view.evaluate_mail_unrung(&SeatName::parse("tally").unwrap(), UnixMs(30_000)),
+        MailUnrungEval::Raise {
+            unread_count: 1,
+            oldest_at: UnixMs(12_000),
+        }
+    );
 }

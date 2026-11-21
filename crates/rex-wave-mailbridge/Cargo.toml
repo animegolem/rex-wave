@@ -12,6 +12,7 @@ rex-wave-api.workspace = true
 rex-wave-runtime.workspace = true
 rex-wave-store.workspace = true
 sha2.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

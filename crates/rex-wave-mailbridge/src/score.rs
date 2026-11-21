@@ -5,9 +5,33 @@
 use crate::acks::{AckIndex, AliasMap};
 use crate::shadow::RingDecision;
 use rex_wave_api::{SeatName, Sha256Hex};
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// The 10 canonical Gate 1 mail-routing cases verified in `presence_and_shadow_mail`.
+/// The 10 canonical Gate 1 mail-routing cases mapped to the exact Rust
+/// integration test function name in
+/// `crates/rex-wave-mailbridge/tests/presence_and_shadow_mail.rs` that verifies
+/// each case's behavior.
+pub const GATE1_CASE_TESTS: &[(&str, &str)] = &[
+    ("genga-stale-six-days", "gate1_case_01_genga_stale_six_days"),
+    (
+        "carbon-crest-misroute",
+        "gate1_case_02_carbon_crest_misroute",
+    ),
+    ("two-tables-one-name", "gate1_case_03_two_tables_one_name"),
+    ("dry-run-marks-seen", "gate1_case_04_dry_run_marks_seen"),
+    (
+        "ring-types-into-a-live-turn",
+        "gate1_case_05_ring_types_into_a_live_turn",
+    ),
+    ("a-transport-dies", "gate1_case_06_a_transport_dies"),
+    ("two-seats-one-name", "gate1_case_07_two_seats_one_name"),
+    ("session-names-drift", "gate1_case_08_session_names_drift"),
+    ("own-watcher-liveness", "gate1_case_09_own_watcher_liveness"),
+    ("bank-before-ring", "gate1_case_10_bank_before_ring"),
+];
+
+/// The 10 canonical Gate 1 mail-routing case IDs verified in `presence_and_shadow_mail`.
 pub const GATE1_CASE_IDS: &[&str] = &[
     "genga-stale-six-days",
     "carbon-crest-misroute",
@@ -21,37 +45,46 @@ pub const GATE1_CASE_IDS: &[&str] = &[
     "bank-before-ring",
 ];
 
-/// Coverage report comparing a Gate 1 `cases.jsonl` fixture file against [`GATE1_CASE_IDS`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Coverage report comparing a Gate 1 `cases.jsonl` fixture file against
+/// [`GATE1_CASE_IDS`] and mapping each case ID to its verifying integration test
+/// in `crates/rex-wave-mailbridge/tests/presence_and_shadow_mail.rs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixtureCoverageReport {
     pub total_cases: usize,
     pub covered_cases: usize,
+    /// True only when the fixture file registers the exact set of [`GATE1_CASE_IDS`]
+    /// with no missing and no unknown IDs. Behavioral proof lives in the test
+    /// functions listed in `case_test_map`.
+    #[serde(alias = "all_covered")]
+    pub fixture_ids_registered: bool,
     pub case_ids: Vec<String>,
     pub missing_case_ids: Vec<String>,
     pub unknown_case_ids: Vec<String>,
+    #[serde(default)]
+    pub case_test_map: BTreeMap<String, String>,
 }
 
 impl FixtureCoverageReport {
-    pub fn all_covered(&self) -> bool {
-        self.total_cases == GATE1_CASE_IDS.len()
-            && self.missing_case_ids.is_empty()
-            && self.unknown_case_ids.is_empty()
+    pub fn fixture_ids_registered(&self) -> bool {
+        self.fixture_ids_registered
     }
 
     pub fn to_json_value(&self) -> serde_json::Value {
         serde_json::json!({
             "total_cases": self.total_cases,
             "covered_cases": self.covered_cases,
-            "all_covered": self.all_covered(),
+            "fixture_ids_registered": self.fixture_ids_registered,
             "case_ids": self.case_ids,
             "missing_case_ids": self.missing_case_ids,
             "unknown_case_ids": self.unknown_case_ids,
+            "case_test_map": self.case_test_map,
         })
     }
 }
 
 /// Parses a Gate 1 `cases.jsonl` fixture document and verifies bidirectional
-/// coverage against [`GATE1_CASE_IDS`] (`missing_case_ids` and `unknown_case_ids`).
+/// registration against [`GATE1_CASE_IDS`] (`missing_case_ids` and `unknown_case_ids`),
+/// attaching the exact verifying test function name per case ID.
 pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, String> {
     let expected: BTreeSet<&str> = GATE1_CASE_IDS.iter().copied().collect();
     let mut case_ids = Vec::new();
@@ -86,12 +119,21 @@ pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, 
         .collect();
     let total_cases = GATE1_CASE_IDS.len();
     let covered_cases = total_cases.saturating_sub(missing_case_ids.len());
+    let fixture_ids_registered = total_cases == GATE1_CASE_IDS.len()
+        && missing_case_ids.is_empty()
+        && unknown_case_ids.is_empty();
+    let case_test_map: BTreeMap<String, String> = GATE1_CASE_TESTS
+        .iter()
+        .map(|(id, test_fn)| ((*id).to_owned(), (*test_fn).to_owned()))
+        .collect();
     Ok(FixtureCoverageReport {
         total_cases,
         covered_cases,
+        fixture_ids_registered,
         case_ids,
         missing_case_ids,
         unknown_case_ids,
+        case_test_map,
     })
 }
 
@@ -108,6 +150,9 @@ pub struct ShadowScoreReport {
     pub skipped_already_acked: usize,
     pub skipped_receipt_only: usize,
     pub skipped_dormant_or_retired: usize,
+    pub skipped_pre_horizon: usize,
+    pub skipped_operator_surface: usize,
+    pub skipped_non_seat_target: usize,
     pub mutated_after_ack_flags: usize,
     pub deferred: usize,
     pub unrung_alerts: usize,
@@ -130,6 +175,9 @@ impl ShadowScoreReport {
             "skipped_already_acked": self.skipped_already_acked,
             "skipped_receipt_only": self.skipped_receipt_only,
             "skipped_dormant_or_retired": self.skipped_dormant_or_retired,
+            "skipped_pre_horizon": self.skipped_pre_horizon,
+            "skipped_operator_surface": self.skipped_operator_surface,
+            "skipped_non_seat_target": self.skipped_non_seat_target,
             "mutated_after_ack_flags": self.mutated_after_ack_flags,
             "deferred": self.deferred,
             "unrung_alerts": self.unrung_alerts,
@@ -187,6 +235,9 @@ pub fn score_shadow_against_acks(
             RingDecision::SkipAlreadyAcked { .. } => report.skipped_already_acked += 1,
             RingDecision::SkipReceiptOnly { .. } => report.skipped_receipt_only += 1,
             RingDecision::SkipDormantOrRetired { .. } => report.skipped_dormant_or_retired += 1,
+            RingDecision::SkipPreHorizonHistory { .. } => report.skipped_pre_horizon += 1,
+            RingDecision::SkipOperatorSurface { .. } => report.skipped_operator_surface += 1,
+            RingDecision::SkipNonSeatTarget { .. } => report.skipped_non_seat_target += 1,
             RingDecision::FlagMutatedAfterAck { .. } => report.mutated_after_ack_flags += 1,
             RingDecision::Defer { .. } => report.deferred += 1,
             RingDecision::RefuseMissingReferent { .. } => report.missing_referent_refusals += 1,
@@ -314,6 +365,9 @@ pub fn score_shadow_jsonl(
             "skip_already_acked" => report.skipped_already_acked += 1,
             "skip_receipt_only" => report.skipped_receipt_only += 1,
             "skip_dormant_or_retired" => report.skipped_dormant_or_retired += 1,
+            "skip_pre_horizon_history" => report.skipped_pre_horizon += 1,
+            "skip_operator_surface" => report.skipped_operator_surface += 1,
+            "skip_non_seat_target" => report.skipped_non_seat_target += 1,
             "flag_mutated_after_ack" => report.mutated_after_ack_flags += 1,
             "defer" => report.deferred += 1,
             "refuse_missing_referent" => report.missing_referent_refusals += 1,
@@ -356,7 +410,7 @@ pub fn score_shadow_jsonl(
 mod tests {
     use super::*;
     use crate::acks::parse_acks_jsonl;
-    use crate::shadow::{RingDeliveryChannel, RingReferent, ShadowPassReport};
+    use crate::shadow::{RingDeliveryChannel, RingReferent, ShadowPassReport, TimeBasis};
     use rex_wave_api::IncarnationId;
     use std::path::PathBuf;
 
@@ -368,15 +422,34 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let full = check_gate1_fixtures(&all_ten).unwrap();
-        assert!(full.all_covered());
+        assert!(full.fixture_ids_registered());
         assert_eq!(full.total_cases, 10);
         assert_eq!(full.covered_cases, 10);
         assert!(full.missing_case_ids.is_empty());
         assert!(full.unknown_case_ids.is_empty());
+        assert_eq!(full.case_test_map.len(), 10);
+        assert_eq!(
+            full.case_test_map
+                .get("dry-run-marks-seen")
+                .map(String::as_str),
+            Some("gate1_case_04_dry_run_marks_seen")
+        );
+
+        // Verify legacy serde alias `all_covered` still deserializes into `fixture_ids_registered`.
+        let legacy: FixtureCoverageReport = serde_json::from_value(serde_json::json!({
+            "total_cases": 10,
+            "covered_cases": 10,
+            "all_covered": true,
+            "case_ids": [],
+            "missing_case_ids": [],
+            "unknown_case_ids": []
+        }))
+        .unwrap();
+        assert!(legacy.fixture_ids_registered());
 
         let one_line = r#"{"id":"genga-stale-six-days"}"#;
         let subset = check_gate1_fixtures(one_line).unwrap();
-        assert!(!subset.all_covered());
+        assert!(!subset.fixture_ids_registered());
         assert_eq!(subset.total_cases, 10);
         assert_eq!(subset.covered_cases, 1);
         assert_eq!(subset.missing_case_ids.len(), 9);
@@ -384,7 +457,7 @@ mod tests {
 
         let with_unknown = format!("{all_ten}\n{{\"id\":\"surprise-case\"}}");
         let extra = check_gate1_fixtures(&with_unknown).unwrap();
-        assert!(!extra.all_covered());
+        assert!(!extra.fixture_ids_registered());
         assert_eq!(extra.covered_cases, 10);
         assert!(extra.missing_case_ids.is_empty());
         assert_eq!(extra.unknown_case_ids, vec!["surprise-case".to_owned()]);
@@ -408,6 +481,7 @@ mod tests {
                     pid: 42,
                 },
                 referent: RingReferent::new("mail/01.md", sha.clone()).unwrap(),
+                time_basis: TimeBasis::LetterIdMs,
             }],
         };
         let jsonl = report.to_jsonl_with_aliases(&aliases);
