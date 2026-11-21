@@ -941,11 +941,11 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
     assert!(state.pending_created.is_empty());
 
     let lock_path = emacs_lock_path(&org_path).unwrap();
-    let with_another = format!(
-        "{}\n* TODO Fix lgoin\n",
+    let with_two_unid = format!(
+        "{}\n* TODO Zebra lgoin\n\n* TODO Alpha tset\n",
         final_org.replace("* TODO Card A renamed", "* TODO Card A v3")
     );
-    fs::write(&org_path, &with_another).unwrap();
+    fs::write(&org_path, &with_two_unid).unwrap();
     client.create_lock_on_next_room_tasks(lock_path.clone());
     let r_locked = sync_org_to_room(
         &client,
@@ -966,12 +966,15 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
         ),
         "lock created during sync skips write-back safely: {r_locked:?}"
     );
-    assert_eq!(client.task_count(), 5);
+    assert_eq!(client.task_count(), 6);
+    assert_eq!(client.task(Seq(5)).title.as_str(), "Zebra lgoin");
+    assert_eq!(client.task(Seq(6)).title.as_str(), "Alpha tset");
     fs::remove_file(&lock_path).unwrap();
 
-    let edited_again = with_another
+    let edited_again = with_two_unid
         .replace("* TODO Card A v3", "* TODO Card A v4")
-        .replace("* TODO Fix lgoin", "* TODO Fix login");
+        .replace("* TODO Zebra lgoin", "* TODO Zebra login")
+        .replace("* TODO Alpha tset", "* TODO Alpha test");
     fs::write(&org_path, &edited_again).unwrap();
 
     let r_converged = sync_org_to_room(
@@ -991,13 +994,18 @@ async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_
                 ref updated,
                 wrote_back: true,
                 ..
-            } if created.is_empty() && updated.len() == 2
+            } if created.is_empty() && updated.len() == 3
         ),
-        "second edit after skipped write-back and un-ID'd typo fix converge cleanly: {r_converged:?}"
+        "second edit after skipped write-back and multi-heading typo fixes converge cleanly: {r_converged:?}"
     );
-    assert_eq!(client.task_count(), 5);
+    assert_eq!(client.task_count(), 6);
     assert_eq!(client.task(Seq(2)).title.as_str(), "Card A v4");
-    assert_eq!(client.task(Seq(5)).title.as_str(), "Fix login");
+    assert_eq!(
+        client.task(Seq(5)).title.as_str(),
+        "Zebra login",
+        "positional ordinal pairing keeps first un-ID'd heading on Seq(5) instead of swapping alphabetically"
+    );
+    assert_eq!(client.task(Seq(6)).title.as_str(), "Alpha test");
 }
 
 #[tokio::test]
@@ -1166,4 +1174,46 @@ async fn emacs_title_edit_does_not_remove_concurrent_room_labels() {
     );
     let final_disk = fs::read_to_string(&org_path).unwrap();
     assert!(final_disk.contains(":area%3Dcore:x%3D1:"));
+
+    let mut fresh_state = OrgSyncState::default();
+    let cold_edit = final_disk.replace(
+        "* TODO Labeled task renamed :area%3Dcore:x%3D1:",
+        "* TODO Labeled task cold edit :area%3Dcore:x%3D1:tier%3Dp0:",
+    );
+    fs::write(&org_path, &cold_edit).unwrap();
+    let cold_res = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut fresh_state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            cold_res,
+            OrgToRoomOutcome::Synced {
+                ref updated,
+                ref labeled,
+                wrote_back: true,
+                ..
+            } if updated.len() == 1 && labeled.len() == 1
+        ),
+        "cold-start title + label edit pushes both TaskUpdate and RoomLabel: {cold_res:?}"
+    );
+    assert_eq!(client.task(Seq(1)).title.as_str(), "Labeled task cold edit");
+    assert_eq!(
+        client.task(Seq(1)).labels,
+        vec![
+            Label::parse("area=core").unwrap(),
+            Label::parse("tier=p0").unwrap(),
+            Label::parse("x=1").unwrap(),
+        ]
+    );
+    assert!(
+        fs::read_to_string(&org_path)
+            .unwrap()
+            .contains(":area%3Dcore:x%3D1:tier%3Dp0:")
+    );
 }

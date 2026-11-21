@@ -107,14 +107,22 @@ pub struct BaselineTask {
     pub labels: Vec<Label>,
 }
 
+/// An un-ID'd `.org` heading already created in the room whose minted `:ID:`
+/// has not yet been written back to disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCreatedTask {
+    pub ordinal: usize,
+    pub title: String,
+    pub occurrence: usize,
+    pub org_id: OrgId,
+}
+
 /// Last-synced snapshot used to detect local Emacs edits and diff by `:ID:`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OrgSyncState {
     pub last_synced_bytes: Option<Vec<u8>>,
     pub tasks: BTreeMap<OrgId, BaselineTask>,
-    /// Un-ID'd headings already posted to the room whose minted `:ID:` has not
-    /// yet been written back to disk (keyed by `(title, occurrence)`).
-    pub pending_created: BTreeMap<(String, usize), OrgId>,
+    pub pending_created: Vec<PendingCreatedTask>,
 }
 
 /// Controls conflict sidecar output and optional `NotifyKind::OrgConflict` delivery.
@@ -656,15 +664,11 @@ fn record_view_in_baseline(
     state: &mut OrgSyncState,
     view: &TaskView,
     seq_to_org_id: &BTreeMap<Seq, OrgId>,
-    disk_labels: &[Label],
 ) {
-    let preserved_labels = state
-        .tasks
-        .get(&view.org_id)
-        .map(|b| b.labels.clone())
-        .unwrap_or_else(|| disk_labels.to_vec());
     let mut entry = baseline_entry_from_view(view, seq_to_org_id);
-    entry.labels = preserved_labels;
+    if let Some(prev) = state.tasks.get(&view.org_id) {
+        entry.labels = prev.labels.clone();
+    }
     state.tasks.insert(view.org_id.clone(), entry);
 }
 
@@ -673,16 +677,11 @@ fn record_claim_in_baseline(
     room_task: &TaskView,
     new_rev: u64,
     seq_to_org_id: &BTreeMap<Seq, OrgId>,
-    disk_labels: &[Label],
 ) {
     let entry = state
         .tasks
         .entry(room_task.org_id.clone())
-        .or_insert_with(|| {
-            let mut e = baseline_entry_from_view(room_task, seq_to_org_id);
-            e.labels = disk_labels.to_vec();
-            e
-        });
+        .or_insert_with(|| baseline_entry_from_view(room_task, seq_to_org_id));
     entry.rev = new_rev;
     entry.status = TaskStatus::Claimed;
 }
@@ -942,7 +941,8 @@ fn expected_rev_for_card(card: &TaskCard, oid: &OrgId, state: &OrgSyncState) -> 
 ///
 /// - Ignores `.#*` lockfiles and `#*#` autosaves, and defers when `.#<file>` exists.
 /// - Newly added headings mint room task-threads while preserving any Emacs-supplied `:ID:`.
-/// - Modified headings submit optimistic-CAS commands (`expected_rev: Some(parsed_rex_rev)`).
+/// - Modified headings submit optimistic-CAS commands carrying the expected revision
+///   (tracked baseline rev when present, otherwise parsed `:REX_REV:` from the file).
 /// - On any conflict (`RevisionConflict`, `LeaseFenced`, `UnmetNeeds`, cycle, missing dep),
 ///   leaves the `.org` file untouched and reports structured [`OrgSyncConflict`]s.
 pub async fn sync_org_to_room<C: Client>(
@@ -986,7 +986,7 @@ pub async fn sync_org_to_room<C: Client>(
     // (due to a conflict or lock race) so retries never post duplicate tasks.
     let mut unid_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unid_keys: BTreeMap<usize, (String, usize)> = BTreeMap::new();
-    let mut matched_pending_keys: BTreeSet<(String, usize)> = BTreeSet::new();
+    let mut matched_pending_slots: BTreeSet<usize> = BTreeSet::new();
     let mut unmatched_unid: Vec<(usize, (String, usize))> = Vec::new();
     for (idx, card) in edoc.doc.tasks.iter_mut().enumerate() {
         if card.org_id.is_none() {
@@ -997,31 +997,45 @@ pub async fn sync_org_to_room<C: Client>(
                 *count += 1;
                 cur
             };
-            let key = (title, occ);
-            if let Some(prev_oid) = state.pending_created.get(&key)
-                && room_by_org_id.contains_key(prev_oid)
+            if let Some((slot, entry)) =
+                state
+                    .pending_created
+                    .iter()
+                    .enumerate()
+                    .find(|(slot, entry)| {
+                        !matched_pending_slots.contains(slot)
+                            && entry.title == title
+                            && entry.occurrence == occ
+                            && room_by_org_id.contains_key(&entry.org_id)
+                    })
             {
-                card.org_id = Some(prev_oid.clone());
-                matched_pending_keys.insert(key);
+                card.org_id = Some(entry.org_id.clone());
+                matched_pending_slots.insert(slot);
             } else {
-                unmatched_unid.push((idx, key));
+                unmatched_unid.push((idx, (title, occ)));
             }
         }
     }
-    let leftover_pending: Vec<((String, usize), OrgId)> = state
+    let mut leftover_slots: Vec<usize> = state
         .pending_created
         .iter()
-        .filter(|(k, oid)| !matched_pending_keys.contains(*k) && room_by_org_id.contains_key(*oid))
-        .map(|(k, oid)| (k.clone(), oid.clone()))
+        .enumerate()
+        .filter_map(|(slot, entry)| {
+            (!matched_pending_slots.contains(&slot) && room_by_org_id.contains_key(&entry.org_id))
+                .then_some(slot)
+        })
         .collect();
-    let mut leftover_iter = leftover_pending.into_iter();
-    for (idx, new_key) in unmatched_unid {
-        if let Some((old_key, prev_oid)) = leftover_iter.next() {
-            edoc.doc.tasks[idx].org_id = Some(prev_oid.clone());
-            state.pending_created.remove(&old_key);
-            state.pending_created.insert(new_key, prev_oid);
+    leftover_slots.sort_by_key(|&slot| state.pending_created[slot].ordinal);
+    let mut leftover_iter = leftover_slots.into_iter();
+    for (idx, (new_title, new_occ)) in unmatched_unid {
+        if let Some(slot) = leftover_iter.next() {
+            let entry = &mut state.pending_created[slot];
+            edoc.doc.tasks[idx].org_id = Some(entry.org_id.clone());
+            entry.ordinal = idx;
+            entry.title = new_title;
+            entry.occurrence = new_occ;
         } else {
-            unid_keys.insert(idx, new_key);
+            unid_keys.insert(idx, (new_title, new_occ));
         }
     }
 
@@ -1148,18 +1162,18 @@ pub async fn sync_org_to_room<C: Client>(
         let card = &edoc.doc.tasks[idx];
         let oid = card.org_id.as_ref().expect("modified task has org_id");
         let room_task = &room_by_org_id[oid];
-        let parsed_rev = expected_rev_for_card(card, oid, state);
-        if parsed_rev != room_task.rev {
+        let expected_rev = expected_rev_for_card(card, oid, state);
+        if expected_rev != room_task.rev {
             conflicts.push(OrgSyncConflict {
                 path: path.to_path_buf(),
                 org_id: oid.clone(),
                 seq: Some(room_task.seq),
                 kind: OrgConflictKind::RevisionConflict {
-                    expected: parsed_rev,
+                    expected: expected_rev,
                     actual: room_task.rev,
                 },
                 detail: format!(
-                    "stale :REX_REV: {parsed_rev} for `{oid}` (room is at rev {})",
+                    "stale expected rev {expected_rev} for `{oid}` (room is at rev {})",
                     room_task.rev
                 ),
             });
@@ -1294,8 +1308,13 @@ pub async fn sync_org_to_room<C: Client>(
                     .expect("room task post returns org_id");
                 org_id_to_seq.insert(oid.clone(), posted.seq);
                 seq_to_org_id.insert(posted.seq, oid.clone());
-                if let Some(unid_key) = unid_keys.get(&idx) {
-                    state.pending_created.insert(unid_key.clone(), oid.clone());
+                if let Some((title, occ)) = unid_keys.get(&idx) {
+                    state.pending_created.push(PendingCreatedTask {
+                        ordinal: idx,
+                        title: title.clone(),
+                        occurrence: *occ,
+                        org_id: oid.clone(),
+                    });
                 }
                 state.tasks.insert(
                     oid.clone(),
@@ -1421,7 +1440,7 @@ pub async fn sync_org_to_room<C: Client>(
             {
                 Ok(view) => {
                     expected_rev = view.rev;
-                    record_view_in_baseline(state, &view, &seq_to_org_id, &info.labels);
+                    record_view_in_baseline(state, &view, &seq_to_org_id);
                     updated.push(oid.clone());
                     applied.push(oid.clone());
                 }
@@ -1451,13 +1470,7 @@ pub async fn sync_org_to_room<C: Client>(
                     .await
                 {
                     Ok(receipt) => {
-                        record_claim_in_baseline(
-                            state,
-                            room_task,
-                            receipt.rev,
-                            &seq_to_org_id,
-                            &info.labels,
-                        );
+                        record_claim_in_baseline(state, room_task, receipt.rev, &seq_to_org_id);
                         transitioned.push(oid.clone());
                         if !applied.contains(&oid) {
                             applied.push(oid.clone());
@@ -1487,7 +1500,7 @@ pub async fn sync_org_to_room<C: Client>(
                     .await
                 {
                     Ok(view) => {
-                        record_view_in_baseline(state, &view, &seq_to_org_id, &info.labels);
+                        record_view_in_baseline(state, &view, &seq_to_org_id);
                         transitioned.push(oid.clone());
                         if !applied.contains(&oid) {
                             applied.push(oid.clone());
