@@ -1347,6 +1347,20 @@ impl Presence {
             });
         }
 
+        // `start_cmd` and `resume_cmd` are operator-only command fields: no
+        // seat, worker, or system principal may set or mutate them.
+        if !matches!(ctx.by, Principal::Operator { .. })
+            && (c.start_cmd.is_some() || c.resume_cmd.is_some())
+        {
+            return Err(ApiError::Denied {
+                principal: ctx.by.to_string(),
+                action: format!(
+                    "set start_cmd/resume_cmd on seat '{}' (operator-only)",
+                    c.seat
+                ),
+            });
+        }
+
         if let Some(old_seat) = replacing_other {
             let Some(old_rec) = state.seats.get(old_seat) else {
                 return Err(ApiError::NotFound {
@@ -1373,6 +1387,18 @@ impl Presence {
                     "seat '{}' is already claimed by {}; pass replace='{}' as an authorized operator to replace explicitly",
                     c.seat, rec.claimed_by, c.seat
                 )));
+            }
+            if replacing_self
+                && !matches!(ctx.by, Principal::Operator { .. })
+                && (rec.start_cmd.is_some() || rec.resume_cmd.is_some())
+            {
+                return Err(ApiError::Denied {
+                    principal: ctx.by.to_string(),
+                    action: format!(
+                        "clear start_cmd/resume_cmd on seat '{}' via replace (operator-only)",
+                        c.seat
+                    ),
+                });
             }
         } else {
             if !can_manage_seat(&ctx.by, &c.seat, None) {
