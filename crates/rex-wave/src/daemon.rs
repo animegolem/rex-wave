@@ -75,6 +75,8 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "127.0.0.1:7781")]
     pub wake_bell: SocketAddr,
     /// Optional loopback HTTP/1.1 + SSE API listener (`127.0.0.1:<port>` or `[::1]:<port>`).
+    /// Opt-in for single-user machines: unauthenticated loopback requests run as `Principal::Operator`
+    /// without Unix peer-UID checks, while `Authorization: Bearer <token>` pins to a seat or worker.
     #[arg(long)]
     pub http: Option<SocketAddr>,
 }
@@ -186,6 +188,31 @@ fn token_store_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+struct TokenStoreGuard {
+    _in_proc: std::sync::MutexGuard<'static, ()>,
+    _lock_file: std::fs::File,
+}
+
+fn lock_token_store(tokens_path: &Path) -> io::Result<TokenStoreGuard> {
+    let in_proc = token_store_lock().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parent) = tokens_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = tokens_path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+    lock_file.lock()?;
+    Ok(TokenStoreGuard {
+        _in_proc: in_proc,
+        _lock_file: lock_file,
+    })
+}
+
 fn read_token_map(tokens_path: &Path) -> io::Result<BTreeMap<String, TokenRecord>> {
     if !tokens_path.exists() {
         return Ok(BTreeMap::new());
@@ -243,8 +270,8 @@ fn random_token(prefix: &str) -> io::Result<(String, [u8; 4])> {
 /// Mints a random 256-bit capability token for `seat` and atomically writes it
 /// into `<state_dir>/tokens.json` with `0600` permissions.
 pub fn mint_seat_token(sock_path: &Path, seat: &SeatName) -> io::Result<String> {
-    let _guard = token_store_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tokens_path = tokens_path_for(sock_path);
+    let _guard = lock_token_store(&tokens_path)?;
     let mut map = read_token_map(&tokens_path)?;
     let (token, suffix) = random_token("rw_")?;
 
@@ -266,8 +293,8 @@ pub fn mint_worker_token(
     thread_id: Option<&str>,
     write_file: bool,
 ) -> io::Result<String> {
-    let _guard = token_store_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tokens_path = tokens_path_for(sock_path);
+    let _guard = lock_token_store(&tokens_path)?;
     let state_dir = state_dir_for(sock_path);
     let mut map = read_token_map(&tokens_path)?;
 
@@ -581,7 +608,10 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         let auth = auth.clone();
         let op = operator.clone();
         tokio::spawn(async move {
-            let _ = serve_http_listener(hl, router, auth, op, HttpConfig::default()).await;
+            if let Err(err) = serve_http_listener(hl, router, auth, op, HttpConfig::default()).await
+            {
+                eprintln!("rex-wave daemon: http listener exited: {err}");
+            }
         })
     });
 

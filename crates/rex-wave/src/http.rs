@@ -200,13 +200,30 @@ pub async fn serve_http_listener(
         ));
     }
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("rex-wave http: accept failed: {err}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let router = router.clone();
         let auth = auth.clone();
         let operator = operator.clone();
         tokio::spawn(async move {
             let _ = handle_connection(stream, router, auth, operator, config).await;
         });
+    }
+}
+
+async fn wait_for_client_eof<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) {
+    let mut sink = [0u8; 64];
+    loop {
+        match reader.read(&mut sink).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
     }
 }
 
@@ -253,10 +270,29 @@ async fn handle_connection(
     };
 
     if matches!(route, Route::Events) {
-        return handle_sse_events(&mut write_half, &req, router, principal, config).await;
+        return handle_sse_events(
+            &mut reader,
+            &mut write_half,
+            &req,
+            router,
+            principal,
+            config,
+        )
+        .await;
     }
 
-    match dispatch_json_route(route, &req, router, principal).await {
+    let is_blocking_wait = matches!(&route, Route::CallTool { tool } if tool == "wait");
+    let result = if is_blocking_wait {
+        tokio::select! {
+            biased;
+            res = dispatch_json_route(route, &req, router, principal) => res,
+            () = wait_for_client_eof(&mut reader) => return Ok(()),
+        }
+    } else {
+        dispatch_json_route(route, &req, router, principal).await
+    };
+
+    match result {
         Ok((status, value)) => write_json_response(&mut write_half, status, &value).await,
         Err(err) => write_error_response(&mut write_half, &err).await,
     }
@@ -1529,7 +1565,8 @@ fn parse_resume_cursor(raw: &str, single_stream: Option<&StreamId>) -> Result<Cu
     ))
 }
 
-async fn handle_sse_events<W: AsyncWrite + Unpin>(
+async fn handle_sse_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<R>,
     writer: &mut W,
     req: &ParsedRequest,
     router: Arc<Router>,
@@ -1562,6 +1599,7 @@ async fn handle_sse_events<W: AsyncWrite + Unpin>(
     loop {
         tokio::select! {
             biased;
+            () = wait_for_client_eof(reader) => break,
             item = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)) => {
                 match item {
                     Some(Ok(frame)) => {

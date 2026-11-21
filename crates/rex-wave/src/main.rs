@@ -1159,10 +1159,15 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         let mentions = !*all;
                         let mut w = Wait::room(room_id, Seq(*since), mentions);
                         if let Some(mut c) = base_cursor {
-                            if *since > 0 {
-                                c.advance(&stream, Seq(*since));
+                            if mentions {
+                                let seq = c.at(&stream).max(Seq(*since));
+                                w.after = Cursor::live().with(stream, seq);
+                            } else {
+                                if *since > 0 {
+                                    c.advance(&stream, Seq(*since));
+                                }
+                                w.after = c;
                             }
-                            w.after = c;
                         }
                         w.timeout_ms = *timeout;
                         w
@@ -2849,6 +2854,35 @@ mod tests {
                 ..
             })
         ));
+
+        let read_cursor = serde_json::to_string(&Cursor::default().with(
+            StreamId::Room {
+                room: rex_wave_api::room::RoomId::Channel {
+                    scope: rex_wave_api::room::RoomScope::Global,
+                    name: ChannelName::parse("general").unwrap(),
+                },
+            },
+            Seq(12),
+        ))
+        .unwrap();
+        let wait_mentions_cursor =
+            parse_cli(&["rex-wave", "wait", "#general", "--cursor", &read_cursor]);
+        let WireCommand::Wait(wmc) = to_command(&wait_mentions_cursor.cmd).unwrap() else {
+            panic!("expected Wait");
+        };
+        assert!(
+            wmc.after.from_head(),
+            "mentions wait with a read cursor must preserve from_head=true"
+        );
+        assert_eq!(
+            wmc.after.at(&StreamId::Room {
+                room: rex_wave_api::room::RoomId::Channel {
+                    scope: rex_wave_api::room::RoomScope::Global,
+                    name: ChannelName::parse("general").unwrap(),
+                },
+            }),
+            Seq(12)
+        );
 
         let task_add = parse_cli(&[
             "rex-wave",

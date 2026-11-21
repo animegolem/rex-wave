@@ -71,9 +71,20 @@ pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
 
 type ActiveWaitKey = (usize, WaveSlug, RoleName);
 
+/// Upper bound applied when a `Principal::Worker` issues a `Wait` with
+/// `timeout_ms: None` so an abandoned call cannot leave a worker `Parked` forever.
+pub const MAX_UNBOUNDED_WORKER_WAIT_MS: u64 = 10 * 60 * 1000;
+
 fn active_worker_waits() -> &'static Mutex<HashMap<ActiveWaitKey, usize>> {
     static MAP: OnceLock<Mutex<HashMap<ActiveWaitKey, usize>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn has_active_wait(key: &ActiveWaitKey) -> bool {
+    active_worker_waits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(key)
 }
 
 fn increment_active_wait(key: &ActiveWaitKey) -> usize {
@@ -131,10 +142,14 @@ fn system_ctx() -> DecideCtx {
 }
 
 async fn restore_worker_working(
+    key: &ActiveWaitKey,
     wave_svc: &Arc<dyn Service<WaveCommand>>,
     wave: &WaveSlug,
     role: &RoleName,
 ) {
+    if has_active_wait(key) {
+        return;
+    }
     let still_parked = match wave_svc
         .dispatch(
             WaveCommand::WaveView(WaveView { wave: wave.clone() }),
@@ -154,7 +169,7 @@ async fn restore_worker_working(
         }),
         _ => false,
     };
-    if still_parked {
+    if still_parked && !has_active_wait(key) {
         let _ = wave_svc
             .dispatch(
                 WaveCommand::WaveObserve(WaveObserve {
@@ -198,7 +213,7 @@ impl WorkerWaitGuard {
     async fn finish(mut self) {
         self.completed = true;
         if decrement_active_wait(&self.key) == 0 {
-            restore_worker_working(&self.wave_svc, &self.wave, &self.role).await;
+            restore_worker_working(&self.key, &self.wave_svc, &self.wave, &self.role).await;
         }
     }
 }
@@ -211,11 +226,12 @@ impl Drop for WorkerWaitGuard {
         if decrement_active_wait(&self.key) == 0
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
+            let key = self.key.clone();
             let wave_svc = self.wave_svc.clone();
             let wave = self.wave.clone();
             let role = self.role.clone();
             handle.spawn(async move {
-                restore_worker_working(&wave_svc, &wave, &role).await;
+                restore_worker_working(&key, &wave_svc, &wave, &role).await;
             });
         }
     }
@@ -235,10 +251,13 @@ impl Router {
             Routed::Inbox(c) => self.inbox.dispatch(c, ctx).await,
             Routed::Mail(c) => self.mail.dispatch(c, ctx).await,
             Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
-            Routed::Read(ReadCommand::Wait(wait)) => {
+            Routed::Read(ReadCommand::Wait(mut wait)) => {
                 let guard = if wait.timeout_ms != Some(0)
                     && let Principal::Worker { wave, role } = by
                 {
+                    if wait.timeout_ms.is_none() {
+                        wait.timeout_ms = Some(MAX_UNBOUNDED_WORKER_WAIT_MS);
+                    }
                     let (room, since) = parked_room_and_since(by, &wait);
                     let guard =
                         WorkerWaitGuard::enter(self.wave.clone(), wave.clone(), role.clone());

@@ -1048,3 +1048,165 @@ async fn http_sse_streams_keepalive_and_resumes_seamlessly_via_last_event_id() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn http_disconnect_cancels_worker_wait_and_restores_working() {
+    use rex_wave_api::wave::{
+        Activity, AgentSpec, Observation, PermissionMode, WaveObserve, WaveSpec, WaveStart,
+        WaveView, WorkerPhase, WorkerSpec, Workspace,
+    };
+    use rex_wave_runtime::LocalClient;
+    use rex_wave_waves::Waves;
+
+    let dir = fresh_dir("wait-cancel");
+    let sock = dir.0.join("daemon.sock");
+    let op = SeatName::parse("owner").unwrap();
+    let wave = WaveSlug::parse("w1").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    let worker_tok = mint_worker_token(&sock, &wave, &role, None, false).unwrap();
+
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(128);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let op_client = LocalClient::new(router.clone(), Principal::Operator { seat: op.clone() });
+    let sys_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::T3Bridge,
+        },
+    );
+    let agent = AgentSpec {
+        provider: ProviderId::parse("antigravity").unwrap(),
+        model: None,
+        reasoning: None,
+        service_tier: None,
+        permission: PermissionMode::AcceptEdits,
+        workspace: Workspace::ProjectDefault,
+    };
+    op_client
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: BbProjectId::parse("proj_1").unwrap(),
+                goal: Body::parse("disconnect cancel test").unwrap(),
+                defaults: agent.clone(),
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("work").unwrap(),
+                    agent: Some(agent),
+                }],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+    sys_client
+        .call(WaveObserve {
+            wave: wave.clone(),
+            role: role.clone(),
+            observation: Observation::Spawned {
+                attempt: 1,
+                thread: BbThreadId::parse("t3:w1:author:a1").unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
+        operator: op.clone(),
+        daemon_uid: None,
+        tokens_path: tokens_path_for(&sock),
+    });
+    let listener = bind_http("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_http_listener(
+        listener,
+        router,
+        auth,
+        op,
+        HttpConfig::default(),
+    ));
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    let wait_body = r#"{"interest":{"interest":"room","room":{"ref":"channel","scope":{"scope":"global"},"name":"general"}},"after":{"positions":[],"from_head":true},"timeout_ms":30000}"#;
+    let bearer = format!("Bearer {worker_tok}");
+    let req = build_request(
+        "POST",
+        "/v1/call/wait",
+        addr,
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        Some(wait_body),
+    );
+    conn.write_all(req.as_bytes()).await.unwrap();
+    conn.flush().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snap = op_client
+                .call(WaveView { wave: wave.clone() })
+                .await
+                .unwrap();
+            if snap.workers.iter().any(|(r, _, phase)| {
+                r == &role
+                    && matches!(
+                        phase,
+                        WorkerPhase::Live {
+                            activity: Activity::Parked { .. },
+                            ..
+                        }
+                    )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("HTTP worker wait entered Parked");
+
+    drop(conn);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snap = op_client
+                .call(WaveView { wave: wave.clone() })
+                .await
+                .unwrap();
+            if snap.workers.iter().any(|(r, _, phase)| {
+                r == &role
+                    && matches!(
+                        phase,
+                        WorkerPhase::Live {
+                            activity: Activity::Working,
+                            ..
+                        }
+                    )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("closing HTTP connection cancelled worker Wait and restored Working");
+
+    server.abort();
+}

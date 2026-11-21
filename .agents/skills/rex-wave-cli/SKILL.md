@@ -55,7 +55,7 @@ rex-wave wait --mentions-only --timeout 60000
 
 - When `--re` or `--label` is passed, `wait` uses `Interest::RoomFiltered`. Replies that landed after `--since` before `wait` started return immediately, and label edits match whether the label matched before or after the edit.
 - On timeout with zero matching entries, `rex-wave wait` exits with code `124`.
-- When authenticated as a wave worker (`Principal::Worker`), blocking `wait` automatically marks the worker `Parked` on entry and restores `Working` on wake or disconnect so the conductor avoids duplicate doorbells.
+- When authenticated as a wave worker (`Principal::Worker`), blocking `wait` marks the worker `Parked` on entry and restores `Working` on wake, timeout, or HTTP disconnect. Always pass `--timeout <ms>` shorter than your bash tool timeout so UDS waits always time out cleanly if interrupted (unbounded worker waits are capped at 10 minutes server-side).
 
 ## Manage leased task threads
 
@@ -100,4 +100,4 @@ rex-wave presence resolve rex-wave
 
 ## HTTP and SSE access
 
-When the daemon runs with `--http 127.0.0.1:<port>`, send `Authorization: Bearer $REX_WAVE_TOKEN` for seat or worker identity and `Content-Type: application/json` (or `X-Rex-Wave: 1`) on `POST` and `PATCH` requests. Resume `GET /v1/events` streams cleanly across disconnects by passing the last event's `id` in the `Last-Event-ID` header or `?after=` query parameter.
+When the daemon runs with opt-in `--http 127.0.0.1:<port>` (intended for single-user machines because unauthenticated loopback traffic acts as `Principal::Operator`), send `Authorization: Bearer $REX_WAVE_TOKEN` for seat or worker identity and `Content-Type: application/json` (or `X-Rex-Wave: 1`) on `POST` and `PATCH` requests. Resume `GET /v1/events` streams cleanly across disconnects by passing the last event's `id` in the `Last-Event-ID` header or `?after=` query parameter.
