@@ -1,11 +1,16 @@
 use rex_wave_api::mail::*;
 use rex_wave_api::notify::*;
+use rex_wave_api::presence::*;
 use rex_wave_api::read::{InboxBadge, Sidebar};
 use rex_wave_api::room::*;
 use rex_wave_api::stage::{Osc7501BlockKind, Osc7501State, derive_osc7501_status};
 use rex_wave_api::wave::*;
 use rex_wave_api::*;
-use rex_wave_notify::{Herald, Inbox, rank};
+use rex_wave_notify::{
+    Herald, HeraldView, Inbox, MailUnrungEval, RECONNECT_GRACE_MS, classify, mail_unrung_draft,
+    org_conflict_draft, org_conflict_resolved_draft, rank, transport_down_draft,
+    transport_recovered_draft,
+};
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
     DecideCtx, Decider, EntryMeta, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router,
@@ -1421,5 +1426,1021 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
         adopted.items[0].draft.dedupe,
         "worker-stuck:pancake-spec:council-claude"
     );
+    herald_task.abort();
+}
+
+fn letter_ref_for(seat: &str, name: &str, sha_char: char) -> LetterRef {
+    let sha = Sha256Hex::parse(sha_char.to_string().repeat(64)).unwrap();
+    let rel = PathBuf::from(format!("to-{seat}/{name}"));
+    let item = MailboxItem {
+        schema: MailSchemaV1,
+        id: format!("letter:to-{seat}/{name}"),
+        from: "tally".into(),
+        to: seat.into(),
+        kind: "letter".into(),
+        state: "open".into(),
+        ts: "2026-11-21T06:00:00Z".into(),
+        ts_basis: "mtime".into(),
+        reference: MailRef {
+            store: "letters".into(),
+            path: rel.clone(),
+            sha256: sha.clone(),
+        },
+        topic: Some("presence".into()),
+        round: Some(1),
+        label: Some("Presence follow-up".into()),
+    };
+    LetterRef {
+        path: rel,
+        sha256: sha,
+        wake_id: WakeId(format!("{sha_char}").repeat(16)),
+        item,
+    }
+}
+
+fn sample_seat_record(seat: &str, status: SeatStatus, at: UnixMs) -> SeatRecord {
+    let seat_name = SeatName::parse(seat).unwrap();
+    let by = Principal::Seat {
+        seat: seat_name.clone(),
+    };
+    SeatRecord {
+        seat: seat_name,
+        status,
+        status_provenance: Some(Provenance {
+            asserted_by: by.clone(),
+            verified_how: VerificationKind::SelfWord,
+            at,
+        }),
+        aliases: Vec::new(),
+        role: None,
+        projects: Vec::new(),
+        home_room: None,
+        retired_at: if status == SeatStatus::Retired {
+            Some(at)
+        } else {
+            None
+        },
+        claimed_by: by,
+        claimed_at: at,
+    }
+}
+
+fn sample_uds_binding(seat: &str, inc: &str, at: UnixMs) -> SeatBinding {
+    SeatBinding {
+        seat: SeatName::parse(seat).unwrap(),
+        incarnation_id: IncarnationId::parse(inc).unwrap(),
+        epoch: 1,
+        lane: None,
+        endpoint: TransportEndpoint::UdsSession {
+            conn_id: 7,
+            client: "presence-hold".into(),
+        },
+        liveness: LivenessMode::SocketLifetime,
+        bound_at: at,
+        expires_at: None,
+        status: BindingStatus::Live,
+    }
+}
+
+#[test]
+fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
+    let mut view = HeraldView::default();
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let genga = SeatName::parse("genga").unwrap();
+    let nodal = SeatName::parse("nodal").unwrap();
+    let quire = SeatName::parse("quire").unwrap();
+    let room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("lounge").unwrap(),
+    };
+
+    // Claim genga=Active, nodal=Dormant, quire=Retired.
+    for (seq, seat, status) in [
+        (1, "genga", SeatStatus::Active),
+        (2, "nodal", SeatStatus::Dormant),
+        (3, "quire", SeatStatus::Retired),
+    ] {
+        let env = Envelope {
+            stream: StreamId::Presence,
+            seq: Seq(seq),
+            at: UnixMs(1_000),
+            by: owner_p.clone(),
+            event: Event::Presence(PresenceEvent::SeatClaimed {
+                record: sample_seat_record(seat, status, UnixMs(1_000)),
+            }),
+        };
+        view.observe(&env);
+    }
+
+    // Dormant and Retired seats raise ZERO MailUnrung cards.
+    for (seq, seat, ch) in [(1, "nodal", 'a'), (2, "quire", 'b')] {
+        let env = Envelope {
+            stream: StreamId::Mail,
+            seq: Seq(seq),
+            at: UnixMs(2_000),
+            by: Principal::Seat {
+                seat: SeatName::parse("tally").unwrap(),
+            },
+            event: Event::Mail(MailEvent::Banked {
+                from_room: room.clone(),
+                range: (Seq(1), Seq(1)),
+                letter: letter_ref_for(seat, "notice-r1.md", ch),
+            }),
+        };
+        view.observe(&env);
+        let emitted = classify(&env, &view);
+        assert!(
+            !emitted
+                .iter()
+                .any(|(_, d)| matches!(d.kind, NotifyKind::MailUnrung { .. })),
+            "dormant/retired seat '{seat}' must never raise MailUnrung"
+        );
+    }
+    assert_eq!(
+        view.evaluate_mail_unrung(&nodal, UnixMs(100_000)),
+        MailUnrungEval::Suppress
+    );
+    assert_eq!(
+        view.evaluate_mail_unrung(&quire, UnixMs(100_000)),
+        MailUnrungEval::Suppress
+    );
+
+    // Active seat that was NEVER bound has 0 s grace and raises immediately.
+    let first_letter = Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(3),
+        at: UnixMs(3_000),
+        by: Principal::Seat {
+            seat: SeatName::parse("tally").unwrap(),
+        },
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room.clone(),
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("genga", "first-r1.md", 'c'),
+        }),
+    };
+    view.observe(&first_letter);
+    let emitted = classify(&first_letter, &view);
+    let unrung: Vec<_> = emitted
+        .iter()
+        .filter(|(_, d)| matches!(d.kind, NotifyKind::MailUnrung { .. }))
+        .collect();
+    assert_eq!(unrung.len(), 1);
+    let (to, draft) = unrung[0];
+    assert_eq!(to, &owner_p);
+    assert_eq!(draft.dedupe, "mail-unrung:genga");
+    assert!(
+        draft.actions.is_empty(),
+        "informational status notice must carry zero decision buttons"
+    );
+    assert!(
+        !draft.title.contains('?') && !draft.preview.contains('?'),
+        "status notice must never ask the operator a question"
+    );
+    assert!(matches!(
+        draft.kind,
+        NotifyKind::MailUnrung {
+            ref seat,
+            unread_count: 1,
+            oldest_at: UnixMs(3_000),
+        } if seat == &genga
+    ));
+
+    // Reconnectable binding drop enforces the exact 15 s grace window.
+    let crest = SeatName::parse("crest").unwrap();
+    let claim_crest = Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(4),
+        at: UnixMs(10_000),
+        by: owner_p.clone(),
+        event: Event::Presence(PresenceEvent::SeatClaimed {
+            record: sample_seat_record("crest", SeatStatus::Active, UnixMs(10_000)),
+        }),
+    };
+    view.observe(&claim_crest);
+
+    let bind_crest = Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(5),
+        at: UnixMs(10_000),
+        by: Principal::Seat {
+            seat: crest.clone(),
+        },
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: sample_uds_binding("crest", "inc-crest-1", UnixMs(10_000)),
+            superseded: Vec::new(),
+        }),
+    };
+    view.observe(&bind_crest);
+
+    let drop_crest = Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(6),
+        at: UnixMs(20_000),
+        by: Principal::System {
+            part: SystemPart::PresenceMonitor,
+        },
+        event: Event::Presence(PresenceEvent::Unbound {
+            seat: crest.clone(),
+            incarnation_id: IncarnationId::parse("inc-crest-1").unwrap(),
+            status: BindingStatus::Unbound,
+            reason: Some("socket EOF".into()),
+        }),
+    };
+    view.observe(&drop_crest);
+
+    // Letter arrives 5 s after socket drop -> still within 15 s grace window.
+    let mail_during_grace = Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(4),
+        at: UnixMs(25_000),
+        by: Principal::Seat {
+            seat: SeatName::parse("tally").unwrap(),
+        },
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room.clone(),
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("crest", "grace-r1.md", 'd'),
+        }),
+    };
+    view.observe(&mail_during_grace);
+    assert!(
+        !classify(&mail_during_grace, &view)
+            .iter()
+            .any(|(_, d)| d.dedupe == "mail-unrung:crest"),
+        "must suppress MailUnrung while inside the 15 s reconnect grace window"
+    );
+    assert_eq!(
+        view.evaluate_mail_unrung(&crest, UnixMs(20_000 + RECONNECT_GRACE_MS - 1)),
+        MailUnrungEval::WithinGrace {
+            ready_at: UnixMs(35_000),
+            unread_count: 1,
+            oldest_at: UnixMs(25_000),
+        }
+    );
+    assert_eq!(
+        view.evaluate_mail_unrung(&crest, UnixMs(20_000 + RECONNECT_GRACE_MS)),
+        MailUnrungEval::Raise {
+            unread_count: 1,
+            oldest_at: UnixMs(25_000),
+        }
+    );
+
+    // Fast redial inside the grace window suppresses alerting completely.
+    let rebind_fast = Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(7),
+        at: UnixMs(27_000),
+        by: Principal::Seat {
+            seat: crest.clone(),
+        },
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: sample_uds_binding("crest", "inc-crest-2", UnixMs(27_000)),
+            superseded: Vec::new(),
+        }),
+    };
+    view.observe(&rebind_fast);
+    assert_eq!(
+        view.evaluate_mail_unrung(&crest, UnixMs(50_000)),
+        MailUnrungEval::Suppress,
+        "fast reconnect within grace window must never raise MailUnrung"
+    );
+}
+
+#[tokio::test]
+async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_and_ack() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let owner = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let herald_sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::Herald,
+        },
+    );
+    let herald_task = spawn_reactor(Herald::new(), herald_sys.clone());
+
+    let mut presence_writer = journal.claim(StreamId::Presence).unwrap();
+    let mut mail_writer = journal.claim(StreamId::Mail).unwrap();
+    let room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("lounge").unwrap(),
+    };
+    let genga = SeatName::parse("genga").unwrap();
+    let tally = Principal::Seat {
+        seat: SeatName::parse("tally").unwrap(),
+    };
+
+    // Register Active seat genga (never bound -> 0 s grace).
+    let claim = presence_writer
+        .append(
+            owner.me(),
+            UnixMs(1_700_000_000_000),
+            None,
+            vec![Event::Presence(PresenceEvent::SeatClaimed {
+                record: sample_seat_record("genga", SeatStatus::Active, UnixMs(1_700_000_000_000)),
+            })],
+        )
+        .unwrap();
+    hub.publish(claim.envelopes());
+
+    // Two letters arrive while genga has no live binding -> ONE deduped card with unread_count = 2.
+    let l1 = letter_ref_for("genga", "first-r1.md", '1');
+    let l2 = letter_ref_for("genga", "second-r1.md", '2');
+    let b1 = mail_writer
+        .append(
+            &tally,
+            UnixMs(1_700_000_010_000),
+            None,
+            vec![Event::Mail(MailEvent::Banked {
+                from_room: room.clone(),
+                range: (Seq(1), Seq(1)),
+                letter: l1.clone(),
+            })],
+        )
+        .unwrap();
+    hub.publish(b1.envelopes());
+
+    let b2 = mail_writer
+        .append(
+            &tally,
+            UnixMs(1_700_000_020_000),
+            None,
+            vec![Event::Mail(MailEvent::Banked {
+                from_room: room,
+                range: (Seq(2), Seq(2)),
+                letter: l2.clone(),
+            })],
+        )
+        .unwrap();
+    hub.publish(b2.envelopes());
+
+    let page = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            let hit = p.items.iter().find(|n| {
+                matches!(
+                    &n.draft.kind,
+                    NotifyKind::MailUnrung {
+                        seat,
+                        unread_count: 2,
+                        oldest_at: UnixMs(1_700_000_010_000),
+                    } if seat == &genga
+                )
+            });
+            if hit.is_some() {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Herald coalesced two unrung letters into one per-seat MailUnrung card");
+
+    let unrung_cards: Vec<_> = page
+        .items
+        .iter()
+        .filter(|n| matches!(n.draft.kind, NotifyKind::MailUnrung { .. }))
+        .collect();
+    assert_eq!(
+        unrung_cards.len(),
+        1,
+        "must emit at most ONE MailUnrung card per Active seat"
+    );
+    assert_eq!(unrung_cards[0].draft.dedupe, "mail-unrung:genga");
+    assert!(unrung_cards[0].draft.actions.is_empty());
+
+    // Rebinding genga BEFORE ACKing must NOT auto-resolve the card yet.
+    let rebind = presence_writer
+        .append(
+            &Principal::Seat {
+                seat: genga.clone(),
+            },
+            UnixMs(1_700_000_030_000),
+            None,
+            vec![Event::Presence(PresenceEvent::Bound {
+                binding: sample_uds_binding("genga", "inc-genga-1", UnixMs(1_700_000_030_000)),
+                superseded: Vec::new(),
+            })],
+        )
+        .unwrap();
+    hub.publish(rebind.envelopes());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let after_rebind = owner
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_rebind
+            .items
+            .iter()
+            .filter(|n| matches!(n.draft.kind, NotifyKind::MailUnrung { .. }))
+            .count(),
+        1,
+        "rebinding without ACKing pending digests keeps MailUnrung open"
+    );
+
+    // Partial ACK (letter 1 of 2) decrements unread_count to 1, still open.
+    let ack1 = mail_writer
+        .append(
+            &Principal::Seat {
+                seat: genga.clone(),
+            },
+            UnixMs(1_700_000_040_000),
+            None,
+            vec![Event::Mail(MailEvent::Acked {
+                path: l1.path.clone(),
+                sha256: l1.sha256.clone(),
+            })],
+        )
+        .unwrap();
+    hub.publish(ack1.envelopes());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.items.iter().any(|n| {
+                matches!(
+                    &n.draft.kind,
+                    NotifyKind::MailUnrung {
+                        seat,
+                        unread_count: 1,
+                        oldest_at: UnixMs(1_700_000_020_000),
+                    } if seat == &genga
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("partial ACK updated unread_count to 1 and advanced oldest_at");
+
+    // Final ACK (letter 2 of 2) auto-resolves MailUnrung to Done.
+    let ack2 = mail_writer
+        .append(
+            &Principal::Seat {
+                seat: genga.clone(),
+            },
+            UnixMs(1_700_000_050_000),
+            None,
+            vec![Event::Mail(MailEvent::Acked {
+                path: l2.path.clone(),
+                sha256: l2.sha256.clone(),
+            })],
+        )
+        .unwrap();
+    hub.publish(ack2.envelopes());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = owner
+                .call(InboxList {
+                    include_done: true,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.items
+                .iter()
+                .any(|n| n.draft.dedupe == "mail-unrung:genga" && n.state == NotifyState::Done)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ACKing all pending digests auto-resolved MailUnrung to Done");
+
+    // TransportDown circuit-breaker raises one deduped card and auto-resolves on recovery.
+    let td = presence_writer
+        .append(
+            &Principal::System {
+                part: SystemPart::PresenceMonitor,
+            },
+            UnixMs(1_700_000_060_000),
+            None,
+            vec![Event::Presence(PresenceEvent::TransportHealthChanged {
+                transport: TransportKind::ClaudeSession,
+                down: true,
+                detail: Some("/tmp/cc-socks missing".into()),
+            })],
+        )
+        .unwrap();
+    hub.publish(td.envelopes());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.items.iter().any(|n| {
+                n.draft.dedupe == "transport-down:claude_session" && n.state == NotifyState::Unread
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TransportDown raised deduped informational Operator card");
+
+    let tr = presence_writer
+        .append(
+            &Principal::System {
+                part: SystemPart::PresenceMonitor,
+            },
+            UnixMs(1_700_000_070_000),
+            None,
+            vec![Event::Presence(PresenceEvent::TransportHealthChanged {
+                transport: TransportKind::ClaudeSession,
+                down: false,
+                detail: None,
+            })],
+        )
+        .unwrap();
+    hub.publish(tr.envelopes());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = owner
+                .call(InboxList {
+                    include_done: true,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.items.iter().any(|n| {
+                n.draft.dedupe == "transport-down:claude_session" && n.state == NotifyState::Done
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TransportDown auto-resolved to Done when transport recovered");
+
+    // OrgConflict cards deduplicate, carry informational copy, auto-resolve, and reopen on fresh conflict.
+    let org_id = OrgId::parse("rw-task-42").unwrap();
+    let conflict = org_conflict_draft(
+        "board.org",
+        org_id.clone(),
+        "expected :REX_REV: 3, journal at 4",
+    );
+    assert!(conflict.actions.is_empty());
+    assert!(!conflict.title.contains('?') && !conflict.preview.contains('?'));
+    herald_sys
+        .call(InboxRaise {
+            to: owner.me().clone(),
+            draft: conflict.clone(),
+        })
+        .await
+        .unwrap();
+    herald_sys
+        .call(InboxRaise {
+            to: owner.me().clone(),
+            draft: conflict,
+        })
+        .await
+        .unwrap();
+    let with_conflict = owner
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        with_conflict
+            .items
+            .iter()
+            .filter(|n| n.draft.dedupe == "org-conflict:board.org:rw-task-42")
+            .count(),
+        1
+    );
+
+    herald_sys
+        .call(InboxRaise {
+            to: owner.me().clone(),
+            draft: org_conflict_resolved_draft("board.org", org_id.clone()),
+        })
+        .await
+        .unwrap();
+    let after_org_clear = owner
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(after_org_clear.items.iter().any(|n| {
+        n.draft.dedupe == "org-conflict:board.org:rw-task-42" && n.state == NotifyState::Done
+    }));
+
+    // Verify clean helper constructors for MailUnrung and TransportDown directly too.
+    let sample_mu = mail_unrung_draft(&genga, 3, UnixMs(1_700_000_000_000));
+    assert_eq!(sample_mu.dedupe, "mail-unrung:genga");
+    assert!(sample_mu.actions.is_empty());
+    let sample_td = transport_down_draft(TransportKind::BbThread, None);
+    assert_eq!(sample_td.dedupe, "transport-down:bb_thread");
+    let sample_tr = transport_recovered_draft(TransportKind::BbThread);
+    assert_eq!(sample_tr.dedupe, "transport-down:bb_thread");
+
+    herald_task.abort();
+}
+
+#[tokio::test]
+async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresses_transport_down_mail_unrung()
+ {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let owner = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let herald_sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::Herald,
+        },
+    );
+    let (herald, handle) = Herald::with_handle();
+    let herald_task = spawn_reactor(herald, herald_sys.clone());
+
+    let mut presence_writer = journal.claim(StreamId::Presence).unwrap();
+    let mut mail_writer = journal.claim(StreamId::Mail).unwrap();
+    let room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("lounge").unwrap(),
+    };
+    let crest = SeatName::parse("crest").unwrap();
+    let tally = Principal::Seat {
+        seat: SeatName::parse("tally").unwrap(),
+    };
+
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let init = presence_writer
+        .append(
+            owner.me(),
+            UnixMs(t0),
+            None,
+            vec![
+                Event::Presence(PresenceEvent::SeatClaimed {
+                    record: sample_seat_record("crest", SeatStatus::Active, UnixMs(t0)),
+                }),
+                Event::Presence(PresenceEvent::Bound {
+                    binding: sample_uds_binding("crest", "inc-crest-1", UnixMs(t0)),
+                    superseded: Vec::new(),
+                }),
+                Event::Presence(PresenceEvent::Unbound {
+                    seat: crest.clone(),
+                    incarnation_id: IncarnationId::parse("inc-crest-1").unwrap(),
+                    status: BindingStatus::Unbound,
+                    reason: Some("socket EOF".into()),
+                }),
+            ],
+        )
+        .unwrap();
+    hub.publish(init.envelopes());
+
+    let banked = mail_writer
+        .append(
+            &tally,
+            UnixMs(t0 + 2_000),
+            None,
+            vec![Event::Mail(MailEvent::Banked {
+                from_room: room.clone(),
+                range: (Seq(1), Seq(1)),
+                letter: letter_ref_for("crest", "quiet-grace-r1.md", '9'),
+            })],
+        )
+        .unwrap();
+    hub.publish(banked.envelopes());
+
+    // Wait until Herald observes the banked letter and registers the exact 15 s deadline.
+    let deadline = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(dl) = handle.next_grace_deadline(UnixMs(t0 + 2_000)) {
+                break dl;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("HeraldHandle exposes 15 s reconnect grace deadline after spawn_reactor");
+    assert_eq!(deadline, UnixMs(t0 + RECONNECT_GRACE_MS));
+
+    // Flushing 1 ms early raises nothing; flushing at exactly +15 s raises the card
+    // with ZERO subsequent journal entries.
+    handle
+        .flush_due_at(UnixMs(t0 + RECONNECT_GRACE_MS - 1), &herald_sys)
+        .await
+        .unwrap();
+    let before_due = owner
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !before_due
+            .items
+            .iter()
+            .any(|n| n.draft.dedupe == "mail-unrung:crest"),
+        "must not raise before 15 s deadline"
+    );
+
+    handle
+        .flush_due_at(UnixMs(t0 + RECONNECT_GRACE_MS), &herald_sys)
+        .await
+        .unwrap();
+    let after_due = owner
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_due
+            .items
+            .iter()
+            .filter(|n| n.draft.dedupe == "mail-unrung:crest")
+            .count(),
+        1,
+        "flush_due_at raises MailUnrung after 15 s quiet period"
+    );
+
+    // S4 + S5 + S6 + S7 pure invariants:
+    // 1. Unrelated room event does NOT re-emit an unchanged MailUnrung draft (S6).
+    let mut view = HeraldView::default();
+    let owner_p = owner.me().clone();
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: owner_p.clone(),
+        event: Event::Presence(PresenceEvent::SeatClaimed {
+            record: sample_seat_record("genga", SeatStatus::Active, UnixMs(1_000)),
+        }),
+    });
+    let mail_env = Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(2_000),
+        by: tally.clone(),
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room.clone(),
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("genga", "once-r1.md", 'e'),
+        }),
+    };
+    view.observe(&mail_env);
+    assert_eq!(
+        classify(&mail_env, &view)
+            .iter()
+            .filter(|(_, d)| d.dedupe == "mail-unrung:genga")
+            .count(),
+        1
+    );
+    let unrelated = Envelope {
+        stream: StreamId::Room { room: room.clone() },
+        seq: Seq(2),
+        at: UnixMs(3_000),
+        by: owner_p.clone(),
+        event: Event::Room(RoomEvent::TopicSet {
+            topic: "chat".into(),
+        }),
+    };
+    view.observe(&unrelated);
+    assert!(
+        classify(&unrelated, &view).is_empty(),
+        "unrelated events must not re-emit unchanged MailUnrung cards"
+    );
+
+    // 2. TransportDown suppresses per-seat MailUnrung and retains bindings created during outage (S4+S5).
+    let mut td_view = HeraldView::default();
+    let loupe = SeatName::parse("loupe").unwrap();
+    td_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: Principal::System {
+            part: SystemPart::PresenceMonitor,
+        },
+        event: Event::Presence(PresenceEvent::TransportHealthChanged {
+            transport: TransportKind::BbThread,
+            down: true,
+            detail: Some("ws closed".into()),
+        }),
+    });
+    td_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(2),
+        at: UnixMs(1_500),
+        by: Principal::Seat {
+            seat: loupe.clone(),
+        },
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: SeatBinding {
+                seat: loupe.clone(),
+                incarnation_id: IncarnationId::parse("inc-loupe-1").unwrap(),
+                epoch: 1,
+                lane: None,
+                endpoint: TransportEndpoint::BbThread {
+                    thread_id: BbThreadId::parse("th_loupe").unwrap(),
+                },
+                liveness: LivenessMode::SocketLifetime,
+                bound_at: UnixMs(1_500),
+                expires_at: None,
+                status: BindingStatus::TransportDown,
+            },
+            superseded: Vec::new(),
+        }),
+    });
+    td_view.observe(&Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(2_000),
+        by: tally,
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room,
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("loupe", "during-outage-r1.md", 'f'),
+        }),
+    });
+    assert_eq!(
+        td_view.evaluate_mail_unrung(&loupe, UnixMs(2_000)),
+        MailUnrungEval::Suppress,
+        "MailUnrung suppressed during provider TransportDown outage"
+    );
+    td_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(3),
+        at: UnixMs(3_000),
+        by: Principal::System {
+            part: SystemPart::PresenceMonitor,
+        },
+        event: Event::Presence(PresenceEvent::TransportHealthChanged {
+            transport: TransportKind::BbThread,
+            down: false,
+            detail: None,
+        }),
+    });
+    assert_eq!(
+        td_view.evaluate_mail_unrung(&loupe, UnixMs(3_000)),
+        MailUnrungEval::Suppress,
+        "binding created during outage becomes live automatically on transport recovery"
+    );
+
+    // 3. Lapsed lease expires_at is honored by evaluate_mail_unrung (S7).
+    let mut lease_view = HeraldView::default();
+    let baton = SeatName::parse("baton").unwrap();
+    lease_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: Principal::Seat {
+            seat: baton.clone(),
+        },
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: SeatBinding {
+                seat: baton.clone(),
+                incarnation_id: IncarnationId::parse("inc-baton-1").unwrap(),
+                epoch: 1,
+                lane: None,
+                endpoint: TransportEndpoint::SelfWatcher {
+                    harness: "codex".into(),
+                    thread_id: None,
+                    pid: None,
+                    proc_start: None,
+                },
+                liveness: LivenessMode::LeaseOnly,
+                bound_at: UnixMs(1_000),
+                expires_at: Some(UnixMs(5_000)),
+                status: BindingStatus::Live,
+            },
+            superseded: Vec::new(),
+        }),
+    });
+    lease_view.observe(&Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(6_000),
+        by: owner_p,
+        event: Event::Mail(MailEvent::Banked {
+            from_room: RoomId::Channel {
+                scope: RoomScope::Global,
+                name: ChannelName::parse("lounge").unwrap(),
+            },
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("baton", "after-lease-r1.md", 'a'),
+        }),
+    });
+    assert_eq!(
+        lease_view.evaluate_mail_unrung(&baton, UnixMs(6_000)),
+        MailUnrungEval::Raise {
+            unread_count: 1,
+            oldest_at: UnixMs(6_000),
+        },
+        "lapsed LeaseOnly binding must not look live"
+    );
+
+    // R2-3: A custom operator seen after the first MailUnrung raise receives the card.
+    let custom_op = Principal::Operator {
+        seat: SeatName::parse("golem").unwrap(),
+    };
+    let custom_op_env = Envelope {
+        stream: StreamId::Room {
+            room: RoomId::Channel {
+                scope: RoomScope::Global,
+                name: ChannelName::parse("lounge").unwrap(),
+            },
+        },
+        seq: Seq(2),
+        at: UnixMs(7_000),
+        by: custom_op.clone(),
+        event: Event::Room(RoomEvent::TopicSet {
+            topic: "ops".into(),
+        }),
+    };
+    lease_view.observe(&custom_op_env);
+    let op_drafts = classify(&custom_op_env, &lease_view);
+    assert!(
+        op_drafts
+            .iter()
+            .any(|(to, d)| to == &custom_op && d.dedupe == "mail-unrung:baton"),
+        "newly observed operator must receive existing MailUnrung card"
+    );
+
     herald_task.abort();
 }

@@ -7,8 +7,10 @@ use rex_wave_api::*;
 use rex_wave_runtime::*;
 use rex_wave_store::Journal;
 use rex_wave_transport::{
-    Authenticator, Credential, Endpoint, RemoteClient, TableAuthenticator, bind_unix,
-    serve_listener,
+    Authenticator, ConnectionHooks, Credential, Endpoint, FnConnectionHooks,
+    PrincipalAuthenticator, PrincipalTokenTable, RemoteClient, StateDirAuthenticator,
+    TableAuthenticator, bind_unix, serve_listener, serve_listener_with_hooks,
+    write_worker_token_file,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -939,4 +941,530 @@ async fn daemon_restart_reconnects_and_resumes_watches_from_their_cursor() {
 
     drop((room, everything, stage, retargeted, client));
     second.abort();
+}
+
+#[tokio::test]
+async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operator() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path();
+    let sock = state_dir.join("daemon.sock");
+    let (listener, uid) = bind_unix(&sock).unwrap();
+
+    let tokens_path = state_dir.join("tokens.json");
+    let tokens_json = serde_json::json!({
+        "tok_legacy_sam": "sam",
+        "tok_op_golem": { "kind": "operator", "seat": "golem" },
+        "tok_worker_inline": { "kind": "worker", "wave": "w1", "role": "verifier" }
+    });
+    std::fs::write(&tokens_path, serde_json::to_vec(&tokens_json).unwrap()).unwrap();
+    std::fs::set_permissions(&tokens_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let worker_dir = state_dir.join("worker-tokens");
+    let t3_worker = Principal::Worker {
+        wave: WaveSlug::parse("auth-v2").unwrap(),
+        role: RoleName::parse("author").unwrap(),
+    };
+    write_worker_token_file(&worker_dir, "t3_thread_99", "tok_t3_author", &t3_worker).unwrap();
+
+    // Malformed structured file with seat-shaped values must NEVER turn JSON field
+    // names ("token", "principal") into bearer tokens, and must not break valid tokens.
+    let malformed_path = worker_dir.join("t3_malformed");
+    std::fs::write(&malformed_path, r#"{"token":"alice","principal":"bob"}"#).unwrap();
+    std::fs::set_permissions(&malformed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        SeatName::parse("owner").unwrap(),
+        Some(uid),
+        state_dir,
+    ));
+
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let server = tokio::spawn(serve_listener(listener, router, auth));
+
+    let sam = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_legacy_sam".into(),
+        },
+        "cli-sam",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sam.me(),
+        &Principal::Seat {
+            seat: SeatName::parse("sam").unwrap()
+        }
+    );
+
+    let op = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_op_golem".into(),
+        },
+        "cli-op",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        op.me(),
+        &Principal::Operator {
+            seat: SeatName::parse("golem").unwrap()
+        }
+    );
+
+    let w_inline = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_worker_inline".into(),
+        },
+        "cli-w1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        w_inline.me(),
+        &Principal::Worker {
+            wave: WaveSlug::parse("w1").unwrap(),
+            role: RoleName::parse("verifier").unwrap(),
+        }
+    );
+
+    let w_file = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_t3_author".into(),
+        },
+        "t3-author",
+    )
+    .await
+    .unwrap();
+    assert_eq!(w_file.me(), &t3_worker);
+
+    // Malformed worker file field names are never accepted as bearer tokens.
+    let malformed_err = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "token".into(),
+        },
+        "t3-malformed",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(malformed_err, ApiError::Denied { .. }));
+
+    // Hot-reload: a newly written worker token works without restarting the server.
+    let w_hot_principal = Principal::Worker {
+        wave: WaveSlug::parse("auth-v2").unwrap(),
+        role: RoleName::parse("hot-added").unwrap(),
+    };
+    let hot_path =
+        write_worker_token_file(&worker_dir, "t3_thread_hot", "tok_t3_hot", &w_hot_principal)
+            .unwrap();
+    let w_hot = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_t3_hot".into(),
+        },
+        "t3-hot",
+    )
+    .await
+    .unwrap();
+    assert_eq!(w_hot.me(), &w_hot_principal);
+
+    // A world-readable worker token file is skipped (its token denied) without
+    // locking out healthy tokens in `tokens.json` or other `0600` worker files.
+    std::fs::set_permissions(&hot_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let bad_file_err = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_t3_hot".into(),
+        },
+        "t3-bad-mode",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(bad_file_err, ApiError::Denied { .. }));
+    let still_ok = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_legacy_sam".into(),
+        },
+        "cli-sam-still-ok",
+    )
+    .await
+    .unwrap();
+    assert_eq!(still_ok.me(), sam.me());
+    drop(still_ok);
+
+    // A world-readable `worker-tokens/` directory is skipped (denying all worker
+    // tokens inside it) without locking out healthy `tokens.json` seat tokens.
+    std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bad_dir_err = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_t3_author".into(),
+        },
+        "t3-bad-dir",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(bad_dir_err, ApiError::Denied { .. }),
+        "got {bad_dir_err:?}"
+    );
+    let sam_survives_bad_worker_dir = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_legacy_sam".into(),
+        },
+        "cli-sam-bad-worker-dir",
+    )
+    .await
+    .unwrap();
+    assert_eq!(sam_survives_bad_worker_dir.me(), sam.me());
+    drop(sam_survives_bad_worker_dir);
+    std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // System principals cannot be inserted into a token table or written to disk.
+    let mut table = PrincipalTokenTable::new();
+    let sys_err = table
+        .insert(
+            "tok_sys",
+            Principal::System {
+                part: SystemPart::PresenceMonitor,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(sys_err, ApiError::Denied { .. }));
+    assert!(
+        write_worker_token_file(
+            &worker_dir,
+            "bad_sys",
+            "tok_sys",
+            &Principal::System {
+                part: SystemPart::Herald,
+            },
+        )
+        .is_err()
+    );
+
+    // PrincipalAuthenticator works in-memory too.
+    table
+        .insert_worker(
+            "tok_mem_worker",
+            WaveSlug::parse("w2").unwrap(),
+            RoleName::parse("coder").unwrap(),
+        )
+        .unwrap();
+    let mem_auth = PrincipalAuthenticator {
+        operator: SeatName::parse("owner").unwrap(),
+        daemon_uid: Some(uid),
+        tokens: table,
+    };
+    assert_eq!(
+        mem_auth
+            .authenticate(
+                Some(uid),
+                &Credential::Token {
+                    token: "tok_mem_worker".into()
+                }
+            )
+            .unwrap(),
+        Principal::Worker {
+            wave: WaveSlug::parse("w2").unwrap(),
+            role: RoleName::parse("coder").unwrap(),
+        }
+    );
+
+    drop((sam, op, w_inline, w_file, w_hot));
+    server.abort();
+}
+
+#[tokio::test]
+async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("daemon.sock");
+    let (listener, uid) = bind_unix(&sock).unwrap();
+
+    let mut table = PrincipalTokenTable::new();
+    table
+        .insert_seat("tok_crest", SeatName::parse("crest").unwrap())
+        .unwrap();
+    let auth: Arc<dyn Authenticator> = Arc::new(PrincipalAuthenticator {
+        operator: SeatName::parse("owner").unwrap(),
+        daemon_uid: Some(uid),
+        tokens: table,
+    });
+
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<(String, u64, Principal)>();
+    let tx_connect = ev_tx.clone();
+    let tx_disconnect = ev_tx.clone();
+    let hooks: Arc<dyn ConnectionHooks> = Arc::new(FnConnectionHooks::new(
+        move |conn_id, principal, client| {
+            let _ = tx_connect.send((format!("connect:{client}"), conn_id, principal.clone()));
+        },
+        move |conn_id, principal| {
+            let _ = tx_disconnect.send(("disconnect".into(), conn_id, principal.clone()));
+        },
+    ));
+
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let server = tokio::spawn(serve_listener_with_hooks(listener, router, auth, hooks));
+
+    // Refused handshake fires neither connect nor disconnect.
+    let bad = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "wrong".into(),
+        },
+        "intruder",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(bad, ApiError::Denied { .. }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), ev_rx.recv())
+            .await
+            .is_err(),
+        "failed auth must not trigger hooks"
+    );
+
+    let crest_principal = Principal::Seat {
+        seat: SeatName::parse("crest").unwrap(),
+    };
+
+    // Normal connect -> drop fires connect then RAII disconnect immediately.
+    let c1 = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_crest".into(),
+        },
+        "presence-hold",
+    )
+    .await
+    .unwrap();
+    let (ev, id1, p1) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, "connect:presence-hold");
+    assert_eq!(p1, crest_principal);
+
+    drop(c1);
+    let (ev, d_id1, d_p1) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, "disconnect");
+    assert_eq!(d_id1, id1);
+    assert_eq!(d_p1, crest_principal);
+
+    // Server cancellation/abort also fires RAII disconnect on active connections.
+    let _c2 = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_crest".into(),
+        },
+        "hold-until-shutdown",
+    )
+    .await
+    .unwrap();
+    let (ev, id2, p2) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, "connect:hold-until-shutdown");
+    assert_ne!(id2, id1);
+    assert_eq!(p2, crest_principal);
+
+    server.abort();
+    let (ev, d_id2, d_p2) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, "disconnect");
+    assert_eq!(d_id2, id2);
+    assert_eq!(d_p2, crest_principal);
+}
+
+#[tokio::test]
+async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
+    struct SlowRecordingService {
+        started: tokio::sync::Notify,
+        events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    }
+
+    impl Service<RoomCommand> for SlowRecordingService {
+        fn dispatch(
+            &self,
+            cmd: RoomCommand,
+            _: DecideCtx,
+        ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+            let body = match cmd {
+                RoomCommand::RoomPost(p) => p.body.as_str().to_owned(),
+                _ => String::new(),
+            };
+            let events = self.events.clone();
+            self.started.notify_one();
+            Box::pin(async move {
+                if body == "quick-promote" {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let _ = events.send("quick_finished");
+                    return Ok(WireReply::RoomJoin(Ack));
+                }
+                struct DropMark(tokio::sync::mpsc::UnboundedSender<&'static str>);
+                impl Drop for DropMark {
+                    fn drop(&mut self) {
+                        let _ = self.0.send("call_aborted");
+                    }
+                }
+                let _mark = DropMark(events.clone());
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let _ = events.send("call_finished_late");
+                Ok(WireReply::RoomJoin(Ack))
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("daemon.sock");
+    let (listener, uid) = bind_unix(&sock).unwrap();
+
+    let mut table = PrincipalTokenTable::new();
+    table
+        .insert_seat("tok_crest", SeatName::parse("crest").unwrap())
+        .unwrap();
+    let auth: Arc<dyn Authenticator> = Arc::new(PrincipalAuthenticator {
+        operator: SeatName::parse("owner").unwrap(),
+        daemon_uid: Some(uid),
+        tokens: table,
+    });
+
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+    let svc = Arc::new(SlowRecordingService {
+        started: tokio::sync::Notify::new(),
+        events: ev_tx.clone(),
+    });
+    let svc_wait = svc.clone();
+
+    let hooks: Arc<dyn ConnectionHooks> = Arc::new(FnConnectionHooks::new(
+        |_, _, _| {},
+        move |_, _| {
+            let _ = ev_tx.send("on_disconnect");
+        },
+    ));
+
+    let journal = Journal::in_memory().unwrap();
+    let router = router_with(&journal, svc);
+    let server = tokio::spawn(serve_listener_with_hooks(listener, router, auth, hooks));
+
+    // 1. Short in-flight call finishes cleanly within drain grace before on_disconnect runs.
+    let client_quick = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_crest".into(),
+        },
+        "quick-in-flight",
+    )
+    .await
+    .unwrap();
+    let quick_task = tokio::spawn({
+        let c = client_quick.clone();
+        async move { c.call(post("quick-promote")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), svc_wait.started.notified())
+        .await
+        .expect("server started quick call");
+    quick_task.abort();
+    let _ = quick_task.await;
+    drop(client_quick);
+
+    let q1 = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let q2 = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (q1, q2),
+        ("quick_finished", "on_disconnect"),
+        "short in-flight call must finish before on_disconnect instead of splitting a write"
+    );
+
+    // 2. Hung in-flight call is aborted after drain timeout, still strictly before on_disconnect.
+    let client = RemoteClient::connect(
+        Endpoint::Unix(sock),
+        Credential::Token {
+            token: "tok_crest".into(),
+        },
+        "in-flight-test",
+    )
+    .await
+    .unwrap();
+
+    let call_task = tokio::spawn({
+        let c = client.clone();
+        async move { c.call(post("slow-bind")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), svc_wait.started.notified())
+        .await
+        .expect("server started slow call");
+
+    call_task.abort();
+    let _ = call_task.await;
+    drop(client);
+
+    let first = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (first, second),
+        ("call_aborted", "on_disconnect"),
+        "in-flight call must abort and drain before on_disconnect runs"
+    );
+
+    server.abort();
 }

@@ -23,12 +23,13 @@
 use futures_util::StreamExt;
 use rex_wave_api::*;
 use rex_wave_runtime::{Router, Session};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -298,6 +299,426 @@ impl Authenticator for TableAuthenticator {
                 }),
             },
         }
+    }
+}
+
+static WORKER_TOKEN_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+fn validate_token_principal(token: &str, principal: &Principal) -> Result<(), ApiError> {
+    if token.is_empty() || token.chars().any(char::is_control) {
+        return Err(ApiError::Invalid(InvalidId {
+            what: "token".into(),
+            reason: "must be non-empty without control characters".into(),
+        }));
+    }
+    if matches!(principal, Principal::System { .. }) {
+        return Err(ApiError::Denied {
+            principal: "anonymous".into(),
+            action: "bearer tokens may not authenticate as system".into(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_private_file(
+    path: &Path,
+    expected_uid: Option<u32>,
+    what: &str,
+) -> Result<bool, ApiError> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(ApiError::Internal(format!("{what} metadata: {e}"))),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(ApiError::Denied {
+            principal: "anonymous".into(),
+            action: format!("{what} must not be a symlink"),
+        });
+    }
+    if !meta.file_type().is_file() {
+        return Err(ApiError::Denied {
+            principal: "anonymous".into(),
+            action: format!("{what} must be a regular file"),
+        });
+    }
+    if let Some(uid) = expected_uid
+        && meta.uid() != uid
+    {
+        return Err(ApiError::Denied {
+            principal: "anonymous".into(),
+            action: format!("{what} owned by another uid"),
+        });
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(ApiError::Denied {
+            principal: "anonymous".into(),
+            action: format!("{what} must be mode 0600"),
+        });
+    }
+    Ok(true)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TokenMapValue {
+    Seat(SeatName),
+    Principal(Principal),
+}
+
+impl TokenMapValue {
+    fn into_principal(self) -> Principal {
+        match self {
+            TokenMapValue::Seat(seat) => Principal::Seat { seat },
+            TokenMapValue::Principal(p) => p,
+        }
+    }
+}
+
+/// On-disk JSON payload for one per-worker token file under `<state_dir>/worker-tokens/`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTokenFile {
+    pub token: String,
+    pub principal: Principal,
+}
+
+/// Principal-scoped capability token table supporting `Seat`, `Worker`, and
+/// `Operator` tokens while refusing `System` tokens.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrincipalTokenTable {
+    tokens: BTreeMap<String, Principal>,
+}
+
+impl PrincipalTokenTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        token: impl Into<String>,
+        principal: Principal,
+    ) -> Result<(), ApiError> {
+        let token = token.into();
+        validate_token_principal(&token, &principal)?;
+        if let Some(existing) = self.tokens.get(&token)
+            && existing != &principal
+        {
+            return Err(ApiError::conflict(
+                "duplicate token bound to different principals",
+            ));
+        }
+        self.tokens.insert(token, principal);
+        Ok(())
+    }
+
+    pub fn insert_seat(
+        &mut self,
+        token: impl Into<String>,
+        seat: SeatName,
+    ) -> Result<(), ApiError> {
+        self.insert(token, Principal::Seat { seat })
+    }
+
+    pub fn insert_worker(
+        &mut self,
+        token: impl Into<String>,
+        wave: WaveSlug,
+        role: RoleName,
+    ) -> Result<(), ApiError> {
+        self.insert(token, Principal::Worker { wave, role })
+    }
+
+    pub fn insert_operator(
+        &mut self,
+        token: impl Into<String>,
+        seat: SeatName,
+    ) -> Result<(), ApiError> {
+        self.insert(token, Principal::Operator { seat })
+    }
+
+    pub fn extend_seats(&mut self, seats: BTreeMap<String, SeatName>) -> Result<(), ApiError> {
+        for (token, seat) in seats {
+            self.insert_seat(token, seat)?;
+        }
+        Ok(())
+    }
+
+    pub fn merge(&mut self, other: PrincipalTokenTable) -> Result<(), ApiError> {
+        for (token, principal) in other.tokens {
+            self.insert(token, principal)?;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, candidate: &str) -> Option<&Principal> {
+        let mut matched: Option<&Principal> = None;
+        for (stored, principal) in &self.tokens {
+            if constant_time_eq(stored.as_bytes(), candidate.as_bytes()) {
+                matched = Some(principal);
+            }
+        }
+        matched
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Loads `tokens.json` in either legacy `{token: "seat"}` or principal-scoped
+    /// `{token: {kind: ...}}` form, enforcing mode `0600` and matching UID.
+    pub fn load_tokens_file(path: &Path, expected_uid: Option<u32>) -> Result<Self, ApiError> {
+        if !verify_private_file(path, expected_uid, "token store")? {
+            return Ok(Self::new());
+        }
+        let raw =
+            std::fs::read(path).map_err(|e| ApiError::Internal(format!("read tokens: {e}")))?;
+        let decoded: BTreeMap<String, TokenMapValue> = serde_json::from_slice(&raw)
+            .map_err(|e| ApiError::Internal(format!("decode tokens: {e}")))?;
+        let mut table = Self::new();
+        for (token, entry) in decoded {
+            table.insert(token, entry.into_principal())?;
+        }
+        Ok(table)
+    }
+
+    /// Loads mode-`0600` per-worker token files from `<state_dir>/worker-tokens/`
+    /// when present. Missing directory yields an empty table.
+    pub fn load_worker_tokens_dir(dir: &Path, expected_uid: Option<u32>) -> Result<Self, ApiError> {
+        let dir_meta = match std::fs::symlink_metadata(dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(e) => return Err(ApiError::Internal(format!("worker-tokens metadata: {e}"))),
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            return Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: "worker-tokens path must be a real directory".into(),
+            });
+        }
+        if let Some(uid) = expected_uid
+            && dir_meta.uid() != uid
+        {
+            return Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: "worker-tokens directory owned by another uid".into(),
+            });
+        }
+        if dir_meta.permissions().mode() & 0o077 != 0 {
+            return Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: "worker-tokens directory must be mode 0700".into(),
+            });
+        }
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| ApiError::Internal(format!("read worker-tokens dir: {e}")))?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| ApiError::Internal(format!("iterate worker-tokens dir: {e}")))?;
+            let fname = entry.file_name();
+            if fname.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            paths.push(entry.path());
+        }
+        paths.sort();
+
+        let mut table = Self::new();
+        for path in paths {
+            let label = format!("worker token {}", path.display());
+            match verify_private_file(&path, expected_uid, &label) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    daemon_log!("skipping {label}: {e}");
+                    continue;
+                }
+            }
+            let raw = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    daemon_log!("skipping {label}: read failed: {e}");
+                    continue;
+                }
+            };
+            let file: WorkerTokenFile = match serde_json::from_slice(&raw) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    daemon_log!("skipping {label}: invalid WorkerTokenFile JSON: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = table.insert(file.token, file.principal) {
+                daemon_log!("skipping {label}: {e}");
+            }
+        }
+        Ok(table)
+    }
+
+    /// Loads both `tokens.json` and `<state_dir>/worker-tokens/` into one table.
+    /// A malformed or non-`0700` `worker-tokens/` directory is logged and skipped
+    /// so `tokens.json` seat handshakes remain available while worker tokens stay denied.
+    pub fn load_state_dir(
+        tokens_path: &Path,
+        worker_tokens_dir: &Path,
+        expected_uid: Option<u32>,
+    ) -> Result<Self, ApiError> {
+        let mut table = Self::load_tokens_file(tokens_path, expected_uid)?;
+        match Self::load_worker_tokens_dir(worker_tokens_dir, expected_uid) {
+            Ok(workers) => table.merge(workers)?,
+            Err(e) => {
+                daemon_log!(
+                    "skipping worker-tokens directory {}: {e}",
+                    worker_tokens_dir.display()
+                );
+            }
+        }
+        Ok(table)
+    }
+}
+
+/// Atomically writes one mode-`0600` per-worker token file under `dir/<id>`.
+pub fn write_worker_token_file(
+    dir: &Path,
+    id: &str,
+    token: &str,
+    principal: &Principal,
+) -> io::Result<PathBuf> {
+    if id.is_empty()
+        || id.starts_with('.')
+        || id.contains('/')
+        || id.contains('\\')
+        || id.chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker token file id must be a single safe filename",
+        ));
+    }
+    validate_token_principal(token, principal)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    std::fs::create_dir_all(dir)?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+
+    let payload = WorkerTokenFile {
+        token: token.to_owned(),
+        principal: principal.clone(),
+    };
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let nonce = WORKER_TOKEN_NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".tmp.{}.{nonce}", std::process::id()));
+    let dest = dir.join(id);
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&encoded)?;
+        f.sync_all()?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, &dest)?;
+    Ok(dest)
+}
+
+/// Authenticator backed by an in-memory [`PrincipalTokenTable`].
+pub struct PrincipalAuthenticator {
+    pub operator: SeatName,
+    pub daemon_uid: Option<u32>,
+    pub tokens: PrincipalTokenTable,
+}
+
+impl Authenticator for PrincipalAuthenticator {
+    fn authenticate(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<Principal, ApiError> {
+        match credential {
+            Credential::PeerUid => match (peer_uid, self.daemon_uid) {
+                (Some(peer), Some(daemon)) if peer == daemon => Ok(Principal::Operator {
+                    seat: self.operator.clone(),
+                }),
+                _ => Err(ApiError::Denied {
+                    principal: "anonymous".into(),
+                    action: "peer-uid hello".into(),
+                }),
+            },
+            Credential::Token { token } => match self.tokens.get(token) {
+                Some(principal) if !matches!(principal, Principal::System { .. }) => {
+                    Ok(principal.clone())
+                }
+                _ => Err(ApiError::Denied {
+                    principal: "anonymous".into(),
+                    action: "invalid token".into(),
+                }),
+            },
+        }
+    }
+}
+
+/// Reloading authenticator reading both `<state_dir>/tokens.json` and
+/// `<state_dir>/worker-tokens/` on each `Token` handshake.
+pub struct StateDirAuthenticator {
+    pub operator: SeatName,
+    pub daemon_uid: Option<u32>,
+    pub tokens_path: PathBuf,
+    pub worker_tokens_dir: PathBuf,
+}
+
+impl StateDirAuthenticator {
+    pub fn from_state_dir(operator: SeatName, daemon_uid: Option<u32>, state_dir: &Path) -> Self {
+        Self {
+            operator,
+            daemon_uid,
+            tokens_path: state_dir.join("tokens.json"),
+            worker_tokens_dir: state_dir.join("worker-tokens"),
+        }
+    }
+}
+
+impl Authenticator for StateDirAuthenticator {
+    fn authenticate(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<Principal, ApiError> {
+        let tokens = match credential {
+            Credential::PeerUid => PrincipalTokenTable::new(),
+            Credential::Token { .. } => PrincipalTokenTable::load_state_dir(
+                &self.tokens_path,
+                &self.worker_tokens_dir,
+                self.daemon_uid,
+            )?,
+        };
+        let auth = PrincipalAuthenticator {
+            operator: self.operator.clone(),
+            daemon_uid: self.daemon_uid,
+            tokens,
+        };
+        auth.authenticate(peer_uid, credential)
     }
 }
 
@@ -955,12 +1376,74 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
     Ok((listener, uid))
 }
 
-/// Serve `router` on an already-bound `UnixListener` until cancelled.
-/// Cancelling closes every connection, as a daemon exit would.
-pub async fn serve_listener(
+/// Lifecycle callbacks fired around each authenticated UDS connection.
+///
+/// `on_disconnect` runs from an RAII drop guard, so it fires on normal EOF,
+/// socket error, protocol violation, and server cancellation alike.
+pub trait ConnectionHooks: Send + Sync + 'static {
+    fn on_connect(&self, _conn_id: u64, _principal: &Principal, _client: &str) {}
+    fn on_disconnect(&self, _conn_id: u64, _principal: &Principal) {}
+}
+
+/// Default connection hook that does nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopHooks;
+
+impl ConnectionHooks for NoopHooks {}
+
+/// Closure-backed [`ConnectionHooks`] adapter.
+pub struct FnConnectionHooks<C, D> {
+    on_connect: C,
+    on_disconnect: D,
+}
+
+impl<C, D> FnConnectionHooks<C, D>
+where
+    C: Fn(u64, &Principal, &str) + Send + Sync + 'static,
+    D: Fn(u64, &Principal) + Send + Sync + 'static,
+{
+    pub fn new(on_connect: C, on_disconnect: D) -> Self {
+        Self {
+            on_connect,
+            on_disconnect,
+        }
+    }
+}
+
+impl<C, D> ConnectionHooks for FnConnectionHooks<C, D>
+where
+    C: Fn(u64, &Principal, &str) + Send + Sync + 'static,
+    D: Fn(u64, &Principal) + Send + Sync + 'static,
+{
+    fn on_connect(&self, conn_id: u64, principal: &Principal, client: &str) {
+        (self.on_connect)(conn_id, principal, client);
+    }
+
+    fn on_disconnect(&self, conn_id: u64, principal: &Principal) {
+        (self.on_disconnect)(conn_id, principal);
+    }
+}
+
+/// Fires `hooks.on_disconnect` unconditionally when an authenticated connection ends.
+struct DisconnectGuard {
+    conn_id: u64,
+    principal: Principal,
+    hooks: Arc<dyn ConnectionHooks>,
+}
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        self.hooks.on_disconnect(self.conn_id, &self.principal);
+    }
+}
+
+/// Serve `router` on an already-bound `UnixListener` until cancelled, firing
+/// `hooks` on every authenticated connect and RAII disconnect.
+pub async fn serve_listener_with_hooks(
     listener: UnixListener,
     router: Arc<Router>,
     auth: Arc<dyn Authenticator>,
+    hooks: Arc<dyn ConnectionHooks>,
 ) -> io::Result<()> {
     if let Ok(addr) = listener.local_addr()
         && let Some(path) = addr.as_pathname()
@@ -978,14 +1461,44 @@ pub async fn serve_listener(
                 let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
                 let router = router.clone();
                 let auth = auth.clone();
+                let hooks = hooks.clone();
                 conns.spawn(async move {
-                    if let Err(e) = handle_conn(conn, stream, peer_uid, router, auth).await {
+                    if let Err(e) = handle_conn(conn, stream, peer_uid, router, auth, hooks).await {
                         daemon_log!("conn #{conn}: {e}");
                     }
                 });
             }
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
+    }
+}
+
+/// Serve `router` on an already-bound `UnixListener` until cancelled.
+/// Cancelling closes every connection, as a daemon exit would.
+pub async fn serve_listener(
+    listener: UnixListener,
+    router: Arc<Router>,
+    auth: Arc<dyn Authenticator>,
+) -> io::Result<()> {
+    serve_listener_with_hooks(listener, router, auth, Arc::new(NoopHooks)).await
+}
+
+/// Serve `router` on `endpoint` with connection lifecycle hooks until cancelled.
+pub async fn serve_with_hooks(
+    endpoint: Endpoint,
+    router: Arc<Router>,
+    auth: Arc<dyn Authenticator>,
+    hooks: Arc<dyn ConnectionHooks>,
+) -> io::Result<()> {
+    match endpoint {
+        Endpoint::Unix(path) => {
+            let (listener, _) = bind_unix(&path)?;
+            serve_listener_with_hooks(listener, router, auth, hooks).await
+        }
+        Endpoint::WebSocket(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "websocket endpoint is not enabled",
+        )),
     }
 }
 
@@ -996,16 +1509,7 @@ pub async fn serve(
     router: Arc<Router>,
     auth: Arc<dyn Authenticator>,
 ) -> io::Result<()> {
-    match endpoint {
-        Endpoint::Unix(path) => {
-            let (listener, _) = bind_unix(&path)?;
-            serve_listener(listener, router, auth).await
-        }
-        Endpoint::WebSocket(_) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "websocket endpoint is not enabled",
-        )),
-    }
+    serve_with_hooks(endpoint, router, auth, Arc::new(NoopHooks)).await
 }
 
 /// Errors that point at the daemon or what it fronts, as opposed to a caller
@@ -1020,6 +1524,7 @@ async fn handle_conn(
     peer_uid: Option<u32>,
     router: Arc<Router>,
     auth: Arc<dyn Authenticator>,
+    hooks: Arc<dyn ConnectionHooks>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let first: Option<wire::ClientFrame> =
@@ -1048,6 +1553,12 @@ async fn handle_conn(
         }
     };
     daemon_log!("conn #{conn}: {client} connected as {me}");
+    hooks.on_connect(conn, &me, &client);
+    let disconnect_guard = DisconnectGuard {
+        conn_id: conn,
+        principal: me.clone(),
+        hooks,
+    };
 
     let session = Session::new(me.clone());
     let (out_tx, mut out_rx) = mpsc::channel::<wire::ServerFrame>(WATCH_BUFFER * 2);
@@ -1060,6 +1571,7 @@ async fn handle_conn(
     let _writer = AbortOnDrop(writer_task.abort_handle());
 
     let mut watches: HashMap<u64, AbortOnDrop> = HashMap::new();
+    let mut in_flight_calls: JoinSet<()> = JoinSet::new();
     let ended = loop {
         let frame = match read_frame::<_, wire::ClientFrame>(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -1069,11 +1581,12 @@ async fn handle_conn(
         match frame {
             wire::ClientFrame::Hello { .. } => break "second hello".to_owned(),
             wire::ClientFrame::Call { id, cmd } => {
+                while in_flight_calls.try_join_next().is_some() {}
                 let router = router.clone();
                 let by = session.me().clone();
                 let out_tx = out_tx.clone();
                 let name = cmd.meta().name;
-                tokio::spawn(async move {
+                in_flight_calls.spawn(async move {
                     let result = router.dispatch(&by, cmd).await;
                     if let Err(e) = &result
                         && worth_logging(e)
@@ -1144,6 +1657,16 @@ async fn handle_conn(
     };
 
     drop(watches);
+    // Allow short in-flight commands (such as MailBridge::promote or PresenceBind)
+    // to finish cleanly before aborting stuck calls and firing RAII on_disconnect.
+    const IN_FLIGHT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+    let _ = tokio::time::timeout(IN_FLIGHT_DRAIN_TIMEOUT, async {
+        while in_flight_calls.join_next().await.is_some() {}
+    })
+    .await;
+    in_flight_calls.abort_all();
+    while in_flight_calls.join_next().await.is_some() {}
+    drop(disconnect_guard);
     drop(out_tx);
     match writer_task.await {
         Ok(Err(e)) => daemon_log!("conn #{conn}: {me} disconnected ({ended}; write failed: {e})"),
