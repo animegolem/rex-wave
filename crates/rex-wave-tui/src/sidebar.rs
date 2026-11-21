@@ -142,7 +142,7 @@ impl Sidebar {
             fold_level: 2,
         };
         sidebar.apply_auto_folds(overview);
-        sidebar.roots = build_with_ctx_filtered(overview, &sidebar.ctx_pct, sidebar.show_archived);
+        sidebar.roots = build_with_ctx(overview, &sidebar.ctx_pct, sidebar.show_archived);
         sidebar
     }
 
@@ -150,7 +150,11 @@ impl Sidebar {
         for proj in &overview.projects {
             for wave in &proj.waves {
                 if wave.finished.is_some() && self.auto_folded_waves.insert(wave.wave.clone()) {
-                    self.folds.set(NodeKey::Room(wave.room.clone()), false);
+                    let cursor_in_wave = self.cursor == NodeKey::Room(wave.room.clone())
+                        || matches!(&self.cursor, NodeKey::Agent { wave: w, .. } if w == &wave.wave);
+                    if !cursor_in_wave {
+                        self.folds.set(NodeKey::Room(wave.room.clone()), false);
+                    }
                 }
             }
         }
@@ -171,7 +175,7 @@ impl Sidebar {
     pub fn rebuild(&mut self, overview: &SidebarTreeSnapshot) {
         let prev_ancestors = ancestor_chain(&self.roots, &self.cursor).unwrap_or_default();
         self.apply_auto_folds(overview);
-        self.roots = build_with_ctx_filtered(overview, &self.ctx_pct, self.show_archived);
+        self.roots = build_with_ctx(overview, &self.ctx_pct, self.show_archived);
 
         if find_node(&self.roots, &self.cursor).is_none() {
             self.cursor = prev_ancestors
@@ -510,13 +514,6 @@ impl Sidebar {
 }
 
 pub fn build_with_ctx(
-    overview: &SidebarTreeSnapshot,
-    ctx_pct: &BTreeMap<(WaveSlug, RoleName), u8>,
-) -> Vec<SidebarNode> {
-    build_with_ctx_filtered(overview, ctx_pct, false)
-}
-
-pub fn build_with_ctx_filtered(
     overview: &SidebarTreeSnapshot,
     ctx_pct: &BTreeMap<(WaveSlug, RoleName), u8>,
     show_archived: bool,

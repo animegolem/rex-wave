@@ -700,18 +700,6 @@ fn draw_stage_frame(title: String, area: Rect, buf: &mut Buffer, ctx: &StageRend
     inner
 }
 
-/// Human label for a stage target (`#proj/room`, `@wave/role`, `Inbox`).
-pub fn target_label(target: &StageTarget) -> String {
-    match target {
-        StageTarget::Inbox => "Inbox".to_owned(),
-        StageTarget::Kanban { board: Some(b) } => format!("Kanban {b}"),
-        StageTarget::Kanban { board: None } => "Kanban".to_owned(),
-        StageTarget::Room { room } => room_label(room),
-        StageTarget::Agent { wave, role } => format!("@{wave}/{role}"),
-        StageTarget::Summary { key } => node_label(key),
-    }
-}
-
 pub fn project_display_name<'a>(
     overview: &'a SidebarTreeSnapshot,
     project: &'a BbProjectId,
@@ -741,7 +729,8 @@ fn board_display_label(board: &BoardId, overview: &SidebarTreeSnapshot) -> Strin
     board.to_string()
 }
 
-fn target_label_in(target: &StageTarget, overview: &SidebarTreeSnapshot) -> String {
+/// Human label for a stage target (`#proj/room`, `@wave/role`, `Inbox`).
+pub fn target_label(target: &StageTarget, overview: &SidebarTreeSnapshot) -> String {
     match target {
         StageTarget::Inbox => "Inbox".to_owned(),
         StageTarget::Kanban { board: Some(b) } => {
@@ -754,7 +743,7 @@ fn target_label_in(target: &StageTarget, overview: &SidebarTreeSnapshot) -> Stri
     }
 }
 
-fn room_label(room: &RoomId) -> String {
+fn room_label_in(room: &RoomId, overview: &SidebarTreeSnapshot) -> String {
     match room {
         RoomId::Channel {
             scope: room::RoomScope::Global,
@@ -763,7 +752,7 @@ fn room_label(room: &RoomId) -> String {
         RoomId::Channel {
             scope: room::RoomScope::Project { project },
             name,
-        } => format!("#{project}/{name}"),
+        } => format!("#{}/{name}", project_display_name(overview, project)),
         RoomId::Direct { pair } => {
             let (a, b) = pair.clone().into();
             format!("{a} ↔ {b}")
@@ -771,35 +760,17 @@ fn room_label(room: &RoomId) -> String {
     }
 }
 
-fn room_label_in(room: &RoomId, overview: &SidebarTreeSnapshot) -> String {
-    match room {
-        RoomId::Channel {
-            scope: room::RoomScope::Project { project },
-            name,
-        } => format!("#{}/{name}", project_display_name(overview, project)),
-        other => room_label(other),
-    }
-}
-
-fn node_label(key: &NodeKey) -> String {
+fn node_label_in(key: &NodeKey, overview: &SidebarTreeSnapshot) -> String {
     match key {
         NodeKey::Inbox => "Inbox".to_owned(),
         NodeKey::Kanban => "Kanban".to_owned(),
         NodeKey::Divider => "Overview".to_owned(),
         NodeKey::ProjectsHeader => "Projects".to_owned(),
-        NodeKey::Project(p) => format!("Project {p}"),
-        NodeKey::Room(r) | NodeKey::Dm(r) => room_label(r),
+        NodeKey::Project(p) => format!("Project {}", project_display_name(overview, p)),
+        NodeKey::Room(r) | NodeKey::Dm(r) => room_label_in(r, overview),
         NodeKey::Agent { wave, role } => format!("@{wave}/{role}"),
         NodeKey::ChannelsHeader => "Channels".to_owned(),
         NodeKey::DmsHeader => "Direct Messages".to_owned(),
-    }
-}
-
-fn node_label_in(key: &NodeKey, overview: &SidebarTreeSnapshot) -> String {
-    match key {
-        NodeKey::Project(p) => format!("Project {}", project_display_name(overview, p)),
-        NodeKey::Room(r) | NodeKey::Dm(r) => room_label_in(r, overview),
-        other => node_label(other),
     }
 }
 
@@ -1971,7 +1942,7 @@ fn render_loading(target: &StageTarget, area: Rect, buf: &mut Buffer, ctx: &Stag
     let inner = draw_stage_frame("Loading".to_owned(), area, buf, ctx);
     if inner.height >= 1 {
         Paragraph::new(Line::from(Span::styled(
-            format!("  ◌ Loading {}…", target_label_in(target, ctx.overview)),
+            format!("  ◌ Loading {}…", target_label(target, ctx.overview)),
             Style::default().fg(C_DIM),
         )))
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
@@ -1990,7 +1961,7 @@ fn render_error(
         Paragraph::new(Line::from(Span::styled(
             format!(
                 "  ✕ {}: {}",
-                target_label_in(target, ctx.overview),
+                target_label(target, ctx.overview),
                 truncate_chars(error, inner.width.saturating_sub(8) as usize)
             ),
             Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),

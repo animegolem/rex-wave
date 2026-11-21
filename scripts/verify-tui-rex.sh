@@ -1039,22 +1039,23 @@ wait_screen_not_contains "Org Tree [archived]" "Sidebar archived filter toggled 
 wait_screen_contains "release-v1" "Unarchived wave stays visible after hiding archived items"
 record_step "wave-unarchived-visible"
 
-printf '==> Journey 7: Live daemon disconnect -> reconnecting badge -> restart -> connected recovery\n'
+printf '==> Journey 7: Live daemon disconnect -> reconnecting badge + stage error -> restart -> auto StageLoader recovery\n'
 kill "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
 wait_screen_contains "○ reconnecting" "Top-chrome badge transitions live to reconnecting on daemon drop"
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+g
+wait_screen_contains "Stage Error" "Stage enters error state when retargeted during daemon outage"
+wait_screen_contains "reconnecting to daemon" "Stage error surfaces reconnecting transport cause"
 record_step "daemon-reconnecting"
 
 start_daemon
 wait_screen_contains "● connected" "Top-chrome badge transitions back to connected on daemon restart"
+wait_screen_contains "DM batch #1 from @sam" "StageLoader automatically recovers Direct Message stage with zero keypresses"
+wait_screen_contains "All 32 alpha shards reported nominal p99." "Wrapped second line in recovered Direct Message stage"
 record_step "daemon-reconnected"
 
-printf '==> Journey 8: Direct Messages jump [G] after reconnect and clean TUI quit [q]\n'
-rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+g
-wait_screen_contains "DM batch #1 from @sam" "Direct Message stage with @sam"
-wait_screen_contains "All 32 alpha shards reported nominal p99." "Wrapped second line in Direct Message stage"
-record_step "direct-message-sam"
+printf '==> Journey 8: Clean TUI quit [q] and OSC 7501 clear\n'
 
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" q
 QUIT_DEADLINE=$(( $(now_ms) + 5000 ))

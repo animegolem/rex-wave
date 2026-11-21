@@ -106,6 +106,7 @@ pub struct Model {
     resizing_sidebar: bool,
     pub active_project: Option<BbProjectId>,
     pub connection: ConnectionState,
+    pub has_connection_watch: bool,
     pub term_cols: u16,
     pub term_rows: u16,
     pub last_error: Option<String>,
@@ -137,6 +138,7 @@ impl Model {
             resizing_sidebar: false,
             active_project,
             connection: ConnectionState::Connected,
+            has_connection_watch: false,
             term_cols: 124,
             term_rows: 34,
             last_error: None,
@@ -235,12 +237,20 @@ fn is_transport_error(err: &ApiError) -> bool {
 }
 
 fn mark_transport_drop(model: &mut Model) {
-    if model.connection == ConnectionState::Connected {
+    if !model.has_connection_watch && model.connection == ConnectionState::Connected {
         model.connection = ConnectionState::Reconnecting;
     }
 }
 
-fn mark_connected(model: &mut Model, effects: &mut Vec<Effect>, fetch_sidebar: bool) {
+fn mark_connected(
+    model: &mut Model,
+    effects: &mut Vec<Effect>,
+    fetch_sidebar: bool,
+    authoritative: bool,
+) {
+    if !authoritative && model.has_connection_watch {
+        return;
+    }
     let was_down = model.connection != ConnectionState::Connected;
     model.connection = ConnectionState::Connected;
     if !was_down {
@@ -284,7 +294,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::ConnectionChanged(up) => {
             if up {
-                mark_connected(model, &mut effects, true);
+                mark_connected(model, &mut effects, true, true);
             } else {
                 model.connection = ConnectionState::Reconnecting;
             }
@@ -295,17 +305,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 model.last_error = Some("daemon disconnected".to_owned());
             }
         }
-        Msg::TreeWatchOpened(res) => match res {
-            Ok(_) => {
-                mark_connected(model, &mut effects, false);
-            }
-            Err(err) => {
+        Msg::TreeWatchOpened(res) => {
+            if let Err(err) = res {
                 if is_transport_error(&err) {
                     mark_transport_drop(model);
                 }
                 model.last_error = Some(format!("sidebar watch: {err}"));
             }
-        },
+        }
         Msg::HoverSettled(key) => {
             if !matches!(model.focus, Pane::Composer | Pane::Overlay)
                 && (model.sidebar.hover.as_ref() == Some(&key) || model.sidebar.cursor == key)
@@ -320,7 +327,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             watch: WatchSlot::Tree,
             frame: Frame::Sidebar(snap),
         } => {
-            mark_connected(model, &mut effects, false);
+            mark_connected(model, &mut effects, false, false);
             let prev = model.sidebar.cursor.clone();
             model.sidebar_snapshot = *snap;
             model.sidebar.rebuild(&model.sidebar_snapshot);
@@ -332,7 +339,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             watch: WatchSlot::Stage,
             frame,
         } => {
-            mark_connected(model, &mut effects, true);
+            mark_connected(model, &mut effects, true, false);
             match frame {
                 Frame::StageFocused { generation, .. } => {
                     if generation >= model.active_generation {
@@ -355,7 +362,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Frame { .. } => {
-            mark_connected(model, &mut effects, true);
+            mark_connected(model, &mut effects, true, false);
         }
         Msg::WatchClosed { watch, error } => match watch {
             WatchSlot::Tree => {
@@ -1161,10 +1168,12 @@ fn handle_reply(
 ) {
     let was_down = model.connection != ConnectionState::Connected;
     if result.is_ok() {
-        model.connection = ConnectionState::Connected;
-        if was_down {
-            model.last_error = None;
-            effects.push(Effect::EnsureTreeWatch);
+        if !model.has_connection_watch {
+            model.connection = ConnectionState::Connected;
+            if was_down {
+                model.last_error = None;
+                effects.push(Effect::EnsureTreeWatch);
+            }
         }
     } else if let Err(err) = &result
         && is_transport_error(err)
@@ -1881,6 +1890,7 @@ async fn run_loop<C: Client + Clone + 'static>(
 
     let mut model = Model::new(client.me().clone(), initial_overview);
     if let Some(rx) = conn_rx.as_mut() {
+        model.has_connection_watch = true;
         model.connection = if *rx.borrow_and_update() {
             ConnectionState::Connected
         } else {
@@ -1912,11 +1922,13 @@ async fn run_loop<C: Client + Clone + 'static>(
     let mut tree_watch = match client.watch(Interest::Sidebar, Cursor::live()).await {
         Ok(s) => Some(s),
         Err(e) => {
-            model.connection = if is_transport_error(&e) {
-                ConnectionState::Reconnecting
-            } else {
-                ConnectionState::Disconnected
-            };
+            if !model.has_connection_watch {
+                model.connection = if is_transport_error(&e) {
+                    ConnectionState::Reconnecting
+                } else {
+                    ConnectionState::Disconnected
+                };
+            }
             model.last_error = Some(format!("sidebar watch: {e}"));
             None
         }

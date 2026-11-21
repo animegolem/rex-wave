@@ -1767,6 +1767,44 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
         Effect::Call { cmd: WireCommand::SetArchived(sa), .. }
             if !sa.archived && sa.target == rex_wave_api::ArchiveTarget::Wave { wave: done_wave.clone() }
     )));
+
+    let builder_key = NodeKey::Agent {
+        wave: active_wave.clone(),
+        role: RoleName::parse("builder").unwrap(),
+    };
+    model.sidebar.cursor = builder_key.clone();
+    overview.projects[0].waves[0].finished = Some(rex_wave_api::wave::WaveOutcome::Completed {
+        summary: Body::parse("finished while inspecting").unwrap(),
+    });
+    let finish_fx = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::new(overview.clone())),
+        },
+    );
+    assert_eq!(model.sidebar.cursor, builder_key);
+    assert!(
+        model
+            .sidebar
+            .folds
+            .is_expanded(&NodeKey::Room(active_room.clone()))
+    );
+    assert!(
+        !finish_fx
+            .iter()
+            .any(|e| matches!(e, Effect::DebounceHover(_)))
+    );
+
+    model.sidebar.cursor = NodeKey::Project(proj);
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::new(overview)),
+        },
+    );
+    assert!(model.sidebar.folds.is_expanded(&NodeKey::Room(active_room)));
 }
 
 #[tokio::test]
@@ -1775,6 +1813,7 @@ async fn watch_connection_drives_reconnecting_badge_and_recovers_stage_on_reconn
         seat: SeatName::parse("owner").unwrap(),
     };
     let mut model = Model::new(me, SidebarTreeSnapshot::default());
+    model.has_connection_watch = true;
     let (conn_tx, conn_rx) = tokio::sync::watch::channel(true);
     let mut conn_slot = Some(conn_rx);
 
@@ -1805,6 +1844,43 @@ async fn watch_connection_drives_reconnecting_badge_and_recovers_stage_on_reconn
         },
     );
     assert!(matches!(model.stage, Stage::Error { .. }));
+
+    let buffered_frame_fx = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Tree,
+            frame: Frame::Sidebar(Box::default()),
+        },
+    );
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Reconnecting
+    );
+    assert!(matches!(model.stage, Stage::Error { .. }));
+    assert!(
+        !buffered_frame_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(_)))
+    );
+
+    let buffered_reply_fx = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::Sidebar,
+            result: Ok(WireReply::Sidebar(SidebarTreeSnapshot::default())),
+        },
+    );
+    assert_eq!(
+        model.connection,
+        rex_wave_tui::ConnectionState::Reconnecting
+    );
+    assert!(matches!(model.stage, Stage::Error { .. }));
+    assert!(
+        !buffered_reply_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(_)))
+    );
+
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .unwrap();
     assert!(screen_text(&term).contains("○ reconnecting"));
