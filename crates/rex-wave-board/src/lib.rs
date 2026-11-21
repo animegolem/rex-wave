@@ -72,6 +72,7 @@ fn map_kanban_error(err: KanbanError) -> ApiError {
             what: "title".into(),
             reason: err.to_string(),
         }),
+        KanbanError::DuplicateOrgId(_) => ApiError::conflict(err.to_string()),
     }
 }
 

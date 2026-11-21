@@ -2716,7 +2716,8 @@ fn parked_room_and_since(
     w: &rex_wave_api::read::Wait,
 ) -> (Option<RoomId>, Seq) {
     match &w.interest {
-        Interest::Room { room } => match room.resolve(worker) {
+        Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
+        {
             Ok(id) => {
                 let since = w.after.at(&StreamId::Room { room: id.clone() });
                 (Some(id), since)

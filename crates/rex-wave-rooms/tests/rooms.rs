@@ -701,3 +701,83 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
     assert_eq!(woken.entries.len(), 1);
     assert_eq!(woken.entries[0].seq, dm_post.seq);
 }
+
+#[tokio::test]
+async fn stubbed_phase3_room_commands_do_not_panic_on_reused_idem_or_persist_unvalidated_tasks() {
+    let journal = Journal::in_memory().unwrap();
+    let router = build_harness(journal, Duration::from_secs(60));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let room = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("stubs").unwrap(),
+    };
+    let idem = IdemKey::parse("shared-k1").unwrap();
+
+    let first = sam
+        .call(RoomPost {
+            idem: Some(idem.clone()),
+            ..RoomPost::new(room.clone(), Body::parse("hello").unwrap())
+        })
+        .await
+        .unwrap();
+
+    let reused = sam
+        .call(RoomLabel {
+            room: room.clone(),
+            seq: first.seq,
+            add: vec![Label::parse("k=v").unwrap()],
+            remove: vec![],
+            idem: Some(idem),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reused,
+        ApiError::Unavailable {
+            family: Family::Room
+        }
+    );
+
+    let with_after = sam
+        .call(RoomPost {
+            after: Some(first.seq),
+            ..RoomPost::new(room.clone(), Body::parse("guarded").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        with_after,
+        ApiError::Unavailable {
+            family: Family::Room
+        }
+    );
+
+    let with_task = sam
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Unvalidated task").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("task body").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        with_task,
+        ApiError::Unavailable {
+            family: Family::Room
+        }
+    );
+
+    let second = sam
+        .call(RoomPost::new(
+            room,
+            Body::parse("actor still alive").unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.seq, first.seq.next());
+}

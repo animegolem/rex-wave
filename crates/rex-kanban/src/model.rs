@@ -750,6 +750,8 @@ pub enum KanbanError {
     },
     #[error("a new card needs a title")]
     MissingTitle,
+    #[error("org id `{0}` is already used by another card on this board")]
+    DuplicateOrgId(OrgId),
 }
 
 fn dedup_vec<T: PartialEq + Clone>(items: impl IntoIterator<Item = T>) -> Vec<T> {
@@ -866,17 +868,23 @@ impl BoardState {
                 if !cmd.patch.needs_remove.is_empty() {
                     needs.retain(|n| !cmd.patch.needs_remove.contains(n));
                 }
-                let org_id = Some(
-                    cmd.patch
-                        .org_id
-                        .clone()
-                        .unwrap_or_else(|| OrgId::for_board_card(&cmd.board, next_no)),
-                );
+                let org_id = cmd
+                    .patch
+                    .org_id
+                    .clone()
+                    .unwrap_or_else(|| OrgId::for_board_card(&cmd.board, next_no));
+                if self
+                    .cards
+                    .values()
+                    .any(|c| c.org_id.as_ref() == Some(&org_id))
+                {
+                    return Err(KanbanError::DuplicateOrgId(org_id));
+                }
 
                 let card = Card {
                     no: next_no,
                     revision: CardRevision(1),
-                    org_id,
+                    org_id: Some(org_id),
                     title,
                     lane: lane.clone(),
                     assignee,
@@ -922,6 +930,14 @@ impl BoardState {
                     && !self.lanes.contains(lane)
                 {
                     return Err(KanbanError::NoSuchLane(lane.clone()));
+                }
+                if let Some(org_id) = &cmd.patch.org_id
+                    && self
+                        .cards
+                        .iter()
+                        .any(|(&other_no, c)| other_no != no && c.org_id.as_ref() == Some(org_id))
+                {
+                    return Err(KanbanError::DuplicateOrgId(org_id.clone()));
                 }
                 if cmd.patch.is_noop() {
                     return Ok(Vec::new());

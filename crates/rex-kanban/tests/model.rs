@@ -459,4 +459,80 @@ fn org_id_validation_minting_and_legacy_card_json_replay() {
     let card: Card = serde_json::from_value(legacy_card_json).expect("legacy card JSON replays");
     assert_eq!(card.org_id, None);
     assert!(card.needs.is_empty());
+
+    let board = BoardId::parse("project:dup").unwrap();
+    let mut state = BoardState::open(board.clone(), Lane::default_board_lanes());
+    let shared_id = OrgId::parse("src-shared").unwrap();
+    let ev1 = state
+        .decide_upsert(&CardUpsert {
+            board: board.clone(),
+            card: None,
+            expected: None,
+            patch: CardPatch {
+                title: Some(Title::parse("First").unwrap()),
+                org_id: Some(shared_id.clone()),
+                ..Default::default()
+            },
+            idem: None,
+        })
+        .unwrap();
+    apply_all(&mut state, &ev1);
+
+    let dup_create = state
+        .decide_upsert(&CardUpsert {
+            board: board.clone(),
+            card: None,
+            expected: None,
+            patch: CardPatch {
+                title: Some(Title::parse("Second").unwrap()),
+                org_id: Some(shared_id.clone()),
+                ..Default::default()
+            },
+            idem: None,
+        })
+        .unwrap_err();
+    assert_eq!(dup_create, KanbanError::DuplicateOrgId(shared_id.clone()));
+
+    let ev2 = state
+        .decide_upsert(&CardUpsert {
+            board: board.clone(),
+            card: None,
+            expected: None,
+            patch: CardPatch {
+                title: Some(Title::parse("Second distinct").unwrap()),
+                ..Default::default()
+            },
+            idem: None,
+        })
+        .unwrap();
+    apply_all(&mut state, &ev2);
+
+    let dup_update = state
+        .decide_upsert(&CardUpsert {
+            board: board.clone(),
+            card: Some(CardNo(2)),
+            expected: None,
+            patch: CardPatch {
+                org_id: Some(shared_id.clone()),
+                ..Default::default()
+            },
+            idem: None,
+        })
+        .unwrap_err();
+    assert_eq!(dup_update, KanbanError::DuplicateOrgId(shared_id.clone()));
+
+    let self_update = state.decide_upsert(&CardUpsert {
+        board,
+        card: Some(CardNo(1)),
+        expected: None,
+        patch: CardPatch {
+            org_id: Some(shared_id),
+            ..Default::default()
+        },
+        idem: None,
+    });
+    assert!(
+        self_update.is_ok(),
+        "updating a card with its own org_id succeeds"
+    );
 }

@@ -8,8 +8,6 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-pub const CANONICAL_TODO_HEADER: &str = "#+TODO: IDEA TODO STRT WAIT BLKD | DONE CNCL";
-
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OrgError {
     #[error("malformed heading at line {line}: {reason}")]

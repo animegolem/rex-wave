@@ -644,7 +644,7 @@ impl Filter {
         };
         while after < upto {
             let Ok(page) = journal.read(stream, after, REPLAY_PAGE) else {
-                break;
+                return;
             };
             if page.is_empty() {
                 break;
@@ -652,7 +652,7 @@ impl Filter {
             for env in &page {
                 if env.seq > upto {
                     if let Filter::RoomFiltered { seeded_upto, .. } = self {
-                        *seeded_upto = upto;
+                        *seeded_upto = (*seeded_upto).max(upto);
                     }
                     return;
                 }
@@ -661,7 +661,7 @@ impl Filter {
             }
         }
         if let Filter::RoomFiltered { seeded_upto, .. } = self {
-            *seeded_upto = upto;
+            *seeded_upto = (*seeded_upto).max(upto);
         }
     }
 
@@ -673,6 +673,7 @@ impl Filter {
                     re,
                     thread_members,
                     current_labels,
+                    seeded_upto,
                     ..
                 },
                 env_stream,
@@ -682,6 +683,7 @@ impl Filter {
                     ..
                 }),
             ) if env_stream == stream => {
+                *seeded_upto = (*seeded_upto).max(env.seq);
                 if let Some(root) = *re
                     && let Some(parent) = post_re
                     && (*parent == root || thread_members.contains(parent))
@@ -694,12 +696,25 @@ impl Filter {
                 Filter::RoomFiltered {
                     stream,
                     current_labels,
+                    seeded_upto,
                     ..
                 },
                 env_stream,
                 Event::Room(RoomEvent::Labeled { target, after, .. }),
             ) if env_stream == stream => {
+                *seeded_upto = (*seeded_upto).max(env.seq);
                 current_labels.insert(*target, after.clone());
+            }
+            (
+                Filter::RoomFiltered {
+                    stream,
+                    seeded_upto,
+                    ..
+                },
+                env_stream,
+                _,
+            ) if env_stream == stream => {
+                *seeded_upto = (*seeded_upto).max(env.seq);
             }
             (
                 Filter::Project { project, waves, .. },

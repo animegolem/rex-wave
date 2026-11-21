@@ -353,10 +353,6 @@ impl Decider for Rooms {
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
         match cmd {
             RoomCommand::RoomPost(c) => c.idem.clone(),
-            RoomCommand::RoomLabel(c) => c.idem.clone(),
-            RoomCommand::TaskClaim(c) => c.idem.clone(),
-            RoomCommand::TaskTransition(c) => c.idem.clone(),
-            RoomCommand::TaskUpdate(c) => c.idem.clone(),
             _ => None,
         }
     }
@@ -532,6 +528,11 @@ impl Decider for Rooms {
             }
 
             RoomCommand::RoomPost(c) => {
+                if c.after.is_some() || c.task.is_some() {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Room,
+                    });
+                }
                 let id = c.room.resolve(&ctx.by)?;
                 if let Some(reply_seq) = c.re
                     && !state.posts.contains(&reply_seq)
