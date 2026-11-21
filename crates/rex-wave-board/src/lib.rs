@@ -1,4 +1,14 @@
-//! Kanban and Org-todo [`Decider`] backed by standalone `rex-kanban`.
+//! Kanban and Org-todo [`Decider`] backed by standalone `rex-kanban`, plus the
+//! two-way task-thread `.org` reconciler in [`task_org`].
+
+pub mod task_org;
+
+pub use task_org::{
+    BaselineTask, CANONICAL_TODO_HEADER, OrgConflictKind, OrgSyncConflict, OrgSyncError,
+    OrgSyncOptions, OrgSyncState, OrgToRoomOutcome, RoomToOrgOutcome, conflict_sidecar_path,
+    emacs_lock_path, has_emacs_lock, is_emacs_lock_or_autosave, project_tasks_into_document,
+    sync_org_to_room, sync_room_to_org,
+};
 
 use rex_kanban::{KanbanError, Lane};
 use rex_wave_api::board::*;
