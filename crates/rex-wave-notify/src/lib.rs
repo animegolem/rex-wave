@@ -8,9 +8,195 @@ use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, LocalClient, Reactor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 
 const DECAY_STEP_MS: u64 = 60_000;
 const MAX_DECAY: u16 = 900;
+
+/// Reconnect grace window (`15 s`) before raising `MailUnrung` after a
+/// reconnectable seat binding drops (`0 s` when the seat was never bound).
+pub const RECONNECT_GRACE_MS: u64 = 15_000;
+
+/// Stable lowercase transport slug used in `TransportDown` cards and dedupe keys.
+pub fn transport_kind_slug(kind: presence::TransportKind) -> &'static str {
+    match kind {
+        presence::TransportKind::UdsSession => "uds_session",
+        presence::TransportKind::ClaudeSession => "claude_session",
+        presence::TransportKind::BbThread => "bb_thread",
+        presence::TransportKind::T3Thread => "t3_thread",
+        presence::TransportKind::SelfWatcher => "self_watcher",
+        presence::TransportKind::OperatorToast => "operator_toast",
+    }
+}
+
+/// Returns `true` when `binding` uses a reconnectable socket or bridge transport
+/// that qualifies for the [`RECONNECT_GRACE_MS`] grace window after a drop.
+pub fn is_reconnectable_binding(binding: &presence::SeatBinding) -> bool {
+    matches!(binding.liveness, presence::LivenessMode::SocketLifetime)
+        || matches!(
+            binding.endpoint,
+            presence::TransportEndpoint::UdsSession { .. }
+                | presence::TransportEndpoint::BbThread { .. }
+                | presence::TransportEndpoint::T3Thread { .. }
+        )
+}
+
+fn unix_secs_to_iso8601_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Builds the single per-seat informational `MailUnrung` Operator status card.
+/// Phrased strictly as a status notice with zero decision prompts or buttons.
+pub fn mail_unrung_draft(
+    seat: &SeatName,
+    unread_count: u32,
+    oldest_at: UnixMs,
+) -> NotificationDraft {
+    let dedupe = format!("mail-unrung:{seat}");
+    if unread_count == 0 {
+        return mail_unrung_resolved_draft(seat);
+    }
+    let noun = if unread_count == 1 {
+        "letter"
+    } else {
+        "letters"
+    };
+    let oldest_iso = unix_secs_to_iso8601_utc(oldest_at.0 / 1_000);
+    NotificationDraft {
+        kind: NotifyKind::MailUnrung {
+            seat: seat.clone(),
+            unread_count,
+            oldest_at,
+        },
+        title: format!("@{seat} has {unread_count} unrung {noun}"),
+        preview: format!(
+            "Banked with no live binding for @{seat}; will ring on rebind (oldest banked at {oldest_iso})."
+        ),
+        actions: Vec::new(),
+        dedupe,
+    }
+}
+
+/// Builds the resolution draft that auto-marks an existing `mail-unrung:<seat>`
+/// card `Done` once the seat rebinds and ACKs pending digests (or becomes non-Active).
+pub fn mail_unrung_resolved_draft(seat: &SeatName) -> NotificationDraft {
+    NotificationDraft {
+        kind: NotifyKind::MailUnrung {
+            seat: seat.clone(),
+            unread_count: 0,
+            oldest_at: UnixMs(0),
+        },
+        title: format!("@{seat} unrung mail cleared"),
+        preview: format!("Pending mail for @{seat} has been acknowledged."),
+        actions: Vec::new(),
+        dedupe: format!("mail-unrung:{seat}"),
+    }
+}
+
+/// Builds the deduped informational `TransportDown` Operator status card.
+pub fn transport_down_draft(
+    transport: presence::TransportKind,
+    detail: Option<&str>,
+) -> NotificationDraft {
+    let slug = transport_kind_slug(transport);
+    let trimmed = detail
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("provider health check failed");
+    NotificationDraft {
+        kind: NotifyKind::TransportDown {
+            transport: slug.to_owned(),
+            detail: trimmed.to_owned(),
+        },
+        title: format!("Transport {slug} offline"),
+        preview: format!(
+            "Status notice: {slug} bindings are paused until recovery ({}).",
+            snippet(trimmed, 120)
+        ),
+        actions: Vec::new(),
+        dedupe: format!("transport-down:{slug}"),
+    }
+}
+
+/// Builds the recovery draft that auto-marks an existing `transport-down:<kind>` card `Done`.
+pub fn transport_recovered_draft(transport: presence::TransportKind) -> NotificationDraft {
+    let slug = transport_kind_slug(transport);
+    NotificationDraft {
+        kind: NotifyKind::TransportDown {
+            transport: slug.to_owned(),
+            detail: String::new(),
+        },
+        title: format!("Transport {slug} recovered"),
+        preview: format!("Status notice: {slug} transport health is restored."),
+        actions: Vec::new(),
+        dedupe: format!("transport-down:{slug}"),
+    }
+}
+
+/// Builds a deduped informational `OrgConflict` Operator status card.
+pub fn org_conflict_draft(
+    path: impl Into<String>,
+    org_id: OrgId,
+    detail: impl Into<String>,
+) -> NotificationDraft {
+    let path = path.into();
+    let raw_detail = detail.into();
+    let trimmed = raw_detail.trim();
+    let effective_detail = if trimmed.is_empty() {
+        "stale :REX_REV: revision during two-way .org sync".to_owned()
+    } else {
+        trimmed.to_owned()
+    };
+    let dedupe = format!("org-conflict:{path}:{org_id}");
+    NotificationDraft {
+        kind: NotifyKind::OrgConflict {
+            path: path.clone(),
+            org_id: org_id.clone(),
+            detail: effective_detail.clone(),
+        },
+        title: format!("Org revision conflict on {org_id}"),
+        preview: format!(
+            "Status notice: write-back deferred for {path} ({}).",
+            snippet(&effective_detail, 120)
+        ),
+        actions: Vec::new(),
+        dedupe,
+    }
+}
+
+/// Builds the resolution draft that auto-marks an existing `org-conflict:<path>:<org_id>` card `Done`.
+pub fn org_conflict_resolved_draft(path: impl Into<String>, org_id: OrgId) -> NotificationDraft {
+    let path = path.into();
+    let dedupe = format!("org-conflict:{path}:{org_id}");
+    NotificationDraft {
+        kind: NotifyKind::OrgConflict {
+            path: path.clone(),
+            org_id: org_id.clone(),
+            detail: String::new(),
+        },
+        title: format!("Org revision conflict cleared on {org_id}"),
+        preview: format!("Status notice: {path} reconciled cleanly."),
+        actions: Vec::new(),
+        dedupe,
+    }
+}
 
 fn snippet(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
@@ -145,6 +331,35 @@ pub fn rank(kind: &NotifyKind, age_ms: u64) -> Rank {
     Rank(base.saturating_sub(decay))
 }
 
+#[derive(Clone, Debug)]
+struct PendingLetter {
+    path: PathBuf,
+    at: UnixMs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DropRecord {
+    dropped_at: UnixMs,
+    reconnectable: bool,
+}
+
+/// Pure verdict for whether an Operator `MailUnrung` card should be raised,
+/// held inside the 15 s reconnect grace window, suppressed, or auto-resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MailUnrungEval {
+    Suppress,
+    WithinGrace {
+        ready_at: UnixMs,
+        unread_count: u32,
+        oldest_at: UnixMs,
+    },
+    Raise {
+        unread_count: u32,
+        oldest_at: UnixMs,
+    },
+    Resolve,
+}
+
 #[derive(Default)]
 pub struct HeraldView {
     members: BTreeMap<room::RoomId, BTreeSet<Principal>>,
@@ -154,12 +369,38 @@ pub struct HeraldView {
     resident_seats: BTreeSet<SeatName>,
     blocked: BTreeMap<(WaveSlug, RoleName), (BbInteractionId, String)>,
     cleared_interactions: Vec<(WaveSlug, RoleName, BbInteractionId, String)>,
+    seat_status: BTreeMap<SeatName, presence::SeatStatus>,
+    live_bindings: BTreeMap<SeatName, BTreeMap<IncarnationId, presence::SeatBinding>>,
+    ever_bound: BTreeSet<SeatName>,
+    last_drop: BTreeMap<SeatName, DropRecord>,
+    down_transports: BTreeSet<presence::TransportKind>,
+    pending_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
+    unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
+    acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
+    raised_mail_unrung: BTreeSet<SeatName>,
+    mail_unrung_emits: Vec<(SeatName, u32, UnixMs)>,
+    transport_emits: Vec<(presence::TransportKind, bool, Option<String>)>,
+}
+
+fn box_seat_from_path(path: &std::path::Path) -> Option<SeatName> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_start_matches("interchange/");
+    let first = trimmed.split('/').next()?;
+    let seat_raw = first.strip_prefix("to-")?;
+    SeatName::parse(seat_raw).ok()
 }
 
 impl HeraldView {
     pub fn observe(&mut self, entry: &Envelope) {
         self.cleared_interactions.clear();
+        self.mail_unrung_emits.clear();
+        self.transport_emits.clear();
         self.record_principal(&entry.by);
+
+        let mut check_seats: BTreeSet<SeatName> = BTreeSet::new();
 
         match (&entry.stream, &entry.event) {
             (StreamId::Room { room }, Event::Room(ev)) => {
@@ -278,8 +519,368 @@ impl HeraldView {
                 }
                 wave::WaveEvent::WorkerRequested { .. } | wave::WaveEvent::Told { .. } => {}
             },
+            (StreamId::Presence, Event::Presence(ev)) => match ev {
+                presence::PresenceEvent::SeatClaimed { record } => {
+                    self.seat_status.insert(record.seat.clone(), record.status);
+                    check_seats.insert(record.seat.clone());
+                }
+                presence::PresenceEvent::SeatStatusSet { seat, status, .. } => {
+                    self.seat_status.insert(seat.clone(), *status);
+                    check_seats.insert(seat.clone());
+                }
+                presence::PresenceEvent::Bound {
+                    binding,
+                    superseded,
+                } => {
+                    let seat = binding.seat.clone();
+                    let seat_bindings = self.live_bindings.entry(seat.clone()).or_default();
+                    for old_id in superseded {
+                        seat_bindings.remove(old_id);
+                    }
+                    self.ever_bound.insert(seat.clone());
+                    if binding.status == presence::BindingStatus::Live
+                        && !self.down_transports.contains(&binding.endpoint.kind())
+                    {
+                        seat_bindings.insert(binding.incarnation_id.clone(), binding.clone());
+                        self.last_drop.remove(&seat);
+                    } else {
+                        seat_bindings.remove(&binding.incarnation_id);
+                    }
+                    check_seats.insert(seat);
+                }
+                presence::PresenceEvent::Heartbeated {
+                    seat,
+                    incarnation_id,
+                    expires_at,
+                } => {
+                    if let Some(binding) = self
+                        .live_bindings
+                        .get_mut(seat)
+                        .and_then(|m| m.get_mut(incarnation_id))
+                    {
+                        binding.expires_at = *expires_at;
+                    }
+                }
+                presence::PresenceEvent::Unbound {
+                    seat,
+                    incarnation_id,
+                    status,
+                    ..
+                } => {
+                    let dropped = self
+                        .live_bindings
+                        .get_mut(seat)
+                        .and_then(|m| m.remove(incarnation_id));
+                    let reconnectable = dropped.as_ref().is_some_and(|b| {
+                        *status == presence::BindingStatus::Unbound && is_reconnectable_binding(b)
+                    });
+                    if !self.has_live_binding(seat) {
+                        self.last_drop.insert(
+                            seat.clone(),
+                            DropRecord {
+                                dropped_at: entry.at,
+                                reconnectable,
+                            },
+                        );
+                        if let Some(pending) = self.pending_mail.get(seat) {
+                            let unrung = self.unrung_mail.entry(seat.clone()).or_default();
+                            for (sha, letter) in pending {
+                                unrung.entry(sha.clone()).or_insert_with(|| letter.clone());
+                            }
+                        }
+                    }
+                    check_seats.insert(seat.clone());
+                }
+                presence::PresenceEvent::TransportHealthChanged {
+                    transport,
+                    down,
+                    detail,
+                } => {
+                    if *down {
+                        self.down_transports.insert(*transport);
+                    } else {
+                        self.down_transports.remove(transport);
+                    }
+                    self.transport_emits
+                        .push((*transport, *down, detail.clone()));
+                }
+            },
+            (StreamId::Mail, Event::Mail(ev)) => match ev {
+                mail::MailEvent::Banked { letter, .. } => {
+                    if let Ok(seat) = SeatName::parse(&letter.item.to) {
+                        self.record_incoming_mail(
+                            seat.clone(),
+                            letter.sha256.clone(),
+                            letter.path.clone(),
+                            entry.at,
+                        );
+                        check_seats.insert(seat);
+                    }
+                }
+                mail::MailEvent::Projected { item } => {
+                    if item.state != "acked"
+                        && let Ok(seat) = SeatName::parse(&item.to)
+                    {
+                        self.record_incoming_mail(
+                            seat.clone(),
+                            item.reference.sha256.clone(),
+                            item.reference.path.clone(),
+                            entry.at,
+                        );
+                        check_seats.insert(seat);
+                    }
+                }
+                mail::MailEvent::Acked { path, sha256 } => {
+                    let seats_to_ack = self.seats_for_ack(&entry.by, path, sha256);
+                    for seat in seats_to_ack {
+                        self.acked_mail.insert((seat.clone(), sha256.clone()));
+                        if let Some(map) = self.pending_mail.get_mut(&seat) {
+                            map.remove(sha256);
+                        }
+                        if let Some(map) = self.unrung_mail.get_mut(&seat) {
+                            map.remove(sha256);
+                        }
+                        check_seats.insert(seat);
+                    }
+                }
+                mail::MailEvent::BellRang { .. } => {}
+            },
             _ => {}
         }
+
+        // Also sweep any seats waiting on reconnect grace whose deadline has now elapsed.
+        for seat in self.unrung_mail.keys() {
+            check_seats.insert(seat.clone());
+        }
+        for seat in &self.raised_mail_unrung {
+            check_seats.insert(seat.clone());
+        }
+
+        for seat in check_seats {
+            match self.evaluate_mail_unrung_with_grace(&seat, entry.at, RECONNECT_GRACE_MS) {
+                MailUnrungEval::Raise {
+                    unread_count,
+                    oldest_at,
+                } => {
+                    self.raised_mail_unrung.insert(seat.clone());
+                    self.mail_unrung_emits.push((seat, unread_count, oldest_at));
+                }
+                MailUnrungEval::Resolve => {
+                    self.raised_mail_unrung.remove(&seat);
+                    self.mail_unrung_emits.push((seat, 0, UnixMs(0)));
+                }
+                MailUnrungEval::Suppress | MailUnrungEval::WithinGrace { .. } => {}
+            }
+        }
+    }
+
+    fn record_incoming_mail(
+        &mut self,
+        seat: SeatName,
+        sha256: Sha256Hex,
+        path: PathBuf,
+        at: UnixMs,
+    ) {
+        if self.acked_mail.contains(&(seat.clone(), sha256.clone())) {
+            return;
+        }
+        let letter = PendingLetter { path, at };
+        self.pending_mail
+            .entry(seat.clone())
+            .or_default()
+            .entry(sha256.clone())
+            .or_insert_with(|| letter.clone());
+        if !self.has_live_binding(&seat) {
+            self.unrung_mail
+                .entry(seat)
+                .or_default()
+                .entry(sha256)
+                .or_insert(letter);
+        }
+    }
+
+    fn seats_for_ack(
+        &self,
+        by: &Principal,
+        path: &std::path::Path,
+        sha256: &Sha256Hex,
+    ) -> Vec<SeatName> {
+        if let Some(box_seat) = box_seat_from_path(path) {
+            return vec![box_seat];
+        }
+        match by {
+            Principal::Seat { seat } | Principal::Operator { seat } => vec![seat.clone()],
+            Principal::System { .. } | Principal::Worker { .. } => self
+                .pending_mail
+                .iter()
+                .filter(|(_, map)| {
+                    map.get(sha256)
+                        .is_some_and(|pending| pending.path == path || map.contains_key(sha256))
+                })
+                .map(|(seat, _)| seat.clone())
+                .collect(),
+        }
+    }
+
+    fn is_operator_seat(&self, seat: &SeatName) -> bool {
+        self.operator_seats.contains(seat)
+            || (self.operator_seats.is_empty() && seat.as_str() == "owner")
+    }
+
+    fn has_live_binding(&self, seat: &SeatName) -> bool {
+        self.live_bindings.get(seat).is_some_and(|m| {
+            m.values().any(|b| {
+                b.status == presence::BindingStatus::Live
+                    && !self.down_transports.contains(&b.endpoint.kind())
+            })
+        })
+    }
+
+    /// Evaluates whether `seat` should raise, hold in reconnect grace, suppress,
+    /// or resolve a `MailUnrung` Operator card at `now` using [`RECONNECT_GRACE_MS`].
+    pub fn evaluate_mail_unrung(&self, seat: &SeatName, now: UnixMs) -> MailUnrungEval {
+        self.evaluate_mail_unrung_with_grace(seat, now, RECONNECT_GRACE_MS)
+    }
+
+    /// Evaluates `MailUnrung` policy for `seat` at `now` with an explicit grace duration.
+    pub fn evaluate_mail_unrung_with_grace(
+        &self,
+        seat: &SeatName,
+        now: UnixMs,
+        grace_ms: u64,
+    ) -> MailUnrungEval {
+        if self.is_operator_seat(seat) {
+            return MailUnrungEval::Suppress;
+        }
+        let status = self
+            .seat_status
+            .get(seat)
+            .copied()
+            .unwrap_or(presence::SeatStatus::Active);
+        if matches!(
+            status,
+            presence::SeatStatus::Dormant | presence::SeatStatus::Retired
+        ) {
+            return if self.raised_mail_unrung.contains(seat) {
+                MailUnrungEval::Resolve
+            } else {
+                MailUnrungEval::Suppress
+            };
+        }
+
+        let Some(unrung) = self.unrung_mail.get(seat).filter(|m| !m.is_empty()) else {
+            return if self.raised_mail_unrung.contains(seat) {
+                MailUnrungEval::Resolve
+            } else {
+                MailUnrungEval::Suppress
+            };
+        };
+
+        let unread_count = unrung.len() as u32;
+        let oldest_at = unrung.values().map(|l| l.at).min().unwrap_or(now);
+
+        if self.has_live_binding(seat) {
+            // Rebinding alone does not clear an already-raised card until pending
+            // digests are ACKed; a fast reconnect before any card was raised
+            // suppresses alerting cleanly.
+            return if self.raised_mail_unrung.contains(seat) {
+                MailUnrungEval::Raise {
+                    unread_count,
+                    oldest_at,
+                }
+            } else {
+                MailUnrungEval::Suppress
+            };
+        }
+
+        if !self.ever_bound.contains(seat) {
+            return MailUnrungEval::Raise {
+                unread_count,
+                oldest_at,
+            };
+        }
+
+        if let Some(drop_rec) = self.last_drop.get(seat)
+            && drop_rec.reconnectable
+        {
+            let ready_at = UnixMs(drop_rec.dropped_at.0.saturating_add(grace_ms));
+            if now < ready_at {
+                return MailUnrungEval::WithinGrace {
+                    ready_at,
+                    unread_count,
+                    oldest_at,
+                };
+            }
+        }
+
+        MailUnrungEval::Raise {
+            unread_count,
+            oldest_at,
+        }
+    }
+
+    /// Returns the earliest reconnect-grace expiry timestamp across all seats
+    /// currently held inside the 15 s grace window.
+    pub fn next_grace_deadline(&self, now: UnixMs) -> Option<UnixMs> {
+        let mut earliest: Option<UnixMs> = None;
+        for seat in self.unrung_mail.keys() {
+            if let MailUnrungEval::WithinGrace { ready_at, .. } =
+                self.evaluate_mail_unrung(seat, now)
+            {
+                earliest = Some(match earliest {
+                    Some(prev) => prev.min(ready_at),
+                    None => ready_at,
+                });
+            }
+        }
+        earliest
+    }
+
+    /// Flushes any `MailUnrung` alerts whose 15 s reconnect grace window has
+    /// expired by `now`, returning `(operator, draft)` pairs ready for `InboxRaise`.
+    pub fn due_mail_unrung(&mut self, now: UnixMs) -> Vec<(Principal, NotificationDraft)> {
+        let seats: Vec<SeatName> = self
+            .unrung_mail
+            .keys()
+            .chain(self.raised_mail_unrung.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let operators = self.all_operators();
+        let mut out = Vec::new();
+        for seat in seats {
+            match self.evaluate_mail_unrung(&seat, now) {
+                MailUnrungEval::Raise {
+                    unread_count,
+                    oldest_at,
+                } => {
+                    self.raised_mail_unrung.insert(seat.clone());
+                    let draft = mail_unrung_draft(&seat, unread_count, oldest_at);
+                    for op in &operators {
+                        out.push((op.clone(), draft.clone()));
+                    }
+                }
+                MailUnrungEval::Resolve => {
+                    self.raised_mail_unrung.remove(&seat);
+                    let draft = mail_unrung_resolved_draft(&seat);
+                    for op in &operators {
+                        out.push((op.clone(), draft.clone()));
+                    }
+                }
+                MailUnrungEval::Suppress | MailUnrungEval::WithinGrace { .. } => {}
+            }
+        }
+        out
+    }
+
+    fn all_operators(&self) -> Vec<Principal> {
+        if !self.operators.is_empty() {
+            return self.operators.iter().cloned().collect();
+        }
+        vec![Principal::Operator {
+            seat: SeatName::parse("owner").expect("default operator seat is valid"),
+        }]
     }
 
     fn record_principal(&mut self, p: &Principal) {
@@ -303,12 +904,7 @@ impl HeraldView {
         if let Some(owner) = self.wave_owners.get(wave) {
             return vec![owner.clone()];
         }
-        if !self.operators.is_empty() {
-            return self.operators.iter().cloned().collect();
-        }
-        vec![Principal::Operator {
-            seat: SeatName::parse("owner").expect("default operator seat is valid"),
-        }]
+        self.all_operators()
     }
 
     fn principals_for_seat(&self, seat: &SeatName) -> Vec<Principal> {
@@ -360,6 +956,28 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     dedupe: format!("interaction:{wave}:{role}:{interaction_id}"),
                 },
             ));
+        }
+    }
+
+    for (transport, down, detail) in &view.transport_emits {
+        let draft = if *down {
+            transport_down_draft(*transport, detail.as_deref())
+        } else {
+            transport_recovered_draft(*transport)
+        };
+        for op in view.all_operators() {
+            out.push((op, draft.clone()));
+        }
+    }
+
+    for (seat, unread_count, oldest_at) in &view.mail_unrung_emits {
+        let draft = if *unread_count == 0 {
+            mail_unrung_resolved_draft(seat)
+        } else {
+            mail_unrung_draft(seat, *unread_count, *oldest_at)
+        };
+        for op in view.all_operators() {
+            out.push((op, draft.clone()));
         }
     }
 
@@ -763,6 +1381,24 @@ impl Decider for Inbox {
                 let is_resolved_interaction =
                     matches!(c.draft.kind, NotifyKind::Interaction { .. })
                         && c.draft.actions.is_empty();
+                let is_resolved_status = matches!(
+                    &c.draft.kind,
+                    NotifyKind::MailUnrung {
+                        unread_count: 0,
+                        ..
+                    }
+                ) || matches!(
+                    &c.draft.kind,
+                    NotifyKind::TransportDown { detail, .. }
+                        | NotifyKind::OrgConflict { detail, .. }
+                        if detail.is_empty()
+                );
+                let is_resolvable_status_kind = matches!(
+                    c.draft.kind,
+                    NotifyKind::MailUnrung { .. }
+                        | NotifyKind::TransportDown { .. }
+                        | NotifyKind::OrgConflict { .. }
+                );
                 let fresh_rank = rank(&c.draft.kind, 0);
                 if let Some(&existing_id) = state.by_dedupe.get(&c.draft.dedupe)
                     && let Some(existing) = state.items.get(&existing_id)
@@ -793,6 +1429,72 @@ impl Decider for Inbox {
                     {
                         return Ok(vec![]);
                     }
+                    if is_resolved_status {
+                        if matches!(existing.state, NotifyState::Done | NotifyState::Dismissed)
+                            && drafts_equal(&existing.draft, &c.draft)
+                        {
+                            return Ok(vec![]);
+                        }
+                        let mut events = Vec::new();
+                        if !drafts_equal(&existing.draft, &c.draft) {
+                            events.push(InboxEvent::Updated {
+                                id: existing_id,
+                                rank: fresh_rank,
+                                draft: c.draft.clone(),
+                            });
+                        }
+                        if existing.state != NotifyState::Done {
+                            events.push(InboxEvent::StateSet {
+                                ids: vec![existing_id],
+                                state: NotifyState::Done,
+                            });
+                        }
+                        return Ok(events);
+                    }
+                    if is_resolvable_status_kind {
+                        if drafts_equal(&existing.draft, &c.draft) {
+                            return Ok(vec![]);
+                        }
+                        let should_reopen = match existing.state {
+                            NotifyState::Done => true,
+                            NotifyState::Dismissed => match (&existing.draft.kind, &c.draft.kind) {
+                                (
+                                    NotifyKind::MailUnrung {
+                                        unread_count: prev_n,
+                                        oldest_at: prev_at,
+                                        ..
+                                    },
+                                    NotifyKind::MailUnrung {
+                                        unread_count: new_n,
+                                        oldest_at: new_at,
+                                        ..
+                                    },
+                                ) => new_n > prev_n || new_at > prev_at,
+                                (
+                                    NotifyKind::TransportDown { detail: prev_d, .. },
+                                    NotifyKind::TransportDown { detail: new_d, .. },
+                                )
+                                | (
+                                    NotifyKind::OrgConflict { detail: prev_d, .. },
+                                    NotifyKind::OrgConflict { detail: new_d, .. },
+                                ) => prev_d != new_d,
+                                _ => false,
+                            },
+                            NotifyState::Unread | NotifyState::Seen => false,
+                        };
+                        let mut events = vec![InboxEvent::Updated {
+                            id: existing_id,
+                            rank: fresh_rank,
+                            draft: c.draft.clone(),
+                        }];
+                        if should_reopen {
+                            events.push(InboxEvent::StateSet {
+                                ids: vec![existing_id],
+                                state: NotifyState::Unread,
+                            });
+                        }
+                        return Ok(events);
+                    }
                     let mut events = Vec::new();
                     if !drafts_equal(&existing.draft, &c.draft) {
                         events.push(InboxEvent::Updated {
@@ -809,7 +1511,7 @@ impl Decider for Inbox {
                     }
                     return Ok(events);
                 }
-                if is_resolved_interaction {
+                if is_resolved_interaction || is_resolved_status {
                     return Ok(vec![]);
                 }
                 if let NotifyKind::WorkerStuck { seq: new_seq, .. } = &c.draft.kind {
@@ -947,7 +1649,14 @@ impl Decider for Inbox {
                     .items
                     .get(id)
                     .map_or((NotifyState::Unread, meta.at), |n| (n.state, n.at));
-                let next_at = if matches!(draft.kind, NotifyKind::WorkerStuck { .. }) {
+                let next_at = if matches!(draft.kind, NotifyKind::WorkerStuck { .. })
+                    || (matches!(
+                        draft.kind,
+                        NotifyKind::MailUnrung { .. }
+                            | NotifyKind::TransportDown { .. }
+                            | NotifyKind::OrgConflict { .. }
+                    ) && matches!(prev_state, NotifyState::Done | NotifyState::Dismissed))
+                {
                     meta.at
                 } else {
                     prev_at
@@ -1101,6 +1810,27 @@ impl Herald {
             caught_up: false,
             replay: std::sync::Arc::new(std::sync::Mutex::new(ReplayBuffer::default())),
         }
+    }
+
+    /// Evaluates pending `MailUnrung` reconnect grace windows at `now` and raises
+    /// any newly due informational cards through `client`.
+    pub fn flush_due_at(
+        &mut self,
+        now: UnixMs,
+        client: &LocalClient,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        let raises = self.view.due_mail_unrung(now);
+        let client = client.clone();
+        async move {
+            for (to, draft) in raises {
+                client.call(InboxRaise { to, draft }).await?;
+            }
+            Ok(())
+        }
+    }
+
+    pub fn next_grace_deadline(&self, now: UnixMs) -> Option<UnixMs> {
+        self.view.next_grace_deadline(now)
     }
 }
 
