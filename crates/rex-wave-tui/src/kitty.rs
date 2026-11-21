@@ -593,7 +593,13 @@ pub fn program_status(sidebar: &SidebarTreeSnapshot) -> Osc7501 {
         Osc7501BlockKind::Auth => BlockKind::Auth,
     });
 
-    let primary_wave = sidebar.projects.iter().flat_map(|p| p.waves.iter()).next();
+    let primary_wave = sidebar
+        .projects
+        .iter()
+        .filter(|p| !p.archived)
+        .flat_map(|p| p.waves.iter())
+        .find(|w| !w.archived && w.finished.is_none())
+        .or_else(|| sidebar.projects.iter().flat_map(|p| p.waves.iter()).next());
     let (id, title) = match primary_wave {
         Some(w) => (format!("wave-{}", w.wave), format!("#wave-{}", w.wave)),
         None => ("rex-wave".to_owned(), "rex-wave".to_owned()),

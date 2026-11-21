@@ -57,6 +57,8 @@ pub enum Action {
     ToggleFold(NodeKey),
     /// Org-mode style global visibility cycle of the sidebar tree.
     CycleFoldAll,
+    ToggleArchive(NodeKey),
+    ToggleShowArchived,
     Activate(NodeKey),
     Hover(NodeKey),
     FocusPane(Pane),
@@ -350,6 +352,24 @@ pub static KEYMAP: &[Binding] = &[
         "Sidebar",
         "open node on stage",
         |k| Action::Activate(k.clone()),
+    ),
+    bind(
+        Char('z'),
+        N,
+        SIDEBAR,
+        "z",
+        "Sidebar",
+        "archive / unarchive node",
+        |k| Action::ToggleArchive(k.clone()),
+    ),
+    bind(
+        Char('A'),
+        N,
+        NAV,
+        "A",
+        "Sidebar",
+        "show / hide archived",
+        |_| Action::ToggleShowArchived,
     ),
     // Stage
     bind(
@@ -1007,6 +1027,33 @@ mod tests {
             .find(|r| r.group == "Sidebar" && r.help == "next node")
             .unwrap();
         assert_eq!(sidebar_next.keys, "j / ↓");
+        assert!(rows.iter().any(|r| r.group == "Sidebar"
+            && r.keys == "z"
+            && r.help == "archive / unarchive node"));
+        assert!(
+            rows.iter()
+                .any(|r| r.group == "Sidebar" && r.keys == "A" && r.help == "show / hide archived")
+        );
+    }
+
+    #[test]
+    fn archive_and_show_archived_keys_are_pane_scoped() {
+        assert_eq!(
+            act(Char('z'), N, Pane::Sidebar),
+            Some(Action::ToggleArchive(NodeKey::Inbox))
+        );
+        assert_eq!(act(Char('z'), N, Pane::Stage), None);
+        assert_eq!(act(Char('z'), N, Pane::Overlay), None);
+        assert_eq!(act(Char('z'), N, Pane::Composer), Some(Action::Input('z')));
+        assert_eq!(
+            act(Char('A'), S, Pane::Sidebar),
+            Some(Action::ToggleShowArchived)
+        );
+        assert_eq!(
+            act(Char('A'), N, Pane::Stage),
+            Some(Action::ToggleShowArchived)
+        );
+        assert_eq!(act(Char('A'), S, Pane::Overlay), None);
     }
 
     #[test]

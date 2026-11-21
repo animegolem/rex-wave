@@ -70,6 +70,14 @@ pub enum ComposerTarget {
     NewTask { board: BoardId, lane: LaneName },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConnectionState {
+    #[default]
+    Connected,
+    Reconnecting,
+    Disconnected,
+}
+
 /// Debug-printable wrapper around a live `FrameStream` returned from an async stage open.
 pub struct OpenedWatch(pub FrameStream);
 
@@ -97,7 +105,7 @@ pub struct Model {
     pub sidebar_hidden: bool,
     resizing_sidebar: bool,
     pub active_project: Option<BbProjectId>,
-    pub connected: bool,
+    pub connection: ConnectionState,
     pub term_cols: u16,
     pub term_rows: u16,
     pub last_error: Option<String>,
@@ -128,7 +136,7 @@ impl Model {
             sidebar_hidden: false,
             resizing_sidebar: false,
             active_project,
-            connected: true,
+            connection: ConnectionState::Connected,
             term_cols: 124,
             term_rows: 34,
             last_error: None,
@@ -140,6 +148,9 @@ impl Model {
 #[derive(Debug)]
 pub enum Msg {
     Action(Action),
+    ConnectionChanged(bool),
+    ConnectionClosed,
+    TreeWatchOpened(Result<OpenedWatch, ApiError>),
     Frame {
         watch: WatchSlot,
         frame: Frame,
@@ -180,6 +191,7 @@ pub enum ReplyTag {
 pub enum Effect {
     Call { tag: ReplyTag, cmd: WireCommand },
     CallBatch { cmds: Vec<WireCommand> },
+    EnsureTreeWatch,
     Retarget(StageTarget),
     DebounceHover(NodeKey),
     Terminal(TermOut),
@@ -222,6 +234,39 @@ fn is_transport_error(err: &ApiError) -> bool {
     matches!(err, ApiError::Transport(_))
 }
 
+fn mark_transport_drop(model: &mut Model) {
+    if model.connection == ConnectionState::Connected {
+        model.connection = ConnectionState::Reconnecting;
+    }
+}
+
+fn mark_connected(model: &mut Model, effects: &mut Vec<Effect>, fetch_sidebar: bool) {
+    let was_down = model.connection != ConnectionState::Connected;
+    model.connection = ConnectionState::Connected;
+    if !was_down {
+        return;
+    }
+    model.last_error = None;
+    effects.push(Effect::EnsureTreeWatch);
+    if fetch_sidebar {
+        effects.push(Effect::Call {
+            tag: ReplyTag::Sidebar,
+            cmd: WireCommand::Sidebar(read::Sidebar::default()),
+        });
+    }
+    if !matches!(model.active_target, StageTarget::Summary { .. }) {
+        model.stage_req_seq = model.stage_req_seq.wrapping_add(1);
+        if model.has_focused_watch {
+            model.active_generation = model.active_generation.next();
+            model.has_focused_watch = false;
+        }
+        if matches!(model.stage, Stage::Error { .. }) {
+            model.stage = Stage::Loading(model.active_target.clone());
+        }
+        effects.push(Effect::Retarget(model.active_target.clone()));
+    }
+}
+
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
     match msg {
@@ -237,6 +282,30 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             handle_action(model, action, &mut effects);
         }
+        Msg::ConnectionChanged(up) => {
+            if up {
+                mark_connected(model, &mut effects, true);
+            } else {
+                model.connection = ConnectionState::Reconnecting;
+            }
+        }
+        Msg::ConnectionClosed => {
+            model.connection = ConnectionState::Disconnected;
+            if model.last_error.is_none() {
+                model.last_error = Some("daemon disconnected".to_owned());
+            }
+        }
+        Msg::TreeWatchOpened(res) => match res {
+            Ok(_) => {
+                mark_connected(model, &mut effects, false);
+            }
+            Err(err) => {
+                if is_transport_error(&err) {
+                    mark_transport_drop(model);
+                }
+                model.last_error = Some(format!("sidebar watch: {err}"));
+            }
+        },
         Msg::HoverSettled(key) => {
             if !matches!(model.focus, Pane::Composer | Pane::Overlay)
                 && (model.sidebar.hover.as_ref() == Some(&key) || model.sidebar.cursor == key)
@@ -251,15 +320,19 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             watch: WatchSlot::Tree,
             frame: Frame::Sidebar(snap),
         } => {
-            model.connected = true;
+            mark_connected(model, &mut effects, false);
+            let prev = model.sidebar.cursor.clone();
             model.sidebar_snapshot = *snap;
             model.sidebar.rebuild(&model.sidebar_snapshot);
+            if model.sidebar.cursor != prev {
+                effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
+            }
         }
         Msg::Frame {
             watch: WatchSlot::Stage,
             frame,
         } => {
-            model.connected = true;
+            mark_connected(model, &mut effects, true);
             match frame {
                 Frame::StageFocused { generation, .. } => {
                     if generation >= model.active_generation {
@@ -282,11 +355,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Frame { .. } => {
-            model.connected = true;
+            mark_connected(model, &mut effects, true);
         }
         Msg::WatchClosed { watch, error } => match watch {
             WatchSlot::Tree => {
-                model.connected = false;
+                model.connection = ConnectionState::Disconnected;
                 let detail = match error {
                     Some(e) => format!("daemon disconnected: {e}"),
                     None => "daemon disconnected".to_owned(),
@@ -296,7 +369,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             WatchSlot::Stage => match error {
                 Some(err) => {
                     if is_transport_error(&err) {
-                        model.connected = false;
+                        mark_transport_drop(model);
                     }
                     if matches!(model.stage, Stage::Loading(_)) {
                         model.stage = Stage::Error {
@@ -308,7 +381,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                     }
                 }
                 None => {
-                    if model.connected
+                    if model.connection == ConnectionState::Connected
                         && model.has_focused_watch
                         && !matches!(model.active_target, StageTarget::Summary { .. })
                     {
@@ -324,7 +397,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 && let Err(err) = watch
             {
                 if is_transport_error(&err) {
-                    model.connected = false;
+                    mark_transport_drop(model);
                 }
                 if matches!(model.stage, Stage::Loading(_)) {
                     model.stage = Stage::Error {
@@ -474,6 +547,27 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                 effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
             }
         }
+        Action::ToggleArchive(key) => {
+            if let Some((target, archived)) =
+                sidebar::archive_target_for(&model.sidebar_snapshot, &key)
+            {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::UserCommand,
+                    cmd: WireCommand::SetArchived(SetArchived {
+                        target,
+                        archived: !archived,
+                    }),
+                });
+            }
+        }
+        Action::ToggleShowArchived => {
+            let prev = model.sidebar.cursor.clone();
+            model.sidebar.show_archived = !model.sidebar.show_archived;
+            model.sidebar.rebuild(&model.sidebar_snapshot);
+            if model.sidebar.cursor != prev {
+                effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
+            }
+        }
         Action::Activate(key) => {
             remember_project(model, &key);
             model.sidebar.cursor = key.clone();
@@ -496,7 +590,9 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                     model
                         .sidebar_snapshot
                         .projects
-                        .first()
+                        .iter()
+                        .find(|p| !p.archived)
+                        .or_else(|| model.sidebar_snapshot.projects.first())
                         .map(|p| project_board(&p.project))
                 });
             model.sidebar.cursor = NodeKey::Kanban;
@@ -1063,12 +1159,17 @@ fn handle_reply(
     result: Result<WireReply, ApiError>,
     effects: &mut Vec<Effect>,
 ) {
+    let was_down = model.connection != ConnectionState::Connected;
     if result.is_ok() {
-        model.connected = true;
+        model.connection = ConnectionState::Connected;
+        if was_down {
+            model.last_error = None;
+            effects.push(Effect::EnsureTreeWatch);
+        }
     } else if let Err(err) = &result
         && is_transport_error(err)
     {
-        model.connected = false;
+        mark_transport_drop(model);
     }
 
     match (tag, result) {
@@ -1083,11 +1184,21 @@ fn handle_reply(
             model.last_error = Some(err.to_string());
         }
         (ReplyTag::Sidebar, Ok(WireReply::Sidebar(snap))) => {
+            let prev = model.sidebar.cursor.clone();
             model.sidebar_snapshot = snap;
             model.sidebar.rebuild(&model.sidebar_snapshot);
+            if model.sidebar.cursor != prev {
+                effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
+            }
         }
         (ReplyTag::StageInitial(seq), Ok(reply)) if seq == model.stage_req_seq => {
             apply_stage_snapshot(model, reply);
+        }
+        (ReplyTag::UserCommand, Ok(WireReply::SetArchived(_))) => {
+            effects.push(Effect::Call {
+                tag: ReplyTag::Sidebar,
+                cmd: WireCommand::Sidebar(read::Sidebar::default()),
+            });
         }
         (ReplyTag::UserCommand, Ok(WireReply::MailPromote(letter))) => {
             if let Stage::Room(r) = &mut model.stage {
@@ -1433,7 +1544,7 @@ pub fn view(
             graphics: model.graphics,
             stage_focused: model.focus == Pane::Stage,
             composing: model.focus == Pane::Composer,
-            connected: model.connected,
+            connection: model.connection,
             last_error: model.last_error.as_deref(),
             cursor_out: &cursor_out,
         },
@@ -1689,7 +1800,36 @@ async fn load_stage_target_with_guard<C: Client, F: Fn() -> bool>(
     (initial_res, watch_res)
 }
 
+/// Polls a transport connection watch receiver, clearing `*rx = None` once the
+/// channel closes so the event loop never busy-spins on a closed watch.
+pub async fn poll_connection(rx: &mut Option<watch::Receiver<bool>>) -> Msg {
+    let Some(sub) = rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    match sub.changed().await {
+        Ok(()) => Msg::ConnectionChanged(*sub.borrow_and_update()),
+        Err(_) => {
+            *rx = None;
+            Msg::ConnectionClosed
+        }
+    }
+}
+
 pub async fn run<C: Client + Clone + 'static>(client: C) -> io::Result<()> {
+    run_inner(client, None).await
+}
+
+pub async fn run_with_connection<C: Client + Clone + 'static>(
+    client: C,
+    connection: watch::Receiver<bool>,
+) -> io::Result<()> {
+    run_inner(client, Some(connection)).await
+}
+
+async fn run_inner<C: Client + Clone + 'static>(
+    client: C,
+    connection: Option<watch::Receiver<bool>>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -1707,7 +1847,7 @@ pub async fn run<C: Client + Clone + 'static>(client: C) -> io::Result<()> {
     terminal.clear()?;
 
     let compositor = KittyCompositor::new(CellPx::default());
-    let res = run_loop(&mut terminal, client, compositor).await;
+    let res = run_loop(&mut terminal, client, connection, compositor).await;
 
     let shutdown = KittyCompositor::new(CellPx::default()).shutdown_bytes();
     let out = terminal.backend_mut();
@@ -1728,6 +1868,7 @@ pub async fn run<C: Client + Clone + 'static>(client: C) -> io::Result<()> {
 async fn run_loop<C: Client + Clone + 'static>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: C,
+    mut conn_rx: Option<watch::Receiver<bool>>,
     mut compositor: KittyCompositor,
 ) -> io::Result<()> {
     let initial_overview = match client
@@ -1739,6 +1880,13 @@ async fn run_loop<C: Client + Clone + 'static>(
     };
 
     let mut model = Model::new(client.me().clone(), initial_overview);
+    if let Some(rx) = conn_rx.as_mut() {
+        model.connection = if *rx.borrow_and_update() {
+            ConnectionState::Connected
+        } else {
+            ConnectionState::Reconnecting
+        };
+    }
     if let Ok(sz) = terminal.size() {
         model.term_cols = sz.width;
         model.term_rows = sz.height;
@@ -1764,11 +1912,16 @@ async fn run_loop<C: Client + Clone + 'static>(
     let mut tree_watch = match client.watch(Interest::Sidebar, Cursor::live()).await {
         Ok(s) => Some(s),
         Err(e) => {
-            model.connected = false;
+            model.connection = if is_transport_error(&e) {
+                ConnectionState::Reconnecting
+            } else {
+                ConnectionState::Disconnected
+            };
             model.last_error = Some(format!("sidebar watch: {e}"));
             None
         }
     };
+    let mut opening_tree_watch = false;
     let mut stage_watch: Option<FrameStream> = None;
     let mut hover_deadline: Option<(tokio::time::Instant, NodeKey)> = None;
 
@@ -1800,6 +1953,8 @@ async fn run_loop<C: Client + Clone + 'static>(
         }
 
         let incoming: Option<Msg> = tokio::select! {
+            biased;
+            m = poll_connection(&mut conn_rx) => Some(m),
             Some(ct_ev) = ev_rx.recv() => match ct_ev {
                 CtEvent::Key(k) if k.kind == KeyEventKind::Press => {
                     input::key_action(k, model.focus, &model.sidebar.cursor).map(Msg::Action)
@@ -1830,6 +1985,16 @@ async fn run_loop<C: Client + Clone + 'static>(
                         stage_watch = stream_opt.map(|w| w.0);
                     }
                     continue;
+                }
+                Msg::TreeWatchOpened(res) => {
+                    opening_tree_watch = false;
+                    match res {
+                        Ok(w) => {
+                            tree_watch = Some(w.0);
+                            continue;
+                        }
+                        Err(err) => Msg::TreeWatchOpened(Err(err)),
+                    }
                 }
                 other => other,
             };
@@ -1864,6 +2029,17 @@ async fn run_loop<C: Client + Clone + 'static>(
                                 });
                             }
                         });
+                    }
+                    Effect::EnsureTreeWatch => {
+                        if tree_watch.is_none() && !opening_tree_watch {
+                            opening_tree_watch = true;
+                            let c = client.clone();
+                            let tx = msg_tx.clone();
+                            tokio::spawn(async move {
+                                let res = c.watch(Interest::Sidebar, Cursor::live()).await;
+                                let _ = tx.send(Msg::TreeWatchOpened(res.map(OpenedWatch)));
+                            });
+                        }
                     }
                     Effect::Retarget(target) => {
                         stage_watch = None;
