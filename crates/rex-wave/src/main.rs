@@ -726,6 +726,21 @@ fn parse_cursor_arg(raw: &str) -> Result<Cursor, ApiError> {
     serde_json::from_str(raw).map_err(|e| invalid("cursor", format!("invalid cursor JSON: {e}")))
 }
 
+fn ensure_cursor_from_head(cursor: Cursor) -> Cursor {
+    if cursor.from_head() {
+        return cursor;
+    }
+    if let Ok(mut val) = serde_json::to_value(&cursor)
+        && let Some(obj) = val.as_object_mut()
+    {
+        obj.insert("from_head".to_owned(), serde_json::Value::Bool(true));
+        if let Ok(live) = serde_json::from_value(val) {
+            return live;
+        }
+    }
+    Cursor::live()
+}
+
 fn parse_task_status(s: &str) -> Result<TaskStatus, ApiError> {
     match s.trim().to_ascii_lowercase().as_str() {
         "open" => Ok(TaskStatus::Open),
@@ -1158,16 +1173,16 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                     } else {
                         let mentions = !*all;
                         let mut w = Wait::room(room_id, Seq(*since), mentions);
-                        if let Some(mut c) = base_cursor {
-                            if mentions {
-                                let seq = c.at(&stream).max(Seq(*since));
-                                w.after = Cursor::live().with(stream, seq);
+                        if let Some(c) = base_cursor {
+                            let mut c = if mentions {
+                                ensure_cursor_from_head(c)
                             } else {
-                                if *since > 0 {
-                                    c.advance(&stream, Seq(*since));
-                                }
-                                w.after = c;
+                                c
+                            };
+                            if *since > 0 || (mentions && !c.lists(&stream)) {
+                                c.advance(&stream, Seq(*since));
                             }
+                            w.after = c;
                         }
                         w.timeout_ms = *timeout;
                         w
@@ -1180,13 +1195,18 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                     if has_filter {
                         return Err(invalid("room", "--re and --label require a target room"));
                     }
+                    let after = match base_cursor {
+                        Some(c) if !*all => ensure_cursor_from_head(c),
+                        Some(c) => c,
+                        None => Cursor::live(),
+                    };
                     Wait {
                         interest: if *all {
                             Interest::Everything
                         } else {
                             Interest::Mentions
                         },
-                        after: base_cursor.unwrap_or_else(Cursor::live),
+                        after,
                         timeout_ms: *timeout,
                     }
                 }
@@ -2876,6 +2896,56 @@ mod tests {
         );
         assert_eq!(
             wmc.after.at(&StreamId::Room {
+                room: rex_wave_api::room::RoomId::Channel {
+                    scope: rex_wave_api::room::RoomScope::Global,
+                    name: ChannelName::parse("general").unwrap(),
+                },
+            }),
+            Seq(12)
+        );
+
+        let other_stream = StreamId::Room {
+            room: rex_wave_api::room::RoomId::Channel {
+                scope: rex_wave_api::room::RoomScope::Global,
+                name: ChannelName::parse("ops").unwrap(),
+            },
+        };
+        let chained_cursor = serde_json::to_string(
+            &Cursor::live()
+                .with(
+                    StreamId::Room {
+                        room: rex_wave_api::room::RoomId::Channel {
+                            scope: rex_wave_api::room::RoomScope::Global,
+                            name: ChannelName::parse("general").unwrap(),
+                        },
+                    },
+                    Seq(12),
+                )
+                .with(other_stream.clone(), Seq(7)),
+        )
+        .unwrap();
+        let wait_chained =
+            parse_cli(&["rex-wave", "wait", "#general", "--cursor", &chained_cursor]);
+        let WireCommand::Wait(wc) = to_command(&wait_chained.cmd).unwrap() else {
+            panic!("expected Wait");
+        };
+        assert!(wc.after.from_head());
+        assert_eq!(
+            wc.after.at(&other_stream),
+            Seq(7),
+            "chaining a live mentions cursor must retain other stream positions"
+        );
+
+        let wait_no_room_read_cursor = parse_cli(&["rex-wave", "wait", "--cursor", &read_cursor]);
+        let WireCommand::Wait(wnr) = to_command(&wait_no_room_read_cursor.cmd).unwrap() else {
+            panic!("expected Wait");
+        };
+        assert!(
+            wnr.after.from_head(),
+            "no-room mentions wait with a read cursor must promote from_head=true"
+        );
+        assert_eq!(
+            wnr.after.at(&StreamId::Room {
                 room: rex_wave_api::room::RoomId::Channel {
                     scope: rex_wave_api::room::RoomScope::Global,
                     name: ChannelName::parse("general").unwrap(),
