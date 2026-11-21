@@ -360,6 +360,13 @@ pub enum MailUnrungEval {
     Resolve,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RaisedMailUnrungState {
+    unread_count: u32,
+    oldest_at: UnixMs,
+    operators: BTreeSet<Principal>,
+}
+
 #[derive(Default)]
 pub struct HeraldView {
     latest_at: UnixMs,
@@ -373,12 +380,13 @@ pub struct HeraldView {
     seat_status: BTreeMap<SeatName, presence::SeatStatus>,
     live_bindings: BTreeMap<SeatName, BTreeMap<IncarnationId, presence::SeatBinding>>,
     ever_bound: BTreeSet<SeatName>,
+    last_bound_at: BTreeMap<SeatName, UnixMs>,
     last_drop: BTreeMap<SeatName, DropRecord>,
     down_transports: BTreeSet<presence::TransportKind>,
     pending_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
-    raised_mail_unrung: BTreeMap<SeatName, (u32, UnixMs)>,
+    raised_mail_unrung: BTreeMap<SeatName, RaisedMailUnrungState>,
     mail_unrung_emits: Vec<(SeatName, u32, UnixMs)>,
     transport_emits: Vec<(presence::TransportKind, bool, Option<String>)>,
 }
@@ -553,8 +561,14 @@ impl HeraldView {
                         presence::BindingStatus::Live | presence::BindingStatus::TransportDown
                     ) {
                         seat_bindings.insert(binding.incarnation_id.clone(), binding.clone());
-                        if !self.down_transports.contains(&binding.endpoint.kind()) {
+                        if binding.status == presence::BindingStatus::Live
+                            && !self.down_transports.contains(&binding.endpoint.kind())
+                        {
                             self.last_drop.remove(&seat);
+                            self.last_bound_at
+                                .entry(seat.clone())
+                                .and_modify(|prev| *prev = (*prev).max(entry.at))
+                                .or_insert(entry.at);
                         }
                     } else {
                         seat_bindings.remove(&binding.incarnation_id);
@@ -639,6 +653,10 @@ impl HeraldView {
                             }
                             if restored {
                                 self.last_drop.remove(seat);
+                                self.last_bound_at
+                                    .entry(seat.clone())
+                                    .and_modify(|prev| *prev = (*prev).max(entry.at))
+                                    .or_insert(entry.at);
                                 check_seats.insert(seat.clone());
                             }
                         }
@@ -655,6 +673,7 @@ impl HeraldView {
                             letter.sha256.clone(),
                             letter.path.clone(),
                             entry.at,
+                            emit_mail_unrung,
                         );
                         check_seats.insert(seat);
                     }
@@ -668,6 +687,7 @@ impl HeraldView {
                             item.reference.sha256.clone(),
                             item.reference.path.clone(),
                             entry.at,
+                            emit_mail_unrung,
                         );
                         check_seats.insert(seat);
                     }
@@ -687,7 +707,7 @@ impl HeraldView {
                 }
                 mail::MailEvent::BellRang { .. } => {}
             },
-            (StreamId::Inbox { .. }, Event::Inbox(ev)) => match ev {
+            (StreamId::Inbox { owner }, Event::Inbox(ev)) => match ev {
                 InboxEvent::Raised { draft, .. } | InboxEvent::Updated { draft, .. } => {
                     if let NotifyKind::MailUnrung {
                         seat,
@@ -696,10 +716,22 @@ impl HeraldView {
                     } = &draft.kind
                     {
                         if *unread_count > 0 {
-                            self.raised_mail_unrung
-                                .insert(seat.clone(), (*unread_count, *oldest_at));
-                        } else {
-                            self.raised_mail_unrung.remove(seat);
+                            let state =
+                                self.raised_mail_unrung
+                                    .entry(seat.clone())
+                                    .or_insert_with(|| RaisedMailUnrungState {
+                                        unread_count: *unread_count,
+                                        oldest_at: *oldest_at,
+                                        operators: BTreeSet::new(),
+                                    });
+                            state.unread_count = *unread_count;
+                            state.oldest_at = *oldest_at;
+                            state.operators.insert(owner.clone());
+                        } else if let Some(state) = self.raised_mail_unrung.get_mut(seat) {
+                            state.operators.remove(owner);
+                            if state.operators.is_empty() {
+                                self.raised_mail_unrung.remove(seat);
+                            }
                         }
                     }
                 }
@@ -722,13 +754,18 @@ impl HeraldView {
             check_seats.insert(seat.clone());
         }
 
+        let operator_set: BTreeSet<Principal> = self.all_operators().into_iter().collect();
         for seat in check_seats {
             match self.evaluate_mail_unrung_with_grace(&seat, entry.at, RECONNECT_GRACE_MS) {
                 MailUnrungEval::Raise {
                     unread_count,
                     oldest_at,
                 } => {
-                    let next = (unread_count, oldest_at);
+                    let next = RaisedMailUnrungState {
+                        unread_count,
+                        oldest_at,
+                        operators: operator_set.clone(),
+                    };
                     if self.raised_mail_unrung.get(&seat) != Some(&next) {
                         self.raised_mail_unrung.insert(seat.clone(), next);
                         self.mail_unrung_emits.push((seat, unread_count, oldest_at));
@@ -744,12 +781,43 @@ impl HeraldView {
         }
     }
 
+    fn reconcile_unrung_after_replay(&mut self) {
+        let now = self.latest_at;
+        let seats: Vec<SeatName> = self.pending_mail.keys().cloned().collect();
+        for seat in seats {
+            let Some(pending) = self.pending_mail.get(&seat) else {
+                continue;
+            };
+            if pending.is_empty() {
+                continue;
+            }
+            if !self.has_live_binding(&seat, now) {
+                let unrung = self.unrung_mail.entry(seat).or_default();
+                for (sha, letter) in pending {
+                    unrung.entry(sha.clone()).or_insert_with(|| letter.clone());
+                }
+            } else if self.raised_mail_unrung.contains_key(&seat) {
+                // Seat already had an open MailUnrung card before restart and has
+                // since rebound: only count letters that arrived before the live bind
+                // so letters received while live never inflate a raised/dismissed card.
+                let bound_at = self.last_bound_at.get(&seat).copied().unwrap_or(UnixMs(0));
+                let unrung = self.unrung_mail.entry(seat).or_default();
+                for (sha, letter) in pending {
+                    if letter.at <= bound_at {
+                        unrung.entry(sha.clone()).or_insert_with(|| letter.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn record_incoming_mail(
         &mut self,
         seat: SeatName,
         sha256: Sha256Hex,
         path: PathBuf,
         at: UnixMs,
+        track_unrung: bool,
     ) {
         if self.acked_mail.contains(&(seat.clone(), sha256.clone())) {
             return;
@@ -760,7 +828,7 @@ impl HeraldView {
             .or_default()
             .entry(sha256.clone())
             .or_insert_with(|| letter.clone());
-        if !self.has_live_binding(&seat, at) {
+        if track_unrung && !self.has_live_binding(&seat, at) {
             self.unrung_mail
                 .entry(seat)
                 .or_default()
@@ -938,7 +1006,7 @@ impl HeraldView {
         now: UnixMs,
     ) -> Vec<(
         SeatName,
-        Option<(u32, UnixMs)>,
+        Option<RaisedMailUnrungState>,
         Vec<(Principal, NotificationDraft)>,
     )> {
         let seats: Vec<SeatName> = self
@@ -950,6 +1018,7 @@ impl HeraldView {
             .into_iter()
             .collect();
         let operators = self.all_operators();
+        let operator_set: BTreeSet<Principal> = operators.iter().cloned().collect();
         let mut out = Vec::new();
         for seat in seats {
             match self.evaluate_mail_unrung(&seat, now) {
@@ -957,7 +1026,11 @@ impl HeraldView {
                     unread_count,
                     oldest_at,
                 } => {
-                    let next = (unread_count, oldest_at);
+                    let next = RaisedMailUnrungState {
+                        unread_count,
+                        oldest_at,
+                        operators: operator_set.clone(),
+                    };
                     if self.raised_mail_unrung.get(&seat) != Some(&next) {
                         let draft = mail_unrung_draft(&seat, unread_count, oldest_at);
                         let raises = operators
@@ -2060,6 +2133,7 @@ impl Reactor for Herald {
                 self.caught_up = true;
                 let due = {
                     let mut view = self.view.lock().expect("herald view lock");
+                    view.reconcile_unrung_after_replay();
                     let now = view.latest_at;
                     view.due_mail_unrung(now)
                 };
@@ -2073,6 +2147,7 @@ impl Reactor for Herald {
             }
             _ => {}
         }
+        let view = self.view.clone();
         let replay = self.replay.clone();
         let client = client.clone();
         async move {
@@ -2085,7 +2160,19 @@ impl Reactor for Herald {
                 }
             }
             for (to, draft) in live_raises {
-                client.call(InboxRaise { to, draft }).await?;
+                let mail_unrung_seat = match &draft.kind {
+                    NotifyKind::MailUnrung { seat, .. } => Some(seat.clone()),
+                    _ => None,
+                };
+                if let Err(err) = client.call(InboxRaise { to, draft }).await {
+                    if let Some(seat) = mail_unrung_seat {
+                        view.lock()
+                            .expect("herald view lock")
+                            .raised_mail_unrung
+                            .remove(&seat);
+                    }
+                    return Err(err);
+                }
             }
             Ok(())
         }

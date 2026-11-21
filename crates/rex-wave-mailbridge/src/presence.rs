@@ -542,11 +542,11 @@ fn make_provenance(
     }
 }
 
-fn can_manage_seat(by: &Principal, seat: &SeatName, existing: Option<&SeatRecord>) -> bool {
+fn can_manage_seat(by: &Principal, seat: &SeatName, _existing: Option<&SeatRecord>) -> bool {
     match by {
         Principal::Operator { .. } | Principal::System { .. } => true,
         Principal::Seat { seat: caller } => caller == seat,
-        Principal::Worker { .. } => existing.is_some_and(|rec| &rec.claimed_by == by),
+        Principal::Worker { .. } => false,
     }
 }
 

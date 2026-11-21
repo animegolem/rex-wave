@@ -1115,7 +1115,8 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
     assert_eq!(still_ok.me(), sam.me());
     drop(still_ok);
 
-    // A world-readable `worker-tokens/` directory itself is rejected fail-closed.
+    // A world-readable `worker-tokens/` directory is skipped (denying all worker
+    // tokens inside it) without locking out healthy `tokens.json` seat tokens.
     std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let bad_dir_err = RemoteClient::connect(
         Endpoint::Unix(sock.clone()),
@@ -1130,6 +1131,17 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
         matches!(bad_dir_err, ApiError::Denied { .. }),
         "got {bad_dir_err:?}"
     );
+    let sam_survives_bad_worker_dir = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_legacy_sam".into(),
+        },
+        "cli-sam-bad-worker-dir",
+    )
+    .await
+    .unwrap();
+    assert_eq!(sam_survives_bad_worker_dir.me(), sam.me());
+    drop(sam_survives_bad_worker_dir);
     std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     // System principals cannot be inserted into a token table or written to disk.
@@ -1321,12 +1333,21 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
     impl Service<RoomCommand> for SlowRecordingService {
         fn dispatch(
             &self,
-            _: RoomCommand,
+            cmd: RoomCommand,
             _: DecideCtx,
         ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+            let body = match cmd {
+                RoomCommand::RoomPost(p) => p.body.as_str().to_owned(),
+                _ => String::new(),
+            };
             let events = self.events.clone();
             self.started.notify_one();
             Box::pin(async move {
+                if body == "quick-promote" {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let _ = events.send("quick_finished");
+                    return Ok(WireReply::RoomJoin(Ack));
+                }
                 struct DropMark(tokio::sync::mpsc::UnboundedSender<&'static str>);
                 impl Drop for DropMark {
                     fn drop(&mut self) {
@@ -1373,6 +1394,42 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
     let router = router_with(&journal, svc);
     let server = tokio::spawn(serve_listener_with_hooks(listener, router, auth, hooks));
 
+    // 1. Short in-flight call finishes cleanly within drain grace before on_disconnect runs.
+    let client_quick = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: "tok_crest".into(),
+        },
+        "quick-in-flight",
+    )
+    .await
+    .unwrap();
+    let quick_task = tokio::spawn({
+        let c = client_quick.clone();
+        async move { c.call(post("quick-promote")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), svc_wait.started.notified())
+        .await
+        .expect("server started quick call");
+    quick_task.abort();
+    let _ = quick_task.await;
+    drop(client_quick);
+
+    let q1 = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let q2 = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (q1, q2),
+        ("quick_finished", "on_disconnect"),
+        "short in-flight call must finish before on_disconnect instead of splitting a write"
+    );
+
+    // 2. Hung in-flight call is aborted after drain timeout, still strictly before on_disconnect.
     let client = RemoteClient::connect(
         Endpoint::Unix(sock),
         Credential::Token {

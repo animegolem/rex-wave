@@ -573,14 +573,23 @@ impl PrincipalTokenTable {
     }
 
     /// Loads both `tokens.json` and `<state_dir>/worker-tokens/` into one table.
+    /// A malformed or non-`0700` `worker-tokens/` directory is logged and skipped
+    /// so `tokens.json` seat handshakes remain available while worker tokens stay denied.
     pub fn load_state_dir(
         tokens_path: &Path,
         worker_tokens_dir: &Path,
         expected_uid: Option<u32>,
     ) -> Result<Self, ApiError> {
         let mut table = Self::load_tokens_file(tokens_path, expected_uid)?;
-        let workers = Self::load_worker_tokens_dir(worker_tokens_dir, expected_uid)?;
-        table.merge(workers)?;
+        match Self::load_worker_tokens_dir(worker_tokens_dir, expected_uid) {
+            Ok(workers) => table.merge(workers)?,
+            Err(e) => {
+                daemon_log!(
+                    "skipping worker-tokens directory {}: {e}",
+                    worker_tokens_dir.display()
+                );
+            }
+        }
         Ok(table)
     }
 }
@@ -1648,6 +1657,13 @@ async fn handle_conn(
     };
 
     drop(watches);
+    // Allow short in-flight commands (such as MailBridge::promote or PresenceBind)
+    // to finish cleanly before aborting stuck calls and firing RAII on_disconnect.
+    const IN_FLIGHT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+    let _ = tokio::time::timeout(IN_FLIGHT_DRAIN_TIMEOUT, async {
+        while in_flight_calls.join_next().await.is_some() {}
+    })
+    .await;
     in_flight_calls.abort_all();
     while in_flight_calls.join_next().await.is_some() {}
     drop(disconnect_guard);

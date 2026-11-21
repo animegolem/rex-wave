@@ -2415,5 +2415,32 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         "lapsed LeaseOnly binding must not look live"
     );
 
+    // R2-3: A custom operator seen after the first MailUnrung raise receives the card.
+    let custom_op = Principal::Operator {
+        seat: SeatName::parse("golem").unwrap(),
+    };
+    let custom_op_env = Envelope {
+        stream: StreamId::Room {
+            room: RoomId::Channel {
+                scope: RoomScope::Global,
+                name: ChannelName::parse("lounge").unwrap(),
+            },
+        },
+        seq: Seq(2),
+        at: UnixMs(7_000),
+        by: custom_op.clone(),
+        event: Event::Room(RoomEvent::TopicSet {
+            topic: "ops".into(),
+        }),
+    };
+    lease_view.observe(&custom_op_env);
+    let op_drafts = classify(&custom_op_env, &lease_view);
+    assert!(
+        op_drafts
+            .iter()
+            .any(|(to, d)| to == &custom_op && d.dedupe == "mail-unrung:baton"),
+        "newly observed operator must receive existing MailUnrung card"
+    );
+
     herald_task.abort();
 }
