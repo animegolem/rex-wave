@@ -34,6 +34,7 @@ pub mod wave;
 
 pub use client::{ApiError, Client, FrameStream};
 pub use id::*;
+pub use read::{ArchiveTarget, SetArchived};
 pub use registry::{
     Audience, BoardCommand, Command, Family, InboxCommand, MailCommand, ReadCommand, RoomCommand,
     Routed, TOOLS, ToolMeta, WaveCommand, WireCommand, WireReply, tool_catalog,

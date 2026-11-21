@@ -379,6 +379,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     }
                 }
                 room::RoomId::Channel { .. } => {
+                    let is_system_post = matches!(entry.by, Principal::System { .. });
                     let mut recipients: BTreeSet<Principal> =
                         mentions.principals.iter().cloned().collect();
                     if mentions.all
@@ -386,7 +387,11 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     {
                         recipients.extend(room_members.iter().cloned());
                     }
-                    recipients.retain(|p| p != &entry.by && !matches!(p, Principal::System { .. }));
+                    recipients.retain(|p| {
+                        p != &entry.by
+                            && !matches!(p, Principal::System { .. })
+                            && !(is_system_post && matches!(p, Principal::Operator { .. }))
+                    });
                     for recipient in recipients {
                         out.push((
                             recipient,
@@ -441,11 +446,12 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                                     wave: wave.clone(),
                                     role: role.clone(),
                                     why: error.clone(),
+                                    seq: entry.seq,
                                 },
                                 title: format!("@{wave}/{role} stuck"),
                                 preview: snippet(error, 160),
                                 actions: Vec::new(),
-                                dedupe: format!("worker-stuck:{wave}:{role}:{}", entry.seq.0),
+                                dedupe: format!("worker-stuck:{wave}:{role}"),
                             },
                         ));
                     }
@@ -638,13 +644,15 @@ fn kinds_equal(a: &NotifyKind, b: &NotifyKind) -> bool {
                 wave: w1,
                 role: r1,
                 why: y1,
+                seq: s1,
             },
             NotifyKind::WorkerStuck {
                 wave: w2,
                 role: r2,
                 why: y2,
+                seq: s2,
             },
-        ) => w1 == w2 && r1 == r2 && y1 == y2,
+        ) => w1 == w2 && r1 == r2 && y1 == y2 && s1 == s2,
         (NotifyKind::WaveFinished { wave: w1 }, NotifyKind::WaveFinished { wave: w2 }) => w1 == w2,
         (NotifyKind::CardAssigned { card: c1 }, NotifyKind::CardAssigned { card: c2 }) => {
             c1.board == c2.board && c1.no == c2.no && c1.revision == c2.revision
@@ -680,6 +688,7 @@ pub struct InboxState {
     items: BTreeMap<NotificationId, Notification>,
     by_dedupe: BTreeMap<String, NotificationId>,
     cursors: BTreeMap<room::RoomId, Seq>,
+    archived: BTreeSet<ArchiveTarget>,
     next_id: u64,
     latest_at: UnixMs,
     head: Seq,
@@ -716,6 +725,27 @@ impl Decider for Inbox {
                 if let Some(&existing_id) = state.by_dedupe.get(&c.draft.dedupe)
                     && let Some(existing) = state.items.get(&existing_id)
                 {
+                    if let (
+                        NotifyKind::WorkerStuck { seq: prev_seq, .. },
+                        NotifyKind::WorkerStuck { seq: new_seq, .. },
+                    ) = (&existing.draft.kind, &c.draft.kind)
+                    {
+                        if new_seq <= prev_seq {
+                            return Ok(vec![]);
+                        }
+                        let mut events = vec![InboxEvent::Updated {
+                            id: existing_id,
+                            rank: fresh_rank,
+                            draft: c.draft.clone(),
+                        }];
+                        if existing.state != NotifyState::Unread {
+                            events.push(InboxEvent::StateSet {
+                                ids: vec![existing_id],
+                                state: NotifyState::Unread,
+                            });
+                        }
+                        return Ok(events);
+                    }
                     if matches!(c.draft.kind, NotifyKind::Interaction { .. })
                         && matches!(existing.state, NotifyState::Done | NotifyState::Dismissed)
                     {
@@ -739,6 +769,40 @@ impl Decider for Inbox {
                 }
                 if is_resolved_interaction {
                     return Ok(vec![]);
+                }
+                if let NotifyKind::WorkerStuck { seq: new_seq, .. } = &c.draft.kind {
+                    let prefix = format!("{}:", c.draft.dedupe);
+                    let mut best_legacy: Option<(Seq, NotificationId)> = None;
+                    for (k, &id) in state.by_dedupe.range(prefix.clone()..) {
+                        let Some(rest) = k.strip_prefix(&prefix) else {
+                            break;
+                        };
+                        if let Ok(parsed) = rest.parse::<u64>() {
+                            let seq = Seq(parsed);
+                            if best_legacy.is_none_or(|(prev, _)| seq > prev) {
+                                best_legacy = Some((seq, id));
+                            }
+                        }
+                    }
+                    if let Some((legacy_seq, legacy_id)) = best_legacy
+                        && let Some(existing) = state.items.get(&legacy_id)
+                    {
+                        if *new_seq <= legacy_seq {
+                            return Ok(vec![]);
+                        }
+                        let mut events = vec![InboxEvent::Updated {
+                            id: legacy_id,
+                            rank: fresh_rank,
+                            draft: c.draft.clone(),
+                        }];
+                        if existing.state != NotifyState::Unread {
+                            events.push(InboxEvent::StateSet {
+                                ids: vec![legacy_id],
+                                state: NotifyState::Unread,
+                            });
+                        }
+                        return Ok(events);
+                    }
                 }
                 let id = NotificationId(state.next_id + 1);
                 Ok(vec![InboxEvent::Raised {
@@ -801,6 +865,17 @@ impl Decider for Inbox {
                 Ok(events)
             }
 
+            InboxCommand::SetArchived(c) => {
+                if state.archived.contains(&c.target) == c.archived {
+                    Ok(vec![])
+                } else {
+                    Ok(vec![InboxEvent::ArchivedSet {
+                        target: c.target.clone(),
+                        archived: c.archived,
+                    }])
+                }
+            }
+
             InboxCommand::InboxList(_) => Ok(vec![]),
         }
     }
@@ -830,6 +905,11 @@ impl Decider for Inbox {
                     .items
                     .get(id)
                     .map_or((NotifyState::Unread, meta.at), |n| (n.state, n.at));
+                let next_at = if matches!(draft.kind, NotifyKind::WorkerStuck { .. }) {
+                    meta.at
+                } else {
+                    prev_at
+                };
                 if let Some(old) = state.items.get(id)
                     && old.draft.dedupe != draft.dedupe
                 {
@@ -840,7 +920,7 @@ impl Decider for Inbox {
                     *id,
                     Notification {
                         id: *id,
-                        at: prev_at,
+                        at: next_at,
                         rank: *rank,
                         state: prev_state,
                         draft: draft.clone(),
@@ -861,6 +941,13 @@ impl Decider for Inbox {
                 let cur = state.cursors.entry(room.clone()).or_default();
                 if *cur < *upto {
                     *cur = *upto;
+                }
+            }
+            InboxEvent::ArchivedSet { target, archived } => {
+                if *archived {
+                    state.archived.insert(target.clone());
+                } else {
+                    state.archived.remove(target);
                 }
             }
         }
@@ -901,6 +988,7 @@ impl Decider for Inbox {
             }
             InboxCommand::InboxAck(_) => WireReply::InboxAck(Ack),
             InboxCommand::InboxMarkRead(_) => WireReply::InboxMarkRead(Ack),
+            InboxCommand::SetArchived(_) => WireReply::SetArchived(Ack),
             InboxCommand::InboxRaise(_) => WireReply::InboxRaise(Ack),
         }
     }
@@ -917,14 +1005,59 @@ impl Decider for Inbox {
     }
 }
 
+#[derive(Default)]
+struct ReplayBuffer {
+    items: std::collections::VecDeque<(Principal, NotificationDraft)>,
+    index: BTreeMap<(Principal, String), usize>,
+    popped: usize,
+}
+
+impl ReplayBuffer {
+    fn upsert(&mut self, to: Principal, draft: NotificationDraft) {
+        let key = (to.clone(), draft.dedupe.clone());
+        if let Some(&abs_idx) = self.index.get(&key)
+            && let Some(rel_idx) = abs_idx.checked_sub(self.popped)
+            && let Some(slot) = self.items.get_mut(rel_idx)
+        {
+            slot.1 = draft;
+            return;
+        }
+        let abs_idx = self.popped + self.items.len();
+        self.index.insert(key, abs_idx);
+        self.items.push_back((to, draft));
+    }
+
+    fn peek(&self) -> Option<(Principal, NotificationDraft)> {
+        self.items.front().cloned()
+    }
+
+    fn pop_committed(&mut self) {
+        if let Some((to, draft)) = self.items.pop_front() {
+            let key = (to, draft.dedupe);
+            if self.index.get(&key) == Some(&self.popped) {
+                self.index.remove(&key);
+            }
+            self.popped += 1;
+        }
+        if self.items.is_empty() {
+            self.index.clear();
+            self.popped = 0;
+        }
+    }
+}
+
 pub struct Herald {
     view: HeraldView,
+    caught_up: bool,
+    replay: std::sync::Arc<std::sync::Mutex<ReplayBuffer>>,
 }
 
 impl Herald {
     pub fn new() -> Self {
         Herald {
             view: HeraldView::default(),
+            caught_up: false,
+            replay: std::sync::Arc::new(std::sync::Mutex::new(ReplayBuffer::default())),
         }
     }
 }
@@ -947,16 +1080,40 @@ impl Reactor for Herald {
         frame: Frame,
         client: &LocalClient,
     ) -> impl Future<Output = Result<(), ApiError>> + Send {
-        let raises = match frame {
+        let mut live_raises = Vec::new();
+        let mut flush_replay = false;
+        match frame {
             Frame::Committed(env) => {
                 self.view.observe(&env);
-                classify(&env, &self.view)
+                let drafts = classify(&env, &self.view);
+                if self.caught_up {
+                    live_raises = drafts;
+                    flush_replay = true;
+                } else {
+                    let mut buf = self.replay.lock().expect("herald replay buffer");
+                    for (to, draft) in drafts {
+                        buf.upsert(to, draft);
+                    }
+                }
             }
-            _ => Vec::new(),
-        };
+            Frame::CaughtUp { .. } => {
+                self.caught_up = true;
+                flush_replay = true;
+            }
+            _ => {}
+        }
+        let replay = self.replay.clone();
         let client = client.clone();
         async move {
-            for (to, draft) in raises {
+            if flush_replay {
+                loop {
+                    let next = replay.lock().expect("herald replay buffer").peek();
+                    let Some((to, draft)) = next else { break };
+                    client.call(InboxRaise { to, draft }).await?;
+                    replay.lock().expect("herald replay buffer").pop_committed();
+                }
+            }
+            for (to, draft) in live_raises {
                 client.call(InboxRaise { to, draft }).await?;
             }
             Ok(())

@@ -8,7 +8,7 @@ use crate::id::{
 use crate::room::{RoomId, RoomRef};
 use crate::stage::Osc7501Status;
 use crate::stream::{Cursor, Envelope, Interest, StreamId};
-use crate::wave::{Activity, PendingInteraction, WorkerPhase};
+use crate::wave::{Activity, PendingInteraction, WaveOutcome, WorkerPhase};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +53,20 @@ impl Wait {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArchiveTarget {
+    Project { project: BbProjectId },
+    Wave { wave: WaveSlug },
+    Room { room: RoomId },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SetArchived {
+    pub target: ArchiveTarget,
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -109,6 +123,10 @@ pub struct BoardBadge {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectBranch {
     pub project: BbProjectId,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
     pub channels: Vec<ChannelLeaf>,
     pub waves: Vec<WaveRoomBranch>,
 }
@@ -118,6 +136,8 @@ pub struct ChannelLeaf {
     pub room: RoomId,
     pub unread: u32,
     pub mentions: u32,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// A `#wave-<slug>` room; unfolding it shows the wave's agents.
@@ -127,6 +147,10 @@ pub struct WaveRoomBranch {
     pub room: RoomId,
     pub unread: u32,
     pub mentions: u32,
+    #[serde(default)]
+    pub finished: Option<WaveOutcome>,
+    #[serde(default)]
+    pub archived: bool,
     pub workers: Vec<WaveWorkerLeaf>,
 }
 
@@ -143,6 +167,8 @@ pub struct DmLeaf {
     pub room: RoomId,
     pub with: Principal,
     pub unread: u32,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// One agent's BB thread, for the Context Window Inspector stage.

@@ -2036,6 +2036,7 @@ fn apply_inbox_event(page: &mut InboxPage, ev: &InboxEvent, at: UnixMs) {
                 None => page.cursors.push((room.clone(), *upto)),
             }
         }
+        InboxEvent::ArchivedSet { .. } => {}
     }
     page.items
         .sort_by(|a, b| b.rank.cmp(&a.rank).then_with(|| b.at.cmp(&a.at)));

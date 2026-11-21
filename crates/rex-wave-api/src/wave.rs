@@ -87,11 +87,17 @@ pub enum WorkerPhase {
         thread: BbThreadId,
         activity: Activity,
     },
+    /// `errored` carries a live `Activity::Errored` across retirement so a
+    /// failed worker never reads as a clean exit.
     Retiring {
         thread: BbThreadId,
+        #[serde(default)]
+        errored: Option<String>,
     },
     Retired {
         thread: Option<BbThreadId>,
+        #[serde(default)]
+        errored: Option<String>,
     },
     Failed {
         error: String,
@@ -126,15 +132,22 @@ impl WorkerPhase {
                     activity: activity.clone(),
                 }
             }
-            (
-                WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread },
-                Observation::Archived,
-            ) => WorkerPhase::Retired {
-                thread: Some(thread.clone()),
-            },
-            (WorkerPhase::Requested { .. }, Observation::Archived) => {
-                WorkerPhase::Retired { thread: None }
+            (WorkerPhase::Live { thread, activity }, Observation::Archived) => {
+                WorkerPhase::Retired {
+                    thread: Some(thread.clone()),
+                    errored: activity.error().map(str::to_owned),
+                }
             }
+            (WorkerPhase::Retiring { thread, errored }, Observation::Archived) => {
+                WorkerPhase::Retired {
+                    thread: Some(thread.clone()),
+                    errored: errored.clone(),
+                }
+            }
+            (WorkerPhase::Requested { .. }, Observation::Archived) => WorkerPhase::Retired {
+                thread: None,
+                errored: None,
+            },
             (phase, _) => phase.clone(),
         }
     }
@@ -142,11 +155,27 @@ impl WorkerPhase {
     /// The phase after `wave_retire_worker` or `wave_finish`.
     pub fn retiring(&self) -> WorkerPhase {
         match self {
-            WorkerPhase::Live { thread, .. } => WorkerPhase::Retiring {
+            WorkerPhase::Live { thread, activity } => WorkerPhase::Retiring {
                 thread: thread.clone(),
+                errored: activity.error().map(str::to_owned),
             },
-            WorkerPhase::Requested { .. } => WorkerPhase::Retired { thread: None },
+            WorkerPhase::Requested { .. } => WorkerPhase::Retired {
+                thread: None,
+                errored: None,
+            },
             phase => phase.clone(),
+        }
+    }
+
+    /// The error a worker ended (or is ending) on, whatever its phase.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            WorkerPhase::Live { activity, .. } => activity.error(),
+            WorkerPhase::Retiring { errored, .. } | WorkerPhase::Retired { errored, .. } => {
+                errored.as_deref()
+            }
+            WorkerPhase::Failed { error } => Some(error),
+            WorkerPhase::Requested { .. } => None,
         }
     }
 }
@@ -172,6 +201,15 @@ pub enum Activity {
     Errored {
         error: String,
     },
+}
+
+impl Activity {
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Activity::Errored { error } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// A BB pending interaction, normalized.

@@ -204,6 +204,7 @@ fn osc7501_and_context_usage_and_wait_constructor_behave() {
     };
     let retired = WorkerPhase::Retired {
         thread: Some(t.clone()),
+        errored: None,
     };
     let blocked = WorkerPhase::Live {
         thread: t,

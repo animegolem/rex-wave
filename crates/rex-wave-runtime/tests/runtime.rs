@@ -214,6 +214,10 @@ impl Decider for ToyInbox {
                 room: c.room.clone(),
                 upto: c.upto,
             }]),
+            InboxCommand::SetArchived(c) => Ok(vec![InboxEvent::ArchivedSet {
+                target: c.target.clone(),
+                archived: c.archived,
+            }]),
             InboxCommand::InboxList(_) => Ok(vec![]),
         }
     }
@@ -235,6 +239,7 @@ impl Decider for ToyInbox {
             }),
             InboxCommand::InboxAck(_) => WireReply::InboxAck(Ack),
             InboxCommand::InboxMarkRead(_) => WireReply::InboxMarkRead(Ack),
+            InboxCommand::SetArchived(_) => WireReply::SetArchived(Ack),
             InboxCommand::InboxRaise(_) => WireReply::InboxRaise(Ack),
         }
     }
@@ -794,4 +799,122 @@ async fn sidebar_projection_and_reactor_update_live() {
     .expect("marking read and acking cleared badges");
 
     reactor_handle.abort();
+}
+
+struct DynamicNamesFeed {
+    names: tokio::sync::watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
+}
+
+impl AgentFeed for DynamicNamesFeed {
+    fn page(
+        &self,
+        _wave: &WaveSlug,
+        _role: &RoleName,
+        _after: Option<BbSeq>,
+        _limit: u32,
+    ) -> BoxFut<'_, Result<rex_wave_api::read::ThreadPageView, ApiError>> {
+        Box::pin(async {
+            Err(ApiError::Unavailable {
+                family: Family::Wave,
+            })
+        })
+    }
+
+    fn live(
+        &self,
+        _wave: &WaveSlug,
+        _role: &RoleName,
+    ) -> BoxFut<'_, Result<FrameStream, ApiError>> {
+        Box::pin(async {
+            Err(ApiError::Unavailable {
+                family: Family::Wave,
+            })
+        })
+    }
+
+    fn project_names(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>> {
+        Some(self.names.clone())
+    }
+}
+
+#[tokio::test]
+async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resolves() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let (names_tx, names_rx) = tokio::sync::watch::channel(Arc::new(BTreeMap::new()));
+    let router = Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<ToyInbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(DynamicNamesFeed { names: names_rx }),
+        }),
+    });
+
+    let owner = LocalClient::new(
+        router,
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let proj = BbProjectId::parse("proj_edaym59nyn").unwrap();
+    owner
+        .call(RoomEnsure {
+            room: RoomRef::Channel {
+                scope: RoomScope::Project {
+                    project: proj.clone(),
+                },
+                name: ChannelName::parse("general").unwrap(),
+            },
+            topic: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+
+    let mut stream = owner
+        .watch(Interest::Sidebar, Cursor::live())
+        .await
+        .unwrap();
+    let initial = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Frame::Sidebar(snap))) = stream.next().await
+                && !snap.projects.is_empty()
+            {
+                break *snap;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(initial.projects[0].project, proj);
+    assert_eq!(
+        initial.projects[0].name, None,
+        "graceful None while offline"
+    );
+
+    let mut map = BTreeMap::new();
+    map.insert(proj.clone(), "pancake-work".to_owned());
+    names_tx.send(Arc::new(map)).unwrap();
+
+    let named = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Frame::Sidebar(snap))) = stream.next().await
+                && snap.projects.first().and_then(|p| p.name.as_deref()) == Some("pancake-work")
+            {
+                break *snap;
+            }
+        }
+    })
+    .await
+    .expect("live sidebar watch emitted updated human project name");
+    assert_eq!(named.projects[0].name.as_deref(), Some("pancake-work"));
 }

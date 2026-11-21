@@ -116,6 +116,31 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+fn backtick_run(bytes: &[u8], at: usize) -> usize {
+    bytes[at..].iter().take_while(|&&b| b == b'`').count()
+}
+
+/// Where the code span or fenced block opening at `open` ends: just past the
+/// next backtick run of the same length (CommonMark's closing rule), or `None`
+/// when it never closes and the backticks are literal.
+fn code_span_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let n = backtick_run(bytes, open);
+    let mut i = open + n;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let run = backtick_run(bytes, i);
+            if run == n {
+                return Some(i + run);
+            }
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Mentions inside inline code or fenced blocks are quoted, not addressed.
 pub fn resolve_mentions(body: &Body, members: &BTreeMap<Handle, Principal>) -> Mentions {
     let text = body.as_str();
     let bytes = text.as_bytes();
@@ -124,6 +149,10 @@ pub fn resolve_mentions(body: &Body, members: &BTreeMap<Handle, Principal>) -> M
     let mut i = 0;
 
     while i < bytes.len() {
+        if bytes[i] == b'`' {
+            i = code_span_end(bytes, i).unwrap_or(i + backtick_run(bytes, i));
+            continue;
+        }
         if bytes[i] == b'@' && (i == 0 || !is_mention_prev(bytes[i - 1])) {
             let start = i + 1;
             let mut end = start;
@@ -571,7 +600,14 @@ impl Decider for Rooms {
                     },
                 }
 
-                let mentions = resolve_mentions(&c.body, &members);
+                let mut mentions = resolve_mentions(&c.body, &members);
+                if matches!(ctx.by, Principal::System { .. })
+                    && matches!(id, RoomId::Channel { .. })
+                {
+                    mentions
+                        .principals
+                        .retain(|p| !matches!(p, Principal::Operator { .. }));
+                }
                 events.push(RoomEvent::Posted {
                     body: c.body.clone(),
                     mentions,

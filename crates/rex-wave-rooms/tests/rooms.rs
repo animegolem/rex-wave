@@ -290,6 +290,30 @@ fn resolve_mentions_parses_handles_qualified_roles_all_and_ignores_emails() {
     assert_eq!(m_all.principals.len(), 3);
 }
 
+#[test]
+fn resolve_mentions_skips_inline_code_and_fenced_blocks() {
+    let mut members = BTreeMap::new();
+    let sam = seat("sam");
+    let verifier = worker("auth-v2", "verifier");
+    members.insert(Handle::parse("sam").unwrap(), sam.clone());
+    members.insert(Handle::parse("verifier").unwrap(), verifier.clone());
+
+    let quoted = Body::parse(
+        "Post one message addressed to `@sam`, or ``@all `x` here``.\n```\n@verifier ok\n```\nDone.",
+    )
+    .unwrap();
+    let m = resolve_mentions(&quoted, &members);
+    assert!(!m.all, "@all inside a double-backtick span is quoted");
+    assert!(m.principals.is_empty(), "{:?}", m.principals);
+
+    let mixed =
+        Body::parse("`@sam` is quoted but @verifier is addressed; stray ` then @sam").unwrap();
+    let m = resolve_mentions(&mixed, &members);
+    assert_eq!(m.principals.len(), 2, "unclosed backtick is literal");
+    assert!(m.principals.contains(&sam));
+    assert!(m.principals.contains(&verifier));
+}
+
 #[tokio::test]
 async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
     let dir = tempfile::tempdir().unwrap();

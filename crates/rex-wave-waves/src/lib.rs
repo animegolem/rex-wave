@@ -55,14 +55,9 @@ pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase
             })
         }
         (
-            WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread },
+            WorkerPhase::Live { .. } | WorkerPhase::Retiring { .. } | WorkerPhase::Requested { .. },
             Observation::Archived,
-        ) => Ok(WorkerPhase::Retired {
-            thread: Some(thread.clone()),
-        }),
-        (WorkerPhase::Requested { .. }, Observation::Archived) => {
-            Ok(WorkerPhase::Retired { thread: None })
-        }
+        ) => Ok(phase.observe(obs)),
         _ => Err(format!(
             "observation {obs:?} does not apply in phase {phase:?}"
         )),
@@ -631,11 +626,13 @@ impl<H: AgentHost> WaveConductor<H> {
                     role,
                     observation: Observation::Archived,
                 } = ev
-                    && let Some(WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread }) =
-                        self.view
-                            .get(wave)
-                            .and_then(|st| st.workers.get(role))
-                            .map(|r| &r.phase)
+                    && let Some(
+                        WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread, .. },
+                    ) = self
+                        .view
+                        .get(wave)
+                        .and_then(|st| st.workers.get(role))
+                        .map(|r| &r.phase)
                 {
                     let th = thread.clone();
                     self.retire_attempts.remove(&th);
@@ -812,7 +809,7 @@ impl<H: AgentHost> WaveConductor<H> {
                             );
                         }
                     }
-                    WorkerPhase::Retiring { thread } => {
+                    WorkerPhase::Retiring { thread, .. } => {
                         if self.retire_attempts.get(thread).copied().unwrap_or(0)
                             < MAX_RETIRE_ATTEMPTS
                             && let Err(e) = self.retire_worker(client, &wave, role, thread).await
@@ -897,7 +894,15 @@ impl<H: AgentHost> WaveConductor<H> {
                 }
                 WaveEvent::WorkerObserved { .. } | WaveEvent::Finished { .. } => {}
             },
-            (StreamId::Room { room }, Event::Room(RoomEvent::Posted { body, mentions, .. })) => {
+            (
+                StreamId::Room { room },
+                Event::Room(RoomEvent::Posted {
+                    body,
+                    mentions,
+                    idem,
+                    ..
+                }),
+            ) => {
                 // Briefs posted by WaveConductor itself are already delivered in `SpawnRequest::prompt`.
                 if matches!(
                     env.by,
@@ -905,6 +910,11 @@ impl<H: AgentHost> WaveConductor<H> {
                         part: SystemPart::WaveConductor
                     }
                 ) {
+                    return Ok(());
+                }
+                if idem.as_ref().is_some_and(|k| {
+                    k.as_str().starts_with("wave:") && k.as_str().contains(":turn:")
+                }) {
                     return Ok(());
                 }
                 self.route_post_wakeups(room, env.seq, &env.by, body, mentions)
@@ -1007,7 +1017,7 @@ impl<H: AgentHost> WaveConductor<H> {
         self.ensure_member(client, room, worker_principal, handle)
             .await?;
 
-        let idem = IdemKey::parse(format!("wave:{wave}:brief:{role}:{attempt}"))?;
+        let idem = IdemKey::parse(format!("wave:{wave}:brief:{role}"))?;
         let mention_prefix = format!("@{role}");
         let brief_post = if rec.brief.as_str().starts_with(&mention_prefix) {
             rec.brief.clone()
@@ -1177,7 +1187,7 @@ impl<H: AgentHost> WaveConductor<H> {
 
     fn retiring_thread(&self, wave: &WaveSlug, role: &RoleName) -> Option<BbThreadId> {
         match &self.view.get(wave)?.workers.get(role)?.phase {
-            WorkerPhase::Retiring { thread } => Some(thread.clone()),
+            WorkerPhase::Retiring { thread, .. } => Some(thread.clone()),
             _ => None,
         }
     }
@@ -1530,6 +1540,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn finishing_a_wave_keeps_each_workers_error_through_retirement() {
+        let mut state = WaveState::default();
+        let mut seq = 0u64;
+        let op = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+        let sys = Principal::System {
+            part: SystemPart::BbBridge,
+        };
+        let spec = sample_spec();
+        let author = RoleName::parse("author").unwrap();
+        let verifier = RoleName::parse("verifier").unwrap();
+        let observe = |state: &mut WaveState, seq: &mut u64, role: &RoleName, o| {
+            apply_cmd(
+                state,
+                seq,
+                sys.clone(),
+                WaveCommand::WaveObserve(WaveObserve {
+                    wave: spec.slug.clone(),
+                    role: role.clone(),
+                    observation: o,
+                }),
+            )
+            .unwrap();
+        };
+        apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveStart(WaveStart {
+                spec: spec.clone(),
+                idem: None,
+            }),
+        )
+        .unwrap();
+        for (role, thread) in [(&author, "th_author"), (&verifier, "th_verifier")] {
+            observe(
+                &mut state,
+                &mut seq,
+                role,
+                Observation::Spawned {
+                    attempt: 1,
+                    thread: BbThreadId::parse(thread).unwrap(),
+                },
+            );
+        }
+        observe(
+            &mut state,
+            &mut seq,
+            &author,
+            Observation::Activity {
+                activity: Activity::Errored {
+                    error: "ServiceUnavailableError".into(),
+                },
+            },
+        );
+        observe(
+            &mut state,
+            &mut seq,
+            &verifier,
+            Observation::Activity {
+                activity: Activity::Idle,
+            },
+        );
+        apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveFinish(WaveFinish {
+                wave: spec.slug.clone(),
+                outcome: WaveOutcome::Completed {
+                    summary: Body::parse("done").unwrap(),
+                },
+            }),
+        )
+        .unwrap();
+        let phases = |state: &mut WaveState, seq: &mut u64| {
+            let (_, reply) = apply_cmd(
+                state,
+                seq,
+                op.clone(),
+                WaveCommand::WaveView(WaveView {
+                    wave: spec.slug.clone(),
+                }),
+            )
+            .unwrap();
+            let WireReply::WaveView(snap) = reply else {
+                panic!("expected WaveSnapshot")
+            };
+            snap.workers
+                .into_iter()
+                .map(|(r, _, p)| (r.to_string(), p))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let retiring = phases(&mut state, &mut seq);
+        assert_eq!(
+            retiring["author"].error(),
+            Some("ServiceUnavailableError"),
+            "retiring keeps the error: {retiring:?}"
+        );
+        assert_eq!(retiring["verifier"].error(), None);
+
+        observe(&mut state, &mut seq, &author, Observation::Archived);
+        observe(&mut state, &mut seq, &verifier, Observation::Archived);
+        let retired = phases(&mut state, &mut seq);
+        assert_eq!(
+            retired["author"],
+            WorkerPhase::Retired {
+                thread: Some(BbThreadId::parse("th_author").unwrap()),
+                errored: Some("ServiceUnavailableError".into()),
+            }
+        );
+        assert_eq!(
+            retired["verifier"],
+            WorkerPhase::Retired {
+                thread: Some(BbThreadId::parse("th_verifier").unwrap()),
+                errored: None,
+            }
+        );
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum HostCall {
         Spawn {
@@ -1558,6 +1690,7 @@ mod tests {
     struct FakeHost {
         calls: Arc<Mutex<Vec<HostCall>>>,
         unreachable_role: Arc<Mutex<Option<String>>>,
+        rejected_role: Arc<Mutex<Option<String>>>,
         unreachable_retire: Arc<Mutex<bool>>,
         reject_retire: Arc<Mutex<bool>>,
         retire_attempts: Arc<Mutex<u32>>,
@@ -1567,6 +1700,11 @@ mod tests {
         async fn spawn(&self, req: SpawnRequest) -> Result<BbThreadId, HostError> {
             if self.unreachable_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
                 return Err(HostError::Unreachable("transient disconnect".into()));
+            }
+            if self.rejected_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
+                return Err(HostError::Rejected(
+                    "environment provider requires a machine".into(),
+                ));
             }
             self.calls.lock().unwrap().push(HostCall::Spawn {
                 wave: req.wave.to_string(),
@@ -2044,11 +2182,13 @@ mod tests {
             ]
         );
         let snap = block_on(op.call(WaveView { wave })).unwrap();
-        assert!(
-            snap.workers
-                .iter()
-                .all(|(_, _, p)| matches!(p, WorkerPhase::Retired { thread: Some(_) }))
-        );
+        assert!(snap.workers.iter().all(|(_, _, p)| matches!(
+            p,
+            WorkerPhase::Retired {
+                thread: Some(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2268,6 +2408,69 @@ mod tests {
     }
 
     #[test]
+    fn rejected_spawn_retries_post_the_brief_once() {
+        let bus = MiniBus::new();
+        let host = FakeHost::default();
+        *host.rejected_role.lock().unwrap() = Some("author".into());
+        let mut conductor = WaveConductor::new(host.clone());
+        let op = BusClient {
+            me: Principal::Operator {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+            bus: bus.clone(),
+        };
+        let sys_conductor = BusClient {
+            me: Principal::System {
+                part: SystemPart::WaveConductor,
+            },
+            bus: bus.clone(),
+        };
+        block_on(op.call(WaveStart {
+            spec: sample_spec(),
+            idem: None,
+        }))
+        .unwrap();
+        let mut author_briefs = 0;
+        let mut drain = |conductor: &mut WaveConductor<FakeHost>| loop {
+            let next = bus.lock().unwrap().queue.pop_front();
+            let Some(env) = next else { break };
+            if let Event::Room(RoomEvent::Posted { body, .. }) = &env.event
+                && body.as_str().starts_with("@author ")
+            {
+                author_briefs += 1;
+            }
+            let _ = block_on(conductor.handle_frame(Frame::Committed(env), &sys_conductor));
+        };
+        drain(&mut conductor);
+        let _ = block_on(conductor.handle_frame(
+            Frame::CaughtUp {
+                cursor: Cursor::default(),
+            },
+            &sys_conductor,
+        ));
+        drain(&mut conductor);
+
+        let snap = block_on(op.call(WaveView {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+        }))
+        .unwrap();
+        let author = &snap
+            .workers
+            .iter()
+            .find(|(r, _, _)| r.as_str() == "author")
+            .unwrap()
+            .2;
+        assert!(
+            matches!(author, WorkerPhase::Failed { .. }),
+            "every attempt was rejected: {author:?}"
+        );
+        assert_eq!(
+            author_briefs, 1,
+            "brief posted once across {MAX_SPAWN_ATTEMPTS} attempts"
+        );
+    }
+
+    #[test]
     fn conductor_continues_past_per_worker_errors_and_retries_rejected_retire() {
         let bus = MiniBus::new();
         let host = FakeHost::default();
@@ -2379,7 +2582,13 @@ mod tests {
             "dirty reconcile spawned author on next frame"
         );
         assert!(
-            matches!(verifier_p3, WorkerPhase::Retired { thread: Some(_) }),
+            matches!(
+                verifier_p3,
+                WorkerPhase::Retired {
+                    thread: Some(_),
+                    ..
+                }
+            ),
             "dirty reconcile completed retire"
         );
 

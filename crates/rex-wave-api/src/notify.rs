@@ -7,6 +7,7 @@
 use crate::board::CardRef;
 use crate::id::{BbInteractionId, Principal, RoleName, Seq, UnixMs, WaveSlug};
 use crate::mail::{LetterRef, MailboxItem};
+use crate::read::ArchiveTarget;
 use crate::registry::WireCommand;
 use crate::room::RoomId;
 use schemars::JsonSchema;
@@ -47,6 +48,8 @@ pub enum NotifyKind {
         wave: WaveSlug,
         role: RoleName,
         why: String,
+        #[serde(default)]
+        seq: Seq,
     },
     WaveFinished {
         wave: WaveSlug,
@@ -161,5 +164,9 @@ pub enum InboxEvent {
     CursorAdvanced {
         room: RoomId,
         upto: Seq,
+    },
+    ArchivedSet {
+        target: ArchiveTarget,
+        archived: bool,
     },
 }

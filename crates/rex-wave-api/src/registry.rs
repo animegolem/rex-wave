@@ -174,10 +174,11 @@ commands! {
         BoardView   -> BoardSnapshot : "board_view",   Member, false, "Lanes and live cards of one board.";
     }
     Inbox(InboxCommand) {
-        InboxList     -> InboxPage : "inbox_list",      Member, false, "Your ranked notifications.";
-        InboxAck      -> Ack       : "inbox_ack",       Member, true,  "Mark notifications seen / done / dismissed.";
-        InboxMarkRead -> Ack       : "inbox_mark_read", Member, true,  "Advance your read cursor in a room.";
-        InboxRaise    -> Ack       : "inbox_raise",     System, true,  "Herald files a notification into one principal's inbox.";
+        InboxList     -> InboxPage : "inbox_list",      Member,   false, "Your ranked notifications.";
+        InboxAck      -> Ack       : "inbox_ack",       Member,   true,  "Mark notifications seen / done / dismissed.";
+        InboxMarkRead -> Ack       : "inbox_mark_read", Member,   true,  "Advance your read cursor in a room.";
+        SetArchived   -> Ack       : "set_archived",    Operator, true,  "Archive or unarchive a project, wave, or room in the sidebar tree.";
+        InboxRaise    -> Ack       : "inbox_raise",     System,   true,  "Herald files a notification into one principal's inbox.";
     }
     Mail(MailCommand) {
         MailPromote  -> LetterRef : "promote_to_letter", Member, true, "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).";
