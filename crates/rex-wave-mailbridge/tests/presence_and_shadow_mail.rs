@@ -10,7 +10,8 @@ use rex_wave_mailbridge::{
     decide_mail_rings_for_seat, extract_letter_timestamp, format_delivery_status, is_process_alive,
     load_claude_session_file_from, parse_acks_jsonl, parse_claude_session_json, project,
     query_process_start, run_shadow_pass, score_shadow_against_acks, score_shadow_jsonl,
-    seed_records_from_interchange, select_binding_for_delivery, sender_delivery_notice,
+    seed_records_from_interchange, seed_records_from_interchange_with_options,
+    select_binding_for_delivery, sender_delivery_notice,
 };
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
@@ -3288,4 +3289,414 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
     let rec = st.seat(&tally_seat).unwrap();
     assert_eq!(rec.start_cmd, None);
     assert_eq!(rec.resume_cmd, None);
+}
+
+#[test]
+fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
+    let dir = TempDirGuard::new("pr22-seed-all-sources");
+    let house = dir.path();
+    let interchange = house.join("interchange");
+    fs::create_dir_all(interchange.join("postmaster/state")).unwrap();
+    fs::create_dir_all(interchange.join("state")).unwrap();
+    fs::create_dir_all(house.join(".watchers")).unwrap();
+
+    fs::write(
+        interchange.join("postmaster/state/roster.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "house-roster/2",
+            "seats": {
+                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
+                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        house.join(".watchers/mailwatch-routes.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "crest": { "own_knocker": true, "aliases": ["crest"] },
+            "desktop": { "aliases": ["desktop"] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        interchange.join("state/bb-knock-routes.tsv"),
+        "# comment\nseat\tbb_thread_id\tnote\nfathom\tthr_bns4xpcfs9\tEmacs-FV review\n",
+    )
+    .unwrap();
+    fs::write(
+        interchange.join("state/codex-knock-routes.tsv"),
+        "seat\thostId\tthreadId\tnote\nastra-emacs-fv\tlocal\t01a1b9c9\tEmacs Verify\n",
+    )
+    .unwrap();
+    fs::write(
+        house.join("herdr-registry.tsv"),
+        concat!(
+            "# seat\ttarget\tverified_date\tverified_how\n",
+            "seat\ttarget\tdate\thow\n",
+            "labile\trex:d5b20f/69f276\t2026-11-16\tself\n",
+            "plumb\tw3:pN\t2026-10-13\tpane\n",
+            "waverunner\tw4:p27\t2026-10-13\tpane\n",
+            "sol_ew\tw5:p2\t2026-10-20\tpane\n",
+            "excluded-seat\tw4:p1S\t2026-10-13\tPERMANENTLY EXCLUDED\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        interchange.join("state/ledger.md"),
+        concat!(
+            "# Interchange ledger\n",
+            "2026-08-15 | CLAIM | mote | local model\n",
+            "2026-08-15 | CLAIM | Parallax | web seat\n",
+            "2026-09-03 | CLAIM | labile | already machine-checked via herdr-registry\n",
+            "2026-09-16 | CLAIM | to-cc/tally-introduction-r1.md | legacy file-path row\n",
+            "2026-09-17 | ACK | to-cc/foo.md | not a claim\n",
+        ),
+    )
+    .unwrap();
+
+    let seats_tsv_path = house.join("seats.tsv");
+    fs::write(
+        &seats_tsv_path,
+        concat!(
+            "# external seats map\n",
+            "ML-Papers\tlabile\t/tmp/labile\n",
+            "Pasted-text.txt attachment (fork) (fork)\tfathom\t/tmp/fathom\n",
+            "fathom-fork\tfathom\t/tmp/fathom\n",
+            "Astra-Outside-Review\tfathom\t/tmp/fathom\n",
+            "cleanup-Color_Tool_K-Means\tchroma\t/tmp/chroma\n",
+            "golem-session\tgolem\t/tmp/golem\n",
+        ),
+    )
+    .unwrap();
+
+    // Base `seed_records_from_interchange` reads all 6 house files hermetically.
+    let base_plan = seed_records_from_interchange(&interchange).unwrap();
+    assert_eq!(base_plan.sources_read.len(), 6);
+    assert!(base_plan.skipped_targets.contains(&"golem".to_owned()));
+    assert!(base_plan.skipped_targets.contains(&"desktop".to_owned()));
+
+    let by_seat = |plan: &rex_wave_mailbridge::SeedInterchangePlan, name: &str| {
+        plan.claims
+            .iter()
+            .find(|c| c.seat.as_str() == name)
+            .cloned()
+    };
+
+    assert_eq!(
+        by_seat(&base_plan, "fathom").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked)
+    );
+    assert_eq!(
+        by_seat(&base_plan, "astra-emacs-fv").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked)
+    );
+    assert_eq!(
+        by_seat(&base_plan, "labile").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked),
+        "labile is in herdr-registry.tsv so MachineChecked beats ledger.md WitnessedBy"
+    );
+    assert_eq!(
+        by_seat(&base_plan, "plumb").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked)
+    );
+    assert_eq!(
+        by_seat(&base_plan, "waverunner").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked)
+    );
+    assert_eq!(
+        by_seat(&base_plan, "sol_ew").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked)
+    );
+    assert_eq!(
+        by_seat(&base_plan, "crest").unwrap().verified_how,
+        Some(VerificationKind::MachineChecked)
+    );
+    assert!(
+        by_seat(&base_plan, "excluded-seat").is_none(),
+        "w4:p1S row must be permanently excluded"
+    );
+    assert!(by_seat(&base_plan, "golem").is_none());
+    assert!(by_seat(&base_plan, "desktop").is_none());
+    assert!(
+        base_plan
+            .claims
+            .iter()
+            .all(|c| !c.seat.as_str().contains('/'))
+    );
+
+    let tally_seat = SeatName::parse("tally").unwrap();
+    assert_eq!(
+        by_seat(&base_plan, "mote").unwrap().verified_how,
+        Some(VerificationKind::WitnessedBy {
+            seat: tally_seat.clone(),
+        })
+    );
+    assert_eq!(
+        by_seat(&base_plan, "parallax").unwrap().verified_how,
+        Some(VerificationKind::WitnessedBy {
+            seat: tally_seat.clone(),
+        })
+    );
+    assert_eq!(
+        by_seat(&base_plan, "neon").unwrap().verified_how,
+        Some(VerificationKind::WitnessedBy { seat: tally_seat })
+    );
+    assert!(by_seat(&base_plan, "chroma").is_none());
+
+    // Extended `seed_records_from_interchange_with_options` includes `seats.tsv`.
+    let ext_plan =
+        seed_records_from_interchange_with_options(&interchange, Some(&seats_tsv_path)).unwrap();
+    assert_eq!(ext_plan.sources_read.len(), 7);
+    let chroma = by_seat(&ext_plan, "chroma").expect("chroma seeded from seats.tsv");
+    assert_eq!(chroma.verified_how, Some(VerificationKind::MachineChecked));
+    assert!(
+        chroma
+            .aliases
+            .iter()
+            .any(|a| a.as_str() == "cleanup-color_tool_k-means")
+    );
+    let fathom = by_seat(&ext_plan, "fathom").unwrap();
+    assert!(
+        fathom
+            .aliases
+            .iter()
+            .any(|a| a.as_str() == "astra-outside-review")
+    );
+    assert!(
+        !fathom.aliases.iter().any(|a| a.as_str().contains("fork")),
+        "fork/attachment session names must not be registered as aliases"
+    );
+    let labile = by_seat(&ext_plan, "labile").unwrap();
+    assert!(labile.aliases.iter().any(|a| a.as_str() == "ml-papers"));
+
+    // Explicit missing `seats.tsv` returns NotFound instead of silently dropping the flag.
+    let missing_seats = house.join("does-not-exist-seats.tsv");
+    let err_missing =
+        seed_records_from_interchange_with_options(&interchange, Some(&missing_seats)).unwrap_err();
+    assert!(
+        matches!(err_missing, ApiError::NotFound { .. }),
+        "missing explicit seats_tsv must return NotFound, got {err_missing:?}"
+    );
+
+    // Symlinked seed sources must be refused.
+    #[cfg(unix)]
+    {
+        let symlink_seats = house.join("seats-link.tsv");
+        std::os::unix::fs::symlink(&seats_tsv_path, &symlink_seats).unwrap();
+        let err = seed_records_from_interchange_with_options(&interchange, Some(&symlink_seats))
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Denied { .. }), "got {err:?}");
+    }
+}
+
+#[test]
+fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
+    let dir = TempDirGuard::new("pr22-shared-lane-r3a");
+    let root = dir.path();
+    fs::create_dir_all(root.join("mail")).unwrap();
+    fs::create_dir_all(root.join("to-desktop")).unwrap();
+    fs::create_dir_all(root.join("to-cc")).unwrap();
+    fs::create_dir_all(root.join("to-tally")).unwrap();
+    fs::create_dir_all(root.join("state")).unwrap();
+    fs::write(root.join("state/acks.jsonl"), b"").unwrap();
+
+    // Box doors and root README/chatter files must be skipped.
+    fs::write(root.join("README.md"), b"root door\n").unwrap();
+    fs::write(root.join("readme-extra.md"), b"root readme variant\n").unwrap();
+    fs::write(root.join("chatter.md"), b"root chatter\n").unwrap();
+    fs::write(root.join("to-tally/README.md"), b"tally door\n").unwrap();
+    fs::write(root.join("to-desktop/README.md"), b"desktop door\n").unwrap();
+    fs::write(root.join("mail/README.md"), b"mail door\n").unwrap();
+
+    // `to-desktop/` is a shared lane: routes by `to:`/`cc:`, never emits `desktop`.
+    fs::write(
+        root.join("to-desktop/01-shared-review.md"),
+        b"---\nfrom: crest\nto: tally (Review Lead desk)\ncc: astra (astra_votp), tangle\n---\nbody\n",
+    )
+    .unwrap();
+
+    // `to-cc/` remains a legacy non-seat box (`SkipNonSeatTarget` for `cc`).
+    fs::write(
+        root.join("to-cc/02-legacy-intake.md"),
+        b"---\nfrom: crest\nto: tally\n---\nbody\n",
+    )
+    .unwrap();
+
+    // `r3/r3a` addressing: semicolon `cc ` / `cc:`, slash splits, parenthetical glosses vs aliases,
+    // and self-author exclusion on shared lanes.
+    fs::write(
+        root.join("mail/03-r3a-units.md"),
+        b"---\nfrom: crest\nto: foo; cc Tally (desk)\ncc: \"Genga-Opus-5 (BOTH live claimants)\", sol (sol_ew / CodeLead-expanding-worlds)\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("mail/04-self-author.md"),
+        b"---\nfrom: genga (session \"Genga-Opus-5.5\")\nto: genga (session users-c7); cc: tally, tally-watcher\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("mail/05-paren-gloss.md"),
+        b"---\nfrom: crest\nto: astra_votp (Astra), tally (CTO)\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("to-tally/06-box-letter.md"),
+        b"---\nfrom: tally\nto: tally\n---\nbody\n",
+    )
+    .unwrap();
+    // File path containing `/` in `to:` must never spawn bogus seats from path segments,
+    // while `tally / genga` resolves both known seats.
+    fs::write(
+        root.join("mail/07-slash-path-and-pair.md"),
+        b"---\nfrom: crest\nto: tally (the desk), for the cross-read with resident_memories/tally/reports/2026-10-15-republican-factory/verdict.md\ncc: tally / genga\n---\nbody\n",
+    )
+    .unwrap();
+    // Multi-author `from:` + `author:` removes every authoring seat on a shared lane.
+    fs::write(
+        root.join("mail/08-multi-author.md"),
+        b"---\nfrom: tally / genga\nauthor: loupe\nto: tally, genga, loupe, tangle\n---\nbody\n",
+    )
+    .unwrap();
+
+    // Build a presence-backed AliasMap mirroring a seeded house.
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    for (seat, aliases) in [
+        ("tally", vec!["tally_votp"]),
+        ("genga", vec!["genga-opus-5"]),
+        ("astra_votp", vec![]),
+        ("tangle", vec![]),
+        ("sol_ew", vec![]),
+        ("tally-watcher", vec![]),
+        ("loupe", vec![]),
+    ] {
+        apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            owner_p.clone(),
+            UnixMs(1_000),
+            PresenceCommand::PresenceClaim(PresenceClaim {
+                aliases: aliases
+                    .into_iter()
+                    .map(|a| SeatName::parse(a).unwrap())
+                    .collect(),
+                ..empty_claim(seat)
+            }),
+            |_, _| true,
+        )
+        .unwrap();
+    }
+    let aliases = AliasMap::from_presence(&st);
+
+    let ro = ReadOnlyInterchange::open(root).unwrap();
+    let scanned = ro.scan_letters(&aliases).unwrap();
+    let by_path: std::collections::BTreeMap<&str, Vec<&str>> = scanned
+        .iter()
+        .map(|l| {
+            (
+                l.rel_path.as_str(),
+                l.recipients.iter().map(SeatName::as_str).collect(),
+            )
+        })
+        .collect();
+
+    // No README* or chatter.md file scanned anywhere.
+    assert_eq!(scanned.len(), 8, "scanned={by_path:?}");
+    assert!(
+        by_path
+            .keys()
+            .all(|p| !p.to_ascii_lowercase().contains("readme") && !p.contains("chatter"))
+    );
+
+    // `to-desktop/` routed by frontmatter, zero `desktop` recipients.
+    assert_eq!(
+        by_path["to-desktop/01-shared-review.md"],
+        vec!["astra", "astra_votp", "tally", "tangle"]
+    );
+    assert!(
+        scanned
+            .iter()
+            .all(|l| !l.recipients.iter().any(|r| r.as_str() == "desktop"))
+    );
+
+    // `to-cc/` still resolves to `cc` -> SkipNonSeatTarget.
+    assert_eq!(by_path["to-cc/02-legacy-intake.md"], vec!["cc"]);
+
+    // `r3/r3a` units: `foo`, `tally` (no `desk`), `genga` (from `Genga-Opus-5`), `sol` + `sol_ew`.
+    assert_eq!(
+        by_path["mail/03-r3a-units.md"],
+        vec!["foo", "genga", "sol", "sol_ew", "tally"]
+    );
+
+    // Self-author `genga` excluded on shared lane, keeping `tally` and `tally-watcher`.
+    assert_eq!(
+        by_path["mail/04-self-author.md"],
+        vec!["tally", "tally-watcher"]
+    );
+
+    // Parenthetical glosses `(Astra)` and `(CTO)` are ignored.
+    assert_eq!(
+        by_path["mail/05-paren-gloss.md"],
+        vec!["astra_votp", "tally"]
+    );
+
+    // Box letter in `to-tally/` still targets `tally`.
+    assert_eq!(by_path["to-tally/06-box-letter.md"], vec!["tally"]);
+
+    // Slash path does not mint `reports` or `2026-10-15-republican-factory`, while `tally / genga` resolves both.
+    assert_eq!(
+        by_path["mail/07-slash-path-and-pair.md"],
+        vec!["genga", "tally"]
+    );
+
+    // Multi-author `from: tally / genga` + `author: loupe` excludes all three, leaving `tangle`.
+    assert_eq!(by_path["mail/08-multi-author.md"], vec!["tangle"]);
+
+    // Offline (`AliasMap::empty()`) also ignores parenthetical glosses (`CTO`, `Astra`) and path segments.
+    let scanned_offline = ro.scan_letters(&AliasMap::empty()).unwrap();
+    let offline_by_path: std::collections::BTreeMap<&str, Vec<&str>> = scanned_offline
+        .iter()
+        .map(|l| {
+            (
+                l.rel_path.as_str(),
+                l.recipients.iter().map(SeatName::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        offline_by_path["mail/05-paren-gloss.md"],
+        vec!["astra_votp", "tally"]
+    );
+    assert_eq!(
+        offline_by_path["mail/07-slash-path-and-pair.md"],
+        vec!["tally"]
+    );
+    assert_eq!(offline_by_path["mail/08-multi-author.md"], vec!["tangle"]);
+
+    // Verify `to-cc/02-legacy-intake.md` produces `SkipNonSeatTarget` in full shadow pass.
+    let pass = run_shadow_pass(
+        &ro,
+        &st,
+        &IncarnationAffinity::new(),
+        &RetryState::new(),
+        &RingPolicy::default(),
+        &aliases,
+        UnixMs(2_000),
+    )
+    .unwrap();
+    let non_seat_targets: Vec<&str> = pass
+        .decisions
+        .iter()
+        .filter_map(|d| match d {
+            RingDecision::SkipNonSeatTarget { seat, .. } => Some(seat.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(non_seat_targets, vec!["cc"]);
 }

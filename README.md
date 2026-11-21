@@ -36,7 +36,7 @@ REX_WAVE_BB_TOKEN="$BB_PLUGIN_TOKEN" rex-wave daemon \
 	--http 127.0.0.1:7783
 ```
 
-The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
+The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. Place `--mail-sandbox` outside `~/agent-folder` and every other path listed in `protected-roots`—never inside a seat's own room under the house folder. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
 
 ```sh
 mkdir -p ~/.config/rex-wave

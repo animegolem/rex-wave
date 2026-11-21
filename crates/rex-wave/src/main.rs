@@ -35,9 +35,10 @@ use rex_wave_board::task_org::{
 };
 use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
-    RingPolicy, check_gate1_fixtures, extract_shadow_aliases, load_claude_session_file,
-    parse_acks_jsonl, parse_claude_session_json, run_shadow_pass, score_shadow_jsonl,
-    seed_records_from_interchange,
+    RingPolicy, check_gate1_fixtures, compare_shadow_with_mailwatch_seen, extract_shadow_aliases,
+    load_claude_session_file, parse_acks_jsonl, parse_claude_session_json,
+    parse_mailwatch_seen_jsonl, run_shadow_pass, score_shadow_jsonl,
+    seed_records_from_interchange_with_options,
 };
 use rex_wave_mcp::McpServer;
 use rex_wave_runtime::{Decider, EntryMeta};
@@ -568,6 +569,9 @@ pub enum MailCmd {
         /// Optional Gate 1 fixture file (`cases.jsonl`) to check case coverage.
         #[arg(long)]
         fixtures: Option<PathBuf>,
+        /// Optional `mailwatch.py` ring log (`seen.jsonl`) to cross-check shadow rings against.
+        #[arg(long = "mailwatch-seen")]
+        mailwatch_seen: Option<PathBuf>,
     },
 }
 
@@ -678,9 +682,12 @@ pub enum PresenceCmd {
     /// Seed durable seat records and aliases from an interchange folder (read-only on interchange).
     #[command(name = "seed-interchange")]
     SeedInterchange {
-        /// Interchange directory containing `postmaster/state/roster.json` and/or `.watchers/mailwatch-routes.json`.
+        /// Interchange directory containing house roster, route tables, and ledger files.
         #[arg(long)]
         interchange: PathBuf,
+        /// Optional external `seats.tsv` (`session_name\tseat\troom_path`) file to include.
+        #[arg(long = "seats-tsv")]
+        seats_tsv: Option<PathBuf>,
         /// Preview the computed seed claims without connecting to or mutating the daemon.
         #[arg(long)]
         dry_run: bool,
@@ -3064,6 +3071,7 @@ fn execute_mail_score(
     shadow_path: &Path,
     acks_path: &Path,
     fixtures_path: Option<&Path>,
+    mailwatch_seen_path: Option<&Path>,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
     let shadow_text = std::fs::read_to_string(shadow_path)
@@ -3084,6 +3092,20 @@ fn execute_mail_score(
         None => None,
     };
 
+    let mailwatch_seen = match mailwatch_seen_path {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                CliError::Msg(format!("read mailwatch seen {}: {e}", path.display()))
+            })?;
+            let seen_idx = parse_mailwatch_seen_jsonl(&raw, &aliases).map_err(CliError::Msg)?;
+            Some(
+                compare_shadow_with_mailwatch_seen(&shadow_text, &seen_idx, &aliases)
+                    .map_err(CliError::Msg)?,
+            )
+        }
+        None => None,
+    };
+
     if as_json {
         let mut root = serde_json::json!({
             "shadow_score": score.to_json_value(),
@@ -3099,6 +3121,11 @@ fn execute_mail_score(
             && let Some(obj) = root.as_object_mut()
         {
             obj.insert("fixtures".to_owned(), fx.to_json_value());
+        }
+        if let Some(ref mw) = mailwatch_seen
+            && let Some(obj) = root.as_object_mut()
+        {
+            obj.insert("mailwatch_seen".to_owned(), mw.to_json_value());
         }
         println!(
             "{}",
@@ -3133,6 +3160,18 @@ fn execute_mail_score(
             acks_report.records.len(),
             acks_report.skipped_lines.len(),
         );
+        if let Some(ref mw) = mailwatch_seen {
+            println!(
+                "mailwatch seen: entries={} shadow_ring_referents={} agreed_rung={} own_knocker={} deferred_or_unrung={} other={} absent={}",
+                mw.seen_entries,
+                mw.shadow_ring_referents,
+                mw.agreed_rung,
+                mw.own_knocker_in_mailwatch,
+                mw.deferred_or_unrung_in_mailwatch,
+                mw.other_in_mailwatch,
+                mw.absent_in_mailwatch,
+            );
+        }
         if let Some(ref fx) = fixtures {
             println!(
                 "fixtures: {}/{} Gate 1 cases registered (fixture_ids_registered={}, missing={}, unknown={})",
@@ -3331,13 +3370,14 @@ fn write_file_atomic_plain(target: &Path, bytes: &[u8]) -> Result<(), CliError> 
 
 async fn execute_presence_seed_interchange(
     interchange: &Path,
+    seats_tsv: Option<&Path>,
     dry_run: bool,
     endpoint: Endpoint,
     sock_path: &Path,
     explicit_token: Option<&str>,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let plan = seed_records_from_interchange(interchange)?;
+    let plan = seed_records_from_interchange_with_options(interchange, seats_tsv)?;
     if dry_run {
         if as_json {
             let mut val = plan.to_json_value();
@@ -3805,7 +3845,14 @@ async fn main() -> ExitCode {
             shadow,
             acks,
             fixtures,
-        }) => execute_mail_score(&shadow, &acks, fixtures.as_deref(), cli.json),
+            mailwatch_seen,
+        }) => execute_mail_score(
+            &shadow,
+            &acks,
+            fixtures.as_deref(),
+            mailwatch_seen.as_deref(),
+            cli.json,
+        ),
         Cmd::Schema { bb } => {
             let out = if bb {
                 rex_wave_bb::bb_tool_catalog()
@@ -3872,10 +3919,12 @@ async fn main() -> ExitCode {
         },
         Cmd::Presence(PresenceCmd::SeedInterchange {
             interchange,
+            seats_tsv,
             dry_run,
         }) => {
             execute_presence_seed_interchange(
                 &interchange,
+                seats_tsv.as_deref(),
                 dry_run,
                 endpoint,
                 &sock_path,
