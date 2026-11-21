@@ -35,6 +35,7 @@ use std::io::{self, Read as _};
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -314,16 +315,27 @@ fn spawn_herald_grace_timer(
     client: LocalClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut logged_err = false;
+        const BASE_BACKOFF_MS: u64 = 250;
+        const MAX_BACKOFF_MS: u64 = 5_000;
+        let mut err_streak: u32 = 0;
         loop {
             let now = rex_wave_runtime::now();
             match handle.flush_due_at(now, &client).await {
-                Ok(()) => logged_err = false,
+                Ok(()) => err_streak = 0,
                 Err(err) => {
-                    if !logged_err {
+                    if err_streak == 0 {
                         eprintln!("rex-wave daemon: herald grace flush failed: {err}");
-                        logged_err = true;
                     }
+                    err_streak = err_streak.saturating_add(1);
+                    let shift = err_streak.saturating_sub(1).min(5);
+                    let backoff_ms = BASE_BACKOFF_MS
+                        .saturating_mul(1u64 << shift)
+                        .min(MAX_BACKOFF_MS);
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                        () = handle.notified() => {}
+                    }
+                    continue;
                 }
             }
             match handle.next_grace_deadline(now) {
@@ -342,7 +354,13 @@ fn spawn_herald_grace_timer(
     })
 }
 
-async fn unbind_uds_sessions(monitor: &LocalClient, target_conn: Option<u64>) {
+enum UdsUnbindScope<'a> {
+    AllOrphanedOnStart,
+    SingleConn(u64),
+    AllNotIn(&'a HashSet<u64>),
+}
+
+async fn unbind_uds_sessions(monitor: &LocalClient, scope: UdsUnbindScope<'_>) {
     let snap = match monitor
         .call(PresenceList {
             project: None,
@@ -368,12 +386,22 @@ async fn unbind_uds_sessions(monitor: &LocalClient, target_conn: Option<u64>) {
             let TransportEndpoint::UdsSession { conn_id, .. } = binding.endpoint else {
                 continue;
             };
-            if target_conn.is_some_and(|want| want != conn_id) {
-                continue;
-            }
-            let reason = match target_conn {
-                Some(id) => format!("uds connection #{id} disconnected"),
-                None => format!("orphaned uds connection #{conn_id} swept on daemon start"),
+            let reason = match scope {
+                UdsUnbindScope::AllOrphanedOnStart => {
+                    format!("orphaned uds connection #{conn_id} swept on daemon start")
+                }
+                UdsUnbindScope::SingleConn(want) => {
+                    if want != conn_id {
+                        continue;
+                    }
+                    format!("uds connection #{want} disconnected")
+                }
+                UdsUnbindScope::AllNotIn(live_conns) => {
+                    if live_conns.contains(&conn_id) {
+                        continue;
+                    }
+                    format!("uds connection #{conn_id} disconnected (overflow sweep)")
+                }
             };
             if let Err(err) = monitor
                 .call(PresenceUnbind {
@@ -393,7 +421,8 @@ async fn unbind_uds_sessions(monitor: &LocalClient, target_conn: Option<u64>) {
 }
 
 struct PresenceDisconnectHooks {
-    tracked: Mutex<HashSet<u64>>,
+    tracked: Arc<Mutex<HashSet<u64>>>,
+    overflow_sweep: Arc<AtomicBool>,
     disconnect_tx: tokio::sync::mpsc::Sender<u64>,
 }
 
@@ -412,7 +441,10 @@ impl ConnectionHooks for PresenceDisconnectHooks {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&conn_id);
         if had_binding && let Err(err) = self.disconnect_tx.try_send(conn_id) {
-            eprintln!("rex-wave daemon: disconnect queue full for conn #{conn_id}: {err}");
+            self.overflow_sweep.store(true, Ordering::Release);
+            eprintln!(
+                "rex-wave daemon: disconnect queue full for conn #{conn_id} (scheduled overflow sweep): {err}"
+            );
         }
     }
 }
@@ -420,10 +452,16 @@ impl ConnectionHooks for PresenceDisconnectHooks {
 fn spawn_presence_disconnect_worker(
     monitor: LocalClient,
     mut rx: tokio::sync::mpsc::Receiver<u64>,
+    tracked: Arc<Mutex<HashSet<u64>>>,
+    overflow_sweep: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(conn_id) = rx.recv().await {
-            unbind_uds_sessions(&monitor, Some(conn_id)).await;
+            unbind_uds_sessions(&monitor, UdsUnbindScope::SingleConn(conn_id)).await;
+            if overflow_sweep.swap(false, Ordering::AcqRel) {
+                let live_snapshot = tracked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                unbind_uds_sessions(&monitor, UdsUnbindScope::AllNotIn(&live_snapshot)).await;
+            }
         }
     })
 }
@@ -584,12 +622,19 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     ));
 
     let presence_monitor = system(SystemPart::PresenceMonitor);
-    unbind_uds_sessions(&presence_monitor, None).await;
+    unbind_uds_sessions(&presence_monitor, UdsUnbindScope::AllOrphanedOnStart).await;
+    let tracked_uds_conns = Arc::new(Mutex::new(HashSet::new()));
+    let overflow_sweep = Arc::new(AtomicBool::new(false));
     let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::channel(256);
-    let presence_disconnect_task =
-        spawn_presence_disconnect_worker(presence_monitor, disconnect_rx);
+    let presence_disconnect_task = spawn_presence_disconnect_worker(
+        presence_monitor,
+        disconnect_rx,
+        tracked_uds_conns.clone(),
+        overflow_sweep.clone(),
+    );
     let hooks: Arc<dyn ConnectionHooks> = Arc::new(PresenceDisconnectHooks {
-        tracked: Mutex::new(HashSet::new()),
+        tracked: tracked_uds_conns,
+        overflow_sweep,
         disconnect_tx,
     });
 

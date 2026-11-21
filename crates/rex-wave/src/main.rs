@@ -3157,7 +3157,7 @@ async fn execute_presence_hold(
                                 },
                                 liveness: LivenessMode::SocketLifetime,
                                 ttl_ms: None,
-                                takeover: true,
+                                takeover: false,
                                 allow_fork: false,
                                 idem: None,
                             })

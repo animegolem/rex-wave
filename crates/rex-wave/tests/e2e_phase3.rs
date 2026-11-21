@@ -341,6 +341,8 @@ struct IsolatedDaemon {
     dir: DirGuard,
     sock: PathBuf,
     http_addr: SocketAddr,
+    t3_addr: SocketAddr,
+    t3_token: String,
     t3_state: Arc<Mutex<MiniT3State>>,
     t3_task: tokio::task::JoinHandle<()>,
     _child: ChildGuard,
@@ -353,21 +355,17 @@ impl Drop for IsolatedDaemon {
 }
 
 impl IsolatedDaemon {
-    async fn start(label: &str) -> Self {
-        let dir = fresh_dir(label);
-        let sandbox = dir.0.join("mail-sandbox");
-        let cfg_dir = dir.0.join("config");
-        std::fs::create_dir_all(&sandbox).unwrap();
-        std::fs::create_dir_all(cfg_dir.join("rex-wave")).unwrap();
-        std::fs::write(sandbox.join(".rex-wave-sandbox"), "e2e\n").unwrap();
-        std::fs::write(cfg_dir.join("rex-wave/protected-roots"), "").unwrap();
-
-        let t3_token = "t3_e2e_secret_tok";
-        let (t3_addr, t3_state, t3_task) = spawn_mock_t3(t3_token).await;
+    async fn spawn_daemon_process(
+        root: &Path,
+        t3_addr: SocketAddr,
+        t3_token: &str,
+    ) -> (PathBuf, SocketAddr, ChildGuard) {
+        let sandbox = root.join("mail-sandbox");
+        let cfg_dir = root.join("config");
         let bell_port = free_port().await;
         let unused_bb_port = free_port().await;
-        let sock = dir.0.join("daemon.sock");
-        let journal = dir.0.join("journal.sqlite3");
+        let sock = root.join("daemon.sock");
+        let journal = root.join("journal.sqlite3");
 
         let mut child = Command::new(bin_path())
             .env("XDG_CONFIG_HOME", &cfg_dir)
@@ -428,14 +426,44 @@ impl IsolatedDaemon {
         .await
         .expect("daemon UDS and ephemeral HTTP became ready");
 
+        (sock, http_addr, ChildGuard(child))
+    }
+
+    async fn start(label: &str) -> Self {
+        let dir = fresh_dir(label);
+        let sandbox = dir.0.join("mail-sandbox");
+        let cfg_dir = dir.0.join("config");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(cfg_dir.join("rex-wave")).unwrap();
+        std::fs::write(sandbox.join(".rex-wave-sandbox"), "e2e\n").unwrap();
+        std::fs::write(cfg_dir.join("rex-wave/protected-roots"), "").unwrap();
+
+        let t3_token = "t3_e2e_secret_tok".to_owned();
+        let (t3_addr, t3_state, t3_task) = spawn_mock_t3(&t3_token).await;
+        let (sock, http_addr, _child) =
+            Self::spawn_daemon_process(&dir.0, t3_addr, &t3_token).await;
+
         Self {
             dir,
             sock,
             http_addr,
+            t3_addr,
+            t3_token,
             t3_state,
             t3_task,
-            _child: ChildGuard(child),
+            _child,
         }
+    }
+
+    async fn restart(&mut self) {
+        let _ = self._child.0.kill();
+        let _ = self._child.0.wait();
+        let _ = std::fs::remove_file(&self.sock);
+        let (sock, http_addr, child) =
+            Self::spawn_daemon_process(&self.dir.0, self.t3_addr, &self.t3_token).await;
+        self.sock = sock;
+        self.http_addr = http_addr;
+        self._child = child;
     }
 
     async fn cli(&self, args: &[&str], envs: &[(&str, &str)], remove_envs: &[&str]) -> Output {
@@ -928,6 +956,97 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         stale_org,
         "stale org-sync conflict must not overwrite local .org edits"
     );
+
+    let sidecar_path = rex_wave_board::conflict_sidecar_path(&org_file);
+    let mut watch_child = ChildGuard(
+        Command::new(bin_path())
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
+            .args([
+                "--socket",
+                daemon.sock.to_str().unwrap(),
+                "--json",
+                "tasks",
+                "org-sync",
+                "#org-e2e",
+                org_path_str,
+                "--watch",
+                "--interval-ms",
+                "60",
+                "--conflict-sidecar",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn tasks org-sync --watch"),
+    );
+    let watch_stdout = watch_child.0.stdout.take().expect("watch stdout");
+    let watch_stderr = watch_child.0.stderr.take().expect("watch stderr");
+    let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<String>();
+    let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        for line in StdBufReader::new(watch_stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = stdout_tx.send(line);
+        }
+    });
+    std::thread::spawn(move || {
+        for line in StdBufReader::new(watch_stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = stderr_tx.send(line);
+        }
+    });
+
+    let first_conflict_line = tokio::time::timeout(Duration::from_secs(4), stderr_rx.recv())
+        .await
+        .expect("watch emitted initial conflict within 4s")
+        .expect("conflict line on stderr");
+    let first_conflict_val: Value = serde_json::from_str(&first_conflict_line).unwrap();
+    assert_eq!(first_conflict_val["outcome"], "conflict");
+    assert!(sidecar_path.exists(), "watch must write conflict sidecar");
+    let sidecar_mtime_1 = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(320)).await;
+    assert!(
+        stderr_rx.try_recv().is_err(),
+        "watch must not spam duplicate conflicts across ticks while .org bytes are unchanged"
+    );
+    let sidecar_mtime_2 = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        sidecar_mtime_1, sidecar_mtime_2,
+        "watch must not rewrite conflict sidecar while .org bytes are unchanged"
+    );
+
+    let resolved_org = stale_org
+        .replace(
+            &format!(":REX_REV: {current_rev}"),
+            &format!(":REX_REV: {bumped_rev}"),
+        )
+        .replace("Conflicting stale title", "Resolved via watch mode");
+    std::fs::write(&org_file, &resolved_org).unwrap();
+    let synced_line = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let line = stdout_rx.recv().await.expect("watch stdout line");
+            let val: Value = serde_json::from_str(&line).unwrap();
+            if val["outcome"] == "synced" {
+                break val;
+            }
+        }
+    })
+    .await
+    .expect("watch synced once .org file was edited");
+    assert_eq!(synced_line["updated"].as_array().unwrap().len(), 1);
+    drop(watch_child);
 
     let alice_tok = daemon.cli_json(&["token", "--seat", "alice"]).await["token"]
         .as_str()
@@ -1498,4 +1617,119 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
     .expect("rebinding + mail_ack auto-resolved MailUnrung card to Done");
 
     let _ = Path::new(&daemon.sock);
+}
+
+#[tokio::test]
+async fn e2e_phase3_presence_hold_restart_rebinds_until_replaced() {
+    let mut daemon = IsolatedDaemon::start("hold-restart").await;
+    daemon.cli_json(&["presence", "claim", "sam"]).await;
+    let sam_tok = daemon.cli_json(&["token", "--seat", "sam"]).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut hold_child = ChildGuard(
+        Command::new(bin_path())
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
+            .args([
+                "--socket",
+                daemon.sock.to_str().unwrap(),
+                "--token",
+                &sam_tok,
+                "--json",
+                "presence",
+                "hold",
+                "--seat",
+                "sam",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn presence hold"),
+    );
+    let hold_stdout = hold_child.0.stdout.take().expect("hold stdout");
+    let (bind_tx, mut bind_rx) = mpsc::unbounded_channel::<Value>();
+    std::thread::spawn(move || {
+        let mut reader = StdBufReader::new(hold_stdout);
+        let mut acc = String::new();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            acc.push_str(&line);
+            line.clear();
+            if let Ok(val) = serde_json::from_str::<Value>(&acc) {
+                let _ = bind_tx.send(val);
+                acc.clear();
+            }
+        }
+    });
+
+    let initial = tokio::time::timeout(Duration::from_secs(5), bind_rx.recv())
+        .await
+        .expect("initial hold bind within 5s")
+        .expect("initial hold bind json");
+    let inc_id = initial["value"]["incarnation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    daemon.restart().await;
+    let rebound = tokio::time::timeout(Duration::from_secs(6), bind_rx.recv())
+        .await
+        .expect("hold rebound cleanly after daemon restart")
+        .expect("rebound json");
+    assert_eq!(rebound["value"]["incarnation_id"], inc_id);
+    assert_eq!(rebound["value"]["endpoint"]["transport"], "uds_session");
+
+    let takeover_out = daemon
+        .cli(
+            &[
+                "--token",
+                &sam_tok,
+                "--json",
+                "presence",
+                "bind",
+                "--seat",
+                "sam",
+                "--self-watcher",
+                "codex",
+                "--takeover",
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert!(
+        takeover_out.status.success(),
+        "self-watcher takeover failed: {}",
+        String::from_utf8_lossy(&takeover_out.stderr)
+    );
+
+    daemon.restart().await;
+
+    let hold_exit = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(status) = hold_child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("replaced presence hold must exit after reconnect conflict");
+    assert!(
+        !hold_exit.success(),
+        "replaced presence hold must exit non-zero rather than stealing the seat"
+    );
+
+    let live_after = daemon.cli_json(&["presence", "list", "--live-only"]).await;
+    let bindings = live_after["value"]["seats"][0]["bindings"]
+        .as_array()
+        .unwrap();
+    let live_bindings: Vec<&Value> = bindings.iter().filter(|b| b["status"] == "live").collect();
+    assert_eq!(live_bindings.len(), 1);
+    assert_eq!(
+        live_bindings[0]["endpoint"]["transport"], "self_watcher",
+        "restarted hold must not overwrite the newer self_watcher binding"
+    );
 }

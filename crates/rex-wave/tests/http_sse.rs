@@ -859,7 +859,7 @@ async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_
             addr,
             &[("Content-Type", "application/json")],
             Some(
-                r#"{"seat":"sam","endpoint":{"kind":"uds_session","conn_id":42,"client":"forged"},"liveness":"socket_lifetime"}"#,
+                r#"{"seat":"sam","endpoint":{"transport":"uds_session","conn_id":42,"client":"forged"},"liveness":"socket_lifetime"}"#,
             ),
         ),
     )
@@ -867,6 +867,14 @@ async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_
     assert_eq!(
         forged_uds_bind.status, 400,
         "HTTP /v1/call/presence_bind must refuse UdsSession endpoints"
+    );
+    let forged_msg = forged_uds_bind.json()["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        forged_msg.contains("Unix socket connection"),
+        "expected UdsSession guard refusal, got: {forged_msg}"
     );
 
     server.abort();

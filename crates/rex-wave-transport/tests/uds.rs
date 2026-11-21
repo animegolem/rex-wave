@@ -1608,22 +1608,19 @@ fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals(
     std::fs::write(&tokens_path, serde_json::to_vec(&legacy_json).unwrap()).unwrap();
     std::fs::set_permissions(&tokens_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let loaded = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    let loaded_revoked = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
     assert_eq!(
-        loaded.get("tok_sam"),
+        loaded_revoked.get("tok_sam"),
         Some(&Principal::Seat {
             seat: SeatName::parse("sam").unwrap()
         })
     );
-    assert_eq!(
-        loaded.get("tok_legacy_worker"),
-        Some(&Principal::Worker {
-            wave: WaveSlug::parse("auth-v2").unwrap(),
-            role: RoleName::parse("author").unwrap(),
-        })
+    assert!(
+        loaded_revoked.get("tok_legacy_worker").is_none(),
+        "thread-scoped legacy worker token must be refused when worker-tokens/<tid> is absent"
     );
     assert_eq!(
-        loaded.get("tok_legacy_worker_no_tid"),
+        loaded_revoked.get("tok_legacy_worker_no_tid"),
         Some(&Principal::Worker {
             wave: WaveSlug::parse("auth-v2").unwrap(),
             role: RoleName::parse("reviewer").unwrap(),
@@ -1633,6 +1630,38 @@ fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals(
     let worker_dir = tmp.path().join("worker-tokens");
     std::fs::create_dir_all(&worker_dir).unwrap();
     std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let legacy_tid_file = worker_dir.join("t3:auth-v2:author:a1");
+    std::fs::write(&legacy_tid_file, "tok_legacy_worker\n").unwrap();
+    std::fs::set_permissions(&legacy_tid_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut loaded_active = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert_eq!(
+        loaded_active.get("tok_legacy_worker"),
+        Some(&Principal::Worker {
+            wave: WaveSlug::parse("auth-v2").unwrap(),
+            role: RoleName::parse("author").unwrap(),
+        }),
+        "thread-scoped legacy worker token authenticates while worker-tokens/<tid> exists and matches"
+    );
+
+    loaded_active
+        .insert_seat("tok_alice", SeatName::parse("alice").unwrap())
+        .unwrap();
+    loaded_active.save_tokens_file(&tokens_path).unwrap();
+    let saved_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&tokens_path).unwrap()).unwrap();
+    assert_eq!(
+        saved_json["tok_legacy_worker"]["thread_id"], "t3:auth-v2:author:a1",
+        "save_tokens_file must preserve legacy thread_id instead of promoting to permanent worker"
+    );
+
+    std::fs::remove_file(&legacy_tid_file).unwrap();
+    let after_unlink = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert!(
+        after_unlink.get("tok_legacy_worker").is_none(),
+        "unlinking worker-tokens/<tid> must immediately revoke legacy thread-scoped token"
+    );
 
     assert!(!rex_wave_transport::is_safe_worker_token_id("a..b"));
     assert!(rex_wave_transport::is_safe_worker_token_id(
