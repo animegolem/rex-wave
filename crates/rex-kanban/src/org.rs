@@ -1,7 +1,7 @@
 //! Bidirectional Org-mode codec for Kanban boards and standalone `.org` files.
 
 use crate::model::{
-    Assignee, BoardSnapshot, Card, CardNo, CardRevision, ExternalLink, Lane, LaneName, Link,
+    Assignee, BoardSnapshot, Card, CardNo, CardRevision, ExternalLink, Lane, LaneName, Link, OrgId,
     OrgPriority, TaskCard, Title,
 };
 use std::collections::BTreeSet;
@@ -30,7 +30,11 @@ impl OrgDocument {
         let mut tasks = Vec::new();
         for lane in &snapshot.lanes {
             for card in &lane.cards {
-                tasks.push(TaskCard::from(card));
+                let mut task = TaskCard::from(card);
+                if task.org_id.is_none() {
+                    task.org_id = Some(OrgId::for_board_card(&snapshot.board, card.no));
+                }
+                tasks.push(task);
             }
         }
         Self {
@@ -107,8 +111,19 @@ pub fn render_document(doc: &OrgDocument) -> String {
         }
         out.push('\n');
 
-        let has_drawer = task.id.is_some()
+        let effective_org_id = match (&task.org_id, task.id) {
+            (Some(oid), _) => Some(oid.clone()),
+            (None, Some(card_no)) => Some(OrgId::for_board_card_scope(
+                doc.title.as_deref().unwrap_or(""),
+                card_no,
+            )),
+            (None, None) => None,
+        };
+
+        let has_drawer = effective_org_id.is_some()
+            || task.id.is_some()
             || task.revision.is_some()
+            || !task.needs.is_empty()
             || task.assignee.is_some()
             || task.due_ms.is_some()
             || task.blocking
@@ -116,11 +131,24 @@ pub fn render_document(doc: &OrgDocument) -> String {
             || !task.properties.is_empty();
         if has_drawer {
             out.push_str(":PROPERTIES:\n");
+            if let Some(oid) = &effective_org_id {
+                let _ = writeln!(out, ":ID: {oid}");
+            }
             if let Some(id) = task.id {
-                let _ = writeln!(out, ":ID: {}", id.0);
+                let _ = writeln!(out, ":REX_CARD: {}", id.0);
             }
             if let Some(rev) = task.revision {
-                let _ = writeln!(out, ":REV: {}", rev.0);
+                let _ = writeln!(out, ":REX_REV: {}", rev.0);
+            }
+            if !task.needs.is_empty() {
+                out.push_str(":REX_NEEDS: ");
+                for (dep_idx, dep) in task.needs.iter().enumerate() {
+                    if dep_idx > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(dep.as_str());
+                }
+                out.push('\n');
             }
             if let Some(who) = &task.assignee {
                 let _ = writeln!(out, ":ASSIGNEE: {who}");
@@ -195,19 +223,25 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
     }
 
     let mut tasks = Vec::new();
-    let mut seen_ids = BTreeSet::new();
+    let mut seen_card_nos = BTreeSet::new();
+    let mut seen_org_ids = BTreeSet::new();
+    let doc_scope = title.as_deref().unwrap_or("");
 
     while idx < raw_lines.len() {
         let heading_line_no = idx + 1;
         let (lane, priority, heading_title, tags) = parse_heading(raw_lines[idx], heading_line_no)?;
         idx += 1;
 
+        let mut raw_id: Option<(usize, String)> = None;
+        let mut org_id: Option<OrgId> = None;
         let mut id: Option<CardNo> = None;
-        let mut revision: Option<CardRevision> = None;
+        let mut rex_rev: Option<CardRevision> = None;
+        let mut legacy_rev: Option<CardRevision> = None;
         let mut assignee: Option<Assignee> = None;
         let mut due_ms: Option<u64> = None;
         let mut blocking = false;
         let mut links: Vec<Link> = Vec::new();
+        let mut needs: Vec<OrgId> = Vec::new();
         let mut properties: Vec<(String, String)> = Vec::new();
 
         if idx < raw_lines.len() && raw_lines[idx].trim() == ":PROPERTIES:" {
@@ -231,13 +265,22 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
                 }
                 let (key, val) = parse_property_line(trimmed, prop_line_no)?;
                 match key {
-                    "ID" | "CARD" => {
+                    "ID" => {
+                        if raw_id.is_some() {
+                            return Err(OrgError::Property {
+                                line: prop_line_no,
+                                reason: "duplicate :ID: in drawer".into(),
+                            });
+                        }
+                        raw_id = Some((prop_line_no, val.to_owned()));
+                    }
+                    "REX_CARD" | "CARD" => {
                         let parsed = val.parse::<u32>().map_err(|_| OrgError::Property {
                             line: prop_line_no,
                             reason: format!("invalid :{key}: `{val}`"),
                         })?;
                         let card_no = CardNo(parsed);
-                        if !seen_ids.insert(card_no) {
+                        if !seen_card_nos.insert(card_no) {
                             return Err(OrgError::Property {
                                 line: prop_line_no,
                                 reason: format!("duplicate :{key}: {parsed}"),
@@ -245,12 +288,26 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
                         }
                         id = Some(card_no);
                     }
+                    "REX_REV" => {
+                        let parsed = val.parse::<u64>().map_err(|_| OrgError::Property {
+                            line: prop_line_no,
+                            reason: format!("invalid :{key}: `{val}`"),
+                        })?;
+                        rex_rev = Some(CardRevision(parsed));
+                    }
                     "REV" | "REVISION" => {
                         let parsed = val.parse::<u64>().map_err(|_| OrgError::Property {
                             line: prop_line_no,
                             reason: format!("invalid :{key}: `{val}`"),
                         })?;
-                        revision = Some(CardRevision(parsed));
+                        legacy_rev = Some(CardRevision(parsed));
+                    }
+                    "REX_NEEDS" => {
+                        for dep in parse_rex_needs(val, prop_line_no)? {
+                            if !needs.contains(&dep) {
+                                needs.push(dep);
+                            }
+                        }
                     }
                     "ASSIGNEE" => {
                         let parsed = Assignee::parse(val).map_err(|e| OrgError::Property {
@@ -288,6 +345,43 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
             }
         }
 
+        if let Some((id_line, raw)) = raw_id {
+            if id.is_none()
+                && let Ok(parsed) = raw.parse::<u32>()
+                && parsed.to_string() == raw
+            {
+                let card_no = CardNo(parsed);
+                if !seen_card_nos.insert(card_no) {
+                    return Err(OrgError::Property {
+                        line: id_line,
+                        reason: format!("duplicate :ID: {parsed}"),
+                    });
+                }
+                id = Some(card_no);
+                let upgraded = OrgId::for_board_card_scope(doc_scope, card_no);
+                if !seen_org_ids.insert(upgraded.clone()) {
+                    return Err(OrgError::Property {
+                        line: id_line,
+                        reason: format!("duplicate :ID: {upgraded}"),
+                    });
+                }
+                org_id = Some(upgraded);
+            } else {
+                let parsed = OrgId::parse(raw).map_err(|e| OrgError::Property {
+                    line: id_line,
+                    reason: e.to_string(),
+                })?;
+                if !seen_org_ids.insert(parsed.clone()) {
+                    return Err(OrgError::Property {
+                        line: id_line,
+                        reason: format!("duplicate :ID: {parsed}"),
+                    });
+                }
+                org_id = Some(parsed);
+            }
+        }
+        let revision = rex_rev.or(legacy_rev);
+
         let body_start = idx;
         while idx < raw_lines.len() && !is_top_heading(raw_lines[idx]) {
             idx += 1;
@@ -299,6 +393,7 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
         let body = body_lines.join("\n");
 
         tasks.push(TaskCard {
+            org_id,
             id,
             revision,
             lane,
@@ -309,6 +404,7 @@ pub fn parse_document(text: &str) -> Result<OrgDocument, OrgError> {
             assignee,
             due_ms,
             links,
+            needs,
             properties,
             body,
         });
@@ -700,6 +796,47 @@ fn percent_decode_lossy(input: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+}
+
+fn parse_rex_needs(val: &str, line: usize) -> Result<Vec<OrgId>, OrgError> {
+    let mut deps = Vec::new();
+    let mut rest = val.trim();
+    while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix("[[") {
+            let Some(close) = after_open.find("]]") else {
+                return Err(OrgError::Property {
+                    line,
+                    reason: "unclosed [[id:...]] link in :REX_NEEDS:".into(),
+                });
+            };
+            let inner = &after_open[..close];
+            let target = inner.split_once("][").map_or(inner, |(t, _)| t);
+            let Some(raw_id) = target.strip_prefix("id:") else {
+                return Err(OrgError::Property {
+                    line,
+                    reason: format!("expected [[id:...]] link in :REX_NEEDS:, got `[[{inner}]]`"),
+                });
+            };
+            let dep = OrgId::parse(raw_id).map_err(|e| OrgError::Property {
+                line,
+                reason: format!("invalid :REX_NEEDS: entry `{raw_id}`: {e}"),
+            })?;
+            deps.push(dep);
+            rest = after_open[close + 2..].trim_start();
+        } else {
+            let end = rest
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            let token = &rest[..end];
+            let dep = OrgId::parse(token).map_err(|e| OrgError::Property {
+                line,
+                reason: format!("invalid :REX_NEEDS: entry `{token}`: {e}"),
+            })?;
+            deps.push(dep);
+            rest = rest[end..].trim_start();
+        }
+    }
+    Ok(deps)
 }
 
 fn hex_val(b: u8) -> Option<u8> {

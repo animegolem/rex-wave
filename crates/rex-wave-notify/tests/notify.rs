@@ -289,6 +289,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
@@ -360,7 +361,10 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(RoomPost {
             room: general.clone(),
             body: Body::parse("hey @alice please review").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -372,7 +376,10 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
                 with: alice_p.clone(),
             },
             body: Body::parse("private heads up").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -727,7 +734,10 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
                 },
             },
             body: Body::parse("Scheduled check-in").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -818,6 +828,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
@@ -904,7 +915,10 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         .call(RoomPost {
             room: room_ref.clone(),
             body: Body::parse("@council-gemini Post your review to @genga when done.").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -1084,6 +1098,7 @@ async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
@@ -1252,6 +1267,7 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),

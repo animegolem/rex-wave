@@ -25,6 +25,7 @@ pub mod client;
 pub mod id;
 pub mod mail;
 pub mod notify;
+pub mod presence;
 pub mod read;
 pub mod registry;
 pub mod room;
@@ -32,12 +33,13 @@ pub mod stage;
 pub mod stream;
 pub mod wave;
 
-pub use client::{ApiError, Client, FrameStream};
+pub use client::{ApiError, Client, ConflictData, FrameStream};
 pub use id::*;
 pub use read::{ArchiveTarget, SetArchived};
 pub use registry::{
-    Audience, BoardCommand, Command, Family, InboxCommand, MailCommand, ReadCommand, RoomCommand,
-    Routed, TOOLS, ToolMeta, WaveCommand, WireCommand, WireReply, tool_catalog,
+    Audience, BoardCommand, Command, Family, InboxCommand, MailCommand, PresenceCommand,
+    ReadCommand, RoomCommand, Routed, TOOLS, ToolMeta, WaveCommand, WireCommand, WireReply,
+    tool_catalog,
 };
 pub use stage::{FocusGeneration, StageTarget};
 pub use stream::{Cursor, Envelope, Event, Frame, Interest, StreamId};

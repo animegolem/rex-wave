@@ -3,7 +3,8 @@
 
 use crate::board::BoardId;
 use crate::id::{
-    BbProjectId, BbSeq, BbThreadId, ModelId, Principal, ProviderId, RoleName, Seq, UnixMs, WaveSlug,
+    BbProjectId, BbSeq, BbThreadId, Label, ModelId, Principal, ProviderId, RoleName, Seq, UnixMs,
+    WaveSlug,
 };
 use crate::room::{RoomId, RoomRef};
 use crate::stage::Osc7501Status;
@@ -51,6 +52,19 @@ impl Wait {
                 after: Cursor::default().with(stream, since),
                 timeout_ms: None,
             }
+        }
+    }
+
+    pub fn room_filtered(room: RoomId, since: Seq, re: Option<Seq>, labels: Vec<Label>) -> Self {
+        let stream = StreamId::Room { room: room.clone() };
+        Wait {
+            interest: Interest::RoomFiltered {
+                room: RoomRef::Id { id: room },
+                re,
+                labels,
+            },
+            after: Cursor::default().with(stream, since),
+            timeout_ms: None,
         }
     }
 }

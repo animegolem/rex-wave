@@ -449,6 +449,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: mail_service.clone(),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
@@ -492,7 +493,10 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
         .call(RoomPost {
             room: design_room.clone(),
             body: Body::parse("Proposal: adopt natural-key RoomId.").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -501,7 +505,10 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
         .call(RoomPost {
             room: design_room.clone(),
             body: Body::parse("Ratified. Let's bank this ruling.").unwrap(),
-            reply_to: Some(p1.seq),
+            re: Some(p1.seq),
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -626,7 +633,10 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
             },
         },
         body: Body::parse("private dm note").unwrap(),
-        reply_to: None,
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
         idem: None,
     })
     .await
@@ -747,6 +757,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: mail_service,
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub,

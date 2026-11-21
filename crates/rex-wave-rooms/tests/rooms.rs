@@ -20,6 +20,7 @@ fn build_harness(journal: Journal, idle: Duration) -> Arc<Router> {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -177,7 +178,10 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .call(RoomPost {
             room: wave_room.clone(),
             body: Body::parse("sneaking in").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -196,7 +200,10 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .call(RoomPost {
             room: wave_room.clone(),
             body: Body::parse("@verifier start review").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -255,7 +262,10 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .call(RoomPost {
             room: RoomRef::Id { id: dm_from_sam.id },
             body: Body::parse("intrude").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -400,7 +410,10 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         .call(RoomPost {
             room: room.clone(),
             body: Body::parse("hello @alice").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: Some(IdemKey::parse("post-1").unwrap()),
         })
         .await
@@ -411,7 +424,10 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         .call(RoomPost {
             room: room.clone(),
             body: Body::parse("bad reply target").unwrap(),
-            reply_to: Some(Seq(1)),
+            re: Some(Seq(1)),
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -427,7 +443,10 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         .call(RoomPost {
             room: room.clone(),
             body: Body::parse("different text").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: Some(IdemKey::parse("post-1").unwrap()),
         })
         .await
@@ -441,7 +460,10 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
         .call(RoomPost {
             room: room.clone(),
             body: Body::parse("ack @sam").unwrap(),
-            reply_to: Some(first.seq),
+            re: Some(first.seq),
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -535,7 +557,10 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
                     .call(RoomPost {
                         room: room_ref.clone(),
                         body: Body::parse(text).unwrap(),
-                        reply_to: None,
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
                         idem: None,
                     })
                     .await
@@ -593,7 +618,10 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         .call(RoomPost {
             room: chan.clone(),
             body: Body::parse("background chatter 1").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -602,7 +630,10 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         .call(RoomPost {
             room: chan.clone(),
             body: Body::parse("please check @verifier").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -611,7 +642,10 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         .call(RoomPost {
             room: chan.clone(),
             body: Body::parse("@all ship gate ready").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -654,7 +688,10 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
                 with: worker("auth-v2", "verifier"),
             },
             body: Body::parse("direct ping").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -663,4 +700,84 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
     assert!(!woken.timed_out);
     assert_eq!(woken.entries.len(), 1);
     assert_eq!(woken.entries[0].seq, dm_post.seq);
+}
+
+#[tokio::test]
+async fn stubbed_phase3_room_commands_do_not_panic_on_reused_idem_or_persist_unvalidated_tasks() {
+    let journal = Journal::in_memory().unwrap();
+    let router = build_harness(journal, Duration::from_secs(60));
+    let sam = LocalClient::new(router.clone(), seat("sam"));
+    let room = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("stubs").unwrap(),
+    };
+    let idem = IdemKey::parse("shared-k1").unwrap();
+
+    let first = sam
+        .call(RoomPost {
+            idem: Some(idem.clone()),
+            ..RoomPost::new(room.clone(), Body::parse("hello").unwrap())
+        })
+        .await
+        .unwrap();
+
+    let reused = sam
+        .call(RoomLabel {
+            room: room.clone(),
+            seq: first.seq,
+            add: vec![Label::parse("k=v").unwrap()],
+            remove: vec![],
+            idem: Some(idem),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reused,
+        ApiError::Unavailable {
+            family: Family::Room
+        }
+    );
+
+    let with_after = sam
+        .call(RoomPost {
+            after: Some(first.seq),
+            ..RoomPost::new(room.clone(), Body::parse("guarded").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        with_after,
+        ApiError::Unavailable {
+            family: Family::Room
+        }
+    );
+
+    let with_task = sam
+        .call(RoomPost {
+            task: Some(TaskSpec {
+                title: rex_wave_api::board::Title::parse("Unvalidated task").unwrap(),
+                org_id: None,
+                needs: vec![],
+                priority: None,
+                due_ms: None,
+            }),
+            ..RoomPost::new(room.clone(), Body::parse("task body").unwrap())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        with_task,
+        ApiError::Unavailable {
+            family: Family::Room
+        }
+    );
+
+    let second = sam
+        .call(RoomPost::new(
+            room,
+            Body::parse("actor still alive").unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.seq, first.seq.next());
 }

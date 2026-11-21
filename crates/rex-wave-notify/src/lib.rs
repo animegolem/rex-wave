@@ -133,7 +133,10 @@ pub fn rank(kind: &NotifyKind, age_ms: u64) -> Rank {
         NotifyKind::DirectMessage { .. } => 7_000,
         NotifyKind::Mention { .. } => 6_000,
         NotifyKind::WorkerStuck { .. } => 5_000,
+        NotifyKind::TransportDown { .. } => 5_500,
+        NotifyKind::OrgConflict { .. } => 4_800,
         NotifyKind::LetterBanked { .. } | NotifyKind::Mail { .. } => 4_500,
+        NotifyKind::MailUnrung { .. } => 4_200,
         NotifyKind::Reminder { .. } => 4_000,
         NotifyKind::CardAssigned { .. } => 3_500,
         NotifyKind::WaveFinished { .. } => 3_000,
@@ -183,7 +186,12 @@ impl HeraldView {
                     }
                     room::RoomEvent::Opened { .. }
                     | room::RoomEvent::Posted { .. }
-                    | room::RoomEvent::TopicSet { .. } => {}
+                    | room::RoomEvent::TopicSet { .. }
+                    | room::RoomEvent::Labeled { .. }
+                    | room::RoomEvent::TaskClaimed { .. }
+                    | room::RoomEvent::TaskHeartbeat { .. }
+                    | room::RoomEvent::TaskTransitioned { .. }
+                    | room::RoomEvent::TaskUpdated { .. } => {}
                 }
             }
             (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
@@ -662,6 +670,40 @@ fn kinds_equal(a: &NotifyKind, b: &NotifyKind) -> bool {
             l1 == l2
         }
         (NotifyKind::Reminder { bell_id: b1 }, NotifyKind::Reminder { bell_id: b2 }) => b1 == b2,
+        (
+            NotifyKind::MailUnrung {
+                seat: s1,
+                unread_count: u1,
+                oldest_at: o1,
+            },
+            NotifyKind::MailUnrung {
+                seat: s2,
+                unread_count: u2,
+                oldest_at: o2,
+            },
+        ) => s1 == s2 && u1 == u2 && o1 == o2,
+        (
+            NotifyKind::TransportDown {
+                transport: t1,
+                detail: d1,
+            },
+            NotifyKind::TransportDown {
+                transport: t2,
+                detail: d2,
+            },
+        ) => t1 == t2 && d1 == d2,
+        (
+            NotifyKind::OrgConflict {
+                path: p1,
+                org_id: o1,
+                detail: d1,
+            },
+            NotifyKind::OrgConflict {
+                path: p2,
+                org_id: o2,
+                detail: d2,
+            },
+        ) => p1 == p2 && o1 == o2 && d1 == d2,
         _ => false,
     }
 }

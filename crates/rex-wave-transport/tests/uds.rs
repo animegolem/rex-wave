@@ -33,6 +33,12 @@ impl Decider for ToyRooms {
             RoomCommand::RoomPost(c) => &c.room,
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
+            RoomCommand::RoomLabel(c) => &c.room,
+            RoomCommand::TaskClaim(c) => &c.room,
+            RoomCommand::TaskHeartbeat(c) => &c.room,
+            RoomCommand::TaskTransition(c) => &c.room,
+            RoomCommand::TaskUpdate(c) => &c.room,
+            RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
             room: r.resolve(&ctx.by)?,
@@ -51,7 +57,10 @@ impl Decider for ToyRooms {
             RoomCommand::RoomPost(c) => Ok(vec![RoomEvent::Posted {
                 body: c.body.clone(),
                 mentions: Mentions::default(),
-                reply_to: c.reply_to,
+                re: c.re,
+                after: c.after,
+                labels: c.labels.clone(),
+                task: c.task.clone(),
                 idem: c.idem.clone(),
             }]),
             _ => Ok(vec![]),
@@ -73,6 +82,9 @@ impl Decider for ToyRooms {
                     room: room.clone(),
                     seq: last.seq,
                     mentions: Mentions::default(),
+                    re: None,
+                    org_id: None,
+                    delivery_notice: None,
                 })
             }
             _ => WireReply::RoomJoin(Ack),
@@ -169,6 +181,7 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -254,7 +267,10 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
             c.call(RoomPost {
                 room: g,
                 body: Body::parse(format!("m-{i}")).unwrap(),
-                reply_to: None,
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
                 idem: None,
             })
             .await
@@ -310,7 +326,10 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     op.call(RoomPost {
         room: general.clone(),
         body: Body::parse("wake!").unwrap(),
-        reply_to: None,
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
         idem: None,
     })
     .await
@@ -414,6 +433,7 @@ async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -584,6 +604,7 @@ fn router_with(journal: &Journal, room: Arc<dyn Service<RoomCommand>>) -> Arc<Ro
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
@@ -603,6 +624,7 @@ fn toy_router(journal: &Journal) -> Arc<Router> {
         board: Arc::new(Unavailable(Family::Board)),
         inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
         read: Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
@@ -628,7 +650,10 @@ fn post(body: &str) -> RoomPost {
     RoomPost {
         room: general(),
         body: Body::parse(body).unwrap(),
-        reply_to: None,
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
         idem: None,
     }
 }
@@ -675,6 +700,7 @@ async fn every_api_error_crosses_the_socket_without_dropping_it() {
         },
         ApiError::Conflict {
             detail: "worker never spawned".into(),
+            data: None,
         },
         ApiError::Unavailable {
             family: Family::Wave,
@@ -849,7 +875,10 @@ async fn daemon_restart_reconnects_and_resumes_watches_from_their_cursor() {
         .call(RoomPost {
             room: alerts,
             body: Body::parse("new-room-while-down").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await

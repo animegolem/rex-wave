@@ -44,10 +44,7 @@ fn extract_messages(entries: &[Envelope]) -> Vec<RoomMessage> {
         if let (
             StreamId::Room { room },
             Event::Room(RoomEvent::Posted {
-                body,
-                mentions,
-                reply_to,
-                ..
+                body, mentions, re, ..
             }),
         ) = (&env.stream, &env.event)
         {
@@ -58,7 +55,7 @@ fn extract_messages(entries: &[Envelope]) -> Vec<RoomMessage> {
                 by: env.by.clone(),
                 body: body.clone(),
                 mentions: mentions.clone(),
-                reply_to: *reply_to,
+                reply_to: *re,
             });
         }
     }
@@ -211,8 +208,10 @@ fn system_slug(part: SystemPart) -> &'static str {
         SystemPart::WaveConductor => "wave_conductor",
         SystemPart::Herald => "herald",
         SystemPart::BbBridge => "bb_bridge",
+        SystemPart::T3Bridge => "t3_bridge",
         SystemPart::MailBridge => "mail_bridge",
         SystemPart::WakeBell => "wake_bell",
+        SystemPart::PresenceMonitor => "presence_monitor",
     }
 }
 
@@ -339,6 +338,12 @@ impl Decider for Rooms {
             RoomCommand::RoomPost(c) => &c.room,
             RoomCommand::RoomJoin(c) => &c.room,
             RoomCommand::RoomLeave(c) => &c.room,
+            RoomCommand::RoomLabel(c) => &c.room,
+            RoomCommand::TaskClaim(c) => &c.room,
+            RoomCommand::TaskHeartbeat(c) => &c.room,
+            RoomCommand::TaskTransition(c) => &c.room,
+            RoomCommand::TaskUpdate(c) => &c.room,
+            RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
             room: r.resolve(&ctx.by)?,
@@ -386,9 +391,9 @@ impl Decider for Rooms {
                     if let Some(req_origin) = &c.origin
                         && req_origin != existing_origin
                     {
-                        return Err(ApiError::Conflict {
-                            detail: format!("room origin already fixed as {existing_origin:?}"),
-                        });
+                        return Err(ApiError::conflict(format!(
+                            "room origin already fixed as {existing_origin:?}"
+                        )));
                     }
                     if let Some(topic) = &c.topic
                         && state.topic.as_ref() != Some(topic)
@@ -428,9 +433,9 @@ impl Decider for Rooms {
             RoomCommand::RoomJoin(c) => {
                 let id = c.room.resolve(&ctx.by)?;
                 if matches!(id, RoomId::Direct { .. }) {
-                    return Err(ApiError::Conflict {
-                        detail: "direct message membership is fixed to the pair".into(),
-                    });
+                    return Err(ApiError::conflict(
+                        "direct message membership is fixed to the pair",
+                    ));
                 }
 
                 let target = c.member.clone().unwrap_or_else(|| ctx.by.clone());
@@ -483,9 +488,9 @@ impl Decider for Rooms {
                             return Ok(vec![]);
                         }
                         if state.members.contains_key(handle) {
-                            return Err(ApiError::Conflict {
-                                detail: format!("handle @{handle} is already in use in this room"),
-                            });
+                            return Err(ApiError::conflict(format!(
+                                "handle @{handle} is already in use in this room"
+                            )));
                         }
                         events.push(RoomEvent::MemberJoined {
                             member: target,
@@ -509,14 +514,13 @@ impl Decider for Rooms {
             RoomCommand::RoomLeave(c) => {
                 let id = c.room.resolve(&ctx.by)?;
                 if matches!(id, RoomId::Direct { .. }) {
-                    return Err(ApiError::Conflict {
-                        detail: "cannot leave a direct message room".into(),
-                    });
+                    return Err(ApiError::conflict("cannot leave a direct message room"));
                 }
                 if !state.has_member(&ctx.by) {
-                    return Err(ApiError::Conflict {
-                        detail: format!("{} is not a member of room", ctx.by),
-                    });
+                    return Err(ApiError::conflict(format!(
+                        "{} is not a member of room",
+                        ctx.by
+                    )));
                 }
                 Ok(vec![RoomEvent::MemberLeft {
                     member: ctx.by.clone(),
@@ -524,8 +528,13 @@ impl Decider for Rooms {
             }
 
             RoomCommand::RoomPost(c) => {
+                if c.after.is_some() || c.task.is_some() {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Room,
+                    });
+                }
                 let id = c.room.resolve(&ctx.by)?;
-                if let Some(reply_seq) = c.reply_to
+                if let Some(reply_seq) = c.re
                     && !state.posts.contains(&reply_seq)
                 {
                     return Err(ApiError::NotFound {
@@ -611,11 +620,23 @@ impl Decider for Rooms {
                 events.push(RoomEvent::Posted {
                     body: c.body.clone(),
                     mentions,
-                    reply_to: c.reply_to,
+                    re: c.re,
+                    after: c.after,
+                    labels: c.labels.clone(),
+                    task: c.task.clone(),
                     idem: c.idem.clone(),
                 });
                 Ok(events)
             }
+
+            RoomCommand::RoomLabel(_)
+            | RoomCommand::TaskClaim(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::TaskTransition(_)
+            | RoomCommand::TaskUpdate(_)
+            | RoomCommand::RoomTasks(_) => Err(ApiError::Unavailable {
+                family: Family::Room,
+            }),
         }
     }
 
@@ -636,6 +657,11 @@ impl Decider for Rooms {
                 state.posts.insert(meta.seq);
             }
             RoomEvent::TopicSet { topic } => state.topic = Some(topic.clone()),
+            RoomEvent::Labeled { .. }
+            | RoomEvent::TaskClaimed { .. }
+            | RoomEvent::TaskHeartbeat { .. }
+            | RoomEvent::TaskTransitioned { .. }
+            | RoomEvent::TaskUpdated { .. } => {}
         }
     }
 
@@ -667,17 +693,29 @@ impl Decider for Rooms {
                 let StreamId::Room { room } = &env.stream else {
                     unreachable!()
                 };
-                let Event::Room(RoomEvent::Posted { mentions, .. }) = &env.event else {
+                let Event::Room(RoomEvent::Posted {
+                    mentions, re, task, ..
+                }) = &env.event
+                else {
                     unreachable!()
                 };
                 WireReply::RoomPost(Posted {
                     room: room.clone(),
                     seq: env.seq,
                     mentions: mentions.clone(),
+                    re: *re,
+                    org_id: task.as_ref().and_then(|t| t.org_id.clone()),
+                    delivery_notice: None,
                 })
             }
             RoomCommand::RoomJoin(_) => WireReply::RoomJoin(Ack),
             RoomCommand::RoomLeave(_) => WireReply::RoomLeave(Ack),
+            RoomCommand::RoomLabel(_)
+            | RoomCommand::TaskClaim(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::TaskTransition(_)
+            | RoomCommand::TaskUpdate(_)
+            | RoomCommand::RoomTasks(_) => unreachable!("rejected in decide"),
         }
     }
 

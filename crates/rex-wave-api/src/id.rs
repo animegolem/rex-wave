@@ -1,6 +1,7 @@
 //! Branded identifiers. Every one is parsed once at the boundary
 //! (`serde(try_from = "String")`) and trusted everywhere inside.
 
+pub use rex_kanban::OrgId;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -12,6 +13,15 @@ use std::fmt;
 pub struct InvalidId {
     pub what: String,
     pub reason: String,
+}
+
+impl From<rex_kanban::InvalidValue> for InvalidId {
+    fn from(e: rex_kanban::InvalidValue) -> Self {
+        InvalidId {
+            what: e.what,
+            reason: e.reason,
+        }
+    }
 }
 
 fn slug(s: &str, max: usize) -> Result<(), &'static str> {
@@ -33,6 +43,28 @@ fn slug(s: &str, max: usize) -> Result<(), &'static str> {
 fn opaque(s: &str) -> Result<(), &'static str> {
     if s.is_empty() || s.len() > 256 || s.chars().any(char::is_control) {
         return Err("must be 1..=256 printable chars");
+    }
+    Ok(())
+}
+
+fn label_kv(s: &str) -> Result<(), &'static str> {
+    let Some((key, value)) = s.split_once('=') else {
+        return Err("must be formatted as key=value");
+    };
+    if key.is_empty() || key.len() > 32 {
+        return Err("label key must be 1..=32 chars");
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err("label key only allows [a-z0-9_.-]");
+    }
+    if value.is_empty() || value.chars().count() > 64 {
+        return Err("label value must be 1..=64 chars");
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("label value must not contain whitespace or control chars");
     }
     Ok(())
 }
@@ -105,6 +137,31 @@ branded_str!(
     /// BB thread id (opaque, owned by BB).
     BbThreadId, "bb thread id", |s| opaque(&s));
 branded_str!(
+    /// T3 Code thread id (opaque, owned by T3 Code).
+    T3ThreadId, "t3 thread id", |s| opaque(&s));
+branded_str!(
+    /// Unique identifier for one ephemeral seat session binding incarnation.
+    IncarnationId, "incarnation id", |s| opaque(&s));
+branded_str!(
+    /// Validated `key=value` message or task label (`key`: `[a-z0-9_.-]{1,32}`, `value`: 1..=64 non-whitespace printable chars).
+    Label, "label", |s| label_kv(&s));
+
+impl Label {
+    pub fn key(&self) -> &str {
+        self.0
+            .split_once('=')
+            .expect("Label validated to contain '='")
+            .0
+    }
+
+    pub fn value(&self) -> &str {
+        self.0
+            .split_once('=')
+            .expect("Label validated to contain '='")
+            .1
+    }
+}
+branded_str!(
     /// BB pending-interaction id (opaque, owned by BB).
     BbInteractionId, "bb interaction id", |s| opaque(&s));
 branded_str!(
@@ -164,6 +221,30 @@ impl Seq {
 )]
 #[serde(transparent)]
 pub struct BbSeq(pub u64);
+
+/// Monotonic task-lease fencing epoch incremented on every claim or expired-lease takeover.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(transparent)]
+pub struct LeaseEpoch(pub u64);
+
+impl LeaseEpoch {
+    pub fn next(self) -> Self {
+        LeaseEpoch(self.0 + 1)
+    }
+}
 
 /// Wall-clock milliseconds since the Unix epoch, stamped by the daemon only.
 #[derive(
@@ -254,8 +335,10 @@ pub enum SystemPart {
     WaveConductor,
     Herald,
     BbBridge,
+    T3Bridge,
     MailBridge,
     WakeBell,
+    PresenceMonitor,
 }
 
 impl fmt::Display for Principal {

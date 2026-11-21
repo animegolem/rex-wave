@@ -1,10 +1,12 @@
 //! The `Client` trait: the only way into the daemon, for every frontend and
 //! for the daemon's own reactors.
 
-use crate::id::{InvalidId, Principal};
+use crate::id::{IncarnationId, InvalidId, LeaseEpoch, Principal, SeatName, Seq};
 use crate::registry::{Command, Family, WireCommand, WireReply};
+use crate::room::RoomMessageSummary;
 use crate::stream::{Cursor, Frame, Interest};
 use futures_core::Stream;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -12,6 +14,34 @@ use std::pin::Pin;
 /// A live subscription. Dropping it unsubscribes (RAII), which is what makes
 /// on-hover stream switching in the TUI cheap: drop the old, open the new.
 pub type FrameStream = Pin<Box<dyn Stream<Item = Result<Frame, ApiError>> + Send + 'static>>;
+
+/// Structured conflict payload carried optionally on [`ApiError::Conflict`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConflictData {
+    NewerMessage {
+        expected: Seq,
+        latest: Seq,
+        newer_message: Box<RoomMessageSummary>,
+    },
+    LeaseFenced {
+        expected: LeaseEpoch,
+        actual: LeaseEpoch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<Principal>,
+    },
+    UnmetNeeds {
+        unmet: Vec<Seq>,
+    },
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    DuplicateLiveSession {
+        seat: SeatName,
+        active: IncarnationId,
+    },
+}
 
 /// Every failure a caller can see. Serializable so it crosses every transport
 /// unchanged; transport-specific detail is flattened into `Transport`.
@@ -25,9 +55,13 @@ pub enum ApiError {
     #[error("not found: {what}")]
     NotFound { what: String },
     /// Optimistic-concurrency or state-machine conflict (e.g. retire a worker
-    /// that was never spawned). Carries the current state for the caller.
+    /// that was never spawned). Carries optional structured conflict data.
     #[error("conflict: {detail}")]
-    Conflict { detail: String },
+    Conflict {
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<ConflictData>,
+    },
     /// The owning service for a family is down or (after a split) unreachable.
     #[error("{family:?} service unavailable")]
     Unavailable { family: Family },
@@ -39,6 +73,22 @@ pub enum ApiError {
     ReplyMismatch { expected: String, got: String },
     #[error("internal: {0}")]
     Internal(#[serde(with = "detail")] String),
+}
+
+impl ApiError {
+    pub fn conflict(detail: impl Into<String>) -> Self {
+        ApiError::Conflict {
+            detail: detail.into(),
+            data: None,
+        }
+    }
+
+    pub fn conflict_with(detail: impl Into<String>, data: ConflictData) -> Self {
+        ApiError::Conflict {
+            detail: detail.into(),
+            data: Some(data),
+        }
+    }
 }
 
 /// An internally tagged enum cannot carry a bare string, so the `String` of
@@ -68,6 +118,12 @@ mod detail {
 impl From<InvalidId> for ApiError {
     fn from(e: InvalidId) -> Self {
         ApiError::Invalid(e)
+    }
+}
+
+impl From<rex_kanban::InvalidValue> for ApiError {
+    fn from(e: rex_kanban::InvalidValue) -> Self {
+        ApiError::Invalid(e.into())
     }
 }
 

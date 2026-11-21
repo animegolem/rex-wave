@@ -15,6 +15,7 @@
 use crate::board::*;
 use crate::mail::*;
 use crate::notify::*;
+use crate::presence::*;
 use crate::read::*;
 use crate::room::*;
 use crate::wave::*;
@@ -152,10 +153,16 @@ macro_rules! commands {
 
 commands! {
     Room(RoomCommand) {
-        RoomEnsure  -> RoomInfo : "room_ensure", Member, true,  "Create-or-fetch a #channel or DM (idempotent: rooms are named, not numbered).";
-        RoomPost    -> Posted   : "room_post",   Member, true,  "Post to a #channel or DM. @handles and @all are resolved against room members.";
-        RoomJoin    -> Ack      : "room_join",   Member, true,  "Add a member (self, or others if you own the room).";
-        RoomLeave   -> Ack      : "room_leave",  Member, true,  "Leave a room.";
+        RoomEnsure     -> RoomInfo         : "room_ensure",     Member, true,  "Create-or-fetch a #channel or DM (idempotent: rooms are named, not numbered).";
+        RoomPost       -> Posted           : "room_post",       Member, true,  "Post to a #channel or DM. @handles and @all are resolved against room members.";
+        RoomJoin       -> Ack              : "room_join",       Member, true,  "Add a member (self, or others if you own the room).";
+        RoomLeave      -> Ack              : "room_leave",      Member, true,  "Leave a room.";
+        RoomLabel      -> Labeled          : "room_label",      Member, true,  "Add or remove validated key=value labels on a room message.";
+        TaskClaim      -> TaskLeaseReceipt : "task_claim",      Member, true,  "Claim a room task thread with a TTL lease and monotonic fencing epoch.";
+        TaskHeartbeat  -> TaskLeaseReceipt : "task_heartbeat",  Member, true,  "Renew an active task lease for the current holder and fencing epoch.";
+        TaskTransition -> TaskView         : "task_transition", Member, true,  "Transition a room task thread's status with lease-epoch or revision CAS checks.";
+        TaskUpdate     -> TaskView         : "task_update",     Member, true,  "Update a room task thread's title, dependencies, priority, or due timestamp.";
+        RoomTasks      -> TaskListView     : "room_tasks",      Member, false, "List task threads in a room with readiness and lease-expiry state.";
     }
     Wave(WaveCommand) {
         WaveStart        -> WaveStarted : "wave_start",         Operator, true,  "Launch a wave on BB: creates #wave-<slug> under the BB project, a board, and spawns workers.";
@@ -184,6 +191,17 @@ commands! {
         MailPromote  -> LetterRef : "promote_to_letter", Member, true, "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).";
         MailAck      -> Ack       : "mail_ack",          Member, true, "ACK a sandbox letter by its exact sha256.";
         MailWakeBell -> Ack       : "mail_wake_bell",    System, true, "wake-bell Sink ingress: deliver a scheduled prompt into a seat's DM.";
+    }
+    Presence(PresenceCommand) {
+        PresenceClaim           -> SeatRecord         : "presence_claim",            Member, true,  "Claim or update durable seat metadata (role, projects, aliases, status) with provenance.";
+        PresenceSetStatus       -> SeatRecord         : "presence_set_status",       Member, true,  "Transition a seat between active, dormant, and retired with provenance.";
+        PresenceBind            -> SeatBinding        : "presence_bind",             Member, true,  "Bind an ephemeral live session endpoint to a seat.";
+        PresenceHeartbeat       -> SeatBinding        : "presence_heartbeat",        Member, true,  "Renew the TTL lease on an active seat binding.";
+        PresenceUnbind          -> Ack                : "presence_unbind",           Member, true,  "Unbind an active seat session incarnation.";
+        PresenceExpire          -> Ack                : "presence_expire",           System, true,  "PresenceMonitor expires a dead or lapsed seat binding.";
+        PresenceTransportHealth -> Ack                : "presence_transport_health", System, true,  "Report transport provider health to trip or clear TransportDown status.";
+        PresenceList            -> PresenceSnapshot   : "presence_list",             Member, false, "List durable seats and live session bindings.";
+        PresenceResolve         -> PresenceResolution : "presence_resolve",          Member, false, "Resolve a seat name, alias, or project to its durable record and live bindings.";
     }
     Read(ReadCommand) {
         Read       -> Page                : "read",        Member, false, "Page one stream after a seq.";

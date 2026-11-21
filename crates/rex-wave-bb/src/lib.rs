@@ -2303,10 +2303,8 @@ impl BbBridge {
             return;
         };
         let post_cmd = RoomPost {
-            room: RoomRef::Id { id: room.clone() },
-            body,
-            reply_to: None,
             idem: Some(idem_key),
+            ..RoomPost::new(RoomRef::Id { id: room.clone() }, body)
         };
         let first_try = backend
             .call_as(worker_principal.clone(), post_cmd.clone().into_wire())
@@ -2718,7 +2716,8 @@ fn parked_room_and_since(
     w: &rex_wave_api::read::Wait,
 ) -> (Option<RoomId>, Seq) {
     match &w.interest {
-        Interest::Room { room } => match room.resolve(worker) {
+        Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
+        {
             Ok(id) => {
                 let since = w.after.at(&StreamId::Room { room: id.clone() });
                 (Some(id), since)
@@ -3365,6 +3364,9 @@ mod tests {
                                         room: id,
                                         seq,
                                         mentions: Mentions::default(),
+                                        re: None,
+                                        org_id: None,
+                                        delivery_notice: None,
                                     }));
                                 }
                                 let map = g.room_members.get(&id).cloned().unwrap_or_default();
@@ -3392,7 +3394,10 @@ mod tests {
                                     Event::Room(RoomEvent::Posted {
                                         body: c.body,
                                         mentions: mentions.clone(),
-                                        reply_to: c.reply_to,
+                                        re: c.re,
+                                        after: c.after,
+                                        labels: c.labels,
+                                        task: c.task,
                                         idem: c.idem.clone(),
                                     }),
                                     &harness.frame_tx,
@@ -3404,9 +3409,15 @@ mod tests {
                                     room: id,
                                     seq: env.seq,
                                     mentions,
+                                    re: c.re,
+                                    org_id: None,
+                                    delivery_notice: None,
                                 }))
                             }
                             RoomCommand::RoomLeave(_) => Ok(WireReply::RoomLeave(Ack)),
+                            _ => Err(ApiError::Unavailable {
+                                family: Family::Room,
+                            }),
                         }
                     }
                     Routed::Board(BoardCommand::BoardEnsure(BoardEnsure { board, lanes })) => {
@@ -3962,7 +3973,10 @@ mod tests {
                 id: started.room.clone(),
             },
             body: Body::parse("@verifier slice A ready").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -4133,7 +4147,10 @@ mod tests {
                 id: started.room.clone(),
             },
             body: Body::parse("@verifier check #4").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -4254,7 +4271,10 @@ mod tests {
         op.call(RoomPost {
             room: RoomRef::Id { id: started.room },
             body: Body::parse("nudge dirty reconcile").unwrap(),
-            reply_to: None,
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
             idem: None,
         })
         .await
@@ -4721,7 +4741,10 @@ mod tests {
                     id: started.room.clone(),
                 },
                 body: Body::parse("Explicit Turn 2 post").unwrap(),
-                reply_to: None,
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
                 idem: None,
             })
             .await

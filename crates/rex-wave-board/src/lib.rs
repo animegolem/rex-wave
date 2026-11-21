@@ -59,13 +59,20 @@ fn map_kanban_error(err: KanbanError) -> ApiError {
                 what: err.to_string(),
             }
         }
-        KanbanError::RevisionConflict { .. } => ApiError::Conflict {
-            detail: err.to_string(),
-        },
+        KanbanError::RevisionConflict {
+            expected, actual, ..
+        } => ApiError::conflict_with(
+            err.to_string(),
+            ConflictData::RevisionConflict {
+                expected: expected.0,
+                actual: actual.0,
+            },
+        ),
         KanbanError::MissingTitle => ApiError::Invalid(InvalidId {
             what: "title".into(),
             reason: err.to_string(),
         }),
+        KanbanError::DuplicateOrgId(_) => ApiError::conflict(err.to_string()),
     }
 }
 

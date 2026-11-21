@@ -5,7 +5,7 @@
 //! UI-side business logic.
 
 use crate::board::CardRef;
-use crate::id::{BbInteractionId, Principal, RoleName, Seq, UnixMs, WaveSlug};
+use crate::id::{BbInteractionId, OrgId, Principal, RoleName, SeatName, Seq, UnixMs, WaveSlug};
 use crate::mail::{LetterRef, MailboxItem};
 use crate::read::ArchiveTarget;
 use crate::registry::WireCommand;
@@ -67,6 +67,29 @@ pub enum NotifyKind {
     /// A wake-bell scheduled prompt.
     Reminder {
         bell_id: String,
+    },
+    /// One informational card per `Active` seat with unrung mail (never per-letter).
+    MailUnrung {
+        seat: SeatName,
+        #[serde(default)]
+        unread_count: u32,
+        #[serde(default)]
+        oldest_at: UnixMs,
+    },
+    /// A transport provider failed health checks (circuit-breaker alert).
+    TransportDown {
+        #[serde(default)]
+        transport: String,
+        #[serde(default)]
+        detail: String,
+    },
+    /// Two-way `.org` reconciliation hit a stale `:REX_REV:` conflict.
+    OrgConflict {
+        #[serde(default)]
+        path: String,
+        org_id: OrgId,
+        #[serde(default)]
+        detail: String,
     },
 }
 
