@@ -1985,3 +1985,508 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
         "block:fathom-card"
     );
 }
+
+#[tokio::test]
+async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
+    let daemon = IsolatedDaemon::start("pr21-guard").await;
+
+    // Mint a Seat token for `tally` and a Worker token for `w1/coder`.
+    let tally_tok = daemon.cli_json(&["token", "--seat", "tally"]).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let worker_tok = daemon.cli_json(&["token", "--worker", "w1/coder"]).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Build a synthetic interchange directory + two manifests:
+    //  - a 1-seat manifest for `tally` with NO exec fields (tests upfront operator check)
+    //  - a manifest for `tally` WITH `start_cmd` / `resume_cmd`
+    let estate = daemon.dir.0.join("estate");
+    let interchange = estate.join("interchange");
+    std::fs::create_dir_all(interchange.join("postmaster/state")).unwrap();
+    std::fs::create_dir_all(estate.join(".watchers")).unwrap();
+    std::fs::create_dir_all(interchange.join("mail")).unwrap();
+    std::fs::create_dir_all(interchange.join("state")).unwrap();
+    std::fs::write(
+        interchange.join("postmaster/state/roster.json"),
+        serde_json::to_vec(&json!({
+            "schema": "house-roster/2",
+            "seats": {
+                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
+                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" },
+                "rd-3": { "name": "nodal", "box": "/tmp/interchange/to-nodal" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        estate.join(".watchers/mailwatch-routes.json"),
+        serde_json::to_vec(&json!({
+            "tally": { "aliases": ["tally", "tally_votp"] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(interchange.join("state/acks.jsonl"), "").unwrap();
+
+    let self_manifest = daemon.dir.0.join("tally-only.json");
+    std::fs::write(
+        &self_manifest,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "rex-wave-resident-manifest/1",
+            "seats": [{
+                "seat": "tally",
+                "role": "estate-desk"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let exec_manifest = daemon.dir.0.join("tally-exec.json");
+    std::fs::write(
+        &exec_manifest,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "rex-wave-resident-manifest/1",
+            "seats": [{
+                "seat": "tally",
+                "role": "estate-desk",
+                "start_cmd": "claude --name Tally-5.2",
+                "resume_cmd": "claude --resume 59e9053e"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let assert_denied = |label: &str, out: &Output| {
+        assert!(
+            !out.status.success(),
+            "{label} must exit non-zero, stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err_json: Value = serde_json::from_slice(&out.stderr).unwrap_or_else(|e| {
+            panic!(
+                "{label} stderr was not ApiError JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(
+            err_json["error"], "denied",
+            "{label} expected ApiError::Denied, got {err_json}"
+        );
+    };
+
+    // 1. Both Seat (`tally`) and Worker (`w1/coder`) tokens are DENIED on:
+    //    - `presence import-manifest` (even a 1-seat manifest for `tally` with no exec fields!)
+    //    - `presence seed-interchange`
+    //    - `presence claim tally --start-cmd ...` / `--resume-cmd ...`
+    for (who, tok) in [
+        ("seat:tally", tally_tok.as_str()),
+        ("worker:w1/coder", worker_tok.as_str()),
+    ] {
+        let out_import = daemon
+            .cli(
+                &[
+                    "--json",
+                    "--token",
+                    tok,
+                    "presence",
+                    "import-manifest",
+                    self_manifest.to_str().unwrap(),
+                ],
+                &[],
+                &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+            )
+            .await;
+        assert_denied(&format!("{who} import-manifest (self-only)"), &out_import);
+
+        let out_seed = daemon
+            .cli(
+                &[
+                    "--json",
+                    "--token",
+                    tok,
+                    "presence",
+                    "seed-interchange",
+                    "--interchange",
+                    interchange.to_str().unwrap(),
+                ],
+                &[],
+                &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+            )
+            .await;
+        assert_denied(&format!("{who} seed-interchange"), &out_seed);
+
+        let out_start = daemon
+            .cli(
+                &[
+                    "--json",
+                    "--token",
+                    tok,
+                    "presence",
+                    "claim",
+                    "tally",
+                    "--start-cmd",
+                    "sh -c evil",
+                ],
+                &[],
+                &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+            )
+            .await;
+        assert_denied(&format!("{who} claim --start-cmd"), &out_start);
+
+        let out_resume = daemon
+            .cli(
+                &[
+                    "--json",
+                    "--token",
+                    tok,
+                    "presence",
+                    "claim",
+                    "tally",
+                    "--resume-cmd",
+                    "sh -c evil",
+                ],
+                &[],
+                &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+            )
+            .await;
+        assert_denied(&format!("{who} claim --resume-cmd"), &out_resume);
+
+        // HTTP transport boundary also denies `start_cmd` for non-operator tokens
+        // (http.rs masks `ApiError::Denied` as 404 `not_found`).
+        let auth_hdr = format!("Bearer {tok}");
+        let http_res = http_request(
+            daemon.http_addr,
+            "POST",
+            "/v1/call/presence_claim",
+            &[
+                ("Authorization", &auth_hdr),
+                ("Content-Type", "application/json"),
+            ],
+            Some(r#"{"seat":"tally","start_cmd":"sh -c evil"}"#),
+        )
+        .await;
+        assert_eq!(
+            http_res.status,
+            404,
+            "{who} HTTP presence_claim with start_cmd must be rejected (masked Denied -> 404), body={}",
+            String::from_utf8_lossy(&http_res.body)
+        );
+        assert_eq!(http_res.json()["error"], "not_found");
+    }
+
+    // Verify no denied call created `tally`.
+    let list_before = daemon.cli_json(&["presence", "list"]).await;
+    assert_eq!(
+        list_before["value"]["seats"].as_array().unwrap().len(),
+        0,
+        "denied non-operator calls must leave presence table empty"
+    );
+
+    // 2. Operator succeeds on `import-manifest` with `start_cmd`/`resume_cmd`,
+    //    and HTTP `/v1/call/presence_claim` succeeds as Operator (proving the 404
+    //    above was masked `Denied`, not a bad route).
+    let op_import = daemon
+        .cli_json(&[
+            "presence",
+            "import-manifest",
+            exec_manifest.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(op_import["imported_count"], 1);
+    let op_http = http_request(
+        daemon.http_addr,
+        "POST",
+        "/v1/call/presence_claim",
+        &[("Content-Type", "application/json")],
+        Some(r#"{"seat":"tally","start_cmd":"claude --name Tally-5.2"}"#),
+    )
+    .await;
+    assert_eq!(
+        op_http.status,
+        200,
+        "operator HTTP presence_claim with start_cmd must succeed: {}",
+        String::from_utf8_lossy(&op_http.body)
+    );
+    let resolved = daemon.cli_json(&["presence", "resolve", "tally"]).await;
+    assert_eq!(
+        resolved["value"]["record"]["start_cmd"],
+        "claude --name Tally-5.2"
+    );
+    assert_eq!(
+        resolved["value"]["record"]["resume_cmd"],
+        "claude --resume 59e9053e"
+    );
+
+    // 3. `tally`'s seat token cannot clear operator-set `start_cmd`/`resume_cmd` via `--replace`,
+    //    but CAN still update its own non-exec metadata while preserving them.
+    let replace_denied = daemon
+        .cli(
+            &[
+                "--json",
+                "--token",
+                &tally_tok,
+                "presence",
+                "claim",
+                "tally",
+                "--replace",
+                "tally",
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert_denied("seat:tally --replace clearing exec fields", &replace_denied);
+
+    let role_update = daemon
+        .cli(
+            &[
+                "--json",
+                "--token",
+                &tally_tok,
+                "presence",
+                "claim",
+                "tally",
+                "--role",
+                "desk-keeper",
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert!(
+        role_update.status.success(),
+        "seat updating its own non-exec role must succeed: {}",
+        String::from_utf8_lossy(&role_update.stderr)
+    );
+    let after_role = daemon.cli_json(&["presence", "resolve", "tally"]).await;
+    assert_eq!(
+        after_role["value"]["record"]["role"]["value"],
+        "desk-keeper"
+    );
+    assert_eq!(
+        after_role["value"]["record"]["start_cmd"],
+        "claude --name Tally-5.2"
+    );
+    assert_eq!(
+        after_role["value"]["record"]["resume_cmd"],
+        "claude --resume 59e9053e"
+    );
+
+    // 4. Smoke-test Tally's exact 4-step 1-seat live-soak flow on a clean isolated daemon.
+    let soak = IsolatedDaemon::start("pr21-tally-soak").await;
+    let soak_estate = soak.dir.0.join("estate");
+    let soak_interchange = soak_estate.join("interchange");
+    std::fs::create_dir_all(soak_interchange.join("postmaster/state")).unwrap();
+    std::fs::create_dir_all(soak_estate.join(".watchers")).unwrap();
+    std::fs::create_dir_all(soak_interchange.join("mail")).unwrap();
+    std::fs::create_dir_all(soak_interchange.join("state")).unwrap();
+    std::fs::write(
+        soak_interchange.join("postmaster/state/roster.json"),
+        serde_json::to_vec(&json!({
+            "schema": "house-roster/2",
+            "seats": {
+                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
+                "rd-2": { "name": "nodal", "box": "/tmp/interchange/to-nodal" },
+                "rd-3": { "name": "golem", "box": "/tmp/interchange/to-golem" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        soak_estate.join(".watchers/mailwatch-routes.json"),
+        serde_json::to_vec(&json!({
+            "tally": { "aliases": ["tally", "tally_votp"] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(soak_interchange.join("state/acks.jsonl"), "").unwrap();
+    // Pre-bind historical letter to `tally` (must be skipped by auto mail horizon on bind).
+    std::fs::write(
+        soak_interchange.join("mail/1792431783570-pre-bind-to-tally.md"),
+        "---\nfrom: crest\nto: tally\ndate: 2026-10-18 12:00 UTC\nsubject: Historical\n---\nold\n",
+    )
+    .unwrap();
+    let tree_before_seed = snapshot_tree(&soak_interchange);
+
+    // Step 2a: `presence seed-interchange --dry-run`
+    let dry = soak
+        .cli_json(&[
+            "presence",
+            "seed-interchange",
+            "--interchange",
+            soak_interchange.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .await;
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(snapshot_tree(&soak_interchange), tree_before_seed);
+
+    // Step 2b: `presence seed-interchange` (apply as Operator)
+    let applied = soak
+        .cli_json(&[
+            "presence",
+            "seed-interchange",
+            "--interchange",
+            soak_interchange.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(applied["dry_run"], false);
+    assert!(applied["applied_count"].as_u64().unwrap() >= 2);
+    assert!(
+        applied["skipped_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "golem")
+    );
+    assert_eq!(snapshot_tree(&soak_interchange), tree_before_seed);
+
+    // Step 3: Manual `presence bind --seat tally --from-claude-session <mock_session_json> --ttl 24h`
+    let my_pid = std::process::id();
+    let my_start = current_process_start().expect("current process start time");
+    let session_json_path = soak.dir.0.join("tally-claude-session.json");
+    let mock_sock = soak.dir.0.join("tally-claude.sock");
+    std::fs::write(
+        &session_json_path,
+        serde_json::to_vec(&json!({
+            "pid": my_pid,
+            "procStart": my_start,
+            "sessionId": "sess-tally-soak-1",
+            "messagingSocketPath": mock_sock.to_str().unwrap(),
+            "kind": "interactive",
+            "name": "Tally-5.2",
+            "nameSource": "user"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let bind = soak
+        .cli_json(&[
+            "presence",
+            "bind",
+            "--seat",
+            "tally",
+            "--from-claude-session",
+            session_json_path.to_str().unwrap(),
+            "--ttl",
+            "24h",
+        ])
+        .await;
+    assert_eq!(bind["reply"], "presence_bind");
+    assert_eq!(bind["value"]["seat"], "tally");
+    assert_eq!(bind["value"]["endpoint"]["transport"], "claude_session");
+    assert!(
+        !mock_sock.exists(),
+        "presence bind must never create or connect to messagingSocketPath"
+    );
+
+    let tally_rec = soak.cli_json(&["presence", "resolve", "tally_votp"]).await;
+    assert_eq!(tally_rec["value"]["record"]["seat"], "tally");
+    let horizon_ms = tally_rec["value"]["record"]["mail_horizon_at"]
+        .as_u64()
+        .expect("bind auto-sets mail_horizon_at");
+    let live_list = soak.cli_json(&["presence", "list", "--live-only"]).await;
+    let live_seats = live_list["value"]["seats"].as_array().unwrap();
+    assert_eq!(live_seats.len(), 1);
+    assert_eq!(live_seats[0]["record"]["seat"], "tally");
+
+    // Step 4: `mail shadow --watch` writing outside `interchange/`
+    let shadow_out = soak.dir.0.join("tally-soak-shadow.jsonl");
+    let _watch_guard = ChildGuard(
+        Command::new(bin_path())
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
+            .args([
+                "--socket",
+                soak.sock.to_str().unwrap(),
+                "mail",
+                "shadow",
+                "--interchange",
+                soak_interchange.to_str().unwrap(),
+                "--out",
+                shadow_out.to_str().unwrap(),
+                "--watch",
+                "--interval-ms",
+                "150",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mail shadow --watch"),
+    );
+
+    // Wait for initial shadow pass to write the file (pre-bind letter skipped as pre-horizon).
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&shadow_out)
+                && text.contains("skip_pre_horizon_history")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("mail shadow --watch wrote initial pass with skip_pre_horizon_history");
+    assert_eq!(
+        snapshot_tree(&soak_interchange),
+        tree_before_seed,
+        "mail shadow --watch must never mutate interchange"
+    );
+
+    // Drop a new post-bind letter addressed to Tally's alias (`tally_votp`).
+    let post_id_ms = horizon_ms + 1_000;
+    let new_letter_name = format!("{post_id_ms}-post-bind-to-tally-votp.md");
+    std::fs::write(
+        soak_interchange.join("mail").join(&new_letter_name),
+        format!(
+            "---\nfrom: crest\nto: tally_votp\nid: {post_id_ms}\nsubject: Live 1-seat soak ring\n---\nhello tally\n"
+        ),
+    )
+    .unwrap();
+    let tree_after_letter = snapshot_tree(&soak_interchange);
+
+    // Wait for the running `--watch` loop to emit a Ring decision for `tally`.
+    let ring_line = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&shadow_out) {
+                for line in text.lines() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line)
+                        && v["decision"] == "ring"
+                        && v["seat"] == "tally"
+                    {
+                        return v;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("mail shadow --watch emitted ring for post-bind letter to tally_votp");
+
+    assert_eq!(ring_line["channel"], "claude_messaging_socket");
+    assert_eq!(
+        ring_line["referent"]["path"],
+        format!("mail/{new_letter_name}")
+    );
+    assert_eq!(
+        snapshot_tree(&soak_interchange),
+        tree_after_letter,
+        "mail shadow --watch must remain structurally read-only on interchange"
+    );
+    assert!(
+        !mock_sock.exists(),
+        "mail shadow --watch must never touch or open messagingSocketPath"
+    );
+}

@@ -3087,3 +3087,205 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
         BTreeSet::from(["to-fathom/2026-10-18-old-history.md".to_owned()])
     );
 }
+
+#[test]
+fn pr21_start_and_resume_cmd_are_operator_only() {
+    let mut st = PresenceState::default();
+    let mut seq = 0;
+    let owner_p = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let tally_seat = SeatName::parse("tally").unwrap();
+    let tally_p = Principal::Seat {
+        seat: tally_seat.clone(),
+    };
+    let worker_p = Principal::Worker {
+        wave: WaveSlug::parse("w1").unwrap(),
+        role: RoleName::parse("coder").unwrap(),
+    };
+    let sys_p = Principal::System {
+        part: SystemPart::MailBridge,
+    };
+
+    // 1. Non-operator principals cannot set `start_cmd` or `resume_cmd` on an unclaimed seat
+    //    (including a seat claiming its own record).
+    for caller in [tally_p.clone(), worker_p.clone(), sys_p.clone()] {
+        let err_start = apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            caller.clone(),
+            UnixMs(1_000),
+            PresenceCommand::PresenceClaim(PresenceClaim {
+                start_cmd: Some("claude --name Tally".into()),
+                ..empty_claim("tally")
+            }),
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_start, ApiError::Denied { .. }),
+            "caller {caller} setting start_cmd must be Denied, got {err_start:?}"
+        );
+
+        let err_resume = apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            caller.clone(),
+            UnixMs(1_001),
+            PresenceCommand::PresenceClaim(PresenceClaim {
+                resume_cmd: Some("claude --resume abc".into()),
+                ..empty_claim("tally")
+            }),
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_resume, ApiError::Denied { .. }),
+            "caller {caller} setting resume_cmd must be Denied, got {err_resume:?}"
+        );
+    }
+    assert!(
+        st.seat(&tally_seat).is_none(),
+        "denied claims must not create seat record"
+    );
+
+    // 2. Operator succeeds setting both `start_cmd` and `resume_cmd`.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(2_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            status: Some(SeatStatus::Active),
+            start_cmd: Some("claude --name Tally".into()),
+            resume_cmd: Some("claude --resume orig".into()),
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let rec = st.seat(&tally_seat).unwrap();
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally"));
+    assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
+
+    // 3. Seat updating its own non-exec metadata succeeds and preserves operator-set commands.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        tally_p.clone(),
+        UnixMs(2_500),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            role: Some("estate-desk".into()),
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let rec = st.seat(&tally_seat).unwrap();
+    assert_eq!(
+        rec.role.as_ref().map(|r| r.value.as_str()),
+        Some("estate-desk")
+    );
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally"));
+    assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
+
+    // 4. Non-operator principals cannot overwrite `start_cmd` or `resume_cmd` on an existing seat
+    //    (even a Worker gets Denied rather than Conflict).
+    for caller in [tally_p.clone(), worker_p.clone(), sys_p.clone()] {
+        let err = apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            caller.clone(),
+            UnixMs(3_000),
+            PresenceCommand::PresenceClaim(PresenceClaim {
+                start_cmd: Some("sh -c pwn".into()),
+                ..empty_claim("tally")
+            }),
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Denied { .. }),
+            "caller {caller} overwriting start_cmd on existing seat must be Denied, got {err:?}"
+        );
+    }
+
+    // 5. Non-operator `replacing_self` cannot clear existing `start_cmd`/`resume_cmd`.
+    for caller in [tally_p.clone(), worker_p.clone(), sys_p.clone()] {
+        let err = apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            caller.clone(),
+            UnixMs(3_500),
+            PresenceCommand::PresenceClaim(PresenceClaim {
+                replace: Some(tally_seat.clone()),
+                ..empty_claim("tally")
+            }),
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Denied { .. }),
+            "caller {caller} clearing start_cmd/resume_cmd via replace must be Denied, got {err:?}"
+        );
+    }
+    let rec = st.seat(&tally_seat).unwrap();
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally"));
+    assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
+
+    // 6. A seat without `start_cmd`/`resume_cmd` may still self-replace its own metadata.
+    let nodal_seat = SeatName::parse("nodal").unwrap();
+    let nodal_p = Principal::Seat {
+        seat: nodal_seat.clone(),
+    };
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        nodal_p.clone(),
+        UnixMs(3_600),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            role: Some("old-role".into()),
+            ..empty_claim("nodal")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        nodal_p,
+        UnixMs(3_700),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            role: Some("new-role".into()),
+            replace: Some(nodal_seat.clone()),
+            ..empty_claim("nodal")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    assert_eq!(
+        st.seat(&nodal_seat)
+            .unwrap()
+            .role
+            .as_ref()
+            .map(|r| r.value.as_str()),
+        Some("new-role")
+    );
+
+    // 7. Operator can clear `start_cmd`/`resume_cmd` via explicit `replace`.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p,
+        UnixMs(4_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            replace: Some(tally_seat.clone()),
+            ..empty_claim("tally")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let rec = st.seat(&tally_seat).unwrap();
+    assert_eq!(rec.start_cmd, None);
+    assert_eq!(rec.resume_cmd, None);
+}
