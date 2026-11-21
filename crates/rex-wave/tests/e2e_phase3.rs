@@ -1032,7 +1032,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
             &format!(":REX_REV: {current_rev}"),
             &format!(":REX_REV: {bumped_rev}"),
         )
-        .replace("Conflicting stale title", "Resolved via watch mode");
+        .replace("Stale Emacs edit", "Resolved via watch mode");
     std::fs::write(&org_file, &resolved_org).unwrap();
     let synced_line = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
@@ -1047,6 +1047,11 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     .expect("watch synced once .org file was edited");
     assert_eq!(synced_line["updated"].as_array().unwrap().len(), 1);
     drop(watch_child);
+
+    let after_watch = daemon
+        .cli_json(&["tasks", "show", "#org-e2e", &org_seq.to_string()])
+        .await;
+    assert_eq!(after_watch["task"]["title"], "Resolved via watch mode");
 
     let alice_tok = daemon.cli_json(&["token", "--seat", "alice"]).await["token"]
         .as_str()

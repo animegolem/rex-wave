@@ -357,7 +357,7 @@ fn spawn_herald_grace_timer(
 enum UdsUnbindScope<'a> {
     AllOrphanedOnStart,
     SingleConn(u64),
-    AllNotIn(&'a HashSet<u64>),
+    AllNotIn(&'a Mutex<HashSet<u64>>),
 }
 
 async fn unbind_uds_sessions(monitor: &LocalClient, scope: UdsUnbindScope<'_>) {
@@ -374,6 +374,12 @@ async fn unbind_uds_sessions(monitor: &LocalClient, scope: UdsUnbindScope<'_>) {
             eprintln!("rex-wave daemon: presence list during UDS unbind failed: {err}");
             return;
         }
+    };
+    let live_snapshot = match scope {
+        UdsUnbindScope::AllNotIn(tracked) => {
+            Some(tracked.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        }
+        _ => None,
     };
     for seat_view in snap.seats {
         for binding in seat_view.bindings {
@@ -396,8 +402,11 @@ async fn unbind_uds_sessions(monitor: &LocalClient, scope: UdsUnbindScope<'_>) {
                     }
                     format!("uds connection #{want} disconnected")
                 }
-                UdsUnbindScope::AllNotIn(live_conns) => {
-                    if live_conns.contains(&conn_id) {
+                UdsUnbindScope::AllNotIn(_) => {
+                    if live_snapshot
+                        .as_ref()
+                        .is_some_and(|live| live.contains(&conn_id))
+                    {
                         continue;
                     }
                     format!("uds connection #{conn_id} disconnected (overflow sweep)")
@@ -459,8 +468,7 @@ fn spawn_presence_disconnect_worker(
         while let Some(conn_id) = rx.recv().await {
             unbind_uds_sessions(&monitor, UdsUnbindScope::SingleConn(conn_id)).await;
             if overflow_sweep.swap(false, Ordering::AcqRel) {
-                let live_snapshot = tracked.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                unbind_uds_sessions(&monitor, UdsUnbindScope::AllNotIn(&live_snapshot)).await;
+                unbind_uds_sessions(&monitor, UdsUnbindScope::AllNotIn(&tracked)).await;
             }
         }
     })
