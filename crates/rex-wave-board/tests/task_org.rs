@@ -5,7 +5,7 @@ use rex_wave_api::*;
 use rex_wave_board::task_org::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -13,8 +13,10 @@ struct FakeRoomState {
     next_seq: u64,
     tasks: BTreeMap<Seq, TaskView>,
     org_ids: BTreeMap<OrgId, Seq>,
+    post_idems: BTreeMap<IdemKey, Posted>,
     raised_notifications: Vec<InboxRaise>,
     bump_rev_before_next_update: Option<Seq>,
+    create_lock_on_next_room_tasks: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -51,6 +53,16 @@ impl FakeTaskRoomClient {
         }
     }
 
+    fn add_label_remotely(&self, seq: Seq, label: &str) {
+        let mut g = self.state.lock().unwrap();
+        let task = g.tasks.get_mut(&seq).expect("task exists");
+        let lbl = Label::parse(label).unwrap();
+        if !task.labels.contains(&lbl) {
+            task.labels.push(lbl);
+            task.labels.sort();
+        }
+    }
+
     fn claim_remotely(&self, seq: Seq, holder: Principal, epoch: u64, expires_at: u64) {
         let mut g = self.state.lock().unwrap();
         let task = g.tasks.get_mut(&seq).expect("task exists");
@@ -65,8 +77,27 @@ impl FakeTaskRoomClient {
         task.ready = false;
     }
 
+    fn heartbeat_remotely(&self, seq: Seq, new_expires_at: u64) {
+        let mut g = self.state.lock().unwrap();
+        let task = g.tasks.get_mut(&seq).expect("task exists");
+        let lease = task.lease.as_mut().expect("active lease");
+        lease.expires_at = UnixMs(new_expires_at);
+    }
+
     fn set_race_bump_on_next_update(&self, seq: Seq) {
         self.state.lock().unwrap().bump_rev_before_next_update = Some(seq);
+    }
+
+    fn create_lock_on_next_room_tasks(&self, lock_path: PathBuf) {
+        self.state.lock().unwrap().create_lock_on_next_room_tasks = Some(lock_path);
+    }
+
+    fn task_count(&self) -> usize {
+        self.state.lock().unwrap().tasks.len()
+    }
+
+    fn task(&self, seq: Seq) -> TaskView {
+        self.state.lock().unwrap().tasks[&seq].clone()
     }
 
     fn notifications(&self) -> Vec<InboxRaise> {
@@ -83,6 +114,9 @@ impl Client for FakeTaskRoomClient {
         let mut g = self.state.lock().unwrap();
         match cmd {
             WireCommand::RoomTasks(req) => {
+                if let Some(lock_path) = g.create_lock_on_next_room_tasks.take() {
+                    let _ = fs::write(&lock_path, "mid-sync-lock");
+                }
                 let room = req.room.resolve(&self.me)?;
                 Ok(WireReply::RoomTasks(TaskListView {
                     room,
@@ -91,6 +125,11 @@ impl Client for FakeTaskRoomClient {
                 }))
             }
             WireCommand::RoomPost(req) => {
+                if let Some(idem) = &req.idem
+                    && let Some(prior) = g.post_idems.get(idem)
+                {
+                    return Ok(WireReply::RoomPost(prior.clone()));
+                }
                 let room = req.room.resolve(&self.me)?;
                 g.next_seq += 1;
                 let seq = Seq(g.next_seq);
@@ -108,7 +147,11 @@ impl Client for FakeTaskRoomClient {
                     let mut labels = req.labels;
                     labels.sort();
                     labels.dedup();
-                    let ready = spec.needs.is_empty();
+                    let ready = spec.needs.iter().all(|dep| {
+                        g.tasks
+                            .get(dep)
+                            .is_some_and(|t| t.status == TaskStatus::Done)
+                    });
                     g.tasks.insert(
                         seq,
                         TaskView {
@@ -134,14 +177,18 @@ impl Client for FakeTaskRoomClient {
                 } else {
                     None
                 };
-                Ok(WireReply::RoomPost(Posted {
+                let posted = Posted {
                     room,
                     seq,
                     mentions: Mentions::default(),
                     re: req.re,
                     org_id,
                     delivery_notice: None,
-                }))
+                };
+                if let Some(idem) = req.idem {
+                    g.post_idems.insert(idem, posted.clone());
+                }
+                Ok(WireReply::RoomPost(posted))
             }
             WireCommand::TaskUpdate(req) => {
                 if g.bump_rev_before_next_update == Some(req.task) {
@@ -191,22 +238,51 @@ impl Client for FakeTaskRoomClient {
             }
             WireCommand::TaskClaim(req) => {
                 let room = req.room.resolve(&self.me)?;
-                let Some(task) = g.tasks.get_mut(&req.task) else {
+                let Some(existing) = g.tasks.get(&req.task).cloned() else {
                     return Err(ApiError::NotFound {
                         what: format!("task {}", req.task.0),
                     });
                 };
                 if let Some(expected) = req.expected_rev
-                    && expected != task.rev
+                    && expected != existing.rev
                 {
                     return Err(ApiError::conflict_with(
                         "rev conflict",
                         ConflictData::RevisionConflict {
                             expected,
-                            actual: task.rev,
+                            actual: existing.rev,
                         },
                     ));
                 }
+                if existing.status == TaskStatus::Claimed
+                    && let Some(lease) = &existing.lease
+                {
+                    return Err(ApiError::conflict_with(
+                        "actively claimed",
+                        ConflictData::LeaseFenced {
+                            expected: LeaseEpoch(0),
+                            actual: lease.epoch,
+                            holder: Some(lease.holder.clone()),
+                        },
+                    ));
+                }
+                let unmet: Vec<Seq> = existing
+                    .needs
+                    .iter()
+                    .copied()
+                    .filter(|dep| {
+                        g.tasks
+                            .get(dep)
+                            .is_none_or(|t| t.status != TaskStatus::Done)
+                    })
+                    .collect();
+                if !unmet.is_empty() && !req.force {
+                    return Err(ApiError::conflict_with(
+                        format!("unmet needs: {unmet:?}"),
+                        ConflictData::UnmetNeeds { unmet },
+                    ));
+                }
+                let task = g.tasks.get_mut(&req.task).unwrap();
                 task.rev += 1;
                 task.status = TaskStatus::Claimed;
                 let epoch = task
@@ -457,9 +533,19 @@ Body prose on newly added heading without an :ID:.
     assert!(after_pull.contains("* STRT [#A] Ship Org reconciler :backend:area%3Dcore:"));
     assert!(after_pull.contains(":REX_REV: 2\n"));
     assert!(after_pull.contains(":REX_EPOCH: 1\n"));
-    assert!(after_pull.contains(":REX_LEASE: @w3/author@999000\n"));
+    assert!(after_pull.contains(":REX_LEASE: @w3/author\n"));
     assert!(after_pull.contains(":EFFORT: 2h\n:OWNER_NOTE: keep this exact custom value\n"));
     assert!(after_pull.contains("** Subheading checklist\n- [ ] verify Clause B-4 symlink\n"));
+
+    client.heartbeat_remotely(Seq(1), 1_500_000);
+    let after_hb = sync_room_to_org(&client, &room, &org_path, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_hb,
+        RoomToOrgOutcome::Unchanged,
+        "worker heartbeat extending expires_at must not churn the .org file"
+    );
 
     let locally_edited = after_pull.replace(
         "* STRT [#A] Ship Org reconciler",
@@ -718,4 +804,347 @@ async fn topological_new_task_creation_and_cycle_rejection_in_org_sync() {
             if conflicts.iter().any(|c| c.kind == OrgConflictKind::DependencyCycle)
     ));
     assert_eq!(fs::read_to_string(&org_path).unwrap(), cyclic);
+}
+
+#[tokio::test]
+async fn partial_apply_and_unid_unmet_needs_conflict_recover_without_duplicates_or_stuck_rev() {
+    let dir = tempfile::tempdir().unwrap();
+    let org_path = dir.path().join("recover.org");
+    let client = FakeTaskRoomClient::new(operator("owner"));
+    let room = tasks_room();
+    let mut state = OrgSyncState::default();
+
+    fs::write(
+        &org_path,
+        "\
+#+TITLE: #sprint
+
+* TODO Open dependency
+:PROPERTIES:
+:ID: dep-open
+:END:
+
+* TODO Card A
+:PROPERTIES:
+:ID: card-a
+:END:
+
+* TODO Card B
+:PROPERTIES:
+:ID: card-b
+:REX_NEEDS: dep-open
+:END:
+",
+    )
+    .unwrap();
+    sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(client.task_count(), 3);
+
+    let synced_v1 = fs::read_to_string(&org_path).unwrap();
+    let edited = format!(
+        "{}\n* STRT New unid task\n:PROPERTIES:\n:REX_NEEDS: dep-open\n:END:\n",
+        synced_v1
+            .replace("* TODO Card A", "* TODO Card A renamed")
+            .replace("* TODO Card B", "* STRT Card B")
+    );
+    fs::write(&org_path, &edited).unwrap();
+
+    let first_attempt = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    let OrgToRoomOutcome::Conflict {
+        applied, conflicts, ..
+    } = first_attempt
+    else {
+        panic!("expected UnmetNeeds conflict, got {first_attempt:?}");
+    };
+    assert_eq!(client.task_count(), 4);
+    assert!(applied.contains(&OrgId::parse("card-a").unwrap()));
+    assert!(
+        conflicts
+            .iter()
+            .all(|c| matches!(c.kind, OrgConflictKind::UnmetNeeds { .. })),
+        "both unid STRT task and Card B hit UnmetNeeds: {conflicts:?}"
+    );
+    assert_eq!(fs::read_to_string(&org_path).unwrap(), edited);
+
+    let retry_while_still_blocked = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        client.task_count(),
+        4,
+        "retrying after conflict must never post a duplicate of the un-ID'd heading"
+    );
+    assert!(matches!(
+        retry_while_still_blocked,
+        OrgToRoomOutcome::Conflict { ref conflicts, .. }
+            if conflicts.iter().all(|c| matches!(c.kind, OrgConflictKind::UnmetNeeds { .. }))
+    ));
+
+    client.bump_task_remotely(Seq(1), None, Some(TaskStatus::Done));
+    let recovered = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    let OrgToRoomOutcome::Synced {
+        created,
+        transitioned,
+        wrote_back,
+        ..
+    } = recovered
+    else {
+        panic!("expected clean recovery after dep-open finished, got {recovered:?}");
+    };
+    assert!(created.is_empty(), "zero duplicate creations on recovery");
+    assert_eq!(client.task_count(), 4);
+    assert_eq!(transitioned.len(), 2);
+    assert!(wrote_back);
+
+    let final_org = fs::read_to_string(&org_path).unwrap();
+    assert!(final_org.contains("* TODO Card A renamed\n:PROPERTIES:\n:ID: card-a\n:REX_REV: 2\n"));
+    assert!(final_org.contains("* STRT Card B"));
+    assert!(final_org.contains("* STRT New unid task"));
+    assert!(state.pending_created.is_empty());
+
+    let lock_path = emacs_lock_path(&org_path).unwrap();
+    let with_another = format!(
+        "{}\n* TODO Deferred writeback task\n",
+        final_org.replace("* TODO Card A renamed", "* TODO Card A v3")
+    );
+    fs::write(&org_path, &with_another).unwrap();
+    client.create_lock_on_next_room_tasks(lock_path.clone());
+    let r_locked = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            r_locked,
+            OrgToRoomOutcome::Synced {
+                wrote_back: false,
+                ..
+            }
+        ),
+        "lock created during sync skips write-back safely: {r_locked:?}"
+    );
+    assert_eq!(client.task_count(), 5);
+    fs::remove_file(&lock_path).unwrap();
+
+    let r_converged = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        r_converged,
+        OrgToRoomOutcome::Synced {
+            ref created,
+            wrote_back: true,
+            ..
+        } if created.is_empty()
+    ));
+    assert_eq!(client.task_count(), 5);
+}
+
+#[tokio::test]
+async fn real_emacs_aligned_id_and_planning_lines_round_trip_without_duplication() {
+    let dir = tempfile::tempdir().unwrap();
+    let org_path = dir.path().join("emacs-real.org");
+    let client = FakeTaskRoomClient::new(operator("owner"));
+    let room = tasks_room();
+    let mut state = OrgSyncState::default();
+
+    let emacs_initial = "\
+#+TITLE: #sprint
+
+* TODO Test task
+SCHEDULED: <2026-11-22 Sun> DEADLINE: <2026-11-25 Wed>
+:PROPERTIES:
+:ID:       E4AFCAD8-9429-42C7-9036-B01F182D9C84
+:END:
+Body line from Emacs.
+";
+    fs::write(&org_path, emacs_initial).unwrap();
+
+    let created = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    let OrgToRoomOutcome::Synced {
+        created: ids,
+        wrote_back,
+        ..
+    } = created
+    else {
+        panic!("expected Synced on real Emacs fixture, got {created:?}");
+    };
+    assert!(wrote_back);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids[0].as_str(), "E4AFCAD8-9429-42C7-9036-B01F182D9C84");
+    assert_eq!(client.task_count(), 1);
+
+    let after_create = fs::read_to_string(&org_path).unwrap();
+    assert!(
+        after_create.contains(
+            "* TODO Test task\nSCHEDULED: <2026-11-22 Sun> DEADLINE: <2026-11-25 Wed>\n:PROPERTIES:\n:ID: E4AFCAD8-9429-42C7-9036-B01F182D9C84\n:REX_REV: 1\n:REX_SEQ: 1\n:END:\nBody line from Emacs.\n"
+        ),
+        "planning line stays between heading and :PROPERTIES: drawer:\n{after_create}"
+    );
+
+    let emacs_closed = "\
+#+TITLE: #sprint
+
+* DONE Test task
+CLOSED: [2026-11-21 Sat 09:53] DEADLINE: <2026-11-25 Wed> SCHEDULED: <2026-11-22 Sun>
+:PROPERTIES:
+:ID:       E4AFCAD8-9429-42C7-9036-B01F182D9C84
+:REX_REV:  1
+:REX_SEQ:  1
+:END:
+Body line from Emacs.
+";
+    fs::write(&org_path, emacs_closed).unwrap();
+
+    let closed = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    let OrgToRoomOutcome::Synced {
+        created: new_ids,
+        transitioned,
+        wrote_back,
+        ..
+    } = closed
+    else {
+        panic!("expected Synced when closing in Emacs with CLOSED planning line, got {closed:?}");
+    };
+    assert!(
+        new_ids.is_empty(),
+        "closing a task with CLOSED planning line must not create a duplicate task"
+    );
+    assert_eq!(
+        transitioned,
+        vec![OrgId::parse("E4AFCAD8-9429-42C7-9036-B01F182D9C84").unwrap()]
+    );
+    assert!(wrote_back);
+    assert_eq!(client.task_count(), 1);
+    assert_eq!(client.task(Seq(1)).status, TaskStatus::Done);
+
+    let after_close = fs::read_to_string(&org_path).unwrap();
+    assert!(after_close.contains(
+        "* DONE Test task\nCLOSED: [2026-11-21 Sat 09:53] DEADLINE: <2026-11-25 Wed> SCHEDULED: <2026-11-22 Sun>\n:PROPERTIES:\n:ID: E4AFCAD8-9429-42C7-9036-B01F182D9C84\n:REX_REV: 2\n:REX_SEQ: 1\n:END:\nBody line from Emacs.\n"
+    ));
+
+    client.bump_task_remotely(Seq(1), Some("Test task retitled remotely"), None);
+    let pulled = sync_room_to_org(&client, &room, &org_path, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(pulled, RoomToOrgOutcome::Written { tasks_synced: 1 });
+    let after_pull = fs::read_to_string(&org_path).unwrap();
+    assert!(after_pull.contains(
+        "* DONE Test task retitled remotely\nCLOSED: [2026-11-21 Sat 09:53] DEADLINE: <2026-11-25 Wed> SCHEDULED: <2026-11-22 Sun>\n:PROPERTIES:\n:ID: E4AFCAD8-9429-42C7-9036-B01F182D9C84\n:REX_REV: 3\n:REX_SEQ: 1\n:END:\nBody line from Emacs.\n"
+    ));
+}
+
+#[tokio::test]
+async fn emacs_title_edit_does_not_remove_concurrent_room_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let org_path = dir.path().join("labels.org");
+    let client = FakeTaskRoomClient::new(operator("owner"));
+    let room = tasks_room();
+    let mut state = OrgSyncState::default();
+
+    fs::write(
+        &org_path,
+        "\
+#+TITLE: #sprint
+
+* TODO Labeled task :area%3Dcore:
+:PROPERTIES:
+:ID: lbl-1
+:END:
+",
+    )
+    .unwrap();
+    sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    client.add_label_remotely(Seq(1), "x=1");
+
+    let cur = fs::read_to_string(&org_path).unwrap();
+    let renamed = cur.replace("Labeled task", "Labeled task renamed");
+    fs::write(&org_path, &renamed).unwrap();
+
+    let res = sync_org_to_room(
+        &client,
+        &room,
+        &org_path,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(res, OrgToRoomOutcome::Synced { .. }));
+    assert_eq!(
+        client.task(Seq(1)).labels,
+        vec![
+            Label::parse("area=core").unwrap(),
+            Label::parse("x=1").unwrap()
+        ],
+        "remote RoomLabel addition must not be wiped by an unrelated Emacs title edit"
+    );
+    let final_disk = fs::read_to_string(&org_path).unwrap();
+    assert!(final_disk.contains(":area%3Dcore:x%3D1:"));
 }

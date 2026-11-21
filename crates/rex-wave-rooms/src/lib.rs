@@ -434,19 +434,21 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// Namespace idempotency keys per room command kind so reusing the same raw key
-/// across different commands (e.g. `RoomPost` and `RoomLabel`) never collides in
-/// the per-stream journal lookup table or panics in `Rooms::reply`.
-fn scoped_idem(tag: char, key: &IdemKey) -> IdemKey {
+/// Namespace idempotency keys for Phase 3 room commands so reusing the same raw
+/// key across different command variants never collides in the per-stream journal
+/// lookup table, while keeping `RoomPost` keys raw for pre-upgrade compatibility.
+fn scoped_idem(prefix: &str, key: &IdemKey) -> IdemKey {
     let raw = key.as_str();
-    let encoded = if raw.len() <= 250 {
-        format!("{tag}:r:{raw}")
+    let max_raw = 256 - prefix.len() - 2;
+    let encoded = if raw.len() <= max_raw {
+        format!("{prefix}r:{raw}")
     } else {
         let h_fwd = fnv1a_128(raw.as_bytes());
         let rev_bytes: Vec<u8> = raw.as_bytes().iter().rev().copied().collect();
         let h_rev = fnv1a_128(&rev_bytes) as u64;
-        let prefix = truncate_utf8(raw, 196);
-        format!("{tag}:h:{h_fwd:032x}{h_rev:016x}:{prefix}")
+        let max_prefix = 256 - prefix.len() - 2 - 48 - 1;
+        let head = truncate_utf8(raw, max_prefix);
+        format!("{prefix}h:{h_fwd:032x}{h_rev:016x}:{head}")
     };
     IdemKey::parse(encoded).expect("scoped idempotency key is valid printable <= 256 bytes")
 }
@@ -641,11 +643,11 @@ impl Decider for Rooms {
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
         match cmd {
-            RoomCommand::RoomPost(c) => c.idem.as_ref().map(|k| scoped_idem('p', k)),
-            RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_idem('l', k)),
-            RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_idem('c', k)),
-            RoomCommand::TaskTransition(c) => c.idem.as_ref().map(|k| scoped_idem('t', k)),
-            RoomCommand::TaskUpdate(c) => c.idem.as_ref().map(|k| scoped_idem('u', k)),
+            RoomCommand::RoomPost(c) => c.idem.clone(),
+            RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_lbl:", k)),
+            RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_clm:", k)),
+            RoomCommand::TaskTransition(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_trn:", k)),
+            RoomCommand::TaskUpdate(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_upd:", k)),
             RoomCommand::RoomEnsure(_)
             | RoomCommand::RoomJoin(_)
             | RoomCommand::RoomLeave(_)
@@ -1420,15 +1422,7 @@ impl Decider for Rooms {
                 }
                 if let Some(spec) = task {
                     let org_id = spec.org_id.clone().unwrap_or_else(|| {
-                        let room_id = state
-                            .opened
-                            .as_ref()
-                            .map(|(id, _)| id.clone())
-                            .unwrap_or_else(|| RoomId::Channel {
-                                scope: RoomScope::Global,
-                                name: ChannelName::parse("room").expect("static"),
-                            });
-                        mint_task_org_id(&room_id, meta.seq, &state.org_ids)
+                        OrgId::mint_deterministic(&format!("room-task:{}", meta.seq.0))
                     });
                     state.org_ids.insert(org_id.clone(), meta.seq);
                     state.tasks.insert(

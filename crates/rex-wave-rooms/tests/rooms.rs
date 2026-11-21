@@ -1810,3 +1810,60 @@ fn pure_clock_lease_expiry_and_readiness_evaluation() {
     let after_takeover = state.task_view_at(task_seq, UnixMs(1_500)).unwrap();
     assert_eq!(after_takeover.lease.unwrap().epoch, LeaseEpoch(2));
 }
+
+#[tokio::test]
+async fn room_post_keeps_raw_idem_keys_for_pre_upgrade_journal_dedupe() {
+    let journal = Journal::in_memory().unwrap();
+    let room_id = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("legacy-idem").unwrap(),
+    };
+    let stream = StreamId::Room {
+        room: room_id.clone(),
+    };
+    let raw_key = IdemKey::parse("wave:auth-v2:brief:verifier").unwrap();
+    {
+        let mut writer = journal.claim(stream).unwrap();
+        writer
+            .append(
+                &seat("sam"),
+                UnixMs(1_000),
+                Some(&raw_key),
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: room_id.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("pre-upgrade brief").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: vec![],
+                        task: None,
+                        idem: Some(raw_key.clone()),
+                    }),
+                ],
+            )
+            .unwrap();
+    }
+
+    let router = build_harness(journal, Duration::from_secs(60));
+    let sam = LocalClient::new(router, seat("sam"));
+    let retried = sam
+        .call(RoomPost {
+            idem: Some(raw_key),
+            ..RoomPost::new(
+                RoomRef::Id { id: room_id },
+                Body::parse("duplicate retry").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.seq,
+        Seq(2),
+        "pre-upgrade raw RoomPost idem keys continue deduping after Phase 3"
+    );
+}
