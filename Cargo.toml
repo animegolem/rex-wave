@@ -11,6 +11,7 @@ members = [
     "crates/rex-wave-notify",
     "crates/rex-wave-mailbridge",
     "crates/rex-wave-bb",
+    "crates/rex-wave-t3",
     "crates/rex-wave-transport",
     "crates/rex-wave-mcp",
     "crates/rex-wave-tui",
@@ -53,6 +54,7 @@ rex-wave-waves = { path = "crates/rex-wave-waves" }
 rex-wave-notify = { path = "crates/rex-wave-notify" }
 rex-wave-mailbridge = { path = "crates/rex-wave-mailbridge" }
 rex-wave-bb = { path = "crates/rex-wave-bb" }
+rex-wave-t3 = { path = "crates/rex-wave-t3" }
 rex-wave-transport = { path = "crates/rex-wave-transport" }
 rex-wave-mcp = { path = "crates/rex-wave-mcp" }
 rex-wave-tui = { path = "crates/rex-wave-tui" }

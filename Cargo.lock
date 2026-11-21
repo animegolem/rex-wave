@@ -1460,6 +1460,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-wave-t3"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures-core",
+ "futures-util",
+ "rex-wave-api",
+ "rex-wave-board",
+ "rex-wave-rooms",
+ "rex-wave-runtime",
+ "rex-wave-store",
+ "rex-wave-waves",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "rex-wave-transport"
 version = "0.1.0"
 dependencies = [

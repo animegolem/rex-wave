@@ -1,0 +1,31 @@
+[package]
+name = "rex-wave-t3"
+description = "T3 Code 0.1.11 host bridge: AgentHost, AgentFeed, worker token files, and CompositeHost/CompositeFeed routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+rex-wave-api.workspace = true
+rex-wave-runtime.workspace = true
+rex-wave-waves.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rex-wave-board.workspace = true
+rex-wave-rooms.workspace = true
+rex-wave-store.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
