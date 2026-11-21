@@ -370,7 +370,7 @@ fn verify_private_file(
     Ok(true)
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum TokenMapValue {
     Seat(SeatName),
@@ -378,6 +378,19 @@ enum TokenMapValue {
 }
 
 impl TokenMapValue {
+    fn from_principal(principal: &Principal) -> Result<Self, ApiError> {
+        match principal {
+            Principal::Seat { seat } => Ok(TokenMapValue::Seat(seat.clone())),
+            Principal::Operator { .. } | Principal::Worker { .. } => {
+                Ok(TokenMapValue::Principal(principal.clone()))
+            }
+            Principal::System { .. } => Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: "bearer tokens may not authenticate as system".into(),
+            }),
+        }
+    }
+
     fn into_principal(self) -> Principal {
         match self {
             TokenMapValue::Seat(seat) => Principal::Seat { seat },
@@ -479,6 +492,51 @@ impl PrincipalTokenTable {
 
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Principal)> {
+        self.tokens.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub fn remove_principal(&mut self, principal: &Principal) {
+        self.tokens.retain(|_, existing| existing != principal);
+    }
+
+    /// Atomically persists the table to `tokens.json` with mode `0600`.
+    /// Seats serialize as bare strings for backward compatibility while workers
+    /// and operators serialize as tagged [`Principal`] objects; `System` is refused.
+    pub fn save_tokens_file(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out: BTreeMap<&str, TokenMapValue> = BTreeMap::new();
+        for (tok, principal) in &self.tokens {
+            validate_token_principal(tok, principal)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            let val = TokenMapValue::from_principal(principal)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            out.insert(tok.as_str(), val);
+        }
+        let encoded = serde_json::to_vec_pretty(&out)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let nonce = WORKER_TOKEN_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(&encoded)?;
+            file.sync_all()?;
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Loads `tokens.json` in either legacy `{token: "seat"}` or principal-scoped
@@ -1580,8 +1638,16 @@ async fn handle_conn(
         };
         match frame {
             wire::ClientFrame::Hello { .. } => break "second hello".to_owned(),
-            wire::ClientFrame::Call { id, cmd } => {
+            wire::ClientFrame::Call { id, mut cmd } => {
                 while in_flight_calls.try_join_next().is_some() {}
+                if let WireCommand::PresenceBind(ref mut bind) = cmd
+                    && let rex_wave_api::presence::TransportEndpoint::UdsSession {
+                        ref mut conn_id,
+                        ..
+                    } = bind.endpoint
+                {
+                    *conn_id = conn;
+                }
                 let router = router.clone();
                 let by = session.me().clone();
                 let out_tx = out_tx.clone();

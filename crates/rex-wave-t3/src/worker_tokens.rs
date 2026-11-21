@@ -4,14 +4,22 @@
 //! storing the worker token in a mode-`0600` file keyed by thread ID lets bash
 //! CLI calls authenticate as `Principal::Worker` without secrets in prompts.
 
-use rex_wave_api::{BbThreadId, RoleName, WaveSlug};
+use rex_wave_api::{BbThreadId, Principal, RoleName, WaveSlug};
 use rex_wave_waves::HostError;
+use serde::{Deserialize, Serialize};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const WORKER_TOKENS_DIR: &str = "worker-tokens";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerTokenRecord {
+    token: String,
+    principal: Principal,
+}
 
 pub type WorkerTokenMinter =
     Arc<dyn Fn(&WaveSlug, &RoleName, &BbThreadId) -> Result<String, HostError> + Send + Sync>;
@@ -63,11 +71,10 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
-/// Atomically writes `token` to `<state_dir>/worker-tokens/<thread_id>` with mode `0600`.
-pub fn write_worker_token_file(
+fn write_worker_token_bytes(
     state_dir: &Path,
     thread_id: &str,
-    token: &str,
+    bytes: &[u8],
 ) -> io::Result<PathBuf> {
     let target = worker_token_path(state_dir, thread_id)?;
     let dir = worker_tokens_dir(state_dir);
@@ -89,8 +96,7 @@ pub fn write_worker_token_file(
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(token.as_bytes())?;
-        file.write_all(b"\n")?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
@@ -101,7 +107,51 @@ pub fn write_worker_token_file(
     Ok(target)
 }
 
+/// Atomically writes `token` to `<state_dir>/worker-tokens/<thread_id>` with mode `0600`.
+pub fn write_worker_token_file(
+    state_dir: &Path,
+    thread_id: &str,
+    token: &str,
+) -> io::Result<PathBuf> {
+    let mut bytes = Vec::with_capacity(token.len() + 1);
+    bytes.extend_from_slice(token.as_bytes());
+    bytes.push(b'\n');
+    write_worker_token_bytes(state_dir, thread_id, &bytes)
+}
+
+/// Atomically writes a structured `WorkerTokenFile` JSON record (`{token, principal}`)
+/// readable by both `StateDirAuthenticator` and `read_worker_token_file`.
+pub fn write_worker_token_record(
+    state_dir: &Path,
+    thread_id: &str,
+    token: &str,
+    principal: &Principal,
+) -> io::Result<PathBuf> {
+    if token.is_empty() || token.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker token must be non-empty without control characters",
+        ));
+    }
+    if matches!(principal, Principal::System { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker token file may not bind Principal::System",
+        ));
+    }
+    let record = WorkerTokenRecord {
+        token: token.to_owned(),
+        principal: principal.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    write_worker_token_bytes(state_dir, thread_id, &bytes)
+}
+
 /// Reads `<state_dir>/worker-tokens/<thread_id>`, refusing symlinks or non-`0600` files.
+/// Accepts both structured `WorkerTokenFile` JSON (`{token, principal}`) and legacy
+/// single-line plain token files.
 pub fn read_worker_token_file(state_dir: &Path, thread_id: &str) -> io::Result<Option<String>> {
     let path = worker_token_path(state_dir, thread_id)?;
     let meta = match std::fs::symlink_metadata(&path) {
@@ -125,6 +175,18 @@ pub fn read_worker_token_file(state_dir: &Path, thread_id: &str) -> io::Result<O
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
+    }
+    if trimmed.starts_with('{') {
+        let record: WorkerTokenRecord = serde_json::from_str(trimmed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tok = record.token.trim();
+        if tok.is_empty() || tok.chars().any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty or invalid token in worker token JSON",
+            ));
+        }
+        return Ok(Some(tok.to_owned()));
     }
     Ok(Some(trimmed.to_owned()))
 }
@@ -157,9 +219,10 @@ impl std::fmt::Debug for ProvisionedWorkerToken {
     }
 }
 
-/// Ensures `<state_dir>/worker-tokens/<thread_id>` exists with mode `0600`.
-/// Without a custom minter, reuses an existing valid `0600` file so idempotent
-/// spawn retries do not rotate an active worker's token.
+/// Ensures `<state_dir>/worker-tokens/<thread_id>` exists with mode `0600` as a
+/// structured `WorkerTokenFile` JSON record for `Principal::Worker { wave, role }`.
+/// Without a custom minter, reuses an existing valid `0600` file for that same
+/// principal so idempotent spawn retries do not rotate an active worker's token.
 pub fn provision_worker_token(
     state_dir: &Path,
     wave: &WaveSlug,
@@ -167,9 +230,13 @@ pub fn provision_worker_token(
     thread: &BbThreadId,
     minter: Option<&WorkerTokenMinter>,
 ) -> Result<ProvisionedWorkerToken, HostError> {
+    let principal = Principal::Worker {
+        wave: wave.clone(),
+        role: role.clone(),
+    };
     if let Some(m) = minter {
         let token = m(wave, role, thread)?;
-        let path = write_worker_token_file(state_dir, thread.as_str(), &token)
+        let path = write_worker_token_record(state_dir, thread.as_str(), &token, &principal)
             .map_err(|e| HostError::Unreachable(format!("write worker token: {e}")))?;
         return Ok(ProvisionedWorkerToken {
             path,
@@ -178,11 +245,23 @@ pub fn provision_worker_token(
         });
     }
 
-    if let Ok(Some(existing)) = read_worker_token_file(state_dir, thread.as_str()) {
-        let path = worker_token_path(state_dir, thread.as_str())
-            .map_err(|e| HostError::Rejected(e.to_string()))?;
+    if let Ok(path) = worker_token_path(state_dir, thread.as_str())
+        && let Ok(Some(existing)) = read_worker_token_file(state_dir, thread.as_str())
+    {
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        if let Ok(rec) = serde_json::from_str::<WorkerTokenRecord>(raw.trim())
+            && rec.principal == principal
+        {
+            return Ok(ProvisionedWorkerToken {
+                path,
+                token: existing,
+                created: false,
+            });
+        }
+        let upgraded = write_worker_token_record(state_dir, thread.as_str(), &existing, &principal)
+            .map_err(|e| HostError::Unreachable(format!("upgrade worker token: {e}")))?;
         return Ok(ProvisionedWorkerToken {
-            path,
+            path: upgraded,
             token: existing,
             created: false,
         });
@@ -190,7 +269,7 @@ pub fn provision_worker_token(
 
     let token = mint_random_worker_token()
         .map_err(|e| HostError::Unreachable(format!("mint worker token: {e}")))?;
-    let path = write_worker_token_file(state_dir, thread.as_str(), &token)
+    let path = write_worker_token_record(state_dir, thread.as_str(), &token, &principal)
         .map_err(|e| HostError::Unreachable(format!("write worker token: {e}")))?;
     Ok(ProvisionedWorkerToken {
         path,
@@ -228,7 +307,15 @@ mod tests {
 
         assert_eq!(
             read_worker_token_file(tmp.path(), thread.as_str()).unwrap(),
-            Some(first.token)
+            Some(first.token.clone())
+        );
+
+        let raw_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&first.path).unwrap()).unwrap();
+        assert_eq!(raw_json["token"], first.token);
+        assert_eq!(
+            raw_json["principal"],
+            serde_json::json!({ "kind": "worker", "wave": "w1", "role": "author" })
         );
 
         remove_worker_token_file(tmp.path(), thread.as_str()).unwrap();

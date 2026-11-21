@@ -22,7 +22,10 @@ pub use presence::{
     parse_claude_session_json, proc_start_matches, query_process_start,
     select_binding_for_delivery, sender_delivery_notice, try_query_process_start,
 };
-pub use score::{ShadowScoreReport, score_shadow_against_acks};
+pub use score::{
+    FixtureCoverageReport, GATE1_CASE_IDS, ShadowScoreReport, check_gate1_fixtures,
+    score_shadow_against_acks, score_shadow_jsonl,
+};
 pub use shadow::{
     DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,
     LetterCandidate, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,

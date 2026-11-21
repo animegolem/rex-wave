@@ -2,10 +2,10 @@
 
 > **Thesis.** Every piece of rex-wave belongs to one of three layers:
 > 1. **The contract** (`rex-wave-api` and `rex-kanban`). One `commands!` list generates the wire enums, the router enum, the typed `Command` impls, and the JSON-schema `TOOLS` catalog for MCP and BB. Every caller speaks one `Client` trait with two required methods, `call_wire` and `watch`.
-> 2. **Deciders**. One pure `decide / evolve / reply` type per subsystem. `rex-wave-runtime` runs each decider as one single-writer actor per stream (one per room, wave, board, or inbox).
-> 3. **Reactors**. Process managers that perform side effects (BB thread spawns, doorbells, notifications, wake-bell delivery). Each reactor watches frames and sends commands through the same `Client` trait that every UI uses.
+> 2. **Deciders**. One pure `decide / evolve / reply` type per subsystem (`Rooms`, `Waves`, `Board`, `Inbox`, `Presence`). `rex-wave-runtime` runs each decider as one single-writer actor per stream (one per room, wave, board, inbox, or global presence stream).
+> 3. **Reactors**. Process managers that perform side effects (`WaveConductor` over `CompositeHost`, `Herald` with `HeraldHandle` reconnect-grace timer, `BellCourier` wake-bell delivery). Each reactor watches frames and sends commands through the same `Client` trait that every UI uses.
 >
-> The TUI, CLI, MCP atomic tools, MCP `run_code`, the BB plugin bridge, a future desktop GUI, and the daemon's own reactors all take that single path into the daemon.
+> The TUI, zero-MCP bash CLI, loopback HTTP/SSE server, MCP atomic tools, MCP `run_code`, `BbBridge`, `T3Bridge`, and the daemon's own reactors all take that single path into the daemon.
 
 ## Problem
 
@@ -116,31 +116,39 @@ let mut stage = client.watch(
 
 ## Shape
 
-### Crate map (14 crates, arrows point to dependencies)
+### Crate map (15 crates, arrows point to dependencies)
 
 ```mermaid
 flowchart TD
-  bin["rex-wave (bin)"]
+  bin["rex-wave (bin + daemon + http/sse)"]
   tui["rex-wave-tui"] --> api
   mcp["rex-wave-mcp"] --> api
   transport["rex-wave-transport"] --> runtime
   bb["rex-wave-bb"] --> waves
+  t3["rex-wave-t3"] --> waves
   rooms["rex-wave-rooms"] --> runtime
-  board["rex-wave-board"] --> runtime
+  board["rex-wave-board (Board + task_org)"] --> runtime
   board --> kanban
   waves["rex-wave-waves"] --> runtime
-  notify["rex-wave-notify"] --> runtime
-  mail["rex-wave-mailbridge"] --> store
+  notify["rex-wave-notify (Inbox + Herald)"] --> runtime
+  mail["rex-wave-mailbridge (MailBridge + Presence + shadow)"] --> store
   mail --> runtime
   runtime["rex-wave-runtime"] --> store
   store["rex-wave-store"] --> api
   api["rex-wave-api"] --> kanban
   kanban["rex-kanban (standalone)"]
-  bin --> tui & mcp & transport & bb & rooms & board & waves & notify & mail
+  bin --> tui & mcp & transport & bb & t3 & rooms & board & waves & notify & mail
   plugin["bb-plugin/server.ts (@get-bb/plugin-sdk 0.6.132)"] -. "WS /bridge" .- bb
+  t3srv["T3 Code 0.1.11 (/ws + /api)"] -. "Effect RPC" .- t3
 ```
 
-No subsystem crate imports a sibling subsystem crate. Only `rex-wave-bb` imports `rex-wave-waves`, because `rex-wave-bb` implements the `AgentHost` port defined there. Five workers can implement `rooms`, `kanban+board`, `waves+bb+plugin`, `notify+mailbridge`, and `mcp+tui+cli` in separate git worktrees without touching shared foundation files.
+No subsystem crate imports a sibling subsystem crate. Only `rex-wave-bb` and `rex-wave-t3` import `rex-wave-waves`, because both implement the `AgentHost` port defined there.
+
+### Phase 3 composition additions
+
+- **Threads, optimistic concurrency, and leased tasks-as-threads (`rex-wave-rooms` and `rex-wave-board::task_org`).** `RoomPost` supports flat thread roots (`re`), optimistic concurrency (`after` returning `ConflictData::NewerMessage`, CLI exit `3`), `key=value` labels (`RoomLabel` recording `before`/`after` sets for `Interest::RoomFiltered`), and task thread roots (`TaskClaim`, `TaskHeartbeat`, `TaskTransition`, `TaskUpdate`, `RoomTasks`) with `needs` DAG cycle checks and monotonic `LeaseEpoch` fencing. `rex-wave tasks org-sync` runs two-way `.org` reconciliation preserving string `:ID:` (`rw-...` or Emacs-authored IDs), `:REX_SEQ:`, `:REX_REV:`, and Emacs planning lines while obeying `ABI-0.md` Clause B-4 (`.#*` lock symlinks and `#*#` autosaves).
+- **Session-bound seat presence and shadow house-mail (`rex-wave-mailbridge` and `rex-wave-notify`).** `Registry<Presence>` serves `StreamId::Presence` separating durable `SeatRecord` provenance (`Active`, `Dormant`, `Retired`) from ephemeral `SeatBinding` rows. `serve_listener_with_hooks` stamps the server connection ID on `UdsSession` bindings and fires RAII `on_disconnect` to dispatch `PresenceUnbind` as `System(PresenceMonitor)`. `Herald::with_handle()` pairs with a daemon grace-deadline timer (`next_grace_deadline` and `flush_due_at`) to flush 15 s `MailUnrung` windows with zero extra journal events and auto-resolve cards on rebind plus ACK. `rex-wave mail shadow` and `rex-wave mail score` evaluate house mail through structurally read-only `ReadOnlyInterchange`.
+- **Multi-host waves and principal-scoped auth (`rex-wave-t3`, `rex-wave-transport`, `rex-wave`).** `CompositeHost` and `CompositeFeed` route `t3:<provider>` and `antigravity` workers to `T3Bridge` and `bb:<provider>` workers to `BbBridge`. `StateDirAuthenticator` loads both `<state_dir>/tokens.json` (`PrincipalTokenTable`) and mode-`0600` per-worker files in `<state_dir>/worker-tokens/` for UDS and loopback `--http` + SSE (`/v1/events` with `id: <cursor>` and `Last-Event-ID` resume).
 
 ### Core data shapes
 

@@ -1,17 +1,20 @@
 //! Daemon composition root wiring `Journal`, `Hub`, `SidebarProjection`,
-//! subsystem `Registry`s (`Rooms`, `Waves`, `Board`, `Inbox`), `MailBridge`,
-//! reactors (`WaveConductor`, `Herald`, `BellCourier`), `CompositeHost` /
-//! `CompositeFeed` (`BbBridge` + `T3Bridge`), the loopback `/sink` listener for
-//! `wake-bell`, optional loopback `--http` HTTP/1.1 + SSE server, and UDS
-//! `serve_listener` with graceful `ctrl_c` shutdown.
+//! subsystem `Registry`s (`Rooms`, `Waves`, `Board`, `Inbox`, `Presence`),
+//! `MailBridge`, reactors (`WaveConductor`, `Herald` with `HeraldHandle`
+//! reconnect-grace timer, `BellCourier`), `CompositeHost` / `CompositeFeed`
+//! (`BbBridge` + `T3Bridge`), the loopback `/sink` listener for `wake-bell`,
+//! optional loopback `--http` HTTP/1.1 + SSE server, and UDS
+//! `serve_listener_with_hooks` (`StateDirAuthenticator` + RAII `PresenceUnbind`)
+//! with graceful `ctrl_c` shutdown.
 
 use crate::http::{HttpConfig, bind_http, serve_http_listener};
+use rex_wave_api::presence::{BindingStatus, PresenceList, PresenceUnbind, TransportEndpoint};
 use rex_wave_api::wave::{Observation, WaveEvent};
 use rex_wave_api::*;
 use rex_wave_bb::{BbBridge, BbHost, BridgeConfig};
 use rex_wave_board::Board;
-use rex_wave_mailbridge::{BellCourier, MailBridge, SandboxRoot};
-use rex_wave_notify::{Herald, Inbox};
+use rex_wave_mailbridge::{BellCourier, MailBridge, Presence, SandboxRoot};
+use rex_wave_notify::{Herald, HeraldHandle, Inbox};
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
     AgentFeed, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection, spawn_reactor,
@@ -19,18 +22,20 @@ use rex_wave_runtime::{
 use rex_wave_store::Journal;
 use rex_wave_t3::{
     CompositeFeed, CompositeHost, RunnerTarget, T3AuthSource, T3Bridge, T3Config, T3EndpointSource,
-    T3Feed, T3Host, T3Origin, ThreadIdResolver, WorkerTokenMinter, read_worker_token_file,
-    runtime_file_path, write_worker_token_file,
+    T3Feed, T3Host, T3Origin, ThreadIdResolver, runtime_file_path, worker_tokens_dir,
 };
-use rex_wave_transport::{Authenticator, Credential, Endpoint, bind_unix, serve_listener};
-use rex_wave_waves::{HostError, WaveConductor, Waves};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::{self, Read as _, Write as _};
+use rex_wave_transport::{
+    Authenticator, ConnectionHooks, Endpoint, FnConnectionHooks, PrincipalTokenTable,
+    StateDirAuthenticator, WorkerTokenFile, bind_unix, serve_listener_with_hooks,
+    write_worker_token_file,
+};
+use rex_wave_waves::{WaveConductor, Waves};
+use std::io::{self, Read as _};
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 pub const DEFAULT_BB_URL: &str = "ws://127.0.0.1:38886/api/v1/plugins/rex-wave/http/bridge";
 
@@ -165,24 +170,6 @@ pub fn tokens_path_for(sock_path: &Path) -> PathBuf {
     sock_path.with_file_name("tokens.json")
 }
 
-/// Entry stored in `tokens.json`. Untagged so existing `"<tok>": "sam"` files
-/// stay backward-compatible while worker tokens store structured records and
-/// `Operator`/`System` principals remain unrepresentable in the token store.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TokenRecord {
-    Seat(SeatName),
-    Worker(WorkerTokenEntry),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerTokenEntry {
-    pub wave: WaveSlug,
-    pub role: RoleName,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_id: Option<String>,
-}
-
 fn token_store_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -213,50 +200,7 @@ fn lock_token_store(tokens_path: &Path) -> io::Result<TokenStoreGuard> {
     })
 }
 
-fn read_token_map(tokens_path: &Path) -> io::Result<BTreeMap<String, TokenRecord>> {
-    if !tokens_path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let raw = std::fs::read(tokens_path)?;
-    serde_json::from_slice(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-fn write_token_map_atomic(
-    tokens_path: &Path,
-    map: &BTreeMap<String, TokenRecord>,
-    entropy: &[u8; 4],
-) -> io::Result<()> {
-    if let Some(parent) = tokens_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let encoded = serde_json::to_vec_pretty(map)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp_path = tokens_path.with_extension(format!(
-        "tmp.{}.{:02x}{:02x}{:02x}{:02x}",
-        std::process::id(),
-        entropy[0],
-        entropy[1],
-        entropy[2],
-        entropy[3]
-    ));
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-    }
-    std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
-    if let Err(e) = std::fs::rename(&tmp_path, tokens_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    Ok(())
-}
-
-fn random_token(prefix: &str) -> io::Result<(String, [u8; 4])> {
+fn random_token(prefix: &str) -> io::Result<String> {
     let mut entropy = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
     let mut token = String::from(prefix);
@@ -264,180 +208,168 @@ fn random_token(prefix: &str) -> io::Result<(String, [u8; 4])> {
         use std::fmt::Write as _;
         let _ = write!(token, "{byte:02x}");
     }
-    Ok((token, [entropy[0], entropy[1], entropy[2], entropy[3]]))
+    Ok(token)
+}
+
+/// Mints a random 256-bit capability token for `principal` via [`PrincipalTokenTable`].
+///
+/// - When `thread_id` is `Some`, persists a mode-`0600` [`WorkerTokenFile`] under
+///   `<state_dir>/worker-tokens/<thread_id>` (reusing an existing valid file for the
+///   same principal idempotently) so unlinking that file revokes access immediately.
+/// - Otherwise persists the token atomically to `<state_dir>/tokens.json` (`0600`)
+///   under a cross-process `tokens.json.lock` guard.
+pub fn mint_principal_token(
+    sock_path: &Path,
+    principal: &Principal,
+    thread_id: Option<&str>,
+) -> io::Result<String> {
+    if matches!(principal, Principal::System { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot mint bearer token for Principal::System",
+        ));
+    }
+
+    let prefix = match principal {
+        Principal::Worker { .. } => "rw_w_",
+        _ => "rw_",
+    };
+
+    if let Some(tid) = thread_id {
+        let state_dir = state_dir_for(sock_path);
+        let dir = worker_tokens_dir(&state_dir);
+        let path = dir.join(tid);
+        if let Ok(raw) = std::fs::read(&path)
+            && let Ok(existing) = serde_json::from_slice::<WorkerTokenFile>(&raw)
+            && existing.principal == *principal
+            && !existing.token.is_empty()
+        {
+            return Ok(existing.token);
+        }
+        let token = random_token(prefix)?;
+        write_worker_token_file(&dir, tid, &token, principal)?;
+        return Ok(token);
+    }
+
+    let tokens_path = tokens_path_for(sock_path);
+    let _guard = lock_token_store(&tokens_path)?;
+    let mut table = PrincipalTokenTable::load_tokens_file(&tokens_path, None)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let token = random_token(prefix)?;
+    table.remove_principal(principal);
+    table
+        .insert(token.clone(), principal.clone())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    table.save_tokens_file(&tokens_path)?;
+    Ok(token)
 }
 
 /// Mints a random 256-bit capability token for `seat` and atomically writes it
 /// into `<state_dir>/tokens.json` with `0600` permissions.
 pub fn mint_seat_token(sock_path: &Path, seat: &SeatName) -> io::Result<String> {
-    let tokens_path = tokens_path_for(sock_path);
-    let _guard = lock_token_store(&tokens_path)?;
-    let mut map = read_token_map(&tokens_path)?;
-    let (token, suffix) = random_token("rw_")?;
-
-    map.retain(|_, existing| !matches!(existing, TokenRecord::Seat(s) if s == seat));
-    map.insert(token.clone(), TokenRecord::Seat(seat.clone()));
-
-    write_token_map_atomic(&tokens_path, &map, &suffix)?;
-    Ok(token)
+    mint_principal_token(sock_path, &Principal::Seat { seat: seat.clone() }, None)
 }
 
-/// Mints (or idempotently reuses for a thread) a random 256-bit capability token
-/// for `Principal::Worker { wave, role }` and persists it to `<state_dir>/tokens.json`
-/// with mode `0600`. When `write_file` is true and `thread_id` is `Some`, also writes
-/// `<state_dir>/worker-tokens/<thread_id>` with mode `0600`.
+/// Mints a random 256-bit capability token for `Principal::Worker { wave, role }`.
+/// When `thread_id` is `Some`, writes `<state_dir>/worker-tokens/<thread_id>` (`0600`);
+/// otherwise stores the principal-scoped token in `<state_dir>/tokens.json` (`0600`).
 pub fn mint_worker_token(
     sock_path: &Path,
     wave: &WaveSlug,
     role: &RoleName,
     thread_id: Option<&str>,
-    write_file: bool,
 ) -> io::Result<String> {
-    let tokens_path = tokens_path_for(sock_path);
-    let _guard = lock_token_store(&tokens_path)?;
-    let state_dir = state_dir_for(sock_path);
-    let mut map = read_token_map(&tokens_path)?;
-
-    let desired = WorkerTokenEntry {
-        wave: wave.clone(),
-        role: role.clone(),
-        thread_id: thread_id.map(str::to_owned),
-    };
-
-    if let Some(tid) = thread_id
-        && let Ok(Some(existing_tok)) = read_worker_token_file(&state_dir, tid)
-        && map.get(&existing_tok) == Some(&TokenRecord::Worker(desired.clone()))
-    {
-        return Ok(existing_tok);
-    }
-
-    let (token, suffix) = random_token("rw_w_")?;
-    map.retain(|_, existing| !matches!(existing, TokenRecord::Worker(w) if w == &desired));
-    map.insert(token.clone(), TokenRecord::Worker(desired));
-
-    write_token_map_atomic(&tokens_path, &map, &suffix)?;
-    if write_file && let Some(tid) = thread_id {
-        write_worker_token_file(&state_dir, tid, &token)?;
-    }
-    Ok(token)
+    mint_principal_token(
+        sock_path,
+        &Principal::Worker {
+            wave: wave.clone(),
+            role: role.clone(),
+        },
+        thread_id,
+    )
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Reloads `tokens.json` on token authentication so `rex-wave token --seat <seat>`,
-/// `rex-wave token --worker <wave>/<role>`, and `T3Bridge` worker tokens take
-/// effect without restarting a running daemon, while enforcing `0600` mode and
-/// matching UID ownership.
-pub struct TokenFileAuthenticator {
-    pub operator: SeatName,
-    pub daemon_uid: Option<u32>,
-    pub tokens_path: PathBuf,
-}
-
-impl TokenFileAuthenticator {
-    fn load_tokens(&self) -> Result<BTreeMap<String, TokenRecord>, ApiError> {
-        let meta = match std::fs::symlink_metadata(&self.tokens_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(e) => return Err(ApiError::Internal(format!("tokens metadata: {e}"))),
-        };
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(ApiError::Denied {
-                principal: "anonymous".to_owned(),
-                action: "token store must be a regular file".to_owned(),
-            });
-        }
-        if let Some(expected_uid) = self.daemon_uid
-            && meta.uid() != expected_uid
-        {
-            return Err(ApiError::Denied {
-                principal: "anonymous".to_owned(),
-                action: "token store owned by another uid".to_owned(),
-            });
-        }
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(ApiError::Denied {
-                principal: "anonymous".to_owned(),
-                action: "token store must be mode 0600".to_owned(),
-            });
-        }
-        let raw = std::fs::read(&self.tokens_path)
-            .map_err(|e| ApiError::Internal(format!("read tokens: {e}")))?;
-        serde_json::from_slice(&raw).map_err(|e| ApiError::Internal(format!("decode tokens: {e}")))
-    }
-
-    fn state_dir(&self) -> PathBuf {
-        self.tokens_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    }
-}
-
-impl Authenticator for TokenFileAuthenticator {
-    fn authenticate(
-        &self,
-        peer_uid: Option<u32>,
-        credential: &Credential,
-    ) -> Result<Principal, ApiError> {
-        match credential {
-            Credential::PeerUid => match (peer_uid, self.daemon_uid) {
-                (Some(peer), Some(daemon)) if peer == daemon => Ok(Principal::Operator {
-                    seat: self.operator.clone(),
-                }),
-                _ => Err(ApiError::Denied {
-                    principal: "anonymous".into(),
-                    action: "peer-uid hello".into(),
-                }),
-            },
-            Credential::Token { token } => {
-                let tokens = self.load_tokens()?;
-                let mut matched: Option<TokenRecord> = None;
-                for (stored, record) in &tokens {
-                    if constant_time_eq(stored.as_bytes(), token.as_bytes()) {
-                        matched = Some(record.clone());
-                    }
+fn spawn_herald_grace_timer(
+    handle: HeraldHandle,
+    client: LocalClient,
+    mut hub_rx: tokio::sync::broadcast::Receiver<Arc<Envelope>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        const IDLE_POLL: Duration = Duration::from_millis(250);
+        const EVENT_SETTLE: Duration = Duration::from_millis(50);
+        loop {
+            let now = rex_wave_runtime::now();
+            let _ = handle.flush_due_at(now, &client).await;
+            let wait = match handle.next_grace_deadline(now) {
+                Some(deadline) => {
+                    let rem_ms = deadline.0.saturating_sub(now.0).saturating_add(5);
+                    Duration::from_millis(rem_ms)
                 }
-                match matched {
-                    Some(TokenRecord::Seat(seat)) => Ok(Principal::Seat { seat }),
-                    Some(TokenRecord::Worker(entry)) => {
-                        if let Some(ref tid) = entry.thread_id {
-                            let state_dir = self.state_dir();
-                            let active = read_worker_token_file(&state_dir, tid)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|disk| {
-                                    constant_time_eq(disk.as_bytes(), token.as_bytes())
-                                });
-                            if !active {
-                                return Err(ApiError::Denied {
-                                    principal: "anonymous".into(),
-                                    action: "worker token revoked".into(),
-                                });
-                            }
-                        }
-                        Ok(Principal::Worker {
-                            wave: entry.wave,
-                            role: entry.role,
-                        })
+                None => IDLE_POLL,
+            };
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                res = hub_rx.recv() => match res {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tokio::time::sleep(EVENT_SETTLE).await;
+                        while hub_rx.try_recv().is_ok() {}
                     }
-                    None => Err(ApiError::Denied {
-                        principal: "anonymous".into(),
-                        action: "invalid token".into(),
-                    }),
-                }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
+    })
+}
+
+async fn unbind_uds_sessions(monitor: &LocalClient, target_conn: Option<u64>) {
+    let Ok(snap) = monitor
+        .call(PresenceList {
+            project: None,
+            live_only: false,
+            include_retired: true,
+        })
+        .await
+    else {
+        return;
+    };
+    for seat_view in snap.seats {
+        for binding in seat_view.bindings {
+            if !matches!(
+                binding.status,
+                BindingStatus::Live | BindingStatus::TransportDown
+            ) {
+                continue;
+            }
+            let TransportEndpoint::UdsSession { conn_id, .. } = binding.endpoint else {
+                continue;
+            };
+            if target_conn.is_some_and(|want| want != conn_id) {
+                continue;
+            }
+            let reason = match target_conn {
+                Some(id) => format!("uds connection #{id} disconnected"),
+                None => format!("orphaned uds connection #{conn_id} swept on daemon start"),
+            };
+            let _ = monitor
+                .call(PresenceUnbind {
+                    seat: binding.seat,
+                    incarnation_id: binding.incarnation_id,
+                    reason: Some(reason),
+                })
+                .await;
+        }
     }
+}
+
+fn spawn_presence_disconnect_worker(
+    monitor: LocalClient,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(conn_id) = rx.recv().await {
+            unbind_uds_sessions(&monitor, Some(conn_id)).await;
+        }
+    })
 }
 
 fn journal_thread_resolver(journal: Journal) -> ThreadIdResolver {
@@ -492,16 +424,21 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     };
 
     let http_listener = match args.http {
-        Some(addr) => Some(
-            bind_http(addr)
+        Some(addr) => {
+            let listener = bind_http(addr)
                 .await
-                .map_err(|e| format!("bind http {addr}: {e}"))?,
-        ),
+                .map_err(|e| format!("bind http {addr}: {e}"))?;
+            if let Ok(local) = listener.local_addr() {
+                eprintln!("rex-wave daemon: http listening on {local}");
+            }
+            Some(listener)
+        }
         None => None,
     };
 
     let journal = Journal::open(&journal_path).map_err(|e| format!("open journal: {e}"))?;
     let hub = Hub::new(4096);
+    let herald_hub_rx = hub.tap();
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let sandbox =
         SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
@@ -532,14 +469,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         RunnerMode::T3 => None,
     };
 
-    let t3_bridge = t3_cfg.map(|cfg| {
-        let sock_for_minter = sock_path.clone();
-        let minter: WorkerTokenMinter = Arc::new(move |wave, role, thread| {
-            mint_worker_token(&sock_for_minter, wave, role, Some(thread.as_str()), false)
-                .map_err(|e| HostError::Unreachable(format!("mint worker token: {e}")))
-        });
-        T3Bridge::with_token_minter(cfg, Some(minter))
-    });
+    let t3_bridge = t3_cfg.map(T3Bridge::new);
 
     let composite_feed: Arc<dyn AgentFeed> = Arc::new(
         CompositeFeed::new(
@@ -562,7 +492,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             mail_writer,
             hub.clone(),
         )),
-        presence: Arc::new(rex_wave_runtime::Unavailable(Family::Presence)),
+        presence: Registry::<Presence>::new(journal.clone(), hub.clone()),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -586,7 +516,10 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         WaveConductor::new(composite_host),
         system(SystemPart::WaveConductor),
     );
-    let herald_task = spawn_reactor(Herald::new(), system(SystemPart::Herald));
+    let (herald, herald_handle) = Herald::with_handle();
+    let herald_client = system(SystemPart::Herald);
+    let herald_task = spawn_reactor(herald, herald_client.clone());
+    let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client, herald_hub_rx);
     let bell_task = spawn_reactor(BellCourier, system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
@@ -595,13 +528,25 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         system(SystemPart::WakeBell),
     ));
 
+    let presence_monitor = system(SystemPart::PresenceMonitor);
+    unbind_uds_sessions(&presence_monitor, None).await;
+    let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+    let presence_disconnect_task =
+        spawn_presence_disconnect_worker(presence_monitor, disconnect_rx);
+    let hooks: Arc<dyn ConnectionHooks> = Arc::new(FnConnectionHooks::new(
+        |_, _, _| {},
+        move |conn_id, _| {
+            let _ = disconnect_tx.send(conn_id);
+        },
+    ));
+
     let (listener, daemon_uid) =
         bind_unix(&sock_path).map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: operator.clone(),
-        daemon_uid: Some(daemon_uid),
-        tokens_path: tokens_path_for(&sock_path),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        operator.clone(),
+        Some(daemon_uid),
+        &state_dir,
+    ));
 
     let http_task = http_listener.map(|hl| {
         let router = router.clone();
@@ -616,7 +561,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     });
 
     let serve_result = tokio::select! {
-        res = serve_listener(listener, router, auth) => {
+        res = serve_listener_with_hooks(listener, router, auth, hooks) => {
             res.map_err(|e| format!("uds serve: {e}"))
         }
         sig = tokio::signal::ctrl_c() => {
@@ -626,7 +571,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     conductor_task.abort();
     herald_task.abort();
+    herald_grace_task.abort();
     bell_task.abort();
+    presence_disconnect_task.abort();
     if let Some(t) = bb_task {
         t.abort();
     }

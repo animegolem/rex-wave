@@ -768,6 +768,124 @@ async fn every_api_error_crosses_the_socket_without_dropping_it() {
     server.abort();
 }
 
+#[tokio::test]
+async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_principal_tokens() {
+    use rex_wave_api::presence::*;
+    use std::sync::Mutex;
+
+    struct CapturePresence(Arc<Mutex<Vec<u64>>>);
+    impl Service<PresenceCommand> for CapturePresence {
+        fn dispatch(
+            &self,
+            cmd: PresenceCommand,
+            ctx: DecideCtx,
+        ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+            let seen = self.0.clone();
+            Box::pin(async move {
+                let PresenceCommand::PresenceBind(bind) = cmd else {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Presence,
+                    });
+                };
+                if let TransportEndpoint::UdsSession { conn_id, .. } = &bind.endpoint {
+                    seen.lock().unwrap().push(*conn_id);
+                }
+                Ok(WireReply::PresenceBind(SeatBinding {
+                    seat: bind.seat,
+                    incarnation_id: IncarnationId::parse("inc-1").unwrap(),
+                    epoch: 1,
+                    lane: bind.lane,
+                    endpoint: bind.endpoint,
+                    liveness: bind.liveness,
+                    bound_at: ctx.at,
+                    expires_at: None,
+                    status: BindingStatus::Live,
+                }))
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tokens_path = tmp.path().join("tokens.json");
+    let mut table = PrincipalTokenTable::new();
+    table
+        .insert_seat("tok_sam", SeatName::parse("sam").unwrap())
+        .unwrap();
+    table
+        .insert_worker(
+            "tok_worker",
+            WaveSlug::parse("w1").unwrap(),
+            RoleName::parse("author").unwrap(),
+        )
+        .unwrap();
+    table.save_tokens_file(&tokens_path).unwrap();
+    let reloaded = PrincipalTokenTable::load_tokens_file(&tokens_path, None).unwrap();
+    assert_eq!(reloaded, table);
+
+    let sock = tmp.path().join("daemon.sock");
+    let (listener, uid) = bind_unix(&sock).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(CapturePresence(seen.clone())),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        SeatName::parse("owner").unwrap(),
+        Some(uid),
+        tmp.path(),
+    ));
+    let server = tokio::spawn(serve_listener(listener, router, auth));
+
+    let sam = RemoteClient::connect(
+        Endpoint::Unix(sock),
+        Credential::Token {
+            token: "tok_sam".into(),
+        },
+        "hold",
+    )
+    .await
+    .unwrap();
+    let bound = sam
+        .call(PresenceBind {
+            seat: SeatName::parse("sam").unwrap(),
+            incarnation_id: None,
+            lane: None,
+            endpoint: TransportEndpoint::UdsSession {
+                conn_id: 0,
+                client: "hold".into(),
+            },
+            liveness: LivenessMode::SocketLifetime,
+            ttl_ms: None,
+            takeover: false,
+            allow_fork: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let stamped = match bound.endpoint {
+        TransportEndpoint::UdsSession { conn_id, .. } => conn_id,
+        other => panic!("expected UdsSession, got {other:?}"),
+    };
+    assert_ne!(stamped, 0, "transport must stamp non-zero server conn_id");
+    assert_eq!(*seen.lock().unwrap(), vec![stamped]);
+
+    drop(sam);
+    server.abort();
+}
+
 /// A daemon restart unlinks and rebinds the socket. The client must redial,
 /// re-open its watches from the last frame it delivered, and serve calls again,
 /// so a TUI never freezes on a dead connection.

@@ -1,4 +1,3 @@
-use rex_wave::daemon::{TokenFileAuthenticator, tokens_path_for};
 use rex_wave_api::room::{Body, RoomMessageSummary};
 use rex_wave_api::wave::{
     Activity, AgentSpec, Observation, PermissionMode, WaveObserve, WaveSpec, WaveStart, WaveView,
@@ -12,7 +11,7 @@ use rex_wave_runtime::{
     SidebarProjection, Unavailable,
 };
 use rex_wave_store::Journal;
-use rex_wave_transport::{Authenticator, bind_unix, serve_listener};
+use rex_wave_transport::{Authenticator, StateDirAuthenticator, bind_unix, serve_listener};
 use rex_wave_waves::Waves;
 use serde_json::Value;
 use std::io::Write as _;
@@ -107,11 +106,11 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
     });
 
     let (listener, daemon_uid) = bind_unix(&sock).unwrap();
-    let auth: Arc<dyn Authenticator> = Arc::new(TokenFileAuthenticator {
-        operator: SeatName::parse("owner").unwrap(),
-        daemon_uid: Some(daemon_uid),
-        tokens_path: tokens_path_for(&sock),
-    });
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        SeatName::parse("owner").unwrap(),
+        Some(daemon_uid),
+        &dir.0,
+    ));
     let server = tokio::spawn(serve_listener(listener, router.clone(), auth));
     let sock_str = sock.to_str().unwrap().to_owned();
 

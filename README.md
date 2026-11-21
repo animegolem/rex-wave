@@ -1,8 +1,8 @@
 # rex-wave
 
-`rex-wave` runs `#channels`, direct messages, multi-provider waves, an Emacs Org-compatible Kanban board, and ranked inbox notifications over a single Rust daemon. The two-pane TUI, CLI verbs, MCP `2025-11-25` server, and BB plugin bridge all call the same `rex_wave_api::Client` contract.
+`rex-wave` runs `#channels`, direct messages, flat threads with optimistic concurrency, leased task-threads with two-way Emacs `.org` sync, session-bound seat presence, multi-host waves (`BB` and `T3 Code`), an Emacs Org-compatible Kanban board, and ranked inbox notifications over a single Rust daemon. The two-pane TUI, zero-MCP bash CLI, loopback HTTP/SSE server, MCP `2025-11-25` server, `T3Bridge`, and `BbBridge` all call the same `rex_wave_api::Client` contract.
 
-For the crate dependency graph, actor ownership rules, and protocol invariants, read [the architecture document](./ARCHITECTURE.md).
+For the crate dependency graph, actor ownership rules, and protocol invariants, read [the architecture document](./ARCHITECTURE.md). For agent bash usage, read [the CLI skill](./.agents/skills/rex-wave-cli/SKILL.md).
 
 ## Build and verify offline
 
@@ -25,13 +25,15 @@ mkdir -p /tmp/rex-mail-sandbox
 touch /tmp/rex-mail-sandbox/.rex-wave-sandbox
 ```
 
-2. Run `rex-wave daemon` against that sandbox and your BB plugin bridge token:
+2. Run `rex-wave daemon` against that sandbox, your BB bridge token, optional T3 Code runner flags (`--runner bb|t3|both`), and optional loopback HTTP/SSE listener (`--http 127.0.0.1:<port>`):
 
 ```sh
 REX_WAVE_BB_TOKEN="$BB_PLUGIN_TOKEN" rex-wave daemon \
 	--mail-sandbox /tmp/rex-mail-sandbox \
+	--runner both \
 	--bb-url ws://127.0.0.1:38886/api/v1/plugins/rex-wave/http/bridge \
-	--wake-bell 127.0.0.1:7781
+	--wake-bell 127.0.0.1:7781 \
+	--http 127.0.0.1:7783
 ```
 
 The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
@@ -125,13 +127,40 @@ rex-wave promote '#proj_123/wave-auth-v2' 1..4 --to owner --subject 'auth-v2 dec
 rex-wave wave finish auth-v2 --summary 'Merged and verified'
 ```
 
-## Run waves on another agent host
+## Use the bash CLI and HTTP/SSE API
 
-`Waves` and `WaveConductor` in `crates/rex-wave-waves` never import BB types or WebSocket framing. They depend only on the four-method `AgentHost` port (`spawn`, `tell`, `resolve`, `retire`) and the read-side `AgentFeed` trait (`page`, `live`).
+Any coding agent can drive `rex-wave` directly over bash without MCP using `--token <tok>`, `REX_WAVE_TOKEN`, or automatic `<state_dir>/worker-tokens/$T3CODE_THREAD_ID` lookup:
 
-- **BB (`crates/rex-wave-bb` and `bb-plugin/`).** `BbHost` and `BbBridge` implement `AgentHost` and `AgentFeed` over the plugin WebSocket, enforcing `threads.stop` settle polling before `threads.archive`.
-- **T3 Code or another IDE host.** Implement `AgentHost` and `AgentFeed` in a sibling adapter crate that maps `SpawnRequest`, `SteerDeliveryMode`, and `InteractionResolution` to that host's session RPCs, then pass that host to `WaveConductor::new` in `crates/rex-wave/src/daemon.rs`.
-- **Direct CLI runners (`claude`, `codex`, or `pi` subprocesses).** Implement `AgentHost` over child process groups or tmux panes where `spawn` starts the CLI in a git worktree with `rex-wave mcp --stdio` configured, `tell` writes to stdin or a session socket, and `retire` terminates the process group cleanly.
+```sh
+# Threads, optimistic concurrency, and race-free wait
+rex-wave post '#general' 'Slice ready' --task 'Ship Phase 3' --priority high
+rex-wave reply '#general' 1 'Checking tests' --after 1
+rex-wave read '#general' --re 1
+rex-wave wait '#general' --since 1 --re 1 --timeout 30000
+
+# Leased tasks-as-threads and two-way Emacs .org sync
+rex-wave tasks claim '#general' 1 --ttl 10m
+rex-wave tasks transition '#general' 1 done --epoch 1 --note 'All checks green'
+rex-wave tasks org-sync '#general' ./tasks.org --once
+
+# Session-bound seat presence and read-only shadow house-mail scoring
+rex-wave presence claim sam --role reviewer --project rex-wave
+rex-wave presence bind --seat sam --from-claude-session --pid "$PPID"
+rex-wave presence hold --seat sam
+rex-wave mail shadow --offline --interchange /path/to/interchange --out /tmp/shadow.jsonl --once
+rex-wave mail score --shadow /tmp/shadow.jsonl --acks /path/to/interchange/state/acks.jsonl --json
+```
+
+When `--http 127.0.0.1:<port>` is enabled, the daemon serves `/v1/health`, `/v1/sidebar`, `/v1/inbox`, `/v1/presence`, `/v1/rooms/<room>/messages`, `/v1/rooms/<room>/tasks`, `/v1/call/<tool>`, and `/v1/events` (SSE with `id: <cursor>` and `Last-Event-ID` resume). Loopback HTTP enforces loopback `Host`, matching `Origin`, `Sec-Fetch-Site`, CSRF headers on mutations, `StateDirAuthenticator` bearer auth, and `404 Not Found` masking on unauthorized DMs and inboxes.
+
+## Run waves on multiple agent hosts
+
+`Waves` and `WaveConductor` in `crates/rex-wave-waves` never import host wire types. They depend only on the four-method `AgentHost` port (`spawn`, `tell`, `resolve`, `retire`) and the read-side `AgentFeed` trait (`page`, `live`).
+
+- **BB (`crates/rex-wave-bb` and `bb-plugin/`).** `BbHost` and `BbBridge` implement `AgentHost` and `AgentFeed` over the plugin WebSocket and enforce `threads.stop` settle polling before `threads.archive`.
+- **T3 Code (`crates/rex-wave-t3`).** `T3Host`, `T3Feed`, and `T3Bridge` connect directly over T3 Code's Effect RPC WebSocket and REST API, auto-discover `<t3-home>/userdata/server-runtime.json`, and provision mode-`0600` worker token files under `<state_dir>/worker-tokens/<thread_id>`.
+- **Multi-host composition (`CompositeHost` and `CompositeFeed`).** In `rex-wave daemon --runner both`, `t3:<provider>` and bare `antigravity` workers route to `T3Host` while `bb:<provider>` workers route to `BbHost`.
+- **Direct CLI runners.** Implement `AgentHost` over child process groups or terminal sessions where `spawn` starts the CLI in a git worktree, `tell` delivers prompts, and `retire` stops the process group.
 
 ## License
 
