@@ -2,7 +2,36 @@
 //!
 //! Non-production sandboxed canon mail service ([`SandboxRoot`], [`MailBridge`]),
 //! `mailbox.item.schema.json` v1 projection ([`project`], [`wake_id`], [`bell_meta`]),
-//! and [`BellCourier`] scheduled wake delivery.
+//! [`BellCourier`] scheduled wake delivery, `Family::Presence` decider
+//! ([`presence::Presence`]), tolerant `acks.jsonl` parsing ([`acks`]),
+//! structurally read-only shadow reactor ([`shadow`]), and Gate 2 scorer ([`score`]).
+
+pub mod acks;
+pub mod presence;
+pub mod score;
+pub mod shadow;
+
+pub use acks::{
+    AckIndex, AckRecord, AcksParseReport, AliasMap, NormalizedLetterPath, SkippedAckLine,
+    letter_paths_match, normalize_letter_path, normalize_seat_token, parse_acks_jsonl,
+};
+pub use presence::{
+    ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus, IncarnationAffinity, Presence,
+    PresenceState, current_process_start, format_delivery_status, is_process_alive,
+    load_claude_session_file, load_claude_session_file_from, normalize_proc_start,
+    parse_claude_session_json, proc_start_matches, query_process_start,
+    select_binding_for_delivery, sender_delivery_notice,
+};
+pub use score::{
+    ReplayScoreReport, ShadowScoreReport, score_replay_against_ground_truth,
+    score_shadow_against_acks, score_shadow_jsonl_against_acks,
+};
+pub use shadow::{
+    DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,
+    LetterCandidate, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
+    RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowPassReport,
+    decide_mail_ring, decide_mail_rings_for_seat, run_shadow_pass,
+};
 
 use rex_wave_api::mail::*;
 use rex_wave_api::*;
@@ -582,7 +611,7 @@ fn relative_slash(root: &Path, target: &Path) -> Result<String, SandboxError> {
     Ok(parts.join("/"))
 }
 
-fn sha256_bytes(bytes: &[u8]) -> Sha256Hex {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> Sha256Hex {
     let mut h = Sha256::new();
     h.update(bytes);
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -603,7 +632,7 @@ pub fn wake_id(seat: &SeatName, mailbox: &str, file: &str, full_sha256: &Sha256H
     WakeId(hex[..16].to_owned())
 }
 
-fn unix_secs_to_iso8601_utc(secs: u64) -> String {
+pub(crate) fn unix_secs_to_iso8601_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hour = rem / 3_600;
@@ -945,7 +974,7 @@ struct Frontmatter {
     ts: Option<String>,
 }
 
-fn unquote_yaml(val: &str) -> String {
+pub(crate) fn unquote_yaml(val: &str) -> String {
     let trimmed = val.trim();
     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
         let inner = &trimmed[1..trimmed.len() - 1];
@@ -1044,13 +1073,14 @@ fn is_acked_in_sandbox(
     let Ok(contents) = fs::read_to_string(&acks_path) else {
         return false;
     };
+    let aliases = acks::AliasMap::house_defaults();
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && ack_row_matches(&val, to_seat, rel_path, sha256)
+            && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases)
         {
             return true;
         }
@@ -1063,23 +1093,9 @@ fn ack_row_matches(
     to_seat: &str,
     rel_path: &str,
     sha256: &Sha256Hex,
+    aliases: &acks::AliasMap,
 ) -> bool {
-    let path_ok = val.get("path").and_then(|v| v.as_str()) == Some(rel_path);
-    if !path_ok {
-        return false;
-    }
-    if let Some(seat) = val.get("seat").and_then(|v| v.as_str())
-        && seat != to_seat
-    {
-        return false;
-    }
-    if let Some(full) = val.get("sha256_full").and_then(|v| v.as_str()) {
-        return full == sha256.as_str();
-    }
-    if let Some(digest) = val.get("sha256").and_then(|v| v.as_str()) {
-        return digest.len() == 64 && digest == sha256.as_str();
-    }
-    false
+    acks::ack_value_matches(val, to_seat, rel_path, sha256, aliases)
 }
 
 pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxItem, SandboxError> {
