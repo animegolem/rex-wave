@@ -388,21 +388,10 @@ impl TokenMapValue {
 
 /// On-disk JSON payload for one per-worker token file under `<state_dir>/worker-tokens/`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerTokenFile {
     pub token: String,
     pub principal: Principal,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum WorkerTokenPayload {
-    Structured(WorkerTokenFile),
-    FlatWorker {
-        token: String,
-        wave: WaveSlug,
-        role: RoleName,
-    },
-    Table(BTreeMap<String, TokenMapValue>),
 }
 
 /// Principal-scoped capability token table supporting `Seat`, `Worker`, and
@@ -411,8 +400,6 @@ enum WorkerTokenPayload {
 pub struct PrincipalTokenTable {
     tokens: BTreeMap<String, Principal>,
 }
-
-pub type TokenTable = PrincipalTokenTable;
 
 impl PrincipalTokenTable {
     pub fn new() -> Self {
@@ -533,6 +520,12 @@ impl PrincipalTokenTable {
                 action: "worker-tokens directory owned by another uid".into(),
             });
         }
+        if dir_meta.permissions().mode() & 0o077 != 0 {
+            return Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: "worker-tokens directory must be mode 0700".into(),
+            });
+        }
         let entries = std::fs::read_dir(dir)
             .map_err(|e| ApiError::Internal(format!("read worker-tokens dir: {e}")))?;
         let mut paths = Vec::new();
@@ -550,25 +543,30 @@ impl PrincipalTokenTable {
         let mut table = Self::new();
         for path in paths {
             let label = format!("worker token {}", path.display());
-            if !verify_private_file(&path, expected_uid, &label)? {
-                continue;
+            match verify_private_file(&path, expected_uid, &label) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    daemon_log!("skipping {label}: {e}");
+                    continue;
+                }
             }
-            let raw = std::fs::read(&path)
-                .map_err(|e| ApiError::Internal(format!("read {label}: {e}")))?;
-            let payload: WorkerTokenPayload = serde_json::from_slice(&raw)
-                .map_err(|e| ApiError::Internal(format!("decode {label}: {e}")))?;
-            match payload {
-                WorkerTokenPayload::Structured(file) => {
-                    table.insert(file.token, file.principal)?;
+            let raw = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    daemon_log!("skipping {label}: read failed: {e}");
+                    continue;
                 }
-                WorkerTokenPayload::FlatWorker { token, wave, role } => {
-                    table.insert_worker(token, wave, role)?;
+            };
+            let file: WorkerTokenFile = match serde_json::from_slice(&raw) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    daemon_log!("skipping {label}: invalid WorkerTokenFile JSON: {e}");
+                    continue;
                 }
-                WorkerTokenPayload::Table(map) => {
-                    for (token, entry) in map {
-                        table.insert(token, entry.into_principal())?;
-                    }
-                }
+            };
+            if let Err(e) = table.insert(file.token, file.principal) {
+                daemon_log!("skipping {label}: {e}");
             }
         }
         Ok(table)
@@ -688,19 +686,6 @@ impl StateDirAuthenticator {
             daemon_uid,
             tokens_path: state_dir.join("tokens.json"),
             worker_tokens_dir: state_dir.join("worker-tokens"),
-        }
-    }
-
-    pub fn from_socket_path(
-        operator: SeatName,
-        daemon_uid: Option<u32>,
-        socket_path: &Path,
-    ) -> Self {
-        Self {
-            operator,
-            daemon_uid,
-            tokens_path: socket_path.with_file_name("tokens.json"),
-            worker_tokens_dir: socket_path.with_file_name("worker-tokens"),
         }
     }
 }
@@ -1577,6 +1562,7 @@ async fn handle_conn(
     let _writer = AbortOnDrop(writer_task.abort_handle());
 
     let mut watches: HashMap<u64, AbortOnDrop> = HashMap::new();
+    let mut in_flight_calls: JoinSet<()> = JoinSet::new();
     let ended = loop {
         let frame = match read_frame::<_, wire::ClientFrame>(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -1586,11 +1572,12 @@ async fn handle_conn(
         match frame {
             wire::ClientFrame::Hello { .. } => break "second hello".to_owned(),
             wire::ClientFrame::Call { id, cmd } => {
+                while in_flight_calls.try_join_next().is_some() {}
                 let router = router.clone();
                 let by = session.me().clone();
                 let out_tx = out_tx.clone();
                 let name = cmd.meta().name;
-                tokio::spawn(async move {
+                in_flight_calls.spawn(async move {
                     let result = router.dispatch(&by, cmd).await;
                     if let Err(e) = &result
                         && worth_logging(e)
@@ -1661,6 +1648,8 @@ async fn handle_conn(
     };
 
     drop(watches);
+    in_flight_calls.abort_all();
+    while in_flight_calls.join_next().await.is_some() {}
     drop(disconnect_guard);
     drop(out_tx);
     match writer_task.await {

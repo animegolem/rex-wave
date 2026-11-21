@@ -5,7 +5,7 @@ use crate::presence::PresenceState;
 use rex_wave_api::{SeatName, Sha256Hex};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Normalizes a raw seat string (`@Tally-VampOTP`, `loupe (review)`, `GPU-Wayland (3)`).
+/// Normalizes a raw seat string (`@Alice-Desk`, `bob (review)`, `Worker-2 (3)`).
 pub fn normalize_seat_token(raw: &str) -> String {
     let trimmed = raw.trim().trim_start_matches('@').trim();
     let base = match trimmed.find(" (") {
@@ -26,55 +26,20 @@ impl AliasMap {
         Self::default()
     }
 
-    /// Standard house aliases observed in `mailwatch-routes.json` and `acks.jsonl`.
-    pub fn house_defaults() -> Self {
+    /// Builds an alias map from explicit `(alias, canonical)` pairs supplied by
+    /// deployment config or tests.
+    pub fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut map = Self::empty();
-        for (alias, canonical) in [
-            ("tally", "tally"),
-            ("tally-vampotp", "tally"),
-            ("tally_votp", "tally"),
-            ("tally-vampotp-cto", "tally"),
-            ("tally desk", "tally"),
-            ("tally-5.2", "tally"),
-            ("cc-tally", "tally"),
-            ("cc-fable", "tally"),
-            ("genga", "genga"),
-            ("genga_votp", "genga"),
-            ("genga-opus-5.5", "genga"),
-            ("genga-2d", "genga"),
-            ("users-c7", "genga"),
-            ("users-f0", "genga"),
-            ("loupe", "loupe"),
-            ("loupe-reviewer", "loupe"),
-            ("kuti", "kuti-supervisor"),
-            ("kuti-supervisor", "kuti-supervisor"),
-            ("kuti-ren-sup", "kuti-supervisor"),
-            ("sonnet", "sonnet"),
-            ("sonnet-5.5-ultracode", "sonnet"),
-            ("quire", "quire"),
-            ("quire-opus-5.5", "quire"),
-            ("tangle", "tangle"),
-            ("tangle-fable-5", "tangle"),
-            ("gpui-wayland", "gpui-wayland"),
-            ("gpu-wayland", "gpui-wayland"),
-            ("atlas", "atlas"),
-            ("atlas-expanding_worlds", "atlas"),
-            ("sol_61", "sol_61"),
-            ("sol 6.1", "sol_61"),
-            ("sol61", "sol_61"),
-            ("muse", "auburn-cepheus"),
-            ("auburn-cepheus", "auburn-cepheus"),
-            ("auburn-cephus", "auburn-cepheus"),
-        ] {
+        for (alias, canonical) in pairs {
             map.insert(alias, canonical);
         }
         map
     }
 
-    /// Builds an alias map starting from house defaults and overlaying every
-    /// durable `SeatRecord`'s canonical name and aliases from `PresenceState`.
+    /// Builds an alias map from every durable `SeatRecord`'s canonical name and
+    /// aliases in `PresenceState`.
     pub fn from_presence(presence: &PresenceState) -> Self {
-        let mut map = Self::house_defaults();
+        let mut map = Self::empty();
         for (seat, rec) in presence.seats() {
             let canon = seat.as_str();
             map.insert(canon, canon);
@@ -296,9 +261,6 @@ fn extract_seat(
             }
         }
     }
-    if obj.contains_key("desk-read") {
-        return (Some("tally".to_owned()), Some("desk-read".to_owned()));
-    }
     (None, None)
 }
 
@@ -415,9 +377,8 @@ fn preview_line(raw: &str, max_chars: usize) -> String {
     out
 }
 
-/// Parses an entire `acks.jsonl` document tolerantly across all historical house
-/// schemas, recording non-JSON lines (such as line 61 in live `acks.jsonl`) in
-/// `skipped_lines` without aborting.
+/// Parses an entire `acks.jsonl` document tolerantly across all historical
+/// schemas, recording non-JSON lines in `skipped_lines` without aborting.
 pub fn parse_acks_jsonl(contents: &str, aliases: &AliasMap) -> AcksParseReport {
     let mut report = AcksParseReport::default();
 

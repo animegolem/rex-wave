@@ -951,18 +951,19 @@ impl ShadowPassReport {
 
 /// Runs one structurally read-only shadow pass over `interchange`. Never writes
 /// to `interchange`, never mutates any cursor file, and never invokes a ring transport.
+#[allow(clippy::too_many_arguments)]
 pub fn run_shadow_pass(
     interchange: &ReadOnlyInterchange,
     presence: &PresenceState,
     affinity: &IncarnationAffinity,
     retry_state: &RetryState,
     policy: &RingPolicy,
+    aliases: &AliasMap,
     now: UnixMs,
 ) -> Result<ShadowPassReport, SandboxError> {
-    let aliases = AliasMap::from_presence(presence);
-    let acks_report = interchange.read_acks(&aliases)?;
+    let acks_report = interchange.read_acks(aliases)?;
     let ack_index = acks_report.index();
-    let scanned = interchange.scan_letters(&aliases)?;
+    let scanned = interchange.scan_letters(aliases)?;
     let letters_scanned = scanned.len();
 
     let mut by_seat: BTreeMap<SeatName, Vec<LetterCandidate>> = BTreeMap::new();
@@ -982,7 +983,7 @@ pub fn run_shadow_pass(
             affinity,
             retry_state,
             policy,
-            &aliases,
+            aliases,
             now,
         ));
     }

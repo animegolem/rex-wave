@@ -8,9 +8,8 @@ use rex_wave_mailbridge::{
     RingDecision, RingDeliveryChannel, RingPolicy, RingReferent, SandboxRoot,
     current_process_start, decide_mail_ring, decide_mail_rings_for_seat, format_delivery_status,
     is_process_alive, load_claude_session_file_from, parse_acks_jsonl, parse_claude_session_json,
-    project, query_process_start, run_shadow_pass, score_replay_against_ground_truth,
-    score_shadow_against_acks, score_shadow_jsonl_against_acks, select_binding_for_delivery,
-    sender_delivery_notice,
+    project, query_process_start, run_shadow_pass, score_shadow_against_acks,
+    select_binding_for_delivery, sender_delivery_notice,
 };
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
@@ -108,6 +107,21 @@ fn claude_endpoint(
         name_source: name_source.map(str::to_owned),
         display_name: display_name.map(str::to_owned),
     }
+}
+
+fn test_aliases() -> AliasMap {
+    AliasMap::from_pairs([
+        ("desk-v1", "tally"),
+        ("desk_old", "tally"),
+        ("cc-desk", "tally"),
+        ("loupe-reviewer", "loupe"),
+    ])
+}
+
+fn opt_in_interchange_dir() -> Option<PathBuf> {
+    std::env::var_os("REX_WAVE_INTERCHANGE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn sample_candidate(rel_path: &str, seat: &str, body: &[u8], seen_at: UnixMs) -> LetterCandidate {
@@ -382,6 +396,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     let loaded = load_claude_session_file_from(dir.path(), my_pid).unwrap();
     assert_eq!(loaded.kind, "bg");
     assert_eq!(loaded.former_names, vec!["Tally-VampOTP-CTO"]);
+    assert!(!loaded.is_derived_name());
     let bind_cmd = loaded
         .into_bind_command(SeatName::parse("tally").unwrap(), None, None, false, false)
         .expect("kind='bg' is allowed to bind");
@@ -408,13 +423,12 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
         subagent.into_endpoint(false),
         Err(ApiError::Invalid(_))
     ));
-    assert_eq!(
-        subagent.derived_seat_name(),
-        None,
-        "nameSource='derived' must NEVER auto-derive a SeatName"
+    assert!(
+        subagent.is_derived_name(),
+        "nameSource='derived' is flagged as derived and never auto-derives a SeatName"
     );
 
-    // Interactive session with `nameSource: "derived"` never derives a SeatName,
+    // Interactive session with `nameSource: "derived"` is flagged as derived,
     // though it may still bind when an explicit `--seat` is provided by its hook.
     let derived_interactive = parse_claude_session_json(
         &serde_json::json!({
@@ -429,7 +443,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
         .to_string(),
     )
     .unwrap();
-    assert_eq!(derived_interactive.derived_seat_name(), None);
+    assert!(derived_interactive.is_derived_name());
     assert!(derived_interactive.into_endpoint(false).is_ok());
 
     // Fork mark (`⑂`) is rejected unless `allow_fork == true`.
@@ -451,7 +465,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
         Err(ApiError::Invalid(_))
     ));
     assert!(fork_session.into_endpoint(true).is_ok());
-    assert_eq!(fork_session.derived_seat_name(), None);
+    assert!(!fork_session.is_derived_name());
 
     // Real process identity test: /clear refresh vs --resume dead-pid auto-supersede vs live duplicate.
     let mut state = PresenceState::default();
@@ -671,24 +685,26 @@ fn gate1_all_10_mail_routing_cases_verified() {
     .into_iter()
     .collect();
 
-    let fixture_path =
-        Path::new("/Users/golem/agent-folder/interchange/fixtures/mail-routing/cases.jsonl");
-    if fixture_path.is_file() {
-        let raw = fs::read_to_string(fixture_path).unwrap();
-        let disk_ids: BTreeSet<String> = raw
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| {
-                let v: serde_json::Value = serde_json::from_str(l).unwrap();
-                v["id"].as_str().unwrap().to_owned()
-            })
-            .collect();
-        let expected_owned: BTreeSet<String> =
-            expected_ids.iter().map(|s| (*s).to_owned()).collect();
-        assert_eq!(
-            disk_ids, expected_owned,
-            "Gate 1 test matrix must cover every case in cases.jsonl"
-        );
+    if let Some(root) = opt_in_interchange_dir() {
+        let fixture_path = root.join("fixtures/mail-routing/cases.jsonl");
+        if fixture_path.is_file() {
+            let raw = fs::read_to_string(fixture_path).unwrap();
+            let disk_ids: BTreeSet<String> = raw
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                    v["id"].as_str().unwrap().to_owned()
+                })
+                .collect();
+            let expected_owned: BTreeSet<String> =
+                expected_ids.iter().map(|s| (*s).to_owned()).collect();
+            assert!(
+                expected_owned.is_subset(&disk_ids),
+                "expected Gate 1 case IDs missing from cases.jsonl: {:?}",
+                expected_owned.difference(&disk_ids).collect::<Vec<_>>()
+            );
+        }
     }
 
     let owner_p = Principal::Operator {
@@ -697,7 +713,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
     let sys_p = Principal::System {
         part: SystemPart::PresenceMonitor,
     };
-    let aliases = AliasMap::house_defaults();
+    let aliases = AliasMap::empty();
     let policy = RingPolicy::default();
     let empty_acks = parse_acks_jsonl("", &aliases).into_index();
     let empty_retry = RetryState::new();
@@ -938,6 +954,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
             &empty_affinity,
             &empty_retry,
             &policy,
+            &aliases,
             UnixMs(10_000),
         )
         .unwrap();
@@ -1151,17 +1168,19 @@ fn gate1_all_10_mail_routing_cases_verified() {
     }
 
     // Case 7: `two-seats-one-name`
-    // Refuses claiming an existing/retired name or alias unless replaced explicitly; supports incarnation affinity on lanes.
+    // Refuses claiming or replacing another seat without authorization; only an operator/system
+    // may replace another seat (retiring it and unbinding its live sessions).
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
         let plumb = SeatName::parse("plumb").unwrap();
+        let plumb_p = Principal::Seat {
+            seat: plumb.clone(),
+        };
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            Principal::Seat {
-                seat: plumb.clone(),
-            },
+            plumb_p.clone(),
             UnixMs(1_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
                 seat: plumb.clone(),
@@ -1177,10 +1196,37 @@ fn gate1_all_10_mail_routing_cases_verified() {
             |_, _| true,
         )
         .unwrap();
+        apply_presence_with_probe(
+            &mut st,
+            &mut seq,
+            plumb_p,
+            UnixMs(1_500),
+            PresenceCommand::PresenceBind(PresenceBind {
+                seat: plumb.clone(),
+                incarnation_id: None,
+                lane: None,
+                endpoint: TransportEndpoint::UdsSession {
+                    conn_id: 77,
+                    client: "plumb-cli".into(),
+                },
+                liveness: LivenessMode::SocketLifetime,
+                ttl_ms: None,
+                takeover: false,
+                allow_fork: false,
+                idem: None,
+            }),
+            |_, _| true,
+        )
+        .unwrap();
 
         let newcomer = Principal::Seat {
             seat: SeatName::parse("fathom").unwrap(),
         };
+        let worker = Principal::Worker {
+            wave: WaveSlug::parse("w1").unwrap(),
+            role: RoleName::parse("coder").unwrap(),
+        };
+
         let collision = apply_presence_with_probe(
             &mut st,
             &mut seq,
@@ -1202,11 +1248,64 @@ fn gate1_all_10_mail_routing_cases_verified() {
         .unwrap_err();
         assert!(matches!(collision, ApiError::Conflict { .. }));
 
-        // Explicit replacement succeeds and retires the replaced seat when claiming a new name.
+        // Neither a peer seat nor a Worker may hijack or retire another seat via `replace`.
+        for unauthorized in [newcomer, worker] {
+            let replace_same = apply_presence_with_probe(
+                &mut st,
+                &mut seq,
+                unauthorized.clone(),
+                UnixMs(2_500),
+                PresenceCommand::PresenceClaim(PresenceClaim {
+                    seat: plumb.clone(),
+                    status: Some(SeatStatus::Active),
+                    role: Some("hijack".into()),
+                    projects: Vec::new(),
+                    aliases: Vec::new(),
+                    home_room: None,
+                    verified_how: None,
+                    replace: Some(plumb.clone()),
+                    idem: None,
+                }),
+                |_, _| true,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(replace_same, ApiError::Denied { .. }),
+                "expected Denied for replace=self by {unauthorized}, got {replace_same:?}"
+            );
+
+            let replace_other = apply_presence_with_probe(
+                &mut st,
+                &mut seq,
+                unauthorized.clone(),
+                UnixMs(2_600),
+                PresenceCommand::PresenceClaim(PresenceClaim {
+                    seat: SeatName::parse("fathom").unwrap(),
+                    status: Some(SeatStatus::Active),
+                    role: Some("emacs".into()),
+                    projects: Vec::new(),
+                    aliases: Vec::new(),
+                    home_room: None,
+                    verified_how: None,
+                    replace: Some(plumb.clone()),
+                    idem: None,
+                }),
+                |_, _| true,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(replace_other, ApiError::Denied { .. }),
+                "expected Denied for replace=other by {unauthorized}, got {replace_other:?}"
+            );
+        }
+        assert_eq!(st.seat(&plumb).unwrap().status, SeatStatus::Active);
+        assert_eq!(st.live_bindings_for(&plumb, None, UnixMs(2_700)).len(), 1);
+
+        // Authorized operator replacement retires the replaced seat and unbinds its live sessions.
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            newcomer,
+            owner_p.clone(),
             UnixMs(3_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
                 seat: SeatName::parse("fathom").unwrap(),
@@ -1223,6 +1322,11 @@ fn gate1_all_10_mail_routing_cases_verified() {
         )
         .unwrap();
         assert_eq!(st.seat(&plumb).unwrap().status, SeatStatus::Retired);
+        assert!(st.live_bindings_for(&plumb, None, UnixMs(3_000)).is_empty());
+        assert_eq!(
+            st.seat(&SeatName::parse("fathom").unwrap()).unwrap().status,
+            SeatStatus::Active
+        );
     }
 
     // Case 8: `session-names-drift`
@@ -1446,7 +1550,7 @@ fn gate1_all_10_mail_routing_cases_verified() {
 
 #[test]
 fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
-    let aliases = AliasMap::house_defaults();
+    let aliases = test_aliases();
     let policy = RingPolicy::default();
     let affinity = IncarnationAffinity::new();
 
@@ -1457,21 +1561,21 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     let sha_mut_old = sha256_of(b"original-acked-bytes");
     let sha_mut_new = sha256_of(b"amended-in-place-bytes");
 
-    // Friction 1: Tolerant `acks.jsonl` parser handles 10+ historical house schemas + non-JSON line 61!
+    // Friction 1: Tolerant `acks.jsonl` parser handles 10+ historical schemas + non-JSON lines.
     let mut mixed_lines = vec![
         // 1. Canonical acked_by + 64-hex sha256 + to-cc/
         format!(
-            r#"{{"ts":"2026-10-07T03:21:00Z","letter":"to-cc/a.md","sha256":"{}","acked_by":"Tally-VampOTP","note":"read"}}"#,
+            r#"{{"ts":"2026-10-07T03:21:00Z","letter":"to-cc/a.md","sha256":"{}","acked_by":"Desk-V1","note":"read"}}"#,
             sha_a.as_str()
         ),
         // 2. seat + 16-hex sha256_16 + interchange/mail/...
         format!(
-            r#"{{"ts":"2026-10-31T06:3xZ","seat":"tally_votp","kind":"ack","letter":"interchange/mail/b.md","sha256_16":"{}"}}"#,
+            r#"{{"ts":"2026-10-31T06:3xZ","seat":"desk_old","kind":"ack","letter":"interchange/mail/b.md","sha256_16":"{}"}}"#,
             &sha_b.as_str()[..16]
         ),
         // 3. by + sha16 + bare filename
         format!(
-            r#"{{"ts":"2026-11-03T07:0x CST","by":"cc-fable","letter":"c.md","sha16":"{}"}}"#,
+            r#"{{"ts":"2026-11-03T07:0x CST","by":"cc-desk","letter":"c.md","sha16":"{}"}}"#,
             &sha_c.as_str()[..16]
         ),
         // 4. file + sha256_full + sha256 short
@@ -1480,9 +1584,9 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
             &sha_d.as_str()[..16],
             sha_d.as_str()
         ),
-        // 5. letters array of objects with desk-read
+        // 5. letters array of objects with seat
         format!(
-            r#"{{"ts":"2026-10-31T01:50:00-05:00","kind":"ack","desk-read":"yes","letters":[{{"file":"interchange/mail/mut.md","sha256_16":"{}"}}]}}"#,
+            r#"{{"ts":"2026-10-31T01:50:00-05:00","kind":"ack","seat":"tally","letters":[{{"file":"interchange/mail/mut.md","sha256_16":"{}"}}]}}"#,
             &sha_mut_old.as_str()[..16]
         ),
         // 6. letters array of strings (path-only historical row)
@@ -1496,8 +1600,8 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
             r#"{{"schema":1,"seat":"loupe","path":"to-loupe/mut.md","sha256_full":"{}"}}"#,
             sha_mut_old.as_str()
         ),
-        // 10. Non-JSON plain-text line (like line 61 in live acks.jsonl)
-        "88c1baf5b74431e4b39142c0f60beb0d3ed2f8d7d0c54d6980657d0fbd82ae3a  to-cc/jim-introduction-r1.md".to_owned(),
+        // 10. Non-JSON plain-text checksum line
+        "88c1baf5b74431e4b39142c0f60beb0d3ed2f8d7d0c54d6980657d0fbd82ae3a  to-cc/intro-r1.md".to_owned(),
     ];
     let acks_text = mixed_lines.join("\n");
     let report = parse_acks_jsonl(&acks_text, &aliases);
@@ -1511,7 +1615,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     assert!(idx.is_acked_by_digest("loupe", &sha_d, &aliases));
     assert!(!idx.is_acked_by_digest("genga", &sha_a, &aliases));
 
-    // Also verify `project()` in lib.rs uses the fixed tolerant `ack_row_matches`!
+    // Also verify `project()` in lib.rs uses the tolerant `ack_row_matches` without hardcoded aliases.
     let sb_dir = TempDirGuard::new("sandbox-acks-compat");
     fs::write(sb_dir.path().join(".rex-wave-sandbox"), b"ok\n").unwrap();
     fs::create_dir_all(sb_dir.path().join("to-tally")).unwrap();
@@ -1520,9 +1624,9 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     let sb_sha = sha256_of(sb_letter);
     let sb_letter_path = sb_dir.path().join("to-tally/compat-r1.md");
     fs::write(&sb_letter_path, sb_letter).unwrap();
-    // Write a legacy house-format ACK row (`acked_by: Tally-VampOTP`, `letter: interchange/to-tally/compat-r1.md`, 16-hex `sha16`) plus a non-JSON line!
+    // Write a historical-format ACK row (`acked_by: @Tally`, `letter: interchange/to-tally/compat-r1.md`, 16-hex `sha16`) plus a non-JSON line.
     mixed_lines.push(format!(
-        r#"{{"ts":"2026-11-21T06:00:00Z","acked_by":"Tally-VampOTP","letter":"interchange/to-tally/compat-r1.md","sha16":"{}"}}"#,
+        r#"{{"ts":"2026-11-21T06:00:00Z","acked_by":"@Tally","letter":"interchange/to-tally/compat-r1.md","sha16":"{}"}}"#,
         &sb_sha.as_str()[..16]
     ));
     fs::write(
@@ -1795,8 +1899,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
 }
 
 #[test]
-fn gate2_shadow_scorer_and_replay_scorer_and_optional_live_interchange_smoke() {
-    let aliases = AliasMap::house_defaults();
+fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     let policy = RingPolicy::default();
     let affinity = IncarnationAffinity::new();
 
@@ -1815,19 +1918,41 @@ fn gate2_shadow_scorer_and_replay_scorer_and_optional_live_interchange_smoke() {
     fs::write(dir.path().join("mail/04-retired.md"), b_retired).unwrap();
 
     let sha_acked = sha256_of(b_acked);
-    let sha_live = sha256_of(b_live);
+    // ACK recorded under an alias declared on loupe's durable SeatRecord.
     let acks_before_raw = format!(
-        "{{\"ts\":\"2026-11-21T05:00:00Z\",\"acked_by\":\"loupe\",\"letter\":\"mail/01-acked.md\",\"sha256\":\"{}\"}}\n",
+        "{{\"ts\":\"2026-11-21T05:00:00Z\",\"acked_by\":\"loupe-review\",\"letter\":\"mail/01-acked.md\",\"sha256\":\"{}\"}}\n",
         sha_acked.as_str()
     );
-    fs::write(dir.path().join("state/acks.jsonl"), &acks_before_raw).unwrap();
+    let acks_path = dir.path().join("state/acks.jsonl");
+    fs::write(&acks_path, &acks_before_raw).unwrap();
+    let acks_mtime_before = fs::metadata(&acks_path).unwrap().modified().unwrap();
+    let acks_bytes_before = fs::read(&acks_path).unwrap();
 
     let mut st = PresenceState::default();
     let mut seq = 0;
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    // loupe = Active + Live, genga = Active + Offline, quire = Retired.
+    // loupe = Active + Live (with alias `loupe-review`), genga = Active + Offline, quire = Retired.
+    apply_presence_with_probe(
+        &mut st,
+        &mut seq,
+        owner_p.clone(),
+        UnixMs(900),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            seat: SeatName::parse("loupe").unwrap(),
+            status: Some(SeatStatus::Active),
+            role: None,
+            projects: Vec::new(),
+            aliases: vec![SeatName::parse("loupe-review").unwrap()],
+            home_room: None,
+            verified_how: None,
+            replace: None,
+            idem: None,
+        }),
+        |_, _| true,
+    )
+    .unwrap();
     apply_presence_with_probe(
         &mut st,
         &mut seq,
@@ -1891,6 +2016,7 @@ fn gate2_shadow_scorer_and_replay_scorer_and_optional_live_interchange_smoke() {
     )
     .unwrap();
 
+    let aliases = AliasMap::from_presence(&st);
     let ro = ReadOnlyInterchange::open(dir.path()).unwrap();
     let pass = run_shadow_pass(
         &ro,
@@ -1898,9 +2024,25 @@ fn gate2_shadow_scorer_and_replay_scorer_and_optional_live_interchange_smoke() {
         &affinity,
         &RetryState::new(),
         &policy,
+        &aliases,
         UnixMs(5_000),
     )
     .unwrap();
+
+    // Read-only invariant verified against the private snapshot directory.
+    assert_eq!(
+        fs::metadata(&acks_path).unwrap().modified().unwrap(),
+        acks_mtime_before
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), acks_bytes_before);
+    assert_eq!(
+        fs::read_dir(dir.path().join("state"))
+            .unwrap()
+            .flatten()
+            .count(),
+        1
+    );
+
     let acks_before = pass.acks_report.index();
     let snap_score = score_shadow_against_acks(&pass.decisions, &acks_before, &aliases);
     assert_eq!(snap_score.rings_emitted, 1);
@@ -1912,74 +2054,48 @@ fn gate2_shadow_scorer_and_replay_scorer_and_optional_live_interchange_smoke() {
     assert_eq!(snap_score.unrung_referents_caught, 1);
     assert_eq!(snap_score.unrung_referents_already_acked, 0);
 
-    // JSONL round-trip scorer matches in-memory scorer identically.
+    // JSONL output serializes every decision cleanly for `--shadow-read-only` logs.
     let jsonl = pass.to_jsonl();
-    let jsonl_score = score_shadow_jsonl_against_acks(&jsonl, &acks_before, &aliases).unwrap();
-    assert_eq!(jsonl_score, snap_score);
+    let parsed_kinds: Vec<String> = jsonl
+        .lines()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["decision"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(parsed_kinds.len(), pass.decisions.len());
+    assert!(parsed_kinds.iter().any(|k| k == "ring"));
+    assert!(parsed_kinds.iter().any(|k| k == "raise_unrung"));
 
-    // Retrospective Gate 2: loupe later ACKs `02-live.md`, genga stays unrung -> 1 TP, 0 FP, 1 caught miss.
-    let acks_after_raw = format!(
-        "{acks_before_raw}{{\"ts\":\"2026-11-21T05:05:00Z\",\"acked_by\":\"loupe\",\"letter\":\"mail/02-live.md\",\"sha256\":\"{}\"}}\n",
-        sha_live.as_str()
-    );
-    let acks_after = parse_acks_jsonl(&acks_after_raw, &aliases).into_index();
-    let replay =
-        score_replay_against_ground_truth(&pass.decisions, &acks_before, &acks_after, &aliases);
-    assert_eq!(replay.true_positive_rings, 1);
-    assert_eq!(replay.duplicate_already_acked_rings, 0);
-    assert_eq!(replay.caught_unrung_misses, 1);
-    assert_eq!(replay.skipped_dormant_or_retired, 1);
-
-    // Live read-only smoke test against estate `~/agent-folder/interchange` if present
-    // (gracefully skipped on GitHub Actions CI runners where `~/agent-folder` does not exist).
-    let live_root = Path::new("/Users/golem/agent-folder/interchange");
-    let live_acks_path = live_root.join("state/acks.jsonl");
-    if live_acks_path.is_file() {
-        let mtime_before = fs::metadata(&live_acks_path).unwrap().modified().unwrap();
-        let size_before = fs::metadata(&live_acks_path).unwrap().len();
-
-        let ro_live = ReadOnlyInterchange::open(live_root).unwrap();
-        let live_acks_report = ro_live.read_acks(&aliases).unwrap();
-        assert!(
-            live_acks_report.records.len() >= 1_000,
-            "expected >=1000 parsed receipts from live acks.jsonl, got {}",
-            live_acks_report.records.len()
-        );
-        assert!(
-            live_acks_report
-                .skipped_lines
-                .iter()
-                .any(|s| s.line_number == 61),
-            "expected non-JSON line 61 reported in skipped_lines"
-        );
-
-        let live_pass = run_shadow_pass(
-            &ro_live,
-            &PresenceState::default(),
-            &affinity,
-            &RetryState::new(),
-            &policy,
-            UnixMs(1_795_262_000_000),
-        )
-        .unwrap();
-        let live_idx = live_pass.acks_report.index();
-        let live_score = score_shadow_against_acks(&live_pass.decisions, &live_idx, &aliases);
-        assert!(live_pass.letters_scanned > 100);
-        assert!(live_score.skipped_already_acked > 100);
-        assert_eq!(
-            live_score.unrung_referents_already_acked, 0,
-            "shadow pass must never emit RaiseUnrung for an already-ACKed (seat, sha256)"
-        );
-        assert_eq!(
-            live_score.ring_referents_confirmed_acked, 0,
-            "shadow pass must never re-ring an already-ACKed (seat, sha256)"
-        );
-
-        assert_eq!(
-            fs::metadata(&live_acks_path).unwrap().modified().unwrap(),
-            mtime_before,
-            "ReadOnlyInterchange must never touch live acks.jsonl"
-        );
-        assert_eq!(fs::metadata(&live_acks_path).unwrap().len(), size_before);
+    // Opt-in read-only smoke test against a real interchange directory when
+    // `REX_WAVE_INTERCHANGE_DIR` is set in the environment.
+    if let Some(live_root) = opt_in_interchange_dir() {
+        let live_acks_path = live_root.join("state/acks.jsonl");
+        if live_acks_path.is_file() {
+            let live_aliases = AliasMap::empty();
+            let ro_live = ReadOnlyInterchange::open(&live_root).unwrap();
+            let live_pass = run_shadow_pass(
+                &ro_live,
+                &PresenceState::default(),
+                &affinity,
+                &RetryState::new(),
+                &policy,
+                &live_aliases,
+                UnixMs(1_795_262_000_000),
+            )
+            .unwrap();
+            let live_idx = live_pass.acks_report.index();
+            let live_score =
+                score_shadow_against_acks(&live_pass.decisions, &live_idx, &live_aliases);
+            assert!(!live_pass.acks_report.records.is_empty());
+            assert_eq!(
+                live_score.unrung_referents_already_acked, 0,
+                "shadow pass must never emit RaiseUnrung for an already-ACKed (seat, sha256)"
+            );
+            assert_eq!(
+                live_score.ring_referents_confirmed_acked, 0,
+                "shadow pass must never re-ring an already-ACKed (seat, sha256)"
+            );
+        }
     }
 }

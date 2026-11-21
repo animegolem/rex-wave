@@ -29,33 +29,64 @@ pub fn proc_start_matches(expected: &str, actual: &str) -> bool {
     !e.is_empty() && e == a
 }
 
-/// Queries the OS process start time in UTC (`TZ=UTC LC_ALL=C ps -p <pid> -o lstart=`)
-/// without `unsafe`, matching Claude Code's UTC `procStart` field verbatim.
-pub fn query_process_start(pid: u32) -> Option<String> {
+fn try_query_process_start_with_bin(bin: &str, pid: u32) -> std::io::Result<Option<String>> {
     if pid == 0 {
-        return None;
+        return Ok(None);
     }
-    let output = Command::new("ps")
+    let output = Command::new(bin)
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .env("TZ", "UTC")
         .env("LC_ALL", "C")
-        .output()
-        .ok()?;
+        .output()?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
-    Some(line.to_owned())
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return Ok(None);
+    };
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+    Ok(line.map(str::to_owned))
 }
 
-/// Returns `true` when `pid` is currently running and its UTC `lstart` matches
-/// `expected_proc_start`, guarding against PID reuse.
-pub fn is_process_alive(pid: u32, expected_proc_start: &str) -> bool {
+/// Queries the OS process start time in UTC (`TZ=UTC LC_ALL=C ps -p <pid> -o lstart=`)
+/// without `unsafe`, distinguishing probe execution failure (`Err`) from a dead
+/// process (`Ok(None)`).
+pub fn try_query_process_start(pid: u32) -> std::io::Result<Option<String>> {
+    try_query_process_start_with_bin("ps", pid)
+}
+
+/// Queries the OS process start time in UTC (`TZ=UTC LC_ALL=C ps -p <pid> -o lstart=`)
+/// without `unsafe`, matching Claude Code's UTC `procStart` field verbatim.
+pub fn query_process_start(pid: u32) -> Option<String> {
+    try_query_process_start(pid).ok().flatten()
+}
+
+fn is_process_alive_with_bin(bin: &str, pid: u32, expected_proc_start: &str) -> bool {
     if pid == 0 || expected_proc_start.trim().is_empty() {
         return false;
     }
-    query_process_start(pid).is_some_and(|actual| proc_start_matches(expected_proc_start, &actual))
+    match try_query_process_start_with_bin(bin, pid) {
+        Ok(Some(actual)) => proc_start_matches(expected_proc_start, &actual),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// Returns `true` when `pid` is currently running and its UTC `lstart` matches
+/// `expected_proc_start`. Fails closed (`true`) if `ps` itself cannot execute so
+/// a live session is never silently superseded on probe failure.
+pub fn is_process_alive(pid: u32, expected_proc_start: &str) -> bool {
+    is_process_alive_with_bin("ps", pid, expected_proc_start)
+}
+
+fn probe_process_alive(pid: u32, expected_proc_start: &str) -> bool {
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| is_process_alive(pid, expected_proc_start))
+    } else {
+        is_process_alive(pid, expected_proc_start)
+    }
 }
 
 /// Returns the current process's UTC `lstart`, useful for hooks and tests.
@@ -220,7 +251,7 @@ pub fn load_claude_session_file(pid: u32) -> Result<ClaudeSessionFile, ApiError>
 }
 
 impl ClaudeSessionFile {
-    /// Enforces Tally's signed-off Claude binding guardrails:
+    /// Enforces Claude session binding guardrails:
     /// `kind` must be `"interactive"` or `"bg"`, and `⑂` forks are rejected
     /// unless `allow_fork` is explicitly set.
     pub fn validate_for_bind(&self, allow_fork: bool) -> Result<(), ApiError> {
@@ -262,24 +293,11 @@ impl ClaudeSessionFile {
         })
     }
 
-    /// Never derives a `SeatName` when `nameSource == "derived"`, when `kind`
-    /// is disallowed, or when the display name carries a `⑂` fork mark.
-    /// Display names remain advisory only; binding always passes an explicit `seat`.
-    pub fn derived_seat_name(&self) -> Option<SeatName> {
-        if TransportEndpoint::is_derived_name_source(self.name_source.as_deref()) {
-            return None;
-        }
-        if !TransportEndpoint::is_allowed_claude_kind(&self.kind) {
-            return None;
-        }
-        let name = self.name.as_deref()?;
-        if TransportEndpoint::is_fork_display_name(name) {
-            return None;
-        }
-        if self.name_source.as_deref() != Some("user") {
-            return None;
-        }
-        SeatName::parse(name.to_ascii_lowercase()).ok()
+    /// Returns `true` when the harness derived the session's display name
+    /// (`nameSource == "derived"`). Seat identity is always passed explicitly to
+    /// [`Self::into_bind_command`] and is never derived from a session display name.
+    pub fn is_derived_name(&self) -> bool {
+        TransportEndpoint::is_derived_name_source(self.name_source.as_deref())
     }
 
     /// Builds a [`PresenceBind`] command for an explicitly supplied `seat`.
@@ -1007,28 +1025,48 @@ impl Presence {
         let replacing_self = c.replace.as_ref() == Some(&c.seat);
         let replacing_other = c.replace.as_ref().filter(|old| *old != &c.seat);
 
-        if let Some(old_seat) = replacing_other
-            && !state.seats.contains_key(old_seat)
-        {
-            return Err(ApiError::NotFound {
-                what: format!("seat '{old_seat}' to replace"),
-            });
+        if let Some(old_seat) = replacing_other {
+            let Some(old_rec) = state.seats.get(old_seat) else {
+                return Err(ApiError::NotFound {
+                    what: format!("seat '{old_seat}' to replace"),
+                });
+            };
+            if !can_manage_seat(&ctx.by, old_seat, Some(old_rec)) {
+                return Err(ApiError::Denied {
+                    principal: ctx.by.to_string(),
+                    action: format!("replace seat '{old_seat}'"),
+                });
+            }
         }
 
         if let Some(rec) = existing {
-            if !replacing_self && !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+            if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+                if replacing_self {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by.to_string(),
+                        action: format!("replace seat '{}'", c.seat),
+                    });
+                }
                 return Err(ApiError::conflict(format!(
-                    "seat '{}' is already claimed by {}; pass replace='{}' to replace explicitly",
+                    "seat '{}' is already claimed by {}; pass replace='{}' as an authorized operator to replace explicitly",
                     c.seat, rec.claimed_by, c.seat
                 )));
             }
-        } else if let Some(owner) = state.alias_owner(&c.seat, &c.seat)
-            && c.replace.as_ref() != Some(&owner)
-        {
-            return Err(ApiError::conflict(format!(
-                "seat name '{}' is already an alias of '{}'; pass replace='{owner}' to replace explicitly",
-                c.seat, owner
-            )));
+        } else {
+            if !can_manage_seat(&ctx.by, &c.seat, None) {
+                return Err(ApiError::Denied {
+                    principal: ctx.by.to_string(),
+                    action: format!("claim seat '{}'", c.seat),
+                });
+            }
+            if let Some(owner) = state.alias_owner(&c.seat, &c.seat)
+                && c.replace.as_ref() != Some(&owner)
+            {
+                return Err(ApiError::conflict(format!(
+                    "seat name '{}' is already an alias of '{}'; pass replace='{owner}' to replace explicitly",
+                    c.seat, owner
+                )));
+            }
         }
 
         for alias in &c.aliases {
@@ -1152,8 +1190,14 @@ impl Presence {
             None
         };
 
+        let can_reassign_owner = matches!(
+            ctx.by,
+            Principal::Operator { .. } | Principal::System { .. }
+        );
         let (claimed_by, claimed_at) = match existing {
-            Some(rec) if !replacing_self => (rec.claimed_by.clone(), rec.claimed_at),
+            Some(rec) if !(replacing_self && can_reassign_owner) => {
+                (rec.claimed_by.clone(), rec.claimed_at)
+            }
             _ => (ctx.by.clone(), ctx.at),
         };
 
@@ -1540,7 +1584,7 @@ impl Decider for Presence {
         cmd: &PresenceCommand,
         ctx: &DecideCtx,
     ) -> Result<Vec<PresenceEvent>, ApiError> {
-        Self::decide_with_probe(state, cmd, ctx, is_process_alive)
+        Self::decide_with_probe(state, cmd, ctx, probe_process_alive)
     }
 
     fn evolve(state: &mut PresenceState, event: &PresenceEvent, meta: &EntryMeta) {
@@ -1618,7 +1662,8 @@ impl Decider for Presence {
                     .get_mut(seat)
                     .and_then(|m| m.get_mut(incarnation_id))
                 {
-                    dropped_reconnectable = is_reconnectable_binding(binding);
+                    dropped_reconnectable =
+                        *status == BindingStatus::Unbound && is_reconnectable_binding(binding);
                     binding.status = *status;
                 }
                 let still_live = state
@@ -1744,5 +1789,22 @@ impl Decider for Presence {
             Event::Presence(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_ps_binary_fails_closed_as_alive() {
+        assert!(
+            is_process_alive_with_bin(
+                "/nonexistent/rex-wave-ps-binary",
+                std::process::id(),
+                "Thu Nov 14 00:00:00 2026",
+            ),
+            "probe spawn failure must fail closed so live sessions are never superseded without takeover"
+        );
     }
 }

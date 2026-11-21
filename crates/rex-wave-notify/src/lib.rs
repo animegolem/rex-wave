@@ -362,6 +362,7 @@ pub enum MailUnrungEval {
 
 #[derive(Default)]
 pub struct HeraldView {
+    latest_at: UnixMs,
     members: BTreeMap<room::RoomId, BTreeSet<Principal>>,
     wave_owners: BTreeMap<WaveSlug, Principal>,
     operators: BTreeSet<Principal>,
@@ -377,7 +378,7 @@ pub struct HeraldView {
     pending_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
-    raised_mail_unrung: BTreeSet<SeatName>,
+    raised_mail_unrung: BTreeMap<SeatName, (u32, UnixMs)>,
     mail_unrung_emits: Vec<(SeatName, u32, UnixMs)>,
     transport_emits: Vec<(presence::TransportKind, bool, Option<String>)>,
 }
@@ -395,6 +396,15 @@ fn box_seat_from_path(path: &std::path::Path) -> Option<SeatName> {
 
 impl HeraldView {
     pub fn observe(&mut self, entry: &Envelope) {
+        self.observe_inner(entry, true);
+    }
+
+    fn observe_replay(&mut self, entry: &Envelope) {
+        self.observe_inner(entry, false);
+    }
+
+    fn observe_inner(&mut self, entry: &Envelope, emit_mail_unrung: bool) {
+        self.latest_at = self.latest_at.max(entry.at);
         self.cleared_interactions.clear();
         self.mail_unrung_emits.clear();
         self.transport_emits.clear();
@@ -538,11 +548,14 @@ impl HeraldView {
                         seat_bindings.remove(old_id);
                     }
                     self.ever_bound.insert(seat.clone());
-                    if binding.status == presence::BindingStatus::Live
-                        && !self.down_transports.contains(&binding.endpoint.kind())
-                    {
+                    if matches!(
+                        binding.status,
+                        presence::BindingStatus::Live | presence::BindingStatus::TransportDown
+                    ) {
                         seat_bindings.insert(binding.incarnation_id.clone(), binding.clone());
-                        self.last_drop.remove(&seat);
+                        if !self.down_transports.contains(&binding.endpoint.kind()) {
+                            self.last_drop.remove(&seat);
+                        }
                     } else {
                         seat_bindings.remove(&binding.incarnation_id);
                     }
@@ -574,7 +587,7 @@ impl HeraldView {
                     let reconnectable = dropped.as_ref().is_some_and(|b| {
                         *status == presence::BindingStatus::Unbound && is_reconnectable_binding(b)
                     });
-                    if !self.has_live_binding(seat) {
+                    if !self.has_live_binding(seat, entry.at) {
                         self.last_drop.insert(
                             seat.clone(),
                             DropRecord {
@@ -598,8 +611,37 @@ impl HeraldView {
                 } => {
                     if *down {
                         self.down_transports.insert(*transport);
+                        for (seat, map) in &mut self.live_bindings {
+                            let mut affected = false;
+                            for b in map.values_mut() {
+                                if b.endpoint.kind() == *transport
+                                    && b.status == presence::BindingStatus::Live
+                                {
+                                    b.status = presence::BindingStatus::TransportDown;
+                                    affected = true;
+                                }
+                            }
+                            if affected {
+                                check_seats.insert(seat.clone());
+                            }
+                        }
                     } else {
                         self.down_transports.remove(transport);
+                        for (seat, map) in &mut self.live_bindings {
+                            let mut restored = false;
+                            for b in map.values_mut() {
+                                if b.endpoint.kind() == *transport
+                                    && b.status == presence::BindingStatus::TransportDown
+                                {
+                                    b.status = presence::BindingStatus::Live;
+                                    restored = true;
+                                }
+                            }
+                            if restored {
+                                self.last_drop.remove(seat);
+                                check_seats.insert(seat.clone());
+                            }
+                        }
                     }
                     self.transport_emits
                         .push((*transport, *down, detail.clone()));
@@ -645,14 +687,38 @@ impl HeraldView {
                 }
                 mail::MailEvent::BellRang { .. } => {}
             },
+            (StreamId::Inbox { .. }, Event::Inbox(ev)) => match ev {
+                InboxEvent::Raised { draft, .. } | InboxEvent::Updated { draft, .. } => {
+                    if let NotifyKind::MailUnrung {
+                        seat,
+                        unread_count,
+                        oldest_at,
+                    } = &draft.kind
+                    {
+                        if *unread_count > 0 {
+                            self.raised_mail_unrung
+                                .insert(seat.clone(), (*unread_count, *oldest_at));
+                        } else {
+                            self.raised_mail_unrung.remove(seat);
+                        }
+                    }
+                }
+                InboxEvent::StateSet { .. }
+                | InboxEvent::CursorAdvanced { .. }
+                | InboxEvent::ArchivedSet { .. } => {}
+            },
             _ => {}
+        }
+
+        if !emit_mail_unrung {
+            return;
         }
 
         // Also sweep any seats waiting on reconnect grace whose deadline has now elapsed.
         for seat in self.unrung_mail.keys() {
             check_seats.insert(seat.clone());
         }
-        for seat in &self.raised_mail_unrung {
+        for seat in self.raised_mail_unrung.keys() {
             check_seats.insert(seat.clone());
         }
 
@@ -662,12 +728,16 @@ impl HeraldView {
                     unread_count,
                     oldest_at,
                 } => {
-                    self.raised_mail_unrung.insert(seat.clone());
-                    self.mail_unrung_emits.push((seat, unread_count, oldest_at));
+                    let next = (unread_count, oldest_at);
+                    if self.raised_mail_unrung.get(&seat) != Some(&next) {
+                        self.raised_mail_unrung.insert(seat.clone(), next);
+                        self.mail_unrung_emits.push((seat, unread_count, oldest_at));
+                    }
                 }
                 MailUnrungEval::Resolve => {
-                    self.raised_mail_unrung.remove(&seat);
-                    self.mail_unrung_emits.push((seat, 0, UnixMs(0)));
+                    if self.raised_mail_unrung.remove(&seat).is_some() {
+                        self.mail_unrung_emits.push((seat, 0, UnixMs(0)));
+                    }
                 }
                 MailUnrungEval::Suppress | MailUnrungEval::WithinGrace { .. } => {}
             }
@@ -690,7 +760,7 @@ impl HeraldView {
             .or_default()
             .entry(sha256.clone())
             .or_insert_with(|| letter.clone());
-        if !self.has_live_binding(&seat) {
+        if !self.has_live_binding(&seat, at) {
             self.unrung_mail
                 .entry(seat)
                 .or_default()
@@ -715,7 +785,7 @@ impl HeraldView {
                 .iter()
                 .filter(|(_, map)| {
                     map.get(sha256)
-                        .is_some_and(|pending| pending.path == path || map.contains_key(sha256))
+                        .is_some_and(|pending| path.as_os_str().is_empty() || pending.path == path)
                 })
                 .map(|(seat, _)| seat.clone())
                 .collect(),
@@ -727,12 +797,31 @@ impl HeraldView {
             || (self.operator_seats.is_empty() && seat.as_str() == "owner")
     }
 
-    fn has_live_binding(&self, seat: &SeatName) -> bool {
+    fn has_live_binding(&self, seat: &SeatName, now: UnixMs) -> bool {
         self.live_bindings.get(seat).is_some_and(|m| {
             m.values().any(|b| {
                 b.status == presence::BindingStatus::Live
                     && !self.down_transports.contains(&b.endpoint.kind())
+                    && b.expires_at.is_none_or(|exp| exp > now)
             })
+        })
+    }
+
+    fn has_only_transport_down_bindings(&self, seat: &SeatName, now: UnixMs) -> bool {
+        self.live_bindings.get(seat).is_some_and(|m| {
+            let mut saw_unexpired = false;
+            for b in m.values() {
+                if b.expires_at.is_some_and(|exp| exp <= now) {
+                    continue;
+                }
+                saw_unexpired = true;
+                if !self.down_transports.contains(&b.endpoint.kind())
+                    && b.status == presence::BindingStatus::Live
+                {
+                    return false;
+                }
+            }
+            saw_unexpired
         })
     }
 
@@ -761,7 +850,7 @@ impl HeraldView {
             status,
             presence::SeatStatus::Dormant | presence::SeatStatus::Retired
         ) {
-            return if self.raised_mail_unrung.contains(seat) {
+            return if self.raised_mail_unrung.contains_key(seat) {
                 MailUnrungEval::Resolve
             } else {
                 MailUnrungEval::Suppress
@@ -769,7 +858,7 @@ impl HeraldView {
         }
 
         let Some(unrung) = self.unrung_mail.get(seat).filter(|m| !m.is_empty()) else {
-            return if self.raised_mail_unrung.contains(seat) {
+            return if self.raised_mail_unrung.contains_key(seat) {
                 MailUnrungEval::Resolve
             } else {
                 MailUnrungEval::Suppress
@@ -779,11 +868,11 @@ impl HeraldView {
         let unread_count = unrung.len() as u32;
         let oldest_at = unrung.values().map(|l| l.at).min().unwrap_or(now);
 
-        if self.has_live_binding(seat) {
+        if self.has_live_binding(seat, now) {
             // Rebinding alone does not clear an already-raised card until pending
             // digests are ACKed; a fast reconnect before any card was raised
             // suppresses alerting cleanly.
-            return if self.raised_mail_unrung.contains(seat) {
+            return if self.raised_mail_unrung.contains_key(seat) {
                 MailUnrungEval::Raise {
                     unread_count,
                     oldest_at,
@@ -791,6 +880,14 @@ impl HeraldView {
             } else {
                 MailUnrungEval::Suppress
             };
+        }
+
+        // During a provider-level TransportDown outage, the deduped TransportDown
+        // card owns alerting instead of raising per-seat MailUnrung cards.
+        if self.has_only_transport_down_bindings(seat, now)
+            && !self.raised_mail_unrung.contains_key(seat)
+        {
+            return MailUnrungEval::Suppress;
         }
 
         if !self.ever_bound.contains(seat) {
@@ -836,13 +933,18 @@ impl HeraldView {
         earliest
     }
 
-    /// Flushes any `MailUnrung` alerts whose 15 s reconnect grace window has
-    /// expired by `now`, returning `(operator, draft)` pairs ready for `InboxRaise`.
-    pub fn due_mail_unrung(&mut self, now: UnixMs) -> Vec<(Principal, NotificationDraft)> {
+    fn pending_mail_unrung_transitions(
+        &self,
+        now: UnixMs,
+    ) -> Vec<(
+        SeatName,
+        Option<(u32, UnixMs)>,
+        Vec<(Principal, NotificationDraft)>,
+    )> {
         let seats: Vec<SeatName> = self
             .unrung_mail
             .keys()
-            .chain(self.raised_mail_unrung.iter())
+            .chain(self.raised_mail_unrung.keys())
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -855,21 +957,47 @@ impl HeraldView {
                     unread_count,
                     oldest_at,
                 } => {
-                    self.raised_mail_unrung.insert(seat.clone());
-                    let draft = mail_unrung_draft(&seat, unread_count, oldest_at);
-                    for op in &operators {
-                        out.push((op.clone(), draft.clone()));
+                    let next = (unread_count, oldest_at);
+                    if self.raised_mail_unrung.get(&seat) != Some(&next) {
+                        let draft = mail_unrung_draft(&seat, unread_count, oldest_at);
+                        let raises = operators
+                            .iter()
+                            .map(|op| (op.clone(), draft.clone()))
+                            .collect();
+                        out.push((seat, Some(next), raises));
                     }
                 }
                 MailUnrungEval::Resolve => {
-                    self.raised_mail_unrung.remove(&seat);
-                    let draft = mail_unrung_resolved_draft(&seat);
-                    for op in &operators {
-                        out.push((op.clone(), draft.clone()));
+                    if self.raised_mail_unrung.contains_key(&seat) {
+                        let draft = mail_unrung_resolved_draft(&seat);
+                        let raises = operators
+                            .iter()
+                            .map(|op| (op.clone(), draft.clone()))
+                            .collect();
+                        out.push((seat, None, raises));
                     }
                 }
                 MailUnrungEval::Suppress | MailUnrungEval::WithinGrace { .. } => {}
             }
+        }
+        out
+    }
+
+    /// Flushes any `MailUnrung` alerts whose 15 s reconnect grace window has
+    /// expired by `now`, returning `(operator, draft)` pairs ready for `InboxRaise`.
+    pub fn due_mail_unrung(&mut self, now: UnixMs) -> Vec<(Principal, NotificationDraft)> {
+        let transitions = self.pending_mail_unrung_transitions(now);
+        let mut out = Vec::new();
+        for (seat, next_state, raises) in transitions {
+            match next_state {
+                Some(state) => {
+                    self.raised_mail_unrung.insert(seat, state);
+                }
+                None => {
+                    self.raised_mail_unrung.remove(&seat);
+                }
+            }
+            out.extend(raises);
         }
         out
     }
@@ -1797,8 +1925,56 @@ impl ReplayBuffer {
     }
 }
 
+/// Cloneable handle to a running [`Herald`] reactor's view, allowing a daemon
+/// timer task to query [`HeraldHandle::next_grace_deadline`] and call
+/// [`HeraldHandle::flush_due_at`] after `spawn_reactor` takes ownership of `Herald`.
+#[derive(Clone)]
+pub struct HeraldHandle {
+    view: std::sync::Arc<std::sync::Mutex<HeraldView>>,
+}
+
+impl HeraldHandle {
+    pub fn next_grace_deadline(&self, now: UnixMs) -> Option<UnixMs> {
+        self.view
+            .lock()
+            .expect("herald view lock")
+            .next_grace_deadline(now)
+    }
+
+    pub fn flush_due_at(
+        &self,
+        now: UnixMs,
+        client: &LocalClient,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send + use<> {
+        let pending = self
+            .view
+            .lock()
+            .expect("herald view lock")
+            .pending_mail_unrung_transitions(now);
+        let view = self.view.clone();
+        let client = client.clone();
+        async move {
+            for (seat, next_state, raises) in pending {
+                for (to, draft) in raises {
+                    client.call(InboxRaise { to, draft }).await?;
+                }
+                let mut guard = view.lock().expect("herald view lock");
+                match next_state {
+                    Some(state) => {
+                        guard.raised_mail_unrung.insert(seat, state);
+                    }
+                    None => {
+                        guard.raised_mail_unrung.remove(&seat);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 pub struct Herald {
-    view: HeraldView,
+    view: std::sync::Arc<std::sync::Mutex<HeraldView>>,
     caught_up: bool,
     replay: std::sync::Arc<std::sync::Mutex<ReplayBuffer>>,
 }
@@ -1806,9 +1982,23 @@ pub struct Herald {
 impl Herald {
     pub fn new() -> Self {
         Herald {
-            view: HeraldView::default(),
+            view: std::sync::Arc::new(std::sync::Mutex::new(HeraldView::default())),
             caught_up: false,
             replay: std::sync::Arc::new(std::sync::Mutex::new(ReplayBuffer::default())),
+        }
+    }
+
+    /// Constructs a [`Herald`] paired with a [`HeraldHandle`] so a timer task
+    /// can flush 15 s reconnect grace deadlines while `spawn_reactor` owns `Herald`.
+    pub fn with_handle() -> (Self, HeraldHandle) {
+        let herald = Self::new();
+        let handle = herald.handle();
+        (herald, handle)
+    }
+
+    pub fn handle(&self) -> HeraldHandle {
+        HeraldHandle {
+            view: self.view.clone(),
         }
     }
 
@@ -1818,19 +2008,12 @@ impl Herald {
         &mut self,
         now: UnixMs,
         client: &LocalClient,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send {
-        let raises = self.view.due_mail_unrung(now);
-        let client = client.clone();
-        async move {
-            for (to, draft) in raises {
-                client.call(InboxRaise { to, draft }).await?;
-            }
-            Ok(())
-        }
+    ) -> impl Future<Output = Result<(), ApiError>> + Send + use<> {
+        self.handle().flush_due_at(now, client)
     }
 
     pub fn next_grace_deadline(&self, now: UnixMs) -> Option<UnixMs> {
-        self.view.next_grace_deadline(now)
+        self.handle().next_grace_deadline(now)
     }
 }
 
@@ -1856,12 +2039,17 @@ impl Reactor for Herald {
         let mut flush_replay = false;
         match frame {
             Frame::Committed(env) => {
-                self.view.observe(&env);
-                let drafts = classify(&env, &self.view);
                 if self.caught_up {
-                    live_raises = drafts;
+                    let mut view = self.view.lock().expect("herald view lock");
+                    view.observe(&env);
+                    live_raises = classify(&env, &view);
                     flush_replay = true;
                 } else {
+                    let drafts = {
+                        let mut view = self.view.lock().expect("herald view lock");
+                        view.observe_replay(&env);
+                        classify(&env, &view)
+                    };
                     let mut buf = self.replay.lock().expect("herald replay buffer");
                     for (to, draft) in drafts {
                         buf.upsert(to, draft);
@@ -1870,6 +2058,17 @@ impl Reactor for Herald {
             }
             Frame::CaughtUp { .. } => {
                 self.caught_up = true;
+                let due = {
+                    let mut view = self.view.lock().expect("herald view lock");
+                    let now = view.latest_at;
+                    view.due_mail_unrung(now)
+                };
+                if !due.is_empty() {
+                    let mut buf = self.replay.lock().expect("herald replay buffer");
+                    for (to, draft) in due {
+                        buf.upsert(to, draft);
+                    }
+                }
                 flush_replay = true;
             }
             _ => {}

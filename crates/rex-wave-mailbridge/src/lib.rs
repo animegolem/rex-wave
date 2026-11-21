@@ -20,12 +20,9 @@ pub use presence::{
     PresenceState, current_process_start, format_delivery_status, is_process_alive,
     load_claude_session_file, load_claude_session_file_from, normalize_proc_start,
     parse_claude_session_json, proc_start_matches, query_process_start,
-    select_binding_for_delivery, sender_delivery_notice,
+    select_binding_for_delivery, sender_delivery_notice, try_query_process_start,
 };
-pub use score::{
-    ReplayScoreReport, ShadowScoreReport, score_replay_against_ground_truth,
-    score_shadow_against_acks, score_shadow_jsonl_against_acks,
-};
+pub use score::{ShadowScoreReport, score_shadow_against_acks};
 pub use shadow::{
     DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,
     LetterCandidate, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
@@ -1073,7 +1070,7 @@ fn is_acked_in_sandbox(
     let Ok(contents) = fs::read_to_string(&acks_path) else {
         return false;
     };
-    let aliases = acks::AliasMap::house_defaults();
+    let aliases = acks::AliasMap::empty();
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {

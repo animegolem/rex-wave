@@ -2094,3 +2094,326 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
 
     herald_task.abort();
 }
+
+#[tokio::test]
+async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresses_transport_down_mail_unrung()
+ {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let owner = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let herald_sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::Herald,
+        },
+    );
+    let (herald, handle) = Herald::with_handle();
+    let herald_task = spawn_reactor(herald, herald_sys.clone());
+
+    let mut presence_writer = journal.claim(StreamId::Presence).unwrap();
+    let mut mail_writer = journal.claim(StreamId::Mail).unwrap();
+    let room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("lounge").unwrap(),
+    };
+    let crest = SeatName::parse("crest").unwrap();
+    let tally = Principal::Seat {
+        seat: SeatName::parse("tally").unwrap(),
+    };
+
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let init = presence_writer
+        .append(
+            owner.me(),
+            UnixMs(t0),
+            None,
+            vec![
+                Event::Presence(PresenceEvent::SeatClaimed {
+                    record: sample_seat_record("crest", SeatStatus::Active, UnixMs(t0)),
+                }),
+                Event::Presence(PresenceEvent::Bound {
+                    binding: sample_uds_binding("crest", "inc-crest-1", UnixMs(t0)),
+                    superseded: Vec::new(),
+                }),
+                Event::Presence(PresenceEvent::Unbound {
+                    seat: crest.clone(),
+                    incarnation_id: IncarnationId::parse("inc-crest-1").unwrap(),
+                    status: BindingStatus::Unbound,
+                    reason: Some("socket EOF".into()),
+                }),
+            ],
+        )
+        .unwrap();
+    hub.publish(init.envelopes());
+
+    let banked = mail_writer
+        .append(
+            &tally,
+            UnixMs(t0 + 2_000),
+            None,
+            vec![Event::Mail(MailEvent::Banked {
+                from_room: room.clone(),
+                range: (Seq(1), Seq(1)),
+                letter: letter_ref_for("crest", "quiet-grace-r1.md", '9'),
+            })],
+        )
+        .unwrap();
+    hub.publish(banked.envelopes());
+
+    // Wait until Herald observes the banked letter and registers the exact 15 s deadline.
+    let deadline = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(dl) = handle.next_grace_deadline(UnixMs(t0 + 2_000)) {
+                break dl;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("HeraldHandle exposes 15 s reconnect grace deadline after spawn_reactor");
+    assert_eq!(deadline, UnixMs(t0 + RECONNECT_GRACE_MS));
+
+    // Flushing 1 ms early raises nothing; flushing at exactly +15 s raises the card
+    // with ZERO subsequent journal entries.
+    handle
+        .flush_due_at(UnixMs(t0 + RECONNECT_GRACE_MS - 1), &herald_sys)
+        .await
+        .unwrap();
+    let before_due = owner
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !before_due
+            .items
+            .iter()
+            .any(|n| n.draft.dedupe == "mail-unrung:crest"),
+        "must not raise before 15 s deadline"
+    );
+
+    handle
+        .flush_due_at(UnixMs(t0 + RECONNECT_GRACE_MS), &herald_sys)
+        .await
+        .unwrap();
+    let after_due = owner
+        .call(InboxList {
+            include_done: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_due
+            .items
+            .iter()
+            .filter(|n| n.draft.dedupe == "mail-unrung:crest")
+            .count(),
+        1,
+        "flush_due_at raises MailUnrung after 15 s quiet period"
+    );
+
+    // S4 + S5 + S6 + S7 pure invariants:
+    // 1. Unrelated room event does NOT re-emit an unchanged MailUnrung draft (S6).
+    let mut view = HeraldView::default();
+    let owner_p = owner.me().clone();
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: owner_p.clone(),
+        event: Event::Presence(PresenceEvent::SeatClaimed {
+            record: sample_seat_record("genga", SeatStatus::Active, UnixMs(1_000)),
+        }),
+    });
+    let mail_env = Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(2_000),
+        by: tally.clone(),
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room.clone(),
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("genga", "once-r1.md", 'e'),
+        }),
+    };
+    view.observe(&mail_env);
+    assert_eq!(
+        classify(&mail_env, &view)
+            .iter()
+            .filter(|(_, d)| d.dedupe == "mail-unrung:genga")
+            .count(),
+        1
+    );
+    let unrelated = Envelope {
+        stream: StreamId::Room { room: room.clone() },
+        seq: Seq(2),
+        at: UnixMs(3_000),
+        by: owner_p.clone(),
+        event: Event::Room(RoomEvent::TopicSet {
+            topic: "chat".into(),
+        }),
+    };
+    view.observe(&unrelated);
+    assert!(
+        classify(&unrelated, &view).is_empty(),
+        "unrelated events must not re-emit unchanged MailUnrung cards"
+    );
+
+    // 2. TransportDown suppresses per-seat MailUnrung and retains bindings created during outage (S4+S5).
+    let mut td_view = HeraldView::default();
+    let loupe = SeatName::parse("loupe").unwrap();
+    td_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: Principal::System {
+            part: SystemPart::PresenceMonitor,
+        },
+        event: Event::Presence(PresenceEvent::TransportHealthChanged {
+            transport: TransportKind::BbThread,
+            down: true,
+            detail: Some("ws closed".into()),
+        }),
+    });
+    td_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(2),
+        at: UnixMs(1_500),
+        by: Principal::Seat {
+            seat: loupe.clone(),
+        },
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: SeatBinding {
+                seat: loupe.clone(),
+                incarnation_id: IncarnationId::parse("inc-loupe-1").unwrap(),
+                epoch: 1,
+                lane: None,
+                endpoint: TransportEndpoint::BbThread {
+                    thread_id: BbThreadId::parse("th_loupe").unwrap(),
+                },
+                liveness: LivenessMode::SocketLifetime,
+                bound_at: UnixMs(1_500),
+                expires_at: None,
+                status: BindingStatus::TransportDown,
+            },
+            superseded: Vec::new(),
+        }),
+    });
+    td_view.observe(&Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(2_000),
+        by: tally,
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room,
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("loupe", "during-outage-r1.md", 'f'),
+        }),
+    });
+    assert_eq!(
+        td_view.evaluate_mail_unrung(&loupe, UnixMs(2_000)),
+        MailUnrungEval::Suppress,
+        "MailUnrung suppressed during provider TransportDown outage"
+    );
+    td_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(3),
+        at: UnixMs(3_000),
+        by: Principal::System {
+            part: SystemPart::PresenceMonitor,
+        },
+        event: Event::Presence(PresenceEvent::TransportHealthChanged {
+            transport: TransportKind::BbThread,
+            down: false,
+            detail: None,
+        }),
+    });
+    assert_eq!(
+        td_view.evaluate_mail_unrung(&loupe, UnixMs(3_000)),
+        MailUnrungEval::Suppress,
+        "binding created during outage becomes live automatically on transport recovery"
+    );
+
+    // 3. Lapsed lease expires_at is honored by evaluate_mail_unrung (S7).
+    let mut lease_view = HeraldView::default();
+    let baton = SeatName::parse("baton").unwrap();
+    lease_view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: Principal::Seat {
+            seat: baton.clone(),
+        },
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: SeatBinding {
+                seat: baton.clone(),
+                incarnation_id: IncarnationId::parse("inc-baton-1").unwrap(),
+                epoch: 1,
+                lane: None,
+                endpoint: TransportEndpoint::SelfWatcher {
+                    harness: "codex".into(),
+                    thread_id: None,
+                    pid: None,
+                    proc_start: None,
+                },
+                liveness: LivenessMode::LeaseOnly,
+                bound_at: UnixMs(1_000),
+                expires_at: Some(UnixMs(5_000)),
+                status: BindingStatus::Live,
+            },
+            superseded: Vec::new(),
+        }),
+    });
+    lease_view.observe(&Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(6_000),
+        by: owner_p,
+        event: Event::Mail(MailEvent::Banked {
+            from_room: RoomId::Channel {
+                scope: RoomScope::Global,
+                name: ChannelName::parse("lounge").unwrap(),
+            },
+            range: (Seq(1), Seq(1)),
+            letter: letter_ref_for("baton", "after-lease-r1.md", 'a'),
+        }),
+    });
+    assert_eq!(
+        lease_view.evaluate_mail_unrung(&baton, UnixMs(6_000)),
+        MailUnrungEval::Raise {
+            unread_count: 1,
+            oldest_at: UnixMs(6_000),
+        },
+        "lapsed LeaseOnly binding must not look live"
+    );
+
+    herald_task.abort();
+}
