@@ -140,11 +140,21 @@ pub fn remove_worker_token_file(state_dir: &Path, thread_id: &str) -> io::Result
 }
 
 /// Result of provisioning a worker token file on spawn.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProvisionedWorkerToken {
     pub path: PathBuf,
     pub token: String,
     pub created: bool,
+}
+
+impl std::fmt::Debug for ProvisionedWorkerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionedWorkerToken")
+            .field("path", &self.path)
+            .field("token", &"<redacted>")
+            .field("created", &self.created)
+            .finish()
+    }
 }
 
 /// Ensures `<state_dir>/worker-tokens/<thread_id>` exists with mode `0600`.
@@ -203,6 +213,9 @@ mod tests {
         let first = provision_worker_token(tmp.path(), &wave, &role, &thread, None).unwrap();
         assert!(first.created);
         assert!(first.token.starts_with("rw_w_"));
+        let dbg = format!("{first:?}");
+        assert!(!dbg.contains(&first.token));
+        assert!(dbg.contains("<redacted>"));
 
         let meta = std::fs::symlink_metadata(&first.path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);

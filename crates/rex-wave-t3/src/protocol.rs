@@ -8,11 +8,149 @@ use rex_wave_api::wave::{
     BaseBranch, InteractionKind, InteractionResolution, PendingInteraction, PermissionMode,
     Question, SteerDeliveryMode, Workspace,
 };
-use rex_wave_api::{BbInteractionId, BbSeq, BbThreadId, RoleName, UnixMs, WaveSlug};
+use rex_wave_api::{
+    BbInteractionId, BbSeq, BbThreadId, IdemKey, InvalidId, RoleName, UnixMs, WaveSlug,
+};
 use rex_wave_waves::{HostError, SpawnRequest};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 pub const T3_THREAD_PREFIX: &str = "t3:";
+pub const ITEM_SEQ_STRIDE: u64 = 1_000;
+
+/// Maps `(turn_item_ordinal, is_terminal)` into a collision-free monotonic `BbSeq`.
+/// In-progress updates use `+1`, terminal updates use `+2`, and live meta events
+/// (`TurnStarted`, `TurnEnded`, `Usage`) allocate in `+3..+999`.
+pub fn item_event_seq(ordinal: u64, is_terminal: bool) -> BbSeq {
+    let base = ordinal.saturating_add(1).saturating_mul(ITEM_SEQ_STRIDE);
+    BbSeq(base.saturating_add(if is_terminal { 2 } else { 1 }))
+}
+
+/// Allocates unique, causally ordered `BbSeq` values for a live `subscribeThread` stream.
+#[derive(Default)]
+pub struct LiveSeqTracker {
+    emitted: HashSet<u64>,
+    high_ordinal: Option<u64>,
+    meta_offset: u64,
+}
+
+impl LiveSeqTracker {
+    pub fn accept_turn_item(&mut self, item: &Value, fallback_ordinal: u64) -> Option<AgentEvent> {
+        if item.get("type").and_then(|v| v.as_str()) == Some("assistant_message")
+            && item
+                .get("streaming")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        let ordinal = item
+            .get("ordinal")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(fallback_ordinal);
+        let ev = normalize_turn_item(item, fallback_ordinal)?;
+        if !self.emitted.insert(ev.seq.0) {
+            return None;
+        }
+        if self.high_ordinal.is_none_or(|prev| ordinal > prev) {
+            self.high_ordinal = Some(ordinal);
+            self.meta_offset = 0;
+        }
+        Some(ev)
+    }
+
+    pub fn next_meta_seq(&mut self) -> Option<BbSeq> {
+        let base = match self.high_ordinal {
+            Some(ord) => ord
+                .saturating_add(1)
+                .saturating_mul(ITEM_SEQ_STRIDE)
+                .saturating_add(3),
+            None => 1,
+        };
+        let limit = match self.high_ordinal {
+            Some(_) => ITEM_SEQ_STRIDE - 3,
+            None => ITEM_SEQ_STRIDE - 1,
+        };
+        if self.meta_offset >= limit {
+            return None;
+        }
+        let seq = base.saturating_add(self.meta_offset);
+        self.meta_offset += 1;
+        self.emitted.insert(seq);
+        Some(BbSeq(seq))
+    }
+
+    pub fn accept_domain_event(&mut self, stream_seq: u64, event: &Value) -> Option<AgentEvent> {
+        let ty = event.get("type").and_then(|v| v.as_str())?;
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        let at = event
+            .get("occurredAt")
+            .or_else(|| event.get("createdAt"))
+            .or_else(|| payload.get("updatedAt"))
+            .map(parse_timestamp_ms)
+            .unwrap_or(UnixMs(0));
+
+        match ty {
+            "turn-item.updated" | "turn-item.created" => self.accept_turn_item(payload, stream_seq),
+            "run.created" => Some(AgentEvent {
+                seq: self.next_meta_seq()?,
+                at,
+                kind: AgentEventKind::TurnStarted,
+            }),
+            "run.updated" => {
+                let status = payload.get("status").and_then(|v| v.as_str())?;
+                if matches!(
+                    status,
+                    "completed" | "failed" | "interrupted" | "cancelled" | "rolled_back"
+                ) {
+                    Some(AgentEvent {
+                        seq: self.next_meta_seq()?,
+                        at,
+                        kind: AgentEventKind::TurnEnded,
+                    })
+                } else {
+                    None
+                }
+            }
+            "provider-turn.updated" | "provider-turn.created" => {
+                let tu = payload.get("tokenUsage")?;
+                let usage = parse_token_usage(tu)?;
+                Some(AgentEvent {
+                    seq: self.next_meta_seq()?,
+                    at,
+                    kind: AgentEventKind::Usage { usage },
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Builds a collision-free idempotency key for final-turn room mirroring while
+/// preserving the `wave:<wave>:turn:` prefix required by `WaveConductor`.
+pub fn mirror_idem_key(
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &BbThreadId,
+    anchor: &str,
+) -> Result<IdemKey, InvalidId> {
+    let raw = format!("wave:{wave}:turn:{role}:{thread}:{anchor}");
+    if raw.len() <= 256 {
+        return IdemKey::parse(raw);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(thread.as_str().as_bytes());
+    hasher.update(b":");
+    hasher.update(anchor.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    IdemKey::parse(format!("wave:{wave}:turn:{role}:h{hex}"))
+}
 
 pub fn is_t3_thread_id(thread: &BbThreadId) -> bool {
     thread.as_str().starts_with(T3_THREAD_PREFIX)
@@ -86,12 +224,20 @@ pub fn runtime_mode_str(permission: PermissionMode) -> &'static str {
     }
 }
 
-pub fn delivery_intent_str(mode: SteerDeliveryMode) -> Option<&'static str> {
+/// Maps `SteerDeliveryMode` to T3 v0.1.11's required `dispatchMode` plus optional `deliveryIntent`.
+pub fn message_dispatch_mode(mode: SteerDeliveryMode) -> (Value, Option<&'static str>) {
     match mode {
-        SteerDeliveryMode::Auto | SteerDeliveryMode::Start => Some("auto"),
-        SteerDeliveryMode::Steer | SteerDeliveryMode::SteerIfActive => Some("steer"),
-        SteerDeliveryMode::QueueIfActive => None,
+        SteerDeliveryMode::Auto | SteerDeliveryMode::QueueIfActive => {
+            (json!({ "type": "queue_after_active" }), None)
+        }
+        SteerDeliveryMode::Start => (json!({ "type": "start_immediately" }), None),
+        SteerDeliveryMode::Steer => (json!({ "type": "start_immediately" }), Some("restart")),
+        SteerDeliveryMode::SteerIfActive => (json!({ "type": "start_immediately" }), Some("steer")),
     }
+}
+
+pub fn delivery_intent_str(mode: SteerDeliveryMode) -> Option<&'static str> {
+    message_dispatch_mode(mode).1
 }
 
 pub fn launch_thread_payload(
@@ -123,11 +269,13 @@ pub fn launch_thread_payload(
         model_sel.insert("options".into(), Value::Array(options));
     }
 
+    // Omit `reuseExistingThread`: T3 v0.1.11 rejects `reuseExistingThread: true`
+    // for unknown thread IDs via `validateReusableThread`; idempotent retries
+    // replay safely through T3's `commandId` receipt.
     json!({
         "commandId": spawn_command_id(&req.wave, &req.role, req.attempt),
         "creationSource": "server",
         "threadId": thread_id.as_str(),
-        "reuseExistingThread": true,
         "projectId": t3_project_id,
         "title": req.title,
         "modelSelection": Value::Object(model_sel),
@@ -149,6 +297,7 @@ pub fn message_dispatch_payload(
     command_id: String,
     message_id: String,
 ) -> Value {
+    let (dispatch_mode, intent) = message_dispatch_mode(mode);
     let mut obj = Map::new();
     obj.insert("type".into(), Value::String("message.dispatch".into()));
     obj.insert("commandId".into(), Value::String(command_id));
@@ -158,7 +307,8 @@ pub fn message_dispatch_payload(
     obj.insert("attachments".into(), Value::Array(Vec::new()));
     obj.insert("createdBy".into(), Value::String("user".into()));
     obj.insert("creationSource".into(), Value::String("server".into()));
-    if let Some(intent) = delivery_intent_str(mode) {
+    obj.insert("dispatchMode".into(), dispatch_mode);
+    if let Some(intent) = intent {
         obj.insert("deliveryIntent".into(), Value::String(intent.into()));
     }
     Value::Object(obj)
@@ -198,13 +348,9 @@ pub fn runtime_request_respond_payload(
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let val = match (ans.selected.as_slice(), free) {
-                    ([], Some(ft)) => Value::String(ft.to_owned()),
+                    ([], Some(ft)) | ([_], Some(ft)) => Value::String(ft.to_owned()),
                     ([], None) => Value::String(String::new()),
                     ([single], None) => Value::String(single.clone()),
-                    ([single], Some(ft)) => Value::Array(vec![
-                        Value::String(single.clone()),
-                        Value::String(ft.to_owned()),
-                    ]),
                     (many, None) => Value::Array(many.iter().cloned().map(Value::String).collect()),
                     (many, Some(ft)) => {
                         let mut arr: Vec<Value> = many.iter().cloned().map(Value::String).collect();
@@ -471,12 +617,13 @@ fn parse_pending_interaction_from_turn_item(
                         for o in opts {
                             if let Some(s) = o.as_str() {
                                 options.push(s.to_owned());
-                            } else if let Some(lbl) = o
-                                .get("label")
-                                .or_else(|| o.get("value"))
+                            } else if let Some(val_str) = o
+                                .get("value")
+                                .or_else(|| o.get("label"))
                                 .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
                             {
-                                options.push(lbl.to_owned());
+                                options.push(val_str.to_owned());
                             }
                         }
                     }
@@ -533,7 +680,20 @@ pub fn normalize_turn_item(item: &Value, fallback_ordinal: u64) -> Option<AgentE
         .get("ordinal")
         .and_then(|v| v.as_u64())
         .unwrap_or(fallback_ordinal);
-    let seq = BbSeq(ordinal);
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inProgress");
+    let is_streaming = item
+        .get("streaming")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_terminal = !is_streaming
+        && (matches!(
+            status,
+            "completed" | "failed" | "error" | "declined" | "cancelled" | "interrupted"
+        ) || item.get("completedAt").is_some_and(|v| !v.is_null()));
+    let seq = item_event_seq(ordinal, is_terminal);
     let at = item
         .get("completedAt")
         .filter(|v| !v.is_null())
@@ -541,15 +701,6 @@ pub fn normalize_turn_item(item: &Value, fallback_ordinal: u64) -> Option<AgentE
         .or_else(|| item.get("startedAt").filter(|v| !v.is_null()))
         .map(parse_timestamp_ms)
         .unwrap_or(UnixMs(0));
-
-    let status = item
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("inProgress");
-    let is_terminal = matches!(
-        status,
-        "completed" | "failed" | "error" | "declined" | "cancelled" | "interrupted"
-    ) || item.get("completedAt").is_some_and(|v| !v.is_null());
 
     let kind = match ty {
         "user_message" => {
@@ -776,52 +927,6 @@ pub fn parse_provider_turns_usage(projection: &Value) -> Option<ThreadContextUsa
         }
     }
     best.map(|(_, u)| u)
-}
-
-/// Normalizes a live `OrchestrationV2DomainEvent` from `orchestration.subscribeThread`.
-pub fn normalize_domain_event(stream_seq: u64, event: &Value) -> Option<AgentEvent> {
-    let ty = event.get("type").and_then(|v| v.as_str())?;
-    let payload = event.get("payload").unwrap_or(&Value::Null);
-    let at = event
-        .get("occurredAt")
-        .or_else(|| event.get("createdAt"))
-        .or_else(|| payload.get("updatedAt"))
-        .map(parse_timestamp_ms)
-        .unwrap_or(UnixMs(0));
-
-    match ty {
-        "turn-item.updated" | "turn-item.created" => normalize_turn_item(payload, stream_seq),
-        "run.created" => Some(AgentEvent {
-            seq: BbSeq(stream_seq),
-            at,
-            kind: AgentEventKind::TurnStarted,
-        }),
-        "run.updated" => {
-            let status = payload.get("status").and_then(|v| v.as_str())?;
-            if matches!(
-                status,
-                "completed" | "failed" | "interrupted" | "cancelled" | "rolled_back"
-            ) {
-                Some(AgentEvent {
-                    seq: BbSeq(stream_seq),
-                    at,
-                    kind: AgentEventKind::TurnEnded,
-                })
-            } else {
-                None
-            }
-        }
-        "provider-turn.updated" | "provider-turn.created" => {
-            let tu = payload.get("tokenUsage")?;
-            let usage = parse_token_usage(tu)?;
-            Some(AgentEvent {
-                seq: BbSeq(stream_seq),
-                at,
-                kind: AgentEventKind::Usage { usage },
-            })
-        }
-        _ => None,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1121,7 +1226,7 @@ mod tests {
             launch_thread_payload(&req, &tid, "uuid-proj-1", "antigravity", "gemini-4-neon");
         assert_eq!(payload["threadId"], "t3:w1:reviewer:a1");
         assert_eq!(payload["commandId"], "rex-wave:spawn:w1:reviewer:a1");
-        assert_eq!(payload["reuseExistingThread"], true);
+        assert!(payload.get("reuseExistingThread").is_none());
         assert_eq!(payload["creationSource"], "server");
         assert_eq!(payload["runtimeMode"], "auto-accept-edits");
         assert_eq!(
@@ -1158,7 +1263,38 @@ mod tests {
             "c1".into(),
             "m1".into(),
         );
-        assert_eq!(tell_auto["deliveryIntent"], "auto");
+        assert_eq!(
+            tell_auto["dispatchMode"],
+            json!({"type": "queue_after_active"})
+        );
+        assert!(tell_auto.get("deliveryIntent").is_none());
+
+        let tell_start = message_dispatch_payload(
+            &tid,
+            &Body::parse("begin").unwrap(),
+            SteerDeliveryMode::Start,
+            "c1b".into(),
+            "m1b".into(),
+        );
+        assert_eq!(
+            tell_start["dispatchMode"],
+            json!({"type": "start_immediately"})
+        );
+        assert!(tell_start.get("deliveryIntent").is_none());
+
+        let tell_steer_interrupt = message_dispatch_payload(
+            &tid,
+            &Body::parse("interrupt").unwrap(),
+            SteerDeliveryMode::Steer,
+            "c2a".into(),
+            "m2a".into(),
+        );
+        assert_eq!(
+            tell_steer_interrupt["dispatchMode"],
+            json!({"type": "start_immediately"})
+        );
+        assert_eq!(tell_steer_interrupt["deliveryIntent"], "restart");
+
         let tell_steer = message_dispatch_payload(
             &tid,
             &Body::parse("stop").unwrap(),
@@ -1166,13 +1302,22 @@ mod tests {
             "c2".into(),
             "m2".into(),
         );
+        assert_eq!(
+            tell_steer["dispatchMode"],
+            json!({"type": "start_immediately"})
+        );
         assert_eq!(tell_steer["deliveryIntent"], "steer");
+
         let tell_queue = message_dispatch_payload(
             &tid,
             &Body::parse("later").unwrap(),
             SteerDeliveryMode::QueueIfActive,
             "c3".into(),
             "m3".into(),
+        );
+        assert_eq!(
+            tell_queue["dispatchMode"],
+            json!({"type": "queue_after_active"})
         );
         assert!(tell_queue.get("deliveryIntent").is_none());
 
@@ -1236,5 +1381,202 @@ mod tests {
             parse_rfc3339_ms("2026-11-21T00:00:00.500Z"),
             Some(1_795_219_200_500)
         );
+    }
+
+    #[test]
+    fn live_seq_tracker_orders_updates_meta_events_and_skips_streaming() {
+        let mut tracker = LiveSeqTracker::default();
+        let started = tracker
+            .accept_domain_event(1, &json!({"type": "run.created", "payload": {}}))
+            .unwrap();
+        let call = tracker
+            .accept_domain_event(
+                2,
+                &json!({
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "c1",
+                        "ordinal": 0,
+                        "type": "command_execution",
+                        "status": "inProgress",
+                        "input": "cargo test"
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .accept_domain_event(
+                    3,
+                    &json!({
+                        "type": "turn-item.updated",
+                        "payload": {
+                            "id": "c1",
+                            "ordinal": 0,
+                            "type": "command_execution",
+                            "status": "inProgress",
+                            "input": "cargo test"
+                        }
+                    }),
+                )
+                .is_none()
+        );
+        let result = tracker
+            .accept_domain_event(
+                4,
+                &json!({
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "c1",
+                        "ordinal": 0,
+                        "type": "command_execution",
+                        "status": "completed",
+                        "input": "cargo test",
+                        "exitCode": 0
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .accept_domain_event(
+                    5,
+                    &json!({
+                        "type": "turn-item.updated",
+                        "payload": {
+                            "id": "a1",
+                            "ordinal": 1,
+                            "type": "assistant_message",
+                            "status": "inProgress",
+                            "streaming": true,
+                            "text": "part..."
+                        }
+                    }),
+                )
+                .is_none()
+        );
+        let final_msg = tracker
+            .accept_domain_event(
+                6,
+                &json!({
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "a1",
+                        "ordinal": 1,
+                        "type": "assistant_message",
+                        "status": "completed",
+                        "streaming": false,
+                        "text": "final answer"
+                    }
+                }),
+            )
+            .unwrap();
+        let usage = tracker
+            .accept_domain_event(
+                7,
+                &json!({
+                    "type": "provider-turn.updated",
+                    "payload": { "tokenUsage": { "usedTokens": 1200, "maxTokens": 8000 } }
+                }),
+            )
+            .unwrap();
+        let ended = tracker
+            .accept_domain_event(
+                8,
+                &json!({ "type": "run.updated", "payload": { "status": "completed" } }),
+            )
+            .unwrap();
+        let next_turn = tracker
+            .accept_domain_event(
+                9,
+                &json!({
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "u2",
+                        "ordinal": 2,
+                        "type": "user_message",
+                        "status": "completed",
+                        "text": "turn 2"
+                    }
+                }),
+            )
+            .unwrap();
+
+        let seqs = [
+            started.seq,
+            call.seq,
+            result.seq,
+            final_msg.seq,
+            usage.seq,
+            ended.seq,
+            next_turn.seq,
+        ];
+        for pair in seqs.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "seqs must be strictly monotonic: {seqs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn question_options_prefer_value_and_free_text_replaces_single_selection() {
+        let proj = json!({
+            "turnItems": [{
+                "type": "user_input_request",
+                "requestId": "req_opt",
+                "questions": [{
+                    "id": "q_env",
+                    "header": "Env",
+                    "question": "Which env?",
+                    "options": [
+                        { "label": "Production (us-east)", "value": "prod-east", "description": "live" },
+                        { "label": "Staging", "description": "stage" }
+                    ],
+                    "multiSelect": false
+                }]
+            }]
+        });
+        let parsed = parse_pending_interaction_from_projection(&proj, "req_opt", None).unwrap();
+        match parsed.kind {
+            InteractionKind::Question { questions } => {
+                assert_eq!(questions[0].options, vec!["prod-east", "Staging"]);
+            }
+            other => panic!("expected Question, got {other:?}"),
+        }
+
+        let tid = BbThreadId::parse("t3:w1:r1:a1").unwrap();
+        let iid = BbInteractionId::parse("req_opt").unwrap();
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "q_env".into(),
+            UserAnswer {
+                selected: vec!["other".into()],
+                free_text: Some("custom-eu".into()),
+            },
+        );
+        let payload = runtime_request_respond_payload(
+            &tid,
+            &iid,
+            &InteractionResolution::UserAnswer { answers },
+            "cmd_1".into(),
+        )
+        .unwrap();
+        assert_eq!(payload["answers"]["q_env"], "custom-eu");
+    }
+
+    #[test]
+    fn mirror_idem_key_hashes_long_anchors_without_collision() {
+        let wave = WaveSlug::parse("a".repeat(48)).unwrap();
+        let role = RoleName::parse("b".repeat(32)).unwrap();
+        let thread = deterministic_thread_id(&wave, &role, 1).unwrap();
+        let anchor_a = format!("run_{}_msg_1", "x".repeat(120));
+        let anchor_b = format!("run_{}_msg_2", "x".repeat(120));
+        let k1 = mirror_idem_key(&wave, &role, &thread, &anchor_a).unwrap();
+        let k2 = mirror_idem_key(&wave, &role, &thread, &anchor_b).unwrap();
+        assert_ne!(k1, k2);
+        assert!(k1.as_str().starts_with("wave:"));
+        assert!(k1.as_str().contains(":turn:"));
+        assert!(k1.as_str().len() <= 256);
     }
 }

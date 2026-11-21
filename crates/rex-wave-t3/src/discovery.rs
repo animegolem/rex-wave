@@ -222,7 +222,7 @@ impl T3EndpointSource {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum T3AuthSource {
     ExplicitToken(String),
     CliSession {
@@ -230,6 +230,26 @@ pub enum T3AuthSource {
         t3_home: PathBuf,
         label: String,
     },
+}
+
+impl std::fmt::Debug for T3AuthSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            T3AuthSource::ExplicitToken(_) => {
+                f.debug_tuple("ExplicitToken").field(&"<redacted>").finish()
+            }
+            T3AuthSource::CliSession {
+                t3_bin,
+                t3_home,
+                label,
+            } => f
+                .debug_struct("CliSession")
+                .field("t3_bin", t3_bin)
+                .field("t3_home", t3_home)
+                .field("label", label)
+                .finish(),
+        }
+    }
 }
 
 /// Configuration for [`crate::T3Bridge`].
@@ -452,5 +472,10 @@ mod tests {
         );
 
         assert!(T3Origin::parse("https://example.com").is_err());
+
+        let cfg = T3Config::explicit("http://127.0.0.1:3773", "super_secret_bearer").unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("super_secret_bearer"));
+        assert!(dbg.contains("<redacted>"));
     }
 }

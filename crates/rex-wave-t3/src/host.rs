@@ -6,10 +6,10 @@ use crate::projects::{
     project_names_map, resolve_or_ensure_t3_project,
 };
 use crate::protocol::{
-    ShellObservation, TurnMirrorCheck, active_pending_interaction,
+    LiveSeqTracker, ShellObservation, TurnMirrorCheck, active_pending_interaction,
     default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
     force_stop_thread_payload, inspect_latest_completed_turn, is_t3_thread_id,
-    launch_thread_payload, message_dispatch_payload, normalize_domain_event, normalize_turn_item,
+    launch_thread_payload, message_dispatch_payload, mirror_idem_key, normalize_turn_item,
     parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
     runtime_request_respond_payload, strip_t3_provider_prefix, thread_archive_payload,
     thread_stop_payload, truncate_utf8, unwrap_projection,
@@ -500,7 +500,7 @@ impl T3Bridge {
             };
             let Ok(stream) = self
                 .rpc
-                .open_stream("orchestration.subscribeShell", init_payload, true)
+                .open_stream("orchestration.subscribeShell", init_payload)
                 .await
             else {
                 break;
@@ -511,8 +511,8 @@ impl T3Bridge {
             loop {
                 let item = tokio::select! {
                     biased;
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
                             ended_by_shutdown = true;
                             break;
                         }
@@ -543,8 +543,8 @@ impl T3Bridge {
                 break;
             }
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
@@ -581,16 +581,6 @@ impl T3Bridge {
                         for th in archived {
                             self.enqueue_shell_thread(per_thread, Some("archive"), th.clone());
                         }
-                    }
-                }
-            }
-            "snapshot-required" => {
-                if let Ok(snap) = self.rpc.http_get_json("/api/orchestration/shell").await {
-                    let projects = parse_t3_projects_snapshot(&snap);
-                    self.replace_or_merge_project_names(&projects, true);
-                    if let Some(seq) = snap.get("snapshotSequence").and_then(|v| v.as_u64()) {
-                        *last_seq = Some(seq);
-                        lease.update_resume_payload(json!({ "afterSequence": seq }));
                     }
                 }
             }
@@ -1023,9 +1013,7 @@ impl T3Bridge {
         };
 
         // `WaveConductor` skips peer wakeups when idem starts with `wave:` and contains `:turn:`.
-        let raw_idem = format!("wave:{wave}:turn:{role}:{thread}:{}", completed.anchor);
-        let idem_str = truncate_utf8(&raw_idem, 256);
-        let Ok(idem_key) = IdemKey::parse(idem_str) else {
+        let Ok(idem_key) = mirror_idem_key(wave, role, thread, &completed.anchor) else {
             return;
         };
 
@@ -1545,7 +1533,7 @@ impl T3Bridge {
         let initial_payload = json!({ "threadId": thread.as_str() });
         let rpc_stream = self
             .rpc
-            .open_stream("orchestration.subscribeThread", initial_payload, true)
+            .open_stream("orchestration.subscribeThread", initial_payload)
             .await
             .map_err(|e| ApiError::Transport(e.to_string()))?;
         let (mut ev_rx, lease) = rpc_stream.into_parts();
@@ -1557,7 +1545,7 @@ impl T3Bridge {
         let thread_str = thread.to_string();
 
         tokio::spawn(async move {
-            let mut last_ordinal: Option<u64> = None;
+            let mut tracker = LiveSeqTracker::default();
             loop {
                 tokio::select! {
                     biased;
@@ -1592,18 +1580,14 @@ impl T3Bridge {
                                                     it.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(*idx as u64)
                                                 });
                                                 for (idx, it) in ordered {
-                                                    if let Some(agent_ev) = normalize_turn_item(it, idx as u64) {
-                                                        if last_ordinal.is_some_and(|prev| agent_ev.seq.0 <= prev) {
-                                                            continue;
-                                                        }
-                                                        last_ordinal = Some(agent_ev.seq.0);
-                                                        if frame_tx.send(Ok(Frame::Agent {
+                                                    if let Some(agent_ev) = tracker.accept_turn_item(it, idx as u64)
+                                                        && frame_tx.send(Ok(Frame::Agent {
                                                             wave: wave_owned.clone(),
                                                             role: role_owned.clone(),
                                                             event: agent_ev,
-                                                        })).await.is_err() {
-                                                            return;
-                                                        }
+                                                        })).await.is_err()
+                                                    {
+                                                        return;
                                                     }
                                                 }
                                             }
@@ -1617,21 +1601,14 @@ impl T3Bridge {
                                                 }));
                                             }
                                             if let Some(domain_ev) = val.get("event")
-                                                && let Some(agent_ev) = normalize_domain_event(seq, domain_ev)
-                                            {
-                                                if matches!(
-                                                    domain_ev.get("type").and_then(|v| v.as_str()),
-                                                    Some("turn-item.updated" | "turn-item.created")
-                                                ) {
-                                                    last_ordinal = Some(last_ordinal.map_or(agent_ev.seq.0, |p| p.max(agent_ev.seq.0)));
-                                                }
-                                                if frame_tx.send(Ok(Frame::Agent {
+                                                && let Some(agent_ev) = tracker.accept_domain_event(seq, domain_ev)
+                                                && frame_tx.send(Ok(Frame::Agent {
                                                     wave: wave_owned.clone(),
                                                     role: role_owned.clone(),
                                                     event: agent_ev,
-                                                })).await.is_err() {
-                                                    return;
-                                                }
+                                                })).await.is_err()
+                                            {
+                                                return;
                                             }
                                         }
                                         _ => {}

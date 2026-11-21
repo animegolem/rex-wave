@@ -40,6 +40,7 @@ struct MockT3State {
     projects: Vec<Value>,
     project_mutations: Vec<Value>,
     launched_threads: Vec<Value>,
+    launch_receipts: HashMap<String, String>,
     dispatched_commands: Vec<Value>,
     force_stops: Vec<Value>,
     fail_thread_stop: bool,
@@ -552,14 +553,52 @@ async fn handle_mock_rpc(
             }));
         }
         "orchestration.launchThread" => {
-            let tid = payload["threadId"]
-                .as_str()
-                .unwrap_or("t3:unknown")
-                .to_owned();
+            let Some(command_id) = payload["commandId"].as_str().filter(|s| !s.is_empty()) else {
+                send_err("launchThread missing commandId");
+                return;
+            };
+            let Some(tid) = payload["threadId"].as_str().filter(|s| !s.is_empty()) else {
+                send_err("launchThread missing threadId");
+                return;
+            };
+            let tid = tid.to_owned();
+            if payload["projectId"].as_str().is_none_or(str::is_empty)
+                || payload["title"].as_str().is_none_or(str::is_empty)
+                || payload["modelSelection"]["instanceId"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                || payload["modelSelection"]["model"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                || payload["runtimeMode"].as_str().is_none_or(str::is_empty)
+                || payload["interactionMode"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                || !payload["workspaceStrategy"].is_object()
+            {
+                send_err("launchThread missing required v0.1.11 fields");
+                return;
+            }
             let mut st = state.lock().await;
-            let already = st.thread_projections.contains_key(&tid);
+            let has_receipt = st.launch_receipts.contains_key(command_id);
+            let exists = st.thread_projections.contains_key(&tid);
+            // Mirrors T3 v0.1.11 ThreadLaunchService.validateReusableThread.
+            if payload["reuseExistingThread"].as_bool() == Some(true) && !has_receipt && !exists {
+                send_err("ProjectionStoreThreadNotFoundError: cannot reuse nonexistent thread");
+                return;
+            }
             st.launched_threads.push(payload.clone());
-            if !already {
+            if has_receipt {
+                send_ok(json!({
+                    "threadId": tid,
+                    "resumed": true,
+                    "sequence": 1
+                }));
+                return;
+            }
+            st.launch_receipts
+                .insert(command_id.to_owned(), tid.clone());
+            if !exists {
                 let proj = json!({
                     "thread": { "id": tid, "archivedAt": null },
                     "runs": [{ "id": "run_1", "ordinal": 1, "status": "running", "startedAt": "2026-11-21T08:00:00Z" }],
@@ -581,14 +620,48 @@ async fn handle_mock_rpc(
             }
             send_ok(json!({
                 "threadId": tid,
-                "resumed": already,
+                "resumed": false,
                 "sequence": 1
             }));
         }
         "orchestration.dispatchCommand" => {
+            let cmd_type = payload["type"].as_str().unwrap_or("");
+            if payload["commandId"].as_str().is_none_or(str::is_empty)
+                || payload["threadId"].as_str().is_none_or(str::is_empty)
+            {
+                send_err("dispatchCommand missing commandId or threadId");
+                return;
+            }
+            if cmd_type == "message.dispatch" {
+                let mode_type = payload["dispatchMode"]["type"].as_str();
+                let valid_mode = matches!(
+                    mode_type,
+                    Some(
+                        "queue_after_active"
+                            | "start_immediately"
+                            | "steer_active"
+                            | "restart_active"
+                    )
+                );
+                if !valid_mode
+                    || payload["messageId"].as_str().is_none_or(str::is_empty)
+                    || payload["createdBy"].as_str().is_none_or(str::is_empty)
+                    || payload["creationSource"].as_str().is_none_or(str::is_empty)
+                    || !payload["attachments"].is_array()
+                {
+                    send_err(
+                        "message.dispatch missing required T3 v0.1.11 dispatchMode or envelope fields",
+                    );
+                    return;
+                }
+            } else if cmd_type == "runtime-request.respond"
+                && payload["requestId"].as_str().is_none_or(str::is_empty)
+            {
+                send_err("runtime-request.respond missing requestId");
+                return;
+            }
             let mut st = state.lock().await;
             st.dispatched_commands.push(payload.clone());
-            let cmd_type = payload["type"].as_str().unwrap_or("");
             if cmd_type == "thread.stop" && st.fail_thread_stop {
                 send_err("provider unresponsive to stop");
                 return;
@@ -848,7 +921,7 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
         let launch = &st.launched_threads[0];
         assert_eq!(launch["threadId"], "t3:auth-v2:gemini-rev:a1");
         assert_eq!(launch["commandId"], "rex-wave:spawn:auth-v2:gemini-rev:a1");
-        assert_eq!(launch["reuseExistingThread"], true);
+        assert!(launch.get("reuseExistingThread").is_none());
         assert_eq!(launch["creationSource"], "server");
         assert_eq!(launch["runtimeMode"], "auto-accept-edits");
         assert_eq!(
@@ -1010,11 +1083,13 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
         let has_steer = st.dispatched_commands.iter().any(|c| {
             c["type"] == "message.dispatch"
                 && c["text"] == "check edge cases"
+                && c["dispatchMode"]["type"] == "start_immediately"
                 && c["deliveryIntent"] == "steer"
         });
         let has_queue = st.dispatched_commands.iter().any(|c| {
             c["type"] == "message.dispatch"
                 && c["text"] == "follow up after run"
+                && c["dispatchMode"]["type"] == "queue_after_active"
                 && c.get("deliveryIntent").is_none()
         });
         has_steer && has_queue
@@ -1360,7 +1435,7 @@ async fn t3_feed_page_live_interrupt_on_drop_and_project_names_updates() {
     let feed = T3Feed(bridge.clone());
     let page1 = feed.page(&wave, &role, None, 5).await.unwrap();
     assert_eq!(page1.events.len(), 5);
-    assert_eq!(page1.next, Some(BbSeq(4)));
+    assert_eq!(page1.next, Some(rex_wave_t3::item_event_seq(4, true)));
     assert!(
         matches!(&page1.events[0].kind, AgentEventKind::UserMessage { text } if text == "hello")
     );
@@ -1396,6 +1471,7 @@ async fn t3_feed_page_live_interrupt_on_drop_and_project_names_updates() {
     );
 
     let mut live = feed.live(&wave, &role).await.unwrap();
+    let mut last_seq = BbSeq(0);
     let mut got_snapshot_items = 0usize;
     while got_snapshot_items < 8 {
         let frame = tokio::time::timeout(Duration::from_secs(2), live.next())
@@ -1403,10 +1479,16 @@ async fn t3_feed_page_live_interrupt_on_drop_and_project_names_updates() {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(matches!(frame, Frame::Agent { .. }));
+        let Frame::Agent { event, .. } = frame else {
+            panic!("expected Frame::Agent");
+        };
+        assert!(event.seq > last_seq);
+        last_seq = event.seq;
         got_snapshot_items += 1;
     }
 
+    // Command ToolCall -> ToolResult on the same ordinal must emit distinct monotonic seqs,
+    // streaming assistant updates must be skipped until finalized, and Usage/TurnEnded must not collide.
     server
         .push_thread_item(
             tid.as_str(),
@@ -1416,8 +1498,70 @@ async fn t3_feed_page_live_interrupt_on_drop_and_project_names_updates() {
                 "event": {
                     "type": "turn-item.updated",
                     "payload": {
-                        "id": "i8",
+                        "id": "i8_cmd",
                         "ordinal": 8,
+                        "type": "command_execution",
+                        "status": "inProgress",
+                        "input": "git diff",
+                        "startedAt": "2026-11-21T08:10:50Z"
+                    }
+                }
+            }),
+        )
+        .await;
+    server
+        .push_thread_item(
+            tid.as_str(),
+            json!({
+                "kind": "event",
+                "sequence": 12,
+                "event": {
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "i8_cmd",
+                        "ordinal": 8,
+                        "type": "command_execution",
+                        "status": "completed",
+                        "input": "git diff",
+                        "exitCode": 0,
+                        "completedAt": "2026-11-21T08:10:52Z"
+                    }
+                }
+            }),
+        )
+        .await;
+    server
+        .push_thread_item(
+            tid.as_str(),
+            json!({
+                "kind": "event",
+                "sequence": 13,
+                "event": {
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "i9_msg",
+                        "ordinal": 9,
+                        "type": "assistant_message",
+                        "status": "inProgress",
+                        "streaming": true,
+                        "text": "Live chunk...",
+                        "updatedAt": "2026-11-21T08:10:58Z"
+                    }
+                }
+            }),
+        )
+        .await;
+    server
+        .push_thread_item(
+            tid.as_str(),
+            json!({
+                "kind": "event",
+                "sequence": 14,
+                "event": {
+                    "type": "turn-item.updated",
+                    "payload": {
+                        "id": "i9_msg",
+                        "ordinal": 9,
                         "type": "assistant_message",
                         "status": "completed",
                         "streaming": false,
@@ -1428,16 +1572,63 @@ async fn t3_feed_page_live_interrupt_on_drop_and_project_names_updates() {
             }),
         )
         .await;
+    server
+        .push_thread_item(
+            tid.as_str(),
+            json!({
+                "kind": "event",
+                "sequence": 15,
+                "event": {
+                    "type": "provider-turn.updated",
+                    "payload": {
+                        "tokenUsage": { "usedTokens": 68000, "maxTokens": 200000 }
+                    }
+                }
+            }),
+        )
+        .await;
+    server
+        .push_thread_item(
+            tid.as_str(),
+            json!({
+                "kind": "event",
+                "sequence": 16,
+                "event": {
+                    "type": "run.updated",
+                    "payload": { "status": "completed" }
+                }
+            }),
+        )
+        .await;
 
-    let live_frame = tokio::time::timeout(Duration::from_secs(2), live.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let mut live_events = Vec::new();
+    for _ in 0..5 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), live.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Frame::Agent { event, .. } = frame else {
+            panic!("expected Frame::Agent");
+        };
+        assert!(event.seq > last_seq, "live seq must advance monotonically");
+        last_seq = event.seq;
+        live_events.push(event);
+    }
     assert!(matches!(
-        live_frame,
-        Frame::Agent { event, .. } if matches!(event.kind, AgentEventKind::AssistantText { ref text } if text == "Live chunk arrived")
+        live_events[0].kind,
+        AgentEventKind::ToolCall { .. }
     ));
+    assert!(matches!(
+        live_events[1].kind,
+        AgentEventKind::ToolResult { ok: true, .. }
+    ));
+    assert!(matches!(
+        live_events[2].kind,
+        AgentEventKind::AssistantText { ref text } if text == "Live chunk arrived"
+    ));
+    assert!(matches!(live_events[3].kind, AgentEventKind::Usage { .. }));
+    assert!(matches!(live_events[4].kind, AgentEventKind::TurnEnded));
 
     // Dropping the FrameStream must emit an Effect RPC `Interrupt` for `subscribeThread`.
     drop(live);

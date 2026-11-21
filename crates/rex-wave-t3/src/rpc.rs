@@ -32,7 +32,6 @@ pub enum RpcClientFrame {
         #[serde(rename = "requestId")]
         request_id: String,
     },
-    Pong,
 }
 
 /// Server-to-client Effect RPC frame.
@@ -46,7 +45,6 @@ pub enum RpcServerFrame {
         request_id: String,
         values: Vec<Value>,
     },
-    Ping,
     Pong,
     Defect {
         defect: Value,
@@ -105,7 +103,6 @@ fn parse_server_frame_value(v: Value) -> RpcServerFrame {
                 values,
             }
         }
-        "Ping" => RpcServerFrame::Ping,
         "Pong" => RpcServerFrame::Pong,
         "Defect" => RpcServerFrame::Defect {
             defect: v.get("defect").cloned().unwrap_or(Value::Null),
@@ -261,7 +258,6 @@ enum RpcOwnerMsg {
     OpenStream {
         tag: String,
         payload: Value,
-        resubscribe_on_reconnect: bool,
         reply: oneshot::Sender<(u64, mpsc::UnboundedReceiver<StreamEvent>)>,
     },
     UpdateStreamPayload {
@@ -280,7 +276,6 @@ enum RpcOwnerMsg {
 struct ActiveStream {
     tag: String,
     payload: Value,
-    resubscribe_on_reconnect: bool,
     current_req_id: Option<String>,
     tx: mpsc::UnboundedSender<StreamEvent>,
 }
@@ -330,26 +325,31 @@ impl RpcOwner {
                     let mut dead = Vec::new();
                     let lease_ids: Vec<u64> = self.streams.keys().copied().collect();
                     for lease_id in lease_ids {
-                        let req_id = self.alloc_req_id();
-                        if let Some(entry) = self.streams.get_mut(&lease_id) {
-                            if entry.tx.is_closed() {
+                        let pending_req = match self.streams.get(&lease_id) {
+                            Some(entry) if entry.tx.is_closed() => {
                                 dead.push(lease_id);
-                                continue;
+                                None
                             }
-                            if entry.current_req_id.is_none() && entry.resubscribe_on_reconnect {
-                                let frame = RpcClientFrame::Request {
-                                    id: req_id.clone(),
-                                    tag: entry.tag.clone(),
-                                    payload: entry.payload.clone(),
-                                    headers: Vec::new(),
-                                };
-                                if let Some(out) = &self.tx_out
-                                    && out.send(frame).is_ok()
-                                {
-                                    entry.current_req_id = Some(req_id.clone());
-                                    self.lease_by_req.insert(req_id, lease_id);
-                                    let _ = entry.tx.send(StreamEvent::Reconnected);
-                                }
+                            Some(entry) if entry.current_req_id.is_none() => {
+                                Some((entry.tag.clone(), entry.payload.clone()))
+                            }
+                            _ => None,
+                        };
+                        if let Some((tag, payload)) = pending_req {
+                            let req_id = self.alloc_req_id();
+                            let frame = RpcClientFrame::Request {
+                                id: req_id.clone(),
+                                tag,
+                                payload,
+                                headers: Vec::new(),
+                            };
+                            if let Some(out) = &self.tx_out
+                                && out.send(frame).is_ok()
+                                && let Some(entry) = self.streams.get_mut(&lease_id)
+                            {
+                                entry.current_req_id = Some(req_id.clone());
+                                self.lease_by_req.insert(req_id, lease_id);
+                                let _ = entry.tx.send(StreamEvent::Reconnected);
                             }
                         }
                     }
@@ -373,21 +373,8 @@ impl RpcOwner {
                             "T3 WebSocket disconnected".into(),
                         )));
                     }
-                    let mut to_close = Vec::new();
-                    for (lease_id, entry) in &mut self.streams {
+                    for entry in self.streams.values_mut() {
                         entry.current_req_id = None;
-                        if !entry.resubscribe_on_reconnect {
-                            let _ =
-                                entry
-                                    .tx
-                                    .send(StreamEvent::Closed(Some(HostError::Unreachable(
-                                        "T3 WebSocket disconnected".into(),
-                                    ))));
-                            to_close.push(*lease_id);
-                        }
-                    }
-                    for lease_id in to_close {
-                        self.streams.remove(&lease_id);
                     }
                 }
                 RpcOwnerMsg::WaitConnected { reply } => {
@@ -436,7 +423,6 @@ impl RpcOwner {
                 RpcOwnerMsg::OpenStream {
                     tag,
                     payload,
-                    resubscribe_on_reconnect,
                     reply,
                 } => {
                     self.next_lease_id += 1;
@@ -463,7 +449,6 @@ impl RpcOwner {
                         ActiveStream {
                             tag,
                             payload,
-                            resubscribe_on_reconnect,
                             current_req_id,
                             tx: ev_tx,
                         },
@@ -497,11 +482,6 @@ impl RpcOwner {
 
     fn handle_inbound(&mut self, frame: RpcServerFrame) {
         match frame {
-            RpcServerFrame::Ping => {
-                if let Some(out) = &self.tx_out {
-                    let _ = out.send(RpcClientFrame::Pong);
-                }
-            }
             RpcServerFrame::Pong | RpcServerFrame::Unknown => {}
             RpcServerFrame::Chunk { request_id, values } => {
                 if let Some(&lease_id) = self.lease_by_req.get(&request_id)
@@ -606,8 +586,8 @@ impl T3RpcClient {
             }
             let dial = tokio::select! {
                 biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { break; }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
                     continue;
                 }
                 res = self.dial_ws() => res,
@@ -619,8 +599,8 @@ impl T3RpcClient {
                 }
                 Err(_) => {
                     tokio::select! {
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() { break; }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
                         }
                         () = tokio::time::sleep(backoff) => {}
                     }
@@ -697,8 +677,8 @@ impl T3RpcClient {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         let _ = ws_writer.send_close_reply(&[]).await;
                         break;
                     }
@@ -792,21 +772,12 @@ impl T3RpcClient {
         }
     }
 
-    pub async fn open_stream(
-        &self,
-        tag: &str,
-        payload: Value,
-        resubscribe_on_reconnect: bool,
-    ) -> Result<RpcStream, HostError> {
-        if !resubscribe_on_reconnect {
-            self.ensure_connected().await?;
-        }
+    pub async fn open_stream(&self, tag: &str, payload: Value) -> Result<RpcStream, HostError> {
         let (tx, rx) = oneshot::channel();
         self.owner
             .send(RpcOwnerMsg::OpenStream {
                 tag: tag.to_owned(),
                 payload,
-                resubscribe_on_reconnect,
                 reply: tx,
             })
             .map_err(|_| HostError::Unreachable("T3 RPC client stopped".into()))?;
