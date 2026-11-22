@@ -574,6 +574,8 @@ impl Service<RoomCommand> for StubPhase3Rooms {
                     room: room_id.clone(),
                     head: Seq(6),
                     tasks: vec![sample_task()],
+                    total_count: 1,
+                    truncated: false,
                 })),
                 RoomCommand::TaskClaim(c) => Ok(WireReply::TaskClaim(TaskLeaseReceipt {
                     room: room_id,
@@ -1120,6 +1122,7 @@ async fn http_disconnect_cancels_worker_wait_and_restores_working() {
     let agent = AgentSpec {
         provider: ProviderId::parse("antigravity").unwrap(),
         model: None,
+        account: None,
         reasoning: None,
         service_tier: None,
         permission: PermissionMode::AcceptEdits,
@@ -1132,10 +1135,14 @@ async fn http_disconnect_cancels_worker_wait_and_restores_working() {
                 project: BbProjectId::parse("proj_1").unwrap(),
                 goal: Body::parse("disconnect cancel test").unwrap(),
                 defaults: agent.clone(),
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("work").unwrap(),
                     agent: Some(agent),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,

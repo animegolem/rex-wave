@@ -541,8 +541,14 @@ seed_workspace_via_cli_and_mcp() {
 	done
 	(( rel_ready == 1 )) || fail "release-v1 workers did not reach live + errored before finish"
 
+	local finish_blocked=0
 	"$bin" --socket "$SOCK" wave finish release-v1 \
-		--summary "Release smoke finished with crash-bot provider error" >/dev/null
+		--summary "Release smoke finished with crash-bot provider error" >/dev/null 2>&1 || finish_blocked=$?
+	(( finish_blocked == 3 )) || fail "expected wave finish without --allow-incomplete to exit 3 when crash-bot is errored (got $finish_blocked)"
+
+	"$bin" --socket "$SOCK" wave finish release-v1 \
+		--summary "Release smoke finished with crash-bot provider error" \
+		--allow-incomplete >/dev/null
 
 	local ret_deadline=$(( $(now_ms) + 8000 ))
 	local ret_ready=0

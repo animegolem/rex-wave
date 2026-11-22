@@ -45,6 +45,7 @@ pub enum Glyph {
     Working,
     Waiting,
     Blocked,
+    Refused,
     Errored,
     Done,
 }
@@ -55,6 +56,7 @@ impl Glyph {
             Self::Working => "●",
             Self::Waiting => "◌",
             Self::Blocked => "◐",
+            Self::Refused => "⊘",
             Self::Errored => "✕",
             Self::Done => "✓",
         }
@@ -65,6 +67,7 @@ impl Glyph {
             Self::Working => C_MINT,
             Self::Waiting => C_ACCENT,
             Self::Blocked => C_AMBER,
+            Self::Refused => C_ROSE,
             Self::Errored => C_ROSE,
             Self::Done => C_DIM,
         }
@@ -446,7 +449,7 @@ impl Sidebar {
                     C_DIM
                 } else if tag.contains('◐') {
                     C_AMBER
-                } else if tag.contains('✕') {
+                } else if tag.contains('✕') || tag.contains('⊘') {
                     C_ROSE
                 } else {
                     C_DIM
@@ -587,6 +590,7 @@ pub fn build_with_ctx(
             {
                 let mut working_cnt = 0u32;
                 let mut blocked_cnt = 0u32;
+                let mut refused_cnt = 0u32;
                 let mut errored_cnt = 0u32;
                 let worker_nodes: Vec<SidebarNode> = wave_branch
                     .workers
@@ -596,6 +600,7 @@ pub fn build_with_ctx(
                         match g {
                             Glyph::Working => working_cnt += 1,
                             Glyph::Blocked => blocked_cnt += 1,
+                            Glyph::Refused => refused_cnt += 1,
                             Glyph::Errored => errored_cnt += 1,
                             _ => {}
                         }
@@ -628,6 +633,9 @@ pub fn build_with_ctx(
                 if blocked_cnt > 0 {
                     wave_parts.push(format!("◐{blocked_cnt}"));
                 }
+                if refused_cnt > 0 {
+                    wave_parts.push(format!("⊘{refused_cnt}"));
+                }
                 if errored_cnt > 0 {
                     wave_parts.push(format!("✕{errored_cnt}"));
                 }
@@ -635,6 +643,8 @@ pub fn build_with_ctx(
                 let wave_glyph = wave_branch.finished.as_ref().map(|outcome| {
                     if matches!(outcome, WaveOutcome::Failed { .. }) || errored_cnt > 0 {
                         Glyph::Errored
+                    } else if refused_cnt > 0 {
+                        Glyph::Refused
                     } else {
                         Glyph::Done
                     }
@@ -802,6 +812,9 @@ pub fn archive_target_for(
 }
 
 pub fn agent_glyph(agent: &WaveWorkerLeaf) -> Glyph {
+    if agent.phase.refusal().is_some() {
+        return Glyph::Refused;
+    }
     if agent.phase.error().is_some() {
         return Glyph::Errored;
     }
@@ -811,6 +824,7 @@ pub fn agent_glyph(agent: &WaveWorkerLeaf) -> Glyph {
             Activity::Working => Glyph::Working,
             Activity::Parked { .. } | Activity::Idle => Glyph::Waiting,
             Activity::Blocked { .. } => Glyph::Blocked,
+            Activity::Refused { .. } => Glyph::Refused,
             Activity::Errored { .. } => Glyph::Errored,
         },
         WorkerPhase::Retiring { .. } | WorkerPhase::Retired { .. } => Glyph::Done,
@@ -969,6 +983,7 @@ mod tests {
             agent_glyph(&leaf(WorkerPhase::Retiring {
                 thread: tid.clone(),
                 errored: Some("402 balance".into()),
+                refused: None,
             })),
             Glyph::Errored
         );
@@ -976,6 +991,7 @@ mod tests {
             agent_glyph(&leaf(WorkerPhase::Retired {
                 thread: Some(tid.clone()),
                 errored: Some("ServiceUnavailableError".into()),
+                refused: None,
             })),
             Glyph::Errored
         );
@@ -983,6 +999,23 @@ mod tests {
             agent_glyph(&leaf(WorkerPhase::Retiring {
                 thread: tid.clone(),
                 errored: None,
+                refused: Some("cyber_safeguard".into()),
+            })),
+            Glyph::Refused
+        );
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Retired {
+                thread: Some(tid.clone()),
+                errored: None,
+                refused: Some("refusal".into()),
+            })),
+            Glyph::Refused
+        );
+        assert_eq!(
+            agent_glyph(&leaf(WorkerPhase::Retiring {
+                thread: tid.clone(),
+                errored: None,
+                refused: None,
             })),
             Glyph::Done
         );
@@ -990,6 +1023,7 @@ mod tests {
             agent_glyph(&leaf(WorkerPhase::Retired {
                 thread: Some(tid),
                 errored: None,
+                refused: None,
             })),
             Glyph::Done
         );

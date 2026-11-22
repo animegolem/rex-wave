@@ -316,10 +316,15 @@ async fn read_room_tail<C: Client>(client: &C, stream: StreamId) -> Result<read:
         after = last_seq;
     }
 
+    let entries: Vec<_> = tail.into_iter().collect();
+    let total_count = (cursor.at(&stream).0 as usize).max(entries.len());
+    let truncated = entries.len() < total_count;
     Ok(read::Page {
-        entries: tail.into_iter().collect(),
+        entries,
         cursor,
         timed_out: false,
+        total_count,
+        truncated,
     })
 }
 

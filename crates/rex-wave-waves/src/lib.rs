@@ -10,6 +10,7 @@ use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, LocalClient, Reactor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 
 pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
     let name =
@@ -48,6 +49,20 @@ pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase
                 })
             }
         }
+        (
+            WorkerPhase::Live {
+                thread,
+                activity: Activity::Refused { reason },
+            },
+            Observation::Activity {
+                activity: Activity::Errored { .. },
+            },
+        ) => Ok(WorkerPhase::Live {
+            thread: thread.clone(),
+            activity: Activity::Refused {
+                reason: reason.clone(),
+            },
+        }),
         (WorkerPhase::Live { thread, .. }, Observation::Activity { activity }) => {
             Ok(WorkerPhase::Live {
                 thread: thread.clone(),
@@ -72,24 +87,123 @@ pub fn doorbell_text(room: &RoomId, seq: Seq, from: &Principal, body: &Body) -> 
     let prefix = format!("[{label} seq={} from {from}] ", seq.0);
     let suffix = "  (reply with room_post; wait to park)";
     let max_body = (64 * 1024usize).saturating_sub(prefix.len() + suffix.len());
-    let text = truncate_utf8(body.as_str(), max_body);
+    let text = truncate_with_notice(body.as_str(), max_body);
     Body::parse(format!("{prefix}{text}{suffix}")).expect("doorbell fits within 64 KiB")
 }
 
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+fn bounded_body(raw: String) -> Body {
+    let trimmed = truncate_with_notice(&raw, 64 * 1024);
+    Body::parse(trimmed).expect("non-empty bounded body")
 }
 
-fn bounded_body(raw: String) -> Body {
-    let trimmed = truncate_utf8(&raw, 64 * 1024);
-    Body::parse(trimmed).expect("non-empty bounded body")
+/// Normalize a wave/worker-owned lexical path (`output_dir` or `writes` entry).
+/// Rejects empty paths, `"."`-only paths, and any `..` parent traversal.
+pub fn normalize_owned_path(path: &Path, what: &str) -> Result<PathBuf, ApiError> {
+    if path.as_os_str().is_empty() {
+        return Err(ApiError::Invalid(InvalidId {
+            what: what.into(),
+            reason: "path must not be empty".into(),
+        }));
+    }
+    let mut normalized = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: what.into(),
+                    reason: format!("path '{}' must not contain '..'", path.display()),
+                }));
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(comp.as_os_str());
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(ApiError::Invalid(InvalidId {
+            what: what.into(),
+            reason: format!("path '{}' must not be empty or '.'", path.display()),
+        }));
+    }
+    Ok(normalized)
+}
+
+/// Resolve a worker's effective output directory: explicit `worker_output_dir`
+/// wins, otherwise `<wave_output_dir>/<role>` when `wave_output_dir` is set.
+pub fn effective_worker_output_dir(
+    wave_output_dir: Option<&Path>,
+    role: &RoleName,
+    worker_output_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, ApiError> {
+    if let Some(dir) = worker_output_dir {
+        return Ok(Some(normalize_owned_path(dir, "worker output_dir")?));
+    }
+    if let Some(base) = wave_output_dir {
+        let norm = normalize_owned_path(base, "wave output_dir")?;
+        return Ok(Some(norm.join(role.as_str())));
+    }
+    Ok(None)
+}
+
+/// Component-wise overlap check between two normalized paths.
+/// Siblings (`out/w1` and `out/w2`) do NOT overlap; identical or ancestor/descendant paths DO.
+pub fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+fn validate_return_schema(schema: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    if let Some(val) = schema
+        && !val.is_object()
+    {
+        return Err(ApiError::Invalid(InvalidId {
+            what: "worker return_schema".into(),
+            reason: "return_schema must be a JSON object".into(),
+        }));
+    }
+    Ok(())
+}
+
+fn normalized_worker_ownership(
+    wave_output_dir: Option<&Path>,
+    worker: &WorkerSpec,
+) -> Result<(Option<PathBuf>, Vec<PathBuf>), ApiError> {
+    validate_return_schema(worker.return_schema.as_ref())?;
+    let output_dir =
+        effective_worker_output_dir(wave_output_dir, &worker.role, worker.output_dir.as_deref())?;
+    let mut writes = Vec::with_capacity(worker.writes.len());
+    for p in &worker.writes {
+        writes.push(normalize_owned_path(p, "worker writes")?);
+    }
+    Ok((output_dir, writes))
+}
+
+fn owned_paths_of<'a>(output_dir: Option<&'a PathBuf>, writes: &'a [PathBuf]) -> Vec<&'a Path> {
+    output_dir
+        .into_iter()
+        .map(PathBuf::as_path)
+        .chain(writes.iter().map(PathBuf::as_path))
+        .collect()
+}
+
+fn check_worker_path_conflicts(
+    role_a: &RoleName,
+    paths_a: &[&Path],
+    role_b: &RoleName,
+    paths_b: &[&Path],
+) -> Result<(), ApiError> {
+    for pa in paths_a {
+        for pb in paths_b {
+            if paths_overlap(pa, pb) {
+                return Err(ApiError::conflict(format!(
+                    "structural one-writer violation: @{role_a} ({}) overlaps with @{role_b} ({})",
+                    pa.display(),
+                    pb.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct Waves;
@@ -100,6 +214,10 @@ struct WorkerRecord {
     brief: Body,
     phase: WorkerPhase,
     resolved_interaction: Option<(BbInteractionId, InteractionResolution)>,
+    output_dir: Option<PathBuf>,
+    writes: Vec<PathBuf>,
+    return_schema: Option<serde_json::Value>,
+    meta: WorkerRuntimeMeta,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,6 +226,7 @@ pub struct WaveState {
     room: Option<RoomId>,
     board: Option<BoardId>,
     opener: Option<Principal>,
+    started_at: UnixMs,
     workers: BTreeMap<RoleName, WorkerRecord>,
     status: Option<WaveStatus>,
     head: Seq,
@@ -186,13 +305,32 @@ impl Decider for Waves {
                         action: "start wave".into(),
                     });
                 }
+                if let Some(base) = c.spec.output_dir.as_deref() {
+                    normalize_owned_path(base, "wave output_dir")?;
+                }
                 let mut seen_roles = BTreeSet::new();
+                let mut resolved_workers: Vec<(Option<PathBuf>, Vec<PathBuf>)> =
+                    Vec::with_capacity(c.spec.workers.len());
                 for w in &c.spec.workers {
                     if !seen_roles.insert(&w.role) {
                         return Err(ApiError::Invalid(InvalidId {
                             what: "worker role".into(),
                             reason: format!("duplicate role {}", w.role),
                         }));
+                    }
+                    let owned = normalized_worker_ownership(c.spec.output_dir.as_deref(), w)?;
+                    resolved_workers.push(owned);
+                }
+                for (i, (out_a, writes_a)) in resolved_workers.iter().enumerate() {
+                    let paths_a = owned_paths_of(out_a.as_ref(), writes_a);
+                    for (j, (out_b, writes_b)) in resolved_workers.iter().enumerate().skip(i + 1) {
+                        let paths_b = owned_paths_of(out_b.as_ref(), writes_b);
+                        check_worker_path_conflicts(
+                            &c.spec.workers[i].role,
+                            &paths_a,
+                            &c.spec.workers[j].role,
+                            &paths_b,
+                        )?;
                     }
                 }
                 if let Some(existing) = &state.spec {
@@ -212,13 +350,19 @@ impl Decider for Waves {
                     room,
                     board,
                 });
-                for w in &c.spec.workers {
-                    let agent = w.agent.clone().unwrap_or_else(|| c.spec.defaults.clone());
+                for (w, (output_dir, writes)) in c.spec.workers.iter().zip(resolved_workers) {
+                    let mut agent = w.agent.clone().unwrap_or_else(|| c.spec.defaults.clone());
+                    if agent.account.is_none() {
+                        agent.account = c.spec.defaults.account.clone();
+                    }
                     events.push(WaveEvent::WorkerRequested {
                         role: w.role.clone(),
                         agent,
                         brief: w.brief.clone(),
                         attempt: 1,
+                        output_dir,
+                        writes,
+                        return_schema: w.return_schema.clone(),
                     });
                 }
                 Ok(events)
@@ -238,16 +382,44 @@ impl Decider for Waves {
                         c.worker.role, c.wave
                     )));
                 }
-                let agent = c
+                let (output_dir, writes) =
+                    normalized_worker_ownership(spec.output_dir.as_deref(), &c.worker)?;
+                let new_paths = owned_paths_of(output_dir.as_ref(), &writes);
+                for (existing_role, existing_rec) in &state.workers {
+                    let existing_paths =
+                        owned_paths_of(existing_rec.output_dir.as_ref(), &existing_rec.writes);
+                    check_worker_path_conflicts(
+                        existing_role,
+                        &existing_paths,
+                        &c.worker.role,
+                        &new_paths,
+                    )?;
+                }
+                let mut agent = c
                     .worker
                     .agent
                     .clone()
                     .unwrap_or_else(|| spec.defaults.clone());
+                if matches!(ctx.by, Principal::Worker { .. })
+                    && let Some(req_acct) = agent.account.as_deref()
+                    && Some(req_acct) != spec.defaults.account.as_deref()
+                {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by.to_string(),
+                        action: format!("override wave paying account in wave {}", c.wave),
+                    });
+                }
+                if agent.account.is_none() {
+                    agent.account = spec.defaults.account.clone();
+                }
                 Ok(vec![WaveEvent::WorkerRequested {
                     role: c.worker.role.clone(),
                     agent,
                     brief: c.worker.brief.clone(),
                     attempt: 1,
+                    output_dir,
+                    writes,
+                    return_schema: c.worker.return_schema.clone(),
                 }])
             }
             WaveCommand::WaveRetireWorker(c) => {
@@ -361,6 +533,42 @@ impl Decider for Waves {
                         c.wave
                     )));
                 }
+                if c.allow_incomplete && !matches!(ctx.by, Principal::Operator { .. }) {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by.to_string(),
+                        action: format!("override incomplete finish gate in wave {}", c.wave),
+                    });
+                }
+                if matches!(c.outcome, WaveOutcome::Completed { .. }) && !c.allow_incomplete {
+                    let mut refused = Vec::new();
+                    let mut errored = Vec::new();
+                    for (role, rec) in &state.workers {
+                        if rec.phase.refusal().is_some() {
+                            refused.push(format!("@{role}"));
+                        } else if rec.phase.error().is_some() {
+                            errored.push(format!("@{role}"));
+                        }
+                    }
+                    if !refused.is_empty() || !errored.is_empty() {
+                        let mut parts = Vec::new();
+                        if !refused.is_empty() {
+                            parts.push(format!("refused: {}", refused.join(", ")));
+                        }
+                        if !errored.is_empty() {
+                            parts.push(format!("errored: {}", errored.join(", ")));
+                        }
+                        let override_hint = if matches!(ctx.by, Principal::Operator { .. }) {
+                            "pass --allow-incomplete to override"
+                        } else {
+                            "an operator must pass --allow-incomplete to override"
+                        };
+                        return Err(ApiError::conflict(format!(
+                            "cannot finish wave {} as completed with incomplete workers ({}); {override_hint}",
+                            c.wave,
+                            parts.join("; ")
+                        )));
+                    }
+                }
                 let mut events = vec![WaveEvent::Finished {
                     outcome: c.outcome.clone(),
                 }];
@@ -390,6 +598,31 @@ impl Decider for Waves {
                         what: format!("worker @{}/{}", c.wave, c.role),
                     });
                 };
+                if let Observation::RuntimeMeta {
+                    actual_model,
+                    actual_account,
+                } = &c.observation
+                {
+                    if !matches!(
+                        rec.phase,
+                        WorkerPhase::Requested { .. }
+                            | WorkerPhase::Live { .. }
+                            | WorkerPhase::Retiring { .. }
+                    ) {
+                        return Ok(vec![]);
+                    }
+                    let model_changed = actual_model.is_some()
+                        && rec.meta.actual_model.as_ref() != actual_model.as_ref();
+                    let account_changed = actual_account.is_some()
+                        && rec.meta.actual_account.as_ref() != actual_account.as_ref();
+                    if !model_changed && !account_changed {
+                        return Ok(vec![]);
+                    }
+                    return Ok(vec![WaveEvent::WorkerObserved {
+                        role: c.role.clone(),
+                        observation: c.observation.clone(),
+                    }]);
+                }
                 let Ok(next) = worker_step(&rec.phase, &c.observation) else {
                     return Ok(vec![]);
                 };
@@ -407,6 +640,9 @@ impl Decider for Waves {
                         agent: rec.agent.clone(),
                         brief: rec.brief.clone(),
                         attempt,
+                        output_dir: rec.output_dir.clone(),
+                        writes: rec.writes.clone(),
+                        return_schema: rec.return_schema.clone(),
                     });
                 }
                 Ok(events)
@@ -426,6 +662,7 @@ impl Decider for Waves {
                 state.room = Some(room.clone());
                 state.board = Some(board.clone());
                 state.opener = Some(meta.by.clone());
+                state.started_at = meta.at;
                 state.status = Some(WaveStatus::Running);
             }
             WaveEvent::WorkerRequested {
@@ -433,7 +670,15 @@ impl Decider for Waves {
                 agent,
                 brief,
                 attempt,
+                output_dir,
+                writes,
+                return_schema,
             } => {
+                let wave_slug = state.spec.as_ref().map_or("wave", |s| s.slug.as_str());
+                let run_stamp = format!(
+                    "{wave_slug}:{role}:attempt-{attempt}:at-{}",
+                    state.started_at.0
+                );
                 state.workers.insert(
                     role.clone(),
                     WorkerRecord {
@@ -441,13 +686,38 @@ impl Decider for Waves {
                         brief: brief.clone(),
                         phase: WorkerPhase::Requested { attempt: *attempt },
                         resolved_interaction: None,
+                        output_dir: output_dir.clone(),
+                        writes: writes.clone(),
+                        return_schema: return_schema.clone(),
+                        meta: WorkerRuntimeMeta {
+                            requested_model: agent.model.clone(),
+                            actual_model: None,
+                            requested_account: agent.account.clone(),
+                            actual_account: None,
+                            run_stamp: Some(run_stamp),
+                        },
                     },
                 );
             }
             WaveEvent::WorkerObserved { role, observation } => {
                 if let Some(rec) = state.workers.get_mut(role) {
-                    rec.phase = rec.phase.observe(observation);
-                    rec.resolved_interaction = None;
+                    match observation {
+                        Observation::RuntimeMeta {
+                            actual_model,
+                            actual_account,
+                        } => {
+                            if let Some(model) = actual_model {
+                                rec.meta.actual_model = Some(model.clone());
+                            }
+                            if let Some(account) = actual_account {
+                                rec.meta.actual_account = Some(account.clone());
+                            }
+                        }
+                        other => {
+                            rec.phase = rec.phase.observe(other);
+                            rec.resolved_interaction = None;
+                        }
+                    }
                 }
             }
             WaveEvent::WorkerRetiring { role, .. } => {
@@ -504,16 +774,24 @@ impl Decider for Waves {
             WaveCommand::WaveView(c) => {
                 let spec = state.spec.clone().expect("validated in decide");
                 let status = state.status.clone().unwrap_or(WaveStatus::Running);
-                let workers = state
+                let workers: Vec<_> = state
                     .workers
                     .iter()
                     .map(|(role, rec)| (role.clone(), rec.agent.clone(), rec.phase.clone()))
+                    .collect();
+                let counts = WaveCounts::from_phases(state.workers.values().map(|rec| &rec.phase));
+                let worker_meta = state
+                    .workers
+                    .iter()
+                    .map(|(role, rec)| (role.clone(), rec.meta.clone()))
                     .collect();
                 let _ = c;
                 WireReply::WaveView(WaveSnapshot {
                     spec,
                     status,
                     workers,
+                    counts,
+                    worker_meta,
                 })
             }
         }
@@ -549,6 +827,10 @@ pub struct SpawnRequest {
     pub room: RoomId,
     pub prompt: Body,
     pub title: String,
+    pub run_stamp: String,
+    pub output_dir: Option<PathBuf>,
+    pub writes: Vec<PathBuf>,
+    pub return_schema: Option<serde_json::Value>,
 }
 
 pub trait AgentHost: Send + Sync + 'static {
@@ -569,6 +851,16 @@ pub trait AgentHost: Send + Sync + 'static {
         resolution: &InteractionResolution,
     ) -> impl Future<Output = Result<(), HostError>> + Send;
     fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send;
+    /// Probe whether a previously-`Live` host thread still exists after a reboot
+    /// or reconnect. Returning `Ok(Some(obs))` submits a corrective `WaveObserve`
+    /// (for example `Activity::Errored` when the host thread vanished after restart,
+    /// or `Observation::Archived` when the thread was already archived).
+    fn check_live(
+        &self,
+        _thread: &BbThreadId,
+    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
+        async { Ok(None) }
+    }
 }
 
 pub struct WaveConductor<H: AgentHost> {
@@ -579,6 +871,7 @@ pub struct WaveConductor<H: AgentHost> {
     opened_boards: BTreeSet<BoardId>,
     room_members: BTreeMap<RoomId, BTreeSet<Principal>>,
     retire_attempts: BTreeMap<BbThreadId, u32>,
+    probed_live_threads: BTreeSet<BbThreadId>,
     seen: Cursor,
     caught_up: bool,
     needs_reconcile: bool,
@@ -602,6 +895,7 @@ impl<H: AgentHost> WaveConductor<H> {
             opened_boards: BTreeSet::new(),
             room_members: BTreeMap::new(),
             retire_attempts: BTreeMap::new(),
+            probed_live_threads: BTreeSet::new(),
             seen: Cursor::default(),
             caught_up: false,
             needs_reconcile: false,
@@ -626,6 +920,7 @@ impl<H: AgentHost> WaveConductor<H> {
                 {
                     let th = thread.clone();
                     self.retire_attempts.remove(&th);
+                    self.probed_live_threads.remove(&th);
                 }
                 let st = self.view.entry(wave.clone()).or_default();
                 Waves::evolve(
@@ -789,11 +1084,9 @@ impl<H: AgentHost> WaveConductor<H> {
                                 .await,
                         );
                     }
-                    WorkerPhase::Live {
-                        thread,
-                        activity: Activity::Blocked { interaction },
-                    } => {
-                        if let Some((resolved_id, resolution)) = &rec.resolved_interaction
+                    WorkerPhase::Live { thread, activity } => {
+                        if let Activity::Blocked { interaction } = activity
+                            && let Some((resolved_id, resolution)) = &rec.resolved_interaction
                             && resolved_id == &interaction.id
                         {
                             record_retryable(
@@ -803,6 +1096,33 @@ impl<H: AgentHost> WaveConductor<H> {
                                     self.host.resolve(thread, resolved_id, resolution).await,
                                 ),
                             );
+                        }
+                        let already_terminal_failure = matches!(
+                            activity,
+                            Activity::Errored { .. } | Activity::Refused { .. }
+                        );
+                        if !already_terminal_failure
+                            && self.probed_live_threads.insert(thread.clone())
+                        {
+                            match self.host.check_live(thread).await {
+                                Ok(Some(obs)) => {
+                                    record_retryable(
+                                        &mut first_err,
+                                        &mut any_retryable,
+                                        client
+                                            .call(WaveObserve {
+                                                wave: wave.clone(),
+                                                role: role.clone(),
+                                                observation: obs,
+                                            })
+                                            .await
+                                            .map(|_| ()),
+                                    );
+                                }
+                                Ok(None)
+                                | Err(HostError::Rejected(_))
+                                | Err(HostError::Unreachable(_)) => {}
+                            }
                         }
                     }
                     WorkerPhase::Retiring { thread, .. } => {
@@ -1027,12 +1347,46 @@ impl<H: AgentHost> WaveConductor<H> {
             })
             .await?;
 
-        let prompt = bounded_body(format!(
-            "Wave: {wave}\nRole: @{role}\nRoom: #wave-{wave} (project {})\nGoal: {}\n\nAssignment:\n{}",
+        let run_stamp = rec
+            .meta
+            .run_stamp
+            .clone()
+            .unwrap_or_else(|| format!("{wave}:{role}:attempt-{attempt}"));
+        let mut provenance = format!("[rex-wave provenance]\nrun_stamp: {run_stamp}\n");
+        if let Some(dir) = &rec.output_dir {
+            let anchor = if dir.is_relative() {
+                " (relative to workspace root)"
+            } else {
+                ""
+            };
+            provenance.push_str(&format!(
+                "output_dir: {}{anchor}\nrule: write deliverables under output_dir and tag them with run_stamp; never treat pre-existing files without matching run_stamp as completed work.\n",
+                dir.display()
+            ));
+        } else {
+            provenance.push_str(
+                "rule: tag deliverables with run_stamp; never treat pre-existing files without matching run_stamp as completed work.\n",
+            );
+        }
+        if !rec.writes.is_empty() {
+            let list: Vec<String> = rec.writes.iter().map(|p| p.display().to_string()).collect();
+            provenance.push_str(&format!("writes: {}\n", list.join(", ")));
+        }
+        if let Some(account) = &rec.agent.account {
+            provenance.push_str(&format!("account: {account}\n"));
+        }
+        let mut prompt_text = format!(
+            "Wave: {wave}\nRole: @{role}\nRoom: #wave-{wave} (project {})\nGoal: {}\n\n{provenance}\nAssignment:\n{}",
             spec.project,
             spec.goal.as_str(),
             rec.brief.as_str()
-        ));
+        );
+        if let Some(schema) = &rec.return_schema
+            && let Ok(compact) = serde_json::to_string(schema)
+        {
+            prompt_text.push_str(&format!("\n\nreturn_schema: {compact}"));
+        }
+        let prompt = bounded_body(prompt_text);
         let req = SpawnRequest {
             wave: wave.clone(),
             role: role.clone(),
@@ -1042,6 +1396,10 @@ impl<H: AgentHost> WaveConductor<H> {
             room: room.clone(),
             prompt,
             title: format!("[{wave}] @{role}"),
+            run_stamp,
+            output_dir: rec.output_dir.clone(),
+            writes: rec.writes.clone(),
+            return_schema: rec.return_schema.clone(),
         };
 
         let observation = match self.host.spawn(req).await {
@@ -1233,6 +1591,7 @@ mod tests {
         AgentSpec {
             provider: ProviderId::parse(provider).unwrap(),
             model: Some(ModelId::parse(model).unwrap()),
+            account: None,
             reasoning: Some("xhigh".into()),
             service_tier: None,
             permission: PermissionMode::AcceptEdits,
@@ -1252,11 +1611,15 @@ mod tests {
                     base: BaseBranch::Default,
                 },
             ),
+            output_dir: None,
             workers: vec![
                 WorkerSpec {
                     role: RoleName::parse("author").unwrap(),
                     brief: Body::parse("Own token refresh").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 },
                 WorkerSpec {
                     role: RoleName::parse("verifier").unwrap(),
@@ -1266,6 +1629,9 @@ mod tests {
                         "claude-opus-5-5",
                         Workspace::ProjectDefault,
                     )),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 },
             ],
         }
@@ -1380,6 +1746,9 @@ mod tests {
                             role: RoleName::parse("helper").unwrap(),
                             brief: Body::parse("Assist").unwrap(),
                             agent: None,
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
                         },
                     }),
                 ),
@@ -1415,6 +1784,9 @@ mod tests {
                             role: RoleName::parse("helper").unwrap(),
                             brief: Body::parse("Assist").unwrap(),
                             agent: None,
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
                         },
                     }),
                 ),
@@ -1440,6 +1812,9 @@ mod tests {
                             path: "/tmp/wt".into(),
                         },
                     )),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 },
             }),
         )
@@ -1597,6 +1972,24 @@ mod tests {
                 activity: Activity::Idle,
             },
         );
+        let blocked_finish = apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveFinish(WaveFinish {
+                wave: spec.slug.clone(),
+                outcome: WaveOutcome::Completed {
+                    summary: Body::parse("done").unwrap(),
+                },
+                allow_incomplete: false,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(blocked_finish, ApiError::Conflict { .. })
+                && blocked_finish.to_string().contains("@author"),
+            "WaveFinish(Completed) without allow_incomplete must reject errored worker: {blocked_finish:?}"
+        );
         apply_cmd(
             &mut state,
             &mut seq,
@@ -1606,6 +1999,7 @@ mod tests {
                 outcome: WaveOutcome::Completed {
                     summary: Body::parse("done").unwrap(),
                 },
+                allow_incomplete: true,
             }),
         )
         .unwrap();
@@ -1643,6 +2037,7 @@ mod tests {
             WorkerPhase::Retired {
                 thread: Some(BbThreadId::parse("th_author").unwrap()),
                 errored: Some("ServiceUnavailableError".into()),
+                refused: None,
             }
         );
         assert_eq!(
@@ -1650,6 +2045,7 @@ mod tests {
             WorkerPhase::Retired {
                 thread: Some(BbThreadId::parse("th_verifier").unwrap()),
                 errored: None,
+                refused: None,
             }
         );
     }
@@ -1681,6 +2077,10 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeHost {
         calls: Arc<Mutex<Vec<HostCall>>>,
+        spawn_requests: Arc<Mutex<Vec<SpawnRequest>>>,
+        missing_threads: Arc<Mutex<BTreeSet<String>>>,
+        unreachable_check_live: Arc<Mutex<bool>>,
+        check_live_calls: Arc<Mutex<u32>>,
         unreachable_role: Arc<Mutex<Option<String>>>,
         rejected_role: Arc<Mutex<Option<String>>>,
         unreachable_retire: Arc<Mutex<bool>>,
@@ -1705,7 +2105,10 @@ mod tests {
                 provider: req.agent.provider.to_string(),
                 workspace: req.agent.workspace.clone(),
             });
-            Ok(BbThreadId::parse(format!("th_{}_{}_{}", req.wave, req.role, req.attempt)).unwrap())
+            let id =
+                BbThreadId::parse(format!("th_{}_{}_{}", req.wave, req.role, req.attempt)).unwrap();
+            self.spawn_requests.lock().unwrap().push(req);
+            Ok(id)
         }
 
         async fn tell(
@@ -1749,6 +2152,26 @@ mod tests {
             });
             Ok(())
         }
+
+        async fn check_live(&self, thread: &BbThreadId) -> Result<Option<Observation>, HostError> {
+            *self.check_live_calls.lock().unwrap() += 1;
+            if *self.unreachable_check_live.lock().unwrap() {
+                return Err(HostError::Unreachable("host disconnected".into()));
+            }
+            if self
+                .missing_threads
+                .lock()
+                .unwrap()
+                .contains(thread.as_str())
+            {
+                return Ok(Some(Observation::Activity {
+                    activity: Activity::Errored {
+                        error: "host thread missing after restart".into(),
+                    },
+                }));
+            }
+            Ok(None)
+        }
     }
 
     struct MiniBus {
@@ -1758,6 +2181,7 @@ mod tests {
         boards: BTreeSet<BoardId>,
         seqs: BTreeMap<StreamId, u64>,
         queue: VecDeque<Envelope>,
+        history: Vec<Envelope>,
     }
 
     impl MiniBus {
@@ -1769,6 +2193,7 @@ mod tests {
                 boards: BTreeSet::new(),
                 seqs: BTreeMap::new(),
                 queue: VecDeque::new(),
+                history: Vec::new(),
             }))
         }
 
@@ -1786,6 +2211,7 @@ mod tests {
                 event,
             };
             self.queue.push_back(env.clone());
+            self.history.push(env.clone());
             env
         }
     }
@@ -2165,6 +2591,7 @@ mod tests {
             outcome: WaveOutcome::Completed {
                 summary: Body::parse("All green").unwrap(),
             },
+            allow_incomplete: false,
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -2338,6 +2765,9 @@ mod tests {
                         path: "/tmp/wt".into(),
                     },
                 )),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
             },
         }))
         .unwrap();
@@ -2644,6 +3074,524 @@ mod tests {
                 .room_posts
                 .contains_key(&(started.room, failure_idem)),
             "exhausted retire posts diagnostic notice to wave room"
+        );
+    }
+
+    #[test]
+    fn refusal_survives_retirement_blocks_finish_without_flag_and_tracks_counts_and_runtime_meta() {
+        let mut state = WaveState::default();
+        let mut seq = 0;
+        let op = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+        let sys = Principal::System {
+            part: SystemPart::BbBridge,
+        };
+        let mut spec = sample_spec();
+        spec.defaults.account = Some("work".into());
+        spec.output_dir = Some(PathBuf::from("artifacts/auth-v2"));
+        apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveStart(WaveStart {
+                spec: spec.clone(),
+                idem: None,
+            }),
+        )
+        .unwrap();
+
+        let author = RoleName::parse("author").unwrap();
+        let verifier = RoleName::parse("verifier").unwrap();
+        for (role, th) in [(&author, "th_a"), (&verifier, "th_v")] {
+            apply_cmd(
+                &mut state,
+                &mut seq,
+                sys.clone(),
+                WaveCommand::WaveObserve(WaveObserve {
+                    wave: spec.slug.clone(),
+                    role: role.clone(),
+                    observation: Observation::Spawned {
+                        attempt: 1,
+                        thread: BbThreadId::parse(th).unwrap(),
+                    },
+                }),
+            )
+            .unwrap();
+        }
+
+        // RuntimeMeta updates actual model/account and is idempotent on repeat.
+        let (evs1, _) = apply_cmd(
+            &mut state,
+            &mut seq,
+            sys.clone(),
+            WaveCommand::WaveObserve(WaveObserve {
+                wave: spec.slug.clone(),
+                role: author.clone(),
+                observation: Observation::RuntimeMeta {
+                    actual_model: Some(ModelId::parse("gpt-6.1-sol-2026").unwrap()),
+                    actual_account: Some("personal".into()),
+                },
+            }),
+        )
+        .unwrap();
+        assert_eq!(evs1.len(), 1);
+        let (evs2, _) = apply_cmd(
+            &mut state,
+            &mut seq,
+            sys.clone(),
+            WaveCommand::WaveObserve(WaveObserve {
+                wave: spec.slug.clone(),
+                role: author.clone(),
+                observation: Observation::RuntimeMeta {
+                    actual_model: Some(ModelId::parse("gpt-6.1-sol-2026").unwrap()),
+                    actual_account: Some("personal".into()),
+                },
+            }),
+        )
+        .unwrap();
+        assert!(evs2.is_empty(), "identical RuntimeMeta is idempotent");
+
+        apply_cmd(
+            &mut state,
+            &mut seq,
+            sys.clone(),
+            WaveCommand::WaveObserve(WaveObserve {
+                wave: spec.slug.clone(),
+                role: author.clone(),
+                observation: Observation::Activity {
+                    activity: Activity::Refused {
+                        reason: "cyber_safeguard: refusal".into(),
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        apply_cmd(
+            &mut state,
+            &mut seq,
+            sys.clone(),
+            WaveCommand::WaveObserve(WaveObserve {
+                wave: spec.slug.clone(),
+                role: verifier.clone(),
+                observation: Observation::Activity {
+                    activity: Activity::Idle,
+                },
+            }),
+        )
+        .unwrap();
+
+        let (_, reply) = apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveView(WaveView {
+                wave: spec.slug.clone(),
+            }),
+        )
+        .unwrap();
+        let WireReply::WaveView(snap) = reply else {
+            panic!("expected WaveView");
+        };
+        assert_eq!(snap.counts.total, 2);
+        assert_eq!(snap.counts.refused, 1);
+        assert_eq!(snap.counts.idle, 1);
+        let author_meta = &snap.worker_meta[&author];
+        assert_eq!(
+            author_meta.actual_model.as_ref().map(ModelId::as_str),
+            Some("gpt-6.1-sol-2026")
+        );
+        assert!(author_meta.account_mismatch());
+        assert_eq!(
+            author_meta.run_stamp.as_deref(),
+            Some("auth-v2:author:attempt-1:at-1000")
+        );
+
+        // S2: a racing Activity::Errored must never overwrite Activity::Refused on the same attempt.
+        let (dup_evs, _) = apply_cmd(
+            &mut state,
+            &mut seq,
+            sys.clone(),
+            WaveCommand::WaveObserve(WaveObserve {
+                wave: spec.slug.clone(),
+                role: author.clone(),
+                observation: Observation::Activity {
+                    activity: Activity::Errored {
+                        error: "generic thread.failed".into(),
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        assert!(
+            dup_evs.is_empty(),
+            "Errored must not overwrite Refused on the same live attempt"
+        );
+
+        // S5: a Live worker cannot bypass allow_incomplete or override paying account.
+        let worker_caller = Principal::Worker {
+            wave: spec.slug.clone(),
+            role: verifier.clone(),
+        };
+        let bypass_err = apply_cmd(
+            &mut state,
+            &mut seq,
+            worker_caller.clone(),
+            WaveCommand::WaveFinish(WaveFinish {
+                wave: spec.slug.clone(),
+                outcome: WaveOutcome::Completed {
+                    summary: Body::parse("bypass").unwrap(),
+                },
+                allow_incomplete: true,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(bypass_err, ApiError::Denied { .. }),
+            "worker caller must be denied allow_incomplete override: {bypass_err:?}"
+        );
+        let acct_override_err = apply_cmd(
+            &mut state,
+            &mut seq,
+            worker_caller,
+            WaveCommand::WaveAddWorker(WaveAddWorker {
+                wave: spec.slug.clone(),
+                worker: WorkerSpec {
+                    role: RoleName::parse("rogue").unwrap(),
+                    brief: Body::parse("Switch billing").unwrap(),
+                    agent: Some(AgentSpec {
+                        provider: ProviderId::parse("codex").unwrap(),
+                        model: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::AcceptEdits,
+                        workspace: Workspace::ProjectDefault,
+                        account: Some("other-billing@example.com".into()),
+                    }),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                },
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(acct_override_err, ApiError::Denied { .. }),
+            "worker caller must be denied overriding paying account: {acct_override_err:?}"
+        );
+
+        let err = apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveFinish(WaveFinish {
+                wave: spec.slug.clone(),
+                outcome: WaveOutcome::Completed {
+                    summary: Body::parse("ship").unwrap(),
+                },
+                allow_incomplete: false,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict { .. })
+                && err.to_string().contains("refused")
+                && err.to_string().contains("@author"),
+            "WaveFinish must reject refused worker without --allow-incomplete: {err:?}"
+        );
+
+        // With allow_incomplete: true it succeeds and preserves refused through Retiring -> Retired.
+        apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveFinish(WaveFinish {
+                wave: spec.slug.clone(),
+                outcome: WaveOutcome::Completed {
+                    summary: Body::parse("partial").unwrap(),
+                },
+                allow_incomplete: true,
+            }),
+        )
+        .unwrap();
+        for role in [&author, &verifier] {
+            apply_cmd(
+                &mut state,
+                &mut seq,
+                sys.clone(),
+                WaveCommand::WaveObserve(WaveObserve {
+                    wave: spec.slug.clone(),
+                    role: role.clone(),
+                    observation: Observation::Archived,
+                }),
+            )
+            .unwrap();
+        }
+        let (_, reply2) = apply_cmd(
+            &mut state,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveView(WaveView {
+                wave: spec.slug.clone(),
+            }),
+        )
+        .unwrap();
+        let WireReply::WaveView(snap2) = reply2 else {
+            panic!("expected WaveView");
+        };
+        assert_eq!(snap2.counts.retired_refused, 1);
+        assert_eq!(snap2.counts.retired_clean, 1);
+        let author_phase = &snap2
+            .workers
+            .iter()
+            .find(|(r, _, _)| r == &author)
+            .unwrap()
+            .2;
+        assert_eq!(author_phase.refusal(), Some("cyber_safeguard: refusal"));
+    }
+
+    #[test]
+    fn structural_one_writer_enforces_path_safety_and_disjoint_ownership() {
+        let op = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+
+        // 1. Parent traversal `..` in wave output_dir is rejected.
+        let mut bad_wave = sample_spec();
+        bad_wave.output_dir = Some(PathBuf::from("../escape"));
+        let mut st = WaveState::default();
+        let mut seq = 0;
+        assert!(matches!(
+            apply_cmd(
+                &mut st,
+                &mut seq,
+                op.clone(),
+                WaveCommand::WaveStart(WaveStart {
+                    spec: bad_wave,
+                    idem: None,
+                }),
+            ),
+            Err(ApiError::Invalid(_))
+        ));
+
+        // 2. Overlapping ancestor/descendant output dirs between workers are rejected.
+        let mut overlap = sample_spec();
+        overlap.workers[0].output_dir = Some(PathBuf::from("out"));
+        overlap.workers[1].output_dir = Some(PathBuf::from("out/sub"));
+        let overlap_err = apply_cmd(
+            &mut st,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveStart(WaveStart {
+                spec: overlap,
+                idem: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(overlap_err, ApiError::Conflict { .. })
+                && overlap_err.to_string().contains("@author")
+                && overlap_err.to_string().contains("@verifier"),
+            "overlapping worker paths must return Conflict: {overlap_err:?}"
+        );
+
+        // 3. Sibling default output dirs (<base>/author vs <base>/verifier) succeed,
+        //    and WaveAddWorker rejecting overlapping `writes` enforces one-writer dynamically.
+        let mut good = sample_spec();
+        good.output_dir = Some(PathBuf::from("reports/wave-1"));
+        good.workers[0].writes = vec![PathBuf::from("src/auth.rs")];
+        good.workers[1].writes = vec![PathBuf::from("tests/auth_test.rs")];
+        apply_cmd(
+            &mut st,
+            &mut seq,
+            op.clone(),
+            WaveCommand::WaveStart(WaveStart {
+                spec: good.clone(),
+                idem: None,
+            }),
+        )
+        .unwrap();
+
+        let conflict_add = apply_cmd(
+            &mut st,
+            &mut seq,
+            op,
+            WaveCommand::WaveAddWorker(WaveAddWorker {
+                wave: good.slug,
+                worker: WorkerSpec {
+                    role: RoleName::parse("reviewer").unwrap(),
+                    brief: Body::parse("Edit auth too").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: vec![PathBuf::from("./src/auth.rs")],
+                    return_schema: None,
+                },
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(conflict_add, ApiError::Conflict { .. })
+                && conflict_add.to_string().contains("@author")
+                && conflict_add.to_string().contains("@reviewer"),
+            "WaveAddWorker must reject normalized overlap: {conflict_add:?}"
+        );
+        // 4. Non-object return_schema (e.g. `42`) is rejected.
+        let mut bad_schema = sample_spec();
+        bad_schema.workers[0].return_schema = Some(serde_json::json!(42));
+        let mut st_schema = WaveState::default();
+        let mut seq_schema = 0;
+        assert!(matches!(
+            apply_cmd(
+                &mut st_schema,
+                &mut seq_schema,
+                Principal::Operator {
+                    seat: SeatName::parse("owner").unwrap(),
+                },
+                WaveCommand::WaveStart(WaveStart {
+                    spec: bad_schema,
+                    idem: None,
+                }),
+            ),
+            Err(ApiError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn conductor_injects_provenance_reconciles_missing_threads_and_marks_truncation() {
+        let bus = MiniBus::new();
+        let host = FakeHost::default();
+        let mut conductor = WaveConductor::new(host.clone());
+        let op = BusClient {
+            me: Principal::Operator {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+            bus: bus.clone(),
+        };
+        let sys_conductor = BusClient {
+            me: Principal::System {
+                part: SystemPart::WaveConductor,
+            },
+            bus: bus.clone(),
+        };
+
+        let mut spec = sample_spec();
+        spec.output_dir = Some(PathBuf::from("runs/auth-v2"));
+        spec.workers[0].writes = vec![PathBuf::from("src/token.rs")];
+        spec.workers[0].return_schema = Some(serde_json::json!({"type": "object"}));
+        let wave = spec.slug.clone();
+
+        block_on(conductor.handle_frame(
+            Frame::CaughtUp {
+                cursor: Cursor::default(),
+            },
+            &sys_conductor,
+        ))
+        .unwrap();
+        block_on(op.call(WaveStart { spec, idem: None })).unwrap();
+        drain_conductor(&mut conductor, &sys_conductor, &bus);
+
+        let reqs = host.spawn_requests.lock().unwrap().clone();
+        let author_req = reqs.iter().find(|r| r.role.as_str() == "author").unwrap();
+        assert_eq!(author_req.run_stamp, "auth-v2:author:attempt-1:at-100");
+        assert_eq!(
+            author_req.output_dir.as_deref(),
+            Some(Path::new("runs/auth-v2/author"))
+        );
+        assert_eq!(author_req.writes, vec![PathBuf::from("src/token.rs")]);
+        assert!(author_req.prompt.as_str().contains("[rex-wave provenance]"));
+        assert!(
+            author_req
+                .prompt
+                .as_str()
+                .contains("run_stamp: auth-v2:author:attempt-1:at-100")
+        );
+        assert!(
+            author_req
+                .prompt
+                .as_str()
+                .contains("output_dir: runs/auth-v2/author (relative to workspace root)")
+        );
+        // S14: return_schema appears after Assignment so a large schema never clips the brief.
+        let assign_pos = author_req.prompt.as_str().find("Assignment:").unwrap();
+        let schema_pos = author_req.prompt.as_str().find("return_schema:").unwrap();
+        assert!(schema_pos > assign_pos);
+
+        // S3: unreachable check_live during reconcile must not fail or leave reconcile dirty.
+        *host.unreachable_check_live.lock().unwrap() = true;
+        let mut offline_restarted = WaveConductor::new(host.clone());
+        let history = bus.lock().unwrap().history.clone();
+        for env in &history {
+            block_on(offline_restarted.handle_frame(Frame::Committed(env.clone()), &sys_conductor))
+                .unwrap();
+        }
+        block_on(offline_restarted.handle_frame(
+            Frame::CaughtUp {
+                cursor: Cursor::default(),
+            },
+            &sys_conductor,
+        ))
+        .unwrap();
+        assert!(!offline_restarted.needs_reconcile);
+        *host.unreachable_check_live.lock().unwrap() = false;
+
+        // Simulate daemon restart: fresh conductor catches up, host reports author thread missing,
+        // and each live thread is probed at most once even if reconcile runs again.
+        *host.check_live_calls.lock().unwrap() = 0;
+        host.missing_threads
+            .lock()
+            .unwrap()
+            .insert("th_auth-v2_author_1".into());
+        let mut restarted = WaveConductor::new(host.clone());
+        for env in history {
+            block_on(restarted.handle_frame(Frame::Committed(env), &sys_conductor)).unwrap();
+        }
+        block_on(restarted.handle_frame(
+            Frame::CaughtUp {
+                cursor: Cursor::default(),
+            },
+            &sys_conductor,
+        ))
+        .unwrap();
+        let probes_after_first = *host.check_live_calls.lock().unwrap();
+        assert_eq!(probes_after_first, 2);
+        block_on(restarted.handle_frame(
+            Frame::CaughtUp {
+                cursor: Cursor::default(),
+            },
+            &sys_conductor,
+        ))
+        .unwrap();
+        assert_eq!(
+            *host.check_live_calls.lock().unwrap(),
+            probes_after_first,
+            "reconcile must not re-probe already-probed live threads"
+        );
+        let snap = block_on(op.call(WaveView { wave })).unwrap();
+        let author_phase = &snap
+            .workers
+            .iter()
+            .find(|(r, _, _)| r.as_str() == "author")
+            .unwrap()
+            .2;
+        assert!(
+            author_phase
+                .error()
+                .is_some_and(|e| e.contains("missing after restart")),
+            "reconcile must surface missing host thread instead of fake Live/Working: {author_phase:?}"
+        );
+
+        // Lesson 4: doorbell_text marks truncation explicitly instead of silently clipping.
+        let huge = Body::parse("a".repeat(64 * 1024)).unwrap();
+        let room = RoomId::Channel {
+            scope: RoomScope::Global,
+            name: ChannelName::parse("general").unwrap(),
+        };
+        let bell = doorbell_text(&room, Seq(7), &op.me, &huge);
+        assert!(bell.as_str().len() <= 64 * 1024);
+        assert!(
+            bell.as_str().contains("[truncated:") && bell.as_str().contains("bytes shown]"),
+            "doorbell must include explicit truncation marker: {}",
+            &bell.as_str()[bell.as_str().len().saturating_sub(120)..]
         );
     }
 }

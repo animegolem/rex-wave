@@ -209,6 +209,7 @@ fn osc7501_and_context_usage_and_wait_constructor_behave() {
     let retired = WorkerPhase::Retired {
         thread: Some(t.clone()),
         errored: None,
+        refused: None,
     };
     let blocked = WorkerPhase::Live {
         thread: t,
@@ -496,6 +497,7 @@ fn phase3_branded_types_conflict_data_and_legacy_room_events_round_trip() {
         RoomTasks {
             room: chan,
             filter: None,
+            limit: None,
         }
         .into_wire(),
     ];
@@ -686,4 +688,84 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
             ..
         }
     ));
+}
+
+#[test]
+fn wave_honesty_refusals_counts_serde_defaults_and_truncation_marker() {
+    let tid = BbThreadId::parse("th_ref_1").unwrap();
+    let live_refused = WorkerPhase::Live {
+        thread: tid.clone(),
+        activity: Activity::Refused {
+            reason: "cyber_safeguard".into(),
+        },
+    };
+    assert_eq!(live_refused.refusal(), Some("cyber_safeguard"));
+    assert_eq!(live_refused.error(), None);
+
+    let room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("a").unwrap(),
+    };
+    assert_eq!(
+        plan_mention_wakeup(&live_refused, &room),
+        WakePlan::Suppress
+    );
+
+    let retiring = live_refused.retiring();
+    assert_eq!(retiring.refusal(), Some("cyber_safeguard"));
+    let retired = retiring.observe(&Observation::Archived);
+    assert_eq!(
+        retired,
+        WorkerPhase::Retired {
+            thread: Some(tid.clone()),
+            errored: None,
+            refused: Some("cyber_safeguard".into()),
+        }
+    );
+
+    let counts = WaveCounts::from_phases([&live_refused, &retired]);
+    assert_eq!(counts.total, 2);
+    assert_eq!(counts.refused, 1);
+    assert_eq!(counts.retired_refused, 1);
+    assert_eq!(counts.retired_clean, 0);
+
+    // S9: substring safeguard/refusal stop reasons match across TS and Rust.
+    assert!(rex_wave_api::wave::is_refusal_stop_reason(
+        "safeguard_block"
+    ));
+    assert!(rex_wave_api::wave::is_refusal_stop_reason(
+        "provider-content-filter"
+    ));
+    assert!(!rex_wave_api::wave::is_refusal_stop_reason("end_turn"));
+
+    // Live refused workers surface as Error in OSC 7501, while already-retired historical workers do not.
+    let osc_live_refused = derive_osc7501_status(&InboxBadge::default(), [&live_refused]);
+    assert_eq!(osc_live_refused.state, Osc7501State::Error);
+    let osc_retired_refused = derive_osc7501_status(&InboxBadge::default(), [&retired]);
+    assert_eq!(osc_retired_refused.state, Osc7501State::Done);
+
+    // Legacy JSON payloads without newly added optional fields must still deserialize cleanly.
+    let legacy_finish: WaveFinish = serde_json::from_value(serde_json::json!({
+        "wave": "auth-v2",
+        "outcome": { "outcome": "completed", "summary": "done" }
+    }))
+    .unwrap();
+    assert!(!legacy_finish.allow_incomplete);
+
+    let legacy_retired: WorkerPhase = serde_json::from_value(serde_json::json!({
+        "phase": "retired",
+        "thread": "th_1",
+        "errored": null
+    }))
+    .unwrap();
+    assert_eq!(legacy_retired.refusal(), None);
+
+    // Non-silent UTF-8 truncation marker stays within budget and never slices mid-codepoint.
+    let short = truncate_with_notice("hello", 64);
+    assert_eq!(short, "hello");
+    let big = "🦀".repeat(50); // 200 bytes
+    let truncated = truncate_with_notice(&big, 80);
+    assert!(truncated.len() <= 80, "len={}", truncated.len());
+    assert!(truncated.contains("[truncated: "));
+    assert!(truncated.contains(" of 200 bytes shown]"));
 }

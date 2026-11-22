@@ -943,6 +943,7 @@ fn handle_stage_open(model: &mut Model, effects: &mut Vec<Effect>) {
                     ))
                 }
                 NotifyKind::Interaction { wave, role, .. }
+                | NotifyKind::WorkerRefused { wave, role, .. }
                 | NotifyKind::WorkerStuck { wave, role, .. } => Some((
                     NodeKey::Agent {
                         wave: wave.clone(),
@@ -1764,10 +1765,13 @@ async fn load_stage_target_with_guard<C: Client, F: Fn() -> bool>(
             )
             .await
             .map(Some);
+        let total_count = all_entries.len();
         let initial = WireReply::Read(Page {
             entries: all_entries,
             cursor,
             timed_out: false,
+            total_count,
+            truncated: false,
         });
         return (Some(Ok(initial)), watch_res);
     }

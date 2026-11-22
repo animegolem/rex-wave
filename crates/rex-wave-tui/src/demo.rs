@@ -336,6 +336,8 @@ impl DemoClient {
             head: Seq(3),
             unread: 3,
             cursors: Vec::new(),
+            total_count: 3,
+            truncated: false,
             items: vec![
                 Notification {
                     id: NotificationId(1),
@@ -859,17 +861,22 @@ impl Client for DemoClient {
                             .collect(),
                         _ => Vec::new(),
                     };
+                    let total_count = entries.len();
                     let last = entries.last().map_or(r.after, |e| e.seq);
                     WireReply::Read(Page {
                         entries,
                         cursor: Cursor::default().with(r.stream, last),
                         timed_out: false,
+                        total_count,
+                        truncated: false,
                     })
                 }
                 WireCommand::Wait(_) => WireReply::Wait(Page {
                     entries: Vec::new(),
                     cursor: Cursor::live(),
                     timed_out: true,
+                    total_count: 0,
+                    truncated: false,
                 }),
                 WireCommand::ThreadPage(tp) => {
                     let view = st
@@ -1018,6 +1025,7 @@ impl Client for DemoClient {
                         defaults: AgentSpec {
                             provider: ProviderId::parse("codex").expect("provider"),
                             model: None,
+                            account: None,
                             reasoning: None,
                             service_tier: None,
                             permission: PermissionMode::AcceptEdits,
@@ -1025,10 +1033,13 @@ impl Client for DemoClient {
                                 base: BaseBranch::Default,
                             },
                         },
+                        output_dir: None,
                         workers: Vec::<WorkerSpec>::new(),
                     },
                     status: WaveStatus::Running,
                     workers: Vec::new(),
+                    counts: rex_wave_api::wave::WaveCounts::default(),
+                    worker_meta: std::collections::BTreeMap::new(),
                 }),
                 WireCommand::MailPromote(mp) => {
                     let sha = Sha256Hex::parse("b".repeat(64)).expect("sha256");

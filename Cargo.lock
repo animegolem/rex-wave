@@ -1517,6 +1517,7 @@ version = "0.1.0"
 dependencies = [
  "rex-wave-api",
  "rex-wave-runtime",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

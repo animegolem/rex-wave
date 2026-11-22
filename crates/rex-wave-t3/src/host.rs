@@ -8,11 +8,12 @@ use crate::projects::{
 use crate::protocol::{
     LiveSeqTracker, ShellObservation, TurnMirrorCheck, active_pending_interaction,
     default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
+    extract_explicit_stop_refusal, extract_refusal_reason, extract_runtime_meta_from_value,
     force_stop_thread_payload, inspect_latest_completed_turn, is_t3_thread_id,
     launch_thread_payload, message_dispatch_payload, mirror_idem_key, normalize_turn_item,
     parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
     runtime_request_respond_payload, strip_t3_provider_prefix, thread_archive_payload,
-    thread_stop_payload, truncate_utf8, unwrap_projection,
+    thread_stop_payload, unwrap_projection,
 };
 use crate::rpc::{StreamEvent, T3RpcClient};
 use crate::worker_tokens::{WorkerTokenMinter, provision_worker_token, remove_worker_token_file};
@@ -250,6 +251,7 @@ impl StateOwner {
                         rec.live = false;
                     }
                 }
+                Observation::RuntimeMeta { .. } => {}
             },
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
@@ -807,6 +809,27 @@ impl T3Bridge {
         }
     }
 
+    async fn observe_runtime_meta_if_present(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        actual_model: Option<ModelId>,
+        actual_account: Option<String>,
+    ) {
+        if actual_model.is_none() && actual_account.is_none() {
+            return;
+        }
+        self.call_wave_observe(
+            wave.clone(),
+            role.clone(),
+            Observation::RuntimeMeta {
+                actual_model,
+                actual_account,
+            },
+        )
+        .await;
+    }
+
     async fn process_thread_shell_update(
         &self,
         thread: &BbThreadId,
@@ -819,6 +842,7 @@ impl T3Bridge {
         let Some((wave, role, attempt)) = self.resolve_worker_identity(thread).await else {
             return false;
         };
+        let (shell_model, shell_account) = extract_runtime_meta_from_value(shell);
 
         match obs {
             ShellObservation::Archived => {
@@ -860,6 +884,8 @@ impl T3Bridge {
                     },
                 )
                 .await;
+                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                    .await;
                 self.call_wave_observe(
                     wave,
                     role,
@@ -880,11 +906,35 @@ impl T3Bridge {
                     },
                 )
                 .await;
+                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                    .await;
                 self.call_wave_observe(
                     wave,
                     role,
                     Observation::Activity {
                         activity: Activity::Working,
+                    },
+                )
+                .await;
+                false
+            }
+            ShellObservation::Refused(reason) => {
+                self.call_wave_observe(
+                    wave.clone(),
+                    role.clone(),
+                    Observation::Spawned {
+                        attempt,
+                        thread: thread.clone(),
+                    },
+                )
+                .await;
+                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                    .await;
+                self.call_wave_observe(
+                    wave,
+                    role,
+                    Observation::Activity {
+                        activity: Activity::Refused { reason },
                     },
                 )
                 .await;
@@ -900,6 +950,8 @@ impl T3Bridge {
                     },
                 )
                 .await;
+                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                    .await;
                 self.call_wave_observe(
                     wave,
                     role,
@@ -920,8 +972,38 @@ impl T3Bridge {
                     },
                 )
                 .await;
-                if mirror_candidate && let Ok(proj) = self.fetch_thread_projection(thread).await {
-                    self.mirror_completed_turn_from_projection(&wave, &role, thread, &proj)
+                let fetched_proj = if mirror_candidate {
+                    self.fetch_thread_projection(thread).await.ok()
+                } else {
+                    None
+                };
+                let (proj_model, proj_account) = fetched_proj
+                    .as_ref()
+                    .map(extract_runtime_meta_from_value)
+                    .unwrap_or((None, None));
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    proj_model.or(shell_model),
+                    proj_account.or(shell_account),
+                )
+                .await;
+                if let Some(proj) = fetched_proj.as_ref()
+                    && let Some(Activity::Refused { reason }) =
+                        derive_activity_from_projection(unwrap_projection(proj))
+                {
+                    self.call_wave_observe(
+                        wave,
+                        role,
+                        Observation::Activity {
+                            activity: Activity::Refused { reason },
+                        },
+                    )
+                    .await;
+                    return false;
+                }
+                if let Some(proj) = fetched_proj.as_ref() {
+                    self.mirror_completed_turn_from_projection(&wave, &role, thread, proj)
                         .await;
                 }
                 self.call_wave_observe(
@@ -1073,7 +1155,7 @@ impl T3Bridge {
             return;
         }
 
-        let trimmed = truncate_utf8(&completed.text, 64 * 1024);
+        let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
         let Ok(body) = Body::parse(trimmed) else {
             return;
         };
@@ -1139,8 +1221,24 @@ impl T3Bridge {
         }
         let Ok(workers) = rx.await else { return };
         for (wave, role, thread, tracked_activity) in workers {
-            let Ok(raw_proj) = self.fetch_thread_projection(&thread).await else {
-                continue;
+            let raw_proj = match self.fetch_thread_projection(&thread).await {
+                Ok(v) => v,
+                Err(HostError::Rejected(msg)) => {
+                    if let Some(obs) = classify_t3_missing_or_archived(&msg) {
+                        let already_terminal_failure = matches!(
+                            tracked_activity,
+                            Activity::Errored { .. } | Activity::Refused { .. }
+                        );
+                        if !already_terminal_failure || matches!(obs, Observation::Archived) {
+                            if matches!(obs, Observation::Archived) {
+                                self.unlink_worker_token(&thread);
+                            }
+                            self.call_wave_observe(wave, role, obs).await;
+                        }
+                    }
+                    continue;
+                }
+                Err(HostError::Unreachable(_)) => continue,
             };
             let proj = unwrap_projection(&raw_proj);
             let thread_obj = proj.get("thread");
@@ -1168,6 +1266,9 @@ impl T3Bridge {
                 continue;
             }
 
+            let (proj_model, proj_account) = extract_runtime_meta_from_value(proj);
+            self.observe_runtime_meta_if_present(&wave, &role, proj_model, proj_account)
+                .await;
             let derived = derive_activity_from_projection(proj);
             if matches!(
                 tracked_activity,
@@ -1270,13 +1371,49 @@ impl T3Bridge {
             .map_err(|e| HostError::Rejected(e.to_string()))?
             .unwrap_or(thread);
 
+        let (reply_model, reply_account) = extract_runtime_meta_from_value(&reply);
         let _ = self.state.send(StateMsg::BindThread {
-            wave: req.wave,
-            role: req.role,
+            wave: req.wave.clone(),
+            role: req.role.clone(),
             attempt: req.attempt,
             thread: returned.clone(),
         });
+        self.observe_runtime_meta_if_present(&req.wave, &req.role, reply_model, reply_account)
+            .await;
         Ok(returned)
+    }
+
+    async fn check_thread_live(
+        &self,
+        thread: &BbThreadId,
+    ) -> Result<Option<Observation>, HostError> {
+        match self.fetch_thread_projection(thread).await {
+            Ok(raw_proj) => {
+                let proj = unwrap_projection(&raw_proj);
+                if proj
+                    .get("thread")
+                    .and_then(|t| t.get("archivedAt"))
+                    .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()))
+                {
+                    self.unlink_worker_token(thread);
+                    return Ok(Some(Observation::Archived));
+                }
+                if let Some(Activity::Refused { reason }) = derive_activity_from_projection(proj) {
+                    return Ok(Some(Observation::Activity {
+                        activity: Activity::Refused { reason },
+                    }));
+                }
+                Ok(None)
+            }
+            Err(HostError::Rejected(msg)) => {
+                let obs = classify_t3_missing_or_archived(&msg);
+                if matches!(obs, Some(Observation::Archived)) {
+                    self.unlink_worker_token(thread);
+                }
+                Ok(obs)
+            }
+            Err(HostError::Unreachable(msg)) => Err(HostError::Unreachable(msg)),
+        }
     }
 
     async fn tell_worker_thread(
@@ -1668,6 +1805,39 @@ fn is_benign_stop_rejection(msg: &str) -> bool {
         || lower.contains("not found")
 }
 
+fn classify_t3_missing_or_archived(msg: &str) -> Option<Observation> {
+    let lower = msg.to_ascii_lowercase();
+    // T3 HTTP errors include the request path (`GET /api/orchestration/threads/t3%3A<wave>%3A<role>... returned HTTP <status>: <body>`).
+    // Inspect only the status+body suffix after `returned http ` when present so wave/role names
+    // containing `archived` or `404` cannot false-match on a 401/403/400 response.
+    let body = lower
+        .find("returned http ")
+        .map(|idx| &lower[idx..])
+        .unwrap_or(lower.as_str());
+    if body.contains("returned http 404")
+        || body.contains("not found")
+        || body.contains("unknown thread")
+        || body.contains("no such thread")
+        || body.contains("does not exist")
+        || body.contains("thread deleted")
+        || body.contains("thread_not_found")
+    {
+        Some(Observation::Activity {
+            activity: Activity::Errored {
+                error: format!("host thread missing after restart ({msg})"),
+            },
+        })
+    } else if body.contains("returned http 410")
+        || body.contains("already archived")
+        || body.contains("thread archived")
+        || body.contains("is archived")
+    {
+        Some(Observation::Archived)
+    } else {
+        None
+    }
+}
+
 fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
     if let Some(runs) = proj.get("runs").and_then(|v| v.as_array())
         && let Some(latest) = runs
@@ -1678,6 +1848,9 @@ fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
         return match status {
             "preparing" | "queued" | "starting" | "running" | "waiting" => Some(Activity::Working),
             "failed" => {
+                if let Some(reason) = extract_refusal_reason(latest) {
+                    return Some(Activity::Refused { reason });
+                }
                 let err = latest
                     .get("error")
                     .or_else(|| latest.get("lastError"))
@@ -1687,15 +1860,23 @@ fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
                     .to_owned();
                 Some(Activity::Errored { error: err })
             }
-            "idle" | "completed" | "interrupted" | "cancelled" | "rolled_back" => {
+            "idle" | "completed" => {
+                if let Some(reason) = extract_explicit_stop_refusal(latest) {
+                    return Some(Activity::Refused { reason });
+                }
                 Some(Activity::Idle)
             }
+            "interrupted" | "cancelled" | "rolled_back" => Some(Activity::Idle),
+            other if rex_wave_api::wave::is_refusal_stop_reason(other) => Some(Activity::Refused {
+                reason: extract_refusal_reason(latest).unwrap_or_else(|| other.to_owned()),
+            }),
             _ => None,
         };
     }
     if let Some(thread) = proj.get("thread") {
         return match derive_shell_observation(thread, None) {
             Some(ShellObservation::Working) => Some(Activity::Working),
+            Some(ShellObservation::Refused(reason)) => Some(Activity::Refused { reason }),
             Some(ShellObservation::Errored(error)) => Some(Activity::Errored { error }),
             Some(ShellObservation::Idle { .. }) => Some(Activity::Idle),
             _ => None,
@@ -1751,6 +1932,15 @@ impl AgentHost for T3Host {
         let thread = thread.clone();
         async move { bridge.retire_worker_thread(&thread).await }
     }
+
+    fn check_live(
+        &self,
+        thread: &BbThreadId,
+    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
+        let bridge = self.0.clone();
+        let thread = thread.clone();
+        async move { bridge.check_thread_live(&thread).await }
+    }
 }
 
 /// `rex_wave_runtime::AgentFeed` adapter backed by [`T3Bridge`].
@@ -1798,5 +1988,34 @@ impl AgentFeed for T3Feed {
 
     fn project_names(&self) -> Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>> {
         self.0.project_names()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_t3_missing_or_archived_ignores_wave_or_role_names_in_url_path() {
+        let auth_err_with_archived_slug = "GET /api/orchestration/threads/t3%3Aarchived-404%3Aworker%3Aa1 returned HTTP 401: unauthorized";
+        assert_eq!(
+            classify_t3_missing_or_archived(auth_err_with_archived_slug),
+            None
+        );
+
+        let not_found_err = "GET /api/orchestration/threads/t3%3Aw1%3Aworker%3Aa1 returned HTTP 404: thread not found";
+        assert!(matches!(
+            classify_t3_missing_or_archived(not_found_err),
+            Some(Observation::Activity {
+                activity: Activity::Errored { ref error }
+            }) if error.contains("missing after restart")
+        ));
+
+        let gone_err =
+            "GET /api/orchestration/threads/t3%3Aw1%3Aworker%3Aa1 returned HTTP 410: gone";
+        assert_eq!(
+            classify_t3_missing_or_archived(gone_err),
+            Some(Observation::Archived)
+        );
     }
 }

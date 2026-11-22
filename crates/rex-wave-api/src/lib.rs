@@ -57,3 +57,39 @@ pub use stream::{Cursor, Envelope, Event, Frame, Interest, StreamId};
     schemars::JsonSchema,
 )]
 pub struct Ack;
+
+/// Bounds `s` to at most `max_bytes` UTF-8 bytes without ever silently dropping the tail.
+/// When `s.len() > max_bytes`, returns a char-boundary prefix followed by an explicit
+/// `\n… [truncated: N of M bytes shown]` marker that fits inside `max_bytes`.
+pub fn truncate_with_notice(s: &str, max_bytes: usize) -> String {
+    let total = s.len();
+    if total <= max_bytes {
+        return s.to_owned();
+    }
+    let mut kept = max_bytes;
+    for _ in 0..4 {
+        let marker = format!("\n… [truncated: {kept} of {total} bytes shown]");
+        let budget = max_bytes.saturating_sub(marker.len());
+        let mut next_kept = budget.min(total);
+        while next_kept > 0 && !s.is_char_boundary(next_kept) {
+            next_kept -= 1;
+        }
+        let final_marker = format!("\n… [truncated: {next_kept} of {total} bytes shown]");
+        if next_kept + final_marker.len() <= max_bytes {
+            let mut out = String::with_capacity(next_kept + final_marker.len());
+            out.push_str(&s[..next_kept]);
+            out.push_str(&final_marker);
+            return out;
+        }
+        kept = next_kept;
+    }
+    let short = format!("[truncated: 0 of {total} bytes shown]");
+    if short.len() <= max_bytes {
+        return short;
+    }
+    let mut end = max_bytes.min(total);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}

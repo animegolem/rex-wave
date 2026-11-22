@@ -420,10 +420,13 @@ impl ReadSide {
                     match tokio::time::timeout_at(until, stream.next()).await {
                         Ok(item) => item,
                         Err(_) => {
+                            let total_count = entries.len();
                             return Ok(Page {
                                 entries,
                                 cursor,
                                 timed_out: true,
+                                total_count,
+                                truncated: false,
                             });
                         }
                     }
@@ -442,10 +445,13 @@ impl ReadSide {
                             cursor.advance(&extra.stream, extra.seq);
                             entries.push(extra);
                         }
+                        let total_count = entries.len();
                         return Ok(Page {
                             entries,
                             cursor,
                             timed_out: false,
+                            total_count,
+                            truncated: false,
                         });
                     }
                 }
@@ -453,10 +459,13 @@ impl ReadSide {
                     cursor = c;
                     caught_up = true;
                     if !entries.is_empty() {
+                        let total_count = entries.len();
                         return Ok(Page {
                             entries,
                             cursor,
                             timed_out: false,
+                            total_count,
+                            truncated: false,
                         });
                     }
                     if req.timeout_ms == Some(0) {
@@ -464,16 +473,21 @@ impl ReadSide {
                             entries,
                             cursor,
                             timed_out: true,
+                            total_count: 0,
+                            truncated: false,
                         });
                     }
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e),
                 None => {
+                    let total_count = entries.len();
                     return Ok(Page {
                         entries,
                         cursor,
                         timed_out: false,
+                        total_count,
+                        truncated: false,
                     });
                 }
             }
@@ -869,12 +883,18 @@ impl Service<ReadCommand> for ReadSide {
                         .journal
                         .read(&r.stream, r.after, limit)
                         .map_err(store_error)?;
+                    let head = self.journal.head(&r.stream).map_err(store_error)?;
+                    let total_count =
+                        (head.0.saturating_sub(r.after.0) as usize).max(entries.len());
+                    let truncated = entries.len() < total_count;
                     let last = entries.last().map_or(r.after, |e| e.seq);
                     let cursor = Cursor::default().with(r.stream, last);
                     Ok(WireReply::Read(Page {
                         entries,
                         cursor,
                         timed_out: false,
+                        total_count,
+                        truncated,
                     }))
                 }
                 ReadCommand::Wait(w) => Ok(WireReply::Wait(self.wait_for(ctx.by, w).await?)),

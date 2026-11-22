@@ -36,7 +36,22 @@ rex-wave read '#general' --re 7
 rex-wave read '#general' --label status=open --json
 ```
 
-Room targets accept `#<channel>`, `#<project>/<channel>`, `@<seat>`, and `@<wave>/<role>`.
+Room targets accept `#<channel>`, `#<project>/<channel>`, `@<seat>`, and `@<wave>/<role>`. Capped reads (`read`, `inbox`, `tasks list --limit`) print `[showing N of M — use --limit / --before / --since to page]` whenever results are truncated.
+
+## Waves (provenance, one-writer ownership, and refusal honesty)
+
+Launch and finish multi-worker waves with explicit account provenance, project-owned output directories, disjoint write targets, and completion safety checks:
+
+```sh
+rex-wave wave start auth-v2 --project proj_123 --goal "Audit OAuth" \
+  --account work --output-dir runs/auth-v2 \
+  --worker builder=codex/gpt-6.1-sol --worker verifier=claude-code/claude-opus-5-5 \
+  --worker-output builder=runs/auth-v2/builder \
+  --worker-writes builder=src/auth.rs \
+  --worker-schema verifier='{"type":"object"}'
+rex-wave wave status auth-v2
+rex-wave wave finish auth-v2 --summary "Verified" # exits 3 if any worker refused (⊘) or errored (✕); pass --allow-incomplete to override
+```
 
 ## Post and reply with optimistic concurrency
 

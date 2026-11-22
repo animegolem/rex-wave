@@ -317,6 +317,8 @@ impl Decider for ToyInbox {
                 items: vec![],
                 unread: 0,
                 cursors: vec![],
+                total_count: 0,
+                truncated: false,
             }),
             InboxCommand::InboxAck(_) => WireReply::InboxAck(Ack),
             InboxCommand::InboxMarkRead(_) => WireReply::InboxMarkRead(Ack),
@@ -1289,28 +1291,36 @@ impl Service<WaveCommand> for RecordingWaves {
                     let agent = rex_wave_api::wave::AgentSpec {
                         provider: ProviderId::parse("codex").unwrap(),
                         model: None,
+                        account: None,
                         reasoning: None,
                         service_tier: None,
                         permission: rex_wave_api::wave::PermissionMode::AcceptEdits,
                         workspace: rex_wave_api::wave::Workspace::ProjectDefault,
                     };
+                    let workers = vec![(
+                        role,
+                        agent.clone(),
+                        rex_wave_api::wave::WorkerPhase::Live {
+                            thread: BbThreadId::parse("t3:w1:author:a1").unwrap(),
+                            activity: act,
+                        },
+                    )];
+                    let counts = rex_wave_api::wave::WaveCounts::from_phases(
+                        workers.iter().map(|(_, _, p)| p),
+                    );
                     Ok(WireReply::WaveView(rex_wave_api::wave::WaveSnapshot {
                         spec: rex_wave_api::wave::WaveSpec {
                             slug: v.wave,
                             project: BbProjectId::parse("proj_1").unwrap(),
                             goal: Body::parse("goal").unwrap(),
-                            defaults: agent.clone(),
+                            defaults: agent,
+                            output_dir: None,
                             workers: vec![],
                         },
                         status: rex_wave_api::wave::WaveStatus::Running,
-                        workers: vec![(
-                            role,
-                            agent,
-                            rex_wave_api::wave::WorkerPhase::Live {
-                                thread: BbThreadId::parse("t3:w1:author:a1").unwrap(),
-                                activity: act,
-                            },
-                        )],
+                        workers,
+                        counts,
+                        worker_meta: std::collections::BTreeMap::new(),
                     }))
                 }
                 _ => Err(ApiError::Unavailable {

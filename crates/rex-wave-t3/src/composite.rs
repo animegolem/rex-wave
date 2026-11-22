@@ -6,7 +6,7 @@
 use crate::protocol::is_t3_thread_id;
 use rex_wave_api::read::ThreadPageView;
 use rex_wave_api::room::Body;
-use rex_wave_api::wave::{InteractionResolution, SteerDeliveryMode};
+use rex_wave_api::wave::{InteractionResolution, Observation, SteerDeliveryMode};
 use rex_wave_api::{
     ApiError, BbInteractionId, BbProjectId, BbSeq, BbThreadId, Family, FrameStream, ProviderId,
     RoleName, WaveSlug,
@@ -205,6 +205,26 @@ impl<B: AgentHost, T: AgentHost> AgentHost for CompositeHost<B, T> {
                 },
                 RunnerTarget::Bb => match &self.bb {
                     Some(bb) => bb.retire(&thread).await,
+                    None => Err(HostError::Unreachable("BB host is not configured".into())),
+                },
+            }
+        }
+    }
+
+    fn check_live(
+        &self,
+        thread: &BbThreadId,
+    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
+        let target = route_thread(thread);
+        let thread = thread.clone();
+        async move {
+            match target {
+                RunnerTarget::T3 => match &self.t3 {
+                    Some(t3) => t3.check_live(&thread).await,
+                    None => Err(HostError::Unreachable("T3 host is not configured".into())),
+                },
+                RunnerTarget::Bb => match &self.bb {
+                    Some(bb) => bb.check_live(&thread).await,
                     None => Err(HostError::Unreachable("BB host is not configured".into())),
                 },
             }

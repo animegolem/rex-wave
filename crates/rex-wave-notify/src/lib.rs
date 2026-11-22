@@ -200,14 +200,19 @@ pub fn org_conflict_resolved_draft(path: impl Into<String>, org_id: OrgId) -> No
 
 fn snippet(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
-    let mut out = String::new();
-    for (idx, ch) in trimmed.chars().enumerate() {
-        if idx >= max_chars {
-            out.push_str("...");
-            break;
-        }
-        out.push(if ch == '\n' || ch == '\r' { ' ' } else { ch });
+    let total_chars = trimmed.chars().count();
+    if total_chars <= max_chars {
+        return trimmed
+            .chars()
+            .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+            .collect();
     }
+    let mut out: String = trimmed
+        .chars()
+        .take(max_chars)
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .collect();
+    out.push_str(&format!("… [{max_chars} of {total_chars} chars shown]"));
     out
 }
 
@@ -314,6 +319,7 @@ fn is_blocking_mail(item: &mail::MailboxItem) -> bool {
 pub fn rank(kind: &NotifyKind, age_ms: u64) -> Rank {
     let base: u16 = match kind {
         NotifyKind::Interaction { .. } => 9_000,
+        NotifyKind::WorkerRefused { .. } => 8_500,
         NotifyKind::Mail { item } if is_blocking_mail(item) => 8_000,
         NotifyKind::LetterBanked { letter } if is_blocking_mail(&letter.item) => 8_000,
         NotifyKind::DirectMessage { .. } => 7_000,
@@ -478,6 +484,7 @@ impl HeraldView {
                         self.blocked
                             .insert(key, (interaction.id.clone(), interaction.summary.clone()));
                     }
+                    wave::Observation::RuntimeMeta { .. } => {}
                     _ => {
                         if let Some((old_id, old_summary)) =
                             self.blocked.remove(&(wave.clone(), role.clone()))
@@ -1288,6 +1295,27 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     }
                 }
                 wave::Observation::Activity {
+                    activity: wave::Activity::Refused { reason },
+                } => {
+                    for op in view.operators_for_wave(wave) {
+                        out.push((
+                            op,
+                            NotificationDraft {
+                                kind: NotifyKind::WorkerRefused {
+                                    wave: wave.clone(),
+                                    role: role.clone(),
+                                    reason: reason.clone(),
+                                    seq: entry.seq,
+                                },
+                                title: format!("@{wave}/{role} refused"),
+                                preview: snippet(reason, 160),
+                                actions: Vec::new(),
+                                dedupe: format!("worker-refused:{wave}:{role}"),
+                            },
+                        ));
+                    }
+                }
+                wave::Observation::Activity {
                     activity: wave::Activity::Errored { error },
                 }
                 | wave::Observation::SpawnFailed { error, .. } => {
@@ -1311,6 +1339,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 }
                 wave::Observation::Spawned { .. }
                 | wave::Observation::Activity { .. }
+                | wave::Observation::RuntimeMeta { .. }
                 | wave::Observation::Archived => {}
             },
             wave::WaveEvent::Finished { outcome } => {
@@ -1506,6 +1535,20 @@ fn kinds_equal(a: &NotifyKind, b: &NotifyKind) -> bool {
                 seq: s2,
             },
         ) => w1 == w2 && r1 == r2 && y1 == y2 && s1 == s2,
+        (
+            NotifyKind::WorkerRefused {
+                wave: w1,
+                role: r1,
+                reason: y1,
+                seq: s1,
+            },
+            NotifyKind::WorkerRefused {
+                wave: w2,
+                role: r2,
+                reason: y2,
+                seq: s2,
+            },
+        ) => w1 == w2 && r1 == r2 && y1 == y2 && s1 == s2,
         (NotifyKind::WaveFinished { wave: w1 }, NotifyKind::WaveFinished { wave: w2 }) => w1 == w2,
         (NotifyKind::CardAssigned { card: c1 }, NotifyKind::CardAssigned { card: c2 }) => {
             c1.board == c2.board && c1.no == c2.no && c1.revision == c2.revision
@@ -1633,6 +1676,10 @@ impl Decider for Inbox {
                     if let (
                         NotifyKind::WorkerStuck { seq: prev_seq, .. },
                         NotifyKind::WorkerStuck { seq: new_seq, .. },
+                    )
+                    | (
+                        NotifyKind::WorkerRefused { seq: prev_seq, .. },
+                        NotifyKind::WorkerRefused { seq: new_seq, .. },
                     ) = (&existing.draft.kind, &c.draft.kind)
                     {
                         if new_seq <= prev_seq {
@@ -1876,18 +1923,21 @@ impl Decider for Inbox {
                     .items
                     .get(id)
                     .map_or((NotifyState::Unread, meta.at), |n| (n.state, n.at));
-                let next_at = if matches!(draft.kind, NotifyKind::WorkerStuck { .. })
-                    || (matches!(
+                let next_at =
+                    if matches!(
+                        draft.kind,
+                        NotifyKind::WorkerStuck { .. } | NotifyKind::WorkerRefused { .. }
+                    ) || (matches!(
                         draft.kind,
                         NotifyKind::MailUnrung { .. }
                             | NotifyKind::TransportDown { .. }
                             | NotifyKind::OrgConflict { .. }
                     ) && matches!(prev_state, NotifyState::Done | NotifyState::Dismissed))
-                {
-                    meta.at
-                } else {
-                    prev_at
-                };
+                    {
+                        meta.at
+                    } else {
+                        prev_at
+                    };
                 if let Some(old) = state.items.get(id)
                     && old.draft.dedupe != draft.dedupe
                 {
@@ -1955,13 +2005,17 @@ impl Decider for Inbox {
                     })
                     .collect();
                 items.sort_by(|a, b| (b.rank, b.at, b.id).cmp(&(a.rank, a.at, a.id)));
+                let total_count = items.len();
                 items.truncate(limit);
+                let truncated = items.len() < total_count;
                 let cursors = state.cursors.iter().map(|(r, s)| (r.clone(), *s)).collect();
                 WireReply::InboxList(InboxPage {
                     head: state.head,
                     items,
                     unread,
                     cursors,
+                    total_count,
+                    truncated,
                 })
             }
             InboxCommand::InboxAck(_) => WireReply::InboxAck(Ack),

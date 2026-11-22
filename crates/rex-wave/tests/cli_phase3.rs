@@ -279,6 +279,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
     let agent = AgentSpec {
         provider: ProviderId::parse("antigravity").unwrap(),
         model: None,
+        account: None,
         reasoning: None,
         service_tier: None,
         permission: PermissionMode::AcceptEdits,
@@ -291,10 +292,14 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
                 project: BbProjectId::parse("proj_1").unwrap(),
                 goal: Body::parse("test t3 worker cli").unwrap(),
                 defaults: agent.clone(),
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("work").unwrap(),
                     agent: Some(agent),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,
@@ -478,6 +483,241 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
     .await
     .unwrap();
     assert!(!retired_post.status.success());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn cli_wave_honesty_enforces_one_writer_refusals_finish_gate_account_mismatch_and_caps() {
+    let dir = fresh_dir("honesty");
+    let sock = dir.0.join("daemon.sock");
+    let sock_str = sock.to_string_lossy().into_owned();
+
+    let journal = Journal::open(&dir.0.join("journal.sqlite3")).unwrap();
+    let hub = Hub::new(128);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let (listener, daemon_uid) = bind_unix(&sock).unwrap();
+    let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
+        SeatName::parse("owner").unwrap(),
+        Some(daemon_uid),
+        &dir.0,
+    ));
+    let server = tokio::spawn(serve_listener(listener, router.clone(), auth));
+
+    let run_cli = |args: Vec<&str>| {
+        let s = sock_str.clone();
+        let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        tokio::task::spawn_blocking(move || {
+            Command::new(bin_path())
+                .arg("--socket")
+                .arg(&s)
+                .args(&owned)
+                .output()
+                .unwrap()
+        })
+    };
+
+    // 1. Structural one-writer violation on wave start exits 3 (Conflict).
+    let overlap_out = run_cli(vec![
+        "wave",
+        "start",
+        "bad-overlap",
+        "--project",
+        "proj_1",
+        "--goal",
+        "Test overlap",
+        "--worker",
+        "w1=codex/gpt-6.1-sol",
+        "--worker",
+        "w2=claude-code/claude-opus-5-5",
+        "--worker-writes",
+        "w1=src/auth.rs",
+        "--worker-writes",
+        "w2=./src/auth.rs",
+    ])
+    .await
+    .unwrap();
+    assert_eq!(overlap_out.status.code(), Some(3));
+
+    // 2. Clean wave with --account + --output-dir succeeds.
+    let start_out = run_cli(vec![
+        "wave",
+        "start",
+        "honesty-cli",
+        "--project",
+        "proj_1",
+        "--goal",
+        "Verify wave honesty CLI",
+        "--account",
+        "work-acct",
+        "--output-dir",
+        "runs/honesty-cli",
+        "--worker",
+        "auditor=claude-code/claude-opus-5-5",
+        "--worker",
+        "builder=codex/gpt-6.1-sol",
+    ])
+    .await
+    .unwrap();
+    assert!(
+        start_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&start_out.stderr)
+    );
+
+    let sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
+    );
+    let wave = WaveSlug::parse("honesty-cli").unwrap();
+    let auditor = RoleName::parse("auditor").unwrap();
+    let builder = RoleName::parse("builder").unwrap();
+
+    sys.call(WaveObserve {
+        wave: wave.clone(),
+        role: auditor.clone(),
+        observation: Observation::Spawned {
+            attempt: 1,
+            thread: BbThreadId::parse("th_auditor").unwrap(),
+        },
+    })
+    .await
+    .unwrap();
+    sys.call(WaveObserve {
+        wave: wave.clone(),
+        role: builder.clone(),
+        observation: Observation::Spawned {
+            attempt: 1,
+            thread: BbThreadId::parse("th_builder").unwrap(),
+        },
+    })
+    .await
+    .unwrap();
+    sys.call(WaveObserve {
+        wave: wave.clone(),
+        role: auditor.clone(),
+        observation: Observation::RuntimeMeta {
+            actual_model: Some(ModelId::parse("claude-opus-5-5-actual").unwrap()),
+            actual_account: Some("personal-acct".into()),
+        },
+    })
+    .await
+    .unwrap();
+    sys.call(WaveObserve {
+        wave: wave.clone(),
+        role: auditor.clone(),
+        observation: Observation::Activity {
+            activity: Activity::Refused {
+                reason: "cyber_safeguard: blocked".into(),
+            },
+        },
+    })
+    .await
+    .unwrap();
+
+    // 3. wave status prints refused count, ⊘ refusal detail, and ACCOUNT MISMATCH.
+    let status_out = run_cli(vec!["wave", "status", "honesty-cli"])
+        .await
+        .unwrap();
+    assert!(status_out.status.success());
+    let status_txt = String::from_utf8_lossy(&status_out.stdout);
+    assert!(
+        status_txt.contains("refused=1"),
+        "expected refused=1 in wave status:\n{status_txt}"
+    );
+    assert!(
+        status_txt.contains("⊘ refused: cyber_safeguard: blocked"),
+        "expected ⊘ refused detail in wave status:\n{status_txt}"
+    );
+    assert!(
+        status_txt.contains("[ACCOUNT MISMATCH]"),
+        "expected ACCOUNT MISMATCH in wave status:\n{status_txt}"
+    );
+    assert!(
+        status_txt.contains("acct=work-acct (unconfirmed)"),
+        "expected unconfirmed requested account marker on builder:\n{status_txt}"
+    );
+
+    // 4. wave finish without --allow-incomplete exits 3; with --allow-incomplete succeeds.
+    let finish_blocked = run_cli(vec!["wave", "finish", "honesty-cli", "--summary", "done"])
+        .await
+        .unwrap();
+    assert_eq!(finish_blocked.status.code(), Some(3));
+    let finish_ok = run_cli(vec![
+        "wave",
+        "finish",
+        "honesty-cli",
+        "--summary",
+        "partial",
+        "--allow-incomplete",
+    ])
+    .await
+    .unwrap();
+    assert!(
+        finish_ok.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&finish_ok.stderr)
+    );
+
+    // 5. Lesson 4: read --limit 1 and tasks list --limit 1 print accurate per-command N of M hints,
+    //    and tasks list --board --limit is rejected instead of silently ignored.
+    for title in ["Task 1", "Task 2"] {
+        let out = run_cli(vec!["tasks", "add", "#caps", title]).await.unwrap();
+        assert!(out.status.success());
+    }
+    let read_capped = run_cli(vec!["read", "#caps", "--limit", "1"])
+        .await
+        .unwrap();
+    assert!(read_capped.status.success());
+    let read_txt = String::from_utf8_lossy(&read_capped.stdout);
+    assert!(
+        read_txt.contains("[showing 1 of ")
+            && read_txt.contains("use --after ")
+            && read_txt.contains("/ --cursor / --limit to page]"),
+        "expected N of M cap banner on read --limit 1:\n{read_txt}"
+    );
+
+    let tasks_capped = run_cli(vec!["tasks", "list", "#caps", "--limit", "1"])
+        .await
+        .unwrap();
+    assert!(tasks_capped.status.success());
+    let tasks_txt = String::from_utf8_lossy(&tasks_capped.stdout);
+    assert!(
+        tasks_txt.contains("[showing 1 of 2 — raise --limit (max 1000) to see more]"),
+        "expected N of M cap banner on tasks list --limit 1:\n{tasks_txt}"
+    );
+
+    let board_limit_err = run_cli(vec![
+        "tasks",
+        "list",
+        "--board",
+        "seat:owner",
+        "--limit",
+        "1",
+    ])
+    .await
+    .unwrap();
+    assert!(
+        !board_limit_err.status.success(),
+        "tasks list --board --limit must be rejected instead of silently ignored"
+    );
 
     server.abort();
 }

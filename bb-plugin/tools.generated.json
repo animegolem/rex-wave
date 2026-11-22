@@ -3122,6 +3122,15 @@
           ],
           "default": null
         },
+        "limit": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "room": {
           "$ref": "#/$defs/RoomRef"
         }
@@ -3141,6 +3150,14 @@
         "AgentSpec": {
           "description": "Which BB provider/model runs a worker. Any provider BB has configured.",
           "properties": {
+            "account": {
+              "default": null,
+              "description": "Optional explicit paying account / billing profile expected for this worker.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "model": {
               "default": null,
               "description": "model",
@@ -3241,9 +3258,29 @@
               "minLength": 1,
               "type": "string"
             },
+            "output_dir": {
+              "default": null,
+              "description": "Project-owned output directory for this worker; defaults to `<wave.output_dir>/<role>`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "return_schema": {
+              "default": null,
+              "description": "Optional JSON Schema describing the expected structured return payload."
+            },
             "role": {
               "description": "role",
               "type": "string"
+            },
+            "writes": {
+              "default": [],
+              "description": "Exclusive project-owned write targets declared by this worker (enforced one-writer per path).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [
@@ -3477,6 +3514,11 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "allow_incomplete": {
+          "default": false,
+          "description": "Explicitly permit `WaveOutcome::Completed` even when workers were refused or errored.",
+          "type": "boolean"
+        },
         "outcome": {
           "$ref": "#/$defs/WaveOutcome"
         },

@@ -583,6 +583,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     let default_agent = AgentSpec {
         provider: ProviderId::parse("codex").unwrap(),
         model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+        account: None,
         reasoning: Some("xhigh".into()),
         service_tier: None,
         permission: PermissionMode::AcceptEdits,
@@ -591,6 +592,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     let verifier_agent = AgentSpec {
         provider: ProviderId::parse("claude-code").unwrap(),
         model: Some(ModelId::parse("claude-opus-5-5").unwrap()),
+        account: None,
         reasoning: Some("xhigh".into()),
         service_tier: None,
         permission: PermissionMode::AcceptEdits,
@@ -604,16 +606,23 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
                 project: project_id.clone(),
                 goal: Body::parse("Ship token rotation").unwrap(),
                 defaults: default_agent.clone(),
+                output_dir: None,
                 workers: vec![
                     WorkerSpec {
                         role: builder_role.clone(),
                         brief: Body::parse("Implement refresh rotation").unwrap(),
                         agent: Some(default_agent),
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
                     },
                     WorkerSpec {
                         role: verifier_role.clone(),
                         brief: Body::parse("Verify token rotation invariants").unwrap(),
                         agent: Some(verifier_agent),
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
                     },
                 ],
             },
@@ -1345,6 +1354,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             outcome: WaveOutcome::Completed {
                 summary: Body::parse("Rotation verified end to end").unwrap(),
             },
+            allow_incomplete: false,
         })
         .await
         .expect("finish wave");

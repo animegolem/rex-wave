@@ -450,10 +450,112 @@ pub enum ShellObservation {
         request_kind: Option<String>,
     },
     Working,
+    Refused(String),
     Errored(String),
     Idle {
         mirror_candidate: bool,
     },
+}
+
+/// Inspect only explicit stop/finish reason or provider error-code fields on a T3 object.
+/// Safe on `idle`/`completed` shells where a stale `lastError` from an earlier run may linger.
+pub fn extract_explicit_stop_refusal(obj: &Value) -> Option<String> {
+    let candidates = [
+        obj.get("stopReason").and_then(|v| v.as_str()),
+        obj.get("stop_reason").and_then(|v| v.as_str()),
+        obj.get("finishReason").and_then(|v| v.as_str()),
+        obj.get("finish_reason").and_then(|v| v.as_str()),
+        obj.get("status").and_then(|v| v.as_str()),
+        obj.get("errorCategory").and_then(|v| v.as_str()),
+        obj.get("providerCode").and_then(|v| v.as_str()),
+    ];
+    for sr in candidates.into_iter().flatten() {
+        if rex_wave_api::wave::is_refusal_stop_reason(sr) {
+            return Some(sr.to_owned());
+        }
+    }
+    None
+}
+
+/// Inspect a failed T3 thread shell, run object, or error payload for safety/policy refusal signals.
+pub fn extract_refusal_reason(obj: &Value) -> Option<String> {
+    let msg = obj
+        .get("lastError")
+        .or_else(|| obj.get("error"))
+        .or_else(|| obj.get("message"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(sr) = extract_explicit_stop_refusal(obj) {
+        return Some(match msg {
+            Some(m) if !m.to_ascii_lowercase().contains(&sr.to_ascii_lowercase()) => {
+                format!("{sr}: {m}")
+            }
+            Some(m) => m.to_owned(),
+            None => sr,
+        });
+    }
+    if let Some(m) = msg
+        && rex_wave_api::wave::is_refusal_error_text(m)
+    {
+        return Some(m.to_owned());
+    }
+    None
+}
+
+/// Extract host-reported runtime `(actual_model, actual_account)` from a T3 shell, launch reply,
+/// or projection. Ignores launch-time `modelSelection` echoes so unconfirmed requests stay `None`.
+pub fn extract_runtime_meta_from_value(
+    raw: &Value,
+) -> (Option<rex_wave_api::ModelId>, Option<String>) {
+    let proj = unwrap_projection(raw);
+    let thread = proj.get("thread").unwrap_or(proj);
+    let latest_run = proj.get("runs").and_then(|v| v.as_array()).and_then(|arr| {
+        arr.iter()
+            .max_by_key(|r| r.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0))
+    });
+
+    let model_str = latest_run
+        .and_then(|r| {
+            r.get("actualModel")
+                .or_else(|| r.get("model"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            thread
+                .get("actualModel")
+                .or_else(|| thread.get("model"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            proj.get("actualModel")
+                .or_else(|| proj.get("model"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let model = model_str.and_then(|s| rex_wave_api::ModelId::parse(s).ok());
+
+    fn direct_account(obj: &Value) -> Option<&str> {
+        obj.get("actualAccount")
+            .or_else(|| obj.get("actual_account"))
+            .or_else(|| obj.get("accountEmail"))
+            .or_else(|| obj.get("accountName"))
+            .or_else(|| obj.get("account_name"))
+            .or_else(|| obj.get("account"))
+            .or_else(|| obj.get("profile"))
+            .and_then(|v| v.as_str())
+    }
+    let account = latest_run
+        .and_then(direct_account)
+        .or_else(|| direct_account(thread))
+        .or_else(|| direct_account(proj))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    (model, account)
 }
 
 pub fn derive_shell_observation(shell: &Value, location: Option<&str>) -> Option<ShellObservation> {
@@ -497,6 +599,9 @@ pub fn derive_shell_observation(shell: &Value, location: Option<&str>) -> Option
             Some(ShellObservation::Working)
         }
         "failed" => {
+            if let Some(reason) = extract_refusal_reason(shell) {
+                return Some(ShellObservation::Refused(reason));
+            }
             let err = shell
                 .get("lastError")
                 .and_then(|v| v.as_str())
@@ -505,12 +610,22 @@ pub fn derive_shell_observation(shell: &Value, location: Option<&str>) -> Option
                 .to_owned();
             Some(ShellObservation::Errored(err))
         }
-        "idle" | "completed" => Some(ShellObservation::Idle {
-            mirror_candidate: true,
-        }),
+        "idle" | "completed" => {
+            if let Some(reason) = extract_explicit_stop_refusal(shell) {
+                return Some(ShellObservation::Refused(reason));
+            }
+            Some(ShellObservation::Idle {
+                mirror_candidate: true,
+            })
+        }
         "interrupted" | "cancelled" | "rolled_back" => Some(ShellObservation::Idle {
             mirror_candidate: false,
         }),
+        other if rex_wave_api::wave::is_refusal_stop_reason(other) => {
+            Some(ShellObservation::Refused(
+                extract_refusal_reason(shell).unwrap_or_else(|| other.to_owned()),
+            ))
+        }
         _ => None,
     }
 }
@@ -1208,6 +1323,7 @@ mod tests {
             agent: AgentSpec {
                 provider: ProviderId::parse("t3:antigravity").unwrap(),
                 model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                account: None,
                 reasoning: Some("xhigh".into()),
                 service_tier: None,
                 permission: PermissionMode::AcceptEdits,
@@ -1220,6 +1336,10 @@ mod tests {
             room,
             prompt: Body::parse("review PR").unwrap(),
             title: "[w1] @reviewer".into(),
+            run_stamp: "w1:reviewer:attempt-1:seq-1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
         };
         let tid = deterministic_thread_id(&wave, &role, 1).unwrap();
         let payload =
@@ -1578,5 +1698,58 @@ mod tests {
         assert!(k1.as_str().starts_with("wave:"));
         assert!(k1.as_str().contains(":turn:"));
         assert!(k1.as_str().len() <= 256);
+    }
+
+    #[test]
+    fn t3_refusal_stop_reasons_runtime_meta_and_stale_last_error_handling_work() {
+        // Explicit stopReason on completed shell is Refused; launch-time modelSelection is NOT echoed as actual_*.
+        let shell_refused = json!({
+            "status": "completed",
+            "stopReason": "safety",
+            "modelSelection": {
+                "model": "gemini-4-neon",
+                "options": [{ "id": "account", "value": "work-acct" }]
+            }
+        });
+        assert_eq!(
+            derive_shell_observation(&shell_refused, None),
+            Some(ShellObservation::Refused("safety".into()))
+        );
+        let (model, account) = extract_runtime_meta_from_value(&shell_refused);
+        assert_eq!(model, None);
+        assert_eq!(account, None);
+
+        // Runtime-reported model & account on latest run are extracted.
+        let proj_runtime = json!({
+            "thread": { "modelSelection": { "model": "requested-model" } },
+            "runs": [{ "ordinal": 1, "model": "gemini-4-neon", "accountEmail": "work-acct@example.com" }]
+        });
+        let (run_model, run_acct) = extract_runtime_meta_from_value(&proj_runtime);
+        assert_eq!(
+            run_model.as_ref().map(ModelId::as_str),
+            Some("gemini-4-neon")
+        );
+        assert_eq!(run_acct.as_deref(), Some("work-acct@example.com"));
+
+        // S11: stale lastError on a later clean idle/completed shell must NOT trigger Refused.
+        let stale_idle = json!({
+            "status": "idle",
+            "lastError": "Request blocked by cyber_safeguard policy"
+        });
+        assert_eq!(
+            derive_shell_observation(&stale_idle, None),
+            Some(ShellObservation::Idle {
+                mirror_candidate: true
+            })
+        );
+
+        let failed_refusal = json!({
+            "status": "failed",
+            "lastError": "Request blocked by cyber_safeguard policy"
+        });
+        assert!(matches!(
+            derive_shell_observation(&failed_refusal, None),
+            Some(ShellObservation::Refused(ref r)) if r.contains("cyber_safeguard")
+        ));
     }
 }
