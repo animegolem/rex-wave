@@ -1213,6 +1213,7 @@ async fn dispatch_json_route(
                     .await
                     .map_err(|e| mask_err(e, &format!("room {room}")))?;
                 p.timed_out = false;
+                let total_count = p.entries.len();
                 if let Some(lim) = limit {
                     let cap = lim.clamp(1, 1000) as usize;
                     if p.entries.len() > cap {
@@ -1227,6 +1228,8 @@ async fn dispatch_json_route(
                         }
                     }
                 }
+                p.total_count = total_count;
+                p.truncated = p.entries.len() < total_count;
                 p
             } else {
                 client
@@ -1314,10 +1317,18 @@ async fn dispatch_json_route(
             } else {
                 None
             };
+            let limit =
+                match req.query_param("limit") {
+                    Some(raw) => Some(raw.parse::<u32>().map_err(|_| {
+                        HttpError::new("400 Bad Request", "invalid", "invalid limit")
+                    })?),
+                    None => None,
+                };
             let tasks = client
                 .call(RoomTasks {
                     room: room_ref,
                     filter,
+                    limit,
                 })
                 .await
                 .map_err(|e| mask_err(e, &format!("room {room}")))?;

@@ -1615,8 +1615,9 @@ fn render_agent(
     }
 
     let phase = find_worker_phase(ctx.overview, &inspector.wave, &inspector.role);
+    let refusal_detail = agent_refusal_detail(phase, &inspector.page.activity);
     let error_detail = agent_error_detail(phase, &inspector.page.activity);
-    let error_h = u16::from(error_detail.is_some());
+    let error_h = u16::from(refusal_detail.is_some() || error_detail.is_some());
     let pending = inspector.active_pending();
     let pending_h = if pending.is_some() { 2 } else { 0 };
     let composer_h = composer_height(&inspector.composer, inner.width, ctx.composing, " Steer > ");
@@ -1746,10 +1747,11 @@ fn render_agent(
         buf,
     );
 
-    if let Some(err_text) = error_detail
+    if let Some((label, detail_text)) = refusal_detail
+        .map(|r| (" ⊘ Refused: ", r))
+        .or_else(|| error_detail.map(|e| (" ✕ Error: ", e)))
         && error_area.height >= 1
     {
-        let label = " ✕ Error: ";
         let max_err = (error_area.width as usize).saturating_sub(display_width(label));
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1757,7 +1759,7 @@ fn render_agent(
                 Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                truncate_chars(err_text, max_err),
+                truncate_chars(detail_text, max_err),
                 Style::default().fg(Color::White),
             ),
         ]))
@@ -2253,7 +2255,9 @@ pub fn find_blocked_worker_for_room(
 
 fn card_tone(kind: &NotifyKind) -> CardTone {
     match kind {
-        NotifyKind::Interaction { .. } | NotifyKind::WorkerStuck { .. } => CardTone::Approval,
+        NotifyKind::Interaction { .. }
+        | NotifyKind::WorkerRefused { .. }
+        | NotifyKind::WorkerStuck { .. } => CardTone::Approval,
         NotifyKind::Mention { .. } | NotifyKind::DirectMessage { .. } => CardTone::Mention,
         NotifyKind::Mail { .. }
         | NotifyKind::LetterBanked { .. }
@@ -2269,6 +2273,7 @@ fn card_tone(kind: &NotifyKind) -> CardTone {
 pub(crate) fn kind_label(kind: &NotifyKind) -> &'static str {
     match kind {
         NotifyKind::Interaction { .. } => "APPROVAL",
+        NotifyKind::WorkerRefused { .. } => "REFUSED",
         NotifyKind::WorkerStuck { .. } => "STUCK",
         NotifyKind::Mention { .. } => "MENTION",
         NotifyKind::DirectMessage { .. } => "DM",
@@ -2305,6 +2310,15 @@ fn find_worker_phase<'a>(
         .map(|wk| &wk.phase)
 }
 
+fn agent_refusal_detail<'a>(
+    phase: Option<&'a WorkerPhase>,
+    activity: &'a Activity,
+) -> Option<&'a str> {
+    phase
+        .and_then(WorkerPhase::refusal)
+        .or_else(|| activity.refusal())
+}
+
 fn agent_error_detail<'a>(
     phase: Option<&'a WorkerPhase>,
     activity: &'a Activity,
@@ -2316,15 +2330,23 @@ fn agent_error_detail<'a>(
 
 fn agent_status_badge(phase: Option<&WorkerPhase>, activity: &Activity) -> (&'static str, Color) {
     match phase {
-        Some(WorkerPhase::Retired { errored, .. }) => {
-            if errored.is_some() || activity.error().is_some() {
+        Some(WorkerPhase::Retired {
+            errored, refused, ..
+        }) => {
+            if refused.is_some() || activity.refusal().is_some() {
+                ("⊘ RETIRED (REFUSED)", C_ROSE)
+            } else if errored.is_some() || activity.error().is_some() {
                 ("✕ RETIRED (ERRORED)", C_ROSE)
             } else {
                 ("✓ RETIRED", C_DIM)
             }
         }
-        Some(WorkerPhase::Retiring { errored, .. }) => {
-            if errored.is_some() || activity.error().is_some() {
+        Some(WorkerPhase::Retiring {
+            errored, refused, ..
+        }) => {
+            if refused.is_some() || activity.refusal().is_some() {
+                ("⊘ RETIRING (REFUSED)", C_ROSE)
+            } else if errored.is_some() || activity.error().is_some() {
                 ("✕ RETIRING (ERRORED)", C_ROSE)
             } else {
                 ("✓ RETIRING", C_DIM)
@@ -2341,6 +2363,7 @@ fn activity_badge(activity: &Activity) -> (&'static str, Color) {
         Activity::Parked { .. } => ("◌ PARKED (wait)", C_ACCENT),
         Activity::Idle => ("◌ IDLE", C_DIM),
         Activity::Blocked { .. } => ("◐ BLOCKED", C_AMBER),
+        Activity::Refused { .. } => ("⊘ REFUSED", C_ROSE),
         Activity::Errored { .. } => ("✕ ERRORED", C_ROSE),
     }
 }

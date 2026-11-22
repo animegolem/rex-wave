@@ -113,11 +113,15 @@ Launch a multi-provider wave under a BB project:
 rex-wave wave start auth-v2 \
 	--project proj_123 \
 	--goal "Rotate OAuth refresh tokens" \
+	--account work \
+	--output-dir runs/auth-v2 \
 	--worker builder=codex/gpt-6.1-sol \
-	--worker verifier=claude-code/claude-opus-5-5
+	--worker verifier=claude-code/claude-opus-5-5 \
+	--worker-writes builder=src/auth.rs \
+	--worker-writes verifier=tests/auth_test.rs
 ```
 
-`WaveConductor` opens `#proj_123/wave-auth-v2`, creates the `project:proj_123` Kanban board, posts initial `@<role>` briefs, and spawns hidden worker threads. Coordinate with the wave from the CLI:
+`WaveConductor` opens `#proj_123/wave-auth-v2`, creates the `project:proj_123` Kanban board, stamps each worker attempt with a deterministic `run_stamp`, enforces disjoint per-worker `--output-dir` / `--worker-output` / `--worker-writes` paths (structural one-writer), posts initial `@<role>` briefs, and spawns hidden worker threads. Coordinate with the wave from the CLI:
 
 ```sh
 rex-wave post '#proj_123/wave-auth-v2' '@verifier please check card #1'
@@ -125,6 +129,8 @@ rex-wave task add 'Verify token replay rejection' --board project:proj_123 --lan
 rex-wave wave status auth-v2
 rex-wave promote '#proj_123/wave-auth-v2' 1..4 --to owner --subject 'auth-v2 decision' --topic auth-v2
 rex-wave wave finish auth-v2 --summary 'Merged and verified'
+# If any worker refused (⊘) or errored (✕), completion requires explicit --allow-incomplete:
+rex-wave wave finish auth-v2 --summary 'Partial result' --allow-incomplete
 ```
 
 ## Use the bash CLI and HTTP/SSE API
@@ -155,7 +161,7 @@ When `--http 127.0.0.1:<port>` is enabled, the daemon serves `/v1/health`, `/v1/
 
 ## Run waves on multiple agent hosts
 
-`Waves` and `WaveConductor` in `crates/rex-wave-waves` never import host wire types. They depend only on the four-method `AgentHost` port (`spawn`, `tell`, `resolve`, `retire`) and the read-side `AgentFeed` trait (`page`, `live`).
+`Waves` and `WaveConductor` in `crates/rex-wave-waves` never import host wire types. They depend only on the five-method `AgentHost` port (`spawn`, `tell`, `resolve`, `retire`, `check_live`) and the read-side `AgentFeed` trait (`page`, `live`).
 
 - **BB (`crates/rex-wave-bb` and `bb-plugin/`).** `BbHost` and `BbBridge` implement `AgentHost` and `AgentFeed` over the plugin WebSocket and enforce `threads.stop` settle polling before `threads.archive`.
 - **T3 Code (`crates/rex-wave-t3`).** `T3Host`, `T3Feed`, and `T3Bridge` connect directly over T3 Code's Effect RPC WebSocket and REST API, auto-discover `<t3-home>/userdata/server-runtime.json`, and provision mode-`0600` worker token files under `<state_dir>/worker-tokens/<thread_id>`.

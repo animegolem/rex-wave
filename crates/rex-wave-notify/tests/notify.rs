@@ -81,6 +81,9 @@ impl Decider for TestWaves {
                         agent: w.agent.clone().unwrap_or_else(|| c.spec.defaults.clone()),
                         brief: w.brief.clone(),
                         attempt: 1,
+                        output_dir: w.output_dir.clone(),
+                        writes: w.writes.clone(),
+                        return_schema: w.return_schema.clone(),
                     });
                 }
                 Ok(events)
@@ -153,15 +156,21 @@ impl Decider for TestWaves {
             WaveCommand::WaveFinish(_) => WireReply::WaveFinish(Ack),
             WaveCommand::WaveAddWorker(_) => WireReply::WaveAddWorker(Ack),
             WaveCommand::WaveTell(_) => WireReply::WaveTell(Ack),
-            WaveCommand::WaveView(_) => WireReply::WaveView(WaveSnapshot {
-                spec: state.spec.clone().unwrap(),
-                status: WaveStatus::Running,
-                workers: state
+            WaveCommand::WaveView(_) => {
+                let workers: Vec<_> = state
                     .workers
                     .iter()
                     .map(|(r, (a, p))| (r.clone(), a.clone(), p.clone()))
-                    .collect(),
-            }),
+                    .collect();
+                let counts = WaveCounts::from_phases(workers.iter().map(|(_, _, p)| p));
+                WireReply::WaveView(WaveSnapshot {
+                    spec: state.spec.clone().unwrap(),
+                    status: WaveStatus::Running,
+                    workers,
+                    counts,
+                    worker_meta: BTreeMap::new(),
+                })
+            }
         }
     }
 
@@ -476,15 +485,20 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
                 defaults: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
                     model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+                    account: None,
                     reasoning: Some("xhigh".into()),
                     service_tier: None,
                     permission: PermissionMode::AcceptEdits,
                     workspace: Workspace::ProjectDefault,
                 },
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("Migrate tokens").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,
@@ -879,15 +893,20 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
                 defaults: AgentSpec {
                     provider: ProviderId::parse("acp-opencode").unwrap(),
                     model: Some(ModelId::parse("opencode/gemini-4-argon").unwrap()),
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::Full,
                     workspace: Workspace::ProjectDefault,
                 },
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("Post review to @genga").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,
@@ -1149,11 +1168,13 @@ async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
                 defaults: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
                     model: None,
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::Full,
                     workspace: Workspace::ProjectDefault,
                 },
+                output_dir: None,
                 workers: vec![],
             },
             idem: None,
@@ -1182,6 +1203,7 @@ async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
         .call(WaveFinish {
             wave: wave.clone(),
             outcome: outcome.clone(),
+            allow_incomplete: false,
         })
         .await
         .unwrap();
@@ -1309,15 +1331,20 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
                 defaults: AgentSpec {
                     provider: ProviderId::parse("claude-code").unwrap(),
                     model: None,
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::Full,
                     workspace: Workspace::ProjectDefault,
                 },
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("Review").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,
@@ -2530,4 +2557,195 @@ fn mail_unrung_suppresses_golem_non_seat_targets_and_pre_horizon_history() {
             oldest_at: UnixMs(12_000),
         }
     );
+}
+
+#[tokio::test]
+async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_truncation() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(512);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let herald_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::Herald,
+        },
+    );
+    let herald_task = spawn_reactor(Herald::new(), herald_client);
+    let owner = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let bb = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
+    );
+    let wave = WaveSlug::parse("honesty-refusal").unwrap();
+    let role = RoleName::parse("auditor").unwrap();
+
+    owner
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+                goal: Body::parse("Audit safety").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("Audit").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let long_reason = format!("cyber_safeguard: {}", "x".repeat(220));
+    bb.call(WaveObserve {
+        wave: wave.clone(),
+        role: role.clone(),
+        observation: Observation::Activity {
+            activity: Activity::Refused {
+                reason: long_reason.clone(),
+            },
+        },
+    })
+    .await
+    .unwrap();
+    // Raise a lower-rank stuck card on another role so we can verify ordering & limit truncation.
+    bb.call(WaveObserve {
+        wave: wave.clone(),
+        role: RoleName::parse("helper").unwrap(),
+        observation: Observation::SpawnFailed {
+            attempt: 1,
+            error: "boom".into(),
+        },
+    })
+    .await
+    .unwrap();
+
+    let mut tap = hub.tap();
+    let full = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if page.items.len() >= 2 {
+                return page;
+            }
+            let _ = tap.recv().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(full.total_count, 2);
+    assert!(!full.truncated);
+    assert!(
+        matches!(
+            &full.items[0].draft.kind,
+            NotifyKind::WorkerRefused { role: r, .. } if *r == role
+        ),
+        "WorkerRefused must outrank WorkerStuck: {:?}",
+        full.items
+    );
+    assert!(
+        full.items[0].draft.preview.contains("chars shown"),
+        "truncated preview must show N of M marker: {}",
+        full.items[0].draft.preview
+    );
+    assert!(
+        rank(&full.items[0].draft.kind, 0) > rank(&full.items[1].draft.kind, 0),
+        "WorkerRefused rank should exceed WorkerStuck rank"
+    );
+
+    let capped = owner
+        .call(InboxList {
+            include_done: false,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(capped.items.len(), 1);
+    assert_eq!(capped.total_count, 2);
+    assert!(capped.truncated);
+
+    // Dismissing then receiving a newer refusal seq must reopen to Unread.
+    owner
+        .call(InboxAck {
+            ids: vec![full.items[0].id],
+            state: NotifyState::Dismissed,
+        })
+        .await
+        .unwrap();
+    bb.call(WaveObserve {
+        wave: wave.clone(),
+        role: role.clone(),
+        observation: Observation::Activity {
+            activity: Activity::Refused {
+                reason: "second refusal".into(),
+            },
+        },
+    })
+    .await
+    .unwrap();
+
+    let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = owner
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if let Some(item) = page.items.iter().find(|n| {
+                matches!(
+                    &n.draft.kind,
+                    NotifyKind::WorkerRefused { reason, .. } if reason == "second refusal"
+                )
+            }) {
+                return item.clone();
+            }
+            let _ = tap.recv().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reopened.state, NotifyState::Unread);
+    herald_task.abort();
 }

@@ -7,6 +7,10 @@ export type WaveMeta = {
   role: string;
   attempt: number;
   roomId: string;
+  runStamp?: string;
+  outputDir?: string;
+  writes?: string[];
+  account?: string;
 };
 
 export type ThreadSignal = "created" | "active" | "idle" | "failed" | "archived";
@@ -38,6 +42,9 @@ export type Up =
       project_id: string;
       meta: WaveMeta | null;
       error: string | null;
+      stop_reason?: string | null;
+      model?: string | null;
+      account?: string | null;
     }
   | { t: "interaction"; thread_id: string; meta?: WaveMeta | null; interaction: unknown }
   | { t: "thread_events"; thread_id: string; sequence: number }

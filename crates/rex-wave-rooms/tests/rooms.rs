@@ -1235,6 +1235,7 @@ async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_n
                 ready_only: true,
                 ..Default::default()
             }),
+            limit: None,
         })
         .await
         .unwrap();
@@ -1336,6 +1337,7 @@ async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_n
                 label: Some(Label::parse("area=core").unwrap()),
                 ..Default::default()
             }),
+            limit: None,
         })
         .await
         .unwrap();
@@ -1542,9 +1544,12 @@ async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_n
                 ready_only: true,
                 ..Default::default()
             }),
+            limit: None,
         })
         .await
         .unwrap();
+    assert_eq!(ready_after_a.total_count, 1);
+    assert!(!ready_after_a.truncated);
     assert_eq!(
         ready_after_a
             .tasks
@@ -1553,6 +1558,18 @@ async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_n
             .collect::<Vec<_>>(),
         vec![task_b.seq]
     );
+
+    let limited = op
+        .call(RoomTasks {
+            room: room.clone(),
+            filter: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(limited.tasks.len(), 1);
+    assert_eq!(limited.total_count, 2);
+    assert!(limited.truncated);
 
     let task_c = op
         .call(RoomPost {

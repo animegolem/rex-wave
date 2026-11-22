@@ -31,6 +31,27 @@ function formatTurnFailure(ev: TurnFailed): string {
   return detail ? `${ev.errorInfo.category} (${detail})` : ev.errorInfo.category;
 }
 
+function turnFailureStopReason(ev: TurnFailed): string | undefined {
+  const normalize = (s: string | null | undefined) =>
+    s ? s.trim().toLowerCase().replaceAll("-", "_") : undefined;
+  const cat = normalize(ev.errorInfo?.category);
+  const code = normalize(ev.errorInfo?.providerCode);
+  const isRefusal = (s: string | undefined) =>
+    s !== undefined &&
+    (s === "policy" ||
+      s === "refusal" ||
+      s === "refused" ||
+      s === "safety" ||
+      s === "content_filter" ||
+      s === "cyber_safeguard" ||
+      s.includes("safeguard") ||
+      s.includes("refusal") ||
+      s.includes("content_filter"));
+  if (isRefusal(code)) return ev.errorInfo?.providerCode ?? undefined;
+  if (isRefusal(cat)) return ev.errorInfo?.category;
+  return undefined;
+}
+
 export default async function rexWaveBridge(bb: BbPluginApi) {
   let daemon: Socket | null = null;
   const toolCalls = new Map<string, (r: { ok: boolean; text: string }) => void>();
@@ -242,6 +263,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
   bb.events.on("turn.failed", async (ev) => {
     const resolved = await waveMetaByThreadId(ev.threadId);
     if (!resolved) return;
+    const stopReason = turnFailureStopReason(ev);
     up({
       t: "thread",
       signal: "failed",
@@ -249,6 +271,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
       project_id: resolved.thread.projectId,
       meta: resolved.meta,
       error: formatTurnFailure(ev),
+      ...(stopReason ? { stop_reason: stopReason } : {}),
     });
   });
 
@@ -314,6 +337,13 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
   bb.agents.configure((context) => {
     const meta = extractWaveMeta(context.pluginMetadata);
     if (!meta) return { tools: [], skills: [] };
+    const provenanceBits: string[] = [];
+    if (meta.runStamp) provenanceBits.push(`run_stamp=${JSON.stringify(meta.runStamp)}`);
+    if (meta.outputDir) provenanceBits.push(`output_dir=${JSON.stringify(meta.outputDir)}`);
+    const provenanceSuffix =
+      provenanceBits.length > 0
+        ? ` Provenance: ${provenanceBits.join(", ")} (never treat pre-existing files without matching run_stamp as completed work).`
+        : "";
     return {
       tools: tools.map((t) => `rex_${t.name}`),
       skills: [],
@@ -322,7 +352,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
         `roomId ${JSON.stringify(meta.roomId)}, project ${JSON.stringify(context.project.id)}), ` +
         `running on ${context.provider.id}/${context.provider.model}. ` +
         `Coordinate through rex_room_post, rex_wait (pass the last seq you read), and rex_run_code. ` +
-        `@mention a peer to wake it.`,
+        `@mention a peer to wake it.${provenanceSuffix}`,
     };
   });
 

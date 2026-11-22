@@ -102,6 +102,10 @@ pub struct Page {
     /// Pass back as `after` to continue without gaps or repeats.
     pub cursor: Cursor,
     pub timed_out: bool,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// The left pane, top to bottom: `Inbox`, `Kanban`, divider, foldable

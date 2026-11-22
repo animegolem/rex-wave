@@ -51,6 +51,14 @@ pub enum NotifyKind {
         #[serde(default)]
         seq: Seq,
     },
+    /// A wave worker ended a turn on a provider safety / policy refusal.
+    WorkerRefused {
+        wave: WaveSlug,
+        role: RoleName,
+        reason: String,
+        #[serde(default)]
+        seq: Seq,
+    },
     WaveFinished {
         wave: WaveSlug,
     },
@@ -165,6 +173,10 @@ pub struct InboxPage {
     pub unread: u32,
     /// Per-room read cursors (merged with room heads by the read side for unread badges).
     pub cursors: Vec<(RoomId, Seq)>,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

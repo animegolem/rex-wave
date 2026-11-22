@@ -330,6 +330,42 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
   const descRes = sentUp.find((m) => m.t === "result" && m.req_id === 10);
   assert.deepEqual(descRes, { t: "result", req_id: 10, ok: true, value: [{ seq: 7 }] });
 
+  for (const fn of listeners.get("turn.failed") ?? []) {
+    await fn({
+      threadId: "th_spawned_1",
+      turnId: "turn_policy",
+      errorInfo: { category: "policy", httpStatusCode: 400, providerCode: "cyber_safeguard" },
+      inputAccepted: false,
+      rateLimits: null,
+    });
+  }
+  assert.ok(
+    sentUp.some(
+      (m) =>
+        m.t === "thread" &&
+        m.signal === "failed" &&
+        m.stop_reason === "cyber_safeguard" &&
+        m.error === "policy (cyber_safeguard)",
+    ),
+  );
+
+  const configuredWithProv = configureFn!({
+    project: { id: "proj_1" },
+    provider: { id: "claude-code", model: "claude-opus-5-5" },
+    pluginMetadata: {
+      rexWave: {
+        waveId: "auth-v2",
+        role: "verifier",
+        attempt: 1,
+        roomId: "#p/wave-auth-v2",
+        runStamp: "auth-v2:verifier:attempt-1:seq-1",
+        outputDir: "runs/auth-v2/verifier",
+      },
+    },
+  });
+  assert.ok(configuredWithProv.instructions?.includes("run_stamp="));
+  assert.ok(configuredWithProv.instructions?.includes("output_dir="));
+
   for (const fn of listeners.get("thread.deleted") ?? []) {
     await fn({ thread: threadRecords.get("th_spawned_1") });
   }

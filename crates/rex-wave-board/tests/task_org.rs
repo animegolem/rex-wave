@@ -118,10 +118,14 @@ impl Client for FakeTaskRoomClient {
                     let _ = fs::write(&lock_path, "mid-sync-lock");
                 }
                 let room = req.room.resolve(&self.me)?;
+                let tasks: Vec<_> = g.tasks.values().cloned().collect();
+                let total_count = tasks.len();
                 Ok(WireReply::RoomTasks(TaskListView {
                     room,
                     head: Seq(g.next_seq),
-                    tasks: g.tasks.values().cloned().collect(),
+                    tasks,
+                    total_count,
+                    truncated: false,
                 }))
             }
             WireCommand::RoomPost(req) => {

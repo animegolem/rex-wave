@@ -786,6 +786,7 @@ async fn fetch_room_tasks<C: Client>(
         .call(RoomTasks {
             room: room.clone(),
             filter: None,
+            limit: None,
         })
         .await
     {

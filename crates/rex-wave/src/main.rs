@@ -263,6 +263,16 @@ pub enum WaveCmd {
         workers: Vec<String>,
         #[arg(long)]
         brief_dir: Option<PathBuf>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long = "worker-output")]
+        worker_outputs: Vec<String>,
+        #[arg(long = "worker-writes")]
+        worker_writes: Vec<String>,
+        #[arg(long = "worker-schema")]
+        worker_schemas: Vec<String>,
         #[arg(long, default_value = "accept-edits")]
         permission: String,
         #[arg(long, default_value = "managed-worktree")]
@@ -277,6 +287,14 @@ pub enum WaveCmd {
         brief_file: Option<PathBuf>,
         #[arg(long)]
         brief: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long = "writes")]
+        writes: Vec<PathBuf>,
+        #[arg(long = "return-schema")]
+        return_schema: Option<String>,
         #[arg(long, default_value = "accept-edits")]
         permission: String,
         #[arg(long, default_value = "managed-worktree")]
@@ -320,6 +338,8 @@ pub enum WaveCmd {
         wave: String,
         #[arg(long)]
         summary: String,
+        #[arg(long)]
+        allow_incomplete: bool,
     },
 }
 
@@ -382,6 +402,8 @@ pub enum TaskCmd {
         holder: Option<String>,
         #[arg(long)]
         label: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Show one room task-thread and its replies.
     Show { room: String, seq: u64 },
@@ -1015,6 +1037,7 @@ fn parse_worker_spec(
     brief_text: String,
     permission: PermissionMode,
     workspace: Workspace,
+    account: Option<String>,
 ) -> Result<WorkerSpec, ApiError> {
     let (role_raw, rhs) = spec_str
         .split_once('=')
@@ -1033,12 +1056,24 @@ fn parse_worker_spec(
         agent: Some(AgentSpec {
             provider,
             model: model_opt,
+            account,
             reasoning: None,
             service_tier: None,
             permission,
             workspace,
         }),
+        output_dir: None,
+        writes: Vec::new(),
+        return_schema: None,
     })
+}
+
+fn parse_role_kv<'a>(raw: &'a str, flag: &str) -> Result<(RoleName, &'a str), ApiError> {
+    let (role_raw, val) = raw
+        .split_once('=')
+        .ok_or_else(|| invalid(flag, format!("expected <role>=<value>, got '{raw}'")))?;
+    let role = RoleName::parse(role_raw)?;
+    Ok((role, val))
 }
 
 fn read_text_source(
@@ -1413,6 +1448,11 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             goal,
             workers,
             brief_dir,
+            account,
+            output_dir,
+            worker_outputs,
+            worker_writes,
+            worker_schemas,
             permission,
             workspace,
         } => {
@@ -1444,7 +1484,59 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                 } else {
                     goal_body.as_str().to_owned()
                 };
-                parsed_workers.push(parse_worker_spec(entry, brief_str, perm, ws.clone())?);
+                parsed_workers.push(parse_worker_spec(
+                    entry,
+                    brief_str,
+                    perm,
+                    ws.clone(),
+                    account.clone(),
+                )?);
+            }
+
+            for raw in worker_outputs {
+                let (role, path_str) = parse_role_kv(raw, "worker-output")?;
+                let w = parsed_workers
+                    .iter_mut()
+                    .find(|w| w.role == role)
+                    .ok_or_else(|| {
+                        invalid(
+                            "worker-output",
+                            format!("unknown worker role @{role} (declare with --worker first)"),
+                        )
+                    })?;
+                w.output_dir = Some(PathBuf::from(path_str));
+            }
+            for raw in worker_writes {
+                let (role, path_str) = parse_role_kv(raw, "worker-writes")?;
+                let w = parsed_workers
+                    .iter_mut()
+                    .find(|w| w.role == role)
+                    .ok_or_else(|| {
+                        invalid(
+                            "worker-writes",
+                            format!("unknown worker role @{role} (declare with --worker first)"),
+                        )
+                    })?;
+                w.writes.push(PathBuf::from(path_str));
+            }
+            for raw in worker_schemas {
+                let (role, json_str) = parse_role_kv(raw, "worker-schema")?;
+                let schema: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+                    invalid(
+                        "worker-schema",
+                        format!("invalid JSON schema for @{role}: {e}"),
+                    )
+                })?;
+                let w = parsed_workers
+                    .iter_mut()
+                    .find(|w| w.role == role)
+                    .ok_or_else(|| {
+                        invalid(
+                            "worker-schema",
+                            format!("unknown worker role @{role} (declare with --worker first)"),
+                        )
+                    })?;
+                w.return_schema = Some(schema);
             }
 
             let default_provider = parsed_workers
@@ -1454,6 +1546,7 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             let defaults = AgentSpec {
                 provider: default_provider,
                 model: None,
+                account: account.clone(),
                 reasoning: None,
                 service_tier: None,
                 permission: perm,
@@ -1466,6 +1559,7 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                     project,
                     goal: goal_body,
                     defaults,
+                    output_dir: output_dir.clone(),
                     workers: parsed_workers,
                 },
                 idem: None,
@@ -1476,6 +1570,10 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             worker,
             brief_file,
             brief,
+            account,
+            output_dir,
+            writes,
+            return_schema,
             permission,
             workspace,
         } => {
@@ -1483,7 +1581,16 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             let perm = parse_permission(permission)?;
             let ws = parse_workspace(workspace)?;
             let brief_raw = read_text_source(brief.as_ref(), brief_file.as_ref(), "brief")?;
-            let spec = parse_worker_spec(worker, brief_raw, perm, ws)?;
+            let mut spec = parse_worker_spec(worker, brief_raw, perm, ws, account.clone())?;
+            spec.output_dir = output_dir.clone();
+            spec.writes = writes.clone();
+            spec.return_schema =
+                match return_schema {
+                    Some(raw) => Some(serde_json::from_str(raw).map_err(|e| {
+                        invalid("return-schema", format!("invalid JSON schema: {e}"))
+                    })?),
+                    None => None,
+                };
             Ok(WireCommand::WaveAddWorker(WaveAddWorker {
                 wave,
                 worker: spec,
@@ -1539,11 +1646,16 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
         WaveCmd::Status { wave } => Ok(WireCommand::WaveView(WaveView {
             wave: WaveSlug::parse(wave.clone())?,
         })),
-        WaveCmd::Finish { wave, summary } => Ok(WireCommand::WaveFinish(WaveFinish {
+        WaveCmd::Finish {
+            wave,
+            summary,
+            allow_incomplete,
+        } => Ok(WireCommand::WaveFinish(WaveFinish {
             wave: WaveSlug::parse(wave.clone())?,
             outcome: WaveOutcome::Completed {
                 summary: Body::parse(summary.clone())?,
             },
+            allow_incomplete: *allow_incomplete,
         })),
     }
 }
@@ -1688,6 +1800,7 @@ fn task_to_command(cmd: &TaskCmd, me: &Principal) -> Result<WireCommand, ApiErro
             mine,
             holder,
             label,
+            limit,
         } => {
             if board_flag.is_none()
                 && let Some(room_raw) = target
@@ -1725,9 +1838,17 @@ fn task_to_command(cmd: &TaskCmd, me: &Principal) -> Result<WireCommand, ApiErro
                 return Ok(WireCommand::RoomTasks(RoomTasks {
                     room: parse_room_ref(room_raw)?,
                     filter,
+                    limit: *limit,
                 }));
             }
 
+            if limit.is_some() {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: "--limit".into(),
+                    reason: "only supported for room task lists (board views return all cards)"
+                        .into(),
+                }));
+            }
             let chosen_board = match target.as_ref().or(board_flag.as_ref()) {
                 Some(b) => map_board_val("board", BoardId::parse(b.clone()))?,
                 None => match me {
@@ -1760,6 +1881,7 @@ fn task_to_command(cmd: &TaskCmd, me: &Principal) -> Result<WireCommand, ApiErro
         TaskCmd::Show { room, .. } => Ok(WireCommand::RoomTasks(RoomTasks {
             room: parse_room_ref(room)?,
             filter: None,
+            limit: None,
         })),
         TaskCmd::Claim {
             room,
@@ -2374,6 +2496,13 @@ fn print_reply(reply: &WireReply, as_json: bool) {
             for task in &list.tasks {
                 println!("{}", format_task_line(task));
             }
+            if list.truncated {
+                println!(
+                    "[showing {} of {} — raise --limit (max 1000) to see more]",
+                    list.tasks.len(),
+                    list.total_count
+                );
+            }
         }
         WireReply::PresenceClaim(rec) | WireReply::PresenceSetStatus(rec) => {
             println!("seat @{} ({:?})", rec.seat, rec.status);
@@ -2417,21 +2546,100 @@ fn print_reply(reply: &WireReply, as_json: bool) {
             )
         }
         WireReply::WaveView(snap) => {
+            let c = &snap.counts;
             println!(
-                "wave {} ({:?}) project={}:",
-                snap.spec.slug, snap.status, snap.spec.project
+                "wave {} ({:?}) project={} [total={} working={} idle={} parked={} blocked={} refused={} errored={} failed={} retiring={} retired(clean={}, refused={}, errored={})]:",
+                snap.spec.slug,
+                snap.status,
+                snap.spec.project,
+                c.total,
+                c.working,
+                c.idle,
+                c.parked,
+                c.blocked,
+                c.refused,
+                c.errored,
+                c.failed,
+                c.retiring,
+                c.retired_clean,
+                c.retired_refused,
+                c.retired_errored,
             );
             for (role, spec, phase) in &snap.workers {
                 let phase_str = match phase {
                     WorkerPhase::Requested { attempt } => format!("requested(attempt={attempt})"),
-                    WorkerPhase::Live { thread, activity } => {
-                        format!("live({thread}, {activity:?})")
+                    WorkerPhase::Live { thread, activity } => match activity {
+                        rex_wave_api::wave::Activity::Refused { reason } => {
+                            format!("live({thread}, ⊘ refused: {reason})")
+                        }
+                        rex_wave_api::wave::Activity::Errored { error } => {
+                            format!("live({thread}, ✕ errored: {error})")
+                        }
+                        other => format!("live({thread}, {other:?})"),
+                    },
+                    WorkerPhase::Retiring {
+                        thread,
+                        errored,
+                        refused,
+                    } => {
+                        if let Some(reason) = refused {
+                            format!("retiring({thread}, ⊘ refused: {reason})")
+                        } else if let Some(err) = errored {
+                            format!("retiring({thread}, ✕ errored: {err})")
+                        } else {
+                            format!("retiring({thread})")
+                        }
                     }
-                    WorkerPhase::Retiring { thread, .. } => format!("retiring({thread})"),
-                    WorkerPhase::Retired { .. } => "retired".to_owned(),
-                    WorkerPhase::Failed { error } => format!("failed({error})"),
+                    WorkerPhase::Retired {
+                        errored, refused, ..
+                    } => {
+                        if let Some(reason) = refused {
+                            format!("retired(⊘ refused: {reason})")
+                        } else if let Some(err) = errored {
+                            format!("retired(✕ errored: {err})")
+                        } else {
+                            "retired(✓ clean)".to_owned()
+                        }
+                    }
+                    WorkerPhase::Failed { error } => format!("failed(✕ {error})"),
                 };
-                println!("  - {role} [{}] -> {phase_str}", spec.provider);
+                let meta = snap.worker_meta.get(role);
+                let req_model = meta
+                    .and_then(|m| m.requested_model.as_ref())
+                    .or(spec.model.as_ref())
+                    .map(ModelId::as_str);
+                let act_model = meta
+                    .and_then(|m| m.actual_model.as_ref())
+                    .map(ModelId::as_str);
+                let model_part = match (req_model, act_model) {
+                    (Some(r), Some(a)) if r != a => format!("/{r}->{a}"),
+                    (Some(r), _) => format!("/{r}"),
+                    (None, Some(a)) => format!("/actual={a}"),
+                    (None, None) => String::new(),
+                };
+                let req_acct = meta
+                    .and_then(|m| m.requested_account.as_deref())
+                    .or(spec.account.as_deref());
+                let act_acct = meta.and_then(|m| m.actual_account.as_deref());
+                let acct_part =
+                    if meta.is_some_and(rex_wave_api::wave::WorkerRuntimeMeta::account_mismatch) {
+                        format!(
+                            " acct={}->{} [ACCOUNT MISMATCH]",
+                            req_acct.unwrap_or("?"),
+                            act_acct.unwrap_or("?")
+                        )
+                    } else {
+                        match (req_acct, act_acct) {
+                            (Some(r), Some(_)) => format!(" acct={r}"),
+                            (Some(r), None) => format!(" acct={r} (unconfirmed)"),
+                            (None, Some(a)) => format!(" acct=actual:{a}"),
+                            (None, None) => String::new(),
+                        }
+                    };
+                println!(
+                    "  - {role} [{}{model_part}{acct_part}] -> {phase_str}",
+                    spec.provider
+                );
             }
         }
         WireReply::BoardView(b) => {
@@ -2459,6 +2667,13 @@ fn print_reply(reply: &WireReply, as_json: bool) {
                     item.id.0, item.state, item.draft.title, item.draft.preview
                 );
             }
+            if page.truncated {
+                println!(
+                    "[showing {} of {} — raise --limit (max 1000) to see more]",
+                    page.items.len(),
+                    page.total_count
+                );
+            }
         }
         WireReply::MailPromote(letter) => {
             println!(
@@ -2476,6 +2691,15 @@ fn print_reply(reply: &WireReply, as_json: bool) {
             } else {
                 for env in &page.entries {
                     println!("{}", format_envelope_line(env));
+                }
+                if page.truncated {
+                    let last_seq = page.entries.last().map(|e| e.seq.0).unwrap_or(0);
+                    println!(
+                        "[showing {} of {} — use --after {} / --cursor / --limit to page]",
+                        page.entries.len(),
+                        page.total_count,
+                        last_seq
+                    );
                 }
             }
         }
@@ -3204,6 +3428,7 @@ async fn execute_task_show<C: Client>(
         .call(RoomTasks {
             room: room_ref,
             filter: None,
+            limit: None,
         })
         .await?;
     let task = list
@@ -3690,6 +3915,7 @@ async fn execute_remote<C: Client>(
         && let WireReply::Wait(mut page) = reply
     {
         page.timed_out = false;
+        let total_count = page.entries.len();
         if let Some(lim) = limit {
             let cap = (*lim).clamp(1, 1000) as usize;
             if page.entries.len() > cap {
@@ -3699,6 +3925,8 @@ async fn execute_remote<C: Client>(
                 }
             }
         }
+        page.total_count = total_count;
+        page.truncated = page.entries.len() < total_count;
         reply = WireReply::Read(page);
     }
 
@@ -4101,6 +4329,66 @@ mod tests {
         assert!(matches!(
             to_command(&status_cli.cmd).unwrap(),
             WireCommand::WaveView(_)
+        ));
+
+        let honesty_wave = parse_cli(&[
+            "rex-wave",
+            "wave",
+            "start",
+            "honesty-1",
+            "--project",
+            "p_123",
+            "--goal",
+            "Audit outputs",
+            "--account",
+            "work-acct",
+            "--output-dir",
+            "runs/honesty-1",
+            "--worker",
+            "auditor=claude-code/claude-opus-5-5",
+            "--worker-output",
+            "auditor=runs/honesty-1/custom",
+            "--worker-writes",
+            "auditor=src/lib.rs",
+            "--worker-schema",
+            "auditor={\"type\":\"object\"}",
+        ]);
+        let WireCommand::WaveStart(hws) = to_command(&honesty_wave.cmd).unwrap() else {
+            panic!("expected WaveStart");
+        };
+        assert_eq!(hws.spec.defaults.account.as_deref(), Some("work-acct"));
+        assert_eq!(
+            hws.spec.output_dir.as_deref(),
+            Some(std::path::Path::new("runs/honesty-1"))
+        );
+        assert_eq!(
+            hws.spec.workers[0].output_dir.as_deref(),
+            Some(std::path::Path::new("runs/honesty-1/custom"))
+        );
+        assert_eq!(
+            hws.spec.workers[0].writes,
+            vec![PathBuf::from("src/lib.rs")]
+        );
+        assert_eq!(
+            hws.spec.workers[0].return_schema,
+            Some(serde_json::json!({"type": "object"}))
+        );
+
+        let finish_cli = parse_cli(&[
+            "rex-wave",
+            "wave",
+            "finish",
+            "honesty-1",
+            "--summary",
+            "partial",
+            "--allow-incomplete",
+        ]);
+        assert!(matches!(
+            to_command(&finish_cli.cmd).unwrap(),
+            WireCommand::WaveFinish(WaveFinish {
+                allow_incomplete: true,
+                ..
+            })
         ));
 
         let post_chan = parse_cli(&[

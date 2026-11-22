@@ -44,6 +44,9 @@ pub struct AgentSpec {
     pub provider: ProviderId,
     #[serde(default)]
     pub model: Option<ModelId>,
+    /// Optional explicit paying account / billing profile expected for this worker.
+    #[serde(default)]
+    pub account: Option<String>,
     #[serde(default)]
     pub reasoning: Option<String>,
     #[serde(default)]
@@ -60,6 +63,15 @@ pub struct WorkerSpec {
     /// Overrides `WaveSpec::defaults` when present.
     #[serde(default)]
     pub agent: Option<AgentSpec>,
+    /// Project-owned output directory for this worker; defaults to `<wave.output_dir>/<role>`.
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    /// Exclusive project-owned write targets declared by this worker (enforced one-writer per path).
+    #[serde(default)]
+    pub writes: Vec<PathBuf>,
+    /// Optional JSON Schema describing the expected structured return payload.
+    #[serde(default)]
+    pub return_schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -69,6 +81,9 @@ pub struct WaveSpec {
     pub goal: Body,
     pub defaults: AgentSpec,
     pub workers: Vec<WorkerSpec>,
+    /// Optional project-owned base directory for wave outputs (`<output_dir>/<role>/`).
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
 }
 
 /// A worker's lifecycle. Transitions are pure (`rex_wave_waves::worker_step`).
@@ -87,17 +102,21 @@ pub enum WorkerPhase {
         thread: BbThreadId,
         activity: Activity,
     },
-    /// `errored` carries a live `Activity::Errored` across retirement so a
-    /// failed worker never reads as a clean exit.
+    /// `errored` and `refused` carry live failure/refusal states across retirement
+    /// so a failed or safety-refused worker never reads as a clean exit.
     Retiring {
         thread: BbThreadId,
         #[serde(default)]
         errored: Option<String>,
+        #[serde(default)]
+        refused: Option<String>,
     },
     Retired {
         thread: Option<BbThreadId>,
         #[serde(default)]
         errored: Option<String>,
+        #[serde(default)]
+        refused: Option<String>,
     },
     Failed {
         error: String,
@@ -136,17 +155,25 @@ impl WorkerPhase {
                 WorkerPhase::Retired {
                     thread: Some(thread.clone()),
                     errored: activity.error().map(str::to_owned),
+                    refused: activity.refusal().map(str::to_owned),
                 }
             }
-            (WorkerPhase::Retiring { thread, errored }, Observation::Archived) => {
-                WorkerPhase::Retired {
-                    thread: Some(thread.clone()),
-                    errored: errored.clone(),
-                }
-            }
+            (
+                WorkerPhase::Retiring {
+                    thread,
+                    errored,
+                    refused,
+                },
+                Observation::Archived,
+            ) => WorkerPhase::Retired {
+                thread: Some(thread.clone()),
+                errored: errored.clone(),
+                refused: refused.clone(),
+            },
             (WorkerPhase::Requested { .. }, Observation::Archived) => WorkerPhase::Retired {
                 thread: None,
                 errored: None,
+                refused: None,
             },
             (phase, _) => phase.clone(),
         }
@@ -158,10 +185,12 @@ impl WorkerPhase {
             WorkerPhase::Live { thread, activity } => WorkerPhase::Retiring {
                 thread: thread.clone(),
                 errored: activity.error().map(str::to_owned),
+                refused: activity.refusal().map(str::to_owned),
             },
             WorkerPhase::Requested { .. } => WorkerPhase::Retired {
                 thread: None,
                 errored: None,
+                refused: None,
             },
             phase => phase.clone(),
         }
@@ -178,9 +207,20 @@ impl WorkerPhase {
             WorkerPhase::Requested { .. } => None,
         }
     }
+
+    /// The safety refusal a worker ended (or is ending) on, whatever its phase.
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            WorkerPhase::Live { activity, .. } => activity.refusal(),
+            WorkerPhase::Retiring { refused, .. } | WorkerPhase::Retired { refused, .. } => {
+                refused.as_deref()
+            }
+            WorkerPhase::Failed { .. } | WorkerPhase::Requested { .. } => None,
+        }
+    }
 }
 
-/// What a live worker is doing, as observed from BB events. Modeling all four
+/// What a live worker is doing, as observed from BB/T3 events. Modeling all
 /// non-working states explicitly is what makes wakeups correct (#12):
 /// `Parked` wakes by `wait` returning; `Idle` wakes by `threads.send(auto)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -198,6 +238,10 @@ pub enum Activity {
     Blocked {
         interaction: PendingInteraction,
     },
+    /// Turn ended with a provider safety / policy / content-filter refusal.
+    Refused {
+        reason: String,
+    },
     Errored {
         error: String,
     },
@@ -210,6 +254,39 @@ impl Activity {
             _ => None,
         }
     }
+
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Activity::Refused { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// True when a provider stop/finish reason or status names a safety / policy refusal.
+pub fn is_refusal_stop_reason(raw: &str) -> bool {
+    let norm = raw.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        norm.as_str(),
+        "refusal" | "refused" | "safety" | "content_filter" | "cyber_safeguard" | "policy"
+    ) || norm.contains("refusal")
+        || norm.contains("content_filter")
+        || norm.contains("safeguard")
+}
+
+/// True when a provider error message or formatted category describes a safety refusal.
+pub fn is_refusal_error_text(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    lower == "policy"
+        || lower.starts_with("policy (")
+        || lower.contains("refusal")
+        || lower.contains("content_filter")
+        || lower.contains("content filter")
+        || lower.contains("cyber_safeguard")
+        || lower.contains("cyber safeguard")
+        || lower.contains("safety_refusal")
+        || lower.contains("safety stop")
+        || lower.contains("safety filter")
 }
 
 /// A BB pending interaction, normalized.
@@ -335,7 +412,9 @@ pub fn plan_mention_wakeup(phase: &WorkerPhase, room: &RoomId) -> WakePlan {
             } if parked == room => WakePlan::Covered,
             Activity::Parked { .. } => WakePlan::Doorbell(SteerDeliveryMode::SteerIfActive),
             Activity::Idle => WakePlan::Doorbell(SteerDeliveryMode::Auto),
-            Activity::Blocked { .. } | Activity::Errored { .. } => WakePlan::Suppress,
+            Activity::Blocked { .. } | Activity::Refused { .. } | Activity::Errored { .. } => {
+                WakePlan::Suppress
+            }
         },
         WorkerPhase::Retiring { .. } | WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => {
             WakePlan::Suppress
@@ -351,13 +430,27 @@ pub enum WaveOutcome {
     Failed { reason: String },
 }
 
-/// What the BB bridge observed about a worker. System audience only.
+/// What the BB/T3 bridge observed about a worker. System audience only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "observed", rename_all = "snake_case")]
 pub enum Observation {
-    Spawned { attempt: u32, thread: BbThreadId },
-    SpawnFailed { attempt: u32, error: String },
-    Activity { activity: Activity },
+    Spawned {
+        attempt: u32,
+        thread: BbThreadId,
+    },
+    SpawnFailed {
+        attempt: u32,
+        error: String,
+    },
+    Activity {
+        activity: Activity,
+    },
+    RuntimeMeta {
+        #[serde(default)]
+        actual_model: Option<ModelId>,
+        #[serde(default)]
+        actual_account: Option<String>,
+    },
     Archived,
 }
 
@@ -402,6 +495,9 @@ pub struct WaveResolve {
 pub struct WaveFinish {
     pub wave: WaveSlug,
     pub outcome: WaveOutcome,
+    /// Explicitly permit `WaveOutcome::Completed` even when workers were refused or errored.
+    #[serde(default)]
+    pub allow_incomplete: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -423,11 +519,95 @@ pub struct WaveStarted {
     pub board: BoardId,
 }
 
+/// Aggregate worker status counts across a wave so safety refusals and errors
+/// are always visible beside active and retired counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WaveCounts {
+    pub total: usize,
+    pub requested: usize,
+    pub working: usize,
+    pub parked: usize,
+    pub idle: usize,
+    pub blocked: usize,
+    pub refused: usize,
+    pub errored: usize,
+    pub failed: usize,
+    pub retiring: usize,
+    pub retired_clean: usize,
+    pub retired_refused: usize,
+    pub retired_errored: usize,
+}
+
+impl WaveCounts {
+    pub fn from_phases<'a>(phases: impl IntoIterator<Item = &'a WorkerPhase>) -> Self {
+        let mut counts = WaveCounts::default();
+        for phase in phases {
+            counts.total += 1;
+            match phase {
+                WorkerPhase::Requested { .. } => counts.requested += 1,
+                WorkerPhase::Live { activity, .. } => match activity {
+                    Activity::Working => counts.working += 1,
+                    Activity::Parked { .. } => counts.parked += 1,
+                    Activity::Idle => counts.idle += 1,
+                    Activity::Blocked { .. } => counts.blocked += 1,
+                    Activity::Refused { .. } => counts.refused += 1,
+                    Activity::Errored { .. } => counts.errored += 1,
+                },
+                WorkerPhase::Retiring { .. } => counts.retiring += 1,
+                WorkerPhase::Retired {
+                    errored, refused, ..
+                } => {
+                    if refused.is_some() {
+                        counts.retired_refused += 1;
+                    } else if errored.is_some() {
+                        counts.retired_errored += 1;
+                    } else {
+                        counts.retired_clean += 1;
+                    }
+                }
+                WorkerPhase::Failed { .. } => counts.failed += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Explicit requested vs. actual runtime provenance for a worker (model, paying account, run stamp).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkerRuntimeMeta {
+    #[serde(default)]
+    pub requested_model: Option<ModelId>,
+    #[serde(default)]
+    pub actual_model: Option<ModelId>,
+    #[serde(default)]
+    pub requested_account: Option<String>,
+    #[serde(default)]
+    pub actual_account: Option<String>,
+    #[serde(default)]
+    pub run_stamp: Option<String>,
+}
+
+impl WorkerRuntimeMeta {
+    pub fn account_mismatch(&self) -> bool {
+        match (
+            self.requested_account.as_deref(),
+            self.actual_account.as_deref(),
+        ) {
+            (Some(req), Some(act)) => req != act,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WaveSnapshot {
     pub spec: WaveSpec,
     pub status: WaveStatus,
     pub workers: Vec<(RoleName, AgentSpec, WorkerPhase)>,
+    #[serde(default)]
+    pub counts: WaveCounts,
+    #[serde(default)]
+    pub worker_meta: BTreeMap<RoleName, WorkerRuntimeMeta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -450,6 +630,12 @@ pub enum WaveEvent {
         agent: AgentSpec,
         brief: Body,
         attempt: u32,
+        #[serde(default)]
+        output_dir: Option<PathBuf>,
+        #[serde(default)]
+        writes: Vec<PathBuf>,
+        #[serde(default)]
+        return_schema: Option<serde_json::Value>,
     },
     WorkerObserved {
         role: RoleName,

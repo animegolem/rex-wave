@@ -576,6 +576,8 @@ impl Decider for TestWaves {
                 spec: state.spec.clone().expect("spec"),
                 status: WaveStatus::Running,
                 workers: Vec::new(),
+                counts: rex_wave_api::wave::WaveCounts::default(),
+                worker_meta: std::collections::BTreeMap::new(),
             }),
             WaveCommand::WaveAddWorker(_) => WireReply::WaveAddWorker(Ack),
             WaveCommand::WaveRetireWorker(_) => WireReply::WaveRetireWorker(Ack),

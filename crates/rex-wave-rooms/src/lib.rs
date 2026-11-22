@@ -115,6 +115,18 @@ impl RoomState {
 
     /// Project the filtered task list of an opened room at timestamp `at`.
     pub fn task_list_at(&self, filter: Option<&TaskFilter>, at: UnixMs) -> Option<TaskListView> {
+        self.task_list_page_at(filter, None, at)
+    }
+
+    /// Project the filtered, optionally capped task list of an opened room at
+    /// timestamp `at`, reporting the full matching `total_count` and whether
+    /// `limit` truncated the returned slice.
+    pub fn task_list_page_at(
+        &self,
+        filter: Option<&TaskFilter>,
+        limit: Option<u32>,
+        at: UnixMs,
+    ) -> Option<TaskListView> {
         let (room, _) = self.opened.as_ref()?;
         let mut tasks = Vec::new();
         for &seq in self.tasks.keys() {
@@ -147,10 +159,17 @@ impl RoomState {
             }
             tasks.push(view);
         }
+        let total_count = tasks.len();
+        if let Some(cap) = limit {
+            tasks.truncate(cap.clamp(1, 1000) as usize);
+        }
+        let truncated = tasks.len() < total_count;
         Some(TaskListView {
             room: room.clone(),
             head: self.head,
             tasks,
+            total_count,
+            truncated,
         })
     }
 
@@ -1694,7 +1713,7 @@ impl Decider for Rooms {
             }
             RoomCommand::RoomTasks(c) => WireReply::RoomTasks(
                 state
-                    .task_list_at(c.filter.as_ref(), rex_wave_runtime::now())
+                    .task_list_page_at(c.filter.as_ref(), c.limit, rex_wave_runtime::now())
                     .expect("RoomTasks verified room is open"),
             ),
         }

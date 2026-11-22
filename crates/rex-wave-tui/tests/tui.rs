@@ -154,6 +154,8 @@ fn hover_debounces_while_activate_retargets_immediately_and_filters_stale_genera
                 entries: Vec::new(),
                 cursor: Cursor::live(),
                 timed_out: false,
+                total_count: 0,
+                truncated: false,
             })),
         },
     );
@@ -759,6 +761,8 @@ async fn room_paging_watch_eof_state_preservation_errors_and_inbox_scroll_hold()
                 items: many_items,
                 unread: 12,
                 cursors: Vec::new(),
+                total_count: 12,
+                truncated: false,
             })),
         },
     );
@@ -867,6 +871,8 @@ fn room_wraps_markdown_collapses_briefs_shortens_senders_and_opens_pager() {
                 entries: vec![brief_env, review_env],
                 cursor: Cursor::live(),
                 timed_out: false,
+                total_count: 2,
+                truncated: false,
             })),
         },
     );
@@ -1240,6 +1246,8 @@ async fn inbox_keys_help_overlay_sidebar_resize_project_kanban_and_multiline_com
         head: Seq(3),
         unread: 3,
         cursors: Vec::new(),
+        total_count: 3,
+        truncated: false,
         items: vec![
             rex_wave_api::notify::Notification {
                 id: NotificationId(10),
@@ -1450,6 +1458,8 @@ async fn inbox_keys_help_overlay_sidebar_resize_project_kanban_and_multiline_com
                 entries: Vec::new(),
                 cursor: Cursor::live(),
                 timed_out: false,
+                total_count: 0,
+                truncated: false,
             })),
         },
     );
@@ -1569,6 +1579,7 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
                             phase: rex_wave_api::wave::WorkerPhase::Retired {
                                 thread: Some(rex_wave_api::BbThreadId::parse("thr_clean").unwrap()),
                                 errored: None,
+                                refused: None,
                             },
                         },
                         rex_wave_api::read::WaveWorkerLeaf {
@@ -1578,6 +1589,19 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
                             phase: rex_wave_api::wave::WorkerPhase::Retired {
                                 thread: Some(rex_wave_api::BbThreadId::parse("thr_crash").unwrap()),
                                 errored: Some("Insufficient balance (402)".to_owned()),
+                                refused: None,
+                            },
+                        },
+                        rex_wave_api::read::WaveWorkerLeaf {
+                            role: RoleName::parse("refused-bot").unwrap(),
+                            provider: rex_wave_api::ProviderId::parse("claude-code").unwrap(),
+                            model: None,
+                            phase: rex_wave_api::wave::WorkerPhase::Retired {
+                                thread: Some(
+                                    rex_wave_api::BbThreadId::parse("thr_refuse").unwrap(),
+                                ),
+                                errored: None,
+                                refused: Some("cyber_safeguard".to_owned()),
                             },
                         },
                     ],
@@ -1634,6 +1658,8 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     let unfolded = screen_text(&term);
     assert!(unfolded.contains("✓ clean-bot [codex]"));
     assert!(unfolded.contains("✕ crash-bot [claude]"));
+    assert!(unfolded.contains("⊘ refused-bot [claude]"));
+    assert!(!unfolded.contains("✓ refused-bot"));
 
     let _ = update(
         &mut model,
@@ -1653,6 +1679,8 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
                 entries: Vec::new(),
                 cursor: Cursor::live(),
                 timed_out: false,
+                total_count: 0,
+                truncated: false,
             })),
         },
     );

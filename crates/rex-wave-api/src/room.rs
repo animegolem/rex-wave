@@ -391,6 +391,8 @@ pub struct RoomTasks {
     pub room: RoomRef,
     #[serde(default)]
     pub filter: Option<TaskFilter>,
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -432,6 +434,10 @@ pub struct TaskListView {
     pub room: RoomId,
     pub head: Seq,
     pub tasks: Vec<TaskView>,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

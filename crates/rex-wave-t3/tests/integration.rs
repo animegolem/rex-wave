@@ -878,6 +878,7 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
                 defaults: AgentSpec {
                     provider: ProviderId::parse("t3:antigravity").unwrap(),
                     model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
                     reasoning: Some("xhigh".into()),
                     service_tier: None,
                     permission: PermissionMode::AcceptEdits,
@@ -887,10 +888,14 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
                         },
                     },
                 },
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("Audit T3 wire integration").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,
@@ -950,6 +955,7 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
             agent: AgentSpec {
                 provider: ProviderId::parse("t3:antigravity").unwrap(),
                 model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                account: None,
                 reasoning: None,
                 service_tier: None,
                 permission: PermissionMode::AcceptEdits,
@@ -962,6 +968,10 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
             room: wave_room(&wave, &project),
             prompt: Body::parse("Audit T3 wire integration").unwrap(),
             title: "[auth-v2] @gemini-rev".into(),
+            run_stamp: "auth-v2:gemini-rev:attempt-1:seq-1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
         })
         .await
         .unwrap();
@@ -1732,15 +1742,20 @@ async fn reconnect_after_ws_drop_mints_fresh_ticket_and_resumes_observations() {
                 defaults: AgentSpec {
                     provider: ProviderId::parse("antigravity").unwrap(),
                     model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::Auto,
                     workspace: Workspace::ProjectDefault,
                 },
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("run").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,
@@ -2023,6 +2038,7 @@ async fn composite_host_and_feed_route_antigravity_to_t3_and_bb_prefix_to_bb() {
         agent: AgentSpec {
             provider: ProviderId::parse(provider).unwrap(),
             model: model.map(|m| ModelId::parse(m).unwrap()),
+            account: None,
             reasoning: None,
             service_tier: None,
             permission: PermissionMode::Full,
@@ -2031,6 +2047,10 @@ async fn composite_host_and_feed_route_antigravity_to_t3_and_bb_prefix_to_bb() {
         room: wave_room(&wave, &project),
         prompt: Body::parse("work").unwrap(),
         title: format!("[mix-v1] @{role}"),
+        run_stamp: format!("mix-v1:{role}:attempt-1:seq-1"),
+        output_dir: None,
+        writes: Vec::new(),
+        return_schema: None,
     };
 
     // Bare `antigravity` routes to T3Host even though default_runner is Bb.
@@ -2226,15 +2246,20 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
                 defaults: AgentSpec {
                     provider: ProviderId::parse("antigravity").unwrap(),
                     model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::Auto,
                     workspace: Workspace::ProjectDefault,
                 },
+                output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
                     brief: Body::parse("Post your result directly").unwrap(),
                     agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
                 }],
             },
             idem: None,

@@ -114,7 +114,7 @@ pub fn derive_osc7501_status<'a>(
             WorkerPhase::Failed { .. } => failed += 1,
             WorkerPhase::Live { activity, .. } => match activity {
                 Activity::Working | Activity::Parked { .. } | Activity::Idle => working += 1,
-                Activity::Errored { .. } => failed += 1,
+                Activity::Errored { .. } | Activity::Refused { .. } => failed += 1,
                 Activity::Blocked { interaction } => {
                     blocked_count += 1;
                     blocked.get_or_insert(match interaction.kind {

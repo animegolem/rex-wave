@@ -50,6 +50,12 @@ mod protocol {
             project_id: String,
             meta: Option<WaveMeta>,
             error: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            stop_reason: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            model: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            account: Option<String>,
         },
         Interaction {
             thread_id: String,
@@ -94,6 +100,14 @@ mod protocol {
         pub role: String,
         pub attempt: u32,
         pub room_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub run_stamp: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub output_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub writes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub account: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +271,10 @@ pub fn spawn_args(req: &SpawnRequest) -> serde_json::Value {
         role: req.role.to_string(),
         attempt: req.attempt,
         room_id: serde_json::to_string(&req.room).unwrap_or_default(),
+        run_stamp: (!req.run_stamp.is_empty()).then(|| req.run_stamp.clone()),
+        output_dir: req.output_dir.as_ref().map(|p| p.display().to_string()),
+        writes: req.writes.iter().map(|p| p.display().to_string()).collect(),
+        account: req.agent.account.clone(),
     };
 
     let mut obj = serde_json::Map::new();
@@ -693,20 +711,260 @@ fn extract_user_content(content: Option<&serde_json::Value>) -> String {
     parts.join("\n")
 }
 
+fn extract_row_error_message(data: &serde_json::Value) -> Option<&str> {
+    data.get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data.get("error").and_then(|e| {
+                e.as_str()
+                    .or_else(|| e.get("message").and_then(|m| m.as_str()))
+            })
+        })
+        .or_else(|| data.get("reason").and_then(|v| v.as_str()))
+        .or_else(|| data.get("detail").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn is_retrying_provider_error(row: &serde_json::Value) -> bool {
+    row.get("type").and_then(|v| v.as_str()) == Some("provider/error")
+        && row
+            .get("data")
+            .and_then(|d| d.get("willRetry"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+}
+
+fn extract_refusal_from_row(row: &serde_json::Value) -> Option<String> {
+    if is_retrying_provider_error(row) {
+        return None;
+    }
+    let ty = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let data = row.get("data").unwrap_or(&serde_json::Value::Null);
+    let stop_candidates = [
+        data.get("stopReason").and_then(|v| v.as_str()),
+        data.get("stop_reason").and_then(|v| v.as_str()),
+        data.get("finishReason").and_then(|v| v.as_str()),
+        data.get("finish_reason").and_then(|v| v.as_str()),
+        data.get("status").and_then(|v| v.as_str()),
+        data.get("errorInfo")
+            .and_then(|e| e.get("providerCode"))
+            .and_then(|v| v.as_str()),
+        data.get("errorInfo")
+            .and_then(|e| e.get("category"))
+            .and_then(|v| v.as_str()),
+        data.get("code").and_then(|v| v.as_str()),
+    ];
+    let msg = extract_row_error_message(data);
+
+    match ty {
+        "turn/completed" | "system/error" | "provider/error" => {
+            for sr in stop_candidates.into_iter().flatten() {
+                if rex_wave_api::wave::is_refusal_stop_reason(sr) {
+                    return Some(match msg {
+                        Some(m) if !m.to_ascii_lowercase().contains(&sr.to_ascii_lowercase()) => {
+                            format!("{sr}: {m}")
+                        }
+                        Some(m) => m.to_owned(),
+                        None => sr.to_owned(),
+                    });
+                }
+            }
+            if let Some(m) = msg
+                && rex_wave_api::wave::is_refusal_error_text(m)
+            {
+                return Some(m.to_owned());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract runtime-reported `(actual_model, actual_account)` from a BB event row.
+/// Ignores outbound request echoes (`client/turn/start`, `turn/request`, `execution`, `sessionOptions`).
+fn extract_runtime_meta_from_row(row: &serde_json::Value) -> (Option<ModelId>, Option<String>) {
+    let ty = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(ty, "client/turn/start" | "turn/request") {
+        return (None, None);
+    }
+    let data = row.get("data").unwrap_or(&serde_json::Value::Null);
+    let model_raw = data
+        .get("fallbackModel")
+        .or_else(|| {
+            data.get("contextWindowUsage")
+                .and_then(|c| c.get("snapshot"))
+                .and_then(|s| s.get("model"))
+        })
+        .or_else(|| data.get("snapshot").and_then(|s| s.get("model")))
+        .or_else(|| data.get("actualModel"))
+        .or_else(|| data.get("actual_model"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let model = model_raw.and_then(|m| ModelId::parse(m).ok());
+
+    let account = data
+        .get("actualAccount")
+        .or_else(|| data.get("actual_account"))
+        .or_else(|| data.get("accountEmail"))
+        .or_else(|| data.get("accountName"))
+        .or_else(|| data.get("account_name"))
+        .or_else(|| data.get("account"))
+        .or_else(|| data.get("profile"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    (model, account)
+}
+
+fn extract_runtime_meta_from_rows(rows: &[serde_json::Value]) -> (Option<ModelId>, Option<String>) {
+    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0));
+    let mut latest_model = None;
+    let mut latest_account = None;
+    for row in ordered {
+        let (m, a) = extract_runtime_meta_from_row(row);
+        if m.is_some() {
+            latest_model = m;
+        }
+        if a.is_some() {
+            latest_account = a;
+        }
+    }
+    (latest_model, latest_account)
+}
+
 fn activity_from_row(row: &serde_json::Value) -> Option<Activity> {
+    if is_retrying_provider_error(row) {
+        return None;
+    }
+    if let Some(reason) = extract_refusal_from_row(row) {
+        return Some(Activity::Refused { reason });
+    }
+    let data = row.get("data").unwrap_or(&serde_json::Value::Null);
     match row.get("type").and_then(|v| v.as_str()) {
         Some("turn/started" | "client/turn/start") => Some(Activity::Working),
-        Some("turn/completed") => Some(Activity::Idle),
+        Some("turn/completed") => {
+            if data.get("status").and_then(|v| v.as_str()) == Some("failed") {
+                let err = extract_row_error_message(data)
+                    .unwrap_or("BB turn failed")
+                    .to_owned();
+                Some(Activity::Errored { error: err })
+            } else {
+                Some(Activity::Idle)
+            }
+        }
         Some("system/error" | "provider/error") => {
-            let msg = row
-                .get("data")
-                .and_then(|d| d.get("message"))
-                .and_then(|v| v.as_str())
+            let msg = extract_row_error_message(data)
                 .unwrap_or("BB error")
                 .to_owned();
             Some(Activity::Errored { error: msg })
         }
         _ => None,
+    }
+}
+
+/// Derive the latest turn's activity from a set of BB thread event rows.
+/// Uses the terminal `turn/completed` row's status (plus any non-retrying `provider/error`
+/// in the same failed turn) so BB-shaped `turn/completed { status: "failed", error: { message } }`
+/// never downgrades a refusal or failure to `Idle`, and transient `willRetry: true` errors
+/// in a turn that completed normally never poison it as `Refused`.
+fn derive_latest_turn_activity(rows: &[serde_json::Value]) -> Option<Activity> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0));
+    let start_idx = ordered
+        .iter()
+        .rposition(|r| {
+            matches!(
+                r.get("type").and_then(|v| v.as_str()),
+                Some("turn/started" | "client/turn/start")
+            )
+        })
+        .unwrap_or(0);
+    let slice = &ordered[start_idx..];
+
+    if let Some(tc_idx) = slice
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+    {
+        let tc = slice[tc_idx];
+        if let Some(reason) = extract_refusal_from_row(tc) {
+            return Some(Activity::Refused { reason });
+        }
+        let data = tc.get("data").unwrap_or(&serde_json::Value::Null);
+        if data.get("status").and_then(|v| v.as_str()) == Some("failed") {
+            // Check preceding non-retrying provider/system error rows in this same failed turn
+            // for structured policy/refusal metadata (`errorInfo.category == "policy"`, etc.).
+            for row in slice[..tc_idx].iter().rev() {
+                if let Some(reason) = extract_refusal_from_row(row) {
+                    return Some(Activity::Refused { reason });
+                }
+            }
+            let err = extract_row_error_message(data)
+                .or_else(|| {
+                    slice[..tc_idx].iter().rev().find_map(|r| {
+                        if is_retrying_provider_error(r) {
+                            return None;
+                        }
+                        if matches!(
+                            r.get("type").and_then(|v| v.as_str()),
+                            Some("provider/error" | "system/error")
+                        ) {
+                            extract_row_error_message(
+                                r.get("data").unwrap_or(&serde_json::Value::Null),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or("BB turn failed")
+                .to_owned();
+            return Some(Activity::Errored { error: err });
+        }
+        return Some(Activity::Idle);
+    }
+
+    for row in slice.iter().rev() {
+        if let Some(act) = activity_from_row(row) {
+            return Some(act);
+        }
+    }
+    None
+}
+
+fn refusal_from_latest_turn(rows: &[serde_json::Value]) -> Option<String> {
+    match derive_latest_turn_activity(rows) {
+        Some(Activity::Refused { reason }) => Some(reason),
+        _ => None,
+    }
+}
+
+fn classify_missing_or_archived_thread(msg: &str) -> Option<Observation> {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("unknown thread")
+        || lower.contains("no such thread")
+        || lower.contains("does not exist")
+        || lower.contains("thread deleted")
+        || lower.contains("thread_not_found")
+        || lower.contains("404")
+    {
+        Some(Observation::Activity {
+            activity: Activity::Errored {
+                error: format!("host thread missing after restart ({msg})"),
+            },
+        })
+    } else if lower.contains("archived") {
+        Some(Observation::Archived)
+    } else {
+        None
     }
 }
 
@@ -1343,6 +1601,11 @@ impl BridgeOwner {
                 }
                 Observation::Activity { activity } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
+                        if matches!(rec.activity, Activity::Refused { .. })
+                            && matches!(activity, Activity::Errored { .. })
+                        {
+                            return;
+                        }
                         rec.pending_interaction = match &activity {
                             Activity::Blocked { interaction } => Some(interaction.clone()),
                             _ => None,
@@ -1364,6 +1627,7 @@ impl BridgeOwner {
                         rec.live = false;
                     }
                 }
+                Observation::RuntimeMeta { .. } => {}
             },
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
@@ -1790,6 +2054,11 @@ impl BbBridge {
 
     async fn rpc(&self, down: protocol::Down) -> Result<serde_json::Value, HostError> {
         self.ensure_connected().await?;
+        self.rpc_if_connected(down).await
+    }
+
+    /// Sends an RPC only if the bridge socket is already connected (0ms fail-fast otherwise).
+    async fn rpc_if_connected(&self, down: protocol::Down) -> Result<serde_json::Value, HostError> {
         let (tx, rx) = oneshot::channel();
         self.owner
             .send(OwnerMsg::Rpc { down, started: tx })
@@ -1895,6 +2164,27 @@ impl BbBridge {
         }
     }
 
+    async fn observe_runtime_meta_if_present(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        actual_model: Option<ModelId>,
+        actual_account: Option<String>,
+    ) {
+        if actual_model.is_none() && actual_account.is_none() {
+            return;
+        }
+        self.call_wave_observe(
+            wave.clone(),
+            role.clone(),
+            Observation::RuntimeMeta {
+                actual_model,
+                actual_account,
+            },
+        )
+        .await;
+    }
+
     async fn on_thread_signal(&self, up: protocol::Up) {
         match up {
             protocol::Up::Thread {
@@ -1902,6 +2192,9 @@ impl BbBridge {
                 thread_id,
                 meta,
                 error,
+                stop_reason,
+                model,
+                account,
                 ..
             } => {
                 let Ok(thread) = BbThreadId::parse(thread_id) else {
@@ -1912,12 +2205,29 @@ impl BbBridge {
                 else {
                     return;
                 };
+                let parsed_model = model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|m| ModelId::parse(m).ok());
+                let parsed_account = account
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
                 match signal {
                     protocol::ThreadSignal::Created => {
                         self.call_wave_observe(
-                            wave,
-                            role,
+                            wave.clone(),
+                            role.clone(),
                             Observation::Spawned { attempt, thread },
+                        )
+                        .await;
+                        self.observe_runtime_meta_if_present(
+                            &wave,
+                            &role,
+                            parsed_model,
+                            parsed_account,
                         )
                         .await;
                     }
@@ -1926,6 +2236,13 @@ impl BbBridge {
                             wave.clone(),
                             role.clone(),
                             Observation::Spawned { attempt, thread },
+                        )
+                        .await;
+                        self.observe_runtime_meta_if_present(
+                            &wave,
+                            &role,
+                            parsed_model,
+                            parsed_account,
                         )
                         .await;
                         self.call_wave_observe(
@@ -1947,33 +2264,94 @@ impl BbBridge {
                             },
                         )
                         .await;
-                        self.mirror_completed_turn_if_unposted(&wave, &role, &thread)
-                            .await;
-                        self.call_wave_observe(
-                            wave,
-                            role,
-                            Observation::Activity {
-                                activity: Activity::Idle,
-                            },
+                        let rows = self.fetch_recent_thread_rows(&thread).await;
+                        let (row_model, row_account) = extract_runtime_meta_from_rows(&rows);
+                        self.observe_runtime_meta_if_present(
+                            &wave,
+                            &role,
+                            parsed_model.or(row_model),
+                            parsed_account.or(row_account),
                         )
                         .await;
+                        let refusal_reason = stop_reason
+                            .as_deref()
+                            .filter(|sr| rex_wave_api::wave::is_refusal_stop_reason(sr))
+                            .map(str::to_owned)
+                            .or_else(|| refusal_from_latest_turn(&rows));
+                        if let Some(reason) = refusal_reason {
+                            self.call_wave_observe(
+                                wave,
+                                role,
+                                Observation::Activity {
+                                    activity: Activity::Refused { reason },
+                                },
+                            )
+                            .await;
+                        } else {
+                            self.mirror_completed_turn_from_rows(&wave, &role, &thread, &rows)
+                                .await;
+                            self.call_wave_observe(
+                                wave,
+                                role,
+                                Observation::Activity {
+                                    activity: Activity::Idle,
+                                },
+                            )
+                            .await;
+                        }
                     }
                     protocol::ThreadSignal::Failed => {
                         let msg = error.unwrap_or_else(|| "BB thread failed".into());
                         self.call_wave_observe(
                             wave.clone(),
                             role.clone(),
-                            Observation::Spawned { attempt, thread },
-                        )
-                        .await;
-                        self.call_wave_observe(
-                            wave,
-                            role,
-                            Observation::Activity {
-                                activity: Activity::Errored { error: msg },
+                            Observation::Spawned {
+                                attempt,
+                                thread: thread.clone(),
                             },
                         )
                         .await;
+                        let mut final_model = parsed_model;
+                        let mut final_account = parsed_account;
+                        let is_direct_refusal = stop_reason
+                            .as_deref()
+                            .is_some_and(rex_wave_api::wave::is_refusal_stop_reason)
+                            || rex_wave_api::wave::is_refusal_error_text(&msg);
+                        let row_refusal = if !is_direct_refusal {
+                            let rows = self.fetch_recent_thread_rows(&thread).await;
+                            let (rm, ra) = extract_runtime_meta_from_rows(&rows);
+                            final_model = final_model.or(rm);
+                            final_account = final_account.or(ra);
+                            refusal_from_latest_turn(&rows)
+                        } else {
+                            None
+                        };
+                        self.observe_runtime_meta_if_present(
+                            &wave,
+                            &role,
+                            final_model,
+                            final_account,
+                        )
+                        .await;
+                        let activity = if is_direct_refusal {
+                            let reason = match stop_reason.as_deref() {
+                                Some(sr)
+                                    if !msg
+                                        .to_ascii_lowercase()
+                                        .contains(&sr.to_ascii_lowercase()) =>
+                                {
+                                    format!("{sr}: {msg}")
+                                }
+                                _ => msg,
+                            };
+                            Activity::Refused { reason }
+                        } else if let Some(reason) = row_refusal {
+                            Activity::Refused { reason }
+                        } else {
+                            Activity::Errored { error: msg }
+                        };
+                        self.call_wave_observe(wave, role, Observation::Activity { activity })
+                            .await;
                     }
                     protocol::ThreadSignal::Archived => {
                         self.call_wave_observe(wave, role, Observation::Archived)
@@ -2133,12 +2511,7 @@ impl BbBridge {
         })
     }
 
-    async fn mirror_completed_turn_if_unposted(
-        &self,
-        wave: &WaveSlug,
-        role: &RoleName,
-        thread: &BbThreadId,
-    ) {
+    async fn fetch_recent_thread_rows(&self, thread: &BbThreadId) -> Vec<serde_json::Value> {
         let Ok(rows_val) = self
             .rpc(protocol::Down::EventsPage {
                 req_id: 0,
@@ -2150,13 +2523,9 @@ impl BbBridge {
             })
             .await
         else {
-            return;
+            return Vec::new();
         };
-        let Some(rows) = rows_val.as_array() else {
-            return;
-        };
-        self.mirror_completed_turn_from_rows(wave, role, thread, rows)
-            .await;
+        rows_val.as_array().cloned().unwrap_or_default()
     }
 
     async fn mirror_completed_turn_from_rows(
@@ -2298,7 +2667,7 @@ impl BbBridge {
             return;
         }
 
-        let trimmed = truncate_body_utf8(&completed.text, 64 * 1024);
+        let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
         let Ok(body) = Body::parse(trimmed) else {
             return;
         };
@@ -2359,12 +2728,15 @@ impl BbBridge {
         }
         let Ok(workers) = rx.await else { return };
         for (wave, role, thread, tracked_activity, mut cursor_seq) in workers {
-            let mut derived_activity: Option<Activity> = None;
+            let had_prev_cursor = cursor_seq.is_some();
             let mut collected_rows: Vec<serde_json::Value> = Vec::new();
+            let mut thread_gone: Option<Observation> = None;
+            let mut saw_new_turn_start = false;
             if cursor_seq.is_none() {
                 let mut before_seq: Option<u64> = None;
+                let mut pages = 0usize;
                 'desc: loop {
-                    let Ok(rows_val) = self
+                    match self
                         .rpc(protocol::Down::EventsPage {
                             req_id: 0,
                             thread_id: thread.to_string(),
@@ -2374,35 +2746,49 @@ impl BbBridge {
                             order: Some(protocol::EventsOrder::Desc),
                         })
                         .await
-                    else {
-                        break;
-                    };
-                    let Some(rows) = rows_val.as_array() else {
-                        break;
-                    };
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let count = rows.len();
-                    let prev_before = before_seq;
-                    collected_rows.extend(rows.iter().cloned());
-                    for row in rows {
-                        if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
-                            cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
-                            before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
+                    {
+                        Ok(rows_val) => {
+                            let Some(rows) = rows_val.as_array() else {
+                                break;
+                            };
+                            if rows.is_empty() {
+                                break;
+                            }
+                            pages += 1;
+                            let count = rows.len();
+                            let prev_before = before_seq;
+                            let mut reached_turn_start = false;
+                            for row in rows {
+                                if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                                    cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                                    before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
+                                }
+                                collected_rows.push(row.clone());
+                                if matches!(
+                                    row.get("type").and_then(|v| v.as_str()),
+                                    Some("turn/started" | "client/turn/start")
+                                ) {
+                                    reached_turn_start = true;
+                                }
+                            }
+                            if reached_turn_start
+                                || count < 200
+                                || before_seq == prev_before
+                                || pages >= 4
+                            {
+                                break 'desc;
+                            }
                         }
-                        if let Some(act) = activity_from_row(row) {
-                            derived_activity = Some(act);
-                            break 'desc;
+                        Err(HostError::Rejected(msg)) => {
+                            thread_gone = classify_missing_or_archived_thread(&msg);
+                            break;
                         }
-                    }
-                    if count < 200 || before_seq == prev_before {
-                        break;
+                        Err(HostError::Unreachable(_)) => break,
                     }
                 }
             } else {
                 loop {
-                    let Ok(rows_val) = self
+                    match self
                         .rpc(protocol::Down::EventsPage {
                             req_id: 0,
                             thread_id: thread.to_string(),
@@ -2412,28 +2798,37 @@ impl BbBridge {
                             order: None,
                         })
                         .await
-                    else {
-                        break;
-                    };
-                    let Some(rows) = rows_val.as_array() else {
-                        break;
-                    };
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let count = rows.len();
-                    let prev = cursor_seq;
-                    collected_rows.extend(rows.iter().cloned());
-                    for row in rows {
-                        if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
-                            cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                    {
+                        Ok(rows_val) => {
+                            let Some(rows) = rows_val.as_array() else {
+                                break;
+                            };
+                            if rows.is_empty() {
+                                break;
+                            }
+                            let count = rows.len();
+                            let prev = cursor_seq;
+                            for row in rows {
+                                if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                                    cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                                }
+                                if matches!(
+                                    row.get("type").and_then(|v| v.as_str()),
+                                    Some("turn/started" | "client/turn/start")
+                                ) {
+                                    saw_new_turn_start = true;
+                                }
+                                collected_rows.push(row.clone());
+                            }
+                            if count < 200 || cursor_seq == prev {
+                                break;
+                            }
                         }
-                        if let Some(act) = activity_from_row(row) {
-                            derived_activity = Some(act);
+                        Err(HostError::Rejected(msg)) => {
+                            thread_gone = classify_missing_or_archived_thread(&msg);
+                            break;
                         }
-                    }
-                    if count < 200 || cursor_seq == prev {
-                        break;
+                        Err(HostError::Unreachable(_)) => break,
                     }
                 }
             }
@@ -2447,10 +2842,32 @@ impl BbBridge {
                 .authoritative_activity(&wave, &role)
                 .await
                 .unwrap_or(tracked_activity);
+            if let Some(obs) = thread_gone {
+                let already_terminal_failure = matches!(
+                    current_activity,
+                    Activity::Errored { .. } | Activity::Refused { .. }
+                );
+                if !already_terminal_failure || matches!(obs, Observation::Archived) {
+                    self.call_wave_observe(wave, role, obs).await;
+                }
+                continue;
+            }
+            let (row_model, row_account) = extract_runtime_meta_from_rows(&collected_rows);
+            self.observe_runtime_meta_if_present(&wave, &role, row_model, row_account)
+                .await;
+            let mut derived_activity = derive_latest_turn_activity(&collected_rows);
             if matches!(
                 current_activity,
                 Activity::Blocked { .. } | Activity::Parked { .. }
             ) && matches!(derived_activity, Some(Activity::Working))
+            {
+                derived_activity = None;
+            }
+            if matches!(
+                current_activity,
+                Activity::Refused { .. } | Activity::Errored { .. }
+            ) && matches!(derived_activity, Some(Activity::Idle))
+                && !(had_prev_cursor && saw_new_turn_start)
             {
                 derived_activity = None;
             }
@@ -2670,6 +3087,10 @@ impl BbBridge {
             role: req.role.to_string(),
             attempt: req.attempt,
             room_id: serde_json::to_string(&req.room).unwrap_or_default(),
+            run_stamp: (!req.run_stamp.is_empty()).then(|| req.run_stamp.clone()),
+            output_dir: req.output_dir.as_ref().map(|p| p.display().to_string()),
+            writes: req.writes.iter().map(|p| p.display().to_string()).collect(),
+            account: req.agent.account.clone(),
         };
 
         let existing = self
@@ -2701,13 +3122,57 @@ impl BbBridge {
                 HostError::Rejected(format!("missing thread_id in spawn reply: {created}"))
             })?;
         let thread = BbThreadId::parse(id_str).map_err(|e| HostError::Rejected(e.to_string()))?;
+        let actual_model = created
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|m| ModelId::parse(m).ok());
+        let actual_account = created
+            .get("account")
+            .or_else(|| created.get("accountEmail"))
+            .or_else(|| created.get("profile"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let _ = self.owner.send(OwnerMsg::BindThread {
-            wave: req.wave,
-            role: req.role,
+            wave: req.wave.clone(),
+            role: req.role.clone(),
             attempt: req.attempt,
             thread: thread.clone(),
         });
+        self.observe_runtime_meta_if_present(&req.wave, &req.role, actual_model, actual_account)
+            .await;
         Ok(thread)
+    }
+
+    async fn check_thread_live(
+        &self,
+        thread: &BbThreadId,
+    ) -> Result<Option<Observation>, HostError> {
+        match self
+            .rpc_if_connected(protocol::Down::EventsPage {
+                req_id: 0,
+                thread_id: thread.to_string(),
+                after_seq: None,
+                before_seq: None,
+                limit: 20,
+                order: Some(protocol::EventsOrder::Desc),
+            })
+            .await
+        {
+            Ok(rows_val) => {
+                if let Some(rows) = rows_val.as_array()
+                    && let Some(act @ Activity::Refused { .. }) = derive_latest_turn_activity(rows)
+                {
+                    return Ok(Some(Observation::Activity { activity: act }));
+                }
+                Ok(None)
+            }
+            Err(HostError::Rejected(msg)) => Ok(classify_missing_or_archived_thread(&msg)),
+            Err(HostError::Unreachable(msg)) => Err(HostError::Unreachable(msg)),
+        }
     }
 }
 
@@ -2783,6 +3248,15 @@ impl AgentHost for BbHost {
             thread_id: thread.to_string(),
         };
         async move { bridge.rpc(down).await.map(|_| ()) }
+    }
+
+    fn check_live(
+        &self,
+        thread: &BbThreadId,
+    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
+        let bridge = self.0.clone();
+        let thread = thread.clone();
+        async move { bridge.check_thread_live(&thread).await }
     }
 }
 
@@ -3039,6 +3513,7 @@ mod tests {
             agent: AgentSpec {
                 provider: ProviderId::parse(provider).unwrap(),
                 model: model.map(|m| ModelId::parse(m).unwrap()),
+                account: None,
                 reasoning: Some("xhigh".into()),
                 service_tier: Some("fast".into()),
                 permission,
@@ -3047,6 +3522,10 @@ mod tests {
             room: room.clone(),
             prompt: Body::parse("ship it").unwrap(),
             title: "[w1] @worker".into(),
+            run_stamp: "w1:worker:attempt-2:seq-1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
         };
 
         let wt = spawn_args(&mk_req(
@@ -3452,11 +3931,14 @@ mod tests {
                             .take(limit)
                             .cloned()
                             .collect();
+                        let total_count = entries.len();
                         let last = entries.last().map_or(r.after, |e| e.seq);
                         Ok(WireReply::Read(Page {
                             entries,
                             cursor: Cursor::default().with(r.stream, last),
                             timed_out: false,
+                            total_count,
+                            truncated: false,
                         }))
                     }
                     Routed::Read(ReadCommand::ThreadPage(t)) => {
@@ -3485,11 +3967,14 @@ mod tests {
                                     let catchup: Vec<Envelope> =
                                         log.iter().filter(|e| e.seq > since).cloned().collect();
                                     if !catchup.is_empty() {
+                                        let total_count = catchup.len();
                                         let last = catchup.last().unwrap().seq;
                                         return Ok(WireReply::Wait(Page {
                                             entries: catchup,
                                             cursor: w.after.with(stream, last),
                                             timed_out: false,
+                                            total_count,
+                                            truncated: false,
                                         }));
                                     }
                                 }
@@ -3512,6 +3997,8 @@ mod tests {
                                             entries: vec![env],
                                             cursor,
                                             timed_out: false,
+                                            total_count: 1,
+                                            truncated: false,
                                         }));
                                     }
                                 }
@@ -3520,6 +4007,8 @@ mod tests {
                                         entries: vec![],
                                         cursor: w.after,
                                         timed_out: true,
+                                        total_count: 0,
+                                        truncated: false,
                                     }));
                                 }
                             }
@@ -3813,6 +4302,7 @@ mod tests {
             defaults: AgentSpec {
                 provider: ProviderId::parse("codex").unwrap(),
                 model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+                account: None,
                 reasoning: Some("xhigh".into()),
                 service_tier: None,
                 permission: PermissionMode::AcceptEdits,
@@ -3820,10 +4310,14 @@ mod tests {
                     base: BaseBranch::Default,
                 },
             },
+            output_dir: None,
             workers: vec![WorkerSpec {
                 role: role.clone(),
                 brief: Body::parse("Audit token rotation").unwrap(),
                 agent: None,
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
             }],
         };
 
@@ -3864,6 +4358,7 @@ mod tests {
                 agent: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
                     model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::AcceptEdits,
@@ -3872,6 +4367,10 @@ mod tests {
                 room: started.room.clone(),
                 prompt: Body::parse("retry").unwrap(),
                 title: "[auth] @verifier".into(),
+                run_stamp: "auth:verifier:attempt-1:seq-1".into(),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
             })
             .await
             .unwrap();
@@ -4054,6 +4553,7 @@ mod tests {
                 agent: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
                     model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+                    account: None,
                     reasoning: None,
                     service_tier: None,
                     permission: PermissionMode::AcceptEdits,
@@ -4061,6 +4561,9 @@ mod tests {
                 },
                 brief: Body::parse("verify").unwrap(),
                 attempt: 1,
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
             },
         );
         bridge.observe_wave_event(
@@ -4257,6 +4760,7 @@ mod tests {
             outcome: WaveOutcome::Completed {
                 summary: Body::parse("Verified").unwrap(),
             },
+            allow_incomplete: false,
         })
         .await
         .unwrap();
@@ -4607,6 +5111,7 @@ mod tests {
                     defaults: AgentSpec {
                         provider: ProviderId::parse("claude-code").unwrap(),
                         model: Some(ModelId::parse("claude-opus-5-5").unwrap()),
+                        account: None,
                         reasoning: None,
                         service_tier: None,
                         permission: PermissionMode::Full,
@@ -4614,16 +5119,23 @@ mod tests {
                             base: BaseBranch::Default,
                         },
                     },
+                    output_dir: None,
                     workers: vec![
                         WorkerSpec {
                             role: role.clone(),
                             brief: Body::parse("Audit spec").unwrap(),
                             agent: None,
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
                         },
                         WorkerSpec {
                             role: peer_role.clone(),
                             brief: Body::parse("Audit concurrency").unwrap(),
                             agent: None,
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
                         },
                     ],
                 },
@@ -4660,6 +5172,10 @@ mod tests {
             role: peer_role.to_string(),
             attempt: 1,
             room_id: serde_json::to_string(&started.room).unwrap(),
+            run_stamp: None,
+            output_dir: None,
+            writes: Vec::new(),
+            account: None,
         };
         push_up_tx
             .send(protocol::Up::Thread {
@@ -4668,6 +5184,9 @@ mod tests {
                 project_id: project.to_string(),
                 meta: Some(peer_meta),
                 error: None,
+                stop_reason: None,
+                model: None,
+                account: None,
             })
             .unwrap();
 
@@ -4676,6 +5195,10 @@ mod tests {
             role: role.to_string(),
             attempt: 1,
             room_id: serde_json::to_string(&started.room).unwrap(),
+            run_stamp: None,
+            output_dir: None,
+            writes: Vec::new(),
+            account: None,
         };
 
         events_by_thread.lock().await.insert(
@@ -4705,6 +5228,9 @@ mod tests {
                     project_id: project.to_string(),
                     meta: Some(meta.clone()),
                     error: None,
+                    stop_reason: None,
+                    model: None,
+                    account: None,
                 })
                 .unwrap();
         }
@@ -4769,6 +5295,9 @@ mod tests {
                 project_id: project.to_string(),
                 meta: Some(meta.clone()),
                 error: None,
+                stop_reason: None,
+                model: None,
+                account: None,
             })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4852,5 +5381,357 @@ mod tests {
         conductor_task.abort();
         server_task.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn bb_refusal_stop_reasons_runtime_meta_and_spawn_provenance_work() {
+        // S1: BB-shaped failed turn (provider/error policy + turn/completed status=failed with nested error.message)
+        // must resolve to Refused, never Idle.
+        let bb_refused_turn = vec![
+            serde_json::json!({ "seq": 1, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 2,
+                "type": "provider/error",
+                "data": {
+                    "message": "blocked by policy",
+                    "errorInfo": { "category": "policy", "providerCode": "cyber_safeguard", "httpStatusCode": 400 }
+                }
+            }),
+            serde_json::json!({
+                "seq": 3,
+                "type": "turn/completed",
+                "data": { "status": "failed", "error": { "message": "turn failed" } }
+            }),
+        ];
+        assert_eq!(
+            derive_latest_turn_activity(&bb_refused_turn),
+            Some(Activity::Refused {
+                reason: "cyber_safeguard: blocked by policy".into()
+            })
+        );
+        assert_eq!(
+            refusal_from_latest_turn(&bb_refused_turn).as_deref(),
+            Some("cyber_safeguard: blocked by policy")
+        );
+
+        // S1: BB-shaped generic failed turn (non-refusal) resolves to Errored with nested error.message.
+        let bb_failed_turn = vec![
+            serde_json::json!({ "seq": 1, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 2,
+                "type": "turn/completed",
+                "data": { "status": "failed", "error": { "message": "upstream timeout" } }
+            }),
+        ];
+        assert_eq!(
+            derive_latest_turn_activity(&bb_failed_turn),
+            Some(Activity::Errored {
+                error: "upstream timeout".into()
+            })
+        );
+
+        // S8: a retrying provider/error (willRetry: true) in a turn that completes normally stays Idle.
+        let retried_then_ok = vec![
+            serde_json::json!({ "seq": 1, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 2,
+                "type": "provider/error",
+                "data": {
+                    "message": "transient policy hiccup",
+                    "willRetry": true,
+                    "errorInfo": { "category": "policy", "providerCode": null, "httpStatusCode": null }
+                }
+            }),
+            serde_json::json!({
+                "seq": 3,
+                "type": "turn/completed",
+                "data": { "status": "completed" }
+            }),
+        ];
+        assert_eq!(
+            derive_latest_turn_activity(&retried_then_ok),
+            Some(Activity::Idle)
+        );
+        assert_eq!(refusal_from_latest_turn(&retried_then_ok), None);
+
+        // S4: runtime model extraction reads actual BB runtime events (contextWindowUsage.snapshot.model
+        // and provider/modelFallback), ignoring request echoes in client/turn/start.
+        let runtime_rows = vec![
+            serde_json::json!({
+                "seq": 1,
+                "type": "client/turn/start",
+                "data": { "execution": { "model": "requested-echo", "account": "echo-acct" } }
+            }),
+            serde_json::json!({
+                "seq": 2,
+                "type": "thread/contextWindowUsage/updated",
+                "data": { "contextWindowUsage": { "snapshot": { "model": "claude-opus-5-5" } } }
+            }),
+            serde_json::json!({
+                "seq": 3,
+                "type": "provider/modelFallback",
+                "data": { "originalModel": "claude-opus-5-5", "fallbackModel": "claude-sonnet-5-0", "reason": "refusal", "message": "fallback" }
+            }),
+        ];
+        let (model, account) = extract_runtime_meta_from_rows(&runtime_rows);
+        assert_eq!(
+            model.as_ref().map(ModelId::as_str),
+            Some("claude-sonnet-5-0")
+        );
+        assert_eq!(account, None);
+
+        // S10: narrow missing-thread matching ignores unrelated "missing required field" errors.
+        assert_eq!(
+            classify_missing_or_archived_thread("missing required field: threadId"),
+            None
+        );
+        assert!(matches!(
+            classify_missing_or_archived_thread("thread not found"),
+            Some(Observation::Activity {
+                activity: Activity::Errored { ref error }
+            }) if error.contains("missing after restart")
+        ));
+
+        // S4: spawn_args keeps account in pluginMetadata.rexWave, not provider sessionOptions.
+        let room = rex_wave_waves::wave_room(
+            &WaveSlug::parse("w-prov").unwrap(),
+            &BbProjectId::parse("proj_1").unwrap(),
+        );
+        let args = spawn_args(&SpawnRequest {
+            wave: WaveSlug::parse("w-prov").unwrap(),
+            role: RoleName::parse("auditor").unwrap(),
+            attempt: 1,
+            project: BbProjectId::parse("proj_1").unwrap(),
+            agent: AgentSpec {
+                provider: ProviderId::parse("claude-code").unwrap(),
+                model: Some(ModelId::parse("claude-opus-5-5").unwrap()),
+                account: Some("enterprise".into()),
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Full,
+                workspace: Workspace::ProjectDefault,
+            },
+            room,
+            prompt: Body::parse("audit").unwrap(),
+            title: "[w-prov] @auditor".into(),
+            run_stamp: "w-prov:auditor:attempt-1:at-1000".into(),
+            output_dir: Some(PathBuf::from("runs/w-prov/auditor")),
+            writes: vec![PathBuf::from("reports/a.md")],
+            return_schema: None,
+        });
+        assert!(
+            args.get("sessionOptions").is_none(),
+            "account must not be injected as an undeclared BB provider sessionOption"
+        );
+        assert_eq!(
+            args["pluginMetadata"]["rexWave"]["runStamp"],
+            "w-prov:auditor:attempt-1:at-1000"
+        );
+        assert_eq!(
+            args["pluginMetadata"]["rexWave"]["outputDir"],
+            "runs/w-prov/auditor"
+        );
+        assert_eq!(args["pluginMetadata"]["rexWave"]["account"], "enterprise");
+    }
+
+    #[tokio::test]
+    async fn bb_reconnect_reconcile_preserves_refused_and_flags_missing_threads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "tok_reconcile_honesty";
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = ws::WsConn::accept(tcp, token).await.unwrap();
+            let (mut ws_reader, mut ws_writer) = ws.into_split();
+            ws_writer
+                .send_text(
+                    &serde_json::to_string(&protocol::Up::Hello {
+                        plugin_version: "0.1.0".into(),
+                        sdk_version: "0.6.132".into(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            while let Ok(Some(ws::WsInbound::Text(raw))) = ws_reader.recv().await {
+                let down: protocol::Down = serde_json::from_str(&raw).unwrap();
+                if let protocol::Down::EventsPage {
+                    req_id, thread_id, ..
+                } = down
+                {
+                    let reply = if thread_id == "th_reconcile_refused" {
+                        // Return newest-first BB-shaped failed refusal turn rows.
+                        protocol::Up::Result {
+                            req_id,
+                            ok: true,
+                            value: serde_json::json!([
+                                {
+                                    "seq": 3,
+                                    "type": "turn/completed",
+                                    "data": { "status": "failed", "error": { "message": "turn failed" } }
+                                },
+                                {
+                                    "seq": 2,
+                                    "type": "provider/error",
+                                    "data": {
+                                        "message": "policy refused",
+                                        "errorInfo": { "category": "policy", "providerCode": "cyber_safeguard", "httpStatusCode": 400 }
+                                    }
+                                },
+                                {
+                                    "seq": 1,
+                                    "type": "turn/started",
+                                    "data": {}
+                                }
+                            ]),
+                        }
+                    } else {
+                        protocol::Up::Result {
+                            req_id,
+                            ok: false,
+                            value: serde_json::Value::String("thread not found".into()),
+                        }
+                    };
+                    let _ = ws_writer
+                        .send_text(&serde_json::to_string(&reply).unwrap())
+                        .await;
+                }
+            }
+        });
+
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: format!("ws://{addr}/bridge"),
+                token: token.into(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let op = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+        let sys = harness.client(Principal::System {
+            part: SystemPart::BbBridge,
+        });
+
+        let wave = WaveSlug::parse("reconcile-honesty").unwrap();
+        let ref_role = RoleName::parse("refused-w").unwrap();
+        let gone_role = RoleName::parse("gone-w").unwrap();
+        let spec = WaveSpec {
+            slug: wave.clone(),
+            project: BbProjectId::parse("proj_1").unwrap(),
+            goal: Body::parse("reconcile").unwrap(),
+            output_dir: None,
+            defaults: AgentSpec {
+                provider: ProviderId::parse("claude-code").unwrap(),
+                model: None,
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Full,
+                workspace: Workspace::ProjectDefault,
+            },
+            workers: vec![
+                WorkerSpec {
+                    role: ref_role.clone(),
+                    brief: Body::parse("a").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                },
+                WorkerSpec {
+                    role: gone_role.clone(),
+                    brief: Body::parse("b").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                },
+            ],
+        };
+        op.call(WaveStart { spec, idem: None }).await.unwrap();
+        sys.call(WaveObserve {
+            wave: wave.clone(),
+            role: ref_role.clone(),
+            observation: Observation::Spawned {
+                attempt: 1,
+                thread: BbThreadId::parse("th_reconcile_refused").unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+        sys.call(WaveObserve {
+            wave: wave.clone(),
+            role: gone_role.clone(),
+            observation: Observation::Spawned {
+                attempt: 1,
+                thread: BbThreadId::parse("th_reconcile_gone").unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+
+        // Simulate restart: bridge learns live workers from journal replay (cursor_seq == None).
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: ref_role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: BbThreadId::parse("th_reconcile_refused").unwrap(),
+                },
+            },
+        );
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: gone_role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: BbThreadId::parse("th_reconcile_gone").unwrap(),
+                },
+            },
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bridge_runner = tokio::spawn({
+            let bridge = bridge.clone();
+            let harness = harness.clone();
+            async move { bridge.run_until(harness, shutdown_rx).await }
+        });
+
+        let snap = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let s = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+                let ref_ok = s
+                    .workers
+                    .iter()
+                    .find(|(r, _, _)| r == &ref_role)
+                    .is_some_and(|(_, _, p)| p.refusal().is_some());
+                let gone_ok = s
+                    .workers
+                    .iter()
+                    .find(|(r, _, _)| r == &gone_role)
+                    .is_some_and(|(_, _, p)| {
+                        p.error()
+                            .is_some_and(|e| e.contains("missing after restart"))
+                    });
+                if ref_ok && gone_ok {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("reconcile_live_workers must observe BB-shaped Refused and missing-thread Errored");
+
+        assert_eq!(snap.counts.refused, 1);
+        assert_eq!(snap.counts.errored, 1);
+        assert_eq!(snap.counts.idle, 0);
+
+        let _ = shutdown_tx.send(true);
+        let _ = bridge_runner.await;
+        server_task.abort();
     }
 }
