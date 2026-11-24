@@ -362,6 +362,8 @@ impl IsolatedDaemon {
     ) -> (PathBuf, SocketAddr, ChildGuard) {
         let sandbox = root.join("mail-sandbox");
         let cfg_dir = root.join("config");
+        let t3_home = root.join("t3-home");
+        std::fs::create_dir_all(&t3_home).unwrap();
         let bell_port = free_port().await;
         let unused_bb_port = free_port().await;
         let sock = root.join("daemon.sock");
@@ -369,6 +371,11 @@ impl IsolatedDaemon {
 
         let mut child = Command::new(bin_path())
             .env("XDG_CONFIG_HOME", &cfg_dir)
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
+            .env_remove("REX_WAVE_T3_HOME")
+            .env_remove("REX_WAVE_T3_URL")
+            .env_remove("REX_WAVE_T3_TOKEN")
             .args([
                 "--socket",
                 sock.to_str().unwrap(),
@@ -381,6 +388,8 @@ impl IsolatedDaemon {
                 "both",
                 "--bb-url",
                 &format!("ws://127.0.0.1:{unused_bb_port}/bridge"),
+                "--t3-home",
+                t3_home.to_str().unwrap(),
                 "--t3-url",
                 &format!("http://{t3_addr}"),
                 "--t3-token",
@@ -476,6 +485,8 @@ impl IsolatedDaemon {
         let owned_rem: Vec<String> = remove_envs.iter().map(|s| (*s).to_owned()).collect();
         tokio::task::spawn_blocking(move || {
             let mut cmd = Command::new(bin_path());
+            cmd.env_remove("REX_WAVE_TOKEN")
+                .env_remove("T3CODE_THREAD_ID");
             for k in &owned_rem {
                 cmd.env_remove(k);
             }

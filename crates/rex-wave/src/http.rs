@@ -908,7 +908,7 @@ pub fn parse_http_room_ref(raw: &str) -> Result<RoomRef, ApiError> {
         return crate::parse_room_ref(trimmed);
     }
     if let Some(rest) = trimmed.strip_prefix("proj:")
-        && let Some((proj, chan)) = rest.split_once('/')
+        && let Some((proj, chan)) = rest.rsplit_once('/')
     {
         return Ok(RoomRef::Channel {
             scope: RoomScope::Project {
@@ -917,7 +917,7 @@ pub fn parse_http_room_ref(raw: &str) -> Result<RoomRef, ApiError> {
             name: ChannelName::parse(chan)?,
         });
     }
-    if let Some((proj, chan)) = trimmed.split_once('/') {
+    if let Some((proj, chan)) = trimmed.rsplit_once('/') {
         return Ok(RoomRef::Channel {
             scope: RoomScope::Project {
                 project: BbProjectId::parse(proj)?,

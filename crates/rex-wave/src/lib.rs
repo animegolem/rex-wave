@@ -30,7 +30,7 @@ pub fn parse_principal_ref(raw: &str) -> Result<Principal, ApiError> {
 
 pub fn parse_room_ref(s: &str) -> Result<RoomRef, ApiError> {
     if let Some(rest) = s.strip_prefix('#') {
-        if let Some((proj, chan)) = rest.split_once('/') {
+        if let Some((proj, chan)) = rest.rsplit_once('/') {
             let proj_clean = proj.strip_prefix("proj:").unwrap_or(proj);
             return Ok(RoomRef::Channel {
                 scope: RoomScope::Project {
@@ -53,4 +53,24 @@ pub fn parse_room_ref(s: &str) -> Result<RoomRef, ApiError> {
         "room",
         "expected #<channel>, #<project>/<channel>, @<seat>, or @<wave>/<role>",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_room_ref_supports_filesystem_path_project_ids() {
+        let parsed =
+            parse_room_ref("#/tmp/work/sample-repo/wave-alpha").expect("path project room");
+        assert_eq!(
+            parsed,
+            RoomRef::Channel {
+                scope: RoomScope::Project {
+                    project: BbProjectId::parse("/tmp/work/sample-repo").unwrap(),
+                },
+                name: ChannelName::parse("wave-alpha").unwrap(),
+            }
+        );
+    }
 }
