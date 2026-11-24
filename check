@@ -181,7 +181,14 @@ git_rev = sys.argv[2]
 # Domain-separated SHA-256 tripwire digests keep this script free of house
 # literals while catching accidental reintroductions in paths or content.
 PRIVATE_PATH_DIGESTS = frozenset([
-    "498cc623fac49db3",
+    "5670a18e02bf44f8",
+    "23b1ee96425be106",
+    "0391f536eeebb32b",
+    "c454a70cf23dde66",
+    "ee0043c7aef55bfc",
+    "a1e096398f6c0576",
+    "aeff0f52626dd5c5",
+    "feb60a0e299fbf85",
     "a6edd614cb7d96bf",
     "274d8306dbe09fc4",
     "e1891630c34c4465",
@@ -273,6 +280,8 @@ def find_private_path_match(line):
         return m_home.group(0)
     cleaned = esc_re.sub(" ", line.lower())
     for chunk in sub_chunk_re.findall(cleaned):
+        if has_digest("subchunk", chunk, frozenset(["aa4964fa720aedd0"])):
+            return chunk
         parts = sub_split_re.split(chunk)
         for i in range(0, len(parts), 2):
             p = parts[i]
@@ -363,62 +372,78 @@ def iter_entries():
             ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
         )
         seen = set()
-        symlink_ancestors = {}
         yielded_ancestors = set()
-
-        def check_ancestors(rel_path):
-            parts = rel_path.split("/")[:-1]
-            cur_rel = ""
-            for seg in parts:
-                cur_rel = seg if not cur_rel else (cur_rel + "/" + seg)
-                if cur_rel not in symlink_ancestors:
-                    anc_full = os.path.join(root, cur_rel)
-                    try:
-                        anc_st = os.lstat(anc_full)
-                        if stat.S_ISLNK(anc_st.st_mode):
-                            symlink_ancestors[cur_rel] = os.readlink(anc_full).encode(
-                                "utf-8", errors="surrogateescape"
-                            )
-                        else:
-                            symlink_ancestors[cur_rel] = None
-                    except FileNotFoundError:
-                        symlink_ancestors[cur_rel] = None
-                if symlink_ancestors[cur_rel] is not None:
-                    return cur_rel, symlink_ancestors[cur_rel]
-            return None
-
-        for path_b in raw.split(b"\0"):
-            if not path_b:
-                continue
-            rel = path_b.decode("utf-8", errors="surrogateescape")
-            if rel in seen:
-                continue
-            seen.add(rel)
-            anc = check_ancestors(rel)
-            if anc is not None:
-                anc_rel, anc_target = anc
-                if anc_rel not in yielded_ancestors:
-                    yielded_ancestors.add(anc_rel)
-                    yield anc_rel, anc_target
-                continue
-            full = os.path.join(root, rel)
-            try:
-                st = os.lstat(full)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISLNK(st.st_mode):
-                target = os.readlink(full).encode("utf-8", errors="surrogateescape")
-                yield rel, target
-            elif stat.S_ISREG(st.st_mode):
-                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(full, flags)
+        o_dir = getattr(os, "O_DIRECTORY", 0)
+        o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+        root_fd = os.open(root, os.O_RDONLY | o_dir)
+        try:
+            for path_b in raw.split(b"\0"):
+                if not path_b:
+                    continue
+                rel = path_b.decode("utf-8", errors="surrogateescape")
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                segments = [seg for seg in rel.split("/") if seg]
+                if not segments:
+                    continue
+                parent_fd = root_fd
+                cur_rel = ""
+                aborted = False
                 try:
-                    with os.fdopen(fd, "rb") as fh:
-                        data = fh.read()
-                except Exception:
-                    os.close(fd)
-                    raise
-                yield rel, data
+                    for seg in segments[:-1]:
+                        cur_rel = seg if not cur_rel else (cur_rel + "/" + seg)
+                        try:
+                            next_fd = os.open(
+                                seg, os.O_RDONLY | o_dir | o_nofollow, dir_fd=parent_fd
+                            )
+                        except OSError:
+                            try:
+                                anc_st = os.lstat(seg, dir_fd=parent_fd)
+                                if stat.S_ISLNK(anc_st.st_mode) and cur_rel not in yielded_ancestors:
+                                    yielded_ancestors.add(cur_rel)
+                                    yield cur_rel, os.readlink(seg, dir_fd=parent_fd).encode(
+                                        "utf-8", errors="surrogateescape"
+                                    )
+                            except OSError:
+                                pass
+                            aborted = True
+                            break
+                        if parent_fd != root_fd:
+                            os.close(parent_fd)
+                        parent_fd = next_fd
+                    if not aborted:
+                        leaf = segments[-1]
+                        try:
+                            st = os.lstat(leaf, dir_fd=parent_fd)
+                        except OSError:
+                            st = None
+                        if st is not None:
+                            if stat.S_ISLNK(st.st_mode):
+                                target = os.readlink(leaf, dir_fd=parent_fd).encode(
+                                    "utf-8", errors="surrogateescape"
+                                )
+                                yield rel, target
+                            elif stat.S_ISREG(st.st_mode):
+                                try:
+                                    fd = os.open(
+                                        leaf, os.O_RDONLY | o_nofollow, dir_fd=parent_fd
+                                    )
+                                except OSError:
+                                    fd = None
+                                if fd is not None:
+                                    try:
+                                        with os.fdopen(fd, "rb") as fh:
+                                            data = fh.read()
+                                    except Exception:
+                                        os.close(fd)
+                                        raise
+                                    yield rel, data
+                finally:
+                    if parent_fd != root_fd:
+                        os.close(parent_fd)
+        finally:
+            os.close(root_fd)
 
 path_hits = []
 seat_hits = []

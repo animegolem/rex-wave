@@ -2081,7 +2081,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_carol_1seat_soak() {
                 "seat": "carol",
                 "role": "estate-desk",
                 "start_cmd": "claude --name Carol-5.2",
-                "resume_cmd": "claude --resume 59e9053e"
+                "resume_cmd": "claude --resume sess_demo_01"
             }]
         }))
         .unwrap(),
@@ -2247,7 +2247,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_carol_1seat_soak() {
     );
     assert_eq!(
         resolved["value"]["record"]["resume_cmd"],
-        "claude --resume 59e9053e"
+        "claude --resume sess_demo_01"
     );
 
     // 3. `carol`'s seat token cannot clear operator-set `start_cmd`/`resume_cmd` via `--replace`,
@@ -2302,7 +2302,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_carol_1seat_soak() {
     );
     assert_eq!(
         after_role["value"]["record"]["resume_cmd"],
-        "claude --resume 59e9053e"
+        "claude --resume sess_demo_01"
     );
 
     // 4. Smoke-test Carol's exact 4-step 1-seat live-soak flow on a clean isolated daemon.

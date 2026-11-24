@@ -415,7 +415,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         "pid": my_pid,
         "procStart": my_start,
         "startedAt": 1_794_550_979_000u64,
-        "sessionId": "59e9053e-bbdd-4181-bf4f-3f7bf864d276",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
         "messagingSocketPath": format!("/tmp/cc-socks/{my_pid}.sock"),
         "kind": "bg",
         "name": "Carol-5.2",
@@ -469,7 +469,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             "pid": my_pid,
             "procStart": my_start,
             "sessionId": "sess-derived",
-            "messagingSocketPath": "/tmp/cc-socks/85820.sock",
+            "messagingSocketPath": "/tmp/cc-socks/41001.sock",
             "kind": "interactive",
             "name": "sess-f0",
             "nameSource": "derived"
@@ -1065,7 +1065,7 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
                 endpoint: claude_endpoint(
                     8195,
                     "Thu Nov 12 06:22:59 2026",
-                    "59e9053e",
+                    "sess_demo_01",
                     "bg",
                     Some("user"),
                     Some("Carol-5.2"),
@@ -1467,9 +1467,9 @@ fn gate1_case_08_session_names_drift() {
                 incarnation_id: Some(IncarnationId::parse("inc-dave-main").unwrap()),
                 lane: None,
                 endpoint: claude_endpoint(
-                    85820,
+                    41001,
                     "Thu Nov 19 05:52:37 2026",
-                    "044c8872",
+                    "sess_demo_02",
                     "interactive",
                     Some("derived"),
                     Some("sess-c7"),
@@ -1495,9 +1495,9 @@ fn gate1_case_08_session_names_drift() {
                 incarnation_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
-                    85820,
+                    41001,
                     "Thu Nov 19 05:52:37 2026",
-                    "044c8872",
+                    "sess_demo_02",
                     "interactive",
                     Some("derived"),
                     Some("sess-f0"),
@@ -1523,7 +1523,7 @@ fn gate1_case_08_session_names_drift() {
                 incarnation_id: Some(IncarnationId::parse("inc-dave-2d").unwrap()),
                 lane: Some("2d".into()),
                 endpoint: claude_endpoint(
-                    18604,
+                    41002,
                     "Thu Nov 19 06:00:00 2026",
                     "2d-sess",
                     "interactive",
@@ -2905,7 +2905,7 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
             avatar: Some("avatars/carol.png".into()),
             home_dir: Some("/workspace/seats/carol".into()),
             start_cmd: Some("claude --name Carol-5.2".into()),
-            resume_cmd: Some("claude --resume 59e9053e".into()),
+            resume_cmd: Some("claude --resume sess_demo_01".into()),
             rex_target: Some("block:carol-desk".into()),
             ..empty_claim("carol")
         }),
@@ -2932,7 +2932,10 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
     assert_eq!(rec.avatar.as_deref(), Some("avatars/carol.png"));
     assert_eq!(rec.home_dir.as_deref(), Some("/workspace/seats/carol"));
     assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Carol-5.2"));
-    assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume 59e9053e"));
+    assert_eq!(
+        rec.resume_cmd.as_deref(),
+        Some("claude --resume sess_demo_01")
+    );
     assert_eq!(rec.rex_target.as_deref(), Some("block:carol-desk"));
     assert_eq!(rec.mail_horizon_at, Some(UnixMs(1_795_284_326_000)));
 
@@ -3341,12 +3344,12 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     .unwrap();
     fs::write(
         interchange.join("state/bb-knock-routes.tsv"),
-        "# comment\nseat\tbb_thread_id\tnote\nfrank\tthr_bns4xpcfs9\tEmacs-FV review\n",
+        "# comment\nseat\tbb_thread_id\tnote\nfrank\tthr_demo_01\tEmacs-FV review\n",
     )
     .unwrap();
     fs::write(
         interchange.join("state/codex-knock-routes.tsv"),
-        "seat\thostId\tthreadId\tnote\ncodex-org-fv\tlocal\t01a1b9c9\tEmacs Verify\n",
+        "seat\thostId\tthreadId\tnote\ncodex-org-fv\tlocal\tcodex_demo_01\tEmacs Verify\n",
     )
     .unwrap();
     fs::write(
@@ -3354,10 +3357,10 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         concat!(
             "# seat\ttarget\tverified_date\tverified_how\n",
             "seat\ttarget\tdate\thow\n",
-            "liam\trex:d5b20f/69f276\t2026-11-16\tself\n",
-            "peggy\tw3:pN\t2026-10-13\tpane\n",
-            "walter\tw4:p27\t2026-10-13\tpane\n",
-            "sol_ext\tw5:p2\t2026-10-20\tpane\n",
+            "liam\trex:demo01/pane01\t2026-11-16\tself\n",
+            "peggy\tw1:p1\t2026-10-13\tpane\n",
+            "walter\tw1:p2\t2026-10-13\tpane\n",
+            "sol_ext\tw1:p3\t2026-10-20\tpane\n",
             "excluded-seat\tw9:p1S\t2026-10-13\tPERMANENTLY EXCLUDED\n",
         ),
     )
@@ -3379,7 +3382,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     fs::write(
         &seats_tsv_path,
         concat!(
-            "# external seats map\n",
+            "# external seats map (ordinary algorithm terms like k-means are allowed)\n",
             "ML-Papers\tliam\t/tmp/liam\n",
             "Pasted-text.txt attachment (fork) (fork)\tfrank\t/tmp/frank\n",
             "frank-fork\tfrank\t/tmp/frank\n",
