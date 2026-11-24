@@ -59,7 +59,7 @@ const EXIT_TIMEOUT: u8 = 124;
     about = "Waves, #channels, DMs, kanban, tasks, presence, and notifications for BB + T3 + Rex"
 )]
 pub struct Cli {
-    /// Daemon Unix socket path (default: `$XDG_STATE_HOME/rex-wave/daemon.sock`).
+    /// Daemon Unix socket path (default: `$XDG_STATE_HOME/rex-wave/daemon.sock`; on macOS, must share `/tmp`'s filesystem).
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
     /// Capability token for seat or worker authentication (falls back to `T3CODE_THREAD_ID` worker token, then Unix peer UID).

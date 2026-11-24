@@ -4045,4 +4045,53 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         err_res.is_err(),
         "corrupt wave header must return an error instead of advancing cursor over skipped history"
     );
+
+    // Filtered room Wait (`RoomFiltered`, used by CLI `read --re`) on a healthy project room
+    // must NOT fail when an unrelated wave has a corrupt header or an unknown stream exists.
+    let disk_proj_room = RoomRef::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("proj_disk").unwrap(),
+        },
+        name: ChannelName::parse("ops").unwrap(),
+    };
+    let root_post = disk_op
+        .call(RoomPost {
+            room: disk_proj_room.clone(),
+            body: Body::parse("root thread msg").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    disk_op
+        .call(RoomPost {
+            room: disk_proj_room.clone(),
+            body: Body::parse("thread reply msg").unwrap(),
+            re: Some(root_post.seq),
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let mut filtered_wait = rex_wave_api::read::Wait::room_ref_filtered(
+        disk_proj_room,
+        disk_op.me(),
+        Seq::ORIGIN,
+        Some(root_post.seq),
+        Vec::new(),
+    )
+    .unwrap();
+    filtered_wait.cursor = Some(saved_proj);
+    filtered_wait.since = None;
+    filtered_wait.timeout_ms = Some(0);
+    let filtered_page = disk_op
+        .call(filtered_wait)
+        .await
+        .expect("RoomFiltered wait must succeed despite corrupt unrelated wave and unknown stream");
+    assert_eq!(filtered_page.entries.len(), 2);
 }

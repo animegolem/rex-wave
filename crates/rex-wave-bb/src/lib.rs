@@ -1735,6 +1735,12 @@ impl Reactor for BridgeWaveWatcher {
     }
 }
 
+struct FallbackWaitEntry {
+    active: usize,
+    epoch: u64,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
 struct WaitFlightGuard {
     bridge: Arc<BbBridge>,
     key: (WaveSlug, RoleName),
@@ -1788,22 +1794,25 @@ impl Client for WorkerToolClient {
             let mut wait_guard = None;
             if let Some((room, since)) = manual_parked_scope {
                 let key = (wave.clone(), role.clone());
-                bridge.increment_fallback_wait(&key);
+                let (epoch, gate) = bridge.increment_fallback_wait(&key);
                 wait_guard = Some(WaitFlightGuard {
                     bridge: bridge.clone(),
-                    key,
+                    key: key.clone(),
                     aborted: aborted_wait,
                     completed: false,
                 });
-                bridge
-                    .call_wave_observe(
-                        wave.clone(),
-                        role.clone(),
-                        Observation::Activity {
-                            activity: Activity::Parked { room, since },
-                        },
-                    )
-                    .await;
+                let _guard_lock = gate.lock().await;
+                if bridge.fallback_wait_is_live(&key, epoch) {
+                    bridge
+                        .call_wave_observe(
+                            wave.clone(),
+                            role.clone(),
+                            Observation::Activity {
+                                activity: Activity::Parked { room, since },
+                            },
+                        )
+                        .await;
+                }
             }
 
             let outcome = backend.call_as(me, cmd).await;
@@ -1812,20 +1821,7 @@ impl Client for WorkerToolClient {
                 let key = guard.key.clone();
                 guard.completed = true;
                 drop(guard);
-                if !bridge.has_fallback_wait(&key)
-                    && let Ok(rec) = bridge.lookup_worker(&wave, &role).await
-                    && matches!(rec.activity, Activity::Parked { .. })
-                {
-                    bridge
-                        .call_wave_observe(
-                            wave,
-                            role,
-                            Observation::Activity {
-                                activity: Activity::Working,
-                            },
-                        )
-                        .await;
-                }
+                bridge.restore_fallback_working_if_idle(&key).await;
             }
             outcome
         }
@@ -1850,7 +1846,7 @@ pub struct BbBridge {
     owner: mpsc::UnboundedSender<OwnerMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     code_runner: Option<CodeRunner>,
-    fallback_active_waits: std::sync::Mutex<HashMap<(WaveSlug, RoleName), usize>>,
+    fallback_active_waits: std::sync::Mutex<HashMap<(WaveSlug, RoleName), FallbackWaitEntry>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -1889,12 +1885,22 @@ impl BbBridge {
         bridge
     }
 
-    fn increment_fallback_wait(&self, key: &(WaveSlug, RoleName)) {
+    fn increment_fallback_wait(
+        &self,
+        key: &(WaveSlug, RoleName),
+    ) -> (u64, Arc<tokio::sync::Mutex<()>>) {
         let mut map = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *map.entry(key.clone()).or_insert(0) += 1;
+        let entry = map.entry(key.clone()).or_insert_with(|| FallbackWaitEntry {
+            active: 0,
+            epoch: 0,
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        entry.active += 1;
+        entry.epoch = entry.epoch.wrapping_add(1);
+        (entry.epoch, entry.gate.clone())
     }
 
     fn decrement_fallback_wait(&self, key: &(WaveSlug, RoleName)) {
@@ -1902,19 +1908,66 @@ impl BbBridge {
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = map.get_mut(key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(key);
-            }
+        if let Some(entry) = map.get_mut(key) {
+            entry.active = entry.active.saturating_sub(1);
         }
     }
 
-    fn has_fallback_wait(&self, key: &(WaveSlug, RoleName)) -> bool {
-        self.fallback_active_waits
+    fn fallback_wait_is_live(&self, key: &(WaveSlug, RoleName), expected_epoch: u64) -> bool {
+        let map = self
+            .fallback_active_waits
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(key)
+            .unwrap_or_else(|e| e.into_inner());
+        map.get(key)
+            .is_some_and(|e| e.active > 0 && e.epoch >= expected_epoch)
+    }
+
+    fn snapshot_idle_fallback_wait(
+        &self,
+        key: &(WaveSlug, RoleName),
+        expected_epoch: Option<u64>,
+    ) -> Option<(u64, Arc<tokio::sync::Mutex<()>>)> {
+        let map = self
+            .fallback_active_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = map.get(key)?;
+        if entry.active > 0 {
+            return None;
+        }
+        if let Some(exp) = expected_epoch
+            && entry.epoch != exp
+        {
+            return None;
+        }
+        Some((entry.epoch, entry.gate.clone()))
+    }
+
+    async fn restore_fallback_working_if_idle(&self, key: &(WaveSlug, RoleName)) {
+        let Some((epoch, gate)) = self.snapshot_idle_fallback_wait(key, None) else {
+            return;
+        };
+        let _guard = gate.lock().await;
+        if self.snapshot_idle_fallback_wait(key, Some(epoch)).is_none() {
+            return;
+        }
+        let Ok(rec) = self.lookup_worker(&key.0, &key.1).await else {
+            return;
+        };
+        if !matches!(rec.activity, Activity::Parked { .. }) {
+            return;
+        }
+        if self.snapshot_idle_fallback_wait(key, Some(epoch)).is_none() {
+            return;
+        }
+        self.call_wave_observe(
+            key.0.clone(),
+            key.1.clone(),
+            Observation::Activity {
+                activity: Activity::Working,
+            },
+        )
+        .await;
     }
 
     fn refresh_local_project_names(&self) {
@@ -2516,21 +2569,9 @@ impl BbBridge {
                 return;
             };
             let res = (runner)(worker_client, args).await;
-            let key = (wave.clone(), role.clone());
-            if !router_handles_park
-                && aborted_wait.load(Ordering::Relaxed)
-                && !self.has_fallback_wait(&key)
-                && let Ok(rec) = self.lookup_worker(&wave, &role).await
-                && matches!(rec.activity, Activity::Parked { .. })
-            {
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Working,
-                    },
-                )
-                .await;
+            let key = (wave, role);
+            if !router_handles_park && aborted_wait.load(Ordering::Relaxed) {
+                self.restore_fallback_working_if_idle(&key).await;
             }
             match res {
                 Ok(text) => send_reply(true, text).await,
@@ -5865,6 +5906,43 @@ mod tests {
                 Box::pin(async move {
                     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("hold");
                     let room_stream = StreamId::Room { room: room.clone() };
+                    if mode == "repark_race" {
+                        let c1 = client.clone();
+                        let c2 = client;
+                        let r1 = room.clone();
+                        let r2 = room;
+                        let rs1 = room_stream.clone();
+                        let rs2 = room_stream;
+                        let first = tokio::spawn(async move {
+                            let w1 = rex_wave_api::read::Wait {
+                                timeout_ms: Some(15),
+                                ..rex_wave_api::read::Wait::new(
+                                    Interest::Room {
+                                        room: RoomRef::Id { id: r1 },
+                                    },
+                                    Cursor::default().with(rs1, Seq(1)),
+                                )
+                            };
+                            let _ = c1.call(w1).await;
+                        });
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        tokio::task::yield_now().await;
+                        let second = tokio::spawn(async move {
+                            let w2 = rex_wave_api::read::Wait {
+                                timeout_ms: Some(5_000),
+                                ..rex_wave_api::read::Wait::new(
+                                    Interest::Room {
+                                        room: RoomRef::Id { id: r2 },
+                                    },
+                                    Cursor::default().with(rs2, Seq(1)),
+                                )
+                            };
+                            let _ = c2.call(w2).await;
+                        });
+                        first.await.unwrap();
+                        second.await.unwrap();
+                        return Ok("reparked".into());
+                    }
                     let w = rex_wave_api::read::Wait {
                         timeout_ms: Some(5_000),
                         ..rex_wave_api::read::Wait::new(
@@ -6058,7 +6136,7 @@ mod tests {
             .unwrap();
             hold_handle.await.unwrap();
             if !router_owns_parking {
-                let end_snap = op.call(WaveView { wave }).await.unwrap();
+                let end_snap = op.call(WaveView { wave: wave.clone() }).await.unwrap();
                 assert!(
                     matches!(
                         &end_snap.workers[0].2,
@@ -6070,6 +6148,46 @@ mod tests {
                     "finishing final fallback wait restores Working: {:?}",
                     end_snap.workers[0].2
                 );
+
+                let b_race = bridge.clone();
+                let race_handle = tokio::spawn(async move {
+                    b_race
+                        .on_tool_call(
+                            "call_repark".into(),
+                            "th_cancel_1".into(),
+                            None,
+                            "run_code".into(),
+                            serde_json::json!({ "mode": "repark_race" }),
+                        )
+                        .await;
+                });
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                let race_snap = op.call(WaveView { wave }).await.unwrap();
+                assert!(
+                    matches!(
+                        &race_snap.workers[0].2,
+                        WorkerPhase::Live {
+                            activity: Activity::Parked { .. },
+                            ..
+                        }
+                    ),
+                    "new fallback wait parking during prior cleanup must stay Parked: {:?}",
+                    race_snap.workers[0].2
+                );
+                op.call(RoomPost {
+                    room: RoomRef::Id {
+                        id: started.room.clone(),
+                    },
+                    body: Body::parse("wake repark wait").unwrap(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: None,
+                })
+                .await
+                .unwrap();
+                race_handle.await.unwrap();
             }
             let _ = shutdown_tx.send(true);
             let _ = bridge_runner.await;

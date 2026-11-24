@@ -476,18 +476,49 @@ impl ReadSide {
         let mut filter = Filter::build(&viewer, interest, &self.journal, self.sidebar.clone())?;
         let from = self.sanitize_and_remap_cursor(&viewer, &from, remap_dm_cursor)?;
         let mut tap = self.hub.tap();
-        let initial: BTreeMap<StreamId, Seq> = self
-            .journal
-            .streams()
-            .map_err(store_error)?
-            .into_iter()
-            .collect();
+        let exact_streams: Option<Vec<StreamId>> = match &filter {
+            Filter::Exact(set) => Some(set.iter().cloned().collect()),
+            Filter::RoomFiltered { stream, .. } => Some(vec![stream.clone()]),
+            Filter::Mentions { .. } | Filter::Project { .. } | Filter::Everything => None,
+        };
+        let initial: BTreeMap<StreamId, Seq> = match &exact_streams {
+            Some(streams) => {
+                let mut map = BTreeMap::new();
+                for s in streams {
+                    if can_read(&viewer, s).is_ok() {
+                        let h = self.journal.head(s).map_err(store_error)?;
+                        map.insert(s.clone(), h);
+                    }
+                }
+                map
+            }
+            None => self
+                .journal
+                .streams()
+                .map_err(store_error)?
+                .into_iter()
+                .collect(),
+        };
 
+        let raw_candidates: Vec<StreamId> = match &exact_streams {
+            Some(streams) => streams.clone(),
+            None => initial.keys().cloned().collect(),
+        };
+
+        let filter_considers_waves = !matches!(
+            filter,
+            Filter::Mentions { .. } | Filter::RoomFiltered { .. }
+        );
         let snap_project_waves = match from.snapshot() {
-            Some(SnapshotScope::Project { project }) => {
+            Some(SnapshotScope::Project { project })
+                if !from.from_head() && filter_considers_waves =>
+            {
                 let mut waves = BTreeSet::new();
-                for s in initial.keys() {
-                    if let StreamId::Wave { wave } = s {
+                for s in &raw_candidates {
+                    if let StreamId::Wave { wave } = s
+                        && can_read(&viewer, s).is_ok()
+                        && !from.lists(s)
+                    {
                         let first = self.journal.read(s, Seq::ORIGIN, 1).map_err(store_error)?;
                         for env in &first {
                             if let Event::Wave(WaveEvent::Started { spec, .. }) = &env.event
@@ -503,18 +534,13 @@ impl ReadSide {
             _ => BTreeSet::new(),
         };
 
-        let raw_candidates: Vec<StreamId> = match &filter {
-            Filter::Exact(set) => set.iter().cloned().collect(),
-            Filter::RoomFiltered { stream, .. } => vec![stream.clone()],
-            _ => initial.keys().cloned().collect(),
-        };
         let mut candidates = Vec::with_capacity(raw_candidates.len());
         for s in raw_candidates {
             if can_read(&viewer, &s).is_err() {
                 continue;
             }
             let start = start_seq_scoped(&from, &initial, &snap_project_waves, &s);
-            filter.seed_stream(&self.journal, &s, start);
+            filter.seed_stream(&self.journal, &s, start)?;
             if !filter.considers_stream(&viewer, &s) {
                 continue;
             }
@@ -624,19 +650,45 @@ impl ReadSide {
                             }
                         }
                         Err(RecvError::Lagged(_)) => {
-                            let streams = match journal.streams() {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    let _ = tx.send(Err(store_error(e))).await;
-                                    break;
+                            let streams: Vec<(StreamId, Seq)> = match &exact_streams {
+                                Some(exact) => {
+                                    let mut v = Vec::with_capacity(exact.len());
+                                    let mut failed = false;
+                                    for s in exact {
+                                        if can_read(&viewer, s).is_err() {
+                                            continue;
+                                        }
+                                        match journal.head(s) {
+                                            Ok(h) => v.push((s.clone(), h)),
+                                            Err(e) => {
+                                                let _ = tx.send(Err(store_error(e))).await;
+                                                failed = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if failed {
+                                        break;
+                                    }
+                                    v
                                 }
+                                None => match journal.streams() {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(store_error(e))).await;
+                                        break;
+                                    }
+                                },
                             };
                             for (s, head) in streams {
                                 if can_read(&viewer, &s).is_err() {
                                     continue;
                                 }
                                 let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq_scoped(&from, &initial, &snap_project_waves, &s));
-                                filter.seed_stream(&journal, &s, cur);
+                                if let Err(e) = filter.seed_stream(&journal, &s, cur) {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
                                 if !filter.considers_stream(&viewer, &s) {
                                     continue;
                                 }
@@ -1083,14 +1135,18 @@ impl Filter {
 
     /// Learn stream-header facts (like which project owns a wave, or prior thread
     /// membership and labels before a mid-stream resume point).
-    fn seed_stream(&mut self, journal: &Journal, stream: &StreamId, upto: Seq) {
-        if let (Filter::Project { .. }, StreamId::Wave { .. }) = (&self, stream)
-            && let Ok(first) = journal.read(stream, Seq::ORIGIN, 1)
-        {
+    fn seed_stream(
+        &mut self,
+        journal: &Journal,
+        stream: &StreamId,
+        upto: Seq,
+    ) -> Result<(), ApiError> {
+        if let (Filter::Project { .. }, StreamId::Wave { .. }) = (&self, stream) {
+            let first = journal.read(stream, Seq::ORIGIN, 1).map_err(store_error)?;
             for env in &first {
                 self.observe(env);
             }
-            return;
+            return Ok(());
         }
 
         let seed_start = match self {
@@ -1109,12 +1165,12 @@ impl Filter {
             _ => None,
         };
         let Some(mut after) = seed_start else {
-            return;
+            return Ok(());
         };
         while after < upto {
-            let Ok(page) = journal.read(stream, after, REPLAY_PAGE) else {
-                return;
-            };
+            let page = journal
+                .read(stream, after, REPLAY_PAGE)
+                .map_err(store_error)?;
             if page.is_empty() {
                 break;
             }
@@ -1123,7 +1179,7 @@ impl Filter {
                     if let Filter::RoomFiltered { seeded_upto, .. } = self {
                         *seeded_upto = (*seeded_upto).max(upto);
                     }
-                    return;
+                    return Ok(());
                 }
                 self.observe(env);
                 after = env.seq;
@@ -1132,6 +1188,7 @@ impl Filter {
         if let Filter::RoomFiltered { seeded_upto, .. } = self {
             *seeded_upto = (*seeded_upto).max(upto);
         }
+        Ok(())
     }
 
     fn observe(&mut self, env: &Envelope) {

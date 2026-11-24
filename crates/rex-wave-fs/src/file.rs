@@ -783,6 +783,18 @@ fn proc_fd_stage_sock_path(stage_dir: &File) -> Option<PathBuf> {
     Some(target)
 }
 
+fn proc_fd_dir_usable(dir: &File) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        proc_fd_stage_sock_path(dir).is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
 fn ensure_same_device_as_verified_tmp(
     dir_meta: &fs::Metadata,
     uid: u32,
@@ -822,7 +834,7 @@ struct BindStage {
 impl BindStage {
     fn create(parent_dir: &File, uid: u32, display_path: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
-        {
+        if proc_fd_dir_usable(parent_dir) {
             let dest_stage = OwnedSubdir::create(parent_dir.try_clone()?, ".s", 16, uid)?;
             if let Some(fd_sock) = proc_fd_stage_sock_path(dest_stage.dir()) {
                 return Ok(Self {
@@ -1136,7 +1148,6 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
         .to_os_string();
     std::os::unix::net::SocketAddr::from_pathname(path)?;
     let parent = parent_of(path)?;
-    #[cfg(not(target_os = "linux"))]
     {
         let mut anc = parent;
         while entry_kind(anc)? == EntryKind::Missing {
@@ -1148,8 +1159,13 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
                 }
             }
         }
-        let anc_meta = fs::metadata(anc)?;
-        ensure_same_device_as_verified_tmp(&anc_meta, uid, path)?;
+        let anc_dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(anc)?;
+        if !proc_fd_dir_usable(&anc_dir) {
+            ensure_same_device_as_verified_tmp(&anc_dir.metadata()?, uid, path)?;
+        }
     }
     if entry_kind(parent)? == EntryKind::Missing {
         fs::DirBuilder::new()
@@ -1202,8 +1218,9 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
             ),
         ));
     }
-    #[cfg(not(target_os = "linux"))]
-    ensure_same_device_as_verified_tmp(&parent_meta, uid, path)?;
+    if !proc_fd_dir_usable(&parent_dir) {
+        ensure_same_device_as_verified_tmp(&parent_meta, uid, path)?;
+    }
 
     let mut lock_name = file_name.clone();
     lock_name.push(".lock");
