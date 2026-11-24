@@ -319,22 +319,6 @@
     "description": "Post to a #channel or DM. @handles and @all are resolved against room members.",
     "inputSchema": {
       "$defs": {
-        "PostOrigin": {
-          "description": "Provenance of a room post. Defaults to [`PostOrigin::Direct`] when omitted so\nexisting journal rows and wire payloads stay 100% compatible.",
-          "oneOf": [
-            {
-              "enum": [
-                "direct"
-              ],
-              "type": "string"
-            },
-            {
-              "const": "mirrored_turn",
-              "description": "Final assistant turn mirrored into a wave room by a host bridge.",
-              "type": "string"
-            }
-          ]
-        },
         "Principal": {
           "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
@@ -676,9 +660,6 @@
             "type": "string"
           },
           "type": "array"
-        },
-        "origin": {
-          "$ref": "#/$defs/PostOrigin"
         },
         "re": {
           "anyOf": [

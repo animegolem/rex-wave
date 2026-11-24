@@ -1,10 +1,12 @@
 //! Canonical mode-`0600` per-worker token storage under `<state_dir>/worker-tokens/<thread_id>`
 //! and OS-CSPRNG capability token minting shared by the daemon, CLI, T3 bridge, and native runners.
 
+use crate::PrincipalTokenTable;
 use rex_wave_api::{HostThreadId, Principal, RoleName, WaveSlug};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 pub const WORKER_TOKENS_DIR: &str = "worker-tokens";
 pub const WORKER_THREAD_ENV: &str = "REX_WAVE_WORKER_THREAD_ID";
@@ -12,6 +14,32 @@ pub const T3_WORKER_THREAD_ENV: &str = "T3CODE_THREAD_ID";
 
 /// The largest worker token file read.
 const MAX_WORKER_TOKEN_FILE_BYTES: u64 = 16 * 1024;
+
+fn state_token_store_mutex() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Cross-process and in-process lock guard over `<state_dir>/tokens.json.lock`
+/// shared by CLI token minting and bridge worker-token provisioning.
+pub struct StateTokenLockGuard {
+    _in_proc: std::sync::MutexGuard<'static, ()>,
+    _lock_file: std::fs::File,
+}
+
+pub fn lock_state_dir_tokens(state_dir: &Path) -> io::Result<StateTokenLockGuard> {
+    let in_proc = state_token_store_mutex()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    rex_wave_fs::create_missing_private_dir(state_dir)?;
+    let lock_path = state_dir.join("tokens.json.lock");
+    let lock_file = rex_wave_fs::open_lock_nofollow(&lock_path)?;
+    lock_file.lock()?;
+    Ok(StateTokenLockGuard {
+        _in_proc: in_proc,
+        _lock_file: lock_file,
+    })
+}
 
 /// On-disk JSON payload for one per-worker token file under `<state_dir>/worker-tokens/`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,8 +200,22 @@ impl std::fmt::Debug for ProvisionedWorkerToken {
 
 /// Ensures `<state_dir>/worker-tokens/<thread_id>` exists with mode `0600` as a
 /// structured [`WorkerTokenFile`] JSON record for `Principal::Worker { wave, role }`,
-/// reusing an existing valid `0600` file for that same principal idempotently.
+/// reusing an existing valid `0600` file for that same principal idempotently
+/// under the shared `<state_dir>/tokens.json.lock` guard.
 pub fn provision_worker_token_in_state_dir(
+    state_dir: &Path,
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+) -> io::Result<ProvisionedWorkerToken> {
+    let guard = lock_state_dir_tokens(state_dir)?;
+    provision_worker_token_locked(&guard, state_dir, wave, role, thread)
+}
+
+/// Same as [`provision_worker_token_in_state_dir`] when the caller already holds
+/// [`StateTokenLockGuard`].
+pub fn provision_worker_token_locked(
+    _guard: &StateTokenLockGuard,
     state_dir: &Path,
     wave: &WaveSlug,
     role: &RoleName,
@@ -183,32 +225,38 @@ pub fn provision_worker_token_in_state_dir(
         wave: wave.clone(),
         role: role.clone(),
     };
-    if let Ok(path) = worker_token_path(state_dir, thread.as_str())
-        && let Ok(Some(existing)) = read_worker_token_file(state_dir, thread.as_str())
+    let path = worker_token_path(state_dir, thread.as_str())?;
+    if let Ok(bytes) = rex_wave_fs::read_private_regular(&path, None, MAX_WORKER_TOKEN_FILE_BYTES)
+        && let Ok(raw) = String::from_utf8(bytes)
     {
-        let raw = rex_wave_fs::read_private_regular(&path, None, MAX_WORKER_TOKEN_FILE_BYTES)
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_default();
         let trimmed = raw.trim();
         if trimmed.starts_with('{') {
-            if let Ok(rec) = serde_json::from_str::<WorkerTokenFile>(trimmed)
-                && rec.principal == principal
+            if let Ok(rec) = serde_json::from_str::<WorkerTokenFile>(trimmed) {
+                let tok = rec.token.trim();
+                if rec.principal == principal
+                    && !tok.is_empty()
+                    && !tok.chars().any(char::is_control)
+                {
+                    return Ok(ProvisionedWorkerToken {
+                        path,
+                        token: tok.to_owned(),
+                        created: false,
+                    });
+                }
+            }
+        } else if !trimmed.is_empty() && !trimmed.chars().any(char::is_control) {
+            let tokens_path = state_dir.join("tokens.json");
+            if let Ok(table) = PrincipalTokenTable::load_tokens_file(&tokens_path, None)
+                && table.get(trimmed) == Some(&principal)
             {
+                let upgraded =
+                    write_worker_token_record(state_dir, thread.as_str(), trimmed, &principal)?;
                 return Ok(ProvisionedWorkerToken {
-                    path,
-                    token: existing,
+                    path: upgraded,
+                    token: trimmed.to_owned(),
                     created: false,
                 });
             }
-        } else {
-            let upgraded =
-                write_worker_token_record(state_dir, thread.as_str(), &existing, &principal)?;
-            return Ok(ProvisionedWorkerToken {
-                path: upgraded,
-                token: existing,
-                created: false,
-            });
         }
     }
 

@@ -256,6 +256,8 @@ pub struct T3Config {
     pub state_dir: Option<PathBuf>,
     /// Principal used for `WaveObserve` and room operations.
     pub system_principal: Principal,
+    /// Daemon-wide default runner used when verifying unprefixed `Requested` providers.
+    pub default_runner: rex_wave_api::RunnerKind,
     pub default_models: BTreeMap<String, String>,
     pub rpc_timeout: Duration,
     pub connect_timeout: Duration,
@@ -280,6 +282,7 @@ impl T3Config {
             system_principal: Principal::System {
                 part: SystemPart::T3Bridge,
             },
+            default_runner: rex_wave_api::RunnerKind::T3,
             default_models: BTreeMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -299,12 +302,18 @@ impl T3Config {
             system_principal: Principal::System {
                 part: SystemPart::T3Bridge,
             },
+            default_runner: rex_wave_api::RunnerKind::T3,
             default_models: BTreeMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             reconnect_min: DEFAULT_RECONNECT_MIN,
             reconnect_max: DEFAULT_RECONNECT_MAX,
         })
+    }
+
+    pub fn with_default_runner(mut self, runner: rex_wave_api::RunnerKind) -> Self {
+        self.default_runner = runner;
+        self
     }
 
     pub fn with_state_dir(mut self, dir: PathBuf) -> Self {

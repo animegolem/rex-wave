@@ -736,3 +736,225 @@ async fn cli_wave_honesty_enforces_one_writer_refusals_finish_gate_account_misma
 
     server.abort();
 }
+
+#[tokio::test]
+async fn worker_credentials_fail_closed_and_legacy_tokens_do_not_rebind_across_principals() {
+    use rex_wave_api::read::{Read, Wait};
+    use rex_wave_api::room::{
+        Body, Mentions, PostOrigin, PrincipalPair, RoomEvent, RoomId, RoomOrigin, RoomPost, RoomRef,
+    };
+    use rex_wave_api::{
+        HostThreadId, IdemKey, Interest, Principal, RoleName, SeatName, Seq, StreamId, UnixMs,
+        WaveSlug,
+    };
+    use rex_wave_runtime::LocalClient;
+    use rex_wave_store::Journal;
+    use rex_wave_transport::{PrincipalTokenTable, provision_worker_token_in_state_dir};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = state_dir.join("daemon.sock");
+
+    // 1. Blank REX_WAVE_WORKER_THREAD_ID and malformed `t3:` T3CODE_THREAD_ID fail closed (never PeerUid).
+    for (env_k, env_v) in [
+        ("REX_WAVE_WORKER_THREAD_ID", "   ".to_owned()),
+        ("T3CODE_THREAD_ID", format!("t3:{}", "x".repeat(300))),
+        ("T3CODE_THREAD_ID", "t3:bad/slash".to_owned()),
+    ] {
+        let out = common::rex_wave_at(&sock)
+            .arg("inbox")
+            .env(env_k, &env_v)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{env_k}={env_v} must fail closed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("refusing PeerUid fallback")
+                || stderr.contains("failed reading worker token"),
+            "unexpected error for {env_k}: {stderr}"
+        );
+    }
+
+    // 2. Legacy plaintext worker token belonging to `@w/other` rotates instead of rebinding to `@w/target`,
+    //    while a verified legacy plaintext entry in `tokens.json` for `@w/target` upgrades in place.
+    let wave = WaveSlug::parse("w1").unwrap();
+    let other_role = RoleName::parse("other").unwrap();
+    let target_role = RoleName::parse("target").unwrap();
+    let tid = HostThreadId::parse("t3:w1:target:a1").unwrap();
+    let wt_dir = state_dir.join("worker-tokens");
+    std::fs::create_dir_all(&wt_dir).unwrap();
+    std::fs::set_permissions(&wt_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let tokens_path = state_dir.join("tokens.json");
+    let mut table = PrincipalTokenTable::new();
+    table
+        .insert_worker("rw_w_other_secret", wave.clone(), other_role)
+        .unwrap();
+    table
+        .insert_worker("rw_w_verified_target", wave.clone(), target_role.clone())
+        .unwrap();
+    table.save_tokens_file(&tokens_path).unwrap();
+
+    let wt_file = wt_dir.join(tid.as_str());
+    std::fs::write(&wt_file, "rw_w_other_secret\n").unwrap();
+    std::fs::set_permissions(&wt_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let rotated =
+        provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
+    assert!(
+        rotated.created,
+        "unowned legacy plaintext token must rotate"
+    );
+    assert_ne!(rotated.token, "rw_w_other_secret");
+
+    std::fs::write(&wt_file, "rw_w_verified_target\n").unwrap();
+    std::fs::set_permissions(&wt_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let upgraded =
+        provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
+    assert!(
+        !upgraded.created,
+        "verified legacy token for same principal upgrades cleanly"
+    );
+    assert_eq!(upgraded.token, "rw_w_verified_target");
+
+    // 3. Explicit canonical RoomRef::Id write + Read + RoomFiltered Wait on a legacy-only DM stay symmetric,
+    //    while raw StreamId reads/subscriptions remain exact, and Seat/Operator cannot spoof MirroredTurn.
+    let db_path = tmp.path().join("legacy-dm.sqlite3");
+    let owner_seat = SeatName::parse("owner").unwrap();
+    let alice_seat = SeatName::parse("alice").unwrap();
+    let op = Principal::Operator {
+        seat: owner_seat.clone(),
+    };
+    let owner_as_seat = Principal::Seat { seat: owner_seat };
+    let alice = Principal::Seat { seat: alice_seat };
+    let legacy_room = RoomId::Direct {
+        pair: PrincipalPair::new(op.clone(), alice.clone()).unwrap(),
+    };
+    let canon_room = RoomId::Direct {
+        pair: PrincipalPair::new(owner_as_seat, alice.clone()).unwrap(),
+    };
+    {
+        let j = Journal::open(&db_path).unwrap();
+        let mut w = j
+            .claim(StreamId::Room {
+                room: legacy_room.clone(),
+            })
+            .unwrap();
+        w.append(
+            &op,
+            UnixMs(1_000),
+            None,
+            vec![
+                rex_wave_api::Event::Room(RoomEvent::Opened {
+                    id: legacy_room.clone(),
+                    origin: RoomOrigin::Manual,
+                    topic: None,
+                }),
+                rex_wave_api::Event::Room(RoomEvent::Posted {
+                    body: Body::parse("seed legacy").unwrap(),
+                    mentions: Mentions::default(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: None,
+                    origin: PostOrigin::Direct,
+                }),
+            ],
+        )
+        .unwrap();
+    }
+
+    let journal = Journal::open(&db_path).unwrap();
+    let hub = rex_wave_runtime::Hub::new(64);
+    let sidebar = rex_wave_runtime::SidebarProjection::spawn(journal.clone(), hub.clone());
+    let read = std::sync::Arc::new(rex_wave_runtime::ReadSide {
+        journal: journal.clone(),
+        hub: hub.clone(),
+        sidebar,
+        agents: std::sync::Arc::new(rex_wave_runtime::NoAgentFeed),
+    });
+    let mut r = rex_wave_runtime::Router::unavailable_with(read);
+    r.room = rex_wave_runtime::Registry::<rex_wave_rooms::Rooms>::new(journal.clone(), hub);
+    let router = std::sync::Arc::new(r);
+
+    let alice_client = LocalClient::new(router.clone(), alice);
+    let denied_mirror = alice_client
+        .call(RoomPost::mirrored_turn(
+            RoomRef::Id {
+                id: canon_room.clone(),
+            },
+            Body::parse("spoof").unwrap(),
+            IdemKey::parse("spoof-1").unwrap(),
+        ))
+        .await;
+    assert!(matches!(
+        denied_mirror,
+        Err(rex_wave_api::ApiError::Denied { .. })
+    ));
+
+    let post_receipt = alice_client
+        .call(RoomPost::new(
+            RoomRef::Id {
+                id: canon_room.clone(),
+            },
+            Body::parse("explicit id post").unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(post_receipt.room, canon_room);
+
+    let read_via_ref = alice_client
+        .call(
+            Read::room_ref(
+                RoomRef::Id {
+                    id: canon_room.clone(),
+                },
+                alice_client.me(),
+                Seq::ORIGIN,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_via_ref.entries.len(),
+        4,
+        "Read by explicit canonical RoomRef::Id sees Opened + 2 MemberJoined + Posted written to that exact ID"
+    );
+
+    let mut filtered_wait = Wait::room_filtered(canon_room.clone(), Seq::ORIGIN, None, Vec::new());
+    filtered_wait.timeout_ms = Some(0);
+    let wait_via_ref = alice_client.call(filtered_wait).await.unwrap();
+    assert_eq!(
+        wait_via_ref.entries.len(),
+        4,
+        "RoomFiltered Wait by explicit canonical RoomId sees the exact entries written to that ID"
+    );
+
+    let raw_canon = alice_client
+        .call(Read::stream(
+            StreamId::Room {
+                room: canon_room.clone(),
+            },
+            Seq::ORIGIN,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(raw_canon.entries.len(), 4);
+    let mut exact_wait = Wait::new(
+        Interest::Streams {
+            streams: vec![StreamId::Room { room: canon_room }],
+        },
+        rex_wave_api::Cursor::default(),
+    );
+    exact_wait.timeout_ms = Some(0);
+    let raw_wait = alice_client.call(exact_wait).await.unwrap();
+    assert_eq!(raw_wait.entries.len(), 4);
+}

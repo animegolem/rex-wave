@@ -573,12 +573,12 @@ struct ShadowFrontmatter {
 
 fn parse_shadow_frontmatter(text: &str) -> ShadowFrontmatter {
     let mut fm = ShadowFrontmatter::default();
-    let doc = FrontmatterDoc::parse(text);
-    if !doc.has_frontmatter {
+    let entries = FrontmatterDoc::parse_headers_lenient(text);
+    if entries.is_empty() {
         return fm;
     }
 
-    for entry in doc.entries {
+    for entry in entries {
         let key = entry.key.to_ascii_lowercase();
         let val = entry.value;
         if val.is_empty() {

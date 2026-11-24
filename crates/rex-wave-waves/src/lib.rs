@@ -63,6 +63,25 @@ pub fn mirror_idem_key(
     IdemKey::parse(format!("wave:{wave}:turn:{role}:h{hex}"))
 }
 
+/// Pre-PR-27 BB turn-mirror idempotency key for inputs exceeding 256 bytes,
+/// preserved solely to recognize already-journaled rows across upgrades.
+pub fn legacy_truncated_mirror_idem_key(
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+    anchor: &str,
+) -> Option<IdemKey> {
+    let raw = format!("wave:{wave}:turn:{role}:{thread}:{anchor}");
+    if raw.len() <= 256 {
+        return None;
+    }
+    let mut end = 256usize;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    IdemKey::parse(&raw[..end]).ok()
+}
+
 pub fn is_legacy_mirror_idem_key(idem: &IdemKey) -> bool {
     idem.as_str().starts_with("wave:") && idem.as_str().contains(":turn:")
 }

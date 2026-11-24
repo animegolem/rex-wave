@@ -187,7 +187,7 @@ impl ReadSide {
     /// Resolve `room` for `viewer`, routing `@<peer>` (`RoomRef::Dm`) to an
     /// existing pre-PR-26 `(Operator, peer)` DM stream when the canonical
     /// `(Seat, peer)` stream does not exist yet, while keeping explicit
-    /// `RoomRef::Id` targets untouched.
+    /// `RoomRef::Id` targets pinned to their exact stream (matching writes).
     pub fn resolve_room_ref(
         &self,
         room: &rex_wave_api::room::RoomRef,
@@ -693,6 +693,15 @@ impl ReadSide {
         viewer: &Principal,
         req: &read::Wait,
     ) -> Result<Cursor, ApiError> {
+        let remap_dm_cursor = matches!(
+            req.interest,
+            Interest::Room {
+                room: rex_wave_api::room::RoomRef::Dm { .. }
+            } | Interest::RoomFiltered {
+                room: rex_wave_api::room::RoomRef::Dm { .. },
+                ..
+            }
+        ) || matches!(req.room, Some(rex_wave_api::room::RoomRef::Dm { .. }));
         let target_stream = match &req.room {
             Some(room_ref) => Some(StreamId::Room {
                 room: self.resolve_room_ref(room_ref, viewer)?,
@@ -700,7 +709,7 @@ impl ReadSide {
             None => None,
         };
         if let Some(ref c) = req.cursor {
-            let mut out = self.sanitize_and_remap_cursor(viewer, c, false)?;
+            let mut out = self.sanitize_and_remap_cursor(viewer, c, remap_dm_cursor)?;
             if let Some(ref target) = target_stream
                 && can_read(viewer, target).is_ok()
             {
@@ -727,7 +736,7 @@ impl ReadSide {
             }
             return Ok(base);
         }
-        self.sanitize_and_remap_cursor(viewer, &req.after, false)
+        self.sanitize_and_remap_cursor(viewer, &req.after, remap_dm_cursor)
     }
 
     pub fn parked_room_and_since(

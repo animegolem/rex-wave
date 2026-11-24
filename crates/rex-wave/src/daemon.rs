@@ -26,8 +26,8 @@ use rex_wave_t3::{
 };
 use rex_wave_transport::{
     Authenticator, ConnectionHooks, Endpoint, PrincipalTokenTable, StateDirAuthenticator,
-    bind_unix_prepared, is_safe_worker_token_id, mint_random_token,
-    provision_worker_token_in_state_dir, read_private_file, serve_listener_with_hooks,
+    bind_unix_prepared, is_safe_worker_token_id, mint_random_token, read_private_file,
+    serve_listener_with_hooks,
 };
 use rex_wave_waves::{HostRouter, WaveConductor, Waves};
 use std::collections::HashSet;
@@ -35,7 +35,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_BB_URL: &str = "ws://127.0.0.1:38886/api/v1/plugins/rex-wave/http/bridge";
@@ -174,28 +174,9 @@ pub fn tokens_path_for(sock_path: &Path) -> PathBuf {
     sock_path.with_file_name("tokens.json")
 }
 
-fn token_store_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct TokenStoreGuard {
-    _in_proc: std::sync::MutexGuard<'static, ()>,
-    _lock_file: std::fs::File,
-}
-
-fn lock_token_store(tokens_path: &Path) -> io::Result<TokenStoreGuard> {
-    let in_proc = token_store_lock().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parent) = tokens_path.parent() {
-        rex_wave_fs::create_missing_private_dir(parent)?;
-    }
-    let lock_path = tokens_path.with_extension("json.lock");
-    let lock_file = rex_wave_fs::open_lock_nofollow(&lock_path)?;
-    lock_file.lock()?;
-    Ok(TokenStoreGuard {
-        _in_proc: in_proc,
-        _lock_file: lock_file,
-    })
+fn lock_token_store(tokens_path: &Path) -> io::Result<rex_wave_transport::StateTokenLockGuard> {
+    let state_dir = tokens_path.parent().unwrap_or_else(|| Path::new("."));
+    rex_wave_transport::lock_state_dir_tokens(state_dir)
 }
 
 fn operator_seat_path(state_dir: &Path) -> PathBuf {
@@ -277,7 +258,7 @@ fn mint_principal_token_for_operator(
     };
 
     let tokens_path = tokens_path_for(sock_path);
-    let _guard = lock_token_store(&tokens_path)?;
+    let guard = lock_token_store(&tokens_path)?;
 
     if let Some(tid) = thread_id {
         let Principal::Worker { wave, role } = principal else {
@@ -295,7 +276,13 @@ fn mint_principal_token_for_operator(
         let parsed_tid = HostThreadId::parse(tid)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let state_dir = state_dir_for(sock_path);
-        let provisioned = provision_worker_token_in_state_dir(&state_dir, wave, role, &parsed_tid)?;
+        let provisioned = rex_wave_transport::provision_worker_token_locked(
+            &guard,
+            &state_dir,
+            wave,
+            role,
+            &parsed_tid,
+        )?;
         return Ok(provisioned.token);
     }
 
@@ -566,8 +553,14 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     }
 
     let runner_mode = resolve_runner_mode(&args);
+    let default_target = match runner_mode {
+        RunnerMode::T3 => RunnerKind::T3,
+        RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
+    };
     let t3_cfg = match runner_mode {
-        RunnerMode::T3 | RunnerMode::Both => Some(build_t3_config(&args, &state_dir)?),
+        RunnerMode::T3 | RunnerMode::Both => {
+            Some(build_t3_config(&args, &state_dir)?.with_default_runner(default_target))
+        }
         RunnerMode::Bb => None,
     };
 
@@ -596,25 +589,28 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         .map_err(|e| format!("persist operator seat: {e}"))?;
 
     let bb_bridge = match runner_mode {
-        RunnerMode::Bb | RunnerMode::Both => Some(BbBridge::with_code_runner(
-            BridgeConfig {
-                url: args.bb_url.clone(),
-                token: args.bb_token.clone(),
-            },
-            Arc::new(|client, args| {
-                Box::pin(async move {
-                    let res = rex_wave_mcp::McpServer::new(client)
-                        .call_tool(rex_wave_mcp::RUN_CODE_TOOL, args)
-                        .await;
-                    let text = res
-                        .content
-                        .into_iter()
-                        .find_map(|c| c.get("text").and_then(|t| t.as_str()).map(str::to_owned))
-                        .unwrap_or_else(|| "null".into());
-                    if res.is_error { Err(text) } else { Ok(text) }
-                })
-            }),
-        )),
+        RunnerMode::Bb | RunnerMode::Both => Some(
+            BbBridge::with_code_runner(
+                BridgeConfig {
+                    url: args.bb_url.clone(),
+                    token: args.bb_token.clone(),
+                },
+                Arc::new(|client, args| {
+                    Box::pin(async move {
+                        let res = rex_wave_mcp::McpServer::new(client)
+                            .call_tool(rex_wave_mcp::RUN_CODE_TOOL, args)
+                            .await;
+                        let text = res
+                            .content
+                            .into_iter()
+                            .find_map(|c| c.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+                            .unwrap_or_else(|| "null".into());
+                        if res.is_error { Err(text) } else { Ok(text) }
+                    })
+                }),
+            )
+            .with_default_runner(default_target),
+        ),
         RunnerMode::T3 => None,
     };
 

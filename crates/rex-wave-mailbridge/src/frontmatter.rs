@@ -18,28 +18,52 @@ pub struct FrontmatterEntry {
 }
 
 /// Lossless split of a Markdown document into optional `---` frontmatter and body.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontmatterDoc {
     pub has_frontmatter: bool,
     pub crlf: bool,
+    pub open_newline: &'static str,
+    pub close_fence: String,
+    pub close_newline: &'static str,
     pub entries: Vec<FrontmatterEntry>,
     pub raw_frontmatter: String,
     pub body: String,
 }
 
+impl Default for FrontmatterDoc {
+    fn default() -> Self {
+        Self {
+            has_frontmatter: false,
+            crlf: false,
+            open_newline: "\n",
+            close_fence: "---".to_owned(),
+            close_newline: "\n",
+            entries: Vec::new(),
+            raw_frontmatter: String::new(),
+            body: String::new(),
+        }
+    }
+}
+
 impl FrontmatterDoc {
     /// Splits `text` at a leading `---` YAML frontmatter fence when terminated by
-    /// a matching `---` line, preserving exact `raw_frontmatter`, `body`, and
-    /// line-ending style so round-trip reconstruction is byte-preserving.
+    /// a matching `---` line (allowing trailing spaces/tabs on the closing fence),
+    /// preserving exact `open_newline`, `raw_frontmatter`, `close_fence`,
+    /// `close_newline` (including EOF with no newline), and `body` so round-trip
+    /// reconstruction via [`Self::render_lossless`] is 100% byte-preserving.
     pub fn parse(text: &str) -> Self {
-        let (after_open, crlf) = if let Some(r) = text.strip_prefix("---\r\n") {
-            (r, true)
+        let (after_open, crlf, open_newline) = if let Some(r) = text.strip_prefix("---\r\n") {
+            (r, true, "\r\n")
         } else if let Some(r) = text.strip_prefix("---\n") {
-            (r, false)
+            (r, false, "\n")
         } else {
+            let is_crlf = text.contains("\r\n");
             return FrontmatterDoc {
                 has_frontmatter: false,
-                crlf: text.contains("\r\n"),
+                crlf: is_crlf,
+                open_newline: if is_crlf { "\r\n" } else { "\n" },
+                close_fence: "---".to_owned(),
+                close_newline: if is_crlf { "\r\n" } else { "\n" },
                 entries: Vec::new(),
                 raw_frontmatter: String::new(),
                 body: text.to_owned(),
@@ -59,9 +83,16 @@ impl FrontmatterDoc {
             } else {
                 bytes.len() + 1
             };
-            let line = after_open[cursor..line_end].trim_end_matches('\r');
-            if line == "---" {
+            let line_no_cr = after_open[cursor..line_end].trim_end_matches('\r');
+            if line_no_cr.trim_end_matches([' ', '\t']) == "---" {
                 let raw_fm = after_open[..cursor].to_owned();
+                let close_newline = if line_end == bytes.len() {
+                    ""
+                } else if line_end > cursor && bytes[line_end - 1] == b'\r' {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
                 let body = if line_end < bytes.len() {
                     after_open[line_end + 1..].to_owned()
                 } else {
@@ -70,12 +101,15 @@ impl FrontmatterDoc {
                 return FrontmatterDoc {
                     has_frontmatter: true,
                     crlf,
+                    open_newline,
+                    close_fence: line_no_cr.to_owned(),
+                    close_newline,
                     entries,
                     raw_frontmatter: raw_fm,
                     body,
                 };
             }
-            if let Some((k, v)) = line.split_once(':') {
+            if let Some((k, v)) = line_no_cr.split_once(':') {
                 let key = k.trim().to_owned();
                 if !key.is_empty() {
                     let raw_value = v.trim().to_owned();
@@ -96,28 +130,68 @@ impl FrontmatterDoc {
         FrontmatterDoc {
             has_frontmatter: false,
             crlf,
+            open_newline,
+            close_fence: "---".to_owned(),
+            close_newline: open_newline,
             entries: Vec::new(),
             raw_frontmatter: String::new(),
             body: text.to_owned(),
         }
     }
 
-    /// Reconstructs the exact original document from `raw_frontmatter` + `body`
-    /// when parsed from source, or renders structured `entries` deterministically.
+    /// Lenient header scan matching historical drop-folder behavior: returns
+    /// closed frontmatter entries when present, or scans header lines to EOF
+    /// when a leading `---` block is unterminated.
+    pub fn parse_headers_lenient(text: &str) -> Vec<FrontmatterEntry> {
+        let doc = Self::parse(text);
+        if doc.has_frontmatter {
+            return doc.entries;
+        }
+        let Some(after_open) = text
+            .strip_prefix("---\r\n")
+            .or_else(|| text.strip_prefix("---\n"))
+        else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for raw_line in after_open.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim().to_owned();
+                if !key.is_empty() {
+                    let raw_value = v.trim().to_owned();
+                    let value = unquote_yaml(&raw_value);
+                    entries.push(FrontmatterEntry {
+                        key,
+                        raw_value,
+                        value,
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    /// Reconstructs the exact original document from `open_newline`,
+    /// `raw_frontmatter`, `close_fence`, `close_newline`, and `body` when parsed
+    /// from source, or renders structured `entries` deterministically.
     pub fn render_lossless(&self) -> String {
         if !self.has_frontmatter {
             return self.body.clone();
         }
-        let nl = if self.crlf { "\r\n" } else { "\n" };
         if !self.raw_frontmatter.is_empty() || self.entries.is_empty() {
             let mut out = String::with_capacity(
-                6 + nl.len() * 2 + self.raw_frontmatter.len() + self.body.len(),
+                3 + self.open_newline.len()
+                    + self.raw_frontmatter.len()
+                    + self.close_fence.len()
+                    + self.close_newline.len()
+                    + self.body.len(),
             );
             out.push_str("---");
-            out.push_str(nl);
+            out.push_str(self.open_newline);
             out.push_str(&self.raw_frontmatter);
-            out.push_str("---");
-            out.push_str(nl);
+            out.push_str(&self.close_fence);
+            out.push_str(self.close_newline);
             out.push_str(&self.body);
             return out;
         }
@@ -365,11 +439,34 @@ mod tests {
         assert_eq!(parsed_crlf.get("from"), Some("o'malley"));
         assert_eq!(parsed_crlf.render_lossless(), crlf_doc);
 
-        let unclosed = "---\nfrom: alice\nno closing fence\n";
+        let unclosed = "---\nfrom: alice\nto: bob\nno closing fence\n";
         let parsed_unclosed = FrontmatterDoc::parse(unclosed);
         assert!(!parsed_unclosed.has_frontmatter);
         assert_eq!(parsed_unclosed.body, unclosed);
         assert_eq!(parsed_unclosed.render_lossless(), unclosed);
+        let lenient = FrontmatterDoc::parse_headers_lenient(unclosed);
+        assert_eq!(lenient.len(), 2);
+        assert_eq!(lenient[0].key, "from");
+        assert_eq!(lenient[0].value, "alice");
+        assert_eq!(lenient[1].key, "to");
+        assert_eq!(lenient[1].value, "bob");
+
+        let eof_close = "---\nfrom: alice\n---";
+        let parsed_eof = FrontmatterDoc::parse(eof_close);
+        assert!(parsed_eof.has_frontmatter);
+        assert_eq!(parsed_eof.close_newline, "");
+        assert_eq!(parsed_eof.render_lossless(), eof_close);
+
+        let mixed_nl = "---\r\nfrom: alice\r\n---\nBody with LF\n";
+        let parsed_mixed = FrontmatterDoc::parse(mixed_nl);
+        assert!(parsed_mixed.has_frontmatter);
+        assert_eq!(parsed_mixed.render_lossless(), mixed_nl);
+
+        let spaced_close = "---\nfrom: alice\n---   \nBody\n";
+        let parsed_spaced = FrontmatterDoc::parse(spaced_close);
+        assert!(parsed_spaced.has_frontmatter);
+        assert_eq!(parsed_spaced.get("from"), Some("alice"));
+        assert_eq!(parsed_spaced.render_lossless(), spaced_close);
     }
 
     #[test]

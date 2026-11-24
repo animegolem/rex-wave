@@ -386,6 +386,7 @@ pub struct RoomPost {
     #[serde(default, alias = "id", skip_serializing_if = "Option::is_none")]
     pub idem: Option<IdemKey>,
     #[serde(default, skip_serializing_if = "PostOrigin::is_direct")]
+    #[schemars(skip)]
     pub origin: PostOrigin,
 }
 

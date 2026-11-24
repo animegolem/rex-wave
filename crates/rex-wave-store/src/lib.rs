@@ -96,15 +96,98 @@ CREATE TABLE IF NOT EXISTS entries(
 ) STRICT;
 ";
 
+fn strip_sql_leading_trivia(mut sql: &str) -> &str {
+    loop {
+        let trimmed = sql.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            sql = match rest.find('\n') {
+                Some(idx) => &rest[idx + 1..],
+                None => "",
+            };
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            sql = match rest.find("*/") {
+                Some(idx) => &rest[idx + 2..],
+                None => "",
+            };
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn leading_sql_verb(sql: &str) -> &str {
+    let clean = strip_sql_leading_trivia(sql);
+    let end = clean
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(clean.len());
+    &clean[..end]
+}
+
+fn split_semicolon_statements(sql: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => {
+                if in_single && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = !in_single;
+            }
+            b'"' if !in_single => {
+                if in_double && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double = !in_double;
+            }
+            b';' if !in_single && !in_double => {
+                let seg = strip_sql_leading_trivia(&sql[start..i]).trim_end();
+                if !seg.is_empty() {
+                    out.push(seg);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = strip_sql_leading_trivia(&sql[start..]).trim_end();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
 /// Sealed initialization handle passed to [`CommitHook::on_init`]. Keeps
-/// `rusqlite` private to `rex-wave-store`.
+/// `rusqlite` and transaction control private to `rex-wave-store`.
 pub struct InitContext<'a> {
     conn: &'a Connection,
 }
 
 impl InitContext<'_> {
     pub fn execute_ddl(&mut self, sql: &str) -> Result<(), StoreError> {
-        self.conn.execute_batch(sql)?;
+        let stmts = split_semicolon_statements(sql);
+        for raw_stmt in stmts {
+            let verb = leading_sql_verb(raw_stmt);
+            if !verb.eq_ignore_ascii_case("CREATE") {
+                return Err(StoreError::Backend(format!(
+                    "init hook DDL only allows CREATE statements (got {verb:?})"
+                )));
+            }
+            let mut stmt = self.conn.prepare(raw_stmt)?;
+            stmt.execute([])?;
+            if self.conn.is_autocommit() {
+                return Err(StoreError::Backend(
+                    "init hook illegally terminated enclosing SQLite transaction".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -117,9 +200,22 @@ pub struct TxContext<'a, 'conn> {
 
 impl TxContext<'_, '_> {
     pub fn execute_sql(&self, sql: &str, text_params: &[&str]) -> Result<usize, StoreError> {
-        let count = self
-            .tx
-            .execute(sql, rusqlite::params_from_iter(text_params.iter()))?;
+        let verb = leading_sql_verb(sql);
+        if !matches!(
+            verb.to_ascii_uppercase().as_str(),
+            "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+        ) {
+            return Err(StoreError::Backend(format!(
+                "commit hook SQL only allows single INSERT/UPDATE/DELETE/REPLACE statements (got {verb:?})"
+            )));
+        }
+        let mut stmt = self.tx.prepare(sql)?;
+        let count = stmt.execute(rusqlite::params_from_iter(text_params.iter()))?;
+        if self.tx.is_autocommit() {
+            return Err(StoreError::Backend(
+                "commit hook illegally terminated enclosing SQLite transaction".into(),
+            ));
+        }
         Ok(count)
     }
 }
@@ -430,9 +526,8 @@ impl Journal {
 
     /// Resolve a DM room for a command carrying an optional idempotency key:
     /// - When `allow_legacy_fallback` is false (explicit `RoomRef::Id`), keeps
-    ///   empty-canonical -> single-legacy routing so an explicit canonical ID
-    ///   never forks a legacy-only DM, while skipping cross-history `idem`
-    ///   lookup so an explicit `RoomRef::Id` still disambiguates split journals.
+    ///   `room` pinned to its exact stream (matching `Read` and `Wait` on
+    ///   `RoomRef::Id`) while verifying `idem` authorship.
     /// - When `allow_legacy_fallback` is true (`RoomRef::Dm`), checks both
     ///   canonical and pre-PR-26 `(Operator, peer)` histories for `idem`,
     ///   routing to the unique stream where `by` (`same_actor`) committed `idem`,
@@ -452,7 +547,7 @@ impl Journal {
         let (a, b): (Principal, Principal) = pair.clone().into();
         let conn = self.inner.conn();
 
-        if a.is_operator() || b.is_operator() {
+        if !allow_legacy_fallback || a.is_operator() || b.is_operator() {
             if let Some(key) = idem
                 && let Some(batch) = find_idem(&conn, &StreamId::Room { room: room.clone() }, key)?
                 && batch.first().is_some_and(|env| !env.by.same_actor(by))
@@ -468,27 +563,6 @@ impl Journal {
             if head_of(&conn, &StreamId::Room { room: cand.clone() })? > Seq::ORIGIN {
                 legacy_existing.push(cand);
             }
-        }
-
-        if !allow_legacy_fallback {
-            let pinned = if canon_exists || legacy_existing.is_empty() {
-                room
-            } else {
-                legacy_existing.remove(0)
-            };
-            if let Some(key) = idem
-                && let Some(batch) = find_idem(
-                    &conn,
-                    &StreamId::Room {
-                        room: pinned.clone(),
-                    },
-                    key,
-                )?
-                && batch.first().is_some_and(|env| !env.by.same_actor(by))
-            {
-                return Ok(DmIdemResolution::CrossAuthor { room: pinned });
-            }
-            return Ok(DmIdemResolution::Route(pinned));
         }
         if let Some(key) = idem {
             let mut to_check = Vec::with_capacity(1 + legacy_existing.len());
@@ -574,59 +648,62 @@ impl StreamWriter {
         if events.iter().any(|e| !e.fits(&self.stream)) {
             return Err(StoreError::WrongStream(self.stream.clone()));
         }
-        let mut conn = self.inner.conn();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(idem) = idem
-            && let Some(prior) = find_idem(&tx, &self.stream, idem)?
-        {
-            return Ok(Appended::Replayed(prior));
-        }
-        let found = head_of(&tx, &self.stream)?;
-        if found != self.head {
-            return Err(StoreError::HeadMoved {
-                expected: self.head,
-                found,
-            });
-        }
-        let by_json = serde_json::to_string(by)?;
-        let batch = events.len() as i64;
-        let mut committed = Vec::with_capacity(events.len());
-        let mut seq = self.head;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO entries(stream, seq, at, by, idem, batch, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for (i, event) in events.into_iter().enumerate() {
-                seq = seq.next();
-                let (row_idem, row_batch) = if i == 0 {
-                    (idem.map(IdemKey::as_str), batch)
-                } else {
-                    (None, 0)
-                };
-                insert.execute(params![
-                    self.key,
-                    seq.0 as i64,
-                    at.0 as i64,
-                    by_json,
-                    row_idem,
-                    row_batch,
-                    serde_json::to_string(&event)?
-                ])?;
-                committed.push(Envelope {
-                    stream: self.stream.clone(),
-                    seq,
-                    at,
-                    by: by.clone(),
-                    event,
+        let committed = {
+            let mut conn = self.inner.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(idem) = idem
+                && let Some(prior) = find_idem(&tx, &self.stream, idem)?
+            {
+                return Ok(Appended::Replayed(prior));
+            }
+            let found = head_of(&tx, &self.stream)?;
+            if found != self.head {
+                return Err(StoreError::HeadMoved {
+                    expected: self.head,
+                    found,
                 });
             }
-        }
-        if let Some(ref hook) = self.inner.hook {
-            let tx_ctx = TxContext { tx: &tx };
-            hook.on_append(&tx_ctx, &committed)?;
-        }
-        tx.commit()?;
-        self.head = seq;
+            let by_json = serde_json::to_string(by)?;
+            let batch = events.len() as i64;
+            let mut committed = Vec::with_capacity(events.len());
+            let mut seq = self.head;
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO entries(stream, seq, at, by, idem, batch, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                for (i, event) in events.into_iter().enumerate() {
+                    seq = seq.next();
+                    let (row_idem, row_batch) = if i == 0 {
+                        (idem.map(IdemKey::as_str), batch)
+                    } else {
+                        (None, 0)
+                    };
+                    insert.execute(params![
+                        self.key,
+                        seq.0 as i64,
+                        at.0 as i64,
+                        by_json,
+                        row_idem,
+                        row_batch,
+                        serde_json::to_string(&event)?
+                    ])?;
+                    committed.push(Envelope {
+                        stream: self.stream.clone(),
+                        seq,
+                        at,
+                        by: by.clone(),
+                        event,
+                    });
+                }
+            }
+            if let Some(ref hook) = self.inner.hook {
+                let tx_ctx = TxContext { tx: &tx };
+                hook.on_append(&tx_ctx, &committed)?;
+            }
+            tx.commit()?;
+            self.head = seq;
+            committed
+        };
         if let Some(ref hook) = self.inner.hook {
             hook.after_commit(&committed);
         }
@@ -708,8 +785,8 @@ mod legacy_dm_tests {
             reopened
                 .resolve_dm_room_with_idem(canon_room.clone(), &op, None, false)
                 .unwrap(),
-            DmIdemResolution::Route(legacy_room.clone()),
-            "explicit canonical RoomRef::Id write on legacy-only DM continues legacy stream without forking"
+            DmIdemResolution::Route(canon_room.clone()),
+            "explicit canonical RoomRef::Id stays pinned to exact canonical stream"
         );
         assert_eq!(
             reopened
@@ -880,16 +957,23 @@ mod legacy_dm_tests {
 
     #[test]
     fn commit_hook_is_atomic_with_append_and_skips_idempotent_replays() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
         struct TestHook {
             fail: AtomicBool,
+            try_commit_sql: AtomicBool,
             on_append_calls: AtomicUsize,
             after_commit_calls: AtomicUsize,
+            observed_head_in_after_commit: AtomicU64,
+            journal: OnceLock<Journal>,
+            stream: StreamId,
         }
 
         impl CommitHook for TestHook {
             fn on_init(&self, ctx: &mut InitContext<'_>) -> Result<(), StoreError> {
+                assert!(ctx.execute_ddl("COMMIT;").is_err());
+                assert!(ctx.execute_ddl("PRAGMA user_version = 99;").is_err());
                 ctx.execute_ddl(
                     "CREATE TABLE IF NOT EXISTS side_index(seq INTEGER PRIMARY KEY, stream TEXT NOT NULL) STRICT;",
                 )
@@ -901,6 +985,9 @@ mod legacy_dm_tests {
                 committed: &[Envelope],
             ) -> Result<(), StoreError> {
                 self.on_append_calls.fetch_add(1, Ordering::SeqCst);
+                if self.try_commit_sql.load(Ordering::SeqCst) {
+                    return tx.execute_sql("COMMIT", &[]).map(|_| ());
+                }
                 if self.fail.load(Ordering::SeqCst) {
                     return Err(StoreError::Backend("injected hook failure".into()));
                 }
@@ -916,16 +1003,17 @@ mod legacy_dm_tests {
             }
 
             fn after_commit(&self, _committed: &[Envelope]) {
+                if let Some(j) = self.journal.get() {
+                    let h = j
+                        .head(&self.stream)
+                        .expect("journal unlocked in after_commit");
+                    self.observed_head_in_after_commit
+                        .store(h.0, Ordering::SeqCst);
+                }
                 self.after_commit_calls.fetch_add(1, Ordering::SeqCst);
             }
         }
 
-        let hook = Arc::new(TestHook {
-            fail: AtomicBool::new(true),
-            on_append_calls: AtomicUsize::new(0),
-            after_commit_calls: AtomicUsize::new(0),
-        });
-        let j = Journal::in_memory_with_hook(Some(hook.clone())).unwrap();
         let alice = Principal::Seat {
             seat: SeatName::parse("alice").unwrap(),
         };
@@ -934,6 +1022,17 @@ mod legacy_dm_tests {
             .resolve(&alice)
             .unwrap();
         let stream = StreamId::Room { room: room.clone() };
+        let hook = Arc::new(TestHook {
+            fail: AtomicBool::new(true),
+            try_commit_sql: AtomicBool::new(true),
+            on_append_calls: AtomicUsize::new(0),
+            after_commit_calls: AtomicUsize::new(0),
+            observed_head_in_after_commit: AtomicU64::new(0),
+            journal: OnceLock::new(),
+            stream: stream.clone(),
+        });
+        let j = Journal::in_memory_with_hook(Some(hook.clone())).unwrap();
+        let _ = hook.journal.set(j.clone());
         let mut w = j.claim(stream.clone()).unwrap();
         let idem = IdemKey::parse("post-1").unwrap();
         let ev = Event::Room(RoomEvent::Opened {
@@ -942,6 +1041,16 @@ mod legacy_dm_tests {
             topic: None,
         });
 
+        // Transaction-control SQL (`COMMIT`) inside `on_append` is rejected with 0 rows committed.
+        assert!(
+            w.append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+                .is_err()
+        );
+        assert_eq!(w.head(), Seq::ORIGIN);
+        assert_eq!(j.head(&stream).unwrap(), Seq::ORIGIN);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 0);
+        hook.try_commit_sql.store(false, Ordering::SeqCst);
+
         // Failing hook rolls back `entries` and leaves `head` at ORIGIN.
         assert!(
             w.append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
@@ -949,17 +1058,19 @@ mod legacy_dm_tests {
         );
         assert_eq!(w.head(), Seq::ORIGIN);
         assert_eq!(j.head(&stream).unwrap(), Seq::ORIGIN);
-        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 2);
         assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 0);
 
-        // Succeeding retry commits both `entries` and `side_index`.
+        // Succeeding retry commits both `entries` and `side_index`, and `after_commit`
+        // reads the committed head on the cloned Journal without deadlocking.
         hook.fail.store(false, Ordering::SeqCst);
         let first = w
             .append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
             .unwrap();
         assert!(matches!(first, Appended::Fresh(_)));
         assert_eq!(w.head(), Seq(1));
-        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(hook.observed_head_in_after_commit.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 3);
         assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
 
         // Idempotent replay does NOT re-invoke `on_append` or `after_commit`.
@@ -967,7 +1078,7 @@ mod legacy_dm_tests {
             .append(&alice, UnixMs(200), Some(&idem), vec![ev])
             .unwrap();
         assert!(matches!(replay, Appended::Replayed(_)));
-        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 3);
         assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
     }
 }

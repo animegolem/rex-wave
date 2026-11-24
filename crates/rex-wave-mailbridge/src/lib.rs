@@ -511,12 +511,12 @@ struct Frontmatter {
 
 fn parse_frontmatter(text: &str) -> Frontmatter {
     let mut fm = Frontmatter::default();
-    let doc = FrontmatterDoc::parse(text);
-    if !doc.has_frontmatter {
+    let entries = FrontmatterDoc::parse_headers_lenient(text);
+    if entries.is_empty() {
         return fm;
     }
 
-    for entry in doc.entries {
+    for entry in entries {
         let key = entry.key.to_ascii_lowercase();
         let val = entry.value;
         if val.is_empty() {

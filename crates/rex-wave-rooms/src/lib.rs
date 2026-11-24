@@ -954,6 +954,17 @@ impl Decider for Rooms {
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
+                if c.origin == rex_wave_api::room::PostOrigin::MirroredTurn
+                    && !matches!(
+                        ctx.by(),
+                        Principal::Worker { .. } | Principal::System { .. }
+                    )
+                {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by().to_string(),
+                        action: "post with mirrored_turn origin".into(),
+                    });
+                }
                 let mentions = resolve_mentions_for_room(&id, ctx.by(), &c.body, &members);
                 events.push(RoomEvent::Posted {
                     body: c.body.clone(),

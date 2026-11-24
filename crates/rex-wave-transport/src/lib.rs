@@ -23,10 +23,11 @@
 pub mod worker_tokens;
 
 pub use worker_tokens::{
-    ProvisionedWorkerToken, T3_WORKER_THREAD_ENV, WORKER_THREAD_ENV, WORKER_TOKENS_DIR,
-    WorkerTokenFile, is_safe_worker_token_id, mint_random_token,
-    provision_worker_token_in_state_dir, read_worker_token_file, remove_worker_token_file,
-    worker_token_path, worker_tokens_dir, write_worker_token_file, write_worker_token_record,
+    ProvisionedWorkerToken, StateTokenLockGuard, T3_WORKER_THREAD_ENV, WORKER_THREAD_ENV,
+    WORKER_TOKENS_DIR, WorkerTokenFile, is_safe_worker_token_id, lock_state_dir_tokens,
+    mint_random_token, provision_worker_token_in_state_dir, provision_worker_token_locked,
+    read_worker_token_file, remove_worker_token_file, worker_token_path, worker_tokens_dir,
+    write_worker_token_file, write_worker_token_record,
 };
 
 use futures_util::StreamExt;

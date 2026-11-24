@@ -1059,39 +1059,58 @@ pub fn resolve_cli_credential(
             token: tok.to_owned(),
         });
     }
-    if let Ok(raw_tid) = std::env::var(rex_wave_transport::WORKER_THREAD_ENV) {
-        let tid = raw_tid.trim();
-        if !tid.is_empty() {
-            let state_dir = daemon::state_dir_for(sock_path);
-            return match rex_wave_transport::read_worker_token_file(&state_dir, tid) {
-                Ok(Some(token)) => Ok(Credential::Token { token }),
-                Ok(None) => Err(format!(
-                    "wave worker token missing or retired for {}={tid}; refusing PeerUid fallback",
-                    rex_wave_transport::WORKER_THREAD_ENV
-                )),
-                Err(e) => Err(format!(
-                    "failed reading worker token for {}={tid}: {e}",
-                    rex_wave_transport::WORKER_THREAD_ENV
-                )),
-            };
+    if let Some(raw_os) = std::env::var_os(rex_wave_transport::WORKER_THREAD_ENV) {
+        let Some(raw_str) = raw_os.to_str() else {
+            return Err(format!(
+                "{} contains non-UTF-8 bytes; refusing PeerUid fallback",
+                rex_wave_transport::WORKER_THREAD_ENV
+            ));
+        };
+        let tid = raw_str.trim();
+        if tid.is_empty() {
+            return Err(format!(
+                "{} is set to an empty value; refusing PeerUid fallback",
+                rex_wave_transport::WORKER_THREAD_ENV
+            ));
         }
+        let state_dir = daemon::state_dir_for(sock_path);
+        return match rex_wave_transport::read_worker_token_file(&state_dir, tid) {
+            Ok(Some(token)) => Ok(Credential::Token { token }),
+            Ok(None) => Err(format!(
+                "wave worker token missing or retired for {}={tid}; refusing PeerUid fallback",
+                rex_wave_transport::WORKER_THREAD_ENV
+            )),
+            Err(e) => Err(format!(
+                "failed reading worker token for {}={tid}: {e}",
+                rex_wave_transport::WORKER_THREAD_ENV
+            )),
+        };
     }
-    if let Ok(raw_tid) = std::env::var(rex_wave_transport::T3_WORKER_THREAD_ENV) {
-        let tid = raw_tid.trim();
+    if let Some(raw_os) = std::env::var_os(rex_wave_transport::T3_WORKER_THREAD_ENV) {
+        let raw_bytes = raw_os.as_encoded_bytes();
+        let trimmed_bytes = raw_bytes
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(&[][..], |idx| &raw_bytes[idx..]);
+        let has_worker_prefix = RunnerKind::from_thread_bytes(trimmed_bytes) != RunnerKind::Bb;
+        let Some(raw_str) = raw_os.to_str() else {
+            return Err(format!(
+                "{} contains non-UTF-8 bytes; refusing PeerUid fallback",
+                rex_wave_transport::T3_WORKER_THREAD_ENV
+            ));
+        };
+        let tid = raw_str.trim();
         if !tid.is_empty() {
             let state_dir = daemon::state_dir_for(sock_path);
-            let is_wave_worker_scheme =
-                HostThreadId::parse(tid).is_ok_and(|h| h.runner_kind() != RunnerKind::Bb);
             match rex_wave_transport::read_worker_token_file(&state_dir, tid) {
                 Ok(Some(token)) => return Ok(Credential::Token { token }),
-                Ok(None) if is_wave_worker_scheme => {
+                Ok(None) if has_worker_prefix => {
                     return Err(format!(
                         "T3 wave worker token missing or retired for thread {tid}; refusing PeerUid fallback"
                     ));
                 }
                 Ok(None) => {}
-                Err(e)
-                    if !is_wave_worker_scheme && e.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(e) if !has_worker_prefix && e.kind() == std::io::ErrorKind::InvalidInput => {}
                 Err(e) => {
                     return Err(format!(
                         "failed reading worker token for T3CODE_THREAD_ID={tid}: {e}"

@@ -71,6 +71,9 @@ fn label_kv(s: &str) -> Result<(), &'static str> {
 
 macro_rules! branded_str {
     ($(#[$m:meta])* $name:ident, $what:literal, |$s:ident| $check:expr) => {
+        branded_str!($(#[$m])* $name, schema = stringify!($name), $what, |$s| $check);
+    };
+    ($(#[$m:meta])* $name:ident, schema = $schema_name:expr, $what:literal, |$s:ident| $check:expr) => {
         $(#[$m])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
@@ -109,7 +112,7 @@ macro_rules! branded_str {
                 true
             }
             fn schema_name() -> Cow<'static, str> {
-                stringify!($name).into()
+                $schema_name.into()
             }
             fn json_schema(_: &mut SchemaGenerator) -> Schema {
                 json_schema!({ "type": "string", "description": $what })
@@ -132,15 +135,15 @@ branded_str!(
     ChannelName, "channel", |s| slug(&s, 64));
 branded_str!(
     /// Host project id or workspace identifier (`proj_...`, T3 UUID, or path).
-    ProjectId, "bb project id", |s| opaque(&s));
-/// Compatibility alias for [`ProjectId`].
-pub type BbProjectId = ProjectId;
+    ProjectId, schema = "BbProjectId", "bb project id", |s| opaque(&s));
+/// Compatibility re-export for [`ProjectId`].
+pub use ProjectId as BbProjectId;
 
 branded_str!(
     /// Host worker thread id (`t3:...`, `acp:...`, `claude:...`, `codex:...`, or BB thread id).
-    HostThreadId, "bb thread id", |s| opaque(&s));
-/// Compatibility alias for [`HostThreadId`].
-pub type BbThreadId = HostThreadId;
+    HostThreadId, schema = "BbThreadId", "bb thread id", |s| opaque(&s));
+/// Compatibility re-export for [`HostThreadId`].
+pub use HostThreadId as BbThreadId;
 
 branded_str!(
     /// T3 Code thread id (opaque, owned by T3 Code).
@@ -169,9 +172,9 @@ impl Label {
 }
 branded_str!(
     /// Host pending-interaction id (approval or user-input request id).
-    HostInteractionId, "bb interaction id", |s| opaque(&s));
-/// Compatibility alias for [`HostInteractionId`].
-pub type BbInteractionId = HostInteractionId;
+    HostInteractionId, schema = "BbInteractionId", "bb interaction id", |s| opaque(&s));
+/// Compatibility re-export for [`HostInteractionId`].
+pub use HostInteractionId as BbInteractionId;
 
 pub const T3_THREAD_PREFIX: &str = "t3:";
 pub const ACP_THREAD_PREFIX: &str = "acp:";
@@ -220,6 +223,26 @@ impl RunnerKind {
         }
     }
 
+    /// Classifies a raw byte slice by reserved thread-ID prefix before UTF-8 or
+    /// identifier validation runs.
+    pub fn from_thread_bytes(raw: &[u8]) -> Self {
+        if raw.starts_with(T3_THREAD_PREFIX.as_bytes()) {
+            RunnerKind::T3
+        } else if raw.starts_with(ACP_THREAD_PREFIX.as_bytes()) {
+            RunnerKind::Acp
+        } else if raw.starts_with(CLAUDE_THREAD_PREFIX.as_bytes()) {
+            RunnerKind::Claude
+        } else if raw.starts_with(CODEX_THREAD_PREFIX.as_bytes()) {
+            RunnerKind::Codex
+        } else {
+            RunnerKind::Bb
+        }
+    }
+
+    pub fn from_thread_str(raw: &str) -> Self {
+        Self::from_thread_bytes(raw.as_bytes())
+    }
+
     pub fn strip_provider_prefix(raw: &str) -> Option<(Self, &str)> {
         let trimmed = raw.trim();
         for (prefix, kind) in [
@@ -241,18 +264,7 @@ impl HostThreadId {
     /// Classifies which runner owns this thread ID by its canonical scheme prefix.
     /// Unprefixed opaque IDs belong to BB (`RunnerKind::Bb`).
     pub fn runner_kind(&self) -> RunnerKind {
-        let s = self.as_str();
-        if s.starts_with(T3_THREAD_PREFIX) {
-            RunnerKind::T3
-        } else if s.starts_with(ACP_THREAD_PREFIX) {
-            RunnerKind::Acp
-        } else if s.starts_with(CLAUDE_THREAD_PREFIX) {
-            RunnerKind::Claude
-        } else if s.starts_with(CODEX_THREAD_PREFIX) {
-            RunnerKind::Codex
-        } else {
-            RunnerKind::Bb
-        }
+        RunnerKind::from_thread_str(self.as_str())
     }
 }
 branded_str!(
@@ -314,14 +326,8 @@ impl Seq {
 #[schemars(rename = "BbSeq")]
 pub struct HostSeq(pub u64);
 
-/// Compatibility alias for [`HostSeq`].
-pub type BbSeq = HostSeq;
-
-/// Compatibility constructor for [`BbSeq`].
-#[allow(non_snake_case)]
-pub const fn BbSeq(v: u64) -> HostSeq {
-    HostSeq(v)
-}
+/// Compatibility re-export for [`HostSeq`] (type, constructor, and tuple pattern).
+pub use HostSeq as BbSeq;
 
 /// Monotonic task-lease fencing epoch incremented on every claim or expired-lease takeover.
 #[derive(
@@ -519,3 +525,31 @@ branded_str!(
     /// resolve handles to principals at post time, so mention resolution never
     /// needs a cross-actor lookup.
     Handle, "handle", |s| slug(&s, 32));
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn bb_aliases_preserve_tuple_pattern_and_json_schema_names() {
+        let seq = BbSeq(42);
+        let BbSeq(n) = seq;
+        assert_eq!(n, 42);
+        assert_eq!(BbProjectId::schema_name(), "BbProjectId");
+        assert_eq!(BbThreadId::schema_name(), "BbThreadId");
+        assert_eq!(BbInteractionId::schema_name(), "BbInteractionId");
+        assert_eq!(BbSeq::schema_name(), "BbSeq");
+        assert_eq!(
+            RunnerKind::from_thread_bytes(b"t3:\xff\xfe"),
+            RunnerKind::T3
+        );
+        assert_eq!(
+            RunnerKind::from_thread_bytes(b"acp:bad\x00"),
+            RunnerKind::Acp
+        );
+        assert_eq!(
+            RunnerKind::from_thread_bytes(b"plain-bb-id"),
+            RunnerKind::Bb
+        );
+    }
+}

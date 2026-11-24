@@ -1228,6 +1228,7 @@ struct TrackedWorker {
     pending_interaction: Option<PendingInteraction>,
     last_seq: Option<u64>,
     mirror_room_watermark: Seq,
+    mirrored_anchors: std::collections::HashSet<String>,
 }
 
 enum OwnerMsg {
@@ -1298,15 +1299,17 @@ enum OwnerMsg {
         thread: BbThreadId,
         lease_id: u64,
     },
-    MirrorWatermark {
+    MirrorState {
         wave: WaveSlug,
         role: RoleName,
-        reply: oneshot::Sender<Seq>,
+        anchor: String,
+        reply: oneshot::Sender<(Seq, bool)>,
     },
     AdvanceMirrorWatermark {
         wave: WaveSlug,
         role: RoleName,
         seq: Seq,
+        anchor: Option<String>,
     },
 }
 
@@ -1457,7 +1460,11 @@ impl BridgeOwner {
                             pending_interaction: None,
                             last_seq: None,
                             mirror_room_watermark: Seq::ORIGIN,
+                            mirrored_anchors: std::collections::HashSet::new(),
                         });
+                    if entry.thread.as_ref() != Some(&thread) {
+                        entry.mirrored_anchors.clear();
+                    }
                     entry.attempt = attempt;
                     entry.thread = Some(thread);
                     entry.live = true;
@@ -1545,18 +1552,36 @@ impl BridgeOwner {
                         }
                     }
                 }
-                OwnerMsg::MirrorWatermark { wave, role, reply } => {
-                    let watermark = self
-                        .workers_by_role
-                        .get(&(wave, role))
-                        .map_or(Seq::ORIGIN, |w| w.mirror_room_watermark);
-                    let _ = reply.send(watermark);
+                OwnerMsg::MirrorState {
+                    wave,
+                    role,
+                    anchor,
+                    reply,
+                } => {
+                    let state =
+                        self.workers_by_role
+                            .get(&(wave, role))
+                            .map_or((Seq::ORIGIN, false), |w| {
+                                (
+                                    w.mirror_room_watermark,
+                                    w.mirrored_anchors.contains(&anchor),
+                                )
+                            });
+                    let _ = reply.send(state);
                 }
-                OwnerMsg::AdvanceMirrorWatermark { wave, role, seq } => {
-                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
-                        && rec.mirror_room_watermark < seq
-                    {
-                        rec.mirror_room_watermark = seq;
+                OwnerMsg::AdvanceMirrorWatermark {
+                    wave,
+                    role,
+                    seq,
+                    anchor,
+                } => {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
+                        if rec.mirror_room_watermark < seq {
+                            rec.mirror_room_watermark = seq;
+                        }
+                        if let Some(a) = anchor {
+                            rec.mirrored_anchors.insert(a);
+                        }
                     }
                 }
             }
@@ -1582,6 +1607,7 @@ impl BridgeOwner {
                         pending_interaction: None,
                         last_seq: None,
                         mirror_room_watermark: Seq::ORIGIN,
+                        mirrored_anchors: std::collections::HashSet::new(),
                     },
                 );
             }
@@ -1596,6 +1622,7 @@ impl BridgeOwner {
                             rec.live = false;
                             rec.pending_interaction = None;
                             rec.last_seq = None;
+                            rec.mirrored_anchors.clear();
                         }
                         return;
                     }
@@ -1618,7 +1645,11 @@ impl BridgeOwner {
                             pending_interaction: None,
                             last_seq: None,
                             mirror_room_watermark: Seq::ORIGIN,
+                            mirrored_anchors: std::collections::HashSet::new(),
                         });
+                    if rec.thread.as_ref() != Some(&thread) {
+                        rec.mirrored_anchors.clear();
+                    }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
                     rec.live = true;
@@ -1887,6 +1918,7 @@ pub type CodeRunner = Arc<
 
 pub struct BbBridge {
     cfg: BridgeConfig,
+    default_runner: std::sync::Mutex<RunnerKind>,
     data_dir: Option<PathBuf>,
     owner: mpsc::UnboundedSender<OwnerMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
@@ -1910,6 +1942,21 @@ impl BbBridge {
         Self::with_options(cfg, default_bb_data_dir(), Some(code_runner))
     }
 
+    pub fn with_default_runner(self: Arc<Self>, runner: RunnerKind) -> Arc<Self> {
+        *self
+            .default_runner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = runner;
+        self
+    }
+
+    fn default_runner(&self) -> RunnerKind {
+        *self
+            .default_runner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with_options(
         cfg: BridgeConfig,
         data_dir: Option<PathBuf>,
@@ -1918,6 +1965,7 @@ impl BbBridge {
         let (project_names_tx, project_names_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let bridge = Arc::new(BbBridge {
             cfg,
+            default_runner: std::sync::Mutex::new(RunnerKind::Bb),
             data_dir,
             owner: BridgeOwner::spawn(),
             backend: OnceLock::new(),
@@ -2299,7 +2347,7 @@ impl BbBridge {
         &self,
         thread: &BbThreadId,
         meta: Option<&protocol::WaveMeta>,
-    ) -> Option<(WaveSlug, RoleName, u32)> {
+    ) -> Option<(WaveSlug, RoleName, u32, bool)> {
         if !is_bb_thread_id(thread) {
             return None;
         }
@@ -2308,8 +2356,8 @@ impl BbBridge {
             thread: thread.clone(),
             reply: tx,
         });
-        if let Ok(Some(found)) = rx.await {
-            return Some(found);
+        if let Ok(Some((wave, role, attempt))) = rx.await {
+            return Some((wave, role, attempt, false));
         }
 
         let m = meta?;
@@ -2327,6 +2375,7 @@ impl BbBridge {
                 )
                 .await
         {
+            let default_runner = self.default_runner();
             let mut matched_live = false;
             let mut matched_retiring = false;
             for (r, spec, phase) in &snap.workers {
@@ -2339,7 +2388,7 @@ impl BbBridge {
                     }
                     WorkerPhase::Requested { attempt }
                         if *attempt == m.attempt
-                            && rex_wave_waves::route_provider(&spec.provider, RunnerKind::Bb)
+                            && rex_wave_waves::route_provider(&spec.provider, default_runner)
                                 .is_ok_and(|routed| routed.target == RunnerKind::Bb) =>
                     {
                         matched_live = true;
@@ -2361,7 +2410,7 @@ impl BbBridge {
                     thread: thread.clone(),
                 });
             }
-            return Some((wave, role, m.attempt));
+            return Some((wave, role, m.attempt, !matched_live));
         }
 
         None
@@ -2428,11 +2477,18 @@ impl BbBridge {
                 let Ok(thread) = BbThreadId::parse(thread_id) else {
                     return;
                 };
-                let Some((wave, role, attempt)) =
+                let Some((wave, role, attempt, retiring)) =
                     self.resolve_worker_identity(&thread, meta.as_ref()).await
                 else {
                     return;
                 };
+                if retiring {
+                    if matches!(signal, protocol::ThreadSignal::Archived) {
+                        self.call_wave_observe(wave, role, Observation::Archived)
+                            .await;
+                    }
+                    return;
+                }
                 let parsed_model = model
                     .as_deref()
                     .map(str::trim)
@@ -2598,11 +2654,14 @@ impl BbBridge {
                 let Some(pending) = parse_pending_interaction(&interaction) else {
                     return;
                 };
-                let Some((wave, role, attempt)) =
+                let Some((wave, role, attempt, retiring)) =
                     self.resolve_worker_identity(&thread, meta.as_ref()).await
                 else {
                     return;
                 };
+                if retiring {
+                    return;
+                }
                 self.call_wave_observe(
                     wave.clone(),
                     role.clone(),
@@ -2642,7 +2701,7 @@ impl BbBridge {
             send_reply(false, "invalid BB thread id".into()).await;
             return;
         };
-        let Some((wave, role, _)) = self.resolve_worker_identity(&thread, meta.as_ref()).await
+        let Some((wave, role, _, _)) = self.resolve_worker_identity(&thread, meta.as_ref()).await
         else {
             send_reply(false, format!("unrecognized wave worker thread {thread}")).await;
             return;
@@ -2752,6 +2811,12 @@ impl BbBridge {
         thread: &BbThreadId,
         rows: &[serde_json::Value],
     ) {
+        fn completed_turn_anchor_hint(check: &TurnMirrorCheck) -> String {
+            match check {
+                TurnMirrorCheck::Unposted(c) => c.anchor.clone(),
+                TurnMirrorCheck::Ignore | TurnMirrorCheck::PostedViaTool => String::new(),
+            }
+        }
         let check = inspect_latest_completed_turn(rows);
         if matches!(check, TurnMirrorCheck::Ignore) {
             return;
@@ -2775,12 +2840,16 @@ impl BbBridge {
         };
 
         let (wm_tx, wm_rx) = oneshot::channel();
-        let _ = self.owner.send(OwnerMsg::MirrorWatermark {
+        let _ = self.owner.send(OwnerMsg::MirrorState {
             wave: wave.clone(),
             role: role.clone(),
+            anchor: completed_turn_anchor_hint(&check),
             reply: wm_tx,
         });
-        let watermark = wm_rx.await.unwrap_or(Seq::ORIGIN);
+        let (watermark, already_mirrored) = wm_rx.await.unwrap_or((Seq::ORIGIN, false));
+        if already_mirrored {
+            return;
+        }
 
         let stream = StreamId::Room { room: room.clone() };
         let mut cursor = watermark;
@@ -2811,6 +2880,7 @@ impl BbBridge {
                     wave: wave.clone(),
                     role: role.clone(),
                     seq: room_head,
+                    anchor: None,
                 });
                 return;
             }
@@ -2821,6 +2891,8 @@ impl BbBridge {
         else {
             return;
         };
+        let legacy_truncated_idem =
+            rex_wave_waves::legacy_truncated_mirror_idem_key(wave, role, thread, &completed.anchor);
 
         let mut already_posted = false;
         let mut reached_end = false;
@@ -2843,7 +2915,9 @@ impl BbBridge {
             let count = page.entries.len();
             for env in &page.entries {
                 if let Event::Room(RoomEvent::Posted { idem, .. }) = &env.event {
-                    if idem.as_ref() == Some(&idem_key) {
+                    if idem.as_ref() == Some(&idem_key)
+                        || (legacy_truncated_idem.is_some() && idem == &legacy_truncated_idem)
+                    {
                         already_posted = true;
                         break;
                     }
@@ -2869,6 +2943,7 @@ impl BbBridge {
                 wave: wave.clone(),
                 role: role.clone(),
                 seq: room_head,
+                anchor: already_posted.then_some(completed.anchor),
             });
             return;
         }
@@ -2916,6 +2991,7 @@ impl BbBridge {
                 wave: wave.clone(),
                 role: role.clone(),
                 seq: posted.seq,
+                anchor: Some(completed.anchor),
             });
         }
     }
@@ -3161,6 +3237,7 @@ impl BbBridge {
                                 pending_interaction,
                                 last_seq: None,
                                 mirror_room_watermark: Seq::ORIGIN,
+                                mirrored_anchors: std::collections::HashSet::new(),
                             })
                         }
                         WorkerPhase::Retiring { thread, .. }
@@ -3175,6 +3252,7 @@ impl BbBridge {
                             pending_interaction: None,
                             last_seq: None,
                             mirror_room_watermark: Seq::ORIGIN,
+                            mirrored_anchors: std::collections::HashSet::new(),
                         }),
                         _ => Err(ApiError::NotFound {
                             what: format!("live BB thread for @{wave}/{role}"),
@@ -6605,6 +6683,228 @@ mod tests {
                 .await,
             None,
             "BbBridge must reject non-BB thread IDs even with matching WaveMeta"
+        );
+
+        // Retiring BB worker must accept terminal Archived without re-entering ListLiveWorkers on Active.
+        let bbrole = RoleName::parse("bbrole").unwrap();
+        op.call(rex_wave_api::wave::WaveRetireWorker {
+            wave: wave.clone(),
+            role: bbrole.clone(),
+            reason: Some("done".into()),
+        })
+        .await
+        .unwrap();
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerRetiring {
+                role: bbrole.clone(),
+                reason: Some("done".into()),
+            },
+        );
+        let bb_meta = protocol::WaveMeta {
+            wave_id: wave.to_string(),
+            role: "bbrole".into(),
+            attempt: 1,
+            room_id: String::new(),
+            run_stamp: None,
+            output_dir: None,
+            writes: Vec::new(),
+            account: None,
+        };
+        bridge
+            .on_thread_signal(protocol::Up::Thread {
+                signal: protocol::ThreadSignal::Active,
+                thread_id: "th_bb_live_1".into(),
+                project_id: "proj_demo_1".into(),
+                meta: Some(bb_meta.clone()),
+                error: None,
+                stop_reason: None,
+                model: None,
+                account: None,
+            })
+            .await;
+        let (list_tx2, list_rx2) = oneshot::channel();
+        bridge
+            .owner
+            .send(OwnerMsg::ListLiveWorkers { reply: list_tx2 })
+            .unwrap();
+        assert!(
+            list_rx2.await.unwrap().is_empty(),
+            "retiring worker must not re-enter ListLiveWorkers on Active signal"
+        );
+        bridge
+            .on_thread_signal(protocol::Up::Thread {
+                signal: protocol::ThreadSignal::Archived,
+                thread_id: "th_bb_live_1".into(),
+                project_id: "proj_demo_1".into(),
+                meta: Some(bb_meta),
+                error: None,
+                stop_reason: None,
+                model: None,
+                account: None,
+            })
+            .await;
+        let snap = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+        let bb_phase = &snap
+            .workers
+            .iter()
+            .find(|(r, _, _)| r == &bbrole)
+            .unwrap()
+            .2;
+        assert!(matches!(bb_phase, WorkerPhase::Retired { .. }));
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_truncated_bb_mirror_turn_does_not_duplicate_across_retries() {
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let _ = bridge.backend.set(Arc::new(harness.clone()));
+        let sys = harness.client(Principal::System {
+            part: SystemPart::WaveConductor,
+        });
+        let owner = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+        let wave = WaveSlug::parse("long-mirror").unwrap();
+        let proj = BbProjectId::parse("proj_mirror").unwrap();
+        let role = RoleName::parse("writer").unwrap();
+        let long_tid = BbThreadId::parse(format!("th_{}", "x".repeat(235))).unwrap();
+
+        owner
+            .call(rex_wave_api::wave::WaveStart {
+                spec: rex_wave_api::wave::WaveSpec {
+                    slug: wave.clone(),
+                    project: proj.clone(),
+                    goal: Body::parse("test upgrade mirror dedupe").unwrap(),
+                    output_dir: None,
+                    defaults: rex_wave_api::wave::AgentSpec {
+                        provider: ProviderId::parse("pi").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: rex_wave_api::wave::PermissionMode::Full,
+                        workspace: rex_wave_api::wave::Workspace::ProjectDefault,
+                    },
+                    workers: vec![rex_wave_api::wave::WorkerSpec {
+                        role: role.clone(),
+                        agent: None,
+                        brief: Body::parse("write").unwrap(),
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    }],
+                },
+                idem: None,
+            })
+            .await
+            .unwrap();
+        let spawned = Observation::Spawned {
+            attempt: 1,
+            thread: long_tid.clone(),
+        };
+        sys.call(WaveObserve {
+            wave: wave.clone(),
+            role: role.clone(),
+            observation: spawned.clone(),
+        })
+        .await
+        .unwrap();
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: spawned,
+            },
+        );
+
+        let room = rex_wave_waves::wave_room(&wave, &proj);
+        sys.call(RoomEnsure {
+            room: RoomRef::Id { id: room.clone() },
+            topic: None,
+            origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
+        })
+        .await
+        .unwrap();
+        let worker_principal = Principal::Worker {
+            wave: wave.clone(),
+            role: role.clone(),
+        };
+        sys.call(RoomJoin {
+            room: RoomRef::Id { id: room.clone() },
+            member: Some(worker_principal.clone()),
+            handle: Handle::parse("writer").ok(),
+        })
+        .await
+        .unwrap();
+
+        let anchor = "s999999999";
+        let legacy_idem =
+            rex_wave_waves::legacy_truncated_mirror_idem_key(&wave, &role, &long_tid, anchor)
+                .expect("exceeds 256 bytes");
+        let worker_client = harness.client(worker_principal);
+        worker_client
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("pre-upgrade mirrored turn").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: Some(legacy_idem),
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+
+        let rows = vec![
+            serde_json::json!({
+                "seq": 999_999_999u64,
+                "at": 500_000_000_000u64,
+                "method": "turn/started",
+                "data": {}
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_000u64,
+                "at": 500_000_000_100u64,
+                "method": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "pre-upgrade mirrored turn" } }
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_001u64,
+                "at": 500_000_000_200u64,
+                "method": "turn/completed",
+                "data": {}
+            }),
+        ];
+
+        // Trigger two consecutive completion mirror passes for the same turn.
+        bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &rows)
+            .await;
+        bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &rows)
+            .await;
+
+        let page = owner
+            .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+            .await
+            .unwrap();
+        let posts: Vec<_> = page
+            .entries
+            .iter()
+            .filter(|e| matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
+            .collect();
+        assert_eq!(
+            posts.len(),
+            1,
+            "pre-upgrade truncated mirror post must not duplicate on consecutive retries"
         );
     }
 }

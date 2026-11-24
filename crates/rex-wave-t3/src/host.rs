@@ -724,14 +724,14 @@ impl T3Bridge {
     async fn resolve_worker_identity(
         &self,
         thread: &BbThreadId,
-    ) -> Option<(WaveSlug, RoleName, u32)> {
+    ) -> Option<(WaveSlug, RoleName, u32, bool)> {
         let (tx, rx) = oneshot::channel();
         let _ = self.state.send(StateMsg::LookupByThread {
             thread: thread.clone(),
             reply: tx,
         });
-        if let Ok(Some(found)) = rx.await {
-            return Some(found);
+        if let Ok(Some((wave, role, attempt))) = rx.await {
+            return Some((wave, role, attempt, false));
         }
 
         let (wave, role, attempt) = parse_t3_thread_id(thread)?;
@@ -757,7 +757,7 @@ impl T3Bridge {
                         if *a == attempt
                             && rex_wave_waves::route_provider(
                                 &spec.provider,
-                                rex_wave_api::RunnerKind::T3,
+                                self.cfg.default_runner,
                             )
                             .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3) =>
                     {
@@ -780,7 +780,7 @@ impl T3Bridge {
                     thread: thread.clone(),
                 });
             }
-            return Some((wave, role, attempt));
+            return Some((wave, role, attempt, !matched_live));
         }
 
         None
@@ -817,7 +817,7 @@ impl T3Bridge {
 
     async fn process_thread_removed(&self, thread: &BbThreadId) {
         self.unlink_worker_token(thread);
-        if let Some((wave, role, _)) = self.resolve_worker_identity(thread).await {
+        if let Some((wave, role, _, _)) = self.resolve_worker_identity(thread).await {
             self.call_wave_observe(wave, role, Observation::Archived)
                 .await;
         }
@@ -853,9 +853,19 @@ impl T3Bridge {
         let Some(obs) = derive_shell_observation(shell, location) else {
             return false;
         };
-        let Some((wave, role, attempt)) = self.resolve_worker_identity(thread).await else {
+        let Some((wave, role, attempt, retiring)) = self.resolve_worker_identity(thread).await
+        else {
             return false;
         };
+        if retiring {
+            if matches!(obs, ShellObservation::Archived) {
+                self.unlink_worker_token(thread);
+                self.call_wave_observe(wave, role, Observation::Archived)
+                    .await;
+                return true;
+            }
+            return false;
+        }
         let (shell_model, shell_account) = extract_runtime_meta_from_value(shell);
 
         match obs {
@@ -1504,7 +1514,7 @@ impl T3Bridge {
         }
 
         self.unlink_worker_token(thread);
-        if let Some((wave, role, _)) = self.resolve_worker_identity(thread).await {
+        if let Some((wave, role, _, _)) = self.resolve_worker_identity(thread).await {
             self.call_wave_observe(wave, role, Observation::Archived)
                 .await;
         }

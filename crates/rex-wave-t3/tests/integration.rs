@@ -2377,3 +2377,208 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
     conductor_task.abort();
     bridge_task.abort();
 }
+
+#[tokio::test]
+async fn t3_bridge_respects_bb_default_runner_on_requested_and_ignores_retiring_working_updates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_iso".into(),
+        projects: vec![json!({
+            "id": "uuid-proj-iso",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_iso")
+        .unwrap()
+        .with_default_runner(rex_wave_api::RunnerKind::Bb);
+    cfg.reconnect_min = Duration::from_millis(15);
+    cfg.reconnect_max = Duration::from_millis(60);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let wave = WaveSlug::parse("dual-iso").unwrap();
+    let project = BbProjectId::parse("uuid-proj-iso").unwrap();
+    let bb_role = RoleName::parse("bbworker").unwrap();
+    let t3_role = RoleName::parse("t3worker").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse("test dual runner isolation").unwrap(),
+                output_dir: None,
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("pi").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                workers: vec![
+                    WorkerSpec {
+                        role: bb_role.clone(),
+                        agent: None,
+                        brief: Body::parse("bb work").unwrap(),
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: t3_role.clone(),
+                        agent: Some(AgentSpec {
+                            provider: ProviderId::parse("antigravity").unwrap(),
+                            model: None,
+                            account: None,
+                            reasoning: None,
+                            service_tier: None,
+                            permission: PermissionMode::Full,
+                            workspace: Workspace::ProjectDefault,
+                        }),
+                        brief: Body::parse("t3 work").unwrap(),
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    // 1. Bare `pi` worker is Requested with default_runner=Bb: a rogue `t3:dual-iso:bbworker:a1`
+    //    shell update must NOT claim it.
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 1,
+            "location": "active",
+            "thread": {
+                "id": "t3:dual-iso:bbworker:a1",
+                "status": "running",
+                "pendingRuntimeRequest": null,
+                "archivedAt": null
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let snap1 = operator
+        .call(WaveView { wave: wave.clone() })
+        .await
+        .unwrap();
+    let bb_phase = &snap1
+        .workers
+        .iter()
+        .find(|(r, _, _)| r == &bb_role)
+        .unwrap()
+        .2;
+    assert!(
+        matches!(bb_phase, WorkerPhase::Requested { attempt: 1 }),
+        "T3Bridge must not claim a Requested worker routed to BB under --runner both: got {bb_phase:?}"
+    );
+
+    // 2. Spawn `t3worker`, retire it into `Retiring`, push a `running` shell update, and verify it
+    //    remains `Retiring` until an `archivedAt` update arrives.
+    let t3_tid = BbThreadId::parse("t3:dual-iso:t3worker:a1").unwrap();
+    sys.call(rex_wave_api::wave::WaveObserve {
+        wave: wave.clone(),
+        role: t3_role.clone(),
+        observation: Observation::Spawned {
+            attempt: 1,
+            thread: t3_tid.clone(),
+        },
+    })
+    .await
+    .unwrap();
+    operator
+        .call(WaveRetireWorker {
+            wave: wave.clone(),
+            role: t3_role.clone(),
+            reason: Some("done".into()),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 2,
+            "location": "active",
+            "thread": {
+                "id": t3_tid.as_str(),
+                "status": "running",
+                "pendingRuntimeRequest": null,
+                "archivedAt": null
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let snap2 = operator
+        .call(WaveView { wave: wave.clone() })
+        .await
+        .unwrap();
+    let t3_phase_mid = &snap2
+        .workers
+        .iter()
+        .find(|(r, _, _)| r == &t3_role)
+        .unwrap()
+        .2;
+    assert!(
+        matches!(t3_phase_mid, WorkerPhase::Retiring { .. }),
+        "retiring T3 worker must stay Retiring on non-archive shell update"
+    );
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 3,
+            "location": "archived",
+            "thread": {
+                "id": t3_tid.as_str(),
+                "status": "completed",
+                "pendingRuntimeRequest": null,
+                "archivedAt": "2026-11-24T12:00:00Z"
+            }
+        }))
+        .await;
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let t3_role = t3_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            snap.workers
+                .iter()
+                .any(|(r, _, p)| r == &t3_role && matches!(p, WorkerPhase::Retired { .. }))
+        }
+    })
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    bridge_task.abort();
+}
