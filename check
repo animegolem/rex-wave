@@ -167,6 +167,7 @@ run_stage1_fmt() {
 
 run_stage1_hygiene() {
 	python3 - "$ROOT" "$GIT_REV" <<'PY'
+import errno
 import hashlib
 import os
 import re
@@ -181,6 +182,8 @@ git_rev = sys.argv[2]
 # Domain-separated SHA-256 tripwire digests keep this script free of house
 # literals while catching accidental reintroductions in paths or content.
 PRIVATE_PATH_DIGESTS = frozenset([
+    "58743b2e0f1a43ac",
+    "59a1d05d3cef8ff5",
     "5670a18e02bf44f8",
     "23b1ee96425be106",
     "0391f536eeebb32b",
@@ -375,6 +378,12 @@ def iter_entries():
         yielded_ancestors = set()
         o_dir = getattr(os, "O_DIRECTORY", 0)
         o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+        expected_walk_errnos = frozenset([
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.ELOOP,
+            getattr(errno, "EMLINK", errno.ELOOP),
+        ])
         root_fd = os.open(root, os.O_RDONLY | o_dir)
         try:
             for path_b in raw.split(b"\0"):
@@ -397,7 +406,14 @@ def iter_entries():
                             next_fd = os.open(
                                 seg, os.O_RDONLY | o_dir | o_nofollow, dir_fd=parent_fd
                             )
-                        except OSError:
+                        except OSError as exc:
+                            if exc.errno not in expected_walk_errnos:
+                                sys.stderr.write(
+                                    "error: repo hygiene failed to open directory {}: {}\n".format(
+                                        cur_rel, exc
+                                    )
+                                )
+                                sys.exit(1)
                             try:
                                 anc_st = os.lstat(seg, dir_fd=parent_fd)
                                 if stat.S_ISLNK(anc_st.st_mode) and cur_rel not in yielded_ancestors:
@@ -405,8 +421,14 @@ def iter_entries():
                                     yield cur_rel, os.readlink(seg, dir_fd=parent_fd).encode(
                                         "utf-8", errors="surrogateescape"
                                     )
-                            except OSError:
-                                pass
+                            except OSError as lstat_exc:
+                                if lstat_exc.errno not in expected_walk_errnos:
+                                    sys.stderr.write(
+                                        "error: repo hygiene failed to stat {}: {}\n".format(
+                                            cur_rel, lstat_exc
+                                        )
+                                    )
+                                    sys.exit(1)
                             aborted = True
                             break
                         if parent_fd != root_fd:
@@ -416,7 +438,12 @@ def iter_entries():
                         leaf = segments[-1]
                         try:
                             st = os.lstat(leaf, dir_fd=parent_fd)
-                        except OSError:
+                        except OSError as exc:
+                            if exc.errno not in expected_walk_errnos:
+                                sys.stderr.write(
+                                    "error: repo hygiene failed to stat {}: {}\n".format(rel, exc)
+                                )
+                                sys.exit(1)
                             st = None
                         if st is not None:
                             if stat.S_ISLNK(st.st_mode):
@@ -429,7 +456,14 @@ def iter_entries():
                                     fd = os.open(
                                         leaf, os.O_RDONLY | o_nofollow, dir_fd=parent_fd
                                     )
-                                except OSError:
+                                except OSError as exc:
+                                    if exc.errno not in expected_walk_errnos:
+                                        sys.stderr.write(
+                                            "error: repo hygiene failed to read {}: {}\n".format(
+                                                rel, exc
+                                            )
+                                        )
+                                        sys.exit(1)
                                     fd = None
                                 if fd is not None:
                                     try:

@@ -3383,8 +3383,8 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         &seats_tsv_path,
         concat!(
             "# external seats map (ordinary algorithm terms like k-means are allowed)\n",
-            "ML-Papers\tliam\t/tmp/liam\n",
-            "Pasted-text.txt attachment (fork) (fork)\tfrank\t/tmp/frank\n",
+            "Paper-Notes\tliam\t/tmp/liam\n",
+            "Notes.txt attachment (fork) (fork)\tfrank\t/tmp/frank\n",
             "frank-fork\tfrank\t/tmp/frank\n",
             "Codex-Outside-Review\tfrank\t/tmp/frank\n",
             "cleanup-palette-tool\tclara\t/tmp/clara\n",
@@ -3496,7 +3496,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         "fork/attachment session names must not be registered as aliases"
     );
     let liam = by_seat(&ext_plan, "liam").unwrap();
-    assert!(liam.aliases.iter().any(|a| a.as_str() == "ml-papers"));
+    assert!(liam.aliases.iter().any(|a| a.as_str() == "paper-notes"));
 
     // Explicit missing `seats.tsv` returns NotFound instead of silently dropping the flag.
     let missing_seats = house.join("does-not-exist-seats.tsv");
