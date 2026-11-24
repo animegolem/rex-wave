@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage: ./check [--lint-only] [--skip-clippy] [--git-rev <rev>] [-h|--help]
+
+Runs the deterministic hermetic commit and CI verification pipeline:
+  Stage 1 (parallel): cargo fmt, repo hygiene lints, bb-plugin tsc + node --test
+  Stage 2 (compile):  cargo clippy (unless --skip-clippy), single-pass cargo test --no-run
+  Stage 3 (parallel): compiled test binaries, rex-wave tui --self-test, schema --bb diff
+
+Flags:
+  --lint-only       Run Stage 1 + cargo clippy only, then exit 0.
+  --skip-clippy     Skip cargo clippy in Stage 2 (used when lint job already ran).
+  --git-rev <rev>   Scan exact Git tree <rev> objects in Stage 1 repo hygiene.
+  -h, --help        Show this help message.
+EOF
+}
+
+LINT_ONLY=0
+SKIP_CLIPPY=0
+GIT_REV=""
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--lint-only)
+		LINT_ONLY=1
+		shift
+		;;
+	--skip-clippy)
+		SKIP_CLIPPY=1
+		shift
+		;;
+	--git-rev)
+		if [[ $# -lt 2 || -z "$2" ]]; then
+			printf 'error: --git-rev requires a commit/tree revision\n' >&2
+			exit 2
+		fi
+		GIT_REV="$2"
+		shift 2
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	*)
+		printf 'error: unknown option: %s\n' "$1" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+START_EPOCH="$(python3 -c 'import time; print(f"{time.time():.3f}")')"
+elapsed_since_start() {
+	python3 -c 'import sys, time; print(f"{max(0.0, time.time() - float(sys.argv[1])):.2f}s")' "$START_EPOCH"
+}
+
+# Capture user cache base before isolating XDG_* for test hermeticity.
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/rex-wave/bb-plugin"
+
+CHECK_TMP="$(mktemp -d /tmp/rwc.XXXXXX)"
+cleanup() {
+	rm -rf "$CHECK_TMP"
+}
+trap cleanup EXIT
+
+export TMPDIR="$CHECK_TMP"
+export BB_DATA_DIR="$CHECK_TMP/bb"
+export XDG_STATE_HOME="$CHECK_TMP/state"
+export XDG_CONFIG_HOME="$CHECK_TMP/cfg"
+mkdir -p "$CHECK_TMP/bb" "$CHECK_TMP/state" "$CHECK_TMP/cfg/rex-wave"
+: > "$CHECK_TMP/cfg/rex-wave/protected-roots"
+
+unset \
+	T3CODE_THREAD_ID \
+	T3CODE_CLI_PATH \
+	T3CODE_DESKTOP_HOST_SCOPE \
+	T3_ACP_MCP_NODE \
+	T3_ACP_MCP_ENDPOINT \
+	T3_ACP_MCP_ENTRYPOINT \
+	T3_ACP_MCP_AUTHORIZATION \
+	REX_WAVE_TOKEN \
+	REX_WAVE_T3_HOME \
+	REX_WAVE_T3_URL \
+	REX_WAVE_T3_TOKEN \
+	REX_WAVE_BB_TOKEN \
+	REX_WAVE_INTERCHANGE_DIR \
+	REX_WAVE_LIVE_INTERCHANGE_TEST_DIR \
+	CLAUDE_PID
+
+# Resolve node/npm across PATH, /opt/homebrew/bin, and /usr/local/bin.
+find_tool() {
+	local name="$1"
+	local found
+	if found="$(command -v "$name" 2>/dev/null)"; then
+		printf '%s\n' "$found"
+		return 0
+	fi
+	local candidate
+	for candidate in "/opt/homebrew/bin/$name" "/usr/local/bin/$name"; do
+		if [[ -x "$candidate" ]]; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+NODE_BIN=""
+if NODE_BIN="$(find_tool node)"; then
+	NODE_DIR="$(dirname "$NODE_BIN")"
+	case ":$PATH:" in
+	*":$NODE_DIR:"*) ;;
+	*) export PATH="$NODE_DIR:$PATH" ;;
+	esac
+fi
+
+NPM_BIN=""
+if NPM_BIN="$(find_tool npm)"; then
+	NPM_DIR="$(dirname "$NPM_BIN")"
+	case ":$PATH:" in
+	*":$NPM_DIR:"*) ;;
+	*) export PATH="$NPM_DIR:$PATH" ;;
+	esac
+fi
+
+run_node() {
+	if [[ -n "$NODE_BIN" ]]; then
+		"$NODE_BIN" "$@"
+	elif [[ -x "/Applications/bb.app/Contents/MacOS/bb" ]]; then
+		ELECTRON_RUN_AS_NODE=1 /Applications/bb.app/Contents/MacOS/bb "$@"
+	else
+		printf 'error: node (>=22.18) or /Applications/bb.app is required for bb-plugin checks\n' >&2
+		return 1
+	fi
+}
+
+run_npm() {
+	if [[ -n "$NPM_BIN" ]]; then
+		"$NPM_BIN" "$@"
+	else
+		printf 'error: npm is required to populate the bb-plugin dependency cache\n' >&2
+		return 1
+	fi
+}
+
+sha256_files() {
+	python3 - "$@" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+for path in sys.argv[1:]:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    h.update(str(len(data)).encode("ascii") + b":" + data)
+print(h.hexdigest())
+PY
+}
+
+run_stage1_fmt() {
+	cargo fmt --all --check
+}
+
+run_stage1_hygiene() {
+	python3 - "$ROOT" "$GIT_REV" <<'PY'
+import errno
+import hashlib
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+
+root = sys.argv[1]
+git_rev = sys.argv[2]
+
+# Domain-separated SHA-256 tripwire digests keep this script free of house
+# literals while catching accidental reintroductions in paths or content.
+PRIVATE_PATH_DIGESTS = frozenset([
+    "58743b2e0f1a43ac",
+    "59a1d05d3cef8ff5",
+    "5670a18e02bf44f8",
+    "23b1ee96425be106",
+    "0391f536eeebb32b",
+    "c454a70cf23dde66",
+    "ee0043c7aef55bfc",
+    "a1e096398f6c0576",
+    "aeff0f52626dd5c5",
+    "feb60a0e299fbf85",
+    "a6edd614cb7d96bf",
+    "274d8306dbe09fc4",
+    "e1891630c34c4465",
+    "1c2c793c35880b1d",
+    "27c49b165113c1d3",
+    "3a7f21d75b8e822a",
+    "61344a74e88ac17a",
+    "684d349f62762ed3",
+    "6e660b173cb01a45",
+    "9261cd539cb56784",
+    "98295ab3b53104b8",
+])
+
+PRIVATE_SEAT_DIGESTS = frozenset([
+    "834645f6e7761372",
+    "da290424be87c328",
+    "8ac20f830d196041",
+    "f33f10e685419f0e",
+    "7622c6fd484d5874",
+    "826dd4d16a706e84",
+    "02c5195505ae0e57",
+    "3cce485ba4d03f29",
+    "3d7666fcca7c37d1",
+    "3d7d0921299d5915",
+    "4027d6b1f298a1e6",
+    "66bd35893c2907a3",
+    "6f1115b1216d79e2",
+    "83a33bc203695b00",
+    "8593a03eb2de9b52",
+    "88c5d7f9962c63d2",
+    "9a87272fdba4056d",
+    "aea5f85f6f787f8f",
+    "b6a9234a7c3d3079",
+    "c5de16516ea9201a",
+    "ce0d9d33b752fb95",
+    "d9f93c7006b5058b",
+    "f1b8953d59faf159",
+    "f5cb94cf2de8fe73",
+    "ff15860485ccb431",
+])
+
+PRIVATE_SEAT_PREFIX4_DIGESTS = frozenset([
+    "6136b0fa87b8d83a",
+])
+
+# Seat names that collide with hyphenated public model IDs (such as gemini-4-*)
+# are matched when used standalone or with underscore/to- seat prefixes.
+PRIVATE_STANDALONE_SEAT_DIGESTS = frozenset([
+    "6c4c066551ee83b9",
+])
+
+LOCKFILES_SKIP_SEAT_WORDS = frozenset([
+    "Cargo.lock",
+    "bb-plugin/package-lock.json",
+])
+
+PATH_MSG = (
+    "house-private path/ID literal: move config to ~/.config/rex-wave/house.json "
+    "or protected-roots, and use generic /workspace or proj_demo_* fixtures"
+)
+SEAT_MSG = (
+    "house-private seat literal: load from ~/.config/rex-wave/house.json "
+    "or use generic operator/postmaster/alice/bob/carol fixtures"
+)
+TODO_MSG = (
+    "stale TODO(PR-...): resolve the TODO or reference a tracked GitHub issue URL"
+)
+
+digest_cache = {}
+
+def has_digest(ns, token, table):
+    key = (ns, token)
+    h = digest_cache.get(key)
+    if h is None:
+        h = hashlib.sha256((ns + ":" + token).encode("utf-8")).hexdigest()[:16]
+        digest_cache[key] = h
+    return h in table
+
+esc_re = re.compile(r"\\[tnr]")
+mac_home_re = re.compile(r"(?<![A-Za-z0-9_])/" + "Users" + r"/[A-Za-z0-9._-]+")
+sub_chunk_re = re.compile(r"[a-z0-9_:-]+")
+sub_split_re = re.compile(r"([_:-])")
+seat_chunk_re = re.compile(r"[a-z0-9_-]+")
+word_token_re = re.compile(r"[a-z0-9]+")
+
+def find_private_path_match(line):
+    m_home = mac_home_re.search(line)
+    if m_home is not None:
+        return m_home.group(0)
+    cleaned = esc_re.sub(" ", line.lower())
+    for chunk in sub_chunk_re.findall(cleaned):
+        if has_digest("subchunk", chunk, frozenset(["aa4964fa720aedd0"])):
+            return chunk
+        parts = sub_split_re.split(chunk)
+        for i in range(0, len(parts), 2):
+            p = parts[i]
+            if not p:
+                continue
+            if has_digest("sub", p, PRIVATE_PATH_DIGESTS):
+                return p
+            if i + 2 < len(parts) and parts[i + 2]:
+                pair = p + parts[i + 1] + parts[i + 2]
+                if has_digest("sub", pair, PRIVATE_PATH_DIGESTS):
+                    return pair
+    return None
+
+def find_private_seat_match(line_low):
+    cleaned = esc_re.sub(" ", line_low)
+    for chunk in seat_chunk_re.findall(cleaned):
+        is_model_slug = chunk.startswith("gemini-") or chunk.startswith("orchestrator-")
+        for w in word_token_re.findall(chunk):
+            if has_digest("seat", w, PRIVATE_SEAT_DIGESTS):
+                return w
+            if not is_model_slug and has_digest("chunk", w, PRIVATE_STANDALONE_SEAT_DIGESTS):
+                return w
+        parts = chunk.split("-")
+        n = len(parts)
+        for i, p in enumerate(parts):
+            if not p:
+                continue
+            if has_digest("seat", p, PRIVATE_SEAT_DIGESTS):
+                return p
+            if i + 1 < n and parts[i + 1]:
+                pair = p + "-" + parts[i + 1]
+                if has_digest("seat", pair, PRIVATE_SEAT_DIGESTS):
+                    return pair
+                if len(parts[i + 1]) >= 4 and has_digest(
+                    "seatp4", p + "-" + parts[i + 1][:4], PRIVATE_SEAT_PREFIX4_DIGESTS
+                ):
+                    return pair
+                if i + 2 < n and parts[i + 2]:
+                    triple = pair + "-" + parts[i + 2]
+                    if has_digest("seat", triple, PRIVATE_SEAT_DIGESTS):
+                        return triple
+    return None
+
+def iter_entries():
+    if git_rev:
+        raw = subprocess.check_output(
+            ["git", "-C", root, "ls-tree", "-r", "-z", git_rev]
+        )
+        blobs = []
+        for rec in raw.split(b"\0"):
+            if not rec:
+                continue
+            meta, path_b = rec.split(b"\t", 1)
+            parts = meta.decode("ascii").split()
+            obj_type = parts[1]
+            obj_sha = parts[2]
+            rel = path_b.decode("utf-8", errors="surrogateescape")
+            if obj_type == "blob":
+                blobs.append((rel, obj_sha))
+            else:
+                yield rel, b""
+        if blobs:
+            proc = subprocess.Popen(
+                ["git", "-C", root, "cat-file", "--batch"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+            )
+            assert proc.stdin is not None and proc.stdout is not None
+            for rel, sha in blobs:
+                proc.stdin.write((sha + "\n").encode("ascii"))
+                proc.stdin.flush()
+                header = proc.stdout.readline().decode("ascii").strip().split()
+                if len(header) < 3 or header[1] == "missing":
+                    proc.stdin.close()
+                    proc.wait()
+                    sys.stderr.write("error: git cat-file missing blob {} ({})\n".format(sha, rel))
+                    sys.exit(1)
+                size = int(header[2])
+                data = proc.stdout.read(size)
+                proc.stdout.read(1)  # trailing LF
+                yield rel, data
+            proc.stdin.close()
+            if proc.wait() != 0:
+                sys.stderr.write("error: git cat-file --batch failed\n")
+                sys.exit(1)
+    else:
+        raw = subprocess.check_output(
+            ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+        )
+        seen = set()
+        yielded_ancestors = set()
+        o_dir = getattr(os, "O_DIRECTORY", 0)
+        o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+        expected_walk_errnos = frozenset([
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.ELOOP,
+            getattr(errno, "EMLINK", errno.ELOOP),
+        ])
+        root_fd = os.open(root, os.O_RDONLY | o_dir)
+        try:
+            for path_b in raw.split(b"\0"):
+                if not path_b:
+                    continue
+                rel = path_b.decode("utf-8", errors="surrogateescape")
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                segments = [seg for seg in rel.split("/") if seg]
+                if not segments:
+                    continue
+                parent_fd = root_fd
+                cur_rel = ""
+                aborted = False
+                try:
+                    for seg in segments[:-1]:
+                        cur_rel = seg if not cur_rel else (cur_rel + "/" + seg)
+                        try:
+                            next_fd = os.open(
+                                seg, os.O_RDONLY | o_dir | o_nofollow, dir_fd=parent_fd
+                            )
+                        except OSError as exc:
+                            if exc.errno not in expected_walk_errnos:
+                                sys.stderr.write(
+                                    "error: repo hygiene failed to open directory {}: {}\n".format(
+                                        cur_rel, exc
+                                    )
+                                )
+                                sys.exit(1)
+                            try:
+                                anc_st = os.lstat(seg, dir_fd=parent_fd)
+                                if stat.S_ISLNK(anc_st.st_mode) and cur_rel not in yielded_ancestors:
+                                    yielded_ancestors.add(cur_rel)
+                                    yield cur_rel, os.readlink(seg, dir_fd=parent_fd).encode(
+                                        "utf-8", errors="surrogateescape"
+                                    )
+                            except OSError as lstat_exc:
+                                if lstat_exc.errno not in expected_walk_errnos:
+                                    sys.stderr.write(
+                                        "error: repo hygiene failed to stat {}: {}\n".format(
+                                            cur_rel, lstat_exc
+                                        )
+                                    )
+                                    sys.exit(1)
+                            aborted = True
+                            break
+                        if parent_fd != root_fd:
+                            os.close(parent_fd)
+                        parent_fd = next_fd
+                    if not aborted:
+                        leaf = segments[-1]
+                        try:
+                            st = os.lstat(leaf, dir_fd=parent_fd)
+                        except OSError as exc:
+                            if exc.errno not in expected_walk_errnos:
+                                sys.stderr.write(
+                                    "error: repo hygiene failed to stat {}: {}\n".format(rel, exc)
+                                )
+                                sys.exit(1)
+                            st = None
+                        if st is not None:
+                            if stat.S_ISLNK(st.st_mode):
+                                target = os.readlink(leaf, dir_fd=parent_fd).encode(
+                                    "utf-8", errors="surrogateescape"
+                                )
+                                yield rel, target
+                            elif stat.S_ISREG(st.st_mode):
+                                try:
+                                    fd = os.open(
+                                        leaf, os.O_RDONLY | o_nofollow, dir_fd=parent_fd
+                                    )
+                                except OSError as exc:
+                                    if exc.errno not in expected_walk_errnos:
+                                        sys.stderr.write(
+                                            "error: repo hygiene failed to read {}: {}\n".format(
+                                                rel, exc
+                                            )
+                                        )
+                                        sys.exit(1)
+                                    fd = None
+                                if fd is not None:
+                                    try:
+                                        with os.fdopen(fd, "rb") as fh:
+                                            data = fh.read()
+                                    except Exception:
+                                        os.close(fd)
+                                        raise
+                                    yield rel, data
+                finally:
+                    if parent_fd != root_fd:
+                        os.close(parent_fd)
+        finally:
+            os.close(root_fd)
+
+path_hits = []
+seat_hits = []
+todo_hits = []
+licenses_nonempty = {"LICENSE-MIT": False, "LICENSE-APACHE": False}
+
+for rel, data in iter_entries():
+    if rel in licenses_nonempty and len(data.strip()) > 0:
+        licenses_nonempty[rel] = True
+
+    m_rel_path = find_private_path_match(rel)
+    if m_rel_path is not None:
+        path_hits.append((rel, 0, m_rel_path))
+    m_rel_seat = find_private_seat_match(rel.lower())
+    if m_rel_seat is not None:
+        seat_hits.append((rel, 0, m_rel_seat))
+
+    check_seats = rel not in LOCKFILES_SKIP_SEAT_WORDS
+    check_todos = rel != "check"
+    text = data.decode("utf-8", errors="replace")
+    for lineno, line in enumerate(text.splitlines(), 1):
+        m_path = find_private_path_match(line)
+        if m_path is not None:
+            path_hits.append((rel, lineno, m_path))
+        if check_seats:
+            m_seat = find_private_seat_match(line.lower())
+            if m_seat is not None:
+                seat_hits.append((rel, lineno, m_seat))
+        if check_todos and "TODO(PR-" in line:
+            todo_hits.append((rel, lineno, line.strip()))
+
+missing_lic = [k for k, ok in sorted(licenses_nonempty.items()) if not ok]
+if missing_lic:
+    for lic in missing_lic:
+        sys.stderr.write("error: {} is missing or empty\n".format(lic))
+    sys.exit(1)
+
+total = len(path_hits) + len(seat_hits) + len(todo_hits)
+if total == 0:
+    sys.exit(0)
+
+MAX_PER_CAT = 25
+
+def report(label, hits, msg):
+    if not hits:
+        return
+    sys.stderr.write("\n[hygiene] {} ({} violation(s)):\n".format(label, len(hits)))
+    for rel, lineno, detail in hits[:MAX_PER_CAT]:
+        sys.stderr.write("  {}:{} ({}): {}\n".format(rel, lineno, detail, msg))
+    if len(hits) > MAX_PER_CAT:
+        sys.stderr.write(
+            "  ... and {} more {} violation(s)\n".format(len(hits) - MAX_PER_CAT, label)
+        )
+
+report("private path/ID literals", path_hits, PATH_MSG)
+report("private seat literals", seat_hits, SEAT_MSG)
+report("stale PR TODOs", todo_hits, TODO_MSG)
+sys.stderr.write(
+    "\nhygiene failed: {} violation(s) total ({} path/ID, {} seat, {} TODO).\n".format(
+        total, len(path_hits), len(seat_hits), len(todo_hits)
+    )
+)
+sys.exit(1)
+PY
+}
+
+run_stage1_bb_plugin() {
+	local pkg_file="$ROOT/bb-plugin/package.json"
+	local lock_file="$ROOT/bb-plugin/package-lock.json"
+	if [[ ! -f "$pkg_file" || ! -f "$lock_file" ]]; then
+		printf 'error: missing bb-plugin/package.json or bb-plugin/package-lock.json\n' >&2
+		return 1
+	fi
+
+	local lock_sha cache_dir cached_nm stage_dir
+	lock_sha="$(sha256_files "$pkg_file" "$lock_file")"
+	cache_dir="$CACHE_ROOT/$lock_sha"
+	cached_nm="$cache_dir/node_modules"
+
+	if [[ ! -f "$cached_nm/typescript/bin/tsc" ]]; then
+		mkdir -p "$CACHE_ROOT"
+		stage_dir="$(mktemp -d "$CACHE_ROOT/.install.${lock_sha}.XXXXXX")"
+		cp "$pkg_file" "$lock_file" "$stage_dir/"
+		if ! (cd "$stage_dir" && run_npm ci --ignore-scripts --no-audit --no-fund); then
+			rm -rf "$stage_dir"
+			return 1
+		fi
+		if [[ ! -f "$stage_dir/node_modules/typescript/bin/tsc" ]]; then
+			rm -rf "$stage_dir"
+			printf 'error: npm ci succeeded without typescript/bin/tsc\n' >&2
+			return 1
+		fi
+		python3 - "$stage_dir" "$cache_dir" <<'PY' || return 1
+import os, shutil, sys
+stage_dir, cache_dir = sys.argv[1], sys.argv[2]
+tsc_rel = os.path.join("node_modules", "typescript", "bin", "tsc")
+try:
+    os.rename(stage_dir, cache_dir)
+except OSError:
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    if not os.path.isfile(os.path.join(cache_dir, tsc_rel)):
+        sys.stderr.write("error: failed to publish bb-plugin cache at {}\n".format(cache_dir))
+        sys.exit(1)
+PY
+	fi
+
+	local work_bb="$CHECK_TMP/bb-plugin"
+	mkdir -p "$work_bb"
+	cp \
+		"$ROOT/bb-plugin/package.json" \
+		"$ROOT/bb-plugin/package-lock.json" \
+		"$ROOT/bb-plugin/tsconfig.json" \
+		"$ROOT/bb-plugin/server.ts" \
+		"$ROOT/bb-plugin/protocol.ts" \
+		"$ROOT/bb-plugin/protocol.test.ts" \
+		"$ROOT/bb-plugin/protocol.fixtures.json" \
+		"$ROOT/bb-plugin/tools.generated.json" \
+		"$work_bb/"
+	ln -s "$cached_nm" "$work_bb/node_modules"
+
+	(
+		cd "$work_bb"
+		run_node "$work_bb/node_modules/typescript/bin/tsc" -p "$work_bb/tsconfig.json" --noEmit
+		run_node --test protocol.test.ts
+	)
+}
+
+printf '==> Stage 1: fmt, repo hygiene, bb-plugin (parallel)\n'
+
+LOG_FMT="$CHECK_TMP/stage1-fmt.log"
+LOG_HYGIENE="$CHECK_TMP/stage1-hygiene.log"
+LOG_BB="$CHECK_TMP/stage1-bb.log"
+
+run_stage1_fmt >"$LOG_FMT" 2>&1 &
+PID_FMT=$!
+run_stage1_hygiene >"$LOG_HYGIENE" 2>&1 &
+PID_HYGIENE=$!
+run_stage1_bb_plugin >"$LOG_BB" 2>&1 &
+PID_BB=$!
+
+STAGE1_FAIL=0
+
+if ! wait "$PID_FMT"; then
+	printf '\n--- [FAIL] cargo fmt --all --check ---\n' >&2
+	cat "$LOG_FMT" >&2
+	STAGE1_FAIL=1
+else
+	printf '  [ok] cargo fmt\n'
+fi
+
+if ! wait "$PID_HYGIENE"; then
+	printf '\n--- [FAIL] repo hygiene ---\n' >&2
+	cat "$LOG_HYGIENE" >&2
+	STAGE1_FAIL=1
+else
+	if [[ -s "$LOG_HYGIENE" ]]; then
+		cat "$LOG_HYGIENE"
+	fi
+	printf '  [ok] repo hygiene\n'
+fi
+
+if ! wait "$PID_BB"; then
+	printf '\n--- [FAIL] bb-plugin (tsc + protocol.test.ts) ---\n' >&2
+	cat "$LOG_BB" >&2
+	STAGE1_FAIL=1
+else
+	printf '  [ok] bb-plugin (tsc + protocol.test.ts)\n'
+fi
+
+if [[ "$STAGE1_FAIL" -ne 0 ]]; then
+	printf '\ncheck: Stage 1 failed (%s).\n' "$(elapsed_since_start)" >&2
+	exit 1
+fi
+
+printf '\n==> Stage 2: compile\n'
+
+if [[ "$SKIP_CLIPPY" -eq 0 ]]; then
+	printf '  running cargo clippy --workspace --all-targets --locked -- -D warnings\n'
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+	printf '  [ok] cargo clippy\n'
+fi
+
+if [[ "$LINT_ONLY" -eq 1 ]]; then
+	printf '\ncheck: lint-only gates passed (%s).\n' "$(elapsed_since_start)"
+	exit 0
+fi
+
+ARTIFACTS_JSONL="$CHECK_TMP/artifacts.jsonl"
+printf '  compiling workspace tests and rex-wave binary (single pass)\n'
+if ! cargo test --workspace --locked --no-run --message-format=json >"$ARTIFACTS_JSONL"; then
+	python3 - "$ARTIFACTS_JSONL" <<'PY' >&2
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("reason") == "compiler-message":
+            rendered = (obj.get("message") or {}).get("rendered")
+            if rendered:
+                sys.stderr.write(rendered)
+PY
+	printf '\ncheck: Stage 2 test compilation failed (%s).\n' "$(elapsed_since_start)" >&2
+	exit 1
+fi
+printf '  [ok] cargo test --workspace --locked --no-run\n'
+
+printf '\n==> Stage 3: parallel test execution + tui self-test + schema diff\n'
+
+python3 - "$ROOT" "$CHECK_TMP" "$ARTIFACTS_JSONL" <<'PY'
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+root = sys.argv[1]
+check_tmp = sys.argv[2]
+artifacts_path = sys.argv[3]
+
+test_bins = []
+seen_exes = set()
+rex_wave_bin = None
+
+with open(artifacts_path, "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("reason") != "compiler-artifact":
+            continue
+        exe = obj.get("executable")
+        if not exe:
+            continue
+        target = obj.get("target") or {}
+        profile = obj.get("profile") or {}
+        kinds = target.get("kind") or []
+        name = target.get("name") or os.path.basename(exe)
+        manifest_path = obj.get("manifest_path") or os.path.join(root, "Cargo.toml")
+        manifest_dir = os.path.dirname(manifest_path)
+        if not profile.get("test") and "bin" in kinds and name == "rex-wave":
+            rex_wave_bin = exe
+        elif profile.get("test"):
+            if exe not in seen_exes:
+                seen_exes.add(exe)
+                pkg_dir = os.path.basename(manifest_dir)
+                label = "{}/{}".format(pkg_dir, name) if pkg_dir != name else name
+                test_bins.append((label, exe, manifest_dir))
+
+if not rex_wave_bin:
+    sys.stderr.write("error: rex-wave binary artifact not found in cargo test --no-run output\n")
+    sys.exit(1)
+
+if not test_bins:
+    sys.stderr.write("error: no compiled test binaries found in cargo test --no-run output\n")
+    sys.exit(1)
+
+def make_isolated_env(idx, manifest_dir):
+    run_dir = os.path.join(check_tmp, "run-{}".format(idx))
+    tmp_dir = os.path.join(run_dir, "tmp")
+    bb_dir = os.path.join(run_dir, "bb")
+    state_dir = os.path.join(run_dir, "state")
+    cfg_dir = os.path.join(run_dir, "cfg")
+    prot_dir = os.path.join(cfg_dir, "rex-wave")
+    for d in (tmp_dir, bb_dir, state_dir, prot_dir):
+        os.makedirs(d, exist_ok=True)
+    with open(os.path.join(prot_dir, "protected-roots"), "w", encoding="utf-8"):
+        pass
+    env = os.environ.copy()
+    env["TMPDIR"] = tmp_dir
+    env["BB_DATA_DIR"] = bb_dir
+    env["XDG_STATE_HOME"] = state_dir
+    env["XDG_CONFIG_HOME"] = cfg_dir
+    env["CARGO_MANIFEST_DIR"] = manifest_dir
+    env["CARGO_BIN_EXE_rex-wave"] = rex_wave_bin
+    return env
+
+passed_re = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored")
+
+def run_test_bin(idx, label, exe, manifest_dir):
+    env = make_isolated_env(idx, manifest_dir)
+    t0 = time.monotonic()
+    proc = subprocess.run(
+        [exe],
+        cwd=manifest_dir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    dt = time.monotonic() - t0
+    passed = 0
+    ignored = 0
+    for m in passed_re.finditer(proc.stdout):
+        passed += int(m.group(1))
+        ignored += int(m.group(3))
+    return {
+        "kind": "test",
+        "label": label,
+        "rc": proc.returncode,
+        "dt": dt,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "passed": passed,
+        "ignored": ignored,
+    }
+
+def run_tui_self_test(idx):
+    env = make_isolated_env(idx, root)
+    t0 = time.monotonic()
+    proc = subprocess.run(
+        [rex_wave_bin, "tui", "--self-test"],
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    dt = time.monotonic() - t0
+    return {
+        "kind": "check",
+        "label": "rex-wave tui --self-test",
+        "rc": proc.returncode,
+        "dt": dt,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "passed": 0,
+        "ignored": 0,
+    }
+
+def run_schema_diff(idx):
+    env = make_isolated_env(idx, root)
+    t0 = time.monotonic()
+    gen = subprocess.run(
+        [rex_wave_bin, "schema", "--bb"],
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if gen.returncode != 0:
+        return {
+            "kind": "check",
+            "label": "rex-wave schema --bb diff",
+            "rc": gen.returncode,
+            "dt": time.monotonic() - t0,
+            "stdout": gen.stdout,
+            "stderr": gen.stderr,
+            "passed": 0,
+            "ignored": 0,
+        }
+    expected_path = os.path.join(root, "bb-plugin", "tools.generated.json")
+    diff = subprocess.run(
+        ["diff", "-u", expected_path, "-"],
+        input=gen.stdout,
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    dt = time.monotonic() - t0
+    return {
+        "kind": "check",
+        "label": "rex-wave schema --bb diff",
+        "rc": diff.returncode,
+        "dt": dt,
+        "stdout": diff.stdout,
+        "stderr": diff.stderr,
+        "passed": 0,
+        "ignored": 0,
+    }
+
+workers = min(8, os.cpu_count() or 4)
+t_stage3 = time.monotonic()
+results = []
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    futures = []
+    for idx, (label, exe, manifest_dir) in enumerate(test_bins):
+        futures.append(pool.submit(run_test_bin, idx, label, exe, manifest_dir))
+    base = len(test_bins)
+    futures.append(pool.submit(run_tui_self_test, base))
+    futures.append(pool.submit(run_schema_diff, base + 1))
+
+    for fut in concurrent.futures.as_completed(futures):
+        results.append(fut.result())
+
+stage3_dt = time.monotonic() - t_stage3
+failures = [r for r in results if r["rc"] != 0]
+test_results = [r for r in results if r["kind"] == "test"]
+total_passed = sum(r["passed"] for r in test_results)
+total_ignored = sum(r["ignored"] for r in test_results)
+
+if failures:
+    for r in sorted(failures, key=lambda item: item["label"]):
+        sys.stderr.write("\n--- [FAIL] {} (exit {}, {:.2f}s) ---\n".format(
+            r["label"], r["rc"], r["dt"]
+        ))
+        if r["stdout"]:
+            sys.stderr.write(r["stdout"])
+            if not r["stdout"].endswith("\n"):
+                sys.stderr.write("\n")
+        if r["stderr"]:
+            sys.stderr.write(r["stderr"])
+            if not r["stderr"].endswith("\n"):
+                sys.stderr.write("\n")
+    sys.stderr.write("\nStage 3 failed: {} of {} checks failed ({:.2f}s).\n".format(
+        len(failures), len(results), stage3_dt
+    ))
+    sys.exit(1)
+
+print("  [ok] {} test binaries ({} passed, {} ignored) + tui --self-test + schema --bb diff in {:.2f}s (workers={})".format(
+    len(test_results), total_passed, total_ignored, stage3_dt, workers
+))
+slowest = sorted(test_results, key=lambda r: r["dt"], reverse=True)[:3]
+print("  slowest 3 test binaries:")
+for r in slowest:
+    print("    {:.2f}s  {} ({} passed)".format(r["dt"], r["label"], r["passed"]))
+PY
+
+printf '\ncheck: all gates passed (%s).\n' "$(elapsed_since_start)"

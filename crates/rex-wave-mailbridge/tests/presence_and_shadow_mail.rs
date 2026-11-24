@@ -7,10 +7,11 @@ use rex_wave_mailbridge::{
     IncarnationAffinity, LetterCandidate, MailBridge, Presence, PresenceState, Protection,
     ReadOnlyInterchange, RetryEntry, RetryState, RingDecision, RingDeliveryChannel, RingPolicy,
     RingReferent, SandboxRoot, ShadowAction, TimeBasis, current_process_start, decide_mail_ring,
-    decide_mail_rings_for_seat, extract_letter_timestamp, format_delivery_status, is_process_alive,
-    load_claude_session_file_from, parse_acks_jsonl, parse_claude_session_json, project,
-    query_process_start, run_shadow_pass, score_shadow_against_acks, score_shadow_jsonl,
-    seed_records_from_interchange, seed_records_from_interchange_with_options,
+    decide_mail_rings_for_seat, extract_letter_timestamp, format_delivery_status,
+    house_profile_path_from, is_process_alive, letter_paths_match, load_claude_session_file_from,
+    load_house_profile_from, normalize_letter_path, parse_acks_jsonl, parse_claude_session_json,
+    project, query_process_start, run_shadow_pass, score_shadow_against_acks, score_shadow_jsonl,
+    seed_records_from_interchange_with_options, seed_records_from_interchange_with_profile,
     select_binding_for_delivery, sender_delivery_notice,
 };
 use rex_wave_rooms::Rooms;
@@ -51,6 +52,33 @@ impl TempDirGuard {
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn seat(raw: &str) -> SeatName {
+    SeatName::parse(raw).unwrap()
+}
+
+/// A non-default house profile: a named operator surface, a seat witness,
+/// one permanently excluded pane, and canonical alias folds.
+fn test_house() -> HouseProfile {
+    let fold =
+        |canon: &str, aliases: &[&str]| (seat(canon), aliases.iter().map(|a| seat(a)).collect());
+    HouseProfile {
+        operator_seat: seat("operator"),
+        witness_seat: seat("carol"),
+        excluded_herdr_targets: vec!["w9:p1S".to_owned()],
+        aliases: [
+            fold("carol", &["carol_old", "carol-legacy"]),
+            fold("dave", &["dave_old", "dave-opus-5"]),
+            fold("heidi", &["heidi-old", "heidi-typo", "maya"]),
+            fold("ivan-supervisor", &["ivan", "ivan-sup"]),
+            fold("lucas", &["lucas-rev"]),
+            fold("niaj", &[]),
+        ]
+        .into_iter()
+        .collect(),
+        fixture_id_aliases: Default::default(),
     }
 }
 
@@ -113,15 +141,15 @@ fn claude_endpoint(
 
 fn test_aliases() -> AliasMap {
     AliasMap::from_pairs([
-        ("desk-v1", "tally"),
-        ("desk_old", "tally"),
-        ("cc-desk", "tally"),
-        ("loupe-reviewer", "loupe"),
+        ("desk-v1", "carol"),
+        ("desk_old", "carol"),
+        ("cc-desk", "carol"),
+        ("lucas-rev", "lucas"),
     ])
 }
 
 fn opt_in_interchange_dir() -> Option<PathBuf> {
-    std::env::var_os("REX_WAVE_INTERCHANGE_DIR")
+    std::env::var_os("REX_WAVE_LIVE_INTERCHANGE_TEST_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
@@ -133,7 +161,7 @@ fn sample_candidate(rel_path: &str, seat: &str, body: &[u8], seen_at: UnixMs) ->
         rel_path: rel_path.to_owned(),
         sha256: sha,
         sha16,
-        from: Some("tally".into()),
+        from: Some("carol".into()),
         to: SeatName::parse(seat).unwrap(),
         subject: Some("Test letter".into()),
         letter_id: None,
@@ -193,30 +221,30 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
             seat: SeatName::parse("owner").unwrap(),
         },
     );
-    let crest = LocalClient::new(
+    let eve = LocalClient::new(
         router.clone(),
         Principal::Seat {
-            seat: SeatName::parse("crest").unwrap(),
+            seat: SeatName::parse("eve").unwrap(),
         },
     );
-    let tally = LocalClient::new(
+    let carol = LocalClient::new(
         router.clone(),
         Principal::Seat {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
         },
     );
 
-    // Claim crest with Operator witness provenance on projects, then update role as crest itself.
+    // Claim eve with Operator witness provenance on projects, then update role as eve itself.
     let claimed = owner
         .call(PresenceClaim {
             status: Some(SeatStatus::Active),
             projects: vec!["rex-wave".into()],
-            aliases: vec![SeatName::parse("crest-lead").unwrap()],
+            aliases: vec![SeatName::parse("eve-lead").unwrap()],
             verified_how: Some(VerificationKind::WitnessedBy {
-                seat: SeatName::parse("tally").unwrap(),
+                seat: SeatName::parse("carol").unwrap(),
             }),
-            idem: Some(IdemKey::parse("claim-crest-1").unwrap()),
-            ..empty_claim("crest")
+            idem: Some(IdemKey::parse("claim-eve-1").unwrap()),
+            ..empty_claim("eve")
         })
         .await
         .unwrap();
@@ -226,7 +254,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     assert_eq!(
         claimed.projects[0].provenance.verified_how,
         VerificationKind::WitnessedBy {
-            seat: SeatName::parse("tally").unwrap()
+            seat: SeatName::parse("carol").unwrap()
         }
     );
 
@@ -235,19 +263,19 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
         .call(PresenceClaim {
             status: Some(SeatStatus::Active),
             projects: vec!["rex-wave".into()],
-            aliases: vec![SeatName::parse("crest-lead").unwrap()],
-            idem: Some(IdemKey::parse("claim-crest-1").unwrap()),
-            ..empty_claim("crest")
+            aliases: vec![SeatName::parse("eve-lead").unwrap()],
+            idem: Some(IdemKey::parse("claim-eve-1").unwrap()),
+            ..empty_claim("eve")
         })
         .await
         .unwrap();
     assert_eq!(retried, claimed);
 
-    // Crest updates its own role; existing project provenance stays intact.
-    let updated = crest
+    // Eve updates its own role; existing project provenance stays intact.
+    let updated = eve
         .call(PresenceClaim {
             role: Some("rex-wave-owner".into()),
-            ..empty_claim("crest")
+            ..empty_claim("eve")
         })
         .await
         .unwrap();
@@ -262,16 +290,16 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     assert_eq!(
         updated.projects[0].provenance.verified_how,
         VerificationKind::WitnessedBy {
-            seat: SeatName::parse("tally").unwrap()
+            seat: SeatName::parse("carol").unwrap()
         },
         "untouched attested field retains its original provenance"
     );
 
-    // Tally may not claim crest's seat without explicit replacement.
-    let hijack = tally
+    // Carol may not claim eve's seat without explicit replacement.
+    let hijack = carol
         .call(PresenceClaim {
             role: Some("usurper".into()),
-            ..empty_claim("crest")
+            ..empty_claim("eve")
         })
         .await
         .unwrap_err();
@@ -280,21 +308,21 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
         "got {hijack:?}"
     );
 
-    // Resolve by project works even while crest has zero live bindings.
-    let resolved = tally
+    // Resolve by project works even while eve has zero live bindings.
+    let resolved = carol
         .call(PresenceResolve {
             query: "rex-wave".into(),
             lane: None,
         })
         .await
         .unwrap();
-    assert_eq!(resolved.record.seat.as_str(), "crest");
+    assert_eq!(resolved.record.seat.as_str(), "eve");
     assert!(resolved.live_bindings.is_empty());
 
     // Bind, heartbeat, retire -> auto-unbinds live bindings and rejects new binds.
-    let bound = crest
+    let bound = eve
         .call(PresenceBind {
-            seat: SeatName::parse("crest").unwrap(),
+            seat: SeatName::parse("eve").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: TransportEndpoint::SelfWatcher {
@@ -308,16 +336,16 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
             takeover: false,
             allow_fork: false,
             mail_horizon_at: None,
-            idem: Some(IdemKey::parse("bind-crest-1").unwrap()),
+            idem: Some(IdemKey::parse("bind-eve-1").unwrap()),
         })
         .await
         .unwrap();
     assert_eq!(bound.status, BindingStatus::Live);
     assert_eq!(bound.epoch, 1);
 
-    let hb = crest
+    let hb = eve
         .call(PresenceHeartbeat {
-            seat: SeatName::parse("crest").unwrap(),
+            seat: SeatName::parse("eve").unwrap(),
             incarnation_id: bound.incarnation_id.clone(),
             ttl_ms: Some(60_000),
         })
@@ -327,7 +355,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
 
     let retired = owner
         .call(PresenceSetStatus {
-            seat: SeatName::parse("crest").unwrap(),
+            seat: SeatName::parse("eve").unwrap(),
             status: SeatStatus::Retired,
             verified_how: None,
             reason: Some("project handed off".into()),
@@ -337,12 +365,12 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     assert_eq!(retired.status, SeatStatus::Retired);
     assert!(retired.retired_at.is_some());
 
-    let list_default = tally.call(PresenceList::default()).await.unwrap();
+    let list_default = carol.call(PresenceList::default()).await.unwrap();
     assert!(
         list_default.seats.is_empty(),
         "retired seats are hidden from PresenceList unless include_retired is true"
     );
-    let list_all = tally
+    let list_all = carol
         .call(PresenceList {
             include_retired: true,
             ..PresenceList::default()
@@ -352,9 +380,9 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
     assert_eq!(list_all.seats.len(), 1);
     assert_eq!(list_all.seats[0].bindings[0].status, BindingStatus::Unbound);
 
-    let bind_retired = crest
+    let bind_retired = eve
         .call(PresenceBind {
-            seat: SeatName::parse("crest").unwrap(),
+            seat: SeatName::parse("eve").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
@@ -374,7 +402,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
 }
 
 #[test]
-fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules() {
+fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules() {
     let dir = TempDirGuard::new("claude-sessions");
     let my_pid = std::process::id();
     let my_start = current_process_start().expect("ps reports current process UTC lstart");
@@ -382,17 +410,17 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     assert!(!is_process_alive(my_pid, "Thu Jan  1 00:00:00 1970"));
     assert!(!is_process_alive(999_999_999, &my_start));
 
-    // Background desk seat (`kind: "bg"`, like Tally's 8195.json) MUST be allowed.
+    // Background desk seat (`kind: "bg"`, like Carol's 8195.json) MUST be allowed.
     let bg_json = serde_json::json!({
         "pid": my_pid,
         "procStart": my_start,
         "startedAt": 1_794_550_979_000u64,
-        "sessionId": "59e9053e-bbdd-4181-bf4f-3f7bf864d276",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
         "messagingSocketPath": format!("/tmp/cc-socks/{my_pid}.sock"),
         "kind": "bg",
-        "name": "Tally-5.2",
+        "name": "Carol-5.2",
         "nameSource": "user",
-        "formerNames": ["Tally-VampOTP-CTO"]
+        "formerNames": ["Carol-legacy"]
     });
     fs::write(
         dir.path().join(format!("{my_pid}.json")),
@@ -401,10 +429,10 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     .unwrap();
     let loaded = load_claude_session_file_from(dir.path(), my_pid).unwrap();
     assert_eq!(loaded.kind, "bg");
-    assert_eq!(loaded.former_names, vec!["Tally-VampOTP-CTO"]);
+    assert_eq!(loaded.former_names, vec!["Carol-legacy"]);
     assert!(!loaded.is_derived_name());
     let bind_cmd = loaded
-        .into_bind_command(SeatName::parse("tally").unwrap(), None, None, false, false)
+        .into_bind_command(SeatName::parse("carol").unwrap(), None, None, false, false)
         .expect("kind='bg' is allowed to bind");
     assert!(matches!(
         bind_cmd.endpoint,
@@ -419,7 +447,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             "sessionId": "sub-1",
             "messagingSocketPath": "/tmp/cc-socks/sub.sock",
             "kind": "subagent",
-            "name": "tally-8c",
+            "name": "carol-8c",
             "nameSource": "derived"
         })
         .to_string(),
@@ -441,9 +469,9 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             "pid": my_pid,
             "procStart": my_start,
             "sessionId": "sess-derived",
-            "messagingSocketPath": "/tmp/cc-socks/85820.sock",
+            "messagingSocketPath": "/tmp/cc-socks/41001.sock",
             "kind": "interactive",
-            "name": "users-f0",
+            "name": "sess-f0",
             "nameSource": "derived"
         })
         .to_string(),
@@ -460,7 +488,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
             "sessionId": "fork-1",
             "messagingSocketPath": "/tmp/cc-socks/10576.sock",
             "kind": "interactive",
-            "name": "Tally-VampOTP-CTO ⑂",
+            "name": "Carol-legacy ⑂",
             "nameSource": "user"
         })
         .to_string(),
@@ -476,8 +504,8 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     // Real process identity test: /clear refresh vs --resume dead-pid auto-supersede vs live duplicate.
     let mut state = PresenceState::default();
     let mut seq = 0u64;
-    let tally_p = Principal::Seat {
-        seat: SeatName::parse("tally").unwrap(),
+    let carol_p = Principal::Seat {
+        seat: SeatName::parse("carol").unwrap(),
     };
 
     // 1) Spawn a short-lived child process, bind it, then let it exit (`--resume` test).
@@ -489,10 +517,10 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     let first_reply = apply_presence_with_probe(
         &mut state,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(1_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: claude_endpoint(
@@ -501,7 +529,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
                 "sess-old-1",
                 "bg",
                 Some("user"),
-                Some("Tally-5.2"),
+                Some("Carol-5.2"),
             ),
             liveness: LivenessMode::ProcessAndLease,
             ttl_ms: Some(600_000),
@@ -522,10 +550,10 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     let clear_reply = apply_presence_with_probe(
         &mut state,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(2_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: claude_endpoint(
@@ -534,7 +562,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
                 "sess-after-clear-2",
                 "bg",
                 Some("user"),
-                Some("Tally-5.2"),
+                Some("Carol-5.2"),
             ),
             liveness: LivenessMode::ProcessAndLease,
             ttl_ms: Some(600_000),
@@ -560,10 +588,10 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     let dup_err = apply_presence_with_probe(
         &mut state,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(3_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: claude_endpoint(
@@ -572,7 +600,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
                 "sess-other-live",
                 "interactive",
                 Some("user"),
-                Some("Tally-5.2"),
+                Some("Carol-5.2"),
             ),
             liveness: LivenessMode::ProcessAndLease,
             ttl_ms: Some(600_000),
@@ -589,7 +617,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
         ApiError::Conflict {
             data: Some(ConflictData::DuplicateLiveSession { ref seat, ref active }),
             ..
-        } if seat.as_str() == "tally" && active == &b1.incarnation_id
+        } if seat.as_str() == "carol" && active == &b1.incarnation_id
     ));
 
     // 4) Kill the old child process -> dead `(pid, proc_start)` auto-supersedes WITHOUT takeover (`--resume`)!
@@ -600,10 +628,10 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     let resume_reply = apply_presence_with_probe(
         &mut state,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(4_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: claude_endpoint(
@@ -612,7 +640,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
                 "sess-after-clear-2",
                 "bg",
                 Some("user"),
-                Some("Tally-5.2"),
+                Some("Carol-5.2"),
             ),
             liveness: LivenessMode::ProcessAndLease,
             ttl_ms: Some(600_000),
@@ -637,10 +665,10 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
     let takeover_reply = apply_presence_with_probe(
         &mut state,
         &mut seq,
-        tally_p,
+        carol_p,
         UnixMs(5_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: claude_endpoint(
@@ -649,7 +677,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
                 "sess-takeover",
                 "interactive",
                 Some("user"),
-                Some("Tally-5.2"),
+                Some("Carol-5.2"),
             ),
             liveness: LivenessMode::ProcessAndLease,
             ttl_ms: Some(600_000),
@@ -667,9 +695,9 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_tally_rules()
         panic!("expected PresenceBind reply");
     };
     assert_eq!(b_takeover.epoch, 3);
-    let tally_bindings = state.bindings_for(&SeatName::parse("tally").unwrap());
+    let carol_bindings = state.bindings_for(&SeatName::parse("carol").unwrap());
     assert_eq!(
-        tally_bindings
+        carol_bindings
             .iter()
             .filter(|b| b.status == BindingStatus::Live)
             .count(),
@@ -693,35 +721,30 @@ fn gate1_all_10_mail_routing_cases_verified() {
         );
     }
 
-    // When running on the estate Mac where Tally's fixture file exists, verify our
-    // 10-case matrix covers 100% of the case IDs in `cases.jsonl`.
+    // When running with an opt-in live interchange directory, verify our 10-case
+    // matrix covers 100% of `cases.jsonl` after applying any configured
+    // `HouseProfile::fixture_id_aliases`.
     if let Some(root) = opt_in_interchange_dir() {
         let fixture_path = root.join("fixtures/mail-routing/cases.jsonl");
         if fixture_path.is_file() {
             let raw = fs::read_to_string(fixture_path).unwrap();
-            let disk_ids: BTreeSet<String> = raw
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    let v: serde_json::Value = serde_json::from_str(l).unwrap();
-                    v["id"].as_str().unwrap().to_owned()
-                })
-                .collect();
-            let expected_owned: BTreeSet<String> =
-                expected_ids.iter().map(|s| (*s).to_owned()).collect();
+            let house = rex_wave_mailbridge::load_house_profile().unwrap();
+            let report =
+                rex_wave_mailbridge::check_gate1_fixtures_with_profile(&raw, &house).unwrap();
             assert!(
-                expected_owned.is_subset(&disk_ids),
-                "expected Gate 1 case IDs missing from cases.jsonl: {:?}",
-                expected_owned.difference(&disk_ids).collect::<Vec<_>>()
+                report.fixture_ids_registered(),
+                "expected Gate 1 case IDs to match cases.jsonl (missing={:?}, unknown={:?})",
+                report.missing_case_ids,
+                report.unknown_case_ids
             );
         }
     }
 }
 
-// Case 1: `genga-stale-six-days`
+// Case 1: `seat-stale-six-days`
 // Dead process expires -> RaiseUnrung + synchronous sender notice with exact timestamp.
 #[test]
-fn gate1_case_01_genga_stale_six_days() {
+fn gate1_case_01_seat_stale_six_days() {
     let sys_p = Principal::System {
         part: SystemPart::PresenceMonitor,
     };
@@ -733,17 +756,15 @@ fn gate1_case_01_genga_stale_six_days() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let genga = SeatName::parse("genga").unwrap();
+        let dave = SeatName::parse("dave").unwrap();
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            Principal::Seat {
-                seat: genga.clone(),
-            },
+            Principal::Seat { seat: dave.clone() },
             UnixMs(1_700_000_000_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: genga.clone(),
-                incarnation_id: Some(IncarnationId::parse("inc-genga-dead").unwrap()),
+                seat: dave.clone(),
+                incarnation_id: Some(IncarnationId::parse("inc-dave-dead").unwrap()),
                 lane: None,
                 endpoint: claude_endpoint(
                     4242,
@@ -751,7 +772,7 @@ fn gate1_case_01_genga_stale_six_days() {
                     "dead-sess",
                     "interactive",
                     Some("user"),
-                    Some("Genga-Opus-5.5"),
+                    Some("Dave-Opus-5.5"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -777,9 +798,9 @@ fn gate1_case_01_genga_stale_six_days() {
         .unwrap();
 
         let letter = sample_candidate(
-            "mail/tally-to-genga.md",
-            "genga",
-            b"---\nto: genga\n---\nhello",
+            "mail/carol-to-dave.md",
+            "dave",
+            b"---\nto: dave\n---\nhello",
             UnixMs(1_700_000_020_000),
         );
         let decision = decide_mail_ring(
@@ -799,22 +820,22 @@ fn gate1_case_01_genga_stale_six_days() {
                 referents,
                 ..
             } => {
-                assert_eq!(seat, genga);
+                assert_eq!(seat, dave);
                 assert_eq!(referents.len(), 1);
                 assert_eq!(
                     sender_notice,
-                    "banked; no live binding for genga since 2023-11-14T22:13:20Z; will ring on rebind"
+                    "banked; no live binding for dave since 2023-11-14T22:13:20Z; will ring on rebind"
                 );
             }
-            other => panic!("expected RaiseUnrung for genga-stale-six-days, got {other:?}"),
+            other => panic!("expected RaiseUnrung for seat-stale-six-days, got {other:?}"),
         }
     }
 }
 
-// Case 2: `carbon-crest-misroute`
+// Case 2: `carbon-copy-misroute`
 // Durable SeatRecord answers project/role queries offline; ambiguous query fails with Conflict listing all candidates.
 #[test]
-fn gate1_case_02_carbon_crest_misroute() {
+fn gate1_case_02_carbon_copy_misroute() {
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
@@ -827,7 +848,7 @@ fn gate1_case_02_carbon_crest_misroute() {
             owner_p.clone(),
             UnixMs(1_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
-                seat: SeatName::parse("crest").unwrap(),
+                seat: SeatName::parse("eve").unwrap(),
                 status: Some(SeatStatus::Active),
                 role: Some("lead".into()),
                 projects: vec!["rex-wave".into(), "shared-infra".into()],
@@ -883,7 +904,7 @@ fn gate1_case_02_carbon_crest_misroute() {
                 UnixMs(2_000),
             )
             .unwrap();
-        assert_eq!(unique.record.seat.as_str(), "crest");
+        assert_eq!(unique.record.seat.as_str(), "eve");
 
         let ambig_project = st
             .resolve_at(
@@ -897,7 +918,7 @@ fn gate1_case_02_carbon_crest_misroute() {
         match ambig_project {
             ApiError::Conflict { detail, .. } => {
                 assert!(
-                    detail.contains("carbon") && detail.contains("crest"),
+                    detail.contains("carbon") && detail.contains("eve"),
                     "{detail}"
                 );
             }
@@ -980,8 +1001,8 @@ fn gate1_case_04_dry_run_marks_seen() {
         let dir = TempDirGuard::new("dry-run");
         fs::create_dir_all(dir.path().join("mail")).unwrap();
         fs::create_dir_all(dir.path().join("state")).unwrap();
-        let letter_path = dir.path().join("mail/1795-tally-to-genga.md");
-        let letter_bytes = b"---\nfrom: tally\nto: genga\nsubject: check\n---\nbody\n";
+        let letter_path = dir.path().join("mail/1795-carol-to-dave.md");
+        let letter_bytes = b"---\nfrom: carol\nto: dave\nsubject: check\n---\nbody\n";
         fs::write(&letter_path, letter_bytes).unwrap();
         let acks_path = dir.path().join("state/acks.jsonl");
         fs::write(&acks_path, b"").unwrap();
@@ -1001,7 +1022,7 @@ fn gate1_case_04_dry_run_marks_seen() {
         .unwrap();
         assert_eq!(report.letters_scanned, 1);
         assert!(report.decisions.iter().any(
-            |d| matches!(d, RingDecision::RaiseUnrung { seat, .. } if seat.as_str() == "genga")
+            |d| matches!(d, RingDecision::RaiseUnrung { seat, .. } if seat.as_str() == "dave")
         ));
         assert_eq!(fs::read(&acks_path).unwrap(), acks_before);
         let state_entries: Vec<_> = fs::read_dir(dir.path().join("state"))
@@ -1028,26 +1049,26 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let tally = SeatName::parse("tally").unwrap();
-        let fathom = SeatName::parse("fathom").unwrap();
+        let carol = SeatName::parse("carol").unwrap();
+        let frank = SeatName::parse("frank").unwrap();
         apply_presence_with_probe(
             &mut st,
             &mut seq,
             Principal::Seat {
-                seat: tally.clone(),
+                seat: carol.clone(),
             },
             UnixMs(1_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: tally.clone(),
+                seat: carol.clone(),
                 incarnation_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
                     8195,
                     "Thu Nov 12 06:22:59 2026",
-                    "59e9053e",
+                    "sess_demo_01",
                     "bg",
                     Some("user"),
-                    Some("Tally-5.2"),
+                    Some("Carol-5.2"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -1063,15 +1084,15 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
             &mut st,
             &mut seq,
             Principal::Seat {
-                seat: fathom.clone(),
+                seat: frank.clone(),
             },
             UnixMs(1_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: fathom.clone(),
+                seat: frank.clone(),
                 incarnation_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::BbThread {
-                    thread_id: BbThreadId::parse("th_fathom_1").unwrap(),
+                    thread_id: BbThreadId::parse("th_frank_1").unwrap(),
                 },
                 liveness: LivenessMode::SocketLifetime,
                 ttl_ms: None,
@@ -1084,8 +1105,8 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
         )
         .unwrap();
 
-        let d_tally = decide_mail_ring(
-            &sample_candidate("mail/a.md", "tally", b"hi tally", UnixMs(1_500)),
+        let d_carol = decide_mail_ring(
+            &sample_candidate("mail/a.md", "carol", b"hi carol", UnixMs(1_500)),
             &empty_acks,
             &st,
             &empty_affinity,
@@ -1095,15 +1116,15 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
             UnixMs(1_500),
         );
         assert!(matches!(
-            d_tally,
+            d_carol,
             RingDecision::Ring {
                 channel: RingDeliveryChannel::ClaudeMessagingSocket { pid: 8195, .. },
                 ..
             }
         ));
 
-        let d_fathom = decide_mail_ring(
-            &sample_candidate("mail/b.md", "fathom", b"hi fathom", UnixMs(1_500)),
+        let d_frank = decide_mail_ring(
+            &sample_candidate("mail/b.md", "frank", b"hi frank", UnixMs(1_500)),
             &empty_acks,
             &st,
             &empty_affinity,
@@ -1113,7 +1134,7 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
             UnixMs(1_500),
         );
         assert!(matches!(
-            d_fathom,
+            d_frank,
             RingDecision::Ring {
                 channel: RingDeliveryChannel::BbQueueIfActive { .. },
                 ..
@@ -1132,9 +1153,9 @@ fn gate1_case_06_a_transport_dies() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let quire = SeatName::parse("quire").unwrap();
-        let tangle = SeatName::parse("tangle").unwrap();
-        for (seat, tid) in [(&quire, "th_quire"), (&tangle, "th_tangle")] {
+        let quinn = SeatName::parse("quinn").unwrap();
+        let trent = SeatName::parse("trent").unwrap();
+        for (seat, tid) in [(&quinn, "th_quinn"), (&trent, "th_trent")] {
             apply_presence_with_probe(
                 &mut st,
                 &mut seq,
@@ -1173,21 +1194,18 @@ fn gate1_case_06_a_transport_dies() {
             |_, _| true,
         )
         .unwrap();
-        assert!(st.live_bindings_for(&quire, None, UnixMs(2_000)).is_empty());
-        assert!(
-            st.live_bindings_for(&tangle, None, UnixMs(2_000))
-                .is_empty()
-        );
+        assert!(st.live_bindings_for(&quinn, None, UnixMs(2_000)).is_empty());
+        assert!(st.live_bindings_for(&trent, None, UnixMs(2_000)).is_empty());
         assert_eq!(
-            st.bindings_for(&quire)[0].status,
+            st.bindings_for(&quinn)[0].status,
             BindingStatus::TransportDown
         );
         assert_eq!(
-            st.bindings_for(&tangle)[0].status,
+            st.bindings_for(&trent)[0].status,
             BindingStatus::TransportDown
         );
 
-        // Recovery restores both; then expiring ONLY quire leaves tangle live.
+        // Recovery restores both; then expiring ONLY quinn leaves trent live.
         apply_presence_with_probe(
             &mut st,
             &mut seq,
@@ -1201,8 +1219,8 @@ fn gate1_case_06_a_transport_dies() {
             |_, _| true,
         )
         .unwrap();
-        assert_eq!(st.live_bindings_for(&quire, None, UnixMs(3_000)).len(), 1);
-        assert_eq!(st.live_bindings_for(&tangle, None, UnixMs(3_000)).len(), 1);
+        assert_eq!(st.live_bindings_for(&quinn, None, UnixMs(3_000)).len(), 1);
+        assert_eq!(st.live_bindings_for(&trent, None, UnixMs(3_000)).len(), 1);
 
         apply_presence_with_probe(
             &mut st,
@@ -1210,16 +1228,16 @@ fn gate1_case_06_a_transport_dies() {
             sys_p.clone(),
             UnixMs(4_000),
             PresenceCommand::PresenceExpire(PresenceExpire {
-                seat: quire.clone(),
-                incarnation_id: IncarnationId::parse("inc-quire").unwrap(),
+                seat: quinn.clone(),
+                incarnation_id: IncarnationId::parse("inc-quinn").unwrap(),
                 reason: "single thread EOF".into(),
             }),
             |_, _| true,
         )
         .unwrap();
-        assert!(st.live_bindings_for(&quire, None, UnixMs(4_000)).is_empty());
+        assert!(st.live_bindings_for(&quinn, None, UnixMs(4_000)).is_empty());
         assert_eq!(
-            st.live_bindings_for(&tangle, None, UnixMs(4_000)).len(),
+            st.live_bindings_for(&trent, None, UnixMs(4_000)).len(),
             1,
             "per-binding expiry must not affect sibling bindings on the same transport"
         );
@@ -1237,17 +1255,17 @@ fn gate1_case_07_two_seats_one_name() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let plumb = SeatName::parse("plumb").unwrap();
-        let plumb_p = Principal::Seat {
-            seat: plumb.clone(),
+        let peggy = SeatName::parse("peggy").unwrap();
+        let peggy_p = Principal::Seat {
+            seat: peggy.clone(),
         };
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            plumb_p.clone(),
+            peggy_p.clone(),
             UnixMs(1_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
-                seat: plumb.clone(),
+                seat: peggy.clone(),
                 status: Some(SeatStatus::Active),
                 role: Some("audio".into()),
                 projects: Vec::new(),
@@ -1270,15 +1288,15 @@ fn gate1_case_07_two_seats_one_name() {
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            plumb_p,
+            peggy_p,
             UnixMs(1_500),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: plumb.clone(),
+                seat: peggy.clone(),
                 incarnation_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::UdsSession {
                     conn_id: 77,
-                    client: "plumb-cli".into(),
+                    client: "peggy-cli".into(),
                 },
                 liveness: LivenessMode::SocketLifetime,
                 ttl_ms: None,
@@ -1292,7 +1310,7 @@ fn gate1_case_07_two_seats_one_name() {
         .unwrap();
 
         let newcomer = Principal::Seat {
-            seat: SeatName::parse("fathom").unwrap(),
+            seat: SeatName::parse("frank").unwrap(),
         };
         let worker = Principal::Worker {
             wave: WaveSlug::parse("w1").unwrap(),
@@ -1305,7 +1323,7 @@ fn gate1_case_07_two_seats_one_name() {
             newcomer.clone(),
             UnixMs(2_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
-                seat: plumb.clone(),
+                seat: peggy.clone(),
                 status: None,
                 role: Some("emacs".into()),
                 projects: Vec::new(),
@@ -1335,7 +1353,7 @@ fn gate1_case_07_two_seats_one_name() {
                 unauthorized.clone(),
                 UnixMs(2_500),
                 PresenceCommand::PresenceClaim(PresenceClaim {
-                    seat: plumb.clone(),
+                    seat: peggy.clone(),
                     status: Some(SeatStatus::Active),
                     role: Some("hijack".into()),
                     projects: Vec::new(),
@@ -1349,7 +1367,7 @@ fn gate1_case_07_two_seats_one_name() {
                     resume_cmd: None,
                     rex_target: None,
                     verified_how: None,
-                    replace: Some(plumb.clone()),
+                    replace: Some(peggy.clone()),
                     idem: None,
                 }),
                 |_, _| true,
@@ -1366,7 +1384,7 @@ fn gate1_case_07_two_seats_one_name() {
                 unauthorized.clone(),
                 UnixMs(2_600),
                 PresenceCommand::PresenceClaim(PresenceClaim {
-                    seat: SeatName::parse("fathom").unwrap(),
+                    seat: SeatName::parse("frank").unwrap(),
                     status: Some(SeatStatus::Active),
                     role: Some("emacs".into()),
                     projects: Vec::new(),
@@ -1380,7 +1398,7 @@ fn gate1_case_07_two_seats_one_name() {
                     resume_cmd: None,
                     rex_target: None,
                     verified_how: None,
-                    replace: Some(plumb.clone()),
+                    replace: Some(peggy.clone()),
                     idem: None,
                 }),
                 |_, _| true,
@@ -1391,8 +1409,8 @@ fn gate1_case_07_two_seats_one_name() {
                 "expected Denied for replace=other by {unauthorized}, got {replace_other:?}"
             );
         }
-        assert_eq!(st.seat(&plumb).unwrap().status, SeatStatus::Active);
-        assert_eq!(st.live_bindings_for(&plumb, None, UnixMs(2_700)).len(), 1);
+        assert_eq!(st.seat(&peggy).unwrap().status, SeatStatus::Active);
+        assert_eq!(st.live_bindings_for(&peggy, None, UnixMs(2_700)).len(), 1);
 
         // Authorized operator replacement retires the replaced seat and unbinds its live sessions.
         apply_presence_with_probe(
@@ -1401,7 +1419,7 @@ fn gate1_case_07_two_seats_one_name() {
             owner_p.clone(),
             UnixMs(3_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
-                seat: SeatName::parse("fathom").unwrap(),
+                seat: SeatName::parse("frank").unwrap(),
                 status: Some(SeatStatus::Active),
                 role: Some("emacs".into()),
                 projects: Vec::new(),
@@ -1415,16 +1433,16 @@ fn gate1_case_07_two_seats_one_name() {
                 resume_cmd: None,
                 rex_target: None,
                 verified_how: None,
-                replace: Some(plumb.clone()),
+                replace: Some(peggy.clone()),
                 idem: None,
             }),
             |_, _| true,
         )
         .unwrap();
-        assert_eq!(st.seat(&plumb).unwrap().status, SeatStatus::Retired);
-        assert!(st.live_bindings_for(&plumb, None, UnixMs(3_000)).is_empty());
+        assert_eq!(st.seat(&peggy).unwrap().status, SeatStatus::Retired);
+        assert!(st.live_bindings_for(&peggy, None, UnixMs(3_000)).is_empty());
         assert_eq!(
-            st.seat(&SeatName::parse("fathom").unwrap()).unwrap().status,
+            st.seat(&SeatName::parse("frank").unwrap()).unwrap().status,
             SeatStatus::Active
         );
     }
@@ -1437,26 +1455,24 @@ fn gate1_case_08_session_names_drift() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let genga = SeatName::parse("genga").unwrap();
-        let gp = Principal::Seat {
-            seat: genga.clone(),
-        };
+        let dave = SeatName::parse("dave").unwrap();
+        let gp = Principal::Seat { seat: dave.clone() };
         apply_presence_with_probe(
             &mut st,
             &mut seq,
             gp.clone(),
             UnixMs(1_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: genga.clone(),
-                incarnation_id: Some(IncarnationId::parse("inc-genga-main").unwrap()),
+                seat: dave.clone(),
+                incarnation_id: Some(IncarnationId::parse("inc-dave-main").unwrap()),
                 lane: None,
                 endpoint: claude_endpoint(
-                    85820,
+                    41001,
                     "Thu Nov 19 05:52:37 2026",
-                    "044c8872",
+                    "sess_demo_02",
                     "interactive",
                     Some("derived"),
-                    Some("users-c7"),
+                    Some("sess-c7"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -1468,23 +1484,23 @@ fn gate1_case_08_session_names_drift() {
             |_, _| true,
         )
         .unwrap();
-        // Display name drifts `users-c7` -> `users-f0` on the same `(pid, proc_start)`: refreshes seamlessly.
+        // Display name drifts `sess-c7` -> `sess-f0` on the same `(pid, proc_start)`: refreshes seamlessly.
         apply_presence_with_probe(
             &mut st,
             &mut seq,
             gp.clone(),
             UnixMs(2_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: genga.clone(),
+                seat: dave.clone(),
                 incarnation_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
-                    85820,
+                    41001,
                     "Thu Nov 19 05:52:37 2026",
-                    "044c8872",
+                    "sess_demo_02",
                     "interactive",
                     Some("derived"),
-                    Some("users-f0"),
+                    Some("sess-f0"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -1496,23 +1512,23 @@ fn gate1_case_08_session_names_drift() {
             |_, _| true,
         )
         .unwrap();
-        // Second live lane (`genga-2d`) bound on explicit lane `"2d"`.
+        // Second live lane (`dave-2d`) bound on explicit lane `"2d"`.
         apply_presence_with_probe(
             &mut st,
             &mut seq,
             gp,
             UnixMs(2_500),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: genga.clone(),
-                incarnation_id: Some(IncarnationId::parse("inc-genga-2d").unwrap()),
+                seat: dave.clone(),
+                incarnation_id: Some(IncarnationId::parse("inc-dave-2d").unwrap()),
                 lane: Some("2d".into()),
                 endpoint: claude_endpoint(
-                    18604,
+                    41002,
                     "Thu Nov 19 06:00:00 2026",
                     "2d-sess",
                     "interactive",
                     Some("user"),
-                    Some("Genga-2D"),
+                    Some("Dave-2D"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -1528,23 +1544,23 @@ fn gate1_case_08_session_names_drift() {
         let mut affinity = IncarnationAffinity::new();
         affinity.record_authored(
             "letter-2d-root",
-            genga.clone(),
-            IncarnationId::parse("inc-genga-2d").unwrap(),
+            dave.clone(),
+            IncarnationId::parse("inc-dave-2d").unwrap(),
         );
         let picked_reply = select_binding_for_delivery(
             &st,
-            &genga,
+            &dave,
             None,
             Some("letter-2d-root"),
             &affinity,
             UnixMs(3_000),
         )
         .unwrap();
-        assert_eq!(picked_reply.incarnation_id.as_str(), "inc-genga-2d");
+        assert_eq!(picked_reply.incarnation_id.as_str(), "inc-dave-2d");
 
         let picked_default =
-            select_binding_for_delivery(&st, &genga, None, None, &affinity, UnixMs(3_000)).unwrap();
-        assert_eq!(picked_default.incarnation_id.as_str(), "inc-genga-main");
+            select_binding_for_delivery(&st, &dave, None, None, &affinity, UnixMs(3_000)).unwrap();
+        assert_eq!(picked_default.incarnation_id.as_str(), "inc-dave-main");
     }
 }
 
@@ -1555,17 +1571,17 @@ fn gate1_case_09_own_watcher_liveness() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let baton = SeatName::parse("baton").unwrap();
+        let blake = SeatName::parse("blake").unwrap();
         apply_presence_with_probe(
             &mut st,
             &mut seq,
             Principal::Seat {
-                seat: baton.clone(),
+                seat: blake.clone(),
             },
             UnixMs(10_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: baton.clone(),
-                incarnation_id: Some(IncarnationId::parse("inc-baton-lease").unwrap()),
+                seat: blake.clone(),
+                incarnation_id: Some(IncarnationId::parse("inc-blake-lease").unwrap()),
                 lane: None,
                 endpoint: TransportEndpoint::SelfWatcher {
                     harness: "codex-cron".into(),
@@ -1584,11 +1600,11 @@ fn gate1_case_09_own_watcher_liveness() {
         )
         .unwrap();
         assert!(matches!(
-            format_delivery_status(&st, &baton, UnixMs(500_000)),
+            format_delivery_status(&st, &blake, UnixMs(500_000)),
             DeliveryStatus::Live { .. }
         ));
         assert!(matches!(
-            format_delivery_status(&st, &baton, UnixMs(910_000)),
+            format_delivery_status(&st, &blake, UnixMs(910_000)),
             DeliveryStatus::Offline { .. }
         ));
     }
@@ -1642,17 +1658,17 @@ fn gate1_case_10_bank_before_ring() {
             let posted = owner
                 .call(RoomPost::new(
                     room_ref,
-                    Body::parse("Bank this letter even when genga is offline.").unwrap(),
+                    Body::parse("Bank this letter even when dave is offline.").unwrap(),
                 ))
                 .await
                 .unwrap();
 
-            // `genga` has NO presence binding, yet `MailPromote` banks the file durably first.
+            // `dave` has NO presence binding, yet `MailPromote` banks the file durably first.
             let letter = owner
                 .call(MailPromote {
                     room: posted.room,
                     range: SeqRange::new(posted.seq, posted.seq).unwrap(),
-                    to: vec![SeatName::parse("genga").unwrap()],
+                    to: vec![SeatName::parse("dave").unwrap()],
                     subject: "Offline delivery".into(),
                     topic: "offline-bank".into(),
                     priority: LetterPriority::Normal,
@@ -1696,24 +1712,24 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
         ),
         // 4. file + sha256_full + sha256 short
         format!(
-            r#"{{"ts":"2026-09-17T09:13:46+00:00","file":"interchange/to-loupe/d.md","sha256":"{}","sha256_full":"{}","by":"Loupe-Reviewer"}}"#,
+            r#"{{"ts":"2026-09-17T09:13:46+00:00","file":"interchange/to-lucas/d.md","sha256":"{}","sha256_full":"{}","by":"Lucas-rev"}}"#,
             &sha_d.as_str()[..16],
             sha_d.as_str()
         ),
         // 5. letters array of objects with seat
         format!(
-            r#"{{"ts":"2026-10-31T01:50:00-05:00","kind":"ack","seat":"tally","letters":[{{"file":"interchange/mail/mut.md","sha256_16":"{}"}}]}}"#,
+            r#"{{"ts":"2026-10-31T01:50:00-05:00","kind":"ack","seat":"carol","letters":[{{"file":"interchange/mail/mut.md","sha256_16":"{}"}}]}}"#,
             &sha_mut_old.as_str()[..16]
         ),
         // 6. letters array of strings (path-only historical row)
-        r#"{"ts":"2026-10-29T04:57:03+0000","seat":"tally","letters":["interchange/mail/old1.md","interchange/mail/old2.md"],"ack":"cc-read"}"#.to_owned(),
+        r#"{"ts":"2026-10-29T04:57:03+0000","seat":"carol","letters":["interchange/mail/old1.md","interchange/mail/old2.md"],"ack":"cc-read"}"#.to_owned(),
         // 7. items batch array
-        r#"{"ts":"2026-10-31T08:05:00-05:00","kind":"ack-batch","seat":"tally","items":[{"letter":"reconcile.md","read":"done"}]}"#.to_owned(),
+        r#"{"ts":"2026-10-31T08:05:00-05:00","kind":"ack-batch","seat":"carol","items":[{"letter":"reconcile.md","read":"done"}]}"#.to_owned(),
         // 8. non-ACK owner-ruling row (counted cleanly, not skipped as broken)
         r#"{"ts":"2026-10-30T11:06:00-05:00","kind":"owner-ruling","topic":"backups-over-everything","verbatim":"keep it clean"}"#.to_owned(),
         // 9. legacy sandbox schema (path + seat + sha256_full)
         format!(
-            r#"{{"schema":1,"seat":"loupe","path":"to-loupe/mut.md","sha256_full":"{}"}}"#,
+            r#"{{"schema":1,"seat":"lucas","path":"to-lucas/mut.md","sha256_full":"{}"}}"#,
             sha_mut_old.as_str()
         ),
         // 10. Non-JSON plain-text checksum line
@@ -1725,24 +1741,24 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     assert_eq!(report.skipped_lines[0].line_number, 10);
     assert_eq!(report.non_ack_rows, 1);
     let idx = report.index();
-    assert!(idx.is_acked_by_digest("tally", &sha_a, &aliases));
-    assert!(idx.is_acked_by_digest("tally", &sha_b, &aliases));
-    assert!(idx.is_acked_by_digest("tally", &sha_c, &aliases));
-    assert!(idx.is_acked_by_digest("loupe", &sha_d, &aliases));
-    assert!(!idx.is_acked_by_digest("genga", &sha_a, &aliases));
+    assert!(idx.is_acked_by_digest("carol", &sha_a, &aliases));
+    assert!(idx.is_acked_by_digest("carol", &sha_b, &aliases));
+    assert!(idx.is_acked_by_digest("carol", &sha_c, &aliases));
+    assert!(idx.is_acked_by_digest("lucas", &sha_d, &aliases));
+    assert!(!idx.is_acked_by_digest("dave", &sha_a, &aliases));
 
     // Also verify `project()` in lib.rs uses the tolerant `ack_row_matches` without hardcoded aliases.
     let sb_dir = TempDirGuard::new("sandbox-acks-compat");
     fs::write(sb_dir.path().join(".rex-wave-sandbox"), b"ok\n").unwrap();
-    fs::create_dir_all(sb_dir.path().join("to-tally")).unwrap();
+    fs::create_dir_all(sb_dir.path().join("to-carol")).unwrap();
     fs::create_dir_all(sb_dir.path().join("state")).unwrap();
-    let sb_letter = b"---\nfrom: genga\nto: tally\nsubject: Compat\n---\nbody\n";
+    let sb_letter = b"---\nfrom: dave\nto: carol\nsubject: Compat\n---\nbody\n";
     let sb_sha = sha256_of(sb_letter);
-    let sb_letter_path = sb_dir.path().join("to-tally/compat-r1.md");
+    let sb_letter_path = sb_dir.path().join("to-carol/compat-r1.md");
     fs::write(&sb_letter_path, sb_letter).unwrap();
-    // Write a historical-format ACK row (`acked_by: @Tally`, `letter: interchange/to-tally/compat-r1.md`, 16-hex `sha16`) plus a non-JSON line.
+    // Write a historical-format ACK row (`acked_by: @Carol`, `letter: interchange/to-carol/compat-r1.md`, 16-hex `sha16`) plus a non-JSON line.
     mixed_lines.push(format!(
-        r#"{{"ts":"2026-11-21T06:00:00Z","acked_by":"@Tally","letter":"interchange/to-tally/compat-r1.md","sha16":"{}"}}"#,
+        r#"{{"ts":"2026-11-21T06:00:00Z","acked_by":"@Carol","letter":"interchange/to-carol/compat-r1.md","sha16":"{}"}}"#,
         &sb_sha.as_str()[..16]
     ));
     fs::write(
@@ -1753,7 +1769,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     let sandbox = SandboxRoot::verify_with(sb_dir.path(), &Protection::default()).unwrap();
     let item = project(
         &sandbox,
-        &sandbox.path().join("to-tally/compat-r1.md"),
+        &sandbox.path().join("to-carol/compat-r1.md"),
         sb_letter,
     )
     .unwrap();
@@ -1762,10 +1778,10 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
         "sandbox project() must recognize historical acks.jsonl schemas and ignore non-JSON lines"
     );
 
-    // Prepare live bindings for `loupe` and `tally` for frictions 2..6.
+    // Prepare live bindings for `lucas` and `carol` for frictions 2..6.
     let mut st = PresenceState::default();
     let mut seq = 0;
-    for (seat, conn_id) in [("loupe", 11u64), ("tally", 12u64)] {
+    for (seat, conn_id) in [("lucas", 11u64), ("carol", 12u64)] {
         let s = SeatName::parse(seat).unwrap();
         apply_presence_with_probe(
             &mut st,
@@ -1792,16 +1808,16 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
         .unwrap();
     }
 
-    // Friction 2: `(seat, sha256)` dedupe across `mail/` and `to-loupe/` copies (acked AND unacked).
-    let copy_mail = sample_candidate("mail/dup-r1.md", "loupe", b"same-content", UnixMs(2_000));
+    // Friction 2: `(seat, sha256)` dedupe across `mail/` and `to-lucas/` copies (acked AND unacked).
+    let copy_mail = sample_candidate("mail/dup-r1.md", "lucas", b"same-content", UnixMs(2_000));
     let copy_box = sample_candidate(
-        "to-loupe/dup-r1.md",
-        "loupe",
+        "to-lucas/dup-r1.md",
+        "lucas",
         b"same-content",
         UnixMs(2_000),
     );
     let decisions_unacked = decide_mail_rings_for_seat(
-        &SeatName::parse("loupe").unwrap(),
+        &SeatName::parse("lucas").unwrap(),
         &[copy_mail, copy_box],
         &idx,
         &st,
@@ -1818,7 +1834,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     );
     assert!(matches!(decisions_unacked[0], RingDecision::Ring { .. }));
 
-    let acked_copy = sample_candidate("mail/d.md", "loupe", b"letter-d-bytes", UnixMs(2_000));
+    let acked_copy = sample_candidate("mail/d.md", "lucas", b"letter-d-bytes", UnixMs(2_000));
     let d_skip = decide_mail_ring(
         &acked_copy,
         &idx,
@@ -1833,11 +1849,11 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
 
     // Friction 3: `FlagMutatedAfterAck` when an already-ACKed path changes SHA-256.
     let mutated = LetterCandidate {
-        rel_path: "to-loupe/mut.md".into(),
+        rel_path: "to-lucas/mut.md".into(),
         sha256: sha_mut_new.clone(),
         sha16: sha_mut_new.as_str()[..16].to_owned(),
-        from: Some("genga".into()),
-        to: SeatName::parse("loupe").unwrap(),
+        from: Some("dave".into()),
+        to: SeatName::parse("lucas").unwrap(),
         subject: Some("Amended".into()),
         letter_id: None,
         in_reply_to: None,
@@ -1864,10 +1880,10 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     }
 
     // Friction 4: Wall-clock age-based retry expiry (`first_seen + deadline`), never pass count.
-    let busy_letter = sample_candidate("mail/busy.md", "tally", b"busy-body", UnixMs(10_000));
+    let busy_letter = sample_candidate("mail/busy.md", "carol", b"busy-body", UnixMs(10_000));
     let mut retry_many_passes = RetryState::new();
     retry_many_passes.insert(
-        SeatName::parse("tally").unwrap(),
+        SeatName::parse("carol").unwrap(),
         busy_letter.sha256.clone(),
         RetryEntry {
             first_seen_at: UnixMs(10_000),
@@ -1899,7 +1915,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
 
     let mut retry_one_pass_expired = RetryState::new();
     retry_one_pass_expired.insert(
-        SeatName::parse("tally").unwrap(),
+        SeatName::parse("carol").unwrap(),
         busy_letter.sha256.clone(),
         RetryEntry {
             first_seen_at: UnixMs(10_000),
@@ -1924,19 +1940,19 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     );
 
     // Friction 5: `>3` queued letters coalesce into ONE `RingDigest` listing every `(path, sha16)`.
-    let tally_seat = SeatName::parse("tally").unwrap();
+    let carol_seat = SeatName::parse("carol").unwrap();
     let burst: Vec<LetterCandidate> = (1..=4)
         .map(|i| {
             sample_candidate(
                 &format!("mail/burst-{i}.md"),
-                "tally",
+                "carol",
                 format!("burst-body-{i}").as_bytes(),
                 UnixMs(20_000 + i),
             )
         })
         .collect();
     let three = decide_mail_rings_for_seat(
-        &tally_seat,
+        &carol_seat,
         &burst[..3],
         &idx,
         &st,
@@ -1950,7 +1966,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     assert!(three.iter().all(|d| matches!(d, RingDecision::Ring { .. })));
 
     let four = decide_mail_rings_for_seat(
-        &tally_seat,
+        &carol_seat,
         &burst,
         &idx,
         &st,
@@ -1972,7 +1988,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
 
     // Friction 6: Mandatory `(path, sha16)` referent + receipt-only skip.
     assert!(RingReferent::new("", sha_a.clone()).is_err());
-    let empty_path_cand = sample_candidate("   ", "tally", b"no-path", UnixMs(25_000));
+    let empty_path_cand = sample_candidate("   ", "carol", b"no-path", UnixMs(25_000));
     assert!(matches!(
         decide_mail_ring(
             &empty_path_cand,
@@ -1987,7 +2003,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
         RingDecision::RefuseMissingReferent { .. }
     ));
 
-    let mut receipt_only = sample_candidate("mail/receipt.md", "tally", b"receipt", UnixMs(25_000));
+    let mut receipt_only = sample_candidate("mail/receipt.md", "carol", b"receipt", UnixMs(25_000));
     receipt_only.receipt_only = true;
     assert!(matches!(
         decide_mail_ring(
@@ -2008,7 +2024,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
     fs::create_dir_all(ro_dir.path().join("mail")).unwrap();
     fs::write(
         ro_dir.path().join("mail/pool-custody.md"),
-        "---\nfrom: tally\nto: loupe\nstatus: \"receipt only; no return ACK requested\"\n---\nbody\n",
+        "---\nfrom: carol\nto: lucas\nstatus: \"receipt only; no return ACK requested\"\n---\nbody\n",
     )
     .unwrap();
     let ro = ReadOnlyInterchange::open(ro_dir.path()).unwrap();
@@ -2027,19 +2043,19 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     fs::create_dir_all(dir.path().join("mail")).unwrap();
     fs::create_dir_all(dir.path().join("state")).unwrap();
 
-    let b_acked = b"---\nfrom: tally\nto: loupe\n---\nalready read\n";
-    let b_live = b"---\nfrom: tally\nto: loupe\n---\nnew for live loupe\n";
-    let b_missed = b"---\nfrom: tally\nto: genga\n---\nmissed for offline genga\n";
-    let b_retired = b"---\nfrom: tally\nto: quire\n---\nto retired quire\n";
+    let b_acked = b"---\nfrom: carol\nto: lucas\n---\nalready read\n";
+    let b_live = b"---\nfrom: carol\nto: lucas\n---\nnew for live lucas\n";
+    let b_missed = b"---\nfrom: carol\nto: dave\n---\nmissed for offline dave\n";
+    let b_retired = b"---\nfrom: carol\nto: quinn\n---\nto retired quinn\n";
     fs::write(dir.path().join("mail/01-acked.md"), b_acked).unwrap();
     fs::write(dir.path().join("mail/02-live.md"), b_live).unwrap();
     fs::write(dir.path().join("mail/03-missed.md"), b_missed).unwrap();
     fs::write(dir.path().join("mail/04-retired.md"), b_retired).unwrap();
 
     let sha_acked = sha256_of(b_acked);
-    // ACK recorded under an alias declared on loupe's durable SeatRecord.
+    // ACK recorded under an alias declared on lucas's durable SeatRecord.
     let acks_before_raw = format!(
-        "{{\"ts\":\"2026-11-21T05:00:00Z\",\"acked_by\":\"loupe-review\",\"letter\":\"mail/01-acked.md\",\"sha256\":\"{}\"}}\n",
+        "{{\"ts\":\"2026-11-21T05:00:00Z\",\"acked_by\":\"lucas-review\",\"letter\":\"mail/01-acked.md\",\"sha256\":\"{}\"}}\n",
         sha_acked.as_str()
     );
     let acks_path = dir.path().join("state/acks.jsonl");
@@ -2052,18 +2068,18 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    // loupe = Active + Live (with alias `loupe-review`), genga = Active + Offline, quire = Retired.
+    // lucas = Active + Live (with alias `lucas-review`), dave = Active + Offline, quinn = Retired.
     apply_presence_with_probe(
         &mut st,
         &mut seq,
         owner_p.clone(),
         UnixMs(900),
         PresenceCommand::PresenceClaim(PresenceClaim {
-            seat: SeatName::parse("loupe").unwrap(),
+            seat: SeatName::parse("lucas").unwrap(),
             status: Some(SeatStatus::Active),
             role: None,
             projects: Vec::new(),
-            aliases: vec![SeatName::parse("loupe-review").unwrap()],
+            aliases: vec![SeatName::parse("lucas-review").unwrap()],
             home_room: None,
             mail_horizon_at: None,
             work_class: None,
@@ -2083,16 +2099,16 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
         &mut st,
         &mut seq,
         Principal::Seat {
-            seat: SeatName::parse("loupe").unwrap(),
+            seat: SeatName::parse("lucas").unwrap(),
         },
         UnixMs(1_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: SeatName::parse("loupe").unwrap(),
+            seat: SeatName::parse("lucas").unwrap(),
             incarnation_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 1,
-                client: "loupe".into(),
+                client: "lucas".into(),
             },
             liveness: LivenessMode::SocketLifetime,
             ttl_ms: None,
@@ -2110,7 +2126,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
         owner_p.clone(),
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
-            seat: SeatName::parse("genga").unwrap(),
+            seat: SeatName::parse("dave").unwrap(),
             status: Some(SeatStatus::Active),
             role: None,
             projects: Vec::new(),
@@ -2136,7 +2152,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
         owner_p,
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
-            seat: SeatName::parse("quire").unwrap(),
+            seat: SeatName::parse("quinn").unwrap(),
             status: Some(SeatStatus::Retired),
             role: None,
             projects: Vec::new(),
@@ -2214,7 +2230,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     );
 
     // Opt-in read-only smoke test against a real interchange directory when
-    // `REX_WAVE_INTERCHANGE_DIR` is set in the environment.
+    // `REX_WAVE_LIVE_INTERCHANGE_TEST_DIR` is set in the environment.
     if let Some(live_root) = opt_in_interchange_dir() {
         let live_acks_path = live_root.join("state/acks.jsonl");
         if live_acks_path.is_file() {
@@ -2251,35 +2267,35 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
     let dir = TempDirGuard::new("pr20-ts-precedence");
     fs::write(dir.path().join(".rex-wave-sandbox"), b"ok\n").unwrap();
     fs::create_dir_all(dir.path().join("mail")).unwrap();
-    fs::create_dir_all(dir.path().join("to-loupe")).unwrap();
+    fs::create_dir_all(dir.path().join("to-lucas")).unwrap();
     fs::create_dir_all(dir.path().join("state")).unwrap();
     fs::write(dir.path().join("state/acks.jsonl"), b"").unwrap();
 
     // 1. Filename 13-digit epoch ms wins over recorded date and newer file mtime.
-    let f_epoch_name = dir.path().join("mail/1792431783570-tally-to-loupe.md");
+    let f_epoch_name = dir.path().join("mail/1792431783570-carol-to-lucas.md");
     let b_epoch_name =
-        b"---\nfrom: tally\nto: loupe\ndate: 2026-11-20 12:00 CST\n---\nepoch filename\n";
+        b"---\nfrom: carol\nto: lucas\ndate: 2026-11-20 12:00 CST\n---\nepoch filename\n";
     fs::write(&f_epoch_name, b_epoch_name).unwrap();
 
     // 2. Frontmatter `id` / `date_ms` wins over recorded date and newer file mtime.
-    let f_id_ms = dir.path().join("to-loupe/id-ms-letter.md");
-    let b_id_ms = b"---\nfrom: tally\nto: loupe\nid: 1795284326392-tally-reply\ndate: 2026-11-21 12:10 CST\n---\nid ms\n";
+    let f_id_ms = dir.path().join("to-lucas/id-ms-letter.md");
+    let b_id_ms = b"---\nfrom: carol\nto: lucas\nid: 1795284326392-carol-reply\ndate: 2026-11-21 12:10 CST\n---\nid ms\n";
     fs::write(&f_id_ms, b_id_ms).unwrap();
 
     // 3. Recorded frontmatter `date` (`YYYY-MM-DD HH:MM CST`) wins over newer file mtime.
-    let f_recorded_fm = dir.path().join("to-loupe/recorded-fm.md");
+    let f_recorded_fm = dir.path().join("to-lucas/recorded-fm.md");
     let b_recorded_fm =
-        b"---\nfrom: tally\nto: loupe\ndate: 2026-10-17 00:36 CDT\n---\nrecorded fm\n";
+        b"---\nfrom: carol\nto: lucas\ndate: 2026-10-17 00:36 CDT\n---\nrecorded fm\n";
     fs::write(&f_recorded_fm, b_recorded_fm).unwrap();
 
     // 4. `YYYY-MM-DD-` filename prefix wins over newer file mtime when no frontmatter date.
-    let f_ymd_name = dir.path().join("to-loupe/2026-09-15-history-note.md");
-    let b_ymd_name = b"---\nfrom: tally\nto: loupe\n---\nymd filename\n";
+    let f_ymd_name = dir.path().join("to-lucas/2026-09-15-history-note.md");
+    let b_ymd_name = b"---\nfrom: carol\nto: lucas\n---\nymd filename\n";
     fs::write(&f_ymd_name, b_ymd_name).unwrap();
 
     // 5. Fallback to filesystem mtime only when no ID or recorded date exists.
-    let f_mtime = dir.path().join("to-loupe/bare-note.md");
-    let b_mtime = b"---\nfrom: tally\nto: loupe\n---\nmtime fallback\n";
+    let f_mtime = dir.path().join("to-lucas/bare-note.md");
+    let b_mtime = b"---\nfrom: carol\nto: lucas\n---\nmtime fallback\n";
     fs::write(&f_mtime, b_mtime).unwrap();
 
     let ro = ReadOnlyInterchange::open(dir.path()).unwrap();
@@ -2289,26 +2305,26 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
         scanned.iter().map(|l| (l.rel_path.as_str(), l)).collect();
 
     assert_eq!(
-        by_path["mail/1792431783570-tally-to-loupe.md"].seen_at,
+        by_path["mail/1792431783570-carol-to-lucas.md"].seen_at,
         UnixMs(1_792_431_783_570)
     );
     assert_eq!(
-        by_path["mail/1792431783570-tally-to-loupe.md"].time_basis,
+        by_path["mail/1792431783570-carol-to-lucas.md"].time_basis,
         TimeBasis::LetterIdMs
     );
 
     assert_eq!(
-        by_path["to-loupe/id-ms-letter.md"].seen_at,
+        by_path["to-lucas/id-ms-letter.md"].seen_at,
         UnixMs(1_795_284_326_392)
     );
     assert_eq!(
-        by_path["to-loupe/id-ms-letter.md"].time_basis,
+        by_path["to-lucas/id-ms-letter.md"].time_basis,
         TimeBasis::LetterIdMs
     );
 
     // 2026-10-17 00:36 CDT == 2026-10-17T05:36:00Z
     let (expected_cdt_ms, expected_cdt_basis) = extract_letter_timestamp(
-        "to-loupe/recorded-fm.md",
+        "to-lucas/recorded-fm.md",
         None,
         None,
         Some("2026-10-17 00:36 CDT"),
@@ -2316,26 +2332,26 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
         Some(UnixMs(1_799_999_999_999)),
     );
     assert_eq!(expected_cdt_basis, TimeBasis::RecordedDate);
-    assert_eq!(by_path["to-loupe/recorded-fm.md"].seen_at, expected_cdt_ms);
+    assert_eq!(by_path["to-lucas/recorded-fm.md"].seen_at, expected_cdt_ms);
     assert_eq!(
-        by_path["to-loupe/recorded-fm.md"].time_basis,
+        by_path["to-lucas/recorded-fm.md"].time_basis,
         TimeBasis::RecordedDate
     );
 
     assert_eq!(
-        by_path["to-loupe/2026-09-15-history-note.md"].time_basis,
+        by_path["to-lucas/2026-09-15-history-note.md"].time_basis,
         TimeBasis::RecordedDate
     );
     assert!(
-        by_path["to-loupe/2026-09-15-history-note.md"].seen_at < expected_cdt_ms,
+        by_path["to-lucas/2026-09-15-history-note.md"].seen_at < expected_cdt_ms,
         "2026-09-15 filename date must sort older than 2026-10-17"
     );
 
     assert_eq!(
-        by_path["to-loupe/bare-note.md"].time_basis,
+        by_path["to-lucas/bare-note.md"].time_basis,
         TimeBasis::FileModified
     );
-    assert!(by_path["to-loupe/bare-note.md"].seen_at.0 > 1_700_000_000_000);
+    assert!(by_path["to-lucas/bare-note.md"].seen_at.0 > 1_700_000_000_000);
 
     // Shadow RaiseUnrung picks the historical oldest_at (2026-09-15), NOT today's mtime!
     let pass = run_shadow_pass(
@@ -2351,8 +2367,8 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
     let unrung = pass
         .decisions
         .iter()
-        .find(|d| matches!(d, RingDecision::RaiseUnrung { seat, .. } if seat.as_str() == "loupe"))
-        .expect("loupe RaiseUnrung decision");
+        .find(|d| matches!(d, RingDecision::RaiseUnrung { seat, .. } if seat.as_str() == "lucas"))
+        .expect("lucas RaiseUnrung decision");
     match unrung {
         RingDecision::RaiseUnrung {
             oldest_at,
@@ -2361,7 +2377,7 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
         } => {
             assert_eq!(
                 *oldest_at,
-                by_path["to-loupe/2026-09-15-history-note.md"].seen_at
+                by_path["to-lucas/2026-09-15-history-note.md"].seen_at
             );
             assert_eq!(*time_basis, TimeBasis::RecordedDate);
         }
@@ -2374,7 +2390,7 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
     let sandbox = SandboxRoot::verify_with(dir.path(), &Protection::default()).unwrap();
     let item_epoch = project(
         &sandbox,
-        &sandbox.path().join("to-loupe/id-ms-letter.md"),
+        &sandbox.path().join("to-lucas/id-ms-letter.md"),
         b_id_ms,
     )
     .unwrap();
@@ -2383,7 +2399,7 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
 
     let item_recorded = project(
         &sandbox,
-        &sandbox.path().join("to-loupe/recorded-fm.md"),
+        &sandbox.path().join("to-lucas/recorded-fm.md"),
         b_recorded_fm,
     )
     .unwrap();
@@ -2392,7 +2408,7 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
 
     let item_ymd = project(
         &sandbox,
-        &sandbox.path().join("to-loupe/2026-09-15-history-note.md"),
+        &sandbox.path().join("to-lucas/2026-09-15-history-note.md"),
         b_ymd_name,
     )
     .unwrap();
@@ -2401,7 +2417,7 @@ fn pr20_timestamp_precedence_letter_id_ms_recorded_date_and_mtime_in_shadow_and_
 
     let item_mtime = project(
         &sandbox,
-        &sandbox.path().join("to-loupe/bare-note.md"),
+        &sandbox.path().join("to-lucas/bare-note.md"),
         b_mtime,
     )
     .unwrap();
@@ -2420,10 +2436,10 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
         serde_json::to_vec(&serde_json::json!({
             "schema": "house-roster/2",
             "seats": {
-                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
-                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" },
-                "rd-3": { "name": "auburn-cepheus", "box": "/tmp/interchange/to-muse" },
-                "rd-4": { "name": "genga", "box": "/tmp/interchange/to-genga" }
+                "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
+                "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" },
+                "rd-3": { "name": "heidi", "box": "/tmp/interchange/to-maya" },
+                "rd-4": { "name": "dave", "box": "/tmp/interchange/to-dave" }
             }
         }))
         .unwrap(),
@@ -2432,28 +2448,28 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
     fs::write(
         dir.path().join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&serde_json::json!({
-            "tally": { "aliases": ["tally", "tally_votp", "Tally-VampOTP-CTO", "tally desk"] },
-            "genga": { "aliases": ["genga", "genga_votp", "users-c7"] },
-            "auburn-cepheus": { "aliases": ["muse", "auburn-cepheus", "auburn-cephus"] },
+            "carol": { "aliases": ["carol", "carol_old", "Carol-legacy", "carol desk"] },
+            "dave": { "aliases": ["dave", "dave_old", "sess-c7"] },
+            "heidi": { "aliases": ["maya", "heidi", "heidi-old"] },
             "cc": { "aliases": ["cc"] }
         }))
         .unwrap(),
     )
     .unwrap();
 
-    let plan = seed_records_from_interchange(&interchange).unwrap();
+    let plan = seed_records_from_interchange_with_profile(&interchange, &test_house()).unwrap();
     assert_eq!(plan.sources_read.len(), 2);
-    assert!(plan.skipped_targets.contains(&"golem".to_owned()));
+    assert!(plan.skipped_targets.contains(&"operator".to_owned()));
     assert!(plan.skipped_targets.contains(&"cc".to_owned()));
 
-    // Apply all seeded claims as Operator, then bind `tally` WITHOUT passing `--alias`.
+    // Apply all seeded claims as Operator, then bind `carol` WITHOUT passing `--alias`.
     let mut st = PresenceState::default();
     let mut seq = 0;
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
     for claim in plan.claims {
-        assert_ne!(claim.seat.as_str(), "golem");
+        assert_ne!(claim.seat.as_str(), "operator");
         assert!(matches!(
             claim.verified_how,
             Some(VerificationKind::MachineChecked | VerificationKind::WitnessedBy { .. })
@@ -2469,22 +2485,22 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
         .unwrap();
     }
 
-    // Binding as `tally` immediately covers `tally_votp` via durable seeded aliases!
-    let tally = SeatName::parse("tally").unwrap();
+    // Binding as `carol` immediately covers `carol_old` via durable seeded aliases!
+    let carol = SeatName::parse("carol").unwrap();
     apply_presence_with_probe(
         &mut st,
         &mut seq,
         Principal::Seat {
-            seat: tally.clone(),
+            seat: carol.clone(),
         },
         UnixMs(2_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: tally.clone(),
+            seat: carol.clone(),
             incarnation_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 5,
-                client: "tally-hook".into(),
+                client: "carol-hook".into(),
             },
             liveness: LivenessMode::SocketLifetime,
             ttl_ms: None,
@@ -2498,22 +2514,22 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
     .unwrap();
 
     let aliases = AliasMap::from_presence(&st);
-    assert_eq!(aliases.canonicalize("tally_votp"), "tally");
-    assert_eq!(aliases.canonicalize("genga_votp"), "genga");
-    assert_eq!(aliases.canonicalize("auburn-cephus"), "auburn-cepheus");
-    assert_eq!(aliases.canonicalize("auburn-chepheus"), "auburn-cepheus");
-    assert_eq!(aliases.canonicalize("muse"), "auburn-cepheus");
+    assert_eq!(aliases.canonicalize("carol_old"), "carol");
+    assert_eq!(aliases.canonicalize("dave_old"), "dave");
+    assert_eq!(aliases.canonicalize("heidi-old"), "heidi");
+    assert_eq!(aliases.canonicalize("heidi-typo"), "heidi");
+    assert_eq!(aliases.canonicalize("maya"), "heidi");
 
     let resolved = st
         .resolve_at(
             &PresenceResolve {
-                query: "tally_votp".into(),
+                query: "carol_old".into(),
                 lane: None,
             },
             UnixMs(2_500),
         )
         .unwrap();
-    assert_eq!(resolved.record.seat, tally);
+    assert_eq!(resolved.record.seat, carol);
     assert_eq!(resolved.live_bindings.len(), 1);
 }
 
@@ -2521,15 +2537,15 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
 fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override() {
     let mut st = PresenceState::default();
     let mut seq = 0;
-    let tally = SeatName::parse("tally").unwrap();
-    let tally_p = Principal::Seat {
-        seat: tally.clone(),
+    let carol = SeatName::parse("carol").unwrap();
+    let carol_p = Principal::Seat {
+        seat: carol.clone(),
     };
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
 
-    // Seed `tally` first (mail_horizon_at starts None).
+    // Seed `carol` first (mail_horizon_at starts None).
     apply_presence_with_probe(
         &mut st,
         &mut seq,
@@ -2537,27 +2553,27 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
             status: Some(SeatStatus::Active),
-            aliases: vec![SeatName::parse("tally_votp").unwrap()],
-            ..empty_claim("tally")
+            aliases: vec![SeatName::parse("carol_old").unwrap()],
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
     .unwrap();
-    assert_eq!(st.seat(&tally).unwrap().mail_horizon_at, None);
+    assert_eq!(st.seat(&carol).unwrap().mail_horizon_at, None);
 
     // First live bind at t=10_000 stamps mail_horizon_at = Some(10_000).
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(10_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: tally.clone(),
+            seat: carol.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-1").unwrap()),
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 1,
-                client: "tally".into(),
+                client: "carol".into(),
             },
             liveness: LivenessMode::SocketLifetime,
             ttl_ms: None,
@@ -2570,7 +2586,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     )
     .unwrap();
     assert_eq!(
-        st.seat(&tally).unwrap().mail_horizon_at,
+        st.seat(&carol).unwrap().mail_horizon_at,
         Some(UnixMs(10_000))
     );
 
@@ -2578,15 +2594,15 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(20_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: tally.clone(),
+            seat: carol.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-2").unwrap()),
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 2,
-                client: "tally".into(),
+                client: "carol".into(),
             },
             liveness: LivenessMode::SocketLifetime,
             ttl_ms: None,
@@ -2599,18 +2615,18 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     )
     .unwrap();
     assert_eq!(
-        st.seat(&tally).unwrap().mail_horizon_at,
+        st.seat(&carol).unwrap().mail_horizon_at,
         Some(UnixMs(10_000))
     );
 
     let aliases = AliasMap::from_presence(&st);
     let empty_acks = parse_acks_jsonl("", &aliases).into_index();
-    let old_letter = sample_candidate("mail/old-hist.md", "tally", b"old", UnixMs(9_999));
-    let exact_letter = sample_candidate("mail/at-horizon.md", "tally", b"at", UnixMs(10_000));
-    let new_letter = sample_candidate("mail/new-live.md", "tally", b"new", UnixMs(15_000));
+    let old_letter = sample_candidate("mail/old-hist.md", "carol", b"old", UnixMs(9_999));
+    let exact_letter = sample_candidate("mail/at-horizon.md", "carol", b"at", UnixMs(10_000));
+    let new_letter = sample_candidate("mail/new-live.md", "carol", b"new", UnixMs(15_000));
 
     let decisions = decide_mail_rings_for_seat(
-        &tally,
+        &carol,
         &[old_letter, exact_letter, new_letter],
         &empty_acks,
         &st,
@@ -2633,14 +2649,14 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     assert_eq!(score.rings_emitted, 2);
     assert_eq!(score.unrung_alerts, 0);
 
-    // Even when tally goes offline later, pre-horizon letters NEVER raise RaiseUnrung!
+    // Even when carol goes offline later, pre-horizon letters NEVER raise RaiseUnrung!
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(25_000),
         PresenceCommand::PresenceUnbind(PresenceUnbind {
-            seat: tally.clone(),
+            seat: carol.clone(),
             incarnation_id: IncarnationId::parse("inc-2").unwrap(),
             reason: Some("closed".into()),
         }),
@@ -2648,7 +2664,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     )
     .unwrap();
     let offline_old = decide_mail_ring(
-        &sample_candidate("mail/hist-480.md", "tally", b"hist-480", UnixMs(5_000)),
+        &sample_candidate("mail/hist-480.md", "carol", b"hist-480", UnixMs(5_000)),
         &empty_acks,
         &st,
         &IncarnationAffinity::new(),
@@ -2666,15 +2682,15 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        tally_p,
+        carol_p,
         UnixMs(30_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: tally.clone(),
+            seat: carol.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-3").unwrap()),
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 3,
-                client: "tally".into(),
+                client: "carol".into(),
             },
             liveness: LivenessMode::SocketLifetime,
             ttl_ms: None,
@@ -2687,32 +2703,32 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
     )
     .unwrap();
     assert_eq!(
-        st.seat(&tally).unwrap().mail_horizon_at,
+        st.seat(&carol).unwrap().mail_horizon_at,
         Some(UnixMs(25_000))
     );
 }
 
 #[test]
-fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
+fn pr20_q3_operator_structural_guard_and_non_seat_pseudo_target_classification() {
     let mut st = PresenceState::default();
     let mut seq = 0;
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    let golem = SeatName::parse("golem").unwrap();
+    let operator = SeatName::parse("operator").unwrap();
 
-    // 1. PresenceBind for `golem` is structurally DENIED (even for Operator!).
+    // 1. PresenceBind for `operator` is structurally DENIED (even for Operator!).
     let bind_err = apply_presence_with_probe(
         &mut st,
         &mut seq,
         owner_p.clone(),
         UnixMs(1_000),
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: golem.clone(),
+            seat: operator.clone(),
             incarnation_id: None,
             lane: None,
             endpoint: TransportEndpoint::OperatorToast {
-                command: "mail-golem.sh".into(),
+                command: "mail-operator.sh".into(),
             },
             liveness: LivenessMode::LeaseOnly,
             ttl_ms: Some(60_000),
@@ -2726,13 +2742,13 @@ fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
     .unwrap_err();
     assert!(matches!(bind_err, ApiError::Denied { .. }), "{bind_err:?}");
 
-    // 2. PresenceClaim setting `golem` to Active (explicit or default) is DENIED.
+    // 2. PresenceClaim setting `operator` to Active (explicit or default) is DENIED.
     let claim_active_err = apply_presence_with_probe(
         &mut st,
         &mut seq,
         owner_p.clone(),
         UnixMs(1_000),
-        PresenceCommand::PresenceClaim(empty_claim("golem")),
+        PresenceCommand::PresenceClaim(empty_claim("operator")),
         |_, _| true,
     )
     .unwrap_err();
@@ -2741,15 +2757,15 @@ fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
         "{claim_active_err:?}"
     );
 
-    // 3. Claiming `golem` as an alias of another seat is DENIED.
+    // 3. Claiming `operator` as an alias of another seat is DENIED.
     let alias_hijack_err = apply_presence_with_probe(
         &mut st,
         &mut seq,
         owner_p.clone(),
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
-            aliases: vec![golem.clone()],
-            ..empty_claim("tally")
+            aliases: vec![operator.clone()],
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
@@ -2759,7 +2775,7 @@ fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
         "{alias_hijack_err:?}"
     );
 
-    // 4. Dormant metadata on `golem` is allowed, but transitioning it to Active is DENIED.
+    // 4. Dormant metadata on `operator` is allowed, but transitioning it to Active is DENIED.
     apply_presence_with_probe(
         &mut st,
         &mut seq,
@@ -2767,7 +2783,7 @@ fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
             status: Some(SeatStatus::Dormant),
-            ..empty_claim("golem")
+            ..empty_claim("operator")
         }),
         |_, _| true,
     )
@@ -2778,7 +2794,7 @@ fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
         owner_p,
         UnixMs(2_000),
         PresenceCommand::PresenceSetStatus(PresenceSetStatus {
-            seat: golem.clone(),
+            seat: operator.clone(),
             status: SeatStatus::Active,
             verified_how: None,
             reason: None,
@@ -2791,13 +2807,18 @@ fn pr20_q3_golem_structural_guard_and_non_seat_pseudo_target_classification() {
         "{promote_err:?}"
     );
 
-    // 5. Shadow classification: `golem` -> SkipOperatorSurface; non-seat targets -> SkipNonSeatTarget.
+    // 5. Shadow classification: `operator` -> SkipOperatorSurface; non-seat targets -> SkipNonSeatTarget.
     let aliases = AliasMap::empty();
     let empty_acks = parse_acks_jsonl("", &aliases).into_index();
     let empty_st = PresenceState::default();
     let mut decisions = Vec::new();
     decisions.push(decide_mail_ring(
-        &sample_candidate("mail/to-golem.md", "golem", b"hi golem", UnixMs(1_000)),
+        &sample_candidate(
+            "mail/to-operator.md",
+            "operator",
+            b"hi operator",
+            UnixMs(1_000),
+        ),
         &empty_acks,
         &empty_st,
         &IncarnationAffinity::new(),
@@ -2867,7 +2888,7 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    let tally = SeatName::parse("tally").unwrap();
+    let carol = SeatName::parse("carol").unwrap();
 
     apply_presence_with_probe(
         &mut st,
@@ -2878,15 +2899,15 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
             status: Some(SeatStatus::Active),
             role: Some("estate-desk".into()),
             projects: vec!["interchange".into()],
-            aliases: vec![SeatName::parse("tally_votp").unwrap()],
+            aliases: vec![SeatName::parse("carol_old").unwrap()],
             mail_horizon_at: Some(UnixMs(1_795_284_326_000)),
             work_class: Some(WorkClass::ClassA),
-            avatar: Some("avatars/tally.png".into()),
-            home_dir: Some("/Users/golem/agent-folder/resident_memories/tally".into()),
-            start_cmd: Some("claude --name Tally-5.2".into()),
-            resume_cmd: Some("claude --resume 59e9053e".into()),
-            rex_target: Some("block:tally-desk".into()),
-            ..empty_claim("tally")
+            avatar: Some("avatars/carol.png".into()),
+            home_dir: Some("/workspace/seats/carol".into()),
+            start_cmd: Some("claude --name Carol-5.2".into()),
+            resume_cmd: Some("claude --resume sess_demo_01".into()),
+            rex_target: Some("block:carol-desk".into()),
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
@@ -2900,22 +2921,22 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
         UnixMs(2_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
             work_class: Some(WorkClass::ClassB),
-            ..empty_claim("tally")
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
     .unwrap();
 
-    let rec = st.seat(&tally).unwrap();
+    let rec = st.seat(&carol).unwrap();
     assert_eq!(rec.work_class, Some(WorkClass::ClassB));
-    assert_eq!(rec.avatar.as_deref(), Some("avatars/tally.png"));
+    assert_eq!(rec.avatar.as_deref(), Some("avatars/carol.png"));
+    assert_eq!(rec.home_dir.as_deref(), Some("/workspace/seats/carol"));
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Carol-5.2"));
     assert_eq!(
-        rec.home_dir.as_deref(),
-        Some("/Users/golem/agent-folder/resident_memories/tally")
+        rec.resume_cmd.as_deref(),
+        Some("claude --resume sess_demo_01")
     );
-    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally-5.2"));
-    assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume 59e9053e"));
-    assert_eq!(rec.rex_target.as_deref(), Some("block:tally-desk"));
+    assert_eq!(rec.rex_target.as_deref(), Some("block:carol-desk"));
     assert_eq!(rec.mail_horizon_at, Some(UnixMs(1_795_284_326_000)));
 
     let manifest = ResidentManifest::from_records([rec]);
@@ -2929,9 +2950,9 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
     let hand_edited: ResidentManifest = serde_json::from_value(serde_json::json!({
         "schema": RESIDENT_MANIFEST_SCHEMA,
         "seats": [{
-            "seat": "nodal",
+            "seat": "nora",
             "work_class": "class_b",
-            "rex_target": "block:nodal-card"
+            "rex_target": "block:nora-card"
         }]
     }))
     .unwrap();
@@ -2948,7 +2969,7 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
             status: Some(SeatStatus::Dormant),
-            ..empty_claim("nodal")
+            ..empty_claim("nora")
         }),
         |_, _| true,
     )
@@ -2962,9 +2983,9 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
         |_, _| true,
     )
     .unwrap();
-    let nodal = st2.seat(&SeatName::parse("nodal").unwrap()).unwrap();
-    assert_eq!(nodal.status, SeatStatus::Dormant);
-    assert_eq!(nodal.work_class, Some(WorkClass::ClassB));
+    let nora = st2.seat(&SeatName::parse("nora").unwrap()).unwrap();
+    assert_eq!(nora.status, SeatStatus::Dormant);
+    assert_eq!(nora.work_class, Some(WorkClass::ClassB));
 }
 
 #[test]
@@ -2972,16 +2993,16 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
     let dir = TempDirGuard::new("pr20-reply-and-date-only");
     fs::write(dir.path().join(".rex-wave-sandbox"), b"ok\n").unwrap();
     fs::create_dir_all(dir.path().join("mail")).unwrap();
-    fs::create_dir_all(dir.path().join("to-fathom")).unwrap();
+    fs::create_dir_all(dir.path().join("to-frank")).unwrap();
     fs::create_dir_all(dir.path().join("state")).unwrap();
     fs::write(dir.path().join("state/acks.jsonl"), b"").unwrap();
 
     // Parent was written at 2026-11-20T22:56:41Z (`1795215401193`).
-    // Seat `fathom` binds at 2026-11-21 01:00 CST (`2026-11-21T07:00:00Z` = `1795244400000`).
-    // Tally replies at 2026-11-21 02:51 CST (`2026-11-21T08:51:00Z` = `1795251060000`) reusing
+    // Seat `frank` binds at 2026-11-21 01:00 CST (`2026-11-21T07:00:00Z` = `1795244400000`).
+    // Carol replies at 2026-11-21 02:51 CST (`2026-11-21T08:51:00Z` = `1795251060000`) reusing
     // the parent's 13-digit prefix in filename and `id`, with `in_reply_to: 1795215401193`.
-    let reply_bytes = b"---\nfrom: tally\nto: fathom\nid: 1795215401193-tally-reply\nin_reply_to: 1795215401193\ndate: 2026-11-21 02:51 CST\nsubject: Post-bind reply\n---\nreply body\n";
-    let reply_path = dir.path().join("mail/1795215401193-tally-reply.md");
+    let reply_bytes = b"---\nfrom: carol\nto: frank\nid: 1795215401193-carol-reply\nin_reply_to: 1795215401193\ndate: 2026-11-21 02:51 CST\nsubject: Post-bind reply\n---\nreply body\n";
+    let reply_path = dir.path().join("mail/1795215401193-carol-reply.md");
     fs::write(&reply_path, reply_bytes).unwrap();
 
     // Date-only box letter written on the same local day (`2026-11-21`, resolves to 00:00 UTC
@@ -2989,18 +3010,18 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
     // skipped by a 2026-11-21 bind horizon, whereas an older historical date-only letter
     // (`2026-10-18`) MUST be skipped as `SkipPreHorizonHistory`.
     fs::write(
-        dir.path().join("to-fathom/2026-11-21-same-day.md"),
-        b"---\nfrom: tally\nto: fathom\ndate: 2026-11-21\n---\nsame-day date-only\n",
+        dir.path().join("to-frank/2026-11-21-same-day.md"),
+        b"---\nfrom: carol\nto: frank\ndate: 2026-11-21\n---\nsame-day date-only\n",
     )
     .unwrap();
     fs::write(
-        dir.path().join("to-fathom/fuzzy-same-day.md"),
-        b"---\nfrom: tally\nto: fathom\ndate: 2026-11-21 11:1x CST\n---\nfuzzy same-day\n",
+        dir.path().join("to-frank/fuzzy-same-day.md"),
+        b"---\nfrom: carol\nto: frank\ndate: 2026-11-21 11:1x CST\n---\nfuzzy same-day\n",
     )
     .unwrap();
     fs::write(
-        dir.path().join("to-fathom/2026-10-18-old-history.md"),
-        b"---\nfrom: tally\nto: fathom\ndate: 2026-10-18\n---\nold history\n",
+        dir.path().join("to-frank/2026-10-18-old-history.md"),
+        b"---\nfrom: carol\nto: frank\ndate: 2026-10-18\n---\nold history\n",
     )
     .unwrap();
 
@@ -3008,7 +3029,7 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
     let sandbox = SandboxRoot::verify_with(dir.path(), &Protection::default()).unwrap();
     let proj_reply = project(
         &sandbox,
-        &sandbox.path().join("mail/1795215401193-tally-reply.md"),
+        &sandbox.path().join("mail/1795215401193-carol-reply.md"),
         reply_bytes,
     )
     .unwrap();
@@ -3017,22 +3038,22 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
 
     let mut st = PresenceState::default();
     let mut seq = 0;
-    let fathom = SeatName::parse("fathom").unwrap();
+    let frank = SeatName::parse("frank").unwrap();
     let bind_horizon = UnixMs(1_795_244_400_000); // 2026-11-21T07:00:00Z (01:00 CST)
     apply_presence_with_probe(
         &mut st,
         &mut seq,
         Principal::Seat {
-            seat: fathom.clone(),
+            seat: frank.clone(),
         },
         bind_horizon,
         PresenceCommand::PresenceBind(PresenceBind {
-            seat: fathom.clone(),
-            incarnation_id: Some(IncarnationId::parse("inc-fathom-1").unwrap()),
+            seat: frank.clone(),
+            incarnation_id: Some(IncarnationId::parse("inc-frank-1").unwrap()),
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 9,
-                client: "fathom".into(),
+                client: "frank".into(),
             },
             liveness: LivenessMode::SocketLifetime,
             ttl_ms: None,
@@ -3072,20 +3093,20 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
         }
     }
     assert!(
-        rung_paths.contains("mail/1795215401193-tally-reply.md"),
+        rung_paths.contains("mail/1795215401193-carol-reply.md"),
         "post-bind reply reusing parent prefix must RING, got rung={rung_paths:?}, skipped={skipped_pre_horizon_paths:?}"
     );
     assert!(
-        rung_paths.contains("to-fathom/2026-11-21-same-day.md"),
+        rung_paths.contains("to-frank/2026-11-21-same-day.md"),
         "same-day date-only letter must RING, got rung={rung_paths:?}, skipped={skipped_pre_horizon_paths:?}"
     );
     assert!(
-        rung_paths.contains("to-fathom/fuzzy-same-day.md"),
+        rung_paths.contains("to-frank/fuzzy-same-day.md"),
         "same-day fuzzy-time letter must RING, got rung={rung_paths:?}, skipped={skipped_pre_horizon_paths:?}"
     );
     assert_eq!(
         skipped_pre_horizon_paths,
-        BTreeSet::from(["to-fathom/2026-10-18-old-history.md".to_owned()])
+        BTreeSet::from(["to-frank/2026-10-18-old-history.md".to_owned()])
     );
 }
 
@@ -3096,9 +3117,9 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    let tally_seat = SeatName::parse("tally").unwrap();
-    let tally_p = Principal::Seat {
-        seat: tally_seat.clone(),
+    let carol_seat = SeatName::parse("carol").unwrap();
+    let carol_p = Principal::Seat {
+        seat: carol_seat.clone(),
     };
     let worker_p = Principal::Worker {
         wave: WaveSlug::parse("w1").unwrap(),
@@ -3110,15 +3131,15 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
 
     // 1. Non-operator principals cannot set `start_cmd` or `resume_cmd` on an unclaimed seat
     //    (including a seat claiming its own record).
-    for caller in [tally_p.clone(), worker_p.clone(), sys_p.clone()] {
+    for caller in [carol_p.clone(), worker_p.clone(), sys_p.clone()] {
         let err_start = apply_presence_with_probe(
             &mut st,
             &mut seq,
             caller.clone(),
             UnixMs(1_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
-                start_cmd: Some("claude --name Tally".into()),
-                ..empty_claim("tally")
+                start_cmd: Some("claude --name Carol".into()),
+                ..empty_claim("carol")
             }),
             |_, _| true,
         )
@@ -3135,7 +3156,7 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
             UnixMs(1_001),
             PresenceCommand::PresenceClaim(PresenceClaim {
                 resume_cmd: Some("claude --resume abc".into()),
-                ..empty_claim("tally")
+                ..empty_claim("carol")
             }),
             |_, _| true,
         )
@@ -3146,7 +3167,7 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
         );
     }
     assert!(
-        st.seat(&tally_seat).is_none(),
+        st.seat(&carol_seat).is_none(),
         "denied claims must not create seat record"
     );
 
@@ -3158,41 +3179,41 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
         UnixMs(2_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
             status: Some(SeatStatus::Active),
-            start_cmd: Some("claude --name Tally".into()),
+            start_cmd: Some("claude --name Carol".into()),
             resume_cmd: Some("claude --resume orig".into()),
-            ..empty_claim("tally")
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
     .unwrap();
-    let rec = st.seat(&tally_seat).unwrap();
-    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally"));
+    let rec = st.seat(&carol_seat).unwrap();
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Carol"));
     assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
 
     // 3. Seat updating its own non-exec metadata succeeds and preserves operator-set commands.
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        tally_p.clone(),
+        carol_p.clone(),
         UnixMs(2_500),
         PresenceCommand::PresenceClaim(PresenceClaim {
             role: Some("estate-desk".into()),
-            ..empty_claim("tally")
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
     .unwrap();
-    let rec = st.seat(&tally_seat).unwrap();
+    let rec = st.seat(&carol_seat).unwrap();
     assert_eq!(
         rec.role.as_ref().map(|r| r.value.as_str()),
         Some("estate-desk")
     );
-    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally"));
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Carol"));
     assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
 
     // 4. Non-operator principals cannot overwrite `start_cmd` or `resume_cmd` on an existing seat
     //    (even a Worker gets Denied rather than Conflict).
-    for caller in [tally_p.clone(), worker_p.clone(), sys_p.clone()] {
+    for caller in [carol_p.clone(), worker_p.clone(), sys_p.clone()] {
         let err = apply_presence_with_probe(
             &mut st,
             &mut seq,
@@ -3200,7 +3221,7 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
             UnixMs(3_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
                 start_cmd: Some("sh -c pwn".into()),
-                ..empty_claim("tally")
+                ..empty_claim("carol")
             }),
             |_, _| true,
         )
@@ -3212,15 +3233,15 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
     }
 
     // 5. Non-operator `replacing_self` cannot clear existing `start_cmd`/`resume_cmd`.
-    for caller in [tally_p.clone(), worker_p.clone(), sys_p.clone()] {
+    for caller in [carol_p.clone(), worker_p.clone(), sys_p.clone()] {
         let err = apply_presence_with_probe(
             &mut st,
             &mut seq,
             caller.clone(),
             UnixMs(3_500),
             PresenceCommand::PresenceClaim(PresenceClaim {
-                replace: Some(tally_seat.clone()),
-                ..empty_claim("tally")
+                replace: Some(carol_seat.clone()),
+                ..empty_claim("carol")
             }),
             |_, _| true,
         )
@@ -3230,23 +3251,23 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
             "caller {caller} clearing start_cmd/resume_cmd via replace must be Denied, got {err:?}"
         );
     }
-    let rec = st.seat(&tally_seat).unwrap();
-    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Tally"));
+    let rec = st.seat(&carol_seat).unwrap();
+    assert_eq!(rec.start_cmd.as_deref(), Some("claude --name Carol"));
     assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
 
     // 6. A seat without `start_cmd`/`resume_cmd` may still self-replace its own metadata.
-    let nodal_seat = SeatName::parse("nodal").unwrap();
-    let nodal_p = Principal::Seat {
-        seat: nodal_seat.clone(),
+    let nora_seat = SeatName::parse("nora").unwrap();
+    let nora_p = Principal::Seat {
+        seat: nora_seat.clone(),
     };
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        nodal_p.clone(),
+        nora_p.clone(),
         UnixMs(3_600),
         PresenceCommand::PresenceClaim(PresenceClaim {
             role: Some("old-role".into()),
-            ..empty_claim("nodal")
+            ..empty_claim("nora")
         }),
         |_, _| true,
     )
@@ -3254,18 +3275,18 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        nodal_p,
+        nora_p,
         UnixMs(3_700),
         PresenceCommand::PresenceClaim(PresenceClaim {
             role: Some("new-role".into()),
-            replace: Some(nodal_seat.clone()),
-            ..empty_claim("nodal")
+            replace: Some(nora_seat.clone()),
+            ..empty_claim("nora")
         }),
         |_, _| true,
     )
     .unwrap();
     assert_eq!(
-        st.seat(&nodal_seat)
+        st.seat(&nora_seat)
             .unwrap()
             .role
             .as_ref()
@@ -3280,13 +3301,13 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
         owner_p,
         UnixMs(4_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
-            replace: Some(tally_seat.clone()),
-            ..empty_claim("tally")
+            replace: Some(carol_seat.clone()),
+            ..empty_claim("carol")
         }),
         |_, _| true,
     )
     .unwrap();
-    let rec = st.seat(&tally_seat).unwrap();
+    let rec = st.seat(&carol_seat).unwrap();
     assert_eq!(rec.start_cmd, None);
     assert_eq!(rec.resume_cmd, None);
 }
@@ -3305,8 +3326,8 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         serde_json::to_vec(&serde_json::json!({
             "schema": "house-roster/2",
             "seats": {
-                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
-                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" }
+                "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
+                "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" }
             }
         }))
         .unwrap(),
@@ -3315,7 +3336,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     fs::write(
         house.join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&serde_json::json!({
-            "crest": { "own_knocker": true, "aliases": ["crest"] },
+            "eve": { "own_knocker": true, "aliases": ["eve"] },
             "desktop": { "aliases": ["desktop"] }
         }))
         .unwrap(),
@@ -3323,12 +3344,12 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     .unwrap();
     fs::write(
         interchange.join("state/bb-knock-routes.tsv"),
-        "# comment\nseat\tbb_thread_id\tnote\nfathom\tthr_bns4xpcfs9\tEmacs-FV review\n",
+        "# comment\nseat\tbb_thread_id\tnote\nfrank\tthr_demo_01\tEmacs-FV review\n",
     )
     .unwrap();
     fs::write(
         interchange.join("state/codex-knock-routes.tsv"),
-        "seat\thostId\tthreadId\tnote\nastra-emacs-fv\tlocal\t01a1b9c9\tEmacs Verify\n",
+        "seat\thostId\tthreadId\tnote\ncodex-org-fv\tlocal\tcodex_demo_01\tEmacs Verify\n",
     )
     .unwrap();
     fs::write(
@@ -3336,11 +3357,11 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         concat!(
             "# seat\ttarget\tverified_date\tverified_how\n",
             "seat\ttarget\tdate\thow\n",
-            "labile\trex:d5b20f/69f276\t2026-11-16\tself\n",
-            "plumb\tw3:pN\t2026-10-13\tpane\n",
-            "waverunner\tw4:p27\t2026-10-13\tpane\n",
-            "sol_ew\tw5:p2\t2026-10-20\tpane\n",
-            "excluded-seat\tw4:p1S\t2026-10-13\tPERMANENTLY EXCLUDED\n",
+            "liam\trex:demo01/pane01\t2026-11-16\tself\n",
+            "peggy\tw1:p1\t2026-10-13\tpane\n",
+            "walter\tw1:p2\t2026-10-13\tpane\n",
+            "sol_ext\tw1:p3\t2026-10-20\tpane\n",
+            "excluded-seat\tw9:p1S\t2026-10-13\tPERMANENTLY EXCLUDED\n",
         ),
     )
     .unwrap();
@@ -3348,10 +3369,10 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         interchange.join("state/ledger.md"),
         concat!(
             "# Interchange ledger\n",
-            "2026-08-15 | CLAIM | mote | local model\n",
-            "2026-08-15 | CLAIM | Parallax | web seat\n",
-            "2026-09-03 | CLAIM | labile | already machine-checked via herdr-registry\n",
-            "2026-09-16 | CLAIM | to-cc/tally-introduction-r1.md | legacy file-path row\n",
+            "2026-08-15 | CLAIM | mallory | local model\n",
+            "2026-08-15 | CLAIM | Piper | web seat\n",
+            "2026-09-03 | CLAIM | liam | already machine-checked via herdr-registry\n",
+            "2026-09-16 | CLAIM | to-cc/carol-introduction-r1.md | legacy file-path row\n",
             "2026-09-17 | ACK | to-cc/foo.md | not a claim\n",
         ),
     )
@@ -3361,21 +3382,22 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     fs::write(
         &seats_tsv_path,
         concat!(
-            "# external seats map\n",
-            "ML-Papers\tlabile\t/tmp/labile\n",
-            "Pasted-text.txt attachment (fork) (fork)\tfathom\t/tmp/fathom\n",
-            "fathom-fork\tfathom\t/tmp/fathom\n",
-            "Astra-Outside-Review\tfathom\t/tmp/fathom\n",
-            "cleanup-Color_Tool_K-Means\tchroma\t/tmp/chroma\n",
-            "golem-session\tgolem\t/tmp/golem\n",
+            "# external seats map (ordinary algorithm terms like k-means are allowed)\n",
+            "Paper-Notes\tliam\t/tmp/liam\n",
+            "Notes.txt attachment (fork) (fork)\tfrank\t/tmp/frank\n",
+            "frank-fork\tfrank\t/tmp/frank\n",
+            "Codex-Outside-Review\tfrank\t/tmp/frank\n",
+            "cleanup-palette-tool\tclara\t/tmp/clara\n",
+            "operator-session\toperator\t/tmp/operator\n",
         ),
     )
     .unwrap();
 
     // Base `seed_records_from_interchange` reads all 6 house files hermetically.
-    let base_plan = seed_records_from_interchange(&interchange).unwrap();
+    let base_plan =
+        seed_records_from_interchange_with_profile(&interchange, &test_house()).unwrap();
     assert_eq!(base_plan.sources_read.len(), 6);
-    assert!(base_plan.skipped_targets.contains(&"golem".to_owned()));
+    assert!(base_plan.skipped_targets.contains(&"operator".to_owned()));
     assert!(base_plan.skipped_targets.contains(&"desktop".to_owned()));
 
     let by_seat = |plan: &rex_wave_mailbridge::SeedInterchangePlan, name: &str| {
@@ -3386,39 +3408,39 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     };
 
     assert_eq!(
-        by_seat(&base_plan, "fathom").unwrap().verified_how,
+        by_seat(&base_plan, "frank").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
-        by_seat(&base_plan, "astra-emacs-fv").unwrap().verified_how,
+        by_seat(&base_plan, "codex-org-fv").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
-        by_seat(&base_plan, "labile").unwrap().verified_how,
+        by_seat(&base_plan, "liam").unwrap().verified_how,
         Some(VerificationKind::MachineChecked),
-        "labile is in herdr-registry.tsv so MachineChecked beats ledger.md WitnessedBy"
+        "liam is in herdr-registry.tsv so MachineChecked beats ledger.md WitnessedBy"
     );
     assert_eq!(
-        by_seat(&base_plan, "plumb").unwrap().verified_how,
+        by_seat(&base_plan, "peggy").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
-        by_seat(&base_plan, "waverunner").unwrap().verified_how,
+        by_seat(&base_plan, "walter").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
-        by_seat(&base_plan, "sol_ew").unwrap().verified_how,
+        by_seat(&base_plan, "sol_ext").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
-        by_seat(&base_plan, "crest").unwrap().verified_how,
+        by_seat(&base_plan, "eve").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert!(
         by_seat(&base_plan, "excluded-seat").is_none(),
-        "w4:p1S row must be permanently excluded"
+        "w9:p1S row must be permanently excluded"
     );
-    assert!(by_seat(&base_plan, "golem").is_none());
+    assert!(by_seat(&base_plan, "operator").is_none());
     assert!(by_seat(&base_plan, "desktop").is_none());
     assert!(
         base_plan
@@ -3427,55 +3449,63 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
             .all(|c| !c.seat.as_str().contains('/'))
     );
 
-    let tally_seat = SeatName::parse("tally").unwrap();
+    let carol_seat = SeatName::parse("carol").unwrap();
     assert_eq!(
-        by_seat(&base_plan, "mote").unwrap().verified_how,
+        by_seat(&base_plan, "mallory").unwrap().verified_how,
         Some(VerificationKind::WitnessedBy {
-            seat: tally_seat.clone(),
+            seat: carol_seat.clone(),
         })
     );
     assert_eq!(
-        by_seat(&base_plan, "parallax").unwrap().verified_how,
+        by_seat(&base_plan, "piper").unwrap().verified_how,
         Some(VerificationKind::WitnessedBy {
-            seat: tally_seat.clone(),
+            seat: carol_seat.clone(),
         })
     );
     assert_eq!(
-        by_seat(&base_plan, "neon").unwrap().verified_how,
-        Some(VerificationKind::WitnessedBy { seat: tally_seat })
+        by_seat(&base_plan, "niaj").unwrap().verified_how,
+        Some(VerificationKind::WitnessedBy { seat: carol_seat })
     );
-    assert!(by_seat(&base_plan, "chroma").is_none());
+    assert!(by_seat(&base_plan, "clara").is_none());
 
     // Extended `seed_records_from_interchange_with_options` includes `seats.tsv`.
-    let ext_plan =
-        seed_records_from_interchange_with_options(&interchange, Some(&seats_tsv_path)).unwrap();
+    let ext_plan = seed_records_from_interchange_with_options(
+        &interchange,
+        Some(&seats_tsv_path),
+        &test_house(),
+    )
+    .unwrap();
     assert_eq!(ext_plan.sources_read.len(), 7);
-    let chroma = by_seat(&ext_plan, "chroma").expect("chroma seeded from seats.tsv");
-    assert_eq!(chroma.verified_how, Some(VerificationKind::MachineChecked));
+    let clara = by_seat(&ext_plan, "clara").expect("clara seeded from seats.tsv");
+    assert_eq!(clara.verified_how, Some(VerificationKind::MachineChecked));
     assert!(
-        chroma
+        clara
             .aliases
             .iter()
-            .any(|a| a.as_str() == "cleanup-color_tool_k-means")
+            .any(|a| a.as_str() == "cleanup-palette-tool")
     );
-    let fathom = by_seat(&ext_plan, "fathom").unwrap();
+    let frank = by_seat(&ext_plan, "frank").unwrap();
     assert!(
-        fathom
+        frank
             .aliases
             .iter()
-            .any(|a| a.as_str() == "astra-outside-review")
+            .any(|a| a.as_str() == "codex-outside-review")
     );
     assert!(
-        !fathom.aliases.iter().any(|a| a.as_str().contains("fork")),
+        !frank.aliases.iter().any(|a| a.as_str().contains("fork")),
         "fork/attachment session names must not be registered as aliases"
     );
-    let labile = by_seat(&ext_plan, "labile").unwrap();
-    assert!(labile.aliases.iter().any(|a| a.as_str() == "ml-papers"));
+    let liam = by_seat(&ext_plan, "liam").unwrap();
+    assert!(liam.aliases.iter().any(|a| a.as_str() == "paper-notes"));
 
     // Explicit missing `seats.tsv` returns NotFound instead of silently dropping the flag.
     let missing_seats = house.join("does-not-exist-seats.tsv");
-    let err_missing =
-        seed_records_from_interchange_with_options(&interchange, Some(&missing_seats)).unwrap_err();
+    let err_missing = seed_records_from_interchange_with_options(
+        &interchange,
+        Some(&missing_seats),
+        &test_house(),
+    )
+    .unwrap_err();
     assert!(
         matches!(err_missing, ApiError::NotFound { .. }),
         "missing explicit seats_tsv must return NotFound, got {err_missing:?}"
@@ -3486,8 +3516,12 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     {
         let symlink_seats = house.join("seats-link.tsv");
         std::os::unix::fs::symlink(&seats_tsv_path, &symlink_seats).unwrap();
-        let err = seed_records_from_interchange_with_options(&interchange, Some(&symlink_seats))
-            .unwrap_err();
+        let err = seed_records_from_interchange_with_options(
+            &interchange,
+            Some(&symlink_seats),
+            &test_house(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ApiError::Denied { .. }), "got {err:?}");
     }
 }
@@ -3499,7 +3533,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     fs::create_dir_all(root.join("mail")).unwrap();
     fs::create_dir_all(root.join("to-desktop")).unwrap();
     fs::create_dir_all(root.join("to-cc")).unwrap();
-    fs::create_dir_all(root.join("to-tally")).unwrap();
+    fs::create_dir_all(root.join("to-carol")).unwrap();
     fs::create_dir_all(root.join("state")).unwrap();
     fs::write(root.join("state/acks.jsonl"), b"").unwrap();
 
@@ -3507,21 +3541,21 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     fs::write(root.join("README.md"), b"root door\n").unwrap();
     fs::write(root.join("readme-extra.md"), b"root readme variant\n").unwrap();
     fs::write(root.join("chatter.md"), b"root chatter\n").unwrap();
-    fs::write(root.join("to-tally/README.md"), b"tally door\n").unwrap();
+    fs::write(root.join("to-carol/README.md"), b"carol door\n").unwrap();
     fs::write(root.join("to-desktop/README.md"), b"desktop door\n").unwrap();
     fs::write(root.join("mail/README.md"), b"mail door\n").unwrap();
 
     // `to-desktop/` is a shared lane: routes by `to:`/`cc:`, never emits `desktop`.
     fs::write(
         root.join("to-desktop/01-shared-review.md"),
-        b"---\nfrom: crest\nto: tally (Review Lead desk)\ncc: astra (astra_votp), tangle\n---\nbody\n",
+        b"---\nfrom: eve\nto: carol (Review Lead desk)\ncc: astra (astra_ext), trent\n---\nbody\n",
     )
     .unwrap();
 
     // `to-cc/` remains a legacy non-seat box (`SkipNonSeatTarget` for `cc`).
     fs::write(
         root.join("to-cc/02-legacy-intake.md"),
-        b"---\nfrom: crest\nto: tally\n---\nbody\n",
+        b"---\nfrom: eve\nto: carol\n---\nbody\n",
     )
     .unwrap();
 
@@ -3529,35 +3563,35 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     // and self-author exclusion on shared lanes.
     fs::write(
         root.join("mail/03-r3a-units.md"),
-        b"---\nfrom: crest\nto: foo; cc Tally (desk)\ncc: \"Genga-Opus-5 (BOTH live claimants)\", sol (sol_ew / CodeLead-expanding-worlds)\n---\nbody\n",
+        b"---\nfrom: eve\nto: foo; cc Carol (desk)\ncc: \"Dave-Opus-5 (BOTH live claimants)\", sol (sol_ext / CodeLead-demo-worlds)\n---\nbody\n",
     )
     .unwrap();
     fs::write(
         root.join("mail/04-self-author.md"),
-        b"---\nfrom: genga (session \"Genga-Opus-5.5\")\nto: genga (session users-c7); cc: tally, tally-watcher\n---\nbody\n",
+        b"---\nfrom: dave (session \"Dave-Opus-5.5\")\nto: dave (session sess-c7); cc: carol, carol-watcher\n---\nbody\n",
     )
     .unwrap();
     fs::write(
         root.join("mail/05-paren-gloss.md"),
-        b"---\nfrom: crest\nto: astra_votp (Astra), tally (CTO)\n---\nbody\n",
+        b"---\nfrom: eve\nto: astra_ext (Astra), carol (CTO)\n---\nbody\n",
     )
     .unwrap();
     fs::write(
-        root.join("to-tally/06-box-letter.md"),
-        b"---\nfrom: tally\nto: tally\n---\nbody\n",
+        root.join("to-carol/06-box-letter.md"),
+        b"---\nfrom: carol\nto: carol\n---\nbody\n",
     )
     .unwrap();
     // File path containing `/` in `to:` must never spawn bogus seats from path segments,
-    // while `tally / genga` resolves both known seats.
+    // while `carol / dave` resolves both known seats.
     fs::write(
         root.join("mail/07-slash-path-and-pair.md"),
-        b"---\nfrom: crest\nto: tally (the desk), for the cross-read with resident_memories/tally/reports/2026-10-15-republican-factory/verdict.md\ncc: tally / genga\n---\nbody\n",
+        b"---\nfrom: eve\nto: carol (the desk), for the cross-read with seats/carol/reports/2026-10-15-republican-factory/verdict.md\ncc: carol / dave\n---\nbody\n",
     )
     .unwrap();
     // Multi-author `from:` + `author:` removes every authoring seat on a shared lane.
     fs::write(
         root.join("mail/08-multi-author.md"),
-        b"---\nfrom: tally / genga\nauthor: loupe\nto: tally, genga, loupe, tangle\n---\nbody\n",
+        b"---\nfrom: carol / dave\nauthor: lucas\nto: carol, dave, lucas, trent\n---\nbody\n",
     )
     .unwrap();
 
@@ -3568,13 +3602,13 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
         seat: SeatName::parse("owner").unwrap(),
     };
     for (seat, aliases) in [
-        ("tally", vec!["tally_votp"]),
-        ("genga", vec!["genga-opus-5"]),
-        ("astra_votp", vec![]),
-        ("tangle", vec![]),
-        ("sol_ew", vec![]),
-        ("tally-watcher", vec![]),
-        ("loupe", vec![]),
+        ("carol", vec!["carol_old"]),
+        ("dave", vec!["dave-opus-5"]),
+        ("astra_ext", vec![]),
+        ("trent", vec![]),
+        ("sol_ext", vec![]),
+        ("carol-watcher", vec![]),
+        ("lucas", vec![]),
     ] {
         apply_presence_with_probe(
             &mut st,
@@ -3617,7 +3651,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     // `to-desktop/` routed by frontmatter, zero `desktop` recipients.
     assert_eq!(
         by_path["to-desktop/01-shared-review.md"],
-        vec!["astra", "astra_votp", "tally", "tangle"]
+        vec!["astra", "astra_ext", "carol", "trent"]
     );
     assert!(
         scanned
@@ -3628,35 +3662,35 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     // `to-cc/` still resolves to `cc` -> SkipNonSeatTarget.
     assert_eq!(by_path["to-cc/02-legacy-intake.md"], vec!["cc"]);
 
-    // `r3/r3a` units: `foo`, `tally` (no `desk`), `genga` (from `Genga-Opus-5`), `sol` + `sol_ew`.
+    // `r3/r3a` units: `foo`, `carol` (no `desk`), `dave` (from `Dave-Opus-5`), `sol` + `sol_ext`.
     assert_eq!(
         by_path["mail/03-r3a-units.md"],
-        vec!["foo", "genga", "sol", "sol_ew", "tally"]
+        vec!["carol", "dave", "foo", "sol", "sol_ext"]
     );
 
-    // Self-author `genga` excluded on shared lane, keeping `tally` and `tally-watcher`.
+    // Self-author `dave` excluded on shared lane, keeping `carol` and `carol-watcher`.
     assert_eq!(
         by_path["mail/04-self-author.md"],
-        vec!["tally", "tally-watcher"]
+        vec!["carol", "carol-watcher"]
     );
 
     // Parenthetical glosses `(Astra)` and `(CTO)` are ignored.
     assert_eq!(
         by_path["mail/05-paren-gloss.md"],
-        vec!["astra_votp", "tally"]
+        vec!["astra_ext", "carol"]
     );
 
-    // Box letter in `to-tally/` still targets `tally`.
-    assert_eq!(by_path["to-tally/06-box-letter.md"], vec!["tally"]);
+    // Box letter in `to-carol/` still targets `carol`.
+    assert_eq!(by_path["to-carol/06-box-letter.md"], vec!["carol"]);
 
-    // Slash path does not mint `reports` or `2026-10-15-republican-factory`, while `tally / genga` resolves both.
+    // Slash path does not mint `reports` or `2026-10-15-republican-factory`, while `carol / dave` resolves both.
     assert_eq!(
         by_path["mail/07-slash-path-and-pair.md"],
-        vec!["genga", "tally"]
+        vec!["carol", "dave"]
     );
 
-    // Multi-author `from: tally / genga` + `author: loupe` excludes all three, leaving `tangle`.
-    assert_eq!(by_path["mail/08-multi-author.md"], vec!["tangle"]);
+    // Multi-author `from: carol / dave` + `author: lucas` excludes all three, leaving `trent`.
+    assert_eq!(by_path["mail/08-multi-author.md"], vec!["trent"]);
 
     // Offline (`AliasMap::empty()`) also ignores parenthetical glosses (`CTO`, `Astra`) and path segments.
     let scanned_offline = ro.scan_letters(&AliasMap::empty()).unwrap();
@@ -3671,13 +3705,13 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
         .collect();
     assert_eq!(
         offline_by_path["mail/05-paren-gloss.md"],
-        vec!["astra_votp", "tally"]
+        vec!["astra_ext", "carol"]
     );
     assert_eq!(
         offline_by_path["mail/07-slash-path-and-pair.md"],
-        vec!["tally"]
+        vec!["carol"]
     );
-    assert_eq!(offline_by_path["mail/08-multi-author.md"], vec!["tangle"]);
+    assert_eq!(offline_by_path["mail/08-multi-author.md"], vec!["trent"]);
 
     // Verify `to-cc/02-legacy-intake.md` produces `SkipNonSeatTarget` in full shadow pass.
     let pass = run_shadow_pass(
@@ -3699,4 +3733,190 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
         })
         .collect();
     assert_eq!(non_seat_targets, vec!["cc"]);
+}
+
+#[test]
+fn house_profile_loader_defaults_when_absent_and_applies_custom_profile_when_present() {
+    let dir = TempDirGuard::new("house-profile");
+    let root = dir.path();
+
+    // Path resolution: absolute XDG wins, relative XDG is ignored, HOME falls back.
+    let xdg = root.join("xdg");
+    assert_eq!(
+        house_profile_path_from(Some(xdg.as_os_str()), Some("/home/nobody".as_ref())),
+        Some(xdg.join("rex-wave/house.json"))
+    );
+    assert_eq!(
+        house_profile_path_from(Some("relative/xdg".as_ref()), Some("/home/nobody".as_ref())),
+        Some(PathBuf::from("/home/nobody/.config/rex-wave/house.json"))
+    );
+    assert_eq!(
+        house_profile_path_from(Some("".as_ref()), Some("/home/nobody".as_ref())),
+        Some(PathBuf::from("/home/nobody/.config/rex-wave/house.json"))
+    );
+    assert_eq!(house_profile_path_from(None, None), None);
+
+    // Absent: defaults.
+    let path = xdg.join("rex-wave/house.json");
+    let absent = load_house_profile_from(&path).unwrap();
+    assert_eq!(absent, HouseProfile::default());
+    assert_eq!(absent.operator_seat.as_str(), DEFAULT_OPERATOR_SURFACE_SEAT);
+    assert_eq!(absent.witness_seat.as_str(), DEFAULT_WITNESS_SEAT);
+    assert!(absent.aliases.is_empty() && absent.excluded_herdr_targets.is_empty());
+    assert!(absent.is_operator_seat("@Operator"));
+    assert!(is_default_operator_surface_seat(" operator "));
+
+    // Present: every field applies.
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        br#"{
+            "operator_seat": "bob",
+            "witness_seat": "alice",
+            "excluded_herdr_targets": ["w9:p1S"],
+            "aliases": { "carol": ["carol_old", "carol-legacy"] }
+        }"#,
+    )
+    .unwrap();
+    let house = load_house_profile_from(&path).unwrap();
+    assert_eq!(house, {
+        let mut h = HouseProfile {
+            operator_seat: seat("bob"),
+            witness_seat: seat("alice"),
+            excluded_herdr_targets: vec!["w9:p1S".to_owned()],
+            ..HouseProfile::default()
+        };
+        h.aliases
+            .insert(seat("carol"), vec![seat("carol_old"), seat("carol-legacy")]);
+        h
+    });
+    assert!(house.is_operator_seat("@BOB") && !house.is_operator_seat("operator"));
+    // Offline PresenceState (zero claimed SeatRecords) still folds house.json aliases.
+    let mut live_st = PresenceState::with_house_profile(house.clone());
+    let offline_aliases = AliasMap::from_presence(&live_st);
+    assert_eq!(offline_aliases.canonicalize("carol_old"), "carol");
+    assert!(offline_aliases.is_operator_surface("@bob"));
+    // Once `carol` has a durable SeatRecord that drops `carol_old`, `from_presence`
+    // honors the durable record and does not resurrect the removed profile alias.
+    let mut live_seq = 0;
+    apply_presence_with_probe(
+        &mut live_st,
+        &mut live_seq,
+        Principal::Operator { seat: seat("bob") },
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            aliases: vec![seat("carol-legacy")],
+            ..empty_claim("carol")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let replaced_aliases = AliasMap::from_presence(&live_st);
+    assert_eq!(replaced_aliases.canonicalize("carol-legacy"), "carol");
+    assert_eq!(replaced_aliases.canonicalize("carol_old"), "carol_old");
+
+    // The loaded profile drives seeding: operator skipped, alias folded,
+    // excluded pane dropped, unconfirmed claims witnessed by the profile's seat.
+    let interchange = root.join("house/interchange");
+    fs::create_dir_all(interchange.join("state")).unwrap();
+    fs::write(
+        interchange.join("state/ledger.md"),
+        "2026-01-01 | CLAIM | bob | operator surface\n2026-01-01 | CLAIM | carol_old | legacy name\n2026-01-01 | CLAIM | dave | plain\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("house/herdr-registry.tsv"),
+        "eve\tw9:p1S\t2026-01-01\tpane\nfrank\tw1:p1\t2026-01-01\tpane\n",
+    )
+    .unwrap();
+    let plan = seed_records_from_interchange_with_profile(&interchange, &house).unwrap();
+    let seats: Vec<&str> = plan.claims.iter().map(|c| c.seat.as_str()).collect();
+    assert_eq!(
+        seats,
+        ["carol", "dave", "frank"],
+        "claims: {:?}",
+        plan.claims
+    );
+    assert!(plan.skipped_targets.contains(&"bob".to_owned()));
+    let carol = &plan.claims[0];
+    assert!(carol.aliases.iter().any(|a| a.as_str() == "carol_old"));
+    assert_eq!(
+        carol.verified_how,
+        Some(VerificationKind::WitnessedBy {
+            seat: seat("alice")
+        })
+    );
+
+    // The decider enforces the profile's operator surface, not the default.
+    let st = PresenceState::with_house_profile(house.clone());
+    let ctx = DecideCtx {
+        by: Principal::Operator {
+            seat: seat("owner"),
+        },
+        at: UnixMs(1_000),
+    };
+    let claim = |name: &str| PresenceCommand::PresenceClaim(empty_claim(name));
+    assert!(matches!(
+        Presence::decide(&st, &claim("bob"), &ctx),
+        Err(ApiError::Denied { .. })
+    ));
+    assert!(Presence::decide(&st, &claim("operator"), &ctx).is_ok());
+
+    // Fail closed: malformed JSON, unknown field, invalid seat name, self-alias,
+    // canonical-seat collision, or duplicate alias across two canonical seats.
+    for bad in [
+        &b"{ not json"[..],
+        br#"{ "operator_seat": "bob", "surprise": 1 }"#,
+        br#"{ "operator_seat": "Not A Seat" }"#,
+        br#"{ "aliases": { "carol": ["bob"] }, "operator_seat": "bob" }"#,
+        br#"{ "aliases": { "carol": ["carol"] } }"#,
+        br#"{ "aliases": { "carol": ["dave"], "dave": [] } }"#,
+        br#"{ "aliases": { "carol": ["shared_alias"], "dave": ["shared_alias"] } }"#,
+    ] {
+        fs::write(&path, bad).unwrap();
+        let err = load_house_profile_from(&path).unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "got {err:?}");
+    }
+
+    // Symlinks are refused even when they point at a valid profile.
+    #[cfg(unix)]
+    {
+        let real = root.join("real-house.json");
+        fs::write(&real, br#"{ "operator_seat": "bob" }"#).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        let err = load_house_profile_from(&path).unwrap_err();
+        assert!(matches!(err, ApiError::Denied { .. }), "got {err:?}");
+    }
+}
+
+#[test]
+fn letter_path_normalization_strips_any_house_root_prefix_but_not_interchange_dirs() {
+    let canon = |raw: &str| normalize_letter_path(raw).map(|n| n.canonical);
+    // Any house root ending at `/interchange/` folds away.
+    for raw in [
+        "~/mail-house/interchange/mail/x.md",
+        "/abs/root/interchange/mail/x.md",
+        "./interchange/mail/x.md",
+        "interchange/mail/x.md",
+        "mail/x.md",
+    ] {
+        assert_eq!(canon(raw).as_deref(), Some("mail/x.md"), "{raw}");
+    }
+    assert_eq!(
+        canon("/abs/root/interchange/to-bob/x.md").as_deref(),
+        Some("to-bob/x.md")
+    );
+    // A path already inside the interchange keeps its directories, even when a
+    // nested folder happens to be named `interchange`.
+    assert_eq!(
+        canon("mail/interchange/x.md").as_deref(),
+        Some("mail/interchange/x.md")
+    );
+    assert_eq!(
+        canon("to-alice/interchange/x.md").as_deref(),
+        Some("to-alice/interchange/x.md")
+    );
+    assert!(!letter_paths_match("mail/interchange/x.md", "to-bob/x.md"));
+    assert_eq!(canon("///"), None);
 }

@@ -4,6 +4,7 @@
 
 use crate::acks::{AckIndex, AliasMap};
 use crate::shadow::{RingDecision, RingReferent};
+use rex_wave_api::presence::HouseProfile;
 use rex_wave_api::{SeatName, Sha256Hex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,11 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `crates/rex-wave-mailbridge/tests/presence_and_shadow_mail.rs` that verifies
 /// each case's behavior.
 pub const GATE1_CASE_TESTS: &[(&str, &str)] = &[
-    ("genga-stale-six-days", "gate1_case_01_genga_stale_six_days"),
-    (
-        "carbon-crest-misroute",
-        "gate1_case_02_carbon_crest_misroute",
-    ),
+    ("seat-stale-six-days", "gate1_case_01_seat_stale_six_days"),
+    ("carbon-copy-misroute", "gate1_case_02_carbon_copy_misroute"),
     ("two-tables-one-name", "gate1_case_03_two_tables_one_name"),
     ("dry-run-marks-seen", "gate1_case_04_dry_run_marks_seen"),
     (
@@ -33,8 +31,8 @@ pub const GATE1_CASE_TESTS: &[(&str, &str)] = &[
 
 /// The 10 canonical Gate 1 mail-routing case IDs verified in `presence_and_shadow_mail`.
 pub const GATE1_CASE_IDS: &[&str] = &[
-    "genga-stale-six-days",
-    "carbon-crest-misroute",
+    "seat-stale-six-days",
+    "carbon-copy-misroute",
     "two-tables-one-name",
     "dry-run-marks-seen",
     "ring-types-into-a-live-turn",
@@ -86,6 +84,16 @@ impl FixtureCoverageReport {
 /// registration against [`GATE1_CASE_IDS`] (`missing_case_ids` and `unknown_case_ids`),
 /// attaching the exact verifying test function name per case ID.
 pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, String> {
+    check_gate1_fixtures_with_profile(cases_jsonl, &HouseProfile::default())
+}
+
+/// Like [`check_gate1_fixtures`], resolving any deployment-specific legacy
+/// fixture IDs through [`HouseProfile::fixture_id_aliases`] before matching
+/// [`GATE1_CASE_IDS`].
+pub fn check_gate1_fixtures_with_profile(
+    cases_jsonl: &str,
+    house: &HouseProfile,
+) -> Result<FixtureCoverageReport, String> {
     let expected: BTreeSet<&str> = GATE1_CASE_IDS.iter().copied().collect();
     let mut case_ids = Vec::new();
     let mut seen = BTreeSet::new();
@@ -98,16 +106,17 @@ pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, 
         }
         let val: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| format!("fixtures line {}: invalid JSON: {e}", idx + 1))?;
-        let id = val
+        let raw_id = val
             .get("id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("fixtures line {}: missing non-empty `id`", idx + 1))?;
+        let id = house.resolve_fixture_id(raw_id);
         if seen.insert(id.to_owned()) {
             case_ids.push(id.to_owned());
             if !expected.contains(id) {
-                unknown_case_ids.push(id.to_owned());
+                unknown_case_ids.push(raw_id.to_owned());
             }
         }
     }
@@ -813,7 +822,7 @@ mod tests {
         .unwrap();
         assert!(legacy.fixture_ids_registered());
 
-        let one_line = r#"{"id":"genga-stale-six-days"}"#;
+        let one_line = r#"{"id":"seat-stale-six-days"}"#;
         let subset = check_gate1_fixtures(one_line).unwrap();
         assert!(!subset.fixture_ids_registered());
         assert_eq!(subset.total_cases, 10);
@@ -830,17 +839,33 @@ mod tests {
 
         assert!(check_gate1_fixtures("{not-json").is_err());
         assert!(check_gate1_fixtures(r#"{"id":"   "}"#).is_err());
+
+        let mut aliased_house = HouseProfile::default();
+        aliased_house.fixture_id_aliases.insert(
+            "legacy-case-01".to_owned(),
+            "seat-stale-six-days".to_owned(),
+        );
+        let aliased_jsonl = all_ten.replace("seat-stale-six-days", "legacy-case-01");
+        assert!(
+            !check_gate1_fixtures(&aliased_jsonl)
+                .unwrap()
+                .fixture_ids_registered()
+        );
+        let mapped = check_gate1_fixtures_with_profile(&aliased_jsonl, &aliased_house).unwrap();
+        assert!(mapped.fixture_ids_registered());
+        assert!(mapped.missing_case_ids.is_empty());
+        assert!(mapped.unknown_case_ids.is_empty());
     }
 
     #[test]
     fn shadow_alias_header_propagates_to_offline_score() {
         let sha = Sha256Hex::parse("a".repeat(64)).unwrap();
-        let aliases = AliasMap::from_pairs([("tally-5.2", "tally")]);
+        let aliases = AliasMap::from_pairs([("carol-5.2", "carol")]);
         let report = ShadowPassReport {
             letters_scanned: 1,
             acks_report: Default::default(),
             decisions: vec![RingDecision::Ring {
-                seat: SeatName::parse("tally").unwrap(),
+                seat: SeatName::parse("carol").unwrap(),
                 incarnation_id: IncarnationId::parse("inc_1").unwrap(),
                 channel: RingDeliveryChannel::ClaudeMessagingSocket {
                     socket: PathBuf::from("/tmp/cc.sock"),
@@ -852,10 +877,10 @@ mod tests {
         };
         let jsonl = report.to_jsonl_with_aliases(&aliases);
         let parsed_aliases = extract_shadow_aliases(&jsonl).unwrap();
-        assert_eq!(parsed_aliases.canonicalize("Tally-5.2"), "tally");
+        assert_eq!(parsed_aliases.canonicalize("Carol-5.2"), "carol");
 
         let acks_raw =
-            format!(r#"{{"acked_by":"Tally-5.2","letter":"mail/01.md","sha256":"{sha}"}}"#);
+            format!(r#"{{"acked_by":"Carol-5.2","letter":"mail/01.md","sha256":"{sha}"}}"#);
         let ack_idx = parse_acks_jsonl(&acks_raw, &parsed_aliases).index();
         let scored = score_shadow_jsonl(&jsonl, &ack_idx, &parsed_aliases).unwrap();
         assert_eq!(scored.rings_emitted, 1);
@@ -873,7 +898,7 @@ mod tests {
         let sha_seeded = Sha256Hex::parse(format!("{}06", "f".repeat(62))).unwrap();
         let sha_absent = Sha256Hex::parse(format!("{}07", "1".repeat(62))).unwrap();
 
-        let aliases = AliasMap::from_pairs([("muse", "auburn-cepheus"), ("tally_votp", "tally")]);
+        let aliases = AliasMap::from_pairs([("maya", "heidi"), ("carol_old", "carol")]);
         let ch = RingDeliveryChannel::ClaudeMessagingSocket {
             socket: PathBuf::from("/tmp/cc.sock"),
             pid: 99,
@@ -884,28 +909,28 @@ mod tests {
             acks_report: Default::default(),
             decisions: vec![
                 RingDecision::Ring {
-                    seat: SeatName::parse("tally").unwrap(),
+                    seat: SeatName::parse("carol").unwrap(),
                     incarnation_id: inc.clone(),
                     channel: ch.clone(),
                     referent: RingReferent::new("mail/01.md", sha_rung.clone()).unwrap(),
                     time_basis: TimeBasis::LetterIdMs,
                 },
                 RingDecision::Ring {
-                    seat: SeatName::parse("auburn-cepheus").unwrap(),
+                    seat: SeatName::parse("heidi").unwrap(),
                     incarnation_id: inc.clone(),
                     channel: ch.clone(),
-                    referent: RingReferent::new("to-muse/02.md", sha_unknown.clone()).unwrap(),
+                    referent: RingReferent::new("to-maya/02.md", sha_unknown.clone()).unwrap(),
                     time_basis: TimeBasis::LetterIdMs,
                 },
                 RingDecision::Ring {
-                    seat: SeatName::parse("crest").unwrap(),
+                    seat: SeatName::parse("eve").unwrap(),
                     incarnation_id: inc.clone(),
                     channel: ch.clone(),
                     referent: RingReferent::new("mail/03.md", sha_own.clone()).unwrap(),
                     time_basis: TimeBasis::LetterIdMs,
                 },
                 RingDecision::RingDigest {
-                    seat: SeatName::parse("genga").unwrap(),
+                    seat: SeatName::parse("dave").unwrap(),
                     incarnation_id: inc,
                     channel: ch,
                     referents: vec![
@@ -923,40 +948,40 @@ mod tests {
         let seen_raw = [
             // Earlier defer:missing overwritten by later rung for same normalized key
             format!(
-                r#"{{"key":"shared-tally_votp:{}","outcome":"defer:missing","attempts":1,"ts":"2026-11-21T19:00:00Z"}}"#,
+                r#"{{"key":"shared-carol_old:{}","outcome":"defer:missing","attempts":1,"ts":"2026-11-21T19:00:00Z"}}"#,
                 &sha_rung.as_str()[..16]
             ),
             format!(
-                r#"{{"key":"shared-tally_votp:{}","outcome":"rung","attempts":2,"ts":"2026-11-21T19:02:00Z"}}"#,
+                r#"{{"key":"shared-carol_old:{}","outcome":"rung","attempts":2,"ts":"2026-11-21T19:02:00Z"}}"#,
                 &sha_rung.as_str()[..16]
             ),
-            // Legacy box/file:sha16 format with alias `to-muse` + outcome `unknown` (counts as rung)
+            // Legacy box/file:sha16 format with alias `to-maya` + outcome `unknown` (counts as rung)
             format!(
-                r#"{{"key":"to-muse/legacy-file.md:{}","outcome":"unknown","attempts":1,"ts":"2026-11-21T19:05:00Z"}}"#,
+                r#"{{"key":"to-maya/legacy-file.md:{}","outcome":"unknown","attempts":1,"ts":"2026-11-21T19:05:00Z"}}"#,
                 &sha_unknown.as_str()[..16]
             ),
             // own-knocker
             format!(
-                r#"{{"key":"shared-crest:{}","outcome":"own-knocker","attempts":1,"ts":"2026-11-21T19:06:00Z"}}"#,
+                r#"{{"key":"shared-eve:{}","outcome":"own-knocker","attempts":1,"ts":"2026-11-21T19:06:00Z"}}"#,
                 &sha_own.as_str()[..16]
             ),
             // Earlier defer:missing overwritten by unrung:gave-up
             format!(
-                r#"{{"key":"shared-genga:{}","outcome":"defer:missing","attempts":29,"ts":"2026-11-21T19:07:00Z"}}"#,
+                r#"{{"key":"shared-dave:{}","outcome":"defer:missing","attempts":29,"ts":"2026-11-21T19:07:00Z"}}"#,
                 &sha_unrung.as_str()[..16]
             ),
             format!(
-                r#"{{"key":"shared-genga:{}","outcome":"unrung:gave-up","attempts":30,"ts":"2026-11-21T19:09:00Z"}}"#,
+                r#"{{"key":"shared-dave:{}","outcome":"unrung:gave-up","attempts":30,"ts":"2026-11-21T19:09:00Z"}}"#,
                 &sha_unrung.as_str()[..16]
             ),
             // Still deferred
             format!(
-                r#"{{"key":"shared-genga:{}","outcome":"defer:busy","attempts":3,"ts":"2026-11-21T19:10:00Z"}}"#,
+                r#"{{"key":"shared-dave:{}","outcome":"defer:busy","attempts":3,"ts":"2026-11-21T19:10:00Z"}}"#,
                 &sha_defer.as_str()[..16]
             ),
             // Seeded (other)
             format!(
-                r#"{{"key":"to-genga/old.md:{}","outcome":"seeded","attempts":0,"ts":"2026-09-27T22:27:27Z"}}"#,
+                r#"{{"key":"to-dave/old.md:{}","outcome":"seeded","attempts":0,"ts":"2026-09-27T22:27:27Z"}}"#,
                 &sha_seeded.as_str()[..16]
             ),
         ]
@@ -967,11 +992,11 @@ mod tests {
         // 8 raw lines collapse to 6 normalized keys (2 overwrites).
         assert_eq!(seen_idx.len(), 6);
         assert_eq!(
-            seen_idx.outcome_for("tally", &sha_rung.as_str()[..16], &parsed_aliases),
+            seen_idx.outcome_for("carol", &sha_rung.as_str()[..16], &parsed_aliases),
             Some("rung")
         );
         assert_eq!(
-            seen_idx.outcome_for("genga", &sha_unrung.as_str()[..16], &parsed_aliases),
+            seen_idx.outcome_for("dave", &sha_unrung.as_str()[..16], &parsed_aliases),
             Some("unrung:gave-up")
         );
 

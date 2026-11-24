@@ -1,6 +1,6 @@
 //! Multi-host routing: `CompositeHost` (`AgentHost`) and `CompositeFeed` (`AgentFeed`).
 //!
-//! Structurally enforces Golem's 2026-11-21 rule: bare `antigravity` ALWAYS routes
+//! Structurally enforces the 2026-11-21 routing rule: bare `antigravity` ALWAYS routes
 //! to `T3Host`, and `bb:antigravity` is rejected outright.
 
 use crate::protocol::is_t3_thread_id;

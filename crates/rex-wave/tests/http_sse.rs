@@ -20,29 +20,13 @@ use rex_wave_store::Journal;
 use rex_wave_transport::{Authenticator, StateDirAuthenticator};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-static NONCE: AtomicU64 = AtomicU64::new(1);
-
-struct DirGuard(PathBuf);
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_dir(label: &str) -> DirGuard {
-    let n = NONCE.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("rex-wave-http-{label}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    DirGuard(p)
-}
+mod common;
+use common::fresh_dir;
 
 struct HttpReply {
     status: u16,

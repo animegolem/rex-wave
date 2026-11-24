@@ -476,10 +476,10 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
             seat: SeatName::parse("alice").unwrap(),
         },
     );
-    let nodal = LocalClient::new(
+    let nora = LocalClient::new(
         router.clone(),
         Principal::Seat {
-            seat: SeatName::parse("nodal").unwrap(),
+            seat: SeatName::parse("nora").unwrap(),
         },
     );
 
@@ -516,12 +516,12 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&outside.path, sandbox.path().join("to-nodal")).unwrap();
+        std::os::unix::fs::symlink(&outside.path, sandbox.path().join("to-nora")).unwrap();
         let escape_err = sam
             .call(MailPromote {
                 room: p1.room.clone(),
                 range: SeqRange::new(p1.seq, p2.seq).unwrap(),
-                to: vec![SeatName::parse("nodal").unwrap()],
+                to: vec![SeatName::parse("nora").unwrap()],
                 subject: "Symlink escape attempt".into(),
                 topic: "escape".into(),
                 priority: LetterPriority::Normal,
@@ -648,11 +648,11 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     }
     .resolve(sam.me())
     .unwrap();
-    let dm_exfil = nodal
+    let dm_exfil = nora
         .call(MailPromote {
             room: dm_id,
             range: SeqRange::new(Seq(1), Seq(4)).unwrap(),
-            to: vec![SeatName::parse("nodal").unwrap()],
+            to: vec![SeatName::parse("nora").unwrap()],
             subject: "leak".into(),
             topic: "leak".into(),
             priority: LetterPriority::Low,
@@ -672,7 +672,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     assert!(matches!(bad_ack, ApiError::Conflict { .. }));
     assert!(!sandbox.path().join("state/acks.jsonl").exists());
 
-    let wrong_seat_ack = nodal
+    let wrong_seat_ack = nora
         .call(MailAck {
             path: letter.path.clone(),
             sha256: letter.sha256.clone(),

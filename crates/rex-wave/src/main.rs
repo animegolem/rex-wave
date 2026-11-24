@@ -35,10 +35,10 @@ use rex_wave_board::task_org::{
 };
 use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
-    RingPolicy, ShadowWatchTracker, check_gate1_fixtures, compare_shadow_with_mailwatch_seen,
-    extract_shadow_aliases, load_claude_session_file, parse_acks_jsonl, parse_claude_session_json,
-    parse_mailwatch_seen_sources, run_shadow_pass, score_shadow_jsonl,
-    seed_records_from_interchange_with_options,
+    RingPolicy, ShadowWatchTracker, check_gate1_fixtures_with_profile,
+    compare_shadow_with_mailwatch_seen, extract_shadow_aliases, load_claude_session_file,
+    load_house_profile, parse_acks_jsonl, parse_claude_session_json, parse_mailwatch_seen_sources,
+    run_shadow_pass, score_shadow_jsonl, seed_records_from_interchange_with_options,
 };
 use rex_wave_mcp::McpServer;
 use rex_wave_runtime::{Decider, EntryMeta};
@@ -3252,8 +3252,9 @@ async fn load_live_presence_state(
     explicit_token: Option<&str>,
     offline: bool,
 ) -> Result<(PresenceState, bool), CliError> {
+    let house = rex_wave_mailbridge::load_house_profile()?;
     if offline {
-        return Ok((PresenceState::default(), false));
+        return Ok((PresenceState::with_house_profile(house), false));
     }
     let cred = resolve_cli_credential(sock_path, explicit_token)?;
     let client = match RemoteClient::connect(
@@ -3272,7 +3273,7 @@ async fn load_live_presence_state(
         }
         Err(e) => return Err(CliError::Api(e)),
     };
-    let mut state = PresenceState::default();
+    let mut state = PresenceState::with_house_profile(house);
     let mut after = Seq::ORIGIN;
     loop {
         let page = client
@@ -3435,9 +3436,11 @@ fn execute_mail_score(
 
     let fixtures = match fixtures_path {
         Some(path) => {
+            let house = load_house_profile()
+                .map_err(|e| CliError::Msg(format!("load house profile: {e}")))?;
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| CliError::Msg(format!("read fixtures {}: {e}", path.display())))?;
-            Some(check_gate1_fixtures(&raw).map_err(CliError::Msg)?)
+            Some(check_gate1_fixtures_with_profile(&raw, &house).map_err(CliError::Msg)?)
         }
         None => None,
     };
@@ -3735,7 +3738,8 @@ async fn execute_presence_seed_interchange(
     explicit_token: Option<&str>,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let plan = seed_records_from_interchange_with_options(interchange, seats_tsv)?;
+    let house = rex_wave_mailbridge::load_house_profile()?;
+    let plan = seed_records_from_interchange_with_options(interchange, seats_tsv, &house)?;
     if dry_run {
         if as_json {
             let mut val = plan.to_json_value();

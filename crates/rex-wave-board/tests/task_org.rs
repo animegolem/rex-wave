@@ -489,7 +489,7 @@ Body prose on newly added heading without an :ID:.
 
     let lock_path = emacs_lock_path(&org_path).unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink("golem@mac.99999:1700000000", &lock_path).unwrap();
+    std::os::unix::fs::symlink("operator@mac.99999:1700000000", &lock_path).unwrap();
     #[cfg(not(unix))]
     fs::write(&lock_path, "lock").unwrap();
 

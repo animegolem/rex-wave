@@ -19,6 +19,24 @@ use std::time::Duration;
 
 struct ToyRooms;
 
+/// A temp dir under `/tmp/rw-...` (never `$TMPDIR`) so `<dir>/<name>.sock`
+/// stays inside macOS's 104-byte `sun_path`. Removed on drop.
+fn short_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rw-uds-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder.tempdir_in("/tmp").unwrap();
+    assert!(
+        dir.path().as_os_str().len() < 64,
+        "{}",
+        dir.path().display()
+    );
+    dir
+}
 #[derive(Default)]
 struct ToyState {
     head: Seq,
@@ -169,7 +187,7 @@ impl AgentFeed for LeaseFeed {
 
 #[tokio::test]
 async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_tempdir();
     let sock = dir.path().join("daemon.sock");
     let (listener, daemon_uid) = bind_unix(&sock).unwrap();
 
@@ -422,7 +440,7 @@ async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
         }
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_tempdir();
     let sock = dir.path().join("daemon.sock");
     let (listener, daemon_uid) = bind_unix(&sock).unwrap();
 
@@ -501,7 +519,7 @@ async fn reply_split_across_writes_survives_a_call_issued_mid_frame() {
         }))
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_tempdir();
     let sock = dir.path().join("stub.sock");
     let listener = tokio::net::UnixListener::bind(&sock).unwrap();
 
@@ -734,7 +752,7 @@ async fn every_api_error_crosses_the_socket_without_dropping_it() {
         }
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_tempdir();
     let sock = dir.path().join("daemon.sock");
     let journal = Journal::in_memory().unwrap();
     let server = serve_on(&sock, router_with(&journal, Arc::new(Fails(every.clone()))));
@@ -805,7 +823,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
         }
     }
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_tempdir();
     let tokens_path = tmp.path().join("tokens.json");
     let mut table = PrincipalTokenTable::new();
     table
@@ -892,7 +910,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
 /// so a TUI never freezes on a dead connection.
 #[tokio::test]
 async fn daemon_restart_reconnects_and_resumes_watches_from_their_cursor() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_tempdir();
     let sock = dir.path().join("daemon.sock");
     let journal = Journal::in_memory().unwrap();
     let first = serve_on(&sock, toy_router(&journal));
@@ -1066,7 +1084,7 @@ async fn daemon_restart_reconnects_and_resumes_watches_from_their_cursor() {
 async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operator() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_tempdir();
     let state_dir = tmp.path();
     let sock = state_dir.join("daemon.sock");
     let (listener, uid) = bind_unix(&sock).unwrap();
@@ -1074,7 +1092,7 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
     let tokens_path = state_dir.join("tokens.json");
     let tokens_json = serde_json::json!({
         "tok_legacy_sam": "sam",
-        "tok_op_golem": { "kind": "operator", "seat": "golem" },
+        "tok_op_operator": { "kind": "operator", "seat": "operator" },
         "tok_worker_inline": { "kind": "worker", "wave": "w1", "role": "verifier" }
     });
     std::fs::write(&tokens_path, serde_json::to_vec(&tokens_json).unwrap()).unwrap();
@@ -1137,7 +1155,7 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
     let op = RemoteClient::connect(
         Endpoint::Unix(sock.clone()),
         Credential::Token {
-            token: "tok_op_golem".into(),
+            token: "tok_op_operator".into(),
         },
         "cli-op",
     )
@@ -1146,7 +1164,7 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
     assert_eq!(
         op.me(),
         &Principal::Operator {
-            seat: SeatName::parse("golem").unwrap()
+            seat: SeatName::parse("operator").unwrap()
         }
     );
 
@@ -1320,13 +1338,13 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
 
 #[tokio::test]
 async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_tempdir();
     let sock = tmp.path().join("daemon.sock");
     let (listener, uid) = bind_unix(&sock).unwrap();
 
     let mut table = PrincipalTokenTable::new();
     table
-        .insert_seat("tok_crest", SeatName::parse("crest").unwrap())
+        .insert_seat("tok_eve", SeatName::parse("eve").unwrap())
         .unwrap();
     let auth: Arc<dyn Authenticator> = Arc::new(PrincipalAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
@@ -1384,15 +1402,15 @@ async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
         "failed auth must not trigger hooks"
     );
 
-    let crest_principal = Principal::Seat {
-        seat: SeatName::parse("crest").unwrap(),
+    let eve_principal = Principal::Seat {
+        seat: SeatName::parse("eve").unwrap(),
     };
 
     // Normal connect -> drop fires connect then RAII disconnect immediately.
     let c1 = RemoteClient::connect(
         Endpoint::Unix(sock.clone()),
         Credential::Token {
-            token: "tok_crest".into(),
+            token: "tok_eve".into(),
         },
         "presence-hold",
     )
@@ -1403,7 +1421,7 @@ async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
         .unwrap()
         .unwrap();
     assert_eq!(ev, "connect:presence-hold");
-    assert_eq!(p1, crest_principal);
+    assert_eq!(p1, eve_principal);
 
     drop(c1);
     let (ev, d_id1, d_p1) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
@@ -1412,13 +1430,13 @@ async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
         .unwrap();
     assert_eq!(ev, "disconnect");
     assert_eq!(d_id1, id1);
-    assert_eq!(d_p1, crest_principal);
+    assert_eq!(d_p1, eve_principal);
 
     // Server cancellation/abort also fires RAII disconnect on active connections.
     let _c2 = RemoteClient::connect(
         Endpoint::Unix(sock.clone()),
         Credential::Token {
-            token: "tok_crest".into(),
+            token: "tok_eve".into(),
         },
         "hold-until-shutdown",
     )
@@ -1430,7 +1448,7 @@ async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
         .unwrap();
     assert_eq!(ev, "connect:hold-until-shutdown");
     assert_ne!(id2, id1);
-    assert_eq!(p2, crest_principal);
+    assert_eq!(p2, eve_principal);
 
     server.abort();
     let (ev, d_id2, d_p2) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
@@ -1439,7 +1457,7 @@ async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
         .unwrap();
     assert_eq!(ev, "disconnect");
     assert_eq!(d_id2, id2);
-    assert_eq!(d_p2, crest_principal);
+    assert_eq!(d_p2, eve_principal);
 }
 
 #[tokio::test]
@@ -1481,13 +1499,13 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
         }
     }
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_tempdir();
     let sock = tmp.path().join("daemon.sock");
     let (listener, uid) = bind_unix(&sock).unwrap();
 
     let mut table = PrincipalTokenTable::new();
     table
-        .insert_seat("tok_crest", SeatName::parse("crest").unwrap())
+        .insert_seat("tok_eve", SeatName::parse("eve").unwrap())
         .unwrap();
     let auth: Arc<dyn Authenticator> = Arc::new(PrincipalAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
@@ -1517,7 +1535,7 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
     let client_quick = RemoteClient::connect(
         Endpoint::Unix(sock.clone()),
         Credential::Token {
-            token: "tok_crest".into(),
+            token: "tok_eve".into(),
         },
         "quick-in-flight",
     )
@@ -1552,7 +1570,7 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
     let client = RemoteClient::connect(
         Endpoint::Unix(sock),
         Credential::Token {
-            token: "tok_crest".into(),
+            token: "tok_eve".into(),
         },
         "in-flight-test",
     )
@@ -1592,7 +1610,7 @@ async fn disconnect_hook_waits_for_and_aborts_in_flight_calls_before_firing() {
 fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_tempdir();
     let tokens_path = tmp.path().join("tokens.json");
     let legacy_json = serde_json::json!({
         "tok_sam": "sam",
@@ -1670,7 +1688,7 @@ fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals(
     ));
 
     let op_principal = Principal::Operator {
-        seat: SeatName::parse("golem").unwrap(),
+        seat: SeatName::parse("operator").unwrap(),
     };
     let seat_principal = Principal::Seat {
         seat: SeatName::parse("sam").unwrap(),
@@ -1683,7 +1701,7 @@ fn legacy_tokens_json_loads_and_worker_tokens_dir_rejects_non_worker_principals(
         &forged_op,
         serde_json::to_vec(&serde_json::json!({
             "token": "tok_forged_op",
-            "principal": { "kind": "operator", "seat": "golem" }
+            "principal": { "kind": "operator", "seat": "operator" }
         }))
         .unwrap(),
     )

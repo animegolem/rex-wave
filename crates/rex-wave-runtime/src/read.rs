@@ -38,7 +38,7 @@ pub trait AgentFeed: Send + Sync + 'static {
     /// Live frames for one agent. Lease semantics: BB-side watch is held only
     /// while the returned stream is alive.
     fn live(&self, wave: &WaveSlug, role: &RoleName) -> BoxFut<'_, Result<FrameStream, ApiError>>;
-    /// Human BB project names (`proj_...` -> `"pancake-work"`), loaded from the
+    /// Human BB project names (`proj_...` -> `"demo-work"`), loaded from the
     /// local BB metadata cache with graceful fallback to `None` when offline.
     fn project_names(&self) -> Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>> {
         None

@@ -299,7 +299,7 @@ pub fn extract_letter_timestamp_detailed(
     let reply_parent_ms = in_reply_to.and_then(|raw| parse_epoch_ms_13(raw, false));
 
     // 1. 13-digit epoch ms prefix at head of filename or numeric frontmatter date_ms / id.
-    //    If this letter is a reply reusing the parent's epoch prefix (e.g., `<parent_ms>-tally-reply.md`),
+    //    If this letter is a reply reusing the parent's epoch prefix (e.g., `<parent_ms>-carol-reply.md`),
     //    do NOT mistake the parent's timestamp for the reply's own time — check `date_ms` / `date` / `ts` first.
     let mut deferred_parent_ms: Option<UnixMs> = None;
     if let Some(ts) = parse_epoch_ms_13(basename, true) {
@@ -798,7 +798,7 @@ fn read_scanned_letter(
     } else {
         for cand in fm.to.iter().chain(fm.cc.iter()) {
             if cand.require_known_alias
-                && (is_operator_surface_seat(&cand.raw)
+                && (aliases.is_operator_surface(&cand.raw)
                     || is_non_seat_target(&cand.raw)
                     || !aliases.contains_known(&cand.raw))
             {
@@ -1331,7 +1331,7 @@ pub fn decide_mail_ring(
         };
     }
 
-    if is_operator_surface_seat(letter.to.as_str()) {
+    if presence.house().is_operator_seat(letter.to.as_str()) {
         return RingDecision::SkipOperatorSurface {
             seat: letter.to.clone(),
             referent,

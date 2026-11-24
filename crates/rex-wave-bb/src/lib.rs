@@ -4297,7 +4297,7 @@ mod tests {
         let role = RoleName::parse("verifier").unwrap();
         let spec = WaveSpec {
             slug: wave.clone(),
-            project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+            project: BbProjectId::parse("proj_demo_main").unwrap(),
             goal: Body::parse("Verify OAuth refresh").unwrap(),
             defaults: AgentSpec {
                 provider: ProviderId::parse("codex").unwrap(),
@@ -4354,7 +4354,7 @@ mod tests {
                 wave: wave.clone(),
                 role: role.clone(),
                 attempt: 1,
-                project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+                project: BbProjectId::parse("proj_demo_main").unwrap(),
                 agent: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
                     model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
@@ -4441,7 +4441,7 @@ mod tests {
             .send(protocol::Up::ToolCall {
                 call_id: "call_wait_1".into(),
                 thread_id: "th_auth_verifier".into(),
-                project_id: "proj_3vs7nkyeum".into(),
+                project_id: "proj_demo_main".into(),
                 meta: None,
                 tool: "wait".into(),
                 args: serde_json::to_value(Wait::room(started.room.clone(), Seq(4), false))
@@ -4876,7 +4876,7 @@ mod tests {
                 "seq": 22,
                 "createdAt": 2020,
                 "type": "item/completed",
-                "data": { "item": { "type": "agentMessage", "text": "Posted the review to @genga." } }
+                "data": { "item": { "type": "agentMessage", "text": "Posted the review to @dave." } }
             }),
             serde_json::json!({ "seq": 23, "createdAt": 2030, "type": "turn/completed", "data": {} }),
         ];
@@ -4924,21 +4924,21 @@ mod tests {
 
         std::fs::write(
             dir.join("projects.json"),
-            r#"[{"id":"proj_edaym59nyn","name":"pancake-work"},{"id":"proj_4jp9j758nq","name":"agent-folder"}]"#,
+            r#"[{"id":"proj_demo_alpha","name":"demo-work"},{"id":"proj_demo_beta","name":"demo-house"}]"#,
         )
         .unwrap();
         let loaded = load_bb_projects_from_dir(&dir);
         assert_eq!(
             loaded
-                .get(&BbProjectId::parse("proj_edaym59nyn").unwrap())
+                .get(&BbProjectId::parse("proj_demo_alpha").unwrap())
                 .map(String::as_str),
-            Some("pancake-work")
+            Some("demo-work")
         );
         assert_eq!(
             loaded
-                .get(&BbProjectId::parse("proj_4jp9j758nq").unwrap())
+                .get(&BbProjectId::parse("proj_demo_beta").unwrap())
                 .map(String::as_str),
-            Some("agent-folder")
+            Some("demo-house")
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5042,7 +5042,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(
             tmp_dir.join("projects.json"),
-            r#"[{"id":"proj_edaym59nyn","name":"pancake-work"}]"#,
+            r#"[{"id":"proj_demo_alpha","name":"demo-work"}]"#,
         )
         .unwrap();
 
@@ -5083,17 +5083,17 @@ mod tests {
         });
 
         let op = harness.client(Principal::Operator {
-            seat: SeatName::parse("genga").unwrap(),
+            seat: SeatName::parse("dave").unwrap(),
         });
-        let project = BbProjectId::parse("proj_edaym59nyn").unwrap();
-        let wave = WaveSlug::parse("pancake-r2").unwrap();
+        let project = BbProjectId::parse("proj_demo_alpha").unwrap();
+        let wave = WaveSlug::parse("demo-r2").unwrap();
         let role = RoleName::parse("council-claude").unwrap();
         let peer_role = RoleName::parse("council-gpt").unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let names = bridge.project_names().unwrap().borrow().clone();
-                if names.get(&project).map(String::as_str) == Some("pancake-work") {
+                if names.get(&project).map(String::as_str) == Some("demo-work") {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5215,7 +5215,7 @@ mod tests {
                     "seq": 3,
                     "createdAt": 1_002,
                     "type": "item/completed",
-                    "data": { "item": { "type": "agentMessage", "text": "@genga Round 1 score: 8/10." } }
+                    "data": { "item": { "type": "agentMessage", "text": "@dave Round 1 score: 8/10." } }
                 }),
                 serde_json::json!({ "seq": 4, "createdAt": 1_003, "type": "turn/completed", "data": { "status": "completed" } }),
             ],
@@ -5316,7 +5316,7 @@ mod tests {
                 "seq": 10,
                 "createdAt": t2_start_at + 11,
                 "type": "item/completed",
-                "data": { "item": { "type": "agentMessage", "text": "@council-gpt @genga Turn 3 unposted addendum." } }
+                "data": { "item": { "type": "agentMessage", "text": "@council-gpt @dave Turn 3 unposted addendum." } }
             }),
             serde_json::json!({ "seq": 11, "createdAt": t2_start_at + 12, "type": "turn/completed", "data": { "status": "completed" } }),
         ];
@@ -5365,9 +5365,9 @@ mod tests {
         assert_eq!(
             t3_posts,
             vec![
-                "@genga Round 1 score: 8/10.".to_owned(),
+                "@dave Round 1 score: 8/10.".to_owned(),
                 "Explicit Turn 2 post".to_owned(),
-                "@council-gpt @genga Turn 3 unposted addendum.".to_owned(),
+                "@council-gpt @dave Turn 3 unposted addendum.".to_owned(),
             ]
         );
         tokio::time::sleep(Duration::from_millis(40)).await;

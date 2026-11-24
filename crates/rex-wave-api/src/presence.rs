@@ -5,11 +5,184 @@ use crate::id::{BbThreadId, IdemKey, IncarnationId, Principal, SeatName, Seq, T3
 use crate::room::RoomId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Reserved human operator surface seat name that must never become an `Active`
-/// bound seat via hooks or receive mail rings / `MailUnrung` alerts.
-pub const OPERATOR_SURFACE_SEAT: &str = "golem";
+/// Default reserved human operator surface seat name when no house profile is
+/// configured. The operator surface must never become an `Active` bound seat via
+/// hooks or receive mail rings / `MailUnrung` alerts.
+pub const DEFAULT_OPERATOR_SURFACE_SEAT: &str = "operator";
+
+/// Default seat recorded as the witness (`VerificationKind::WitnessedBy`) for
+/// seeded claims that no machine-readable source confirmed.
+pub const DEFAULT_WITNESS_SEAT: &str = "postmaster";
+
+/// Upper bound on canonical seats in [`HouseProfile::aliases`].
+pub const HOUSE_PROFILE_MAX_SEATS: usize = 256;
+/// Upper bound on aliases listed under one canonical seat.
+pub const HOUSE_PROFILE_MAX_ALIASES_PER_SEAT: usize = 64;
+/// Upper bound on [`HouseProfile::excluded_herdr_targets`] entries.
+pub const HOUSE_PROFILE_MAX_EXCLUDED_TARGETS: usize = 256;
+/// Upper bound on one excluded pane target's byte length.
+pub const HOUSE_PROFILE_MAX_TARGET_LEN: usize = 64;
+/// Upper bound on [`HouseProfile::fixture_id_aliases`] entries.
+pub const HOUSE_PROFILE_MAX_FIXTURE_ALIASES: usize = 64;
+
+/// Deployment-specific house facts that used to be compiled in: which seat is
+/// the human operator surface, which seat witnesses seeded claims, which
+/// multiplexer pane targets are never seats, canonical alias folds, and
+/// optional Gate 1 fixture ID aliases.
+///
+/// Loaded once at the process boundary (optional `house.json`) and passed down
+/// as plain data; deciders never read disk.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HouseProfile {
+    #[serde(default = "default_operator_surface_seat")]
+    pub operator_seat: SeatName,
+    #[serde(default = "default_witness_seat")]
+    pub witness_seat: SeatName,
+    #[serde(default)]
+    pub excluded_herdr_targets: Vec<String>,
+    #[serde(default)]
+    pub aliases: BTreeMap<SeatName, Vec<SeatName>>,
+    #[serde(default)]
+    pub fixture_id_aliases: BTreeMap<String, String>,
+}
+
+fn default_operator_surface_seat() -> SeatName {
+    SeatName::parse(DEFAULT_OPERATOR_SURFACE_SEAT).expect("default operator surface seat is valid")
+}
+
+fn default_witness_seat() -> SeatName {
+    SeatName::parse(DEFAULT_WITNESS_SEAT).expect("default witness seat is valid")
+}
+
+impl Default for HouseProfile {
+    fn default() -> Self {
+        Self {
+            operator_seat: default_operator_surface_seat(),
+            witness_seat: default_witness_seat(),
+            excluded_herdr_targets: Vec::new(),
+            aliases: BTreeMap::new(),
+            fixture_id_aliases: BTreeMap::new(),
+        }
+    }
+}
+
+impl HouseProfile {
+    /// Returns `true` when `raw` (optionally `@`-prefixed, any case) names this
+    /// house's operator surface seat.
+    pub fn is_operator_seat(&self, raw: &str) -> bool {
+        raw.trim()
+            .trim_start_matches('@')
+            .eq_ignore_ascii_case(self.operator_seat.as_str())
+    }
+
+    /// Returns `true` when `target` is a pane target that never names a seat.
+    pub fn is_excluded_herdr_target(&self, target: &str) -> bool {
+        self.excluded_herdr_targets.iter().any(|t| t == target)
+    }
+
+    /// Resolves an external Gate 1 fixture case ID through `fixture_id_aliases`,
+    /// returning `id` unchanged when no alias is configured.
+    pub fn resolve_fixture_id<'a>(&'a self, id: &'a str) -> &'a str {
+        self.fixture_id_aliases
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or(id)
+    }
+
+    /// Checks the profile's bounds and cross-field invariants. Loaders call this
+    /// so a malformed profile fails closed instead of half-applying.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.aliases.len() > HOUSE_PROFILE_MAX_SEATS {
+            return Err(format!(
+                "aliases: {} canonical seats exceeds limit {HOUSE_PROFILE_MAX_SEATS}",
+                self.aliases.len()
+            ));
+        }
+        if self.excluded_herdr_targets.len() > HOUSE_PROFILE_MAX_EXCLUDED_TARGETS {
+            return Err(format!(
+                "excluded_herdr_targets: {} entries exceeds limit {HOUSE_PROFILE_MAX_EXCLUDED_TARGETS}",
+                self.excluded_herdr_targets.len()
+            ));
+        }
+        if self.fixture_id_aliases.len() > HOUSE_PROFILE_MAX_FIXTURE_ALIASES {
+            return Err(format!(
+                "fixture_id_aliases: {} entries exceeds limit {HOUSE_PROFILE_MAX_FIXTURE_ALIASES}",
+                self.fixture_id_aliases.len()
+            ));
+        }
+        for target in &self.excluded_herdr_targets {
+            let t = target.trim();
+            if t.is_empty() || t.len() > HOUSE_PROFILE_MAX_TARGET_LEN || t != target {
+                return Err(format!(
+                    "excluded_herdr_targets: {target:?} must be 1..={HOUSE_PROFILE_MAX_TARGET_LEN} bytes without surrounding whitespace"
+                ));
+            }
+        }
+        for (alias_id, canon_id) in &self.fixture_id_aliases {
+            for (field, val) in [("key", alias_id), ("value", canon_id)] {
+                let trimmed = val.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > HOUSE_PROFILE_MAX_TARGET_LEN
+                    || trimmed != val
+                {
+                    return Err(format!(
+                        "fixture_id_aliases {field}: {val:?} must be 1..={HOUSE_PROFILE_MAX_TARGET_LEN} bytes without surrounding whitespace"
+                    ));
+                }
+            }
+        }
+        let mut seen_aliases: std::collections::BTreeMap<&SeatName, &SeatName> =
+            std::collections::BTreeMap::new();
+        for (canon, list) in &self.aliases {
+            if list.len() > HOUSE_PROFILE_MAX_ALIASES_PER_SEAT {
+                return Err(format!(
+                    "aliases.{canon}: {} aliases exceeds limit {HOUSE_PROFILE_MAX_ALIASES_PER_SEAT}",
+                    list.len()
+                ));
+            }
+            if self.is_operator_seat(canon.as_str())
+                || list.iter().any(|a| self.is_operator_seat(a.as_str()))
+            {
+                return Err(format!(
+                    "aliases.{canon}: the operator surface seat '{}' may not be a canonical seat or alias",
+                    self.operator_seat
+                ));
+            }
+            for alias in list {
+                if alias == canon {
+                    return Err(format!(
+                        "aliases.{canon}: self-alias '{alias}' is redundant"
+                    ));
+                }
+                if self.aliases.contains_key(alias) {
+                    return Err(format!(
+                        "aliases.{canon}: alias '{alias}' collides with canonical seat '{alias}'"
+                    ));
+                }
+                if let Some(prev_canon) = seen_aliases.insert(alias, canon)
+                    && prev_canon != canon
+                {
+                    return Err(format!(
+                        "aliases.{canon}: alias '{alias}' is already claimed by '{prev_canon}'"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns `true` when `seat` names [`DEFAULT_OPERATOR_SURFACE_SEAT`]. Callers
+/// holding a [`HouseProfile`] use [`HouseProfile::is_operator_seat`] instead.
+pub fn is_default_operator_surface_seat(raw: &str) -> bool {
+    raw.trim()
+        .trim_start_matches('@')
+        .eq_ignore_ascii_case(DEFAULT_OPERATOR_SURFACE_SEAT)
+}
 
 /// Reserved non-seat group/lane/pseudo-target names that appear in historical
 /// interchange headers (`to:`/`cc:` or `to-cc/`) but are not bindable seats.
@@ -23,13 +196,6 @@ pub const NON_SEAT_TARGETS: &[&str] = &[
     "claude",
     "unregistered-addressee",
 ];
-
-/// Returns `true` when `seat` names the reserved human operator surface (`golem`).
-pub fn is_operator_surface_seat(seat: &str) -> bool {
-    seat.trim()
-        .trim_start_matches('@')
-        .eq_ignore_ascii_case(OPERATOR_SURFACE_SEAT)
-}
 
 /// Returns `true` when `seat` names a reserved non-seat group/lane pseudo-target.
 pub fn is_non_seat_target(seat: &str) -> bool {

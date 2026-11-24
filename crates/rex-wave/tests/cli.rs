@@ -6,8 +6,10 @@ use rex_wave_store::Journal;
 use rex_wave_transport::{Authenticator, TableAuthenticator, bind_unix, serve_listener};
 use rex_wave_tui::demo::DemoClient;
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::sync::Arc;
+
+mod common;
+use common::{fresh_dir, rex_wave, rex_wave_at};
 
 struct DemoForwardService<C>(DemoClient, std::marker::PhantomData<C>);
 
@@ -26,13 +28,10 @@ where
     }
 }
 
-fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_rex-wave")
-}
-
 #[test]
 fn tui_self_test_and_schema_flags_run_standalone_zero_daemon() {
-    let self_test = Command::new(bin_path())
+    let env_dir = fresh_dir("cli-zero");
+    let self_test = rex_wave(&env_dir.0)
         .args(["tui", "--self-test"])
         .output()
         .expect("spawn rex-wave tui --self-test");
@@ -45,7 +44,7 @@ fn tui_self_test_and_schema_flags_run_standalone_zero_daemon() {
     assert!(stdout.contains("SELF-TEST PASSED"));
     assert!(stdout.contains("Org Tree"));
 
-    let schema = Command::new(bin_path())
+    let schema = rex_wave(&env_dir.0)
         .args(["schema", "--bb"])
         .output()
         .expect("spawn rex-wave schema --bb");
@@ -64,9 +63,8 @@ fn tui_self_test_and_schema_flags_run_standalone_zero_daemon() {
 
 #[tokio::test]
 async fn all_cli_verbs_round_trip_over_real_unix_socket() {
-    let dir = std::env::temp_dir().join(format!("rex-wave-cli-uds-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = fresh_dir("cli-uds");
+    let dir = dir_guard.0.clone();
     let sock_path = dir.join("daemon.sock");
     let journal_path = dir.join("journal.sqlite3");
     let goal_path = dir.join("goal.md");
@@ -106,9 +104,7 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
     let run_verb = move |args: Vec<String>| -> serde_json::Value {
         let mut full = vec!["--socket".to_owned(), sock_str.clone(), "--json".to_owned()];
         full.extend(args);
-        let out = Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
+        let out = rex_wave_at(&sock_str)
             .args(&full)
             .output()
             .expect("run rex-wave");
@@ -122,9 +118,7 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
 
     let sock_for_tok = sock_path.to_str().unwrap().to_owned();
     let tok_val = tokio::task::spawn_blocking(move || {
-        let out = Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
+        let out = rex_wave_at(&sock_for_tok)
             .args(["--socket", &sock_for_tok, "token", "--seat", "sam"])
             .output()
             .unwrap();
@@ -155,9 +149,7 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
 
     let sock_for_wait = sock_path.to_str().unwrap().to_owned();
     let wait_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
+        rex_wave_at(&sock_for_wait)
             .args([
                 "--socket",
                 &sock_for_wait,
