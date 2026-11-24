@@ -517,11 +517,11 @@ async fn audience_and_privacy_boundaries_hold() {
     let alice = Principal::Seat {
         seat: SeatName::parse("alice").unwrap(),
     };
-    let nodal = Principal::Seat {
-        seat: SeatName::parse("nodal").unwrap(),
+    let nora = Principal::Seat {
+        seat: SeatName::parse("nora").unwrap(),
     };
     let sam_c = LocalClient::new(router.clone(), sam.clone());
-    let nodal_c = LocalClient::new(router.clone(), nodal);
+    let nora_c = LocalClient::new(router.clone(), nora);
 
     let err = sam_c
         .call(InboxRaise {
@@ -559,7 +559,7 @@ async fn audience_and_privacy_boundaries_hold() {
         .await
         .unwrap();
     let dm = RoomRef::Dm { with: alice }.resolve(&sam).unwrap();
-    let denied = nodal_c
+    let denied = nora_c
         .call(Read {
             stream: StreamId::Room { room: dm },
             after: Seq::ORIGIN,

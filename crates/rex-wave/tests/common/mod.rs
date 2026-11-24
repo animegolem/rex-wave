@@ -41,11 +41,24 @@ pub fn fresh_dir(label: &str) -> DirGuard {
     } else {
         PathBuf::from("/tmp")
     };
-    let guard = Builder::new()
-        .prefix(&format!("rw-{short}-"))
+    let prefix = format!("rw-{short}-");
+    let mut builder = Builder::new();
+    builder.prefix(&prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let guard = builder
         .tempdir_in(&base)
         .expect("create private short test temp dir");
     let p = guard.path().to_path_buf();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "test dir {} must be 0700", p.display());
+    }
     assert!(
         p.as_os_str().len() < MAX_TEST_DIR_LEN,
         "test dir {} must stay under {MAX_TEST_DIR_LEN} bytes",

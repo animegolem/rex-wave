@@ -530,7 +530,7 @@ mod tests {
         "- bullet with a fairly long body that must wrap\n  - nested 😀 bullet wrapping too",
         "12. numbered item with words\n> quoted text that keeps going on and on",
         "# Heading that is long enough to wrap\n###### tiny\n####### not heading",
-        "@sol @notan: hello @x.y. ok",
+        "@sol @nordic: hello @x.y. ok",
         "tab\tseparated\r\nwindows\r\nline\u{7}bell",
         "e\u{301}e\u{301}e\u{301} combining",
     ];
@@ -601,9 +601,9 @@ mod tests {
     #[test]
     fn mention_inside_bold_and_not_in_email() {
         let p = pal();
-        let s = spans(&markdown_lines("**ask @atlas** mail a@b.c", 80, &p));
+        let s = spans(&markdown_lines("**ask @acme** mail a@b.c", 80, &p));
         assert!(s.contains(&("ask ".into(), p.bold)));
-        assert!(s.contains(&("@atlas".into(), p.mention)));
+        assert!(s.contains(&("@acme".into(), p.mention)));
         assert!(s.contains(&(" mail a@b.c".into(), p.text)));
     }
 

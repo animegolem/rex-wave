@@ -2042,7 +2042,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_carol_1seat_soak() {
             "seats": {
                 "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
                 "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" },
-                "rd-3": { "name": "nodal", "box": "/tmp/interchange/to-nodal" }
+                "rd-3": { "name": "nora", "box": "/tmp/interchange/to-nora" }
             }
         }))
         .unwrap(),
@@ -2319,7 +2319,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_carol_1seat_soak() {
             "schema": "house-roster/2",
             "seats": {
                 "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
-                "rd-2": { "name": "nodal", "box": "/tmp/interchange/to-nodal" },
+                "rd-2": { "name": "nora", "box": "/tmp/interchange/to-nora" },
                 "rd-3": { "name": "operator", "box": "/tmp/interchange/to-operator" }
             }
         }))
@@ -2534,7 +2534,7 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
     )
     .unwrap();
     let seats_tsv = estate.join("seats.tsv");
-    std::fs::write(&seats_tsv, "Chroma-Session\tchroma\t/tmp/chroma\n").unwrap();
+    std::fs::write(&seats_tsv, "Clara-Session\tclara\t/tmp/clara\n").unwrap();
 
     let dry_seed = daemon
         .cli_json(&[
@@ -2554,7 +2554,7 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
         .filter_map(|c| c["seat"].as_str())
         .collect();
     assert!(seeded_seats.contains(&"frank"));
-    assert!(seeded_seats.contains(&"chroma"));
+    assert!(seeded_seats.contains(&"clara"));
     assert!(seeded_seats.contains(&"niaj"));
     assert!(!seeded_seats.contains(&"bob"));
     assert!(

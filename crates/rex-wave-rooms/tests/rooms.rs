@@ -58,7 +58,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
     let op = LocalClient::new(router.clone(), operator("owner"));
     let sam = LocalClient::new(router.clone(), seat("sam"));
     let alice = LocalClient::new(router.clone(), seat("alice"));
-    let nodal = LocalClient::new(router.clone(), seat("nodal"));
+    let nora = LocalClient::new(router.clone(), seat("nora"));
     let conductor = LocalClient::new(
         router.clone(),
         Principal::System {
@@ -174,7 +174,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         "system wave conductor does not add itself as a chat handle"
     );
 
-    let non_member_post = nodal
+    let non_member_post = nora
         .call(RoomPost {
             room: wave_room.clone(),
             body: Body::parse("sneaking in").unwrap(),
@@ -258,7 +258,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
         .unwrap_err();
     assert!(matches!(dm_leave, ApiError::Conflict { .. }));
 
-    let outsider_dm = nodal
+    let outsider_dm = nora
         .call(RoomPost {
             room: RoomRef::Id { id: dm_from_sam.id },
             body: Body::parse("intrude").unwrap(),
@@ -332,7 +332,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
 
     let sam = LocalClient::new(router.clone(), seat("sam"));
     let alice = LocalClient::new(router.clone(), seat("alice"));
-    let nodal = LocalClient::new(router.clone(), seat("nodal"));
+    let nora = LocalClient::new(router.clone(), seat("nora"));
     let w1_ver = LocalClient::new(router.clone(), worker("w1", "verifier"));
     let w2_ver = LocalClient::new(router.clone(), worker("w2", "verifier"));
 
@@ -359,14 +359,14 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
     let unauthorized_invite = alice
         .call(RoomJoin {
             room: room.clone(),
-            member: Some(seat("nodal")),
+            member: Some(seat("nora")),
             handle: None,
         })
         .await
         .unwrap_err();
     assert!(matches!(unauthorized_invite, ApiError::Denied { .. }));
 
-    let duplicate_handle = nodal
+    let duplicate_handle = nora
         .call(RoomJoin {
             room: room.clone(),
             member: None,

@@ -1543,18 +1543,18 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         seat: SeatName::parse("owner").unwrap(),
     };
     let dave = SeatName::parse("dave").unwrap();
-    let nodal = SeatName::parse("nodal").unwrap();
-    let quire = SeatName::parse("quire").unwrap();
+    let nora = SeatName::parse("nora").unwrap();
+    let quinn = SeatName::parse("quinn").unwrap();
     let room = RoomId::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("lounge").unwrap(),
     };
 
-    // Claim dave=Active, nodal=Dormant, quire=Retired.
+    // Claim dave=Active, nora=Dormant, quinn=Retired.
     for (seq, seat, status) in [
         (1, "dave", SeatStatus::Active),
-        (2, "nodal", SeatStatus::Dormant),
-        (3, "quire", SeatStatus::Retired),
+        (2, "nora", SeatStatus::Dormant),
+        (3, "quinn", SeatStatus::Retired),
     ] {
         let env = Envelope {
             stream: StreamId::Presence,
@@ -1569,7 +1569,7 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
     }
 
     // Dormant and Retired seats raise ZERO MailUnrung cards.
-    for (seq, seat, ch) in [(1, "nodal", 'a'), (2, "quire", 'b')] {
+    for (seq, seat, ch) in [(1, "nora", 'a'), (2, "quinn", 'b')] {
         let env = Envelope {
             stream: StreamId::Mail,
             seq: Seq(seq),
@@ -1593,11 +1593,11 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         );
     }
     assert_eq!(
-        view.evaluate_mail_unrung(&nodal, UnixMs(100_000)),
+        view.evaluate_mail_unrung(&nora, UnixMs(100_000)),
         MailUnrungEval::Suppress
     );
     assert_eq!(
-        view.evaluate_mail_unrung(&quire, UnixMs(100_000)),
+        view.evaluate_mail_unrung(&quinn, UnixMs(100_000)),
         MailUnrungEval::Suppress
     );
 
@@ -2388,18 +2388,18 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
 
     // 3. Lapsed lease expires_at is honored by evaluate_mail_unrung (S7).
     let mut lease_view = HeraldView::default();
-    let baton = SeatName::parse("baton").unwrap();
+    let blake = SeatName::parse("blake").unwrap();
     lease_view.observe(&Envelope {
         stream: StreamId::Presence,
         seq: Seq(1),
         at: UnixMs(1_000),
         by: Principal::Seat {
-            seat: baton.clone(),
+            seat: blake.clone(),
         },
         event: Event::Presence(PresenceEvent::Bound {
             binding: SeatBinding {
-                seat: baton.clone(),
-                incarnation_id: IncarnationId::parse("inc-baton-1").unwrap(),
+                seat: blake.clone(),
+                incarnation_id: IncarnationId::parse("inc-blake-1").unwrap(),
                 epoch: 1,
                 lane: None,
                 endpoint: TransportEndpoint::SelfWatcher {
@@ -2427,11 +2427,11 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 name: ChannelName::parse("lounge").unwrap(),
             },
             range: (Seq(1), Seq(1)),
-            letter: letter_ref_for("baton", "after-lease-r1.md", 'a'),
+            letter: letter_ref_for("blake", "after-lease-r1.md", 'a'),
         }),
     });
     assert_eq!(
-        lease_view.evaluate_mail_unrung(&baton, UnixMs(6_000)),
+        lease_view.evaluate_mail_unrung(&blake, UnixMs(6_000)),
         MailUnrungEval::Raise {
             unread_count: 1,
             oldest_at: UnixMs(6_000),
@@ -2462,7 +2462,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
     assert!(
         op_drafts
             .iter()
-            .any(|(to, d)| to == &custom_op && d.dedupe == "mail-unrung:baton"),
+            .any(|(to, d)| to == &custom_op && d.dedupe == "mail-unrung:blake"),
         "newly observed operator must receive existing MailUnrung card"
     );
 

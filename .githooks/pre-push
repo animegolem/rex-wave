@@ -12,9 +12,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 		continue
 	fi
 	PUSH_COUNT=$((PUSH_COUNT + 1))
-	if [[ "$local_sha" != "$HEAD_SHA" ]]; then
-		printf 'pre-push: outgoing ref %s (%s) does not match checked-out HEAD (%s); check out the exact commit before pushing so ./check verifies what is pushed.\n' \
-			"$local_ref" "$local_sha" "$HEAD_SHA" >&2
+	PEELED_SHA="$(git -C "$ROOT" rev-parse --verify --quiet "${local_sha}^{commit}" || true)"
+	if [[ -z "$PEELED_SHA" ]]; then
+		printf 'pre-push: outgoing ref %s (%s) does not resolve to a commit object; refusing push.\n' \
+			"$local_ref" "$local_sha" >&2
+		exit 1
+	fi
+	if [[ "$PEELED_SHA" != "$HEAD_SHA" ]]; then
+		printf 'pre-push: outgoing ref %s (%s -> commit %s) does not match checked-out HEAD (%s); check out the exact commit before pushing so ./check verifies what is pushed.\n' \
+			"$local_ref" "$local_sha" "$PEELED_SHA" "$HEAD_SHA" >&2
 		exit 1
 	fi
 done

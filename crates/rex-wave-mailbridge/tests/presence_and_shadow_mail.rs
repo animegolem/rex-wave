@@ -471,7 +471,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             "sessionId": "sess-derived",
             "messagingSocketPath": "/tmp/cc-socks/85820.sock",
             "kind": "interactive",
-            "name": "users-f0",
+            "name": "sess-f0",
             "nameSource": "derived"
         })
         .to_string(),
@@ -1153,9 +1153,9 @@ fn gate1_case_06_a_transport_dies() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let quire = SeatName::parse("quire").unwrap();
+        let quinn = SeatName::parse("quinn").unwrap();
         let trent = SeatName::parse("trent").unwrap();
-        for (seat, tid) in [(&quire, "th_quire"), (&trent, "th_trent")] {
+        for (seat, tid) in [(&quinn, "th_quinn"), (&trent, "th_trent")] {
             apply_presence_with_probe(
                 &mut st,
                 &mut seq,
@@ -1194,10 +1194,10 @@ fn gate1_case_06_a_transport_dies() {
             |_, _| true,
         )
         .unwrap();
-        assert!(st.live_bindings_for(&quire, None, UnixMs(2_000)).is_empty());
+        assert!(st.live_bindings_for(&quinn, None, UnixMs(2_000)).is_empty());
         assert!(st.live_bindings_for(&trent, None, UnixMs(2_000)).is_empty());
         assert_eq!(
-            st.bindings_for(&quire)[0].status,
+            st.bindings_for(&quinn)[0].status,
             BindingStatus::TransportDown
         );
         assert_eq!(
@@ -1205,7 +1205,7 @@ fn gate1_case_06_a_transport_dies() {
             BindingStatus::TransportDown
         );
 
-        // Recovery restores both; then expiring ONLY quire leaves trent live.
+        // Recovery restores both; then expiring ONLY quinn leaves trent live.
         apply_presence_with_probe(
             &mut st,
             &mut seq,
@@ -1219,7 +1219,7 @@ fn gate1_case_06_a_transport_dies() {
             |_, _| true,
         )
         .unwrap();
-        assert_eq!(st.live_bindings_for(&quire, None, UnixMs(3_000)).len(), 1);
+        assert_eq!(st.live_bindings_for(&quinn, None, UnixMs(3_000)).len(), 1);
         assert_eq!(st.live_bindings_for(&trent, None, UnixMs(3_000)).len(), 1);
 
         apply_presence_with_probe(
@@ -1228,14 +1228,14 @@ fn gate1_case_06_a_transport_dies() {
             sys_p.clone(),
             UnixMs(4_000),
             PresenceCommand::PresenceExpire(PresenceExpire {
-                seat: quire.clone(),
-                incarnation_id: IncarnationId::parse("inc-quire").unwrap(),
+                seat: quinn.clone(),
+                incarnation_id: IncarnationId::parse("inc-quinn").unwrap(),
                 reason: "single thread EOF".into(),
             }),
             |_, _| true,
         )
         .unwrap();
-        assert!(st.live_bindings_for(&quire, None, UnixMs(4_000)).is_empty());
+        assert!(st.live_bindings_for(&quinn, None, UnixMs(4_000)).is_empty());
         assert_eq!(
             st.live_bindings_for(&trent, None, UnixMs(4_000)).len(),
             1,
@@ -1472,7 +1472,7 @@ fn gate1_case_08_session_names_drift() {
                     "044c8872",
                     "interactive",
                     Some("derived"),
-                    Some("users-c7"),
+                    Some("sess-c7"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -1484,7 +1484,7 @@ fn gate1_case_08_session_names_drift() {
             |_, _| true,
         )
         .unwrap();
-        // Display name drifts `users-c7` -> `users-f0` on the same `(pid, proc_start)`: refreshes seamlessly.
+        // Display name drifts `sess-c7` -> `sess-f0` on the same `(pid, proc_start)`: refreshes seamlessly.
         apply_presence_with_probe(
             &mut st,
             &mut seq,
@@ -1500,7 +1500,7 @@ fn gate1_case_08_session_names_drift() {
                     "044c8872",
                     "interactive",
                     Some("derived"),
-                    Some("users-f0"),
+                    Some("sess-f0"),
                 ),
                 liveness: LivenessMode::ProcessAndLease,
                 ttl_ms: Some(600_000),
@@ -1571,17 +1571,17 @@ fn gate1_case_09_own_watcher_liveness() {
     {
         let mut st = PresenceState::default();
         let mut seq = 0;
-        let baton = SeatName::parse("baton").unwrap();
+        let blake = SeatName::parse("blake").unwrap();
         apply_presence_with_probe(
             &mut st,
             &mut seq,
             Principal::Seat {
-                seat: baton.clone(),
+                seat: blake.clone(),
             },
             UnixMs(10_000),
             PresenceCommand::PresenceBind(PresenceBind {
-                seat: baton.clone(),
-                incarnation_id: Some(IncarnationId::parse("inc-baton-lease").unwrap()),
+                seat: blake.clone(),
+                incarnation_id: Some(IncarnationId::parse("inc-blake-lease").unwrap()),
                 lane: None,
                 endpoint: TransportEndpoint::SelfWatcher {
                     harness: "codex-cron".into(),
@@ -1600,11 +1600,11 @@ fn gate1_case_09_own_watcher_liveness() {
         )
         .unwrap();
         assert!(matches!(
-            format_delivery_status(&st, &baton, UnixMs(500_000)),
+            format_delivery_status(&st, &blake, UnixMs(500_000)),
             DeliveryStatus::Live { .. }
         ));
         assert!(matches!(
-            format_delivery_status(&st, &baton, UnixMs(910_000)),
+            format_delivery_status(&st, &blake, UnixMs(910_000)),
             DeliveryStatus::Offline { .. }
         ));
     }
@@ -2046,7 +2046,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     let b_acked = b"---\nfrom: carol\nto: lucas\n---\nalready read\n";
     let b_live = b"---\nfrom: carol\nto: lucas\n---\nnew for live lucas\n";
     let b_missed = b"---\nfrom: carol\nto: dave\n---\nmissed for offline dave\n";
-    let b_retired = b"---\nfrom: carol\nto: quire\n---\nto retired quire\n";
+    let b_retired = b"---\nfrom: carol\nto: quinn\n---\nto retired quinn\n";
     fs::write(dir.path().join("mail/01-acked.md"), b_acked).unwrap();
     fs::write(dir.path().join("mail/02-live.md"), b_live).unwrap();
     fs::write(dir.path().join("mail/03-missed.md"), b_missed).unwrap();
@@ -2068,7 +2068,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    // lucas = Active + Live (with alias `lucas-review`), dave = Active + Offline, quire = Retired.
+    // lucas = Active + Live (with alias `lucas-review`), dave = Active + Offline, quinn = Retired.
     apply_presence_with_probe(
         &mut st,
         &mut seq,
@@ -2152,7 +2152,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
         owner_p,
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
-            seat: SeatName::parse("quire").unwrap(),
+            seat: SeatName::parse("quinn").unwrap(),
             status: Some(SeatStatus::Retired),
             role: None,
             projects: Vec::new(),
@@ -2449,7 +2449,7 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
         dir.path().join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&serde_json::json!({
             "carol": { "aliases": ["carol", "carol_old", "Carol-legacy", "carol desk"] },
-            "dave": { "aliases": ["dave", "dave_old", "users-c7"] },
+            "dave": { "aliases": ["dave", "dave_old", "sess-c7"] },
             "heidi": { "aliases": ["maya", "heidi", "heidi-old"] },
             "cc": { "aliases": ["cc"] }
         }))
@@ -2947,9 +2947,9 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
     let hand_edited: ResidentManifest = serde_json::from_value(serde_json::json!({
         "schema": RESIDENT_MANIFEST_SCHEMA,
         "seats": [{
-            "seat": "nodal",
+            "seat": "nora",
             "work_class": "class_b",
-            "rex_target": "block:nodal-card"
+            "rex_target": "block:nora-card"
         }]
     }))
     .unwrap();
@@ -2966,7 +2966,7 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
         UnixMs(1_000),
         PresenceCommand::PresenceClaim(PresenceClaim {
             status: Some(SeatStatus::Dormant),
-            ..empty_claim("nodal")
+            ..empty_claim("nora")
         }),
         |_, _| true,
     )
@@ -2980,9 +2980,9 @@ fn pr20_resident_manifest_fields_claim_preserve_and_round_trip() {
         |_, _| true,
     )
     .unwrap();
-    let nodal = st2.seat(&SeatName::parse("nodal").unwrap()).unwrap();
-    assert_eq!(nodal.status, SeatStatus::Dormant);
-    assert_eq!(nodal.work_class, Some(WorkClass::ClassB));
+    let nora = st2.seat(&SeatName::parse("nora").unwrap()).unwrap();
+    assert_eq!(nora.status, SeatStatus::Dormant);
+    assert_eq!(nora.work_class, Some(WorkClass::ClassB));
 }
 
 #[test]
@@ -3253,18 +3253,18 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
     assert_eq!(rec.resume_cmd.as_deref(), Some("claude --resume orig"));
 
     // 6. A seat without `start_cmd`/`resume_cmd` may still self-replace its own metadata.
-    let nodal_seat = SeatName::parse("nodal").unwrap();
-    let nodal_p = Principal::Seat {
-        seat: nodal_seat.clone(),
+    let nora_seat = SeatName::parse("nora").unwrap();
+    let nora_p = Principal::Seat {
+        seat: nora_seat.clone(),
     };
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        nodal_p.clone(),
+        nora_p.clone(),
         UnixMs(3_600),
         PresenceCommand::PresenceClaim(PresenceClaim {
             role: Some("old-role".into()),
-            ..empty_claim("nodal")
+            ..empty_claim("nora")
         }),
         |_, _| true,
     )
@@ -3272,18 +3272,18 @@ fn pr21_start_and_resume_cmd_are_operator_only() {
     apply_presence_with_probe(
         &mut st,
         &mut seq,
-        nodal_p,
+        nora_p,
         UnixMs(3_700),
         PresenceCommand::PresenceClaim(PresenceClaim {
             role: Some("new-role".into()),
-            replace: Some(nodal_seat.clone()),
-            ..empty_claim("nodal")
+            replace: Some(nora_seat.clone()),
+            ..empty_claim("nora")
         }),
         |_, _| true,
     )
     .unwrap();
     assert_eq!(
-        st.seat(&nodal_seat)
+        st.seat(&nora_seat)
             .unwrap()
             .role
             .as_ref()
@@ -3346,7 +3346,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     .unwrap();
     fs::write(
         interchange.join("state/codex-knock-routes.tsv"),
-        "seat\thostId\tthreadId\tnote\nastra-emacs-fv\tlocal\t01a1b9c9\tEmacs Verify\n",
+        "seat\thostId\tthreadId\tnote\ncodex-org-fv\tlocal\t01a1b9c9\tEmacs Verify\n",
     )
     .unwrap();
     fs::write(
@@ -3367,7 +3367,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         concat!(
             "# Interchange ledger\n",
             "2026-08-15 | CLAIM | mallory | local model\n",
-            "2026-08-15 | CLAIM | Parallax | web seat\n",
+            "2026-08-15 | CLAIM | Piper | web seat\n",
             "2026-09-03 | CLAIM | liam | already machine-checked via herdr-registry\n",
             "2026-09-16 | CLAIM | to-cc/carol-introduction-r1.md | legacy file-path row\n",
             "2026-09-17 | ACK | to-cc/foo.md | not a claim\n",
@@ -3383,8 +3383,8 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
             "ML-Papers\tliam\t/tmp/liam\n",
             "Pasted-text.txt attachment (fork) (fork)\tfrank\t/tmp/frank\n",
             "frank-fork\tfrank\t/tmp/frank\n",
-            "Astra-Outside-Review\tfrank\t/tmp/frank\n",
-            "cleanup-Color_Tool_K-Means\tchroma\t/tmp/chroma\n",
+            "Codex-Outside-Review\tfrank\t/tmp/frank\n",
+            "cleanup-palette-tool\tclara\t/tmp/clara\n",
             "operator-session\toperator\t/tmp/operator\n",
         ),
     )
@@ -3409,7 +3409,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
-        by_seat(&base_plan, "astra-emacs-fv").unwrap().verified_how,
+        by_seat(&base_plan, "codex-org-fv").unwrap().verified_how,
         Some(VerificationKind::MachineChecked)
     );
     assert_eq!(
@@ -3454,7 +3454,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         })
     );
     assert_eq!(
-        by_seat(&base_plan, "parallax").unwrap().verified_how,
+        by_seat(&base_plan, "piper").unwrap().verified_how,
         Some(VerificationKind::WitnessedBy {
             seat: carol_seat.clone(),
         })
@@ -3463,7 +3463,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         by_seat(&base_plan, "niaj").unwrap().verified_how,
         Some(VerificationKind::WitnessedBy { seat: carol_seat })
     );
-    assert!(by_seat(&base_plan, "chroma").is_none());
+    assert!(by_seat(&base_plan, "clara").is_none());
 
     // Extended `seed_records_from_interchange_with_options` includes `seats.tsv`.
     let ext_plan = seed_records_from_interchange_with_options(
@@ -3473,20 +3473,20 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
     )
     .unwrap();
     assert_eq!(ext_plan.sources_read.len(), 7);
-    let chroma = by_seat(&ext_plan, "chroma").expect("chroma seeded from seats.tsv");
-    assert_eq!(chroma.verified_how, Some(VerificationKind::MachineChecked));
+    let clara = by_seat(&ext_plan, "clara").expect("clara seeded from seats.tsv");
+    assert_eq!(clara.verified_how, Some(VerificationKind::MachineChecked));
     assert!(
-        chroma
+        clara
             .aliases
             .iter()
-            .any(|a| a.as_str() == "cleanup-color_tool_k-means")
+            .any(|a| a.as_str() == "cleanup-palette-tool")
     );
     let frank = by_seat(&ext_plan, "frank").unwrap();
     assert!(
         frank
             .aliases
             .iter()
-            .any(|a| a.as_str() == "astra-outside-review")
+            .any(|a| a.as_str() == "codex-outside-review")
     );
     assert!(
         !frank.aliases.iter().any(|a| a.as_str().contains("fork")),
@@ -3545,7 +3545,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     // `to-desktop/` is a shared lane: routes by `to:`/`cc:`, never emits `desktop`.
     fs::write(
         root.join("to-desktop/01-shared-review.md"),
-        b"---\nfrom: eve\nto: carol (Review Lead desk)\ncc: astra (astra_votp), trent\n---\nbody\n",
+        b"---\nfrom: eve\nto: carol (Review Lead desk)\ncc: astra (astra_ext), trent\n---\nbody\n",
     )
     .unwrap();
 
@@ -3565,12 +3565,12 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     .unwrap();
     fs::write(
         root.join("mail/04-self-author.md"),
-        b"---\nfrom: dave (session \"Dave-Opus-5.5\")\nto: dave (session users-c7); cc: carol, carol-watcher\n---\nbody\n",
+        b"---\nfrom: dave (session \"Dave-Opus-5.5\")\nto: dave (session sess-c7); cc: carol, carol-watcher\n---\nbody\n",
     )
     .unwrap();
     fs::write(
         root.join("mail/05-paren-gloss.md"),
-        b"---\nfrom: eve\nto: astra_votp (Astra), carol (CTO)\n---\nbody\n",
+        b"---\nfrom: eve\nto: astra_ext (Astra), carol (CTO)\n---\nbody\n",
     )
     .unwrap();
     fs::write(
@@ -3601,7 +3601,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     for (seat, aliases) in [
         ("carol", vec!["carol_old"]),
         ("dave", vec!["dave-opus-5"]),
-        ("astra_votp", vec![]),
+        ("astra_ext", vec![]),
         ("trent", vec![]),
         ("sol_ext", vec![]),
         ("carol-watcher", vec![]),
@@ -3648,7 +3648,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     // `to-desktop/` routed by frontmatter, zero `desktop` recipients.
     assert_eq!(
         by_path["to-desktop/01-shared-review.md"],
-        vec!["astra", "astra_votp", "carol", "trent"]
+        vec!["astra", "astra_ext", "carol", "trent"]
     );
     assert!(
         scanned
@@ -3674,7 +3674,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
     // Parenthetical glosses `(Astra)` and `(CTO)` are ignored.
     assert_eq!(
         by_path["mail/05-paren-gloss.md"],
-        vec!["astra_votp", "carol"]
+        vec!["astra_ext", "carol"]
     );
 
     // Box letter in `to-carol/` still targets `carol`.
@@ -3702,7 +3702,7 @@ fn pr22_to_desktop_shared_lane_readme_skip_and_r3a_addressing() {
         .collect();
     assert_eq!(
         offline_by_path["mail/05-paren-gloss.md"],
-        vec!["astra_votp", "carol"]
+        vec!["astra_ext", "carol"]
     );
     assert_eq!(
         offline_by_path["mail/07-slash-path-and-pair.md"],
@@ -3789,10 +3789,28 @@ fn house_profile_loader_defaults_when_absent_and_applies_custom_profile_when_pre
     });
     assert!(house.is_operator_seat("@BOB") && !house.is_operator_seat("operator"));
     // Offline PresenceState (zero claimed SeatRecords) still folds house.json aliases.
-    let offline_aliases =
-        AliasMap::from_presence(&PresenceState::with_house_profile(house.clone()));
+    let mut live_st = PresenceState::with_house_profile(house.clone());
+    let offline_aliases = AliasMap::from_presence(&live_st);
     assert_eq!(offline_aliases.canonicalize("carol_old"), "carol");
     assert!(offline_aliases.is_operator_surface("@bob"));
+    // Once `carol` has a durable SeatRecord that drops `carol_old`, `from_presence`
+    // honors the durable record and does not resurrect the removed profile alias.
+    let mut live_seq = 0;
+    apply_presence_with_probe(
+        &mut live_st,
+        &mut live_seq,
+        Principal::Operator { seat: seat("bob") },
+        UnixMs(1_000),
+        PresenceCommand::PresenceClaim(PresenceClaim {
+            aliases: vec![seat("carol-legacy")],
+            ..empty_claim("carol")
+        }),
+        |_, _| true,
+    )
+    .unwrap();
+    let replaced_aliases = AliasMap::from_presence(&live_st);
+    assert_eq!(replaced_aliases.canonicalize("carol-legacy"), "carol");
+    assert_eq!(replaced_aliases.canonicalize("carol_old"), "carol_old");
 
     // The loaded profile drives seeding: operator skipped, alias folded,
     // excluded pane dropped, unconfirmed claims witnessed by the profile's seat.

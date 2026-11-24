@@ -22,10 +22,14 @@ struct ToyRooms;
 /// A temp dir under `/tmp/rw-...` (never `$TMPDIR`) so `<dir>/<name>.sock`
 /// stays inside macOS's 104-byte `sun_path`. Removed on drop.
 fn short_tempdir() -> tempfile::TempDir {
-    let dir = tempfile::Builder::new()
-        .prefix("rw-uds-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rw-uds-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder.tempdir_in("/tmp").unwrap();
     assert!(
         dir.path().as_os_str().len() < 64,
         "{}",

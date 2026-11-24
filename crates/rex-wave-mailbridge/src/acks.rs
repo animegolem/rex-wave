@@ -57,24 +57,30 @@ impl AliasMap {
         }
     }
 
-    /// Builds an alias map from the house profile's configured alias folds and
-    /// every durable `SeatRecord` in `PresenceState`, carrying the state's
-    /// operator surface seat. Durable `SeatRecord` claims take precedence over
-    /// static profile folds when present.
+    /// Builds an alias map from every durable `SeatRecord` in `PresenceState`,
+    /// falling back to the house profile's static alias folds only for canonical
+    /// seats that do not yet have a durable `SeatRecord` (such as `--offline`
+    /// runs). Once a seat has a durable record, removed aliases stay removed.
     pub fn from_presence(presence: &PresenceState) -> Self {
         let mut map = Self::empty().with_operator_seat(presence.house().operator_seat.clone());
         for (canon_seat, alias_list) in &presence.house().aliases {
-            if presence
-                .seats()
-                .values()
-                .any(|rec| rec.aliases.iter().any(|a| &a.value == canon_seat))
+            if presence.seats().contains_key(canon_seat)
+                || presence
+                    .seats()
+                    .values()
+                    .any(|rec| rec.aliases.iter().any(|a| &a.value == canon_seat))
             {
                 continue;
             }
             let canon = canon_seat.as_str();
             map.insert(canon, canon);
             for alias in alias_list {
-                if !presence.seats().contains_key(alias) {
+                if !presence.seats().contains_key(alias)
+                    && !presence
+                        .seats()
+                        .values()
+                        .any(|rec| rec.aliases.iter().any(|a| &a.value == alias))
+                {
                     map.insert(alias.as_str(), canon);
                 }
             }

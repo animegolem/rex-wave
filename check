@@ -181,6 +181,10 @@ git_rev = sys.argv[2]
 # Domain-separated SHA-256 tripwire digests keep this script free of house
 # literals while catching accidental reintroductions in paths or content.
 PRIVATE_PATH_DIGESTS = frozenset([
+    "498cc623fac49db3",
+    "a6edd614cb7d96bf",
+    "274d8306dbe09fc4",
+    "e1891630c34c4465",
     "1c2c793c35880b1d",
     "27c49b165113c1d3",
     "3a7f21d75b8e822a",
@@ -192,6 +196,13 @@ PRIVATE_PATH_DIGESTS = frozenset([
 ])
 
 PRIVATE_SEAT_DIGESTS = frozenset([
+    "834645f6e7761372",
+    "da290424be87c328",
+    "8ac20f830d196041",
+    "f33f10e685419f0e",
+    "7622c6fd484d5874",
+    "826dd4d16a706e84",
+    "02c5195505ae0e57",
     "3cce485ba4d03f29",
     "3d7666fcca7c37d1",
     "3d7d0921299d5915",
@@ -330,15 +341,20 @@ def iter_entries():
                 stdout=subprocess.PIPE,
             )
             assert proc.stdin is not None and proc.stdout is not None
-            payload = "".join(sha + "\n" for _, sha in blobs).encode("ascii")
-            proc.stdin.write(payload)
-            proc.stdin.close()
-            for rel, _ in blobs:
+            for rel, sha in blobs:
+                proc.stdin.write((sha + "\n").encode("ascii"))
+                proc.stdin.flush()
                 header = proc.stdout.readline().decode("ascii").strip().split()
+                if len(header) < 3 or header[1] == "missing":
+                    proc.stdin.close()
+                    proc.wait()
+                    sys.stderr.write("error: git cat-file missing blob {} ({})\n".format(sha, rel))
+                    sys.exit(1)
                 size = int(header[2])
                 data = proc.stdout.read(size)
                 proc.stdout.read(1)  # trailing LF
                 yield rel, data
+            proc.stdin.close()
             if proc.wait() != 0:
                 sys.stderr.write("error: git cat-file --batch failed\n")
                 sys.exit(1)
@@ -347,6 +363,30 @@ def iter_entries():
             ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
         )
         seen = set()
+        symlink_ancestors = {}
+        yielded_ancestors = set()
+
+        def check_ancestors(rel_path):
+            parts = rel_path.split("/")[:-1]
+            cur_rel = ""
+            for seg in parts:
+                cur_rel = seg if not cur_rel else (cur_rel + "/" + seg)
+                if cur_rel not in symlink_ancestors:
+                    anc_full = os.path.join(root, cur_rel)
+                    try:
+                        anc_st = os.lstat(anc_full)
+                        if stat.S_ISLNK(anc_st.st_mode):
+                            symlink_ancestors[cur_rel] = os.readlink(anc_full).encode(
+                                "utf-8", errors="surrogateescape"
+                            )
+                        else:
+                            symlink_ancestors[cur_rel] = None
+                    except FileNotFoundError:
+                        symlink_ancestors[cur_rel] = None
+                if symlink_ancestors[cur_rel] is not None:
+                    return cur_rel, symlink_ancestors[cur_rel]
+            return None
+
         for path_b in raw.split(b"\0"):
             if not path_b:
                 continue
@@ -354,6 +394,13 @@ def iter_entries():
             if rel in seen:
                 continue
             seen.add(rel)
+            anc = check_ancestors(rel)
+            if anc is not None:
+                anc_rel, anc_target = anc
+                if anc_rel not in yielded_ancestors:
+                    yielded_ancestors.add(anc_rel)
+                    yield anc_rel, anc_target
+                continue
             full = os.path.join(root, rel)
             try:
                 st = os.lstat(full)
@@ -388,10 +435,6 @@ for rel, data in iter_entries():
     m_rel_seat = find_private_seat_match(rel.lower())
     if m_rel_seat is not None:
         seat_hits.append((rel, 0, m_rel_seat))
-
-    # Skip binary blobs cleanly while still scanning UTF-8 / text files and symlinks.
-    if b"\0" in data:
-        continue
 
     check_seats = rel not in LOCKFILES_SKIP_SEAT_WORDS
     check_todos = rel != "check"
