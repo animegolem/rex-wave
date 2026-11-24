@@ -3,7 +3,7 @@
 //! coverage verification (`cases.jsonl`).
 
 use crate::acks::{AckIndex, AliasMap};
-use crate::shadow::RingDecision;
+use crate::shadow::{RingDecision, RingReferent};
 use rex_wave_api::{SeatName, Sha256Hex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -218,55 +218,127 @@ impl ShadowScoreReport {
     }
 }
 
+/// Referent-level accumulator shared by [`score_shadow_against_acks`] and
+/// [`score_shadow_jsonl`] so both count identically.
+///
+/// A `--watch` log is a sequence of transitions, so the same referent can
+/// appear on several lines. Rung referents count once per
+/// `(canonical_seat, sha256)`; a ring logged on an early pass survives a later
+/// `skip_already_acked`. Unrung referents also count once, and only when that
+/// referent never rang anywhere in the log (resolved at the end, because the
+/// ring may come after the unrung line).
+struct ScoreAccumulator<'a> {
+    report: ShadowScoreReport,
+    acks: &'a AckIndex,
+    aliases: &'a AliasMap,
+    rung: BTreeSet<(String, Sha256Hex)>,
+    unrung: BTreeMap<(String, Sha256Hex), SeatName>,
+    unrung_seats: BTreeSet<SeatName>,
+}
+
+impl<'a> ScoreAccumulator<'a> {
+    fn new(acks: &'a AckIndex, aliases: &'a AliasMap) -> Self {
+        Self {
+            report: ShadowScoreReport::default(),
+            acks,
+            aliases,
+            rung: BTreeSet::new(),
+            unrung: BTreeMap::new(),
+            unrung_seats: BTreeSet::new(),
+        }
+    }
+
+    fn ring_line<'s>(&mut self, seat: &SeatName, shas: impl IntoIterator<Item = &'s Sha256Hex>) {
+        let canon = self.aliases.canonicalize(seat.as_str());
+        let mut fresh = false;
+        for sha in shas {
+            if !self.rung.insert((canon.clone(), sha.clone())) {
+                continue;
+            }
+            fresh = true;
+            self.report
+                .record_ring_referent(seat, sha, self.acks, self.aliases);
+        }
+        if fresh {
+            self.report.rings_emitted += 1;
+        }
+    }
+
+    fn unrung_line<'s>(&mut self, seat: &SeatName, shas: impl IntoIterator<Item = &'s Sha256Hex>) {
+        let canon = self.aliases.canonicalize(seat.as_str());
+        self.unrung_seats.insert(seat.clone());
+        let mut fresh = false;
+        for sha in shas {
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.unrung.entry((canon.clone(), sha.clone()))
+            {
+                e.insert(seat.clone());
+                fresh = true;
+            }
+        }
+        if fresh {
+            self.report.unrung_alerts += 1;
+        }
+    }
+
+    fn finish(mut self) -> ShadowScoreReport {
+        for ((canon, sha), seat) in &self.unrung {
+            if self.rung.contains(&(canon.clone(), sha.clone())) {
+                continue;
+            }
+            self.report
+                .record_unrung_referent(seat, sha, self.acks, self.aliases);
+        }
+        self.report.seats_with_unrung = self.unrung_seats.into_iter().collect();
+        assert!(self.report.referents_rung == self.rung.len());
+        assert!(
+            self.report.unrung_referents_caught + self.report.unrung_referents_already_acked
+                <= self.unrung.len()
+        );
+        self.report
+    }
+}
+
 /// Scores in-memory shadow [`RingDecision`]s against ground-truth `acks.jsonl`.
 pub fn score_shadow_against_acks(
     decisions: &[RingDecision],
     acks: &AckIndex,
     aliases: &AliasMap,
 ) -> ShadowScoreReport {
-    let mut report = ShadowScoreReport {
-        total_decisions: decisions.len(),
-        ..ShadowScoreReport::default()
-    };
-    let mut unrung_seats = BTreeSet::new();
+    let mut acc = ScoreAccumulator::new(acks, aliases);
+    acc.report.total_decisions = decisions.len();
+    let report = &mut acc;
 
     for decision in decisions {
         match decision {
-            RingDecision::SkipAlreadyAcked { .. } => report.skipped_already_acked += 1,
-            RingDecision::SkipReceiptOnly { .. } => report.skipped_receipt_only += 1,
-            RingDecision::SkipDormantOrRetired { .. } => report.skipped_dormant_or_retired += 1,
-            RingDecision::SkipPreHorizonHistory { .. } => report.skipped_pre_horizon += 1,
-            RingDecision::SkipOperatorSurface { .. } => report.skipped_operator_surface += 1,
-            RingDecision::SkipNonSeatTarget { .. } => report.skipped_non_seat_target += 1,
-            RingDecision::FlagMutatedAfterAck { .. } => report.mutated_after_ack_flags += 1,
-            RingDecision::Defer { .. } => report.deferred += 1,
-            RingDecision::RefuseMissingReferent { .. } => report.missing_referent_refusals += 1,
+            RingDecision::SkipAlreadyAcked { .. } => report.report.skipped_already_acked += 1,
+            RingDecision::SkipReceiptOnly { .. } => report.report.skipped_receipt_only += 1,
+            RingDecision::SkipDormantOrRetired { .. } => {
+                report.report.skipped_dormant_or_retired += 1;
+            }
+            RingDecision::SkipPreHorizonHistory { .. } => report.report.skipped_pre_horizon += 1,
+            RingDecision::SkipOperatorSurface { .. } => {
+                report.report.skipped_operator_surface += 1;
+            }
+            RingDecision::SkipNonSeatTarget { .. } => report.report.skipped_non_seat_target += 1,
+            RingDecision::FlagMutatedAfterAck { .. } => report.report.mutated_after_ack_flags += 1,
+            RingDecision::Defer { .. } => report.report.deferred += 1,
+            RingDecision::RefuseMissingReferent { .. } => {
+                report.report.missing_referent_refusals += 1;
+            }
             RingDecision::Ring { seat, referent, .. } => {
-                report.rings_emitted += 1;
-                report.record_ring_referent(seat, referent.sha256(), acks, aliases);
+                report.ring_line(seat, [referent.sha256()]);
             }
             RingDecision::RingDigest {
                 seat, referents, ..
-            } => {
-                report.rings_emitted += 1;
-                for referent in referents {
-                    report.record_ring_referent(seat, referent.sha256(), acks, aliases);
-                }
-            }
+            } => report.ring_line(seat, referents.iter().map(RingReferent::sha256)),
             RingDecision::RaiseUnrung {
                 seat, referents, ..
-            } => {
-                report.unrung_alerts += 1;
-                unrung_seats.insert(seat.clone());
-                for referent in referents {
-                    report.record_unrung_referent(seat, referent.sha256(), acks, aliases);
-                }
-            }
+            } => report.unrung_line(seat, referents.iter().map(RingReferent::sha256)),
         }
     }
 
-    report.seats_with_unrung = unrung_seats.into_iter().collect();
-    report
+    acc.finish()
 }
 
 fn extract_referent_sha(val: &serde_json::Value, line_no: usize) -> Result<Sha256Hex, String> {
@@ -326,14 +398,15 @@ pub fn extract_shadow_aliases(shadow_jsonl: &str) -> Result<AliasMap, String> {
 
 /// Scores a JSONL shadow log produced by `ShadowPassReport::to_jsonl` or
 /// `ShadowPassReport::to_jsonl_with_aliases` against ground-truth `acks.jsonl`,
-/// matching [`score_shadow_against_acks`] exactly.
+/// matching [`score_shadow_against_acks`] exactly. Also accepts append-only
+/// `mail shadow --watch` transition logs, including several concatenated
+/// logs: referents are deduplicated by `(canonical_seat, sha256)`.
 pub fn score_shadow_jsonl(
     shadow_jsonl: &str,
     acks: &AckIndex,
     aliases: &AliasMap,
 ) -> Result<ShadowScoreReport, String> {
-    let mut report = ShadowScoreReport::default();
-    let mut unrung_seats = BTreeSet::new();
+    let mut acc = ScoreAccumulator::new(acks, aliases);
 
     for (idx, raw) in shadow_jsonl.lines().enumerate() {
         let line_no = idx + 1;
@@ -360,6 +433,7 @@ pub fn score_shadow_jsonl(
         let seat = SeatName::parse(seat_raw)
             .map_err(|e| format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}"))?;
 
+        let report = &mut acc.report;
         report.total_decisions += 1;
         match decision {
             "skip_already_acked" => report.skipped_already_acked += 1,
@@ -376,23 +450,15 @@ pub fn score_shadow_jsonl(
                     .get("referent")
                     .ok_or_else(|| format!("shadow line {line_no}: missing `referent`"))?;
                 let sha = extract_referent_sha(ref_val, line_no)?;
-                report.rings_emitted += 1;
-                report.record_ring_referent(&seat, &sha, acks, aliases);
+                acc.ring_line(&seat, [&sha]);
             }
             "ring_digest" => {
                 let shas = extract_referents_shas(obj, line_no)?;
-                report.rings_emitted += 1;
-                for sha in &shas {
-                    report.record_ring_referent(&seat, sha, acks, aliases);
-                }
+                acc.ring_line(&seat, &shas);
             }
             "raise_unrung" => {
                 let shas = extract_referents_shas(obj, line_no)?;
-                report.unrung_alerts += 1;
-                unrung_seats.insert(seat.clone());
-                for sha in &shas {
-                    report.record_unrung_referent(&seat, sha, acks, aliases);
-                }
+                acc.unrung_line(&seat, &shas);
             }
             other => {
                 return Err(format!(
@@ -402,32 +468,55 @@ pub fn score_shadow_jsonl(
         }
     }
 
-    report.seats_with_unrung = unrung_seats.into_iter().collect();
-    Ok(report)
+    Ok(acc.finish())
 }
 
-/// Parsed `.watchers/mailwatch-state/seen.jsonl` ring log indexed by normalized
-/// raw key (`<box_or_shared>:<sha16>`) and canonical `(seat, sha16)`.
+/// Parsed ring logs (`mailwatch.py`'s `.watchers/mailwatch-state/seen.jsonl`
+/// and the T3 doorbell's `seen.jsonl`) indexed by normalized raw key and by
+/// canonical `(seat, sha16)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MailwatchSeenIndex {
-    by_raw_key: BTreeMap<String, String>,
+    by_raw_key: BTreeMap<String, SeenRow>,
     by_seat_sha16: BTreeMap<(String, String), String>,
 }
 
-fn mailwatch_outcome_rank(outcome: &str) -> u8 {
-    if matches!(outcome, "rung" | "unknown") {
-        4
-    } else if outcome == "own-knocker" {
-        3
-    } else if outcome.starts_with("defer") || outcome.starts_with("unrung") {
-        2
-    } else {
-        1
+/// One normalized `seen.jsonl` row. `seat` is `None` for mailwatch boxes that
+/// are not a `shared-<seat>` or `to-<seat>` lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SeenRow {
+    seat: Option<String>,
+    sha16: String,
+    outcome: String,
+}
+
+/// How a ring watcher's `outcome` string compares with a shadow ring. The
+/// order is the precedence used when lanes disagree for one `(seat, sha16)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SeenOutcomeClass {
+    Other,
+    DeferredOrUnrung,
+    OwnKnocker,
+    Rung,
+}
+
+/// Single classifier for both watcher formats. `mailwatch.py` writes `rung`,
+/// `unknown`, `own-knocker`, `defer:*`, `unrung:*`; the T3 doorbell writes
+/// `rung`, `outcome_unknown`, `failed*`, `gave-up`, `seeded`. An unknown
+/// delivery outcome counts as rung in both, matching the watchers themselves.
+fn classify_seen_outcome(outcome: &str) -> SeenOutcomeClass {
+    match outcome {
+        "rung" | "unknown" | "outcome_unknown" => SeenOutcomeClass::Rung,
+        "own-knocker" => SeenOutcomeClass::OwnKnocker,
+        "gave-up" => SeenOutcomeClass::DeferredOrUnrung,
+        o if o.starts_with("defer") || o.starts_with("unrung") || o.starts_with("failed") => {
+            SeenOutcomeClass::DeferredOrUnrung
+        }
+        _ => SeenOutcomeClass::Other,
     }
 }
 
 impl MailwatchSeenIndex {
-    /// Number of unique normalized keys (`<box_or_shared>:<sha16>`) in `seen.jsonl`.
+    /// Number of unique normalized keys across all ingested sources.
     pub fn len(&self) -> usize {
         self.by_raw_key.len()
     }
@@ -436,8 +525,8 @@ impl MailwatchSeenIndex {
         self.by_raw_key.is_empty()
     }
 
-    /// Returns the final `mailwatch.py` outcome for `(seat, sha16)` across
-    /// `shared-<alias>` and `to-<alias>` lanes after canonicalizing `seat`.
+    /// Returns the winning outcome for `(seat, sha16)` across `shared-<alias>`,
+    /// `to-<alias>` and doorbell rows after canonicalizing `seat`.
     pub fn outcome_for(&self, seat: &str, sha16: &str, aliases: &AliasMap) -> Option<&str> {
         let canon = aliases.canonicalize(seat);
         self.by_seat_sha16
@@ -447,7 +536,7 @@ impl MailwatchSeenIndex {
 }
 
 /// Cross-check summary comparing `rex-wave` shadow rings (`ring` + `ring_digest`)
-/// against `mailwatch.py`'s `.watchers/mailwatch-state/seen.jsonl`.
+/// against ring watcher `seen.jsonl` logs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailwatchComparisonReport {
     pub seen_entries: usize,
@@ -473,78 +562,119 @@ impl MailwatchComparisonReport {
     }
 }
 
-/// Parses `.watchers/mailwatch-state/seen.jsonl` matching `mailwatch.py`'s
-/// `load_seen()` semantics: legacy `"box/file:sha16"` keys normalize to
-/// `"box:sha16"`, and later lines overwrite earlier lines for the same
-/// normalized key.
-pub fn parse_mailwatch_seen_jsonl(
-    raw: &str,
-    aliases: &AliasMap,
-) -> Result<MailwatchSeenIndex, String> {
-    let mut by_raw_key: BTreeMap<String, String> = BTreeMap::new();
+fn seen_field<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a str> {
+    obj.get(field)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
 
-    for (idx, line_raw) in raw.lines().enumerate() {
-        let line_no = idx + 1;
-        let line = line_raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let val: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| format!("mailwatch seen line {line_no}: invalid JSON: {e}"))?;
-        let obj = val
-            .as_object()
-            .ok_or_else(|| format!("mailwatch seen line {line_no}: expected JSON object"))?;
-        let key = obj
-            .get("key")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("mailwatch seen line {line_no}: missing `key` field"))?;
-        let outcome = obj
-            .get("outcome")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("mailwatch seen line {line_no}: missing `outcome` field"))?;
+/// Parses one `seen.jsonl` line into its normalized key and row.
+///
+/// - mailwatch: `{"key":"<box>[/file]:<sha16>","outcome":..}`. Legacy
+///   `box/file:sha16` keys normalize to `box:sha16` (`mailwatch.py` `load_seen()`).
+/// - T3 doorbell: `{"sha16":"<16hex>","seat":"<seat>","outcome":..}`, keyed
+///   `t3-doorbell/<seat>:<sha16>` so it never collides with a mailwatch box.
+fn parse_seen_line(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    at: &str,
+) -> Result<(String, SeenRow), String> {
+    let outcome = seen_field(obj, "outcome")
+        .ok_or_else(|| format!("{at}: missing `outcome` field"))?
+        .to_owned();
+    if let Some(key) = seen_field(obj, "key") {
         let Some((left, sha_raw)) = key.rsplit_once(':') else {
-            return Err(format!(
-                "mailwatch seen line {line_no}: key `{key}` missing `:` separator"
-            ));
+            return Err(format!("{at}: key `{key}` missing `:` separator"));
         };
         let box_part = left.split('/').next().unwrap_or(left).trim();
         let sha16 = sha_raw.trim().to_ascii_lowercase();
         if box_part.is_empty() || sha16.is_empty() {
-            return Err(format!(
-                "mailwatch seen line {line_no}: invalid key `{key}`"
-            ));
+            return Err(format!("{at}: invalid key `{key}`"));
         }
-        by_raw_key.insert(format!("{box_part}:{sha16}"), outcome.to_owned());
+        let seat = box_part
+            .strip_prefix("shared-")
+            .or_else(|| box_part.strip_prefix("to-"))
+            .map(str::to_owned);
+        let norm_key = format!("{box_part}:{sha16}");
+        return Ok((
+            norm_key,
+            SeenRow {
+                seat,
+                sha16,
+                outcome,
+            },
+        ));
+    }
+    let (Some(sha_raw), Some(seat_raw)) = (seen_field(obj, "sha16"), seen_field(obj, "seat"))
+    else {
+        return Err(format!(
+            "{at}: expected mailwatch `key` or t3-doorbell `sha16` + `seat` fields"
+        ));
+    };
+    let sha16 = sha_raw.to_ascii_lowercase();
+    if sha16.len() != 16 || !sha16.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{at}: `sha16` '{sha_raw}' is not 16 hex chars"));
+    }
+    let seat = seat_raw.trim_start_matches('@').to_ascii_lowercase();
+    let norm_key = format!("t3-doorbell/{seat}:{sha16}");
+    Ok((
+        norm_key,
+        SeenRow {
+            seat: Some(seat),
+            sha16,
+            outcome,
+        },
+    ))
+}
+
+/// Parses one or more ring watcher `seen.jsonl` sources (`(label, text)`, in
+/// order) into one merged index. Within a normalized key the later line wins;
+/// across lanes for one canonical `(seat, sha16)` the strongest outcome wins
+/// (rung > own-knocker > deferred/unrung > other). Errors name the source label.
+pub fn parse_mailwatch_seen_sources(
+    sources: &[(&str, &str)],
+    aliases: &AliasMap,
+) -> Result<MailwatchSeenIndex, String> {
+    let mut by_raw_key: BTreeMap<String, SeenRow> = BTreeMap::new();
+
+    for (label, raw) in sources {
+        for (idx, line_raw) in raw.lines().enumerate() {
+            let at = format!("{label} line {}", idx + 1);
+            let line = line_raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let val: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| format!("{at}: invalid JSON: {e}"))?;
+            let obj = val
+                .as_object()
+                .ok_or_else(|| format!("{at}: expected JSON object"))?;
+            let (norm_key, row) = parse_seen_line(obj, &at)?;
+            by_raw_key.insert(norm_key, row);
+        }
     }
 
     let mut by_seat_sha16: BTreeMap<(String, String), String> = BTreeMap::new();
-    for (norm_key, outcome) in &by_raw_key {
-        let Some((box_part, sha16)) = norm_key.rsplit_once(':') else {
-            continue;
-        };
-        let Some(raw_seat) = box_part
-            .strip_prefix("shared-")
-            .or_else(|| box_part.strip_prefix("to-"))
-        else {
+    for row in by_raw_key.values() {
+        let Some(raw_seat) = row.seat.as_deref() else {
             continue;
         };
         let canon = aliases.canonicalize(raw_seat);
         if canon.is_empty() {
             continue;
         }
-        let map_key = (canon, sha16.to_owned());
+        let map_key = (canon, row.sha16.clone());
         match by_seat_sha16.get_mut(&map_key) {
             Some(prev) => {
-                if mailwatch_outcome_rank(outcome) >= mailwatch_outcome_rank(prev) {
-                    *prev = outcome.clone();
+                if classify_seen_outcome(&row.outcome) >= classify_seen_outcome(prev) {
+                    *prev = row.outcome.clone();
                 }
             }
             None => {
-                by_seat_sha16.insert(map_key, outcome.clone());
+                by_seat_sha16.insert(map_key, row.outcome.clone());
             }
         }
     }
@@ -555,9 +685,20 @@ pub fn parse_mailwatch_seen_jsonl(
     })
 }
 
+/// Parses one `seen.jsonl` (mailwatch or T3 doorbell format). See
+/// [`parse_mailwatch_seen_sources`] for merging several files.
+pub fn parse_mailwatch_seen_jsonl(
+    raw: &str,
+    aliases: &AliasMap,
+) -> Result<MailwatchSeenIndex, String> {
+    parse_mailwatch_seen_sources(&[("mailwatch seen", raw)], aliases)
+}
+
 /// Compares `ring` and `ring_digest` referents emitted in `shadow_jsonl`
-/// against a parsed [`MailwatchSeenIndex`]. Per `mailwatch.py`, both `"rung"`
-/// and `"unknown"` count as rung (`agreed_rung`).
+/// against a parsed [`MailwatchSeenIndex`]. Each `(canonical_seat, sha256)`
+/// referent is compared once even if it appears on several lines (watch
+/// logs, concatenated logs). `rung`, `unknown` and `outcome_unknown` all count
+/// as `agreed_rung`.
 pub fn compare_shadow_with_mailwatch_seen(
     shadow_jsonl: &str,
     seen: &MailwatchSeenIndex,
@@ -567,17 +708,24 @@ pub fn compare_shadow_with_mailwatch_seen(
         seen_entries: seen.len(),
         ..MailwatchComparisonReport::default()
     };
+    let mut compared: BTreeSet<(String, Sha256Hex)> = BTreeSet::new();
 
     let mut record = |seat: &SeatName, sha: &Sha256Hex| {
+        if !compared.insert((aliases.canonicalize(seat.as_str()), sha.clone())) {
+            return;
+        }
         report.shadow_ring_referents += 1;
         let sha16 = &sha.as_str()[..16];
-        match seen.outcome_for(seat.as_str(), sha16, aliases) {
-            Some("rung" | "unknown") => report.agreed_rung += 1,
-            Some("own-knocker") => report.own_knocker_in_mailwatch += 1,
-            Some(o) if o.starts_with("defer") || o.starts_with("unrung") => {
+        match seen
+            .outcome_for(seat.as_str(), sha16, aliases)
+            .map(classify_seen_outcome)
+        {
+            Some(SeenOutcomeClass::Rung) => report.agreed_rung += 1,
+            Some(SeenOutcomeClass::OwnKnocker) => report.own_knocker_in_mailwatch += 1,
+            Some(SeenOutcomeClass::DeferredOrUnrung) => {
                 report.deferred_or_unrung_in_mailwatch += 1;
             }
-            Some(_) => report.other_in_mailwatch += 1,
+            Some(SeenOutcomeClass::Other) => report.other_in_mailwatch += 1,
             None => report.absent_in_mailwatch += 1,
         }
     };
@@ -600,35 +748,24 @@ pub fn compare_shadow_with_mailwatch_seen(
             .get("decision")
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("shadow line {line_no}: missing `decision` field"))?;
-        match decision {
-            "ring" => {
-                let seat_raw = obj
-                    .get("seat")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("shadow line {line_no}: missing `seat` field"))?;
-                let seat = SeatName::parse(seat_raw).map_err(|e| {
-                    format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}")
-                })?;
-                let ref_val = obj
-                    .get("referent")
-                    .ok_or_else(|| format!("shadow line {line_no}: missing `referent`"))?;
-                let sha = extract_referent_sha(ref_val, line_no)?;
-                record(&seat, &sha);
+        if !matches!(decision, "ring" | "ring_digest") {
+            continue;
+        }
+        let seat_raw = obj
+            .get("seat")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("shadow line {line_no}: missing `seat` field"))?;
+        let seat = SeatName::parse(seat_raw)
+            .map_err(|e| format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}"))?;
+        if decision == "ring" {
+            let ref_val = obj
+                .get("referent")
+                .ok_or_else(|| format!("shadow line {line_no}: missing `referent`"))?;
+            record(&seat, &extract_referent_sha(ref_val, line_no)?);
+        } else {
+            for sha in &extract_referents_shas(obj, line_no)? {
+                record(&seat, sha);
             }
-            "ring_digest" => {
-                let seat_raw = obj
-                    .get("seat")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("shadow line {line_no}: missing `seat` field"))?;
-                let seat = SeatName::parse(seat_raw).map_err(|e| {
-                    format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}")
-                })?;
-                let shas = extract_referents_shas(obj, line_no)?;
-                for sha in &shas {
-                    record(&seat, sha);
-                }
-            }
-            _ => {}
         }
     }
 

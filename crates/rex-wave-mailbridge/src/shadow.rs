@@ -1025,7 +1025,7 @@ pub enum DeferReason {
 pub enum RingDecision {
     SkipAlreadyAcked {
         seat: SeatName,
-        sha256: Sha256Hex,
+        referent: RingReferent,
         time_basis: TimeBasis,
     },
     SkipReceiptOnly {
@@ -1123,12 +1123,14 @@ impl RingDecision {
         match self {
             RingDecision::SkipAlreadyAcked {
                 seat,
-                sha256,
+                referent,
                 time_basis,
             } => serde_json::json!({
                 "decision": "skip_already_acked",
                 "seat": seat.as_str(),
-                "sha256": sha256.as_str(),
+                // Top-level `sha256` kept for logs scored by older readers.
+                "sha256": referent.sha256().as_str(),
+                "referent": referent.to_json_value(),
                 "time_basis": time_basis.as_str(),
             }),
             RingDecision::SkipReceiptOnly {
@@ -1300,7 +1302,7 @@ pub fn decide_mail_ring(
     if ack_index.is_acked_by_digest(letter.to.as_str(), &letter.sha256, aliases) {
         return RingDecision::SkipAlreadyAcked {
             seat: letter.to.clone(),
-            sha256: letter.sha256.clone(),
+            referent,
             time_basis,
         };
     }
@@ -1678,4 +1680,330 @@ pub fn run_shadow_pass(
         acks_report,
         decisions,
     })
+}
+
+/// Upper bound on `(seat, sha256)` referents plus refusals one
+/// [`ShadowWatchTracker`] remembers. A house that outgrows it gets a loud error
+/// instead of silent unbounded growth.
+pub const WATCH_TRACKER_MAX_ENTRIES: usize = 1_000_000;
+
+/// Last-emitted watch state of one `(seat, sha256)` referent. Holds the
+/// decision kind plus only the discriminant that marks a real transition;
+/// per-pass churn (`pass_count`, deadlines, channel, incarnation,
+/// `time_basis`) is deliberately absent so an unchanged referent stays quiet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchDecisionState {
+    SkipAlreadyAcked,
+    SkipReceiptOnly,
+    SkipDormantOrRetired { status: String },
+    SkipPreHorizonHistory,
+    SkipOperatorSurface,
+    SkipNonSeatTarget,
+    FlagMutatedAfterAck { prior_ack_sha: String },
+    Ring,
+    Defer { reason_kind: String },
+    RaiseUnrung,
+}
+
+/// What one shadow JSON decision line asserts about watch state. Derived from
+/// the serialized line for both live decisions and hydration, so the two paths
+/// cannot disagree about what counts as a transition.
+enum WatchLineFacts {
+    Single {
+        key: (SeatName, Sha256Hex),
+        state: WatchDecisionState,
+    },
+    Multi {
+        seat: SeatName,
+        shas: Vec<Sha256Hex>,
+        state: WatchDecisionState,
+    },
+    Refusal {
+        key: (SeatName, String),
+    },
+}
+
+fn watch_str<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    line_no: usize,
+) -> Result<&'a str, String> {
+    obj.get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("shadow line {line_no}: missing `{field}` field"))
+}
+
+fn watch_sha(raw: Option<&serde_json::Value>, line_no: usize) -> Result<Sha256Hex, String> {
+    let raw = raw
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("shadow line {line_no}: referent missing `sha256`"))?;
+    Sha256Hex::parse(raw).map_err(|e| format!("shadow line {line_no}: invalid `sha256`: {e}"))
+}
+
+fn watch_line_facts(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    line_no: usize,
+) -> Result<WatchLineFacts, String> {
+    let decision = watch_str(obj, "decision", line_no)?;
+    let seat_raw = watch_str(obj, "seat", line_no)?;
+    let seat = SeatName::parse(seat_raw)
+        .map_err(|e| format!("shadow line {line_no}: invalid `seat` '{seat_raw}': {e}"))?;
+    let referent_sha = || watch_sha(obj.get("referent").and_then(|r| r.get("sha256")), line_no);
+    let single = |sha: Sha256Hex, state: WatchDecisionState| WatchLineFacts::Single {
+        key: (seat.clone(), sha),
+        state,
+    };
+    let multi = |state: WatchDecisionState| -> Result<WatchLineFacts, String> {
+        let arr = obj
+            .get("referents")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("shadow line {line_no}: missing `referents` array"))?;
+        let shas = arr
+            .iter()
+            .map(|item| watch_sha(item.get("sha256"), line_no))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(WatchLineFacts::Multi {
+            seat: seat.clone(),
+            shas,
+            state,
+        })
+    };
+    Ok(match decision {
+        // Older logs carry only the top-level `sha256` on this kind.
+        "skip_already_acked" => single(
+            watch_sha(
+                obj.get("referent")
+                    .and_then(|r| r.get("sha256"))
+                    .or_else(|| obj.get("sha256")),
+                line_no,
+            )?,
+            WatchDecisionState::SkipAlreadyAcked,
+        ),
+        "skip_receipt_only" => single(referent_sha()?, WatchDecisionState::SkipReceiptOnly),
+        "skip_dormant_or_retired" => single(
+            referent_sha()?,
+            WatchDecisionState::SkipDormantOrRetired {
+                status: watch_str(obj, "status", line_no)?.to_owned(),
+            },
+        ),
+        "skip_pre_horizon_history" => {
+            single(referent_sha()?, WatchDecisionState::SkipPreHorizonHistory)
+        }
+        "skip_operator_surface" => single(referent_sha()?, WatchDecisionState::SkipOperatorSurface),
+        "skip_non_seat_target" => single(referent_sha()?, WatchDecisionState::SkipNonSeatTarget),
+        "flag_mutated_after_ack" => single(
+            referent_sha()?,
+            WatchDecisionState::FlagMutatedAfterAck {
+                prior_ack_sha: watch_str(obj, "prior_ack_sha", line_no)?.to_owned(),
+            },
+        ),
+        "ring" => single(referent_sha()?, WatchDecisionState::Ring),
+        "defer" => {
+            // `reason` is `Debug` output such as `TargetBusy { pass_count: 2 }`;
+            // only the variant name is a transition.
+            let reason = watch_str(obj, "reason", line_no)?;
+            let reason_kind: String = reason
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            if reason_kind.is_empty() {
+                return Err(format!(
+                    "shadow line {line_no}: defer `reason` '{reason}' has no kind"
+                ));
+            }
+            single(referent_sha()?, WatchDecisionState::Defer { reason_kind })
+        }
+        "ring_digest" => multi(WatchDecisionState::Ring)?,
+        "raise_unrung" => multi(WatchDecisionState::RaiseUnrung)?,
+        "refuse_missing_referent" => WatchLineFacts::Refusal {
+            key: (seat.clone(), watch_str(obj, "reason", line_no)?.to_owned()),
+        },
+        other => {
+            return Err(format!(
+                "shadow line {line_no}: unknown decision kind '{other}'"
+            ));
+        }
+    })
+}
+
+/// Lines a [`ShadowWatchTracker`] pass decided to append.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchDelta {
+    /// JSONL to append verbatim; empty when nothing transitioned.
+    pub jsonl: String,
+    /// Decision lines in `jsonl` (alias header lines excluded).
+    pub decision_lines: usize,
+    /// `{"meta":"aliases"}` lines in `jsonl` (0 or 1).
+    pub alias_lines: usize,
+}
+
+/// Pure, deterministic `mail shadow --watch` transition tracker. Remembers the
+/// last state emitted per `(seat, sha256)` and the alias mappings already
+/// written so each pass appends only deltas. Hydrating from an existing log
+/// lets a restarted watcher continue the same append-only file without
+/// duplicating its baseline.
+#[derive(Clone, Debug, Default)]
+pub struct ShadowWatchTracker {
+    states: BTreeMap<(SeatName, Sha256Hex), WatchDecisionState>,
+    refusals: BTreeSet<(SeatName, String)>,
+    aliases: BTreeMap<String, String>,
+}
+
+impl ShadowWatchTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hydrates from an existing shadow JSONL log (snapshot or watch format).
+    /// Later lines win for the same referent. Any malformed line is an error:
+    /// appending onto a log we cannot read would corrupt it further.
+    pub fn from_existing_jsonl(existing: &str) -> Result<Self, String> {
+        let mut tracker = Self::new();
+        for (idx, raw) in existing.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let val: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("shadow line {line_no}: invalid JSON: {e}"))?;
+            let obj = val
+                .as_object()
+                .ok_or_else(|| format!("shadow line {line_no}: expected JSON object"))?;
+            if obj.get("meta").and_then(|v| v.as_str()) == Some("aliases") {
+                let map = obj
+                    .get("aliases")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| format!("shadow line {line_no}: missing `aliases` object"))?;
+                for (k, v) in map {
+                    let canon = v.as_str().ok_or_else(|| {
+                        format!("shadow line {line_no}: alias target for `{k}` must be a string")
+                    })?;
+                    tracker.aliases.insert(k.clone(), canon.to_owned());
+                }
+                continue;
+            }
+            match watch_line_facts(obj, line_no)? {
+                WatchLineFacts::Single { key, state } => {
+                    tracker.states.insert(key, state);
+                }
+                WatchLineFacts::Multi { seat, shas, state } => {
+                    for sha in shas {
+                        tracker.states.insert((seat.clone(), sha), state.clone());
+                    }
+                }
+                WatchLineFacts::Refusal { key } => {
+                    tracker.refusals.insert(key);
+                }
+            }
+            tracker.check_bound()?;
+        }
+        Ok(tracker)
+    }
+
+    /// Number of `(seat, sha256)` referents with a remembered state.
+    pub fn tracked_referents(&self) -> usize {
+        self.states.len()
+    }
+
+    pub fn state_of(&self, seat: &SeatName, sha256: &Sha256Hex) -> Option<&WatchDecisionState> {
+        self.states.get(&(seat.clone(), sha256.clone()))
+    }
+
+    fn check_bound(&self) -> Result<(), String> {
+        let total = self.states.len() + self.refusals.len();
+        if total > WATCH_TRACKER_MAX_ENTRIES {
+            return Err(format!(
+                "shadow watch tracker exceeded {WATCH_TRACKER_MAX_ENTRIES} entries ({total})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records one pass and returns only the lines that are new or changed
+    /// since the last emission, each stamped with `observed_at_ms`.
+    pub fn observe_pass(
+        &mut self,
+        decisions: &[RingDecision],
+        aliases: &AliasMap,
+        now: UnixMs,
+    ) -> Result<WatchDelta, String> {
+        let mut delta = WatchDelta::default();
+        let push = |delta: &mut WatchDelta, mut val: serde_json::Value| {
+            let obj = val.as_object_mut().expect("shadow line is a JSON object");
+            obj.insert("observed_at_ms".to_owned(), serde_json::json!(now.0));
+            let line = serde_json::to_string(&val).expect("shadow line serializes");
+            delta.jsonl.push_str(&line);
+            delta.jsonl.push('\n');
+        };
+
+        let new_aliases: BTreeMap<String, String> = aliases
+            .entries()
+            .iter()
+            .filter(|(k, v)| self.aliases.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !new_aliases.is_empty() {
+            push(
+                &mut delta,
+                serde_json::json!({ "meta": "aliases", "aliases": new_aliases }),
+            );
+            delta.alias_lines = 1;
+            self.aliases.extend(new_aliases);
+        }
+
+        for decision in decisions {
+            let val = decision.to_json_value();
+            let obj = val.as_object().expect("decision JSON is an object");
+            match watch_line_facts(obj, 0)? {
+                WatchLineFacts::Single { key, state } => {
+                    if self.states.get(&key) == Some(&state) {
+                        continue;
+                    }
+                    self.states.insert(key, state);
+                    push(&mut delta, val);
+                }
+                WatchLineFacts::Refusal { key } => {
+                    if !self.refusals.insert(key) {
+                        continue;
+                    }
+                    push(&mut delta, val);
+                }
+                WatchLineFacts::Multi { seat, state, .. } => {
+                    let Some(filtered) = self.filter_multi(decision, &seat, &state) else {
+                        continue;
+                    };
+                    push(&mut delta, filtered.to_json_value());
+                }
+            }
+            delta.decision_lines += 1;
+            self.check_bound()?;
+        }
+        Ok(delta)
+    }
+
+    /// Narrows a `RingDigest` / `RaiseUnrung` to referents not already in
+    /// `state`, records them, and returns the narrowed decision (or `None`).
+    fn filter_multi(
+        &mut self,
+        decision: &RingDecision,
+        seat: &SeatName,
+        state: &WatchDecisionState,
+    ) -> Option<RingDecision> {
+        let mut narrowed = decision.clone();
+        let referents = match &mut narrowed {
+            RingDecision::RingDigest { referents, .. }
+            | RingDecision::RaiseUnrung { referents, .. } => referents,
+            _ => unreachable!("only multi-referent decisions are filtered"),
+        };
+        referents.retain(|r| self.states.get(&(seat.clone(), r.sha256().clone())) != Some(state));
+        if referents.is_empty() {
+            return None;
+        }
+        for r in referents.iter() {
+            self.states
+                .insert((seat.clone(), r.sha256().clone()), state.clone());
+        }
+        Some(narrowed)
+    }
 }
