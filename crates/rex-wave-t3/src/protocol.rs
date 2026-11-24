@@ -1020,6 +1020,7 @@ pub fn parse_provider_turns_usage(projection: &Value) -> Option<ThreadContextUsa
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedTurn {
     pub anchor: String,
+    pub run_key: Option<String>,
     pub run_start_at: u64,
     pub run_end_at: u64,
     pub text: String,
@@ -1028,70 +1029,22 @@ pub struct CompletedTurn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnMirrorCheck {
     Ignore,
-    PostedViaTool { run_end_at: u64 },
+    PostedViaTool {
+        run_key: Option<String>,
+        run_end_at: u64,
+    },
     Unposted(CompletedTurn),
 }
 
-pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
-    let proj = unwrap_projection(projection);
-    let Some(items) = proj.get("turnItems").and_then(|v| v.as_array()) else {
-        return TurnMirrorCheck::Ignore;
-    };
-    if items.is_empty() {
-        return TurnMirrorCheck::Ignore;
-    }
-
-    let runs = proj.get("runs").and_then(|v| v.as_array());
-    let latest_run = runs.and_then(|arr| {
-        arr.iter()
-            .max_by_key(|r| r.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0))
-    });
-
-    let (target_run_id, run_start_at, run_end_at) = if let Some(run) = latest_run {
-        let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status != "completed" {
-            return TurnMirrorCheck::Ignore;
-        }
-        let id = run.get("id").and_then(|v| v.as_str()).map(str::to_owned);
-        let started = run
-            .get("startedAt")
-            .or_else(|| run.get("createdAt"))
-            .map(parse_timestamp_ms)
-            .map_or(0, |u| u.0);
-        let ended = run
-            .get("completedAt")
-            .or_else(|| run.get("endedAt"))
-            .or_else(|| run.get("updatedAt"))
-            .map(parse_timestamp_ms)
-            .map_or(0, |u| u.0);
-        (id, started, ended)
-    } else {
-        (None, 0, 0)
-    };
-
-    let mut ordered: Vec<&Value> = items.iter().collect();
-    ordered.sort_by_key(|it| it.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0));
-
-    let slice: Vec<&Value> = if let Some(ref run_id) = target_run_id {
-        let filtered: Vec<&Value> = ordered
-            .iter()
-            .copied()
-            .filter(|it| it.get("runId").and_then(|v| v.as_str()) == Some(run_id.as_str()))
-            .collect();
-        if filtered.is_empty() {
-            ordered
-        } else {
-            filtered
-        }
-    } else {
-        let start = ordered
-            .iter()
-            .rposition(|it| it.get("type").and_then(|v| v.as_str()) == Some("user_message"))
-            .unwrap_or(0);
-        ordered[start..].to_vec()
-    };
-
-    for item in &slice {
+fn inspect_turn_slice(
+    slice: &[&Value],
+    target_run_id: Option<&str>,
+    run_key: Option<String>,
+    fallback_tool_key: String,
+    run_start_at: u64,
+    run_end_at: u64,
+) -> TurnMirrorCheck {
+    for item in slice {
         if item.get("type").and_then(|v| v.as_str()) != Some("dynamic_tool") {
             continue;
         }
@@ -1111,13 +1064,16 @@ pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
                 .and_then(|v| v.as_str())
                 == Some("dm");
             if !is_dm {
-                return TurnMirrorCheck::PostedViaTool { run_end_at };
+                return TurnMirrorCheck::PostedViaTool {
+                    run_key: run_key.or(Some(fallback_tool_key)),
+                    run_end_at,
+                };
             }
         }
     }
 
     let mut last_assistant: Option<(String, String)> = None;
-    for item in &slice {
+    for item in slice {
         if item.get("type").and_then(|v| v.as_str()) != Some("assistant_message") {
             continue;
         }
@@ -1159,10 +1115,138 @@ pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
 
     TurnMirrorCheck::Unposted(CompletedTurn {
         anchor,
+        run_key,
         run_start_at,
         run_end_at,
         text,
     })
+}
+
+pub fn inspect_completed_turns_in_order(projection: &Value) -> Vec<(TurnMirrorCheck, Option<u64>)> {
+    let proj = unwrap_projection(projection);
+    let Some(items) = proj.get("turnItems").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ordered: Vec<&Value> = items.iter().collect();
+    ordered.sort_by_key(|it| it.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0));
+
+    if let Some(runs_arr) = proj
+        .get("runs")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+    {
+        let mut ordered_runs: Vec<(usize, &Value)> = runs_arr.iter().enumerate().collect();
+        ordered_runs.sort_by_key(|(idx, r)| {
+            (
+                r.get("ordinal")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*idx as u64),
+                *idx,
+            )
+        });
+        let single_run = ordered_runs.len() == 1;
+        let mut out = Vec::new();
+        for (pos, (idx, run)) in ordered_runs.iter().enumerate() {
+            let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status != "completed" || extract_explicit_stop_refusal(run).is_some() {
+                continue;
+            }
+            let target_run_id = run
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let ord = run
+                .get("ordinal")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(*idx as u64);
+            let run_key = Some(match target_run_id {
+                Some(id) => format!("run:{id}"),
+                None => format!("run_ord:{ord}"),
+            });
+            let run_start_at = run
+                .get("startedAt")
+                .or_else(|| run.get("createdAt"))
+                .map(parse_timestamp_ms)
+                .map_or(0, |u| u.0);
+            let run_end_at = run
+                .get("completedAt")
+                .or_else(|| run.get("endedAt"))
+                .map(parse_timestamp_ms)
+                .map_or(0, |u| u.0);
+            let next_run_start_at = ordered_runs[pos + 1..].iter().find_map(|(_, nr)| {
+                nr.get("startedAt")
+                    .or_else(|| nr.get("createdAt"))
+                    .map(parse_timestamp_ms)
+                    .map(|u| u.0)
+                    .filter(|ts| *ts > 0)
+            });
+            let slice: Vec<&Value> = if let Some(run_id) = target_run_id {
+                let filtered: Vec<&Value> = ordered
+                    .iter()
+                    .copied()
+                    .filter(|it| it.get("runId").and_then(|v| v.as_str()) == Some(run_id))
+                    .collect();
+                if filtered.is_empty() && single_run {
+                    ordered.clone()
+                } else {
+                    filtered
+                }
+            } else if single_run {
+                ordered.clone()
+            } else {
+                Vec::new()
+            };
+            if slice.is_empty() {
+                continue;
+            }
+            let check = inspect_turn_slice(
+                &slice,
+                target_run_id,
+                run_key,
+                format!("run_pos:{pos}"),
+                run_start_at,
+                run_end_at,
+            );
+            if !matches!(check, TurnMirrorCheck::Ignore) {
+                out.push((check, next_run_start_at));
+            }
+        }
+        return out;
+    }
+
+    let mut starts: Vec<usize> = ordered
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            (it.get("type").and_then(|v| v.as_str()) == Some("user_message")).then_some(i)
+        })
+        .collect();
+    if starts.first().copied() != Some(0) {
+        starts.insert(0, 0);
+    }
+    let mut out = Vec::new();
+    for (seg_idx, &start) in starts.iter().enumerate() {
+        let end = starts.get(seg_idx + 1).copied().unwrap_or(ordered.len());
+        let seg = &ordered[start..end];
+        if seg.is_empty() {
+            continue;
+        }
+        let check = inspect_turn_slice(seg, None, None, format!("seg:{seg_idx}"), 0, 0);
+        if !matches!(check, TurnMirrorCheck::Ignore) {
+            out.push((check, None));
+        }
+    }
+    out
+}
+
+pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
+    inspect_completed_turns_in_order(projection)
+        .pop()
+        .map_or(TurnMirrorCheck::Ignore, |(check, _)| check)
 }
 
 pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {

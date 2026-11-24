@@ -9,7 +9,7 @@ use crate::protocol::{
     LiveSeqTracker, ShellObservation, TurnMirrorCheck, active_pending_interaction,
     default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
     extract_explicit_stop_refusal, extract_refusal_reason, extract_runtime_meta_from_value,
-    force_stop_thread_payload, inspect_latest_completed_turn, is_t3_thread_id,
+    force_stop_thread_payload, inspect_completed_turns_in_order, is_t3_thread_id,
     launch_thread_payload, message_dispatch_payload, mirror_idem_key, normalize_turn_item,
     parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
     runtime_request_respond_payload, strip_t3_provider_prefix, thread_archive_payload,
@@ -28,7 +28,7 @@ pub use rex_wave_runtime::BridgeBackend;
 use rex_wave_runtime::{AgentFeed, BoxFut, LocalClient, Reactor, Router, spawn_reactor};
 use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -52,6 +52,7 @@ struct TrackedWorker {
     activity: Activity,
     pending_interaction: Option<PendingInteraction>,
     mirror_room_watermark: Seq,
+    settled_turn_keys: BTreeSet<String>,
 }
 
 enum StateMsg {
@@ -77,17 +78,19 @@ enum StateMsg {
     ListLiveWorkers {
         reply: oneshot::Sender<Vec<(WaveSlug, RoleName, BbThreadId, Activity)>>,
     },
-    MirrorWatermark {
+    MirrorState {
         wave: WaveSlug,
         role: RoleName,
         thread: BbThreadId,
-        reply: oneshot::Sender<Seq>,
+        turn_keys: Vec<String>,
+        reply: oneshot::Sender<(Seq, bool)>,
     },
     AdvanceMirrorWatermark {
         wave: WaveSlug,
         role: RoleName,
         thread: BbThreadId,
         seq: Seq,
+        turn_keys: Vec<String>,
     },
 }
 
@@ -128,9 +131,11 @@ impl StateOwner {
                             activity: Activity::Working,
                             pending_interaction: None,
                             mirror_room_watermark: Seq::ORIGIN,
+                            settled_turn_keys: BTreeSet::new(),
                         });
                     if rec.thread.as_ref() != Some(&thread) {
                         rec.mirror_room_watermark = Seq::ORIGIN;
+                        rec.settled_turn_keys.clear();
                     }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
@@ -161,29 +166,42 @@ impl StateOwner {
                     }
                     let _ = reply.send(out);
                 }
-                StateMsg::MirrorWatermark {
+                StateMsg::MirrorState {
                     wave,
                     role,
                     thread,
+                    turn_keys,
                     reply,
                 } => {
-                    let wm = match self.workers_by_role.get(&(wave, role)) {
-                        Some(r) if r.thread.as_ref() == Some(&thread) => r.mirror_room_watermark,
-                        _ => Seq::ORIGIN,
+                    let st = match self.workers_by_role.get(&(wave, role)) {
+                        Some(r) if r.thread.as_ref() == Some(&thread) => {
+                            let settled = turn_keys
+                                .iter()
+                                .any(|k| !k.is_empty() && r.settled_turn_keys.contains(k));
+                            (r.mirror_room_watermark, settled)
+                        }
+                        _ => (Seq::ORIGIN, false),
                     };
-                    let _ = reply.send(wm);
+                    let _ = reply.send(st);
                 }
                 StateMsg::AdvanceMirrorWatermark {
                     wave,
                     role,
                     thread,
                     seq,
+                    turn_keys,
                 } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
-                        && rec.mirror_room_watermark < seq
                     {
-                        rec.mirror_room_watermark = seq;
+                        if rec.mirror_room_watermark < seq {
+                            rec.mirror_room_watermark = seq;
+                        }
+                        for k in turn_keys {
+                            if !k.is_empty() {
+                                rec.settled_turn_keys.insert(k);
+                            }
+                        }
                     }
                 }
             }
@@ -208,6 +226,7 @@ impl StateOwner {
                         activity: Activity::Working,
                         pending_interaction: None,
                         mirror_room_watermark: Seq::ORIGIN,
+                        settled_turn_keys: BTreeSet::new(),
                     },
                 );
             }
@@ -222,6 +241,7 @@ impl StateOwner {
                             rec.live = false;
                             rec.pending_interaction = None;
                             rec.mirror_room_watermark = Seq::ORIGIN;
+                            rec.settled_turn_keys.clear();
                         }
                         return;
                     }
@@ -243,9 +263,11 @@ impl StateOwner {
                             activity: Activity::Working,
                             pending_interaction: None,
                             mirror_room_watermark: Seq::ORIGIN,
+                            settled_turn_keys: BTreeSet::new(),
                         });
                     if rec.thread.as_ref() != Some(&thread) {
                         rec.mirror_room_watermark = Seq::ORIGIN;
+                        rec.settled_turn_keys.clear();
                     }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
@@ -346,6 +368,7 @@ pub struct T3Bridge {
     state: mpsc::UnboundedSender<StateMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     token_minter: Option<WorkerTokenMinter>,
+    mirror_lock: tokio::sync::Mutex<()>,
     cmd_nonce: AtomicU64,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
@@ -365,6 +388,7 @@ impl T3Bridge {
             state: StateOwner::spawn(),
             backend: OnceLock::new(),
             token_minter,
+            mirror_lock: tokio::sync::Mutex::new(()),
             cmd_nonce: AtomicU64::new(1),
             project_names_tx,
             project_names_rx,
@@ -1068,8 +1092,9 @@ impl T3Bridge {
         thread: &BbThreadId,
         projection: &Value,
     ) {
-        let check = inspect_latest_completed_turn(projection);
-        if matches!(check, TurnMirrorCheck::Ignore) {
+        let _mirror_guard = self.mirror_lock.lock().await;
+        let checks = inspect_completed_turns_in_order(projection);
+        if checks.is_empty() {
             return;
         }
         let Some(backend) = self.backend.get() else {
@@ -1087,203 +1112,232 @@ impl T3Bridge {
             wave: wave.clone(),
             role: role.clone(),
         };
-
-        let (wm_tx, wm_rx) = oneshot::channel();
-        let _ = self.state.send(StateMsg::MirrorWatermark {
-            wave: wave.clone(),
-            role: role.clone(),
-            thread: thread.clone(),
-            reply: wm_tx,
-        });
-        let watermark = wm_rx.await.unwrap_or(Seq::ORIGIN);
-
         let stream = StreamId::Room { room: room.clone() };
-        let mut cursor = watermark;
-        let mut room_head = watermark;
-        let mut safe_watermark = watermark;
-        let mut watermark_pinned = false;
-        let completed = match check {
-            TurnMirrorCheck::Ignore => return,
-            TurnMirrorCheck::PostedViaTool { run_end_at } => {
-                let mut tool_reached_end = false;
-                loop {
-                    let Ok(WireReply::Read(page)) = backend
-                        .call_as(
-                            sys.clone(),
-                            Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
-                        )
-                        .await
-                    else {
-                        return;
-                    };
-                    let Some(last) = page.entries.last() else {
-                        tool_reached_end = true;
-                        break;
-                    };
-                    if last.seq <= cursor {
-                        break;
-                    }
-                    cursor = last.seq;
-                    for env in &page.entries {
-                        if env.by == worker_principal
-                            && let Event::Room(RoomEvent::Posted { origin, .. }) = &env.event
-                            && *origin != rex_wave_api::room::PostOrigin::MirroredTurn
-                            && run_end_at > 0
-                            && env.at.0 > run_end_at
-                        {
-                            watermark_pinned = true;
-                        }
-                        if !watermark_pinned {
-                            safe_watermark = env.seq;
-                        }
-                    }
-                    if page.entries.len() < 500 {
-                        tool_reached_end = true;
-                        break;
-                    }
-                }
-                if tool_reached_end {
-                    let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
-                        wave: wave.clone(),
-                        role: role.clone(),
-                        thread: thread.clone(),
-                        seq: safe_watermark,
-                    });
-                }
-                return;
-            }
-            TurnMirrorCheck::Unposted(c) => c,
-        };
 
-        // `WaveConductor` skips peer wakeups when idem starts with `wave:` and contains `:turn:`.
-        let Ok(idem_key) = mirror_idem_key(wave, role, thread, &completed.anchor) else {
-            return;
-        };
-
-        let mut already_posted = false;
-        let mut reached_end = false;
-        loop {
-            let Ok(WireReply::Read(page)) = backend
-                .call_as(
-                    sys.clone(),
-                    Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
-                )
-                .await
-            else {
-                return;
-            };
-            let Some(last) = page.entries.last() else {
-                reached_end = true;
-                break;
-            };
-            if last.seq <= cursor {
-                break;
-            }
-            cursor = last.seq;
-            room_head = last.seq;
-            let count = page.entries.len();
-            for env in &page.entries {
-                if let Event::Room(RoomEvent::Posted { idem, origin, .. }) = &env.event {
-                    if idem.as_ref() == Some(&idem_key) {
-                        if !watermark_pinned {
-                            safe_watermark = env.seq;
-                        }
-                        already_posted = true;
-                        break;
+        let total = checks.len();
+        for (idx, (check, next_run_start_at)) in checks.into_iter().enumerate() {
+            let allow_watermark_advance = idx + 1 == total && next_run_start_at.is_none();
+            let turn_keys: Vec<String> = match &check {
+                TurnMirrorCheck::Ignore => continue,
+                TurnMirrorCheck::PostedViaTool { run_key, .. } => run_key.iter().cloned().collect(),
+                TurnMirrorCheck::Unposted(c) => {
+                    let mut keys = vec![c.anchor.clone()];
+                    if let Some(rk) = &c.run_key {
+                        keys.push(rk.clone());
                     }
-                    if *origin != rex_wave_api::room::PostOrigin::MirroredTurn
-                        && env.by == worker_principal
-                        && (completed.run_start_at == 0 || env.at.0 >= completed.run_start_at)
-                    {
-                        if completed.run_end_at > 0 && env.at.0 > completed.run_end_at {
-                            watermark_pinned = true;
-                        } else {
+                    keys
+                }
+            };
+
+            let (wm_tx, wm_rx) = oneshot::channel();
+            let _ = self.state.send(StateMsg::MirrorState {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+                turn_keys: turn_keys.clone(),
+                reply: wm_tx,
+            });
+            let (watermark, already_settled) = wm_rx.await.unwrap_or((Seq::ORIGIN, false));
+            if already_settled {
+                continue;
+            }
+
+            let mut cursor = watermark;
+            let mut room_head = watermark;
+            let mut safe_watermark = watermark;
+            let mut watermark_pinned = !allow_watermark_advance;
+
+            let settle_turn = |target_seq: Seq, keys: Vec<String>| {
+                let next_seq = if allow_watermark_advance {
+                    target_seq
+                } else {
+                    watermark
+                };
+                let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    seq: next_seq,
+                    turn_keys: keys,
+                });
+            };
+
+            let completed = match check {
+                TurnMirrorCheck::Ignore => continue,
+                TurnMirrorCheck::PostedViaTool { run_end_at, .. } => {
+                    let mut tool_reached_end = false;
+                    loop {
+                        let Ok(WireReply::Read(page)) = backend
+                            .call_as(
+                                sys.clone(),
+                                Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
+                            )
+                            .await
+                        else {
+                            return;
+                        };
+                        let Some(last) = page.entries.last() else {
+                            tool_reached_end = true;
+                            break;
+                        };
+                        if last.seq <= cursor {
+                            break;
+                        }
+                        cursor = last.seq;
+                        for env in &page.entries {
+                            if env.by == worker_principal
+                                && let Event::Room(RoomEvent::Posted { origin, .. }) = &env.event
+                                && *origin != rex_wave_api::room::PostOrigin::MirroredTurn
+                                && ((run_end_at > 0 && env.at.0 > run_end_at)
+                                    || next_run_start_at.is_some_and(|ns| env.at.0 >= ns))
+                            {
+                                watermark_pinned = true;
+                            }
+                            if !watermark_pinned {
+                                safe_watermark = env.seq;
+                            }
+                        }
+                        if page.entries.len() < 500 {
+                            tool_reached_end = true;
+                            break;
+                        }
+                    }
+                    if tool_reached_end {
+                        settle_turn(safe_watermark, turn_keys);
+                    }
+                    continue;
+                }
+                TurnMirrorCheck::Unposted(c) => c,
+            };
+
+            // `WaveConductor` skips peer wakeups when idem starts with `wave:` and contains `:turn:`.
+            let Ok(idem_key) = mirror_idem_key(wave, role, thread, &completed.anchor) else {
+                settle_turn(watermark, turn_keys);
+                continue;
+            };
+
+            let mut already_posted = false;
+            let mut reached_end = false;
+            loop {
+                let Ok(WireReply::Read(page)) = backend
+                    .call_as(
+                        sys.clone(),
+                        Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
+                    )
+                    .await
+                else {
+                    return;
+                };
+                let Some(last) = page.entries.last() else {
+                    reached_end = true;
+                    break;
+                };
+                if last.seq <= cursor {
+                    break;
+                }
+                cursor = last.seq;
+                room_head = last.seq;
+                let count = page.entries.len();
+                for env in &page.entries {
+                    if let Event::Room(RoomEvent::Posted { idem, origin, .. }) = &env.event {
+                        if idem.as_ref() == Some(&idem_key) {
                             if !watermark_pinned {
                                 safe_watermark = env.seq;
                             }
                             already_posted = true;
                             break;
                         }
+                        if *origin != rex_wave_api::room::PostOrigin::MirroredTurn
+                            && env.by == worker_principal
+                            && (completed.run_start_at == 0 || env.at.0 >= completed.run_start_at)
+                        {
+                            let post_after_run = (completed.run_end_at > 0
+                                && env.at.0 > completed.run_end_at)
+                                || next_run_start_at.is_some_and(|ns| env.at.0 >= ns);
+                            if post_after_run {
+                                watermark_pinned = true;
+                            } else {
+                                if !watermark_pinned {
+                                    safe_watermark = env.seq;
+                                }
+                                already_posted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !watermark_pinned {
+                        safe_watermark = env.seq;
                     }
                 }
-                if !watermark_pinned {
-                    safe_watermark = env.seq;
+                if already_posted {
+                    break;
+                }
+                if count < 500 {
+                    reached_end = true;
+                    break;
                 }
             }
+
+            if !already_posted && !reached_end {
+                return;
+            }
+
             if already_posted {
-                break;
+                settle_turn(safe_watermark, turn_keys);
+                continue;
             }
-            if count < 500 {
-                reached_end = true;
-                break;
-            }
-        }
 
-        if !already_posted && !reached_end {
-            return;
-        }
-
-        if already_posted {
-            let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-                seq: safe_watermark,
-            });
-            return;
-        }
-
-        let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
-        let Ok(body) = Body::parse(trimmed) else {
-            return;
-        };
-        let post_cmd = RoomPost::mirrored_turn(RoomRef::Id { id: room.clone() }, body, idem_key);
-        let first_try = backend
-            .call_as(worker_principal.clone(), post_cmd.clone().into_wire())
-            .await;
-        let post_res = match first_try {
-            Err(ApiError::Denied { .. }) => {
-                let _ = backend
-                    .call_as(
-                        sys.clone(),
-                        RoomEnsure {
-                            room: RoomRef::Id { id: room.clone() },
-                            topic: None,
-                            origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
-                        }
-                        .into_wire(),
-                    )
-                    .await;
-                let _ = backend
-                    .call_as(
-                        sys,
-                        RoomJoin {
-                            room: RoomRef::Id { id: room },
-                            member: Some(worker_principal.clone()),
-                            handle: Handle::parse(role.as_str()).ok(),
-                        }
-                        .into_wire(),
-                    )
-                    .await;
-                backend
-                    .call_as(worker_principal, post_cmd.into_wire())
-                    .await
-            }
-            other => other,
-        };
-        if let Ok(WireReply::RoomPost(posted)) = post_res {
-            let posted_head = if !watermark_pinned && posted.seq.0 == room_head.0.saturating_add(1)
-            {
-                posted.seq
-            } else {
-                safe_watermark
+            let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
+            let Ok(body) = Body::parse(trimmed) else {
+                settle_turn(safe_watermark, turn_keys);
+                continue;
             };
-            let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-                seq: posted_head,
-            });
+            let post_cmd =
+                RoomPost::mirrored_turn(RoomRef::Id { id: room.clone() }, body, idem_key);
+            let first_try = backend
+                .call_as(worker_principal.clone(), post_cmd.clone().into_wire())
+                .await;
+            let post_res = match first_try {
+                Err(ApiError::Denied { .. }) => {
+                    let _ = backend
+                        .call_as(
+                            sys.clone(),
+                            RoomEnsure {
+                                room: RoomRef::Id { id: room.clone() },
+                                topic: None,
+                                origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
+                            }
+                            .into_wire(),
+                        )
+                        .await;
+                    let _ = backend
+                        .call_as(
+                            sys.clone(),
+                            RoomJoin {
+                                room: RoomRef::Id { id: room.clone() },
+                                member: Some(worker_principal.clone()),
+                                handle: Handle::parse(role.as_str()).ok(),
+                            }
+                            .into_wire(),
+                        )
+                        .await;
+                    backend
+                        .call_as(worker_principal.clone(), post_cmd.into_wire())
+                        .await
+                }
+                other => other,
+            };
+            if let Ok(WireReply::RoomPost(posted)) = post_res {
+                let posted_head =
+                    if !watermark_pinned && posted.seq.0 == room_head.0.saturating_add(1) {
+                        posted.seq
+                    } else {
+                        safe_watermark
+                    };
+                settle_turn(posted_head, turn_keys);
+            } else {
+                return;
+            }
         }
     }
 
@@ -1355,7 +1409,11 @@ impl T3Bridge {
                 continue;
             }
             if let Some(activity) = derived {
-                if matches!(activity, Activity::Idle) {
+                let runs_present = proj
+                    .get("runs")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty());
+                if matches!(activity, Activity::Idle) || runs_present {
                     self.mirror_completed_turn_from_projection(&wave, &role, &thread, proj)
                         .await;
                 }
@@ -1641,6 +1699,7 @@ impl T3Bridge {
                                 activity,
                                 pending_interaction,
                                 mirror_room_watermark: Seq::ORIGIN,
+                                settled_turn_keys: BTreeSet::new(),
                             })
                         }
                         WorkerPhase::Retiring { thread, .. }
@@ -1657,6 +1716,7 @@ impl T3Bridge {
                                 activity: Activity::Idle,
                                 pending_interaction: None,
                                 mirror_room_watermark: Seq::ORIGIN,
+                                settled_turn_keys: BTreeSet::new(),
                             })
                         }
                         _ => Err(ApiError::NotFound {

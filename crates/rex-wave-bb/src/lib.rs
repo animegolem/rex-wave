@@ -1097,47 +1097,43 @@ fn terminal_turn_bounds(rows: &[serde_json::Value]) -> (Option<u64>, Option<u64>
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
     match last_completed {
-        Some(end_idx) if end_idx + 1 == ordered.len() => {
-            let prev_end = ordered[..end_idx]
-                .iter()
-                .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
-            let search_from = prev_end.map_or(0, |i| i + 1);
-            let start_seq = ordered[search_from..=end_idx]
-                .iter()
-                .rposition(|r| {
-                    matches!(
-                        r.get("type").and_then(|v| v.as_str()),
-                        Some("turn/started" | "client/turn/start")
-                    )
-                })
-                .and_then(|rel| {
-                    ordered[search_from + rel]
-                        .get("seq")
-                        .and_then(|v| v.as_u64())
-                })
-                .filter(|&s| s > 0);
-            let end_seq = ordered[end_idx]
-                .get("seq")
-                .and_then(|v| v.as_u64())
-                .filter(|&s| s > 0);
-            (start_seq, end_seq)
-        }
         Some(end_idx) => {
-            let start_seq = ordered[end_idx + 1..]
-                .iter()
-                .rposition(|r| {
-                    matches!(
-                        r.get("type").and_then(|v| v.as_str()),
-                        Some("turn/started" | "client/turn/start")
-                    )
-                })
-                .and_then(|rel| {
-                    ordered[end_idx + 1 + rel]
-                        .get("seq")
-                        .and_then(|v| v.as_u64())
-                })
-                .filter(|&s| s > 0);
-            (start_seq, None)
+            if let Some(after_start_rel) = ordered[end_idx + 1..].iter().rposition(|r| {
+                matches!(
+                    r.get("type").and_then(|v| v.as_str()),
+                    Some("turn/started" | "client/turn/start")
+                )
+            }) {
+                let start_seq = ordered[end_idx + 1 + after_start_rel]
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&s| s > 0);
+                (start_seq, None)
+            } else {
+                let prev_end = ordered[..end_idx].iter().rposition(|r| {
+                    r.get("type").and_then(|v| v.as_str()) == Some("turn/completed")
+                });
+                let search_from = prev_end.map_or(0, |i| i + 1);
+                let start_seq = ordered[search_from..=end_idx]
+                    .iter()
+                    .rposition(|r| {
+                        matches!(
+                            r.get("type").and_then(|v| v.as_str()),
+                            Some("turn/started" | "client/turn/start")
+                        )
+                    })
+                    .and_then(|rel| {
+                        ordered[search_from + rel]
+                            .get("seq")
+                            .and_then(|v| v.as_u64())
+                    })
+                    .filter(|&s| s > 0);
+                let end_seq = ordered[end_idx]
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&s| s > 0);
+                (start_seq, end_seq)
+            }
         }
         None => {
             let start_seq = ordered
@@ -1164,22 +1160,30 @@ fn rows_before_terminal_turn(rows: &[serde_json::Value]) -> Vec<serde_json::Valu
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
     let cut_idx = match last_completed {
-        Some(end_idx) if end_idx + 1 == ordered.len() => {
-            let prev_end = ordered[..end_idx]
-                .iter()
-                .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
-            let search_from = prev_end.map_or(0, |i| i + 1);
-            ordered[search_from..=end_idx]
-                .iter()
-                .rposition(|r| {
-                    matches!(
-                        r.get("type").and_then(|v| v.as_str()),
-                        Some("turn/started" | "client/turn/start")
-                    )
-                })
-                .map_or(search_from, |rel| search_from + rel)
+        Some(end_idx) => {
+            if let Some(after_start_rel) = ordered[end_idx + 1..].iter().position(|r| {
+                matches!(
+                    r.get("type").and_then(|v| v.as_str()),
+                    Some("turn/started" | "client/turn/start")
+                )
+            }) {
+                end_idx + 1 + after_start_rel
+            } else {
+                let prev_end = ordered[..end_idx].iter().rposition(|r| {
+                    r.get("type").and_then(|v| v.as_str()) == Some("turn/completed")
+                });
+                let search_from = prev_end.map_or(0, |i| i + 1);
+                ordered[search_from..=end_idx]
+                    .iter()
+                    .rposition(|r| {
+                        matches!(
+                            r.get("type").and_then(|v| v.as_str()),
+                            Some("turn/started" | "client/turn/start")
+                        )
+                    })
+                    .map_or(search_from, |rel| search_from + rel)
+            }
         }
-        Some(end_idx) => end_idx + 1,
         None => 0,
     };
     let end_exclusive = if cut_idx < ordered.len()
@@ -1239,8 +1243,18 @@ fn mirrorable_turn_completions_in_order(
     }
     let trailing_start_at = ordered[seg_start..]
         .iter()
-        .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
-        .find(|&at| at > 0);
+        .position(|r| {
+            matches!(
+                r.get("type").and_then(|v| v.as_str()),
+                Some("turn/started" | "client/turn/start")
+            )
+        })
+        .and_then(|rel| {
+            ordered[seg_start + rel..]
+                .iter()
+                .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
+                .find(|&at| at > 0)
+        });
     let mut out = Vec::new();
     for (seg_idx, &(s_idx, end_idx)) in segments.iter().enumerate() {
         if is_turn_window_suppressed(
@@ -1255,7 +1269,16 @@ fn mirrorable_turn_completions_in_order(
         let next_start_at = segments
             .get(seg_idx + 1)
             .and_then(|&(ns, ne)| {
-                ordered[ns..=ne]
+                let from = ordered[ns..=ne]
+                    .iter()
+                    .position(|r| {
+                        matches!(
+                            r.get("type").and_then(|v| v.as_str()),
+                            Some("turn/started" | "client/turn/start")
+                        )
+                    })
+                    .map_or(ns, |rel| ns + rel);
+                ordered[from..=ne]
                     .iter()
                     .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
                     .find(|&at| at > 0)
@@ -1682,6 +1705,7 @@ struct TrackedWorker {
     last_seq: Option<u64>,
     feed_seq: Option<u64>,
     pending_mirror_since: Option<u64>,
+    backscan_state: Option<(u64, bool)>,
     mirror_room_watermark: Seq,
     last_mirrored_end_seq: u64,
     last_mirrored_anchor: Option<String>,
@@ -1696,6 +1720,7 @@ type LiveWorkerSnapshot = (
     Activity,
     Option<u64>,
     Option<u64>,
+    Option<(u64, bool)>,
     u64,
     BTreeSet<u64>,
     BTreeSet<u64>,
@@ -1773,6 +1798,12 @@ enum OwnerMsg {
         thread: BbThreadId,
         start_seq: Option<u64>,
         end_seq: Option<u64>,
+    },
+    SetBackscanState {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        state: Option<(u64, bool)>,
     },
     AdvanceSeq {
         thread: BbThreadId,
@@ -1969,6 +2000,7 @@ impl BridgeOwner {
                             last_seq: None,
                             feed_seq: None,
                             pending_mirror_since: None,
+                            backscan_state: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             last_mirrored_end_seq: 0,
                             last_mirrored_anchor: None,
@@ -1979,6 +2011,7 @@ impl BridgeOwner {
                         entry.last_seq = None;
                         entry.feed_seq = None;
                         entry.pending_mirror_since = None;
+                        entry.backscan_state = None;
                         entry.mirror_room_watermark = Seq::ORIGIN;
                         entry.last_mirrored_end_seq = 0;
                         entry.last_mirrored_anchor = None;
@@ -2017,6 +2050,7 @@ impl BridgeOwner {
                                 rec.activity.clone(),
                                 rec.last_seq,
                                 rec.pending_mirror_since,
+                                rec.backscan_state,
                                 rec.last_mirrored_end_seq,
                                 rec.suppressed_start_seqs.clone(),
                                 rec.suppressed_end_seqs.clone(),
@@ -2068,6 +2102,18 @@ impl BridgeOwner {
                         if let Some(e) = end_seq.filter(|&e| e > 0) {
                             rec.suppressed_end_seqs.insert(e);
                         }
+                    }
+                }
+                OwnerMsg::SetBackscanState {
+                    wave,
+                    role,
+                    thread,
+                    state,
+                } => {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
+                        rec.backscan_state = state;
                     }
                 }
                 OwnerMsg::AdvanceSeq { thread, seq } => {
@@ -2238,6 +2284,7 @@ impl BridgeOwner {
                         last_seq: None,
                         feed_seq: None,
                         pending_mirror_since: None,
+                        backscan_state: None,
                         mirror_room_watermark: Seq::ORIGIN,
                         last_mirrored_end_seq: 0,
                         last_mirrored_anchor: None,
@@ -2259,6 +2306,7 @@ impl BridgeOwner {
                             rec.last_seq = None;
                             rec.feed_seq = None;
                             rec.pending_mirror_since = None;
+                            rec.backscan_state = None;
                             rec.mirror_room_watermark = Seq::ORIGIN;
                             rec.last_mirrored_end_seq = 0;
                             rec.last_mirrored_anchor = None;
@@ -2287,6 +2335,7 @@ impl BridgeOwner {
                             last_seq: None,
                             feed_seq: None,
                             pending_mirror_since: None,
+                            backscan_state: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             last_mirrored_end_seq: 0,
                             last_mirrored_anchor: None,
@@ -2297,6 +2346,7 @@ impl BridgeOwner {
                         rec.last_seq = None;
                         rec.feed_seq = None;
                         rec.pending_mirror_since = None;
+                        rec.backscan_state = None;
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.last_mirrored_end_seq = 0;
                         rec.last_mirrored_anchor = None;
@@ -2919,7 +2969,9 @@ impl BbBridge {
                 self.refresh_local_project_names();
                 let bridge = self.clone();
                 tokio::spawn(async move {
-                    bridge.reconcile_live_workers().await;
+                    while bridge.reconcile_live_workers_step().await {
+                        tokio::task::yield_now().await;
+                    }
                 });
             }
             protocol::Up::Result { req_id, ok, value } => {
@@ -4370,6 +4422,10 @@ impl BbBridge {
     }
 
     async fn reconcile_live_workers(&self) {
+        let _ = self.reconcile_live_workers_step().await;
+    }
+
+    async fn reconcile_live_workers_step(&self) -> bool {
         let _reconcile_guard = self.reconcile_lock.lock().await;
         let (tx, rx) = oneshot::channel();
         if self
@@ -4377,9 +4433,10 @@ impl BbBridge {
             .send(OwnerMsg::ListLiveWorkers { reply: tx })
             .is_err()
         {
-            return;
+            return false;
         }
-        let Ok(workers) = rx.await else { return };
+        let Ok(workers) = rx.await else { return false };
+        let mut has_remaining_backscan = false;
         'workers: for (
             wave,
             role,
@@ -4387,6 +4444,7 @@ impl BbBridge {
             tracked_activity,
             mut cursor_seq,
             pending_mirror_since,
+            backscan_state,
             last_mirrored_end_seq,
             mut suppressed_start_seqs,
             mut suppressed_end_seqs,
@@ -4394,10 +4452,16 @@ impl BbBridge {
         {
             let initial_cursor = cursor_seq;
             let had_prev_cursor = initial_cursor.is_some();
-            let mut collected_rows: Vec<serde_json::Value> = Vec::new();
+            let mut forward_rows: Vec<serde_json::Value> = Vec::new();
+            let mut backscan_rows: Vec<serde_json::Value> = Vec::new();
             let mut thread_gone: Option<Observation> = None;
             let mut saw_new_turn_start = false;
             let mut fetch_complete = true;
+            let mut next_backscan: Option<(u64, bool)> = backscan_state;
+            let tracked_terminal_failure = matches!(
+                tracked_activity,
+                Activity::Errored { .. } | Activity::Refused { .. }
+            );
             if let Some(init_cur) = initial_cursor {
                 loop {
                     match self
@@ -4430,7 +4494,7 @@ impl BbBridge {
                                 ) {
                                     saw_new_turn_start = true;
                                 }
-                                collected_rows.push(row.clone());
+                                forward_rows.push(row.clone());
                             }
                             if count < 200 || cursor_seq == prev {
                                 break;
@@ -4478,7 +4542,7 @@ impl BbBridge {
                                         cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
                                         before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
                                     }
-                                    collected_rows.push(row.clone());
+                                    backscan_rows.push(row.clone());
                                 }
                                 let covered_pending = before_seq.is_some_and(|b| b <= pend);
                                 if covered_pending || count < 200 || before_seq == prev_before {
@@ -4497,13 +4561,94 @@ impl BbBridge {
                         }
                     }
                 }
+                if fetch_complete && let Some((b_start, needs_prior_completion)) = backscan_state {
+                    let mut before_seq = Some(b_start);
+                    let mut pages = 0usize;
+                    let mut reached_turn_start = false;
+                    loop {
+                        match self
+                            .rpc(protocol::Down::EventsPage {
+                                req_id: 0,
+                                thread_id: thread.to_string(),
+                                after_seq: None,
+                                before_seq,
+                                limit: 200,
+                                order: Some(protocol::EventsOrder::Desc),
+                            })
+                            .await
+                        {
+                            Ok(rows_val) => {
+                                let Some(rows) = rows_val.as_array() else {
+                                    next_backscan = None;
+                                    break;
+                                };
+                                if rows.is_empty() {
+                                    next_backscan = None;
+                                    break;
+                                }
+                                pages += 1;
+                                let count = rows.len();
+                                let prev_before = before_seq;
+                                for row in rows {
+                                    if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                                        before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
+                                    }
+                                    if matches!(
+                                        row.get("type").and_then(|v| v.as_str()),
+                                        Some("turn/started" | "client/turn/start")
+                                    ) {
+                                        reached_turn_start = true;
+                                    }
+                                    backscan_rows.push(row.clone());
+                                }
+                                let saw_older_completion = !mirrorable_turn_completions_in_order(
+                                    &backscan_rows,
+                                    &suppressed_start_seqs,
+                                    &suppressed_end_seqs,
+                                )
+                                .is_empty();
+                                let covered_pending = pending_mirror_since
+                                    .is_none_or(|pend| before_seq.is_some_and(|b| b <= pend));
+                                let ready_to_stop = covered_pending
+                                    && if needs_prior_completion || tracked_terminal_failure {
+                                        saw_older_completion
+                                    } else {
+                                        reached_turn_start
+                                    };
+                                if ready_to_stop
+                                    || count < 200
+                                    || before_seq.is_some_and(|b| b <= 1)
+                                    || before_seq == prev_before
+                                {
+                                    next_backscan = None;
+                                    break;
+                                }
+                                if pages >= 4 && pending_mirror_since.is_none() {
+                                    next_backscan = before_seq.map(|b| {
+                                        (b, needs_prior_completion || tracked_terminal_failure)
+                                    });
+                                    break;
+                                }
+                            }
+                            Err(HostError::Rejected(msg)) => {
+                                thread_gone = classify_missing_or_archived_thread(&msg);
+                                fetch_complete = false;
+                                break;
+                            }
+                            Err(HostError::Unreachable(_)) => {
+                                next_backscan = before_seq.map(|b| {
+                                    (b, needs_prior_completion || tracked_terminal_failure)
+                                });
+                                fetch_complete = false;
+                                break;
+                            }
+                        }
+                    }
+                }
             } else {
                 let mut before_seq: Option<u64> = None;
                 let mut pages = 0usize;
-                let tracked_terminal_failure = matches!(
-                    tracked_activity,
-                    Activity::Errored { .. } | Activity::Refused { .. }
-                );
+                let mut reached_turn_start = false;
                 'desc: loop {
                     match self
                         .rpc(protocol::Down::EventsPage {
@@ -4518,21 +4663,22 @@ impl BbBridge {
                     {
                         Ok(rows_val) => {
                             let Some(rows) = rows_val.as_array() else {
+                                next_backscan = None;
                                 break;
                             };
                             if rows.is_empty() {
+                                next_backscan = None;
                                 break;
                             }
                             pages += 1;
                             let count = rows.len();
                             let prev_before = before_seq;
-                            let mut reached_turn_start = false;
                             for row in rows {
                                 if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
                                     cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
                                     before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
                                 }
-                                collected_rows.push(row.clone());
+                                forward_rows.push(row.clone());
                                 if matches!(
                                     row.get("type").and_then(|v| v.as_str()),
                                     Some("turn/started" | "client/turn/start")
@@ -4540,9 +4686,9 @@ impl BbBridge {
                                     reached_turn_start = true;
                                 }
                             }
-                            let page_derived = derive_latest_turn_activity(&collected_rows);
+                            let page_derived = derive_latest_turn_activity(&forward_rows);
                             let latest_nonmirrorable = latest_turn_is_nonmirrorable(
-                                &collected_rows,
+                                &forward_rows,
                                 &suppressed_start_seqs,
                                 &suppressed_end_seqs,
                             ) || matches!(
@@ -4554,10 +4700,10 @@ impl BbBridge {
                                     && matches!(page_derived, Some(Activity::Idle))
                                 {
                                     std::borrow::Cow::Owned(rows_before_terminal_turn(
-                                        &collected_rows,
+                                        &forward_rows,
                                     ))
                                 } else {
-                                    std::borrow::Cow::Borrowed(&collected_rows)
+                                    std::borrow::Cow::Borrowed(&forward_rows)
                                 };
                             let saw_nonfailed_completion = !mirrorable_turn_completions_in_order(
                                 &candidate_rows,
@@ -4572,9 +4718,14 @@ impl BbBridge {
                                 && (!latest_nonmirrorable || saw_nonfailed_completion);
                             if ready_to_stop
                                 || count < 200
+                                || before_seq.is_some_and(|b| b <= 1)
                                 || before_seq == prev_before
-                                || (pages >= 4 && pending_mirror_since.is_none())
                             {
+                                next_backscan = None;
+                                break 'desc;
+                            }
+                            if pages >= 4 && pending_mirror_since.is_none() {
+                                next_backscan = before_seq.map(|b| (b, latest_nonmirrorable));
                                 break 'desc;
                             }
                         }
@@ -4610,6 +4761,9 @@ impl BbBridge {
             if !fetch_complete {
                 continue;
             }
+            let mut collected_rows = Vec::with_capacity(backscan_rows.len() + forward_rows.len());
+            collected_rows.extend(backscan_rows.iter().cloned());
+            collected_rows.extend(forward_rows.iter().cloned());
             let (row_model, row_account) = extract_runtime_meta_from_rows(&collected_rows);
             self.observe_runtime_meta_if_present(&wave, &role, row_model, row_account)
                 .await;
@@ -4617,7 +4771,11 @@ impl BbBridge {
                 current_activity,
                 Activity::Refused { .. } | Activity::Errored { .. }
             ) && !(had_prev_cursor && saw_new_turn_start);
-            let mut derived_activity = derive_latest_turn_activity(&collected_rows);
+            let mut derived_activity = if !had_prev_cursor || !forward_rows.is_empty() {
+                derive_latest_turn_activity(&forward_rows)
+            } else {
+                None
+            };
             if matches!(
                 current_activity,
                 Activity::Blocked { .. } | Activity::Parked { .. }
@@ -4630,7 +4788,7 @@ impl BbBridge {
                     && matches!(derived_activity, Some(Activity::Idle))
                 {
                     derived_activity = None;
-                    let (sup_start, sup_end) = terminal_turn_bounds(&collected_rows);
+                    let (sup_start, sup_end) = terminal_turn_bounds(&forward_rows);
                     if let Some(s) = sup_start {
                         suppressed_start_seqs.insert(s);
                     }
@@ -4644,12 +4802,23 @@ impl BbBridge {
                         start_seq: sup_start,
                         end_seq: sup_end,
                     });
-                    std::borrow::Cow::Owned(rows_before_terminal_turn(&collected_rows))
+                    let mut combined = backscan_rows;
+                    combined.extend(rows_before_terminal_turn(&forward_rows));
+                    std::borrow::Cow::Owned(combined)
                 } else {
                     std::borrow::Cow::Borrowed(&collected_rows)
                 };
 
-            let floor = match (pending_mirror_since, initial_cursor, last_mirrored_end_seq) {
+            let effective_init_cursor = if backscan_state.is_some() {
+                None
+            } else {
+                initial_cursor
+            };
+            let floor = match (
+                pending_mirror_since,
+                effective_init_cursor,
+                last_mirrored_end_seq,
+            ) {
                 (Some(pend), Some(cur), _) => cur.min(pend.saturating_sub(1)),
                 (Some(pend), None, last_m) => {
                     if last_m > 0 {
@@ -4718,6 +4887,15 @@ impl BbBridge {
                     mark_unknown_dirty: false,
                 });
             }
+            if next_backscan.is_some() {
+                has_remaining_backscan = true;
+            }
+            let _ = self.owner.send(OwnerMsg::SetBackscanState {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+                state: next_backscan,
+            });
 
             if let Some(activity) = derived_activity
                 && self.is_current_live_thread(&wave, &role, &thread).await
@@ -4732,6 +4910,7 @@ impl BbBridge {
                 });
             }
         }
+        has_remaining_backscan
     }
 
     async fn seed_tail_seq(&self, thread: &BbThreadId) -> Option<u64> {
@@ -4811,6 +4990,7 @@ impl BbBridge {
                                 last_seq: None,
                                 feed_seq: None,
                                 pending_mirror_since: None,
+                                backscan_state: None,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 last_mirrored_end_seq: 0,
                                 last_mirrored_anchor: None,
@@ -4831,6 +5011,7 @@ impl BbBridge {
                             last_seq: None,
                             feed_seq: None,
                             pending_mirror_since: None,
+                            backscan_state: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             last_mirrored_end_seq: 0,
                             last_mirrored_anchor: None,
@@ -10199,6 +10380,12 @@ mod tests {
                 "type": "turn/completed",
                 "data": { "status": "completed" }
             }));
+            v.push(serde_json::json!({
+                "seq": 1130u64,
+                "createdAt": 1_013u64,
+                "type": "thread/contextWindowUsage/updated",
+                "data": {}
+            }));
             v
         };
         short_fail_events.push(serde_json::json!({
@@ -10241,7 +10428,7 @@ mod tests {
             "type": "turn/started",
             "data": {}
         }));
-        for s in 1128u64..1325u64 {
+        for s in 1128u64..1975u64 {
             refused_page_events.push(serde_json::json!({
                 "seq": s,
                 "createdAt": 1_010u64 + (s - 1127),
@@ -10250,8 +10437,8 @@ mod tests {
             }));
         }
         refused_page_events.push(serde_json::json!({
-            "seq": 1325u64,
-            "createdAt": 1_299u64,
+            "seq": 1975u64,
+            "createdAt": 1_999u64,
             "type": "provider/error",
             "data": {
                 "willRetry": false,
@@ -10260,8 +10447,8 @@ mod tests {
             }
         }));
         refused_page_events.push(serde_json::json!({
-            "seq": 1326u64,
-            "createdAt": 1_300u64,
+            "seq": 1976u64,
+            "createdAt": 2_000u64,
             "type": "turn/completed",
             "data": { "status": "completed" }
         }));

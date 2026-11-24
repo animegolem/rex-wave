@@ -2306,6 +2306,7 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
             .thread_projections
             .get_mut(expected_tid.as_str())
             .unwrap();
+        proj["runs"][0]["completedAt"] = json!(rex_wave_runtime::now().0);
         proj["runs"][0]["status"] = json!("completed");
         proj["turnItems"].as_array_mut().unwrap().push(json!({
             "id": "item_done",
@@ -2353,8 +2354,27 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
     })
     .await;
 
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 31,
+            "location": "active",
+            "thread": {
+                "id": expected_tid.as_str(),
+                "status": "completed",
+                "pendingRuntimeRequest": null,
+                "archivedAt": null
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
     let room_page = operator
-        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .call(Read::stream(
+            StreamId::Room { room: room.clone() },
+            Seq::ORIGIN,
+            Some(50),
+        ))
         .await
         .unwrap();
     let worker_posts: Vec<&Envelope> = room_page
@@ -2370,8 +2390,73 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
     assert_eq!(
         worker_posts.len(),
         1,
-        "must not mirror assistant_message after worker already posted"
+        "must not mirror assistant_message after worker already posted even across repeated thread.updated"
     );
+
+    let run2_start = rex_wave_runtime::now().0.saturating_add(5);
+    {
+        let mut st = server.state.lock().await;
+        let proj = st
+            .thread_projections
+            .get_mut(expected_tid.as_str())
+            .unwrap();
+        proj["runs"].as_array_mut().unwrap().push(json!({
+            "id": "run_2",
+            "ordinal": 2,
+            "status": "completed",
+            "startedAt": run2_start,
+            "completedAt": run2_start + 10
+        }));
+        proj["turnItems"].as_array_mut().unwrap().push(json!({
+            "id": "item_run2",
+            "messageId": "msg_run2",
+            "runId": "run_2",
+            "ordinal": 3,
+            "type": "assistant_message",
+            "status": "completed",
+            "streaming": false,
+            "text": "Second run unposted reply",
+            "updatedAt": "2026-11-21T08:05:00Z"
+        }));
+    }
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 32,
+            "location": "active",
+            "thread": {
+                "id": expected_tid.as_str(),
+                "status": "completed",
+                "pendingRuntimeRequest": null,
+                "archivedAt": null
+            }
+        }))
+        .await;
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let role = role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            page.entries
+                .iter()
+                .filter(|e| {
+                    e.by == Principal::Worker {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                    } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                })
+                .count()
+                == 2
+        }
+    })
+    .await;
 
     let _ = shutdown_tx.send(true);
     conductor_task.abort();
