@@ -542,18 +542,58 @@ impl PreparedUnixSocket {
             Err(e) => Err(io::Error::from(e)),
         }
     }
+    pub fn unlink_stale(&self, display_path: &Path) -> io::Result<()> {
+        use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+
+        match statat(&self.parent_dir, &self.file_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => {
+                if FileType::from_raw_mode(st.st_mode) != FileType::Socket {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to unlink non-socket entry at {}",
+                            display_path.display()
+                        ),
+                    ));
+                }
+                if st.st_uid != self.uid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to unlink socket {} owned by another uid",
+                            display_path.display()
+                        ),
+                    ));
+                }
+                if std::os::unix::net::UnixStream::connect(display_path).is_ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "another daemon is already listening on {}",
+                            display_path.display()
+                        ),
+                    ));
+                }
+                unlinkat(&self.parent_dir, &self.file_name, AtFlags::empty())
+                    .map_err(io::Error::from)?;
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(io::Error::from(e)),
+        }
+        Ok(())
+    }
 }
 
-/// Prepare `path` for `UnixListener::bind`:
-/// 1. Derives the process UID independently of `path`.
+/// Validate `path` and its parent directory for a Unix-domain socket without
+/// unlinking or binding yet:
+/// 1. Derives the process UID via `geteuid()`.
 /// 2. Creates missing parent directories with mode `0700`, opens the parent
 ///    directory with `O_DIRECTORY | O_NOFOLLOW`, and requires it to be owned
 ///    by this UID and not writable by group or others (`mode & 0o022 == 0`).
-/// 3. Uses `statat(AT_SYMLINK_NOFOLLOW)` + `unlinkat` on the held parent
-///    descriptor to remove a stale socket owned by this UID while refusing
-///    symlinks, regular files, directories, or foreign sockets.
-pub fn prepare_unix_socket(path: &Path) -> io::Result<PreparedUnixSocket> {
-    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+/// 3. Refuses non-socket entries, foreign-UID sockets, and live listening
+///    endpoints (`AddrInUse`) at `path`.
+pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket> {
+    use rustix::fs::{AtFlags, FileType, statat};
     use std::os::unix::fs::DirBuilderExt as _;
 
     let uid = current_process_uid()?;
@@ -636,7 +676,12 @@ pub fn prepare_unix_socket(path: &Path) -> io::Result<PreparedUnixSocket> {
                     ),
                 ));
             }
-            unlinkat(&parent_dir, &file_name, AtFlags::empty()).map_err(io::Error::from)?;
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("another daemon is already listening on {}", path.display()),
+                ));
+            }
         }
         Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(io::Error::from(e)),
@@ -647,6 +692,14 @@ pub fn prepare_unix_socket(path: &Path) -> io::Result<PreparedUnixSocket> {
         file_name,
         uid,
     })
+}
+
+/// Validate `path` and unlink any dead stale socket owned by this UID before
+/// `UnixListener::bind`.
+pub fn prepare_unix_socket(path: &Path) -> io::Result<PreparedUnixSocket> {
+    let prepared = validate_unix_socket_target(path)?;
+    prepared.unlink_stale(path)?;
+    Ok(prepared)
 }
 
 /// The real, symlink-free absolute location of an existing `path`.

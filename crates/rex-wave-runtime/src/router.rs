@@ -151,16 +151,23 @@ fn resolve_room_cmd(
         RoomCommand::TaskUpdate(c) => &mut c.room,
         RoomCommand::RoomTasks(c) => &mut c.room,
     };
+    let allow_legacy_fallback = matches!(slot, RoomRef::Dm { .. });
     let resolved = slot.resolve(by)?;
     let target = match read
         .journal
-        .resolve_dm_room_with_idem(resolved, by, idem.as_ref())
+        .resolve_dm_room_with_idem(resolved, by, idem.as_ref(), allow_legacy_fallback)
         .map_err(crate::store_error)?
     {
         DmIdemResolution::Route(room) => room,
+        DmIdemResolution::CrossAuthor { .. } => {
+            return Err(ApiError::conflict(format!(
+                "idempotency key {:?} in this DM was already used by another participant",
+                idem.as_ref().map(IdemKey::as_str).unwrap_or_default()
+            )));
+        }
         DmIdemResolution::Ambiguous(_) => {
             return Err(ApiError::conflict(format!(
-                "ambiguous idempotency key {:?} across DM histories; specify an explicit RoomId or a fresh idem key",
+                "ambiguous idempotency key {:?} exists on both legacy and canonical DM histories; specify an explicit RoomId or a fresh idem key",
                 idem.as_ref().map(IdemKey::as_str).unwrap_or_default()
             )));
         }

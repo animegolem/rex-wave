@@ -820,21 +820,82 @@ pub fn open_outside_rw_append_confined(
 }
 
 /// Descriptor-confined atomic snapshot write outside `protected_root`:
-/// creates any missing parent directories via `mkdirat` on verified descriptors
-/// and atomically writes `bytes` to the verified leaf path, re-checking
-/// `OutsidePath::verify` so an ancestor swap cannot land inside `protected_root`.
+/// creates any missing parent directories via `mkdirat` on verified descriptors,
+/// then creates the exclusive temporary sibling and renames it into place via
+/// `openat` + `renameat` relative to the held parent descriptor so no pathname
+/// traversal occurs after verification.
 pub fn write_outside_atomic_confined(
     out: &Path,
     protected_root: &Path,
     bytes: &[u8],
     mode: u32,
 ) -> Result<PathBuf, OutsideError> {
-    let (_dir_fd, _parent_path, _file_name, final_path) =
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, renameat, statat, unlinkat};
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let (dir_fd, _parent_path, file_name, final_path) =
         walk_outside_parent_confined(out, protected_root)?;
-    let recheck = OutsidePath::verify(&final_path, protected_root)?;
-    crate::file::write_atomic_path(recheck.path(), bytes, mode, false)
-        .map_err(|e| OutsideError::Io(format!("write {}: {e}", recheck.path().display())))?;
-    Ok(recheck.path().to_path_buf())
+
+    let check_not_symlink = || -> Result<(), OutsideError> {
+        match statat(&dir_fd, &file_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
+                Err(OutsideError::Symlink(out.to_path_buf()))
+            }
+            Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(e) => Err(OutsideError::Io(format!(
+                "stat {}: {e}",
+                final_path.display()
+            ))),
+        }
+    };
+    check_not_symlink()?;
+
+    #[allow(clippy::unnecessary_cast)]
+    let raw_mode = mode as rustix::fs::RawMode;
+    let tmp_flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let pid = std::process::id();
+    let (tmp_name, mut tmp_file) = loop {
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let cand = format!(".rex-wave-tmp.{pid}.{seq}");
+        match openat(&dir_fd, &cand, tmp_flags, Mode::from_raw_mode(raw_mode)) {
+            Ok(fd) => break (cand, std::fs::File::from(fd)),
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(e) => {
+                return Err(OutsideError::Io(format!(
+                    "create temp in {}: {e}",
+                    final_path.display()
+                )));
+            }
+        }
+    };
+
+    let write_res = tmp_file.write_all(bytes).and_then(|()| tmp_file.sync_all());
+    drop(tmp_file);
+    if let Err(e) = write_res {
+        let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+        return Err(OutsideError::Io(format!(
+            "write {}: {e}",
+            final_path.display()
+        )));
+    }
+
+    if let Err(e) = check_not_symlink() {
+        let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+        return Err(e);
+    }
+
+    if let Err(e) = renameat(&dir_fd, &tmp_name, &dir_fd, &file_name) {
+        let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+        return Err(OutsideError::Io(format!(
+            "rename {}: {e}",
+            final_path.display()
+        )));
+    }
+    Ok(final_path)
 }
 
 #[cfg(test)]

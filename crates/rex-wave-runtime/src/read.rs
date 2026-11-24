@@ -907,12 +907,8 @@ impl Service<ReadCommand> for ReadSide {
         Box::pin(async move {
             match cmd {
                 ReadCommand::Read(r) => {
-                    let target_stream = match r.stream {
-                        StreamId::Room { room } => StreamId::Room {
-                            room: self.journal.resolve_dm_room(room).map_err(store_error)?,
-                        },
-                        other => other,
-                    };
+                    let requested_stream = r.stream;
+                    let target_stream = self.resolve_stream(requested_stream.clone())?;
                     can_read(ctx.by(), &target_stream)?;
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
                     let entries = self
@@ -924,7 +920,10 @@ impl Service<ReadCommand> for ReadSide {
                         (head.0.saturating_sub(r.after.0) as usize).max(entries.len());
                     let truncated = entries.len() < total_count;
                     let last = entries.last().map_or(r.after, |e| e.seq);
-                    let cursor = Cursor::default().with(target_stream, last);
+                    let mut cursor = Cursor::default().with(target_stream.clone(), last);
+                    if requested_stream != target_stream {
+                        cursor = cursor.with(requested_stream, last);
+                    }
                     Ok(WireReply::Read(Page {
                         entries,
                         cursor,

@@ -26,7 +26,7 @@ use rex_wave_t3::{
 };
 use rex_wave_transport::{
     Authenticator, ConnectionHooks, Endpoint, PrincipalTokenTable, StateDirAuthenticator,
-    WorkerTokenFile, bind_unix, is_safe_worker_token_id, read_private_file,
+    WorkerTokenFile, bind_unix_prepared, is_safe_worker_token_id, read_private_file,
     serve_listener_with_hooks, write_worker_token_file,
 };
 use rex_wave_waves::{WaveConductor, Waves};
@@ -211,6 +211,11 @@ fn persist_operator_seat(state_dir: &Path, operator: &SeatName) -> io::Result<()
 /// of truth as the daemon: `<state_dir>/operator-seat` when written by a daemon
 /// on `sock_path`, then `REX_WAVE_OPERATOR`, then `"owner"`.
 pub fn resolve_effective_operator(sock_path: &Path) -> SeatName {
+    let env_val = std::env::var("REX_WAVE_OPERATOR").ok();
+    resolve_effective_operator_with_env(sock_path, env_val.as_deref())
+}
+
+fn resolve_effective_operator_with_env(sock_path: &Path, env_val: Option<&str>) -> SeatName {
     let state_dir = state_dir_for(sock_path);
     if let Ok(Some(bytes)) =
         read_private_file(&operator_seat_path(&state_dir), None, "operator-seat")
@@ -219,7 +224,7 @@ pub fn resolve_effective_operator(sock_path: &Path) -> SeatName {
     {
         return seat;
     }
-    if let Ok(raw) = std::env::var("REX_WAVE_OPERATOR")
+    if let Some(raw) = env_val
         && let Ok(seat) = SeatName::parse(raw.trim())
     {
         return seat;
@@ -250,22 +255,31 @@ pub fn mint_principal_token(
     principal: &Principal,
     thread_id: Option<&str>,
 ) -> io::Result<String> {
+    let effective_operator = resolve_effective_operator(sock_path);
+    mint_principal_token_for_operator(sock_path, principal, thread_id, &effective_operator)
+}
+
+fn mint_principal_token_for_operator(
+    sock_path: &Path,
+    principal: &Principal,
+    thread_id: Option<&str>,
+    effective_operator: &SeatName,
+) -> io::Result<String> {
     if principal.is_operator_or_system() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "cannot mint bearer token for Operator or System principals",
         ));
     }
-    if let Principal::Seat { seat } = principal {
-        let effective_operator = resolve_effective_operator(sock_path);
-        if seat == &effective_operator {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "cannot mint a Seat token for operator seat '{seat}'; the operator authenticates via PeerUid or an Operator entry"
-                ),
-            ));
-        }
+    if let Principal::Seat { seat } = principal
+        && seat == effective_operator
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cannot mint a Seat token for operator seat '{seat}'; the operator authenticates via PeerUid or an Operator entry"
+            ),
+        ));
     }
 
     let prefix = match principal {
@@ -551,12 +565,12 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         .journal
         .clone()
         .unwrap_or_else(|| sock_path.with_file_name("journal.sqlite3"));
+    let sandbox =
+        SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
     rex_wave_fs::create_missing_private_dir(&state_dir)
         .map_err(|e| format!("create socket dir {}: {e}", state_dir.display()))?;
-    let (listener, daemon_uid) =
-        bind_unix(&sock_path).map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
-    persist_operator_seat(&state_dir, &operator)
-        .map_err(|e| format!("persist operator seat: {e}"))?;
+    let prepared_sock = rex_wave_fs::validate_unix_socket_target(&sock_path)
+        .map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
     if let Some(parent) = journal_path.parent()
         && parent != state_dir.as_path()
     {
@@ -586,11 +600,13 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let journal = Journal::open(&journal_path).map_err(|e| format!("open journal: {e}"))?;
     let hub = Hub::new(4096);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
-    let sandbox =
-        SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
     let mail_writer = journal
         .claim(StreamId::Mail)
         .map_err(|e| format!("claim mail stream: {e}"))?;
+    let (listener, daemon_uid) = bind_unix_prepared(&sock_path, &prepared_sock)
+        .map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
+    persist_operator_seat(&state_dir, &operator)
+        .map_err(|e| format!("persist operator seat: {e}"))?;
 
     let bb_bridge = match runner_mode {
         RunnerMode::Bb | RunnerMode::Both => Some(BbBridge::with_code_runner(
@@ -753,15 +769,106 @@ mod tests {
         let ops = SeatName::parse("ops").unwrap();
         let alice = SeatName::parse("alice").unwrap();
 
-        assert!(mint_seat_token(&sock, &owner).is_err());
-        assert!(mint_seat_token(&sock, &ops).is_ok());
+        let eff_default = resolve_effective_operator_with_env(&sock, None);
+        assert_eq!(eff_default, owner);
+        assert!(
+            mint_principal_token_for_operator(
+                &sock,
+                &Principal::Seat {
+                    seat: owner.clone()
+                },
+                None,
+                &eff_default,
+            )
+            .is_err()
+        );
+        assert!(
+            mint_principal_token_for_operator(
+                &sock,
+                &Principal::Seat { seat: ops.clone() },
+                None,
+                &eff_default,
+            )
+            .is_ok()
+        );
+
+        let eff_env = resolve_effective_operator_with_env(&sock, Some("ops"));
+        assert_eq!(eff_env, ops);
 
         let state_dir = state_dir_for(&sock);
         persist_operator_seat(&state_dir, &ops).unwrap();
-        assert_eq!(resolve_effective_operator(&sock), ops);
+        assert_eq!(resolve_effective_operator_with_env(&sock, None), ops);
         assert!(mint_seat_token(&sock, &ops).is_err());
         assert!(mint_seat_token(&sock, &owner).is_ok());
         assert!(mint_seat_token(&sock, &alice).is_ok());
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_invalid_sandbox_and_live_socket_without_clobbering_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let unmarked_sb = dir.path().join("unmarked");
+        std::fs::create_dir(&unmarked_sb).unwrap();
+
+        let sock = state_dir.join("daemon.sock");
+        let journal = state_dir.join("journal.sqlite3");
+        let bad_args = DaemonArgs {
+            journal: Some(journal.clone()),
+            mail_sandbox: unmarked_sb,
+            bb_url: "ws://127.0.0.1:1/disabled".into(),
+            bb_token: String::new(),
+            runner: Some(RunnerMode::Bb),
+            t3_home: None,
+            t3_url: None,
+            t3_token: None,
+            operator: "ops".into(),
+            wake_bell: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            herald_grace_ms: 100,
+        };
+        assert!(run(bad_args, Some(sock.clone())).await.is_err());
+        assert!(!sock.exists(), "failed start must not leave socket file");
+        assert!(
+            !operator_seat_path(&state_dir).exists(),
+            "failed start must not publish operator-seat"
+        );
+        assert!(!journal.exists());
+
+        let (live_listener, _) = rex_wave_transport::bind_unix(&sock).unwrap();
+        persist_operator_seat(&state_dir, &SeatName::parse("owner").unwrap()).unwrap();
+        let valid_sb = dir.path().join("sb");
+        std::fs::create_dir(&valid_sb).unwrap();
+        std::fs::write(valid_sb.join(".rex-wave-sandbox"), b"ok\n").unwrap();
+        let second_args = DaemonArgs {
+            journal: Some(journal),
+            mail_sandbox: valid_sb,
+            bb_url: "ws://127.0.0.1:1/disabled".into(),
+            bb_token: String::new(),
+            runner: Some(RunnerMode::Bb),
+            t3_home: None,
+            t3_url: None,
+            t3_token: None,
+            operator: "intruder".into(),
+            wake_bell: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            herald_grace_ms: 100,
+        };
+        let second_err = run(second_args, Some(sock.clone())).await.unwrap_err();
+        assert!(
+            second_err.contains("already listening"),
+            "unexpected error: {second_err}"
+        );
+        assert!(
+            std::os::unix::net::UnixStream::connect(&sock).is_ok(),
+            "healthy listener must remain reachable after failed second start"
+        );
+        assert_eq!(
+            resolve_effective_operator_with_env(&sock, None).as_str(),
+            "owner"
+        );
+        drop(live_listener);
     }
 
     #[tokio::test]

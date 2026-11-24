@@ -1235,31 +1235,44 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
             cursor,
             limit,
         } => {
-            let room_id = parse_room_ref(room)?.resolve(me)?;
-            let stream = StreamId::Room {
-                room: room_id.clone(),
-            };
+            let room_ref = parse_room_ref(room)?;
             let parsed_labels = parse_labels(labels)?;
-            let start_seq = match (after, cursor) {
-                (Some(n), _) => Seq(*n),
-                (None, Some(c)) => parse_cursor_arg(c)?.at_compatible(&stream),
-                (None, None) => Seq::ORIGIN,
-            };
-            if re.is_some() || !parsed_labels.is_empty() {
-                let mut wait = Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
-                if after.is_none()
-                    && let Some(c) = cursor
-                {
-                    wait.after = parse_cursor_arg(c)?;
-                }
-                wait.timeout_ms = Some(0);
-                Ok(WireCommand::Wait(wait))
-            } else {
-                Ok(WireCommand::Read(Read {
-                    stream,
-                    after: start_seq,
-                    limit: *limit,
+            if after.is_none()
+                && let Some(c) = cursor
+            {
+                let parsed_cursor = parse_cursor_arg(c)?;
+                let interest = if re.is_some() || !parsed_labels.is_empty() {
+                    Interest::RoomFiltered {
+                        room: room_ref,
+                        re: re.map(Seq),
+                        labels: parsed_labels,
+                    }
+                } else {
+                    Interest::Room { room: room_ref }
+                };
+                Ok(WireCommand::Wait(Wait {
+                    interest,
+                    after: parsed_cursor,
+                    timeout_ms: Some(0),
                 }))
+            } else {
+                let room_id = room_ref.resolve(me)?;
+                let stream = StreamId::Room {
+                    room: room_id.clone(),
+                };
+                let start_seq = after.map_or(Seq::ORIGIN, Seq);
+                if re.is_some() || !parsed_labels.is_empty() {
+                    let mut wait =
+                        Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
+                    wait.timeout_ms = Some(0);
+                    Ok(WireCommand::Wait(wait))
+                } else {
+                    Ok(WireCommand::Read(Read {
+                        stream,
+                        after: start_seq,
+                        limit: *limit,
+                    }))
+                }
             }
         }
         Cmd::Wait {
@@ -1281,27 +1294,34 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
 
             let wait = match room {
                 Some(r) => {
-                    let room_id = parse_room_ref(r)?.resolve(me)?;
+                    let room_ref = parse_room_ref(r)?;
+                    let room_id = room_ref.resolve(me)?;
                     let stream = StreamId::Room {
                         room: room_id.clone(),
                     };
                     if has_filter {
-                        let start_seq = if *since > 0 {
-                            Seq(*since)
-                        } else {
-                            base_cursor
-                                .as_ref()
-                                .map_or(Seq::ORIGIN, |c| c.at_compatible(&stream))
-                        };
-                        let mut w =
-                            Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
                         if *since == 0
                             && let Some(c) = base_cursor
                         {
-                            w.after = c;
+                            Wait {
+                                interest: Interest::RoomFiltered {
+                                    room: room_ref,
+                                    re: re.map(Seq),
+                                    labels: parsed_labels,
+                                },
+                                after: c,
+                                timeout_ms: *timeout,
+                            }
+                        } else {
+                            let mut w = Wait::room_filtered(
+                                room_id,
+                                Seq(*since),
+                                re.map(Seq),
+                                parsed_labels,
+                            );
+                            w.timeout_ms = *timeout;
+                            w
                         }
-                        w.timeout_ms = *timeout;
-                        w
                     } else {
                         let mentions = !*all;
                         let mut w = Wait::room(room_id, Seq(*since), mentions);
@@ -1311,7 +1331,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                             } else {
                                 c
                             };
-                            if *since > 0 || (mentions && !c.lists_compatible(&stream)) {
+                            if *since > 0 || (mentions && !c.lists(&stream)) {
                                 c.advance(&stream, Seq(*since));
                             }
                             w.after = c;

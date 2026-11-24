@@ -2915,7 +2915,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     let p2 = zorro_op
         .call(rex_wave_api::read::Read {
             stream: canon_stream.clone(),
-            after: p1.cursor.at_compatible(&canon_stream),
+            after: p1.cursor.at(&canon_stream),
             limit: Some(1),
         })
         .await
@@ -2924,7 +2924,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     let p3 = zorro_op
         .call(rex_wave_api::read::Read {
             stream: canon_stream,
-            after: p2.cursor.at_compatible(&StreamId::Room {
+            after: p2.cursor.at(&StreamId::Room {
                 room: canon_room.clone(),
             }),
             limit: Some(1),
@@ -3030,8 +3030,28 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     let split_op = LocalClient::new(split_router.clone(), op_p);
     let retried = split_op
         .call(RoomPost {
-            room: RoomRef::Dm { with: alice_p },
+            room: RoomRef::Dm {
+                with: alice_p.clone(),
+            },
             body: Body::parse("operator legacy #3").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: Some(shared_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried.room, legacy_room);
+    assert_eq!(retried.seq, Seq(3));
+
+    // Explicit canonical RoomRef::Id stays pinned to canonical stream and rejects peer's idem key.
+    let explicit_cross_author = split_op
+        .call(RoomPost {
+            room: RoomRef::Id {
+                id: canon_room.clone(),
+            },
+            body: Body::parse("explicit canonical").unwrap(),
             re: None,
             after: None,
             labels: Vec::new(),
@@ -3039,7 +3059,27 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
             idem: Some(shared_idem),
         })
         .await
+        .unwrap_err();
+    assert!(matches!(explicit_cross_author, ApiError::Conflict { .. }));
+
+    // A legacy cursor at seq 3 does not skip canonical entries on a split journal.
+    let legacy_cursor = Cursor::default().with(
+        StreamId::Room {
+            room: legacy_room.clone(),
+        },
+        Seq(3),
+    );
+    let split_wait_page = split_op
+        .call(rex_wave_api::read::Wait {
+            interest: Interest::Room {
+                room: RoomRef::Dm { with: alice_p },
+            },
+            after: legacy_cursor,
+            timeout_ms: Some(0),
+        })
+        .await
         .unwrap();
-    assert_eq!(retried.room, legacy_room);
-    assert_eq!(retried.seq, Seq(3));
+    assert_eq!(split_wait_page.entries.len(), 2);
+    assert_eq!(split_wait_page.entries[0].seq, Seq(1));
+    assert_eq!(split_wait_page.entries[1].seq, Seq(2));
 }

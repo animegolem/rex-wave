@@ -1471,10 +1471,19 @@ impl Connection {
     }
 }
 
-/// Bind `endpoint`, recording the daemon process's own Unix uid from the bound
-/// socket inode so callers do not need `unsafe` `geteuid()`.
+/// Bind `endpoint`, recording the daemon process's own Unix uid from `geteuid()`.
 pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
-    let prepared = rex_wave_fs::prepare_unix_socket(path)?;
+    let prepared = rex_wave_fs::validate_unix_socket_target(path)?;
+    bind_unix_prepared(path, &prepared)
+}
+
+/// Unlink any stale socket, bind `path`, and apply mode `0600` using a
+/// previously validated [`rex_wave_fs::PreparedUnixSocket`].
+pub fn bind_unix_prepared(
+    path: &std::path::Path,
+    prepared: &rex_wave_fs::PreparedUnixSocket,
+) -> io::Result<(UnixListener, u32)> {
+    prepared.unlink_stale(path)?;
     let listener = UnixListener::bind(path)?;
     prepared.finalize_permissions(path)?;
     Ok((listener, prepared.uid()))

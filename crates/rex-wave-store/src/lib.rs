@@ -195,6 +195,7 @@ fn find_idem(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DmIdemResolution {
     Route(RoomId),
+    CrossAuthor { room: RoomId },
     Ambiguous(Vec<RoomId>),
 }
 
@@ -315,36 +316,44 @@ impl Journal {
         Ok(room)
     }
 
-    /// Resolve a canonical `(Seat, peer)` DM room for a command carrying an
-    /// optional idempotency key across both canonical and pre-PR-26
-    /// `(Operator, peer)` histories:
-    /// - Checks every existing history for `idem`;
-    /// - Routes to the unique stream where `by` (`same_actor`) committed `idem`;
-    /// - Returns [`DmIdemResolution::Ambiguous`] when `idem` exists on multiple
-    ///   histories for `by` or belongs to a different author.
+    /// Resolve a DM room for a command carrying an optional idempotency key:
+    /// - When `allow_legacy_fallback` is false (explicit `RoomRef::Id`), keeps
+    ///   `room` pinned to its exact stream while verifying `idem` authorship.
+    /// - When `allow_legacy_fallback` is true (`RoomRef::Dm`), checks both
+    ///   canonical and pre-PR-26 `(Operator, peer)` histories for `idem`,
+    ///   routing to the unique stream where `by` (`same_actor`) committed `idem`,
+    ///   returning [`DmIdemResolution::Ambiguous`] when `idem` exists for `by`
+    ///   on multiple histories, and [`DmIdemResolution::CrossAuthor`] when
+    ///   `idem` was committed by another participant.
     pub fn resolve_dm_room_with_idem(
         &self,
         room: RoomId,
         by: &Principal,
         idem: Option<&IdemKey>,
+        allow_legacy_fallback: bool,
     ) -> Result<DmIdemResolution, StoreError> {
         let RoomId::Direct { ref pair } = room else {
             return Ok(DmIdemResolution::Route(room));
         };
         let (a, b): (Principal, Principal) = pair.clone().into();
-        if a.is_operator() || b.is_operator() {
+        let conn = self.inner.conn();
+
+        if !allow_legacy_fallback || a.is_operator() || b.is_operator() {
+            if let Some(key) = idem
+                && let Some(batch) = find_idem(&conn, &StreamId::Room { room: room.clone() }, key)?
+                && batch.first().is_some_and(|env| !env.by.same_actor(by))
+            {
+                return Ok(DmIdemResolution::CrossAuthor { room });
+            }
             return Ok(DmIdemResolution::Route(room));
         }
-        let conn = self.inner.conn();
+
         let canon_exists = head_of(&conn, &StreamId::Room { room: room.clone() })? > Seq::ORIGIN;
         let mut legacy_existing = Vec::new();
         for cand in legacy_dm_candidates(&a, &b) {
             if head_of(&conn, &StreamId::Room { room: cand.clone() })? > Seq::ORIGIN {
                 legacy_existing.push(cand);
             }
-        }
-        if legacy_existing.is_empty() {
-            return Ok(DmIdemResolution::Route(room));
         }
         if let Some(key) = idem {
             let mut to_check = Vec::with_capacity(1 + legacy_existing.len());
@@ -370,11 +379,11 @@ impl Journal {
             if same_actor_rooms.len() > 1 {
                 return Ok(DmIdemResolution::Ambiguous(same_actor_rooms));
             }
-            if !other_actor_rooms.is_empty() {
-                return Ok(DmIdemResolution::Ambiguous(other_actor_rooms));
+            if let Some(other_room) = other_actor_rooms.into_iter().next() {
+                return Ok(DmIdemResolution::CrossAuthor { room: other_room });
             }
         }
-        if canon_exists {
+        if canon_exists || legacy_existing.is_empty() {
             Ok(DmIdemResolution::Route(room))
         } else {
             Ok(DmIdemResolution::Route(legacy_existing.remove(0)))
@@ -651,14 +660,23 @@ mod legacy_dm_tests {
         let same_idem = IdemKey::parse("same-idem").unwrap();
         assert_eq!(
             split
-                .resolve_dm_room_with_idem(canon_room.clone(), &op, Some(&same_idem))
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, Some(&same_idem), true)
                 .unwrap(),
             DmIdemResolution::Route(legacy_room.clone()),
-            "operator retry resolves to the operator's legacy batch even when peer used same key on canonical stream"
+            "operator retry via RoomRef::Dm resolves to operator's legacy batch"
         );
         assert_eq!(
             split
-                .resolve_dm_room_with_idem(canon_room.clone(), &alice, Some(&same_idem))
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, Some(&same_idem), false)
+                .unwrap(),
+            DmIdemResolution::CrossAuthor {
+                room: canon_room.clone()
+            },
+            "explicit canonical RoomRef::Id stays pinned to canonical stream and flags cross-author idem"
+        );
+        assert_eq!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &alice, Some(&same_idem), true)
                 .unwrap(),
             DmIdemResolution::Route(canon_room.clone()),
             "peer retry resolves to peer's canonical batch"
@@ -668,9 +686,9 @@ mod legacy_dm_tests {
         };
         assert!(matches!(
             split
-                .resolve_dm_room_with_idem(canon_room.clone(), &bob, Some(&same_idem))
+                .resolve_dm_room_with_idem(canon_room.clone(), &bob, Some(&same_idem), true)
                 .unwrap(),
-            DmIdemResolution::Ambiguous(_)
+            DmIdemResolution::CrossAuthor { .. }
         ));
     }
 }
