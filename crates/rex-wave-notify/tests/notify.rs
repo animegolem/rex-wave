@@ -3658,4 +3658,178 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         ),
         "live worker Wait must record subscription head Seq(5) in Activity::Parked, got {phase:?}"
     );
+
+    // Denied worker wait on a private DM fails before emitting any `Activity::Parked` wave event.
+    let wave_head_before = router
+        .read
+        .journal
+        .head(&StreamId::Wave {
+            wave: wave_slug.clone(),
+        })
+        .unwrap();
+    let secret_dm = RoomId::Direct {
+        pair: PrincipalPair::new(bob_p, carol_p).unwrap(),
+    };
+    let denied_wait = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(200),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Id { id: secret_dm },
+                },
+                Cursor::live(),
+            )
+        })
+        .await;
+    assert!(matches!(denied_wait, Err(ApiError::Denied { .. })));
+    let wave_head_after = router
+        .read
+        .journal
+        .head(&StreamId::Wave { wave: wave_slug })
+        .unwrap();
+    assert_eq!(
+        wave_head_after, wave_head_before,
+        "denied worker wait must not publish private DM head to wave journal"
+    );
+
+    // Project wait cursor uses the same scoped start rule for plain `Read` as for `Wait`.
+    let proj_wait = alice
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_park").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    let global_read = alice
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                general,
+                &alice_p,
+                Seq::ORIGIN,
+                Some(proj_wait.cursor.clone()),
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        global_read.entries.is_empty(),
+        "plain Read with project cursor must start unlisted global room at head"
+    );
+
+    let new_proj_room = RoomRef::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("proj_park").unwrap(),
+        },
+        name: ChannelName::parse("alerts").unwrap(),
+    };
+    bob.call(RoomPost {
+        room: new_proj_room.clone(),
+        body: Body::parse("alert in new project room").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+    let proj_room_read = alice
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                new_proj_room,
+                &alice_p,
+                Seq::ORIGIN,
+                Some(proj_wait.cursor),
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !proj_room_read.entries.is_empty(),
+        "plain Read with project cursor must start newly created project room at origin"
+    );
+
+    // Post committed while `WaveObserve(Parked)` is still in flight must be delivered, not skipped.
+    struct PostDuringParkWave {
+        inner: Arc<dyn rex_wave_runtime::Service<rex_wave_api::WaveCommand>>,
+        poster: LocalClient,
+        room: RoomId,
+    }
+    impl rex_wave_runtime::Service<rex_wave_api::WaveCommand> for PostDuringParkWave {
+        fn dispatch(
+            &self,
+            cmd: rex_wave_api::WaveCommand,
+            ctx: rex_wave_runtime::DecideCtx,
+        ) -> rex_wave_runtime::BoxFut<'_, Result<WireReply, ApiError>> {
+            let is_park = matches!(
+                &cmd,
+                rex_wave_api::WaveCommand::WaveObserve(WaveObserve {
+                    observation: Observation::Activity {
+                        activity: Activity::Parked { .. },
+                    },
+                    ..
+                })
+            );
+            Box::pin(async move {
+                let res = self.inner.dispatch(cmd, ctx).await;
+                if is_park {
+                    self.poster
+                        .call(RoomPost {
+                            room: RoomRef::Id {
+                                id: self.room.clone(),
+                            },
+                            body: Body::parse("arrived during Parked observe").unwrap(),
+                            re: None,
+                            after: None,
+                            labels: Vec::new(),
+                            task: None,
+                            idem: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                res
+            })
+        }
+    }
+
+    let race_router = Arc::new(Router {
+        room: router.room.clone(),
+        wave: Arc::new(PostDuringParkWave {
+            inner: router.wave.clone(),
+            poster: alice.clone(),
+            room: general_id.clone(),
+        }),
+        board: router.board.clone(),
+        inbox: router.inbox.clone(),
+        mail: router.mail.clone(),
+        presence: router.presence.clone(),
+        read: router.read.clone(),
+    });
+    let race_worker = LocalClient::new(race_router, worker_p);
+    let race_page = race_worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(150),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Id { id: general_id },
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        !race_page.timed_out && race_page.entries.len() == 1,
+        "worker Wait must deliver post committed while WaveObserve(Parked) was in flight, got {race_page:?}"
+    );
 }

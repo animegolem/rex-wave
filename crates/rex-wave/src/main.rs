@@ -890,12 +890,7 @@ fn parse_cursor_arg(raw: &str) -> Result<Cursor, ApiError> {
 }
 
 fn ensure_cursor_from_head(cursor: Cursor) -> Cursor {
-    if cursor.from_head()
-        || matches!(
-            cursor.snapshot(),
-            Some(SnapshotScope::Mentions | SnapshotScope::Everything)
-        )
-    {
+    if cursor.from_head() || cursor.snapshot().is_some() {
         return cursor;
     }
     cursor.with_from_head(true)
@@ -1327,6 +1322,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         let mentions = !*all;
                         let mut w = Wait::room_ref(room_ref, me, Seq(*since), mentions)?;
                         if let Some(c) = base_cursor {
+                            let was_unscoped = !c.from_head() && c.snapshot().is_none();
                             let base_c = if mentions {
                                 ensure_cursor_from_head(c)
                             } else {
@@ -1335,14 +1331,16 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                             let mut wire_c = base_c.clone();
                             if *since > 0 {
                                 wire_c.advance(&fallback_stream, Seq(*since));
-                            } else {
-                                w.since = None;
+                            } else if was_unscoped {
+                                w.since = Some(Seq::ORIGIN);
                                 if mentions
                                     && !wire_c.lists(&stream)
                                     && !wire_c.lists(&fallback_stream)
                                 {
                                     wire_c.advance(&fallback_stream, Seq::ORIGIN);
                                 }
+                            } else {
+                                w.since = None;
                             }
                             w.after = wire_c;
                             w.cursor = Some(base_c);

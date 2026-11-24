@@ -1203,11 +1203,14 @@ pub fn load_bb_projects_from_dir(dir: &Path) -> BTreeMap<BbProjectId, String> {
 pub trait BridgeBackend: Send + Sync + 'static {
     type C: Client + Clone + 'static;
     fn client(&self, me: Principal) -> Self::C;
+    fn handles_worker_wait_parking(&self) -> bool {
+        false
+    }
     fn parked_room_and_since(
         &self,
         worker: &Principal,
         wait: &rex_wave_api::read::Wait,
-    ) -> (Option<RoomId>, Seq) {
+    ) -> Option<(Option<RoomId>, Seq)> {
         parked_room_and_since(worker, wait)
     }
 }
@@ -1217,22 +1220,26 @@ impl BridgeBackend for Arc<Router> {
     fn client(&self, me: Principal) -> LocalClient {
         LocalClient::new(self.clone(), me)
     }
+    fn handles_worker_wait_parking(&self) -> bool {
+        true
+    }
     fn parked_room_and_since(
         &self,
         worker: &Principal,
         wait: &rex_wave_api::read::Wait,
-    ) -> (Option<RoomId>, Seq) {
+    ) -> Option<(Option<RoomId>, Seq)> {
         self.read.parked_room_and_since(worker, wait)
     }
 }
 
 trait ErasedBackend: Send + Sync {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>>;
+    fn handles_worker_wait_parking(&self) -> bool;
     fn parked_scope(
         &self,
         worker: &Principal,
         wait: &rex_wave_api::read::Wait,
-    ) -> (Option<RoomId>, Seq);
+    ) -> Option<(Option<RoomId>, Seq)>;
 }
 
 impl<B: BridgeBackend> ErasedBackend for B {
@@ -1240,11 +1247,14 @@ impl<B: BridgeBackend> ErasedBackend for B {
         let client = self.client(me);
         Box::pin(async move { client.call_wire(cmd).await })
     }
+    fn handles_worker_wait_parking(&self) -> bool {
+        BridgeBackend::handles_worker_wait_parking(self)
+    }
     fn parked_scope(
         &self,
         worker: &Principal,
         wait: &rex_wave_api::read::Wait,
-    ) -> (Option<RoomId>, Seq) {
+    ) -> Option<(Option<RoomId>, Seq)> {
         self.parked_room_and_since(worker, wait)
     }
 }
@@ -1768,30 +1778,33 @@ impl Client for WorkerToolClient {
         let active_waits = self.active_waits.clone();
         let aborted_wait = self.aborted_wait.clone();
         async move {
-            let parked_scope = match &cmd {
-                WireCommand::Wait(w) => Some(backend.parked_scope(&me, w)),
+            let is_blocking_wait = matches!(&cmd, WireCommand::Wait(w) if w.timeout_ms != Some(0));
+            let router_handles_park = backend.handles_worker_wait_parking();
+            let manual_parked_scope = match &cmd {
+                WireCommand::Wait(w) if is_blocking_wait && !router_handles_park => {
+                    backend.parked_scope(&me, w)
+                }
                 _ => None,
             };
             let mut wait_guard = None;
-            if let Some((room, since)) = &parked_scope {
+            if is_blocking_wait && (router_handles_park || manual_parked_scope.is_some()) {
                 active_waits.fetch_add(1, Ordering::Relaxed);
                 wait_guard = Some(WaitFlightGuard {
                     active: active_waits.clone(),
                     aborted: aborted_wait,
                     completed: false,
                 });
-                bridge
-                    .call_wave_observe(
-                        wave.clone(),
-                        role.clone(),
-                        Observation::Activity {
-                            activity: Activity::Parked {
-                                room: room.clone(),
-                                since: *since,
+                if let Some((room, since)) = manual_parked_scope {
+                    bridge
+                        .call_wave_observe(
+                            wave.clone(),
+                            role.clone(),
+                            Observation::Activity {
+                                activity: Activity::Parked { room, since },
                             },
-                        },
-                    )
-                    .await;
+                        )
+                        .await;
+                }
             }
 
             let outcome = backend.call_as(me, cmd).await;
@@ -1799,7 +1812,8 @@ impl Client for WorkerToolClient {
             if let Some(mut guard) = wait_guard {
                 guard.completed = true;
                 drop(guard);
-                if active_waits.load(Ordering::Relaxed) == 0
+                if !router_handles_park
+                    && active_waits.load(Ordering::Relaxed) == 0
                     && let Ok(rec) = bridge.lookup_worker(&wave, &role).await
                     && matches!(rec.activity, Activity::Parked { .. })
                 {
@@ -3195,28 +3209,53 @@ impl BbBridge {
     }
 }
 
+fn can_worker_read_stream(worker: &Principal, stream: &StreamId) -> bool {
+    if worker.is_operator_or_system() {
+        return true;
+    }
+    match stream {
+        StreamId::Inbox { owner } => owner == worker,
+        StreamId::Room {
+            room: RoomId::Direct { pair },
+        } => pair.other_for_viewer(worker).is_some(),
+        StreamId::Room { .. }
+        | StreamId::Wave { .. }
+        | StreamId::Board { .. }
+        | StreamId::Mail
+        | StreamId::Presence => true,
+    }
+}
+
 fn parked_room_and_since(
     worker: &Principal,
     w: &rex_wave_api::read::Wait,
-) -> (Option<RoomId>, Seq) {
-    let effective = match w.effective_cursor_for(worker) {
-        Ok(c) => c,
-        Err(_) => return (None, Seq::ORIGIN),
-    };
+) -> Option<(Option<RoomId>, Seq)> {
+    let effective = w.effective_cursor_for(worker).ok()?;
     match &w.interest {
-        Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
-        {
-            Ok(id) => {
-                let since = effective.at(&StreamId::Room { room: id.clone() });
-                (Some(id), since)
+        Interest::Everything if !worker.is_operator_or_system() => None,
+        Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
+            let id = room.resolve(worker).ok()?;
+            let s = StreamId::Room { room: id.clone() };
+            if !can_worker_read_stream(worker, &s) {
+                return None;
             }
-            Err(_) => (None, Seq::ORIGIN),
-        },
-        Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
-            StreamId::Room { room } => (Some(room.clone()), effective.at(&streams[0])),
-            _ => (None, Seq::ORIGIN),
-        },
-        _ => (None, Seq::ORIGIN),
+            Some((Some(id), effective.at(&s)))
+        }
+        Interest::Streams { streams } => {
+            for s in streams {
+                if !can_worker_read_stream(worker, s) {
+                    return None;
+                }
+            }
+            if streams.len() == 1
+                && let StreamId::Room { room } = &streams[0]
+            {
+                Some((Some(room.clone()), effective.at(&streams[0])))
+            } else {
+                Some((None, Seq::ORIGIN))
+            }
+        }
+        _ => Some((None, Seq::ORIGIN)),
     }
 }
 

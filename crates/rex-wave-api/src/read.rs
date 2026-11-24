@@ -235,7 +235,11 @@ impl Wait {
             if let Some(ref target) = target_stream {
                 if let Some(since) = self.since {
                     out.advance(target, since);
-                } else if matches!(self.interest, Interest::Mentions) && !out.lists(target) {
+                } else if matches!(self.interest, Interest::Mentions)
+                    && !c.from_head()
+                    && c.snapshot().is_none()
+                    && !out.lists(target)
+                {
                     out.advance(target, Seq::ORIGIN);
                 }
             }

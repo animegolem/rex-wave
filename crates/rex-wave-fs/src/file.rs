@@ -532,8 +532,8 @@ impl PreparedUnixSocket {
 
         self.unlink_stale(display_path)?;
 
-        let stage = StageDir::create(&self.parent_dir, self.uid, display_path)?;
-        let listener = std::os::unix::net::UnixListener::bind(&stage.sock_path)?;
+        let stage = BindStage::create(&self.parent_dir, self.uid, display_path)?;
+        let listener = std::os::unix::net::UnixListener::bind(&stage.bind_addr)?;
         chmod_socket_nofollow(
             stage.dir(),
             std::ffi::OsStr::new("s"),
@@ -684,34 +684,160 @@ fn chmod_socket_nofollow(
     }
 }
 
-fn next_stage_token() -> u64 {
+fn next_stage_token_128() -> u128 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher as _, Hasher as _};
 
     let n = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-    let mut h = RandomState::new().build_hasher();
-    h.write_u32(std::process::id());
-    h.write_u64(n);
-    h.finish()
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u32(std::process::id());
+    h1.write_u64(n);
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(n.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    (u128::from(h1.finish()) << 64) | u128::from(h2.finish())
 }
 
-fn resolve_stage_sock_path(stage_dir: &File, display_path: &Path) -> io::Result<Option<PathBuf>> {
-    use std::os::unix::net::SocketAddr;
+struct OwnedSubdir {
+    host_dir: File,
+    name: String,
+    dir: Option<File>,
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let fd_dir = PathBuf::from(format!("/proc/self/fd/{}", stage_dir.as_raw_fd()));
-        if let (Ok(stage_meta), Ok(fd_meta)) = (stage_dir.metadata(), fs::metadata(&fd_dir))
-            && (stage_meta.dev(), stage_meta.ino()) == (fd_meta.dev(), fd_meta.ino())
-        {
-            let target = fd_dir.join("s");
-            if SocketAddr::from_pathname(&target).is_ok() {
-                return Ok(Some(target));
+impl OwnedSubdir {
+    fn create(host_dir: File, prefix: &str, hex_chars: usize, uid: u32) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, fchmod, mkdirat, openat};
+
+        let mut created_name: Option<String> = None;
+        for _ in 0..MAX_TEMP_ATTEMPTS {
+            let tok = format!("{:032x}", next_stage_token_128());
+            let candidate = format!("{prefix}{}", &tok[..hex_chars.min(32)]);
+            match mkdirat(&host_dir, &candidate, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {
+                    created_name = Some(candidate);
+                    break;
+                }
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(e) => return Err(io::Error::from(e)),
             }
         }
+        let name = created_name.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "exhausted temporary socket staging names",
+            )
+        })?;
+        let mut out = Self {
+            host_dir,
+            name: name.clone(),
+            dir: None,
+        };
+
+        let fd = openat(
+            &out.host_dir,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let dir = File::from(fd);
+        fchmod(&dir, Mode::from_raw_mode(0o700)).map_err(io::Error::from)?;
+        let meta = dir.metadata()?;
+        if !meta.is_dir() || meta.uid() != uid || (meta.permissions().mode() & 0o777 != 0o700) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "socket staging directory failed ownership or 0700 mode check",
+            ));
+        }
+        out.dir = Some(dir);
+        Ok(out)
     }
 
+    fn dir(&self) -> &File {
+        self.dir.as_ref().expect("subdir initialized")
+    }
+}
+
+impl Drop for OwnedSubdir {
+    fn drop(&mut self) {
+        if let Some(ref sd) = self.dir {
+            let _ = rustix::fs::unlinkat(sd, "s", rustix::fs::AtFlags::empty());
+            let _ = rustix::fs::unlinkat(sd, "d", rustix::fs::AtFlags::empty());
+        }
+        let _ = rustix::fs::unlinkat(&self.host_dir, &self.name, rustix::fs::AtFlags::REMOVEDIR);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_fd_stage_sock_path(stage_dir: &File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::SocketAddr;
+
+    let fd_dir = PathBuf::from(format!("/proc/self/fd/{}", stage_dir.as_raw_fd()));
+    let (Ok(stage_meta), Ok(fd_meta)) = (stage_dir.metadata(), fs::metadata(&fd_dir)) else {
+        return None;
+    };
+    if (stage_meta.dev(), stage_meta.ino()) != (fd_meta.dev(), fd_meta.ino()) {
+        return None;
+    }
+    let target = fd_dir.join("s");
+    SocketAddr::from_pathname(&target).ok()?;
+    Some(target)
+}
+
+/// Stages a new socket on the destination filesystem (`parent_dir`) while
+/// addressing it via a short path independent of `parent_dir`'s path length
+/// (`/proc/self/fd/<fd>/s` on Linux; a symlink trampoline inside verified
+/// `/tmp` on macOS and fallback targets).
+struct BindStage {
+    dest_stage: OwnedSubdir,
+    _tramp_stage: Option<OwnedSubdir>,
+    bind_addr: PathBuf,
+}
+
+impl BindStage {
+    fn create(parent_dir: &File, uid: u32, display_path: &Path) -> io::Result<Self> {
+        let dest_stage = OwnedSubdir::create(parent_dir.try_clone()?, ".s", 16, uid)?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(fd_sock) = proc_fd_stage_sock_path(dest_stage.dir()) {
+            return Ok(Self {
+                dest_stage,
+                _tramp_stage: None,
+                bind_addr: fd_sock,
+            });
+        }
+
+        let dest_dir_path = stage_dir_abs_path(dest_stage.dir(), &dest_stage.name, display_path)?;
+        let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "socket {}: cannot anchor trampoline root ({e})",
+                    display_path.display()
+                ),
+            )
+        })?;
+        let tramp_stage = OwnedSubdir::create(tmp_dir, ".t", 16, uid)?;
+        rustix::fs::symlinkat(&dest_dir_path, tramp_stage.dir(), "d").map_err(io::Error::from)?;
+        let bind_addr = tmp_path.join(&tramp_stage.name).join("d").join("s");
+        std::os::unix::net::SocketAddr::from_pathname(&bind_addr)?;
+        Ok(Self {
+            dest_stage,
+            _tramp_stage: Some(tramp_stage),
+            bind_addr,
+        })
+    }
+
+    fn dir(&self) -> &File {
+        self.dest_stage.dir()
+    }
+}
+
+fn stage_dir_abs_path(
+    stage_dir: &File,
+    stage_name: &str,
+    display_path: &Path,
+) -> io::Result<PathBuf> {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -720,10 +846,9 @@ fn resolve_stage_sock_path(stage_dir: &File, display_path: &Path) -> io::Result<
     ))]
     {
         use std::os::unix::ffi::OsStrExt as _;
+        let _ = (stage_name, display_path);
         let cpath = rustix::fs::getpath(stage_dir).map_err(io::Error::from)?;
-        let target = PathBuf::from(std::ffi::OsStr::from_bytes(cpath.as_bytes())).join("s");
-        let _ = display_path;
-        Ok(SocketAddr::from_pathname(&target).ok().map(|_| target))
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(cpath.as_bytes())))
     }
 
     #[cfg(not(any(
@@ -733,121 +858,9 @@ fn resolve_stage_sock_path(stage_dir: &File, display_path: &Path) -> io::Result<
         target_os = "watchos"
     )))]
     {
-        let _ = (stage_dir, display_path);
-        Ok(None)
-    }
-}
-
-struct StageDir {
-    host_dir: File,
-    stage_name: String,
-    stage_dir: Option<File>,
-    sock_path: PathBuf,
-}
-
-impl StageDir {
-    fn create_in_host(host_dir: File, uid: u32) -> io::Result<(Self, File)> {
-        use rustix::fs::{Mode, OFlags, fchmod, mkdirat, openat};
-
-        let mut created_stage: Option<String> = None;
-        for _ in 0..MAX_TEMP_ATTEMPTS {
-            let candidate = format!(".s{:08x}", next_stage_token() as u32);
-            match mkdirat(&host_dir, &candidate, Mode::from_raw_mode(0o700)) {
-                Ok(()) => {
-                    created_stage = Some(candidate);
-                    break;
-                }
-                Err(rustix::io::Errno::EXIST) => continue,
-                Err(e) => return Err(io::Error::from(e)),
-            }
-        }
-        let stage_name = created_stage.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "exhausted temporary socket staging names",
-            )
-        })?;
-        let out = Self {
-            host_dir,
-            stage_name: stage_name.clone(),
-            stage_dir: None,
-            sock_path: PathBuf::new(),
-        };
-
-        let stage_fd = openat(
-            &out.host_dir,
-            &stage_name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let stage_dir = File::from(stage_fd);
-        fchmod(&stage_dir, Mode::from_raw_mode(0o700)).map_err(io::Error::from)?;
-        let stage_meta = stage_dir.metadata()?;
-        if !stage_meta.is_dir()
-            || stage_meta.uid() != uid
-            || (stage_meta.permissions().mode() & 0o777 != 0o700)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "socket staging directory failed ownership or 0700 mode check",
-            ));
-        }
-        Ok((out, stage_dir))
-    }
-
-    fn create(parent_dir: &File, uid: u32, display_path: &Path) -> io::Result<Self> {
-        let parent_clone = parent_dir.try_clone()?;
-        let (mut stage, stage_dir) = Self::create_in_host(parent_clone, uid)?;
-        if let Some(sock_path) = resolve_stage_sock_path(&stage_dir, display_path)? {
-            stage.sock_path = sock_path;
-            stage.stage_dir = Some(stage_dir);
-            return Ok(stage);
-        }
-        drop(stage_dir);
-        drop(stage);
-
-        let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "socket {}: cannot anchor fallback staging root ({e})",
-                    display_path.display()
-                ),
-            )
-        })?;
-        if tmp_dir.metadata()?.dev() != parent_dir.metadata()?.dev() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "socket {}: staging path in parent directory exceeds SUN_LEN and /tmp is on a different filesystem",
-                    display_path.display()
-                ),
-            ));
-        }
-        let (mut tmp_stage, tmp_stage_dir) = Self::create_in_host(tmp_dir, uid)?;
-        let sock_path = tmp_path.join(&tmp_stage.stage_name).join("s");
-        std::os::unix::net::SocketAddr::from_pathname(&sock_path)?;
-        tmp_stage.sock_path = sock_path;
-        tmp_stage.stage_dir = Some(tmp_stage_dir);
-        Ok(tmp_stage)
-    }
-
-    fn dir(&self) -> &File {
-        self.stage_dir.as_ref().expect("stage_dir initialized")
-    }
-}
-
-impl Drop for StageDir {
-    fn drop(&mut self) {
-        if let Some(ref sd) = self.stage_dir {
-            let _ = rustix::fs::unlinkat(sd, "s", rustix::fs::AtFlags::empty());
-        }
-        let _ = rustix::fs::unlinkat(
-            &self.host_dir,
-            &self.stage_name,
-            rustix::fs::AtFlags::REMOVEDIR,
-        );
+        let _ = stage_dir;
+        let parent = parent_of(display_path)?;
+        Ok(fs::canonicalize(parent)?.join(stage_name))
     }
 }
 
@@ -867,10 +880,8 @@ fn open_verified_sticky_tmp_root(uid: u32) -> io::Result<(File, PathBuf)> {
         .custom_flags(NOFOLLOW | libc::O_DIRECTORY)
         .open("/")?;
     let root_meta = cur.metadata()?;
-    if !root_meta.is_dir()
-        || (root_meta.uid() != 0 && root_meta.uid() != uid)
-        || (root_meta.permissions().mode() & 0o022 != 0)
-    {
+    let root_owner_ok = root_meta.uid() == 0 || (uid == 0 && root_meta.uid() == uid);
+    if !root_meta.is_dir() || !root_owner_ok || (root_meta.permissions().mode() & 0o022 != 0) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "root directory / failed ownership or mode verification",
@@ -892,13 +903,13 @@ fn open_verified_sticky_tmp_root(uid: u32) -> io::Result<(File, PathBuf)> {
                 let next = File::from(next_fd);
                 let meta = next.metadata()?;
                 let mode = meta.permissions().mode();
-                let owner_ok = meta.uid() == 0 || meta.uid() == uid;
+                let owner_ok = meta.uid() == 0;
                 let mode_ok = (mode & 0o022 == 0) || (mode & 0o1000 != 0);
                 if !meta.is_dir() || !owner_ok || !mode_ok {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!(
-                            "temporary ancestor {} failed ownership or sticky-mode verification",
+                            "temporary ancestor {} failed root-ownership or sticky-mode verification",
                             built.join(seg).display()
                         ),
                     ));
@@ -934,22 +945,89 @@ fn connect_held_socket(
 ) -> io::Result<HeldProbeOutcome> {
     use rustix::fs::{AtFlags, linkat, statat};
 
-    let stage = StageDir::create(parent_dir, uid, display_path)?;
-    match linkat(parent_dir, file_name, stage.dir(), "s", AtFlags::empty()) {
+    #[cfg(target_os = "linux")]
+    {
+        let stage = OwnedSubdir::create(parent_dir.try_clone()?, ".p", 16, uid)?;
+        if let Some(fd_sock) = proc_fd_stage_sock_path(stage.dir()) {
+            match linkat(parent_dir, file_name, stage.dir(), "s", AtFlags::empty()) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::NOENT) => return Ok(HeldProbeOutcome::Gone),
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "refusing to unlink socket {}: cannot anchor liveness probe to held directory ({e})",
+                            display_path.display()
+                        ),
+                    ));
+                }
+            }
+            let linked_st =
+                statat(stage.dir(), "s", AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+            if stat_file_id(&linked_st) != expected_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to unlink socket {}: socket identity changed while staging probe",
+                        display_path.display()
+                    ),
+                ));
+            }
+            return match std::os::unix::net::UnixStream::connect(&fd_sock) {
+                Ok(_) => Ok(HeldProbeOutcome::Listening),
+                Err(e)
+                    if e.kind() == io::ErrorKind::ConnectionRefused
+                        || e.raw_os_error() == Some(libc::ECONNREFUSED) =>
+                {
+                    Ok(HeldProbeOutcome::Stale)
+                }
+                Err(e) => Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "refusing to unlink socket {} after inconclusive liveness probe: {e}",
+                        display_path.display()
+                    ),
+                )),
+            };
+        }
+    }
+
+    // Without procfs fd paths, anchor the probe inside root-owned sticky `/tmp`
+    // via hard-link (`linkat`) so `connect` never resolves user-renameable
+    // ancestors of `parent_dir`. If `parent_dir` sits on another filesystem
+    // (`EXDEV`), decline stale recovery cleanly.
+    let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "refusing to unlink socket {}: cannot anchor probe staging root ({e})",
+                display_path.display()
+            ),
+        )
+    })?;
+    let probe_stage = OwnedSubdir::create(tmp_dir, ".p", 32, uid)?;
+    match linkat(
+        parent_dir,
+        file_name,
+        probe_stage.dir(),
+        "s",
+        AtFlags::empty(),
+    ) {
         Ok(()) => {}
         Err(rustix::io::Errno::NOENT) => return Ok(HeldProbeOutcome::Gone),
         Err(e) => {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+                io::ErrorKind::AddrInUse,
                 format!(
-                    "refusing to unlink socket {}: cannot anchor liveness probe to held directory ({e})",
+                    "refusing to unlink pre-existing socket {}: cannot anchor liveness probe across filesystems ({e})",
                     display_path.display()
                 ),
             ));
         }
     }
 
-    let linked_st = statat(stage.dir(), "s", AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    let linked_st =
+        statat(probe_stage.dir(), "s", AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     if stat_file_id(&linked_st) != expected_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -960,7 +1038,8 @@ fn connect_held_socket(
         ));
     }
 
-    match std::os::unix::net::UnixStream::connect(&stage.sock_path) {
+    let probe_addr = tmp_path.join(&probe_stage.name).join("s");
+    match std::os::unix::net::UnixStream::connect(&probe_addr) {
         Ok(_) => Ok(HeldProbeOutcome::Listening),
         Err(e)
             if e.kind() == io::ErrorKind::ConnectionRefused
@@ -968,13 +1047,6 @@ fn connect_held_socket(
         {
             Ok(HeldProbeOutcome::Stale)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to unlink socket {}: staging path diverged during probe",
-                display_path.display()
-            ),
-        )),
         Err(e) => Err(io::Error::new(
             e.kind(),
             format!(

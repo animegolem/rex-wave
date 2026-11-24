@@ -1,6 +1,5 @@
 use crate::read::ReadSide;
 use crate::{BoxFut, DecideCtx, Service, now};
-use rex_wave_api::room::RoomId;
 use rex_wave_api::wave::{Activity, Observation, WaveObserve, WaveView, WorkerPhase};
 use rex_wave_api::*;
 use std::collections::HashMap;
@@ -94,14 +93,6 @@ fn decrement_active_wait(key: &ActiveWaitKey) -> usize {
         map.remove(key);
     }
     remaining
-}
-
-fn parked_room_and_since(
-    read: &ReadSide,
-    worker: &Principal,
-    wait: &rex_wave_api::read::Wait,
-) -> (Option<RoomId>, Seq) {
-    read.parked_room_and_since(worker, wait)
 }
 
 fn resolve_room_cmd(
@@ -299,13 +290,17 @@ impl Router {
             }
             Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
             Routed::Read(ReadCommand::Wait(mut wait)) => {
-                let guard = if wait.timeout_ms != Some(0)
+                if wait.timeout_ms != Some(0)
+                    && matches!(by, Principal::Worker { .. })
+                    && wait.timeout_ms.is_none()
+                {
+                    wait.timeout_ms = Some(MAX_UNBOUNDED_WORKER_WAIT_MS);
+                }
+                let prepared = self.read.prepare_wait(by.clone(), wait)?;
+                let guard = if prepared.timeout_ms() != Some(0)
                     && let Principal::Worker { wave, role } = by
                 {
-                    if wait.timeout_ms.is_none() {
-                        wait.timeout_ms = Some(MAX_UNBOUNDED_WORKER_WAIT_MS);
-                    }
-                    let (room, since) = parked_room_and_since(&self.read, by, &wait);
+                    let (room, since) = prepared.parked_scope();
                     let guard =
                         WorkerWaitGuard::enter(self.wave.clone(), wave.clone(), role.clone());
                     let _ = self
@@ -325,7 +320,11 @@ impl Router {
                 } else {
                     None
                 };
-                let outcome = self.read.dispatch(ReadCommand::Wait(wait), ctx).await;
+                let outcome = self
+                    .read
+                    .run_prepared_wait(prepared)
+                    .await
+                    .map(WireReply::Wait);
                 if let Some(g) = guard {
                     g.finish().await;
                 }
