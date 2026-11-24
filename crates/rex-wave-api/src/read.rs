@@ -22,14 +22,42 @@ pub struct Read {
     /// `RoomRef::Id` stays pinned to its exact stream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomRef>,
+    /// Sequence to read after when `cursor` is omitted (also populated as a
+    /// single-stream fallback for older daemons when `cursor` is set).
     #[serde(default)]
     pub after: Seq,
-    /// Optional resume cursor; when present and `after == Seq::ORIGIN`, the
-    /// server looks up `cursor.at(&target_stream)` after resolving `room`.
+    /// Optional resume cursor; when present, takes precedence over `after` and
+    /// resolves against the server-selected stream (`from_head` starts unlisted
+    /// streams at `head`, otherwise `Seq::ORIGIN`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<Cursor>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Legacy pre-PR-26 `(Operator, peer)` DM stream when `me` is an operator
+/// addressing `@peer` (`RoomRef::Dm`). Populated alongside canonical DM wire
+/// fields so a newer CLI stays compatible with an older daemon during a
+/// rolling upgrade.
+pub fn legacy_operator_dm_stream(
+    room: &RoomRef,
+    me: &Principal,
+) -> Result<Option<StreamId>, crate::id::InvalidId> {
+    match (room, me) {
+        (RoomRef::Dm { with }, Principal::Operator { .. }) => {
+            let peer = with.as_dm_member();
+            if me.same_actor(&peer) {
+                Ok(None)
+            } else {
+                Ok(Some(StreamId::Room {
+                    room: RoomId::Direct {
+                        pair: crate::room::PrincipalPair::new(me.clone(), peer)?,
+                    },
+                }))
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 impl Read {
@@ -50,26 +78,13 @@ impl Read {
         cursor: Option<Cursor>,
         limit: Option<u32>,
     ) -> Result<Self, crate::id::InvalidId> {
-        let fallback_id = match (&room, viewer) {
-            (RoomRef::Dm { with }, Principal::Operator { .. }) => {
-                let peer = with.as_dm_member();
-                if viewer.same_actor(&peer) {
-                    room.resolve(viewer)?
-                } else {
-                    RoomId::Direct {
-                        pair: crate::room::PrincipalPair::new(viewer.clone(), peer)?,
-                    }
-                }
-            }
-            _ => room.resolve(viewer)?,
+        let canon_stream = StreamId::Room {
+            room: room.resolve(viewer)?,
         };
-        let fallback_stream = StreamId::Room { room: fallback_id };
-        let wire_after = if after > Seq::ORIGIN {
-            after
-        } else if let Some(ref c) = cursor {
-            c.at(&fallback_stream)
-        } else {
-            Seq::ORIGIN
+        let fallback_stream = legacy_operator_dm_stream(&room, viewer)?.unwrap_or(canon_stream);
+        let wire_after = match &cursor {
+            Some(c) => c.at(&fallback_stream),
+            None => after,
         };
         Ok(Read {
             stream: fallback_stream,
@@ -126,17 +141,27 @@ impl Wait {
     ) -> Result<Self, crate::id::InvalidId> {
         let id = room.resolve(me)?;
         let stream = StreamId::Room { room: id };
+        let legacy = legacy_operator_dm_stream(&room, me)?;
+        let mut after = if mentions_only {
+            Cursor::live()
+        } else {
+            Cursor::default()
+        }
+        .with(stream, since);
+        if let Some(leg) = legacy {
+            after = after.with(leg, since);
+        }
         if mentions_only {
             Ok(Wait {
                 interest: Interest::Mentions,
-                after: Cursor::live().with(stream, since),
+                after,
                 timeout_ms: None,
                 limit: None,
             })
         } else {
             Ok(Wait {
                 interest: Interest::Room { room },
-                after: Cursor::default().with(stream, since),
+                after,
                 timeout_ms: None,
                 limit: None,
             })
@@ -166,9 +191,13 @@ impl Wait {
     ) -> Result<Self, crate::id::InvalidId> {
         let id = room.resolve(me)?;
         let stream = StreamId::Room { room: id };
+        let mut after = Cursor::default().with(stream, since);
+        if let Some(leg) = legacy_operator_dm_stream(&room, me)? {
+            after = after.with(leg, since);
+        }
         Ok(Wait {
             interest: Interest::RoomFiltered { room, re, labels },
-            after: Cursor::default().with(stream, since),
+            after,
             timeout_ms: None,
             limit: None,
         })

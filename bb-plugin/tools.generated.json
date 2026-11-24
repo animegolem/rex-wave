@@ -5773,7 +5773,8 @@
       "properties": {
         "after": {
           "$ref": "#/$defs/Seq",
-          "default": 0
+          "default": 0,
+          "description": "Sequence to read after when `cursor` is omitted (also populated as a\nsingle-stream fallback for older daemons when `cursor` is set)."
         },
         "cursor": {
           "anyOf": [
@@ -5784,7 +5785,7 @@
               "type": "null"
             }
           ],
-          "description": "Optional resume cursor; when present and `after == Seq::ORIGIN`, the\nserver looks up `cursor.at(&target_stream)` after resolving `room`."
+          "description": "Optional resume cursor; when present, takes precedence over `after` and\nresolves against the server-selected stream (`from_head` starts unlisted\nstreams at `head`, otherwise `Seq::ORIGIN`)."
         },
         "limit": {
           "default": null,

@@ -3165,3 +3165,112 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
         Seq(2)
     );
 }
+
+#[tokio::test]
+async fn capped_multi_stream_wait_advances_cursor_without_looping() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let op = LocalClient::new(
+        router,
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+
+    let first_ref = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("first").unwrap(),
+    };
+    let second_ref = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("second").unwrap(),
+    };
+    let first_stream = StreamId::Room {
+        room: first_ref.resolve(op.me()).unwrap(),
+    };
+    let second_stream = StreamId::Room {
+        room: second_ref.resolve(op.me()).unwrap(),
+    };
+
+    for (room, text) in [
+        (&first_ref, "first-1"),
+        (&first_ref, "first-2"),
+        (&second_ref, "second-1"),
+        (&second_ref, "second-2"),
+    ] {
+        op.call(RoomPost {
+            room: room.clone(),
+            body: Body::parse(text).unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let mut cursor = Cursor::default();
+    let mut delivered = Vec::new();
+    for _ in 0..8 {
+        let page = op
+            .call(rex_wave_api::read::Wait {
+                interest: Interest::Streams {
+                    streams: vec![first_stream.clone(), second_stream.clone()],
+                },
+                after: cursor,
+                timeout_ms: Some(0),
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let env = &page.entries[0];
+        delivered.push((env.stream.clone(), env.seq));
+        cursor = page.cursor;
+    }
+
+    assert_eq!(
+        delivered,
+        vec![
+            (first_stream.clone(), Seq(1)),
+            (first_stream.clone(), Seq(2)),
+            (first_stream.clone(), Seq(3)),
+            (first_stream.clone(), Seq(4)),
+            (second_stream.clone(), Seq(1)),
+            (second_stream.clone(), Seq(2)),
+            (second_stream.clone(), Seq(3)),
+            (second_stream.clone(), Seq(4)),
+        ]
+    );
+
+    let done = op
+        .call(rex_wave_api::read::Wait {
+            interest: Interest::Streams {
+                streams: vec![first_stream, second_stream],
+            },
+            after: cursor,
+            timeout_ms: Some(0),
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert!(done.entries.is_empty());
+    assert!(done.timed_out);
+}

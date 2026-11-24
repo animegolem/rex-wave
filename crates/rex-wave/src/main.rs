@@ -1314,6 +1314,8 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         }
                     } else {
                         let mentions = !*all;
+                        let legacy_stream =
+                            rex_wave_api::read::legacy_operator_dm_stream(&room_ref, me)?;
                         let mut w = Wait::room_ref(room_ref, me, Seq(*since), mentions)?;
                         if let Some(c) = base_cursor {
                             let mut c = if mentions {
@@ -1321,8 +1323,22 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                             } else {
                                 c
                             };
-                            if *since > 0 || (mentions && !c.lists(&stream)) {
+                            if *since > 0 {
                                 c.advance(&stream, Seq(*since));
+                                if let Some(ref leg) = legacy_stream {
+                                    c.advance(leg, Seq(*since));
+                                }
+                            } else if mentions {
+                                let lists_canon = c.lists(&stream);
+                                if !lists_canon {
+                                    c.advance(&stream, Seq::ORIGIN);
+                                }
+                                if !lists_canon
+                                    && let Some(ref leg) = legacy_stream
+                                    && !c.lists(leg)
+                                {
+                                    c.advance(leg, Seq::ORIGIN);
+                                }
                             }
                             w.after = c;
                         }
@@ -3882,12 +3898,28 @@ async fn execute_remote<C: Client>(
     }
 
     let wire = to_command_for(cmd, client.me())?;
+    let wait_after = match &wire {
+        WireCommand::Wait(w) => Some(w.after.clone()),
+        _ => None,
+    };
     let mut reply = client.call_wire(wire).await?;
 
-    if matches!(cmd, Cmd::Read { .. })
+    if let Cmd::Read { limit, .. } = cmd
         && let WireReply::Wait(mut page) = reply
     {
         page.timed_out = false;
+        let cap = limit.unwrap_or(200).clamp(1, 1000) as usize;
+        if page.entries.len() > cap {
+            let total_count = page.total_count.max(page.entries.len());
+            page.entries.truncate(cap);
+            let mut retained = wait_after.unwrap_or_default();
+            for env in &page.entries {
+                retained.advance(&env.stream, env.seq);
+            }
+            page.cursor = retained;
+            page.total_count = total_count;
+            page.truncated = true;
+        }
         reply = WireReply::Read(page);
     }
 

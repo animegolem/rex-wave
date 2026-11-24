@@ -444,31 +444,61 @@ impl ReadSide {
     }
 
     async fn wait_for(&self, viewer: Principal, req: read::Wait) -> Result<Page, ApiError> {
-        let mut stream = self.watch_journal(viewer, req.interest, req.after.clone())?;
+        let remap_dm_cursor = matches!(
+            &req.interest,
+            Interest::Room {
+                room: rex_wave_api::room::RoomRef::Dm { .. }
+            } | Interest::RoomFiltered {
+                room: rex_wave_api::room::RoomRef::Dm { .. },
+                ..
+            } | Interest::Mentions
+        );
+        let initial_cursor = if remap_dm_cursor {
+            req.after.try_map_streams(|s| self.resolve_stream(s))?
+        } else {
+            req.after.clone()
+        };
+        let mut stream = self.watch_journal(viewer, req.interest, req.after)?;
         let cap = req.limit.map(|n| n.clamp(1, 1000) as usize);
         let mut entries = Vec::new();
         let mut total_matched = 0usize;
-        let mut cursor = req.after;
+        let mut cursor = initial_cursor.clone();
+        let mut retained_cursor = initial_cursor;
         let mut caught_up = false;
         let deadline = req
             .timeout_ms
             .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
 
-        let finalize_page =
-            |entries: Vec<Envelope>, mut cursor: Cursor, total_matched: usize, timed_out: bool| {
-                let total_count = total_matched.max(entries.len());
-                let truncated = entries.len() < total_count;
-                if truncated && let Some(last) = entries.last() {
-                    cursor = Cursor::default().with(last.stream.clone(), last.seq);
-                }
-                Page {
-                    entries,
-                    cursor,
-                    timed_out,
-                    total_count,
-                    truncated,
-                }
-            };
+        let finalize_page = |entries: Vec<Envelope>,
+                             cursor: Cursor,
+                             retained_cursor: Cursor,
+                             total_matched: usize,
+                             timed_out: bool| {
+            let total_count = total_matched.max(entries.len());
+            let truncated = entries.len() < total_count;
+            Page {
+                entries,
+                cursor: if truncated { retained_cursor } else { cursor },
+                timed_out,
+                total_count,
+                truncated,
+            }
+        };
+
+        let record_entry = |env: Envelope,
+                            entries: &mut Vec<Envelope>,
+                            cursor: &mut Cursor,
+                            retained_cursor: &mut Cursor,
+                            total_matched: &mut usize| {
+            cursor.advance(&env.stream, env.seq);
+            *total_matched += 1;
+            if cap.is_none_or(|c| entries.len() < c) {
+                retained_cursor.advance(&env.stream, env.seq);
+                entries.push(env);
+            } else if retained_cursor.from_head() && !retained_cursor.lists(&env.stream) {
+                retained_cursor.advance(&env.stream, Seq(env.seq.0.saturating_sub(1)));
+            }
+        };
 
         loop {
             let next = match deadline {
@@ -476,7 +506,13 @@ impl ReadSide {
                     match tokio::time::timeout_at(until, stream.next()).await {
                         Ok(item) => item,
                         Err(_) => {
-                            return Ok(finalize_page(entries, cursor, total_matched, true));
+                            return Ok(finalize_page(
+                                entries,
+                                cursor,
+                                retained_cursor,
+                                total_matched,
+                                true,
+                            ));
                         }
                     }
                 }
@@ -484,31 +520,48 @@ impl ReadSide {
             };
             match next {
                 Some(Ok(Frame::Committed(env))) => {
-                    cursor.advance(&env.stream, env.seq);
-                    total_matched += 1;
-                    if cap.is_none_or(|c| entries.len() < c) {
-                        entries.push(env);
-                    }
+                    record_entry(
+                        env,
+                        &mut entries,
+                        &mut cursor,
+                        &mut retained_cursor,
+                        &mut total_matched,
+                    );
                     if caught_up {
                         tokio::task::yield_now().await;
                         while let Ok(Some(Ok(Frame::Committed(extra)))) =
                             tokio::time::timeout(Duration::ZERO, stream.next()).await
                         {
-                            cursor.advance(&extra.stream, extra.seq);
-                            total_matched += 1;
-                            if cap.is_none_or(|c| entries.len() < c) {
-                                entries.push(extra);
-                            }
+                            record_entry(
+                                extra,
+                                &mut entries,
+                                &mut cursor,
+                                &mut retained_cursor,
+                                &mut total_matched,
+                            );
                         }
-                        return Ok(finalize_page(entries, cursor, total_matched, false));
+                        return Ok(finalize_page(
+                            entries,
+                            cursor,
+                            retained_cursor,
+                            total_matched,
+                            false,
+                        ));
                     }
                 }
                 Some(Ok(Frame::CaughtUp { cursor: c })) => {
                     cursor = c;
                     caught_up = true;
                     if total_matched > 0 {
-                        return Ok(finalize_page(entries, cursor, total_matched, false));
+                        return Ok(finalize_page(
+                            entries,
+                            cursor,
+                            retained_cursor,
+                            total_matched,
+                            false,
+                        ));
                     }
+                    retained_cursor = cursor.clone();
                     if req.timeout_ms == Some(0) {
                         return Ok(Page {
                             entries,
@@ -522,7 +575,13 @@ impl ReadSide {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e),
                 None => {
-                    return Ok(finalize_page(entries, cursor, total_matched, false));
+                    return Ok(finalize_page(
+                        entries,
+                        cursor,
+                        retained_cursor,
+                        total_matched,
+                        false,
+                    ));
                 }
             }
         }

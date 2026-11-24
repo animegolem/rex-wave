@@ -581,13 +581,47 @@ impl PreparedUnixSocket {
 
 /// Returns `Ok(true)` when a dead stale socket still sits at `(parent_dir, file_name)`,
 /// `Ok(false)` when the entry disappeared concurrently (`NOENT` in `parent_dir`),
-/// or `Err` when a live daemon is listening or the probe path diverged / failed.
+/// or `Err` when a live daemon is listening or `path` does not name the exact
+/// socket inode held in `(parent_dir, file_name)`.
 fn probe_socket_is_stale(
     parent_dir: &File,
     file_name: &std::ffi::OsStr,
     path: &Path,
 ) -> io::Result<bool> {
-    use rustix::fs::{AtFlags, statat};
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    let diverged = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to unlink socket {}: probe path diverged from held directory",
+                path.display()
+            ),
+        )
+    };
+
+    let st_before = match statat(parent_dir, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => st,
+        Err(rustix::io::Errno::NOENT) => return Ok(false),
+        Err(e) => return Err(io::Error::from(e)),
+    };
+    if FileType::from_raw_mode(st_before.st_mode) != FileType::Socket {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to unlink non-socket entry at {}", path.display()),
+        ));
+    }
+    let expected_id = (st_before.st_dev as u64, st_before.st_ino as u64);
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) if (meta.dev(), meta.ino()) == expected_id => {}
+        Ok(_) => return Err(diverged()),
+        Err(_) => match statat(parent_dir, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => return Ok(false),
+            Ok(_) => return Err(diverged()),
+            Err(se) => return Err(io::Error::from(se)),
+        },
+    }
 
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => Err(io::Error::new(
@@ -598,18 +632,25 @@ fn probe_socket_is_stale(
             if e.kind() == io::ErrorKind::ConnectionRefused
                 || e.raw_os_error() == Some(libc::ECONNREFUSED) =>
         {
-            Ok(true)
+            let st_after = match statat(parent_dir, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => st,
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(se) => return Err(io::Error::from(se)),
+            };
+            if FileType::from_raw_mode(st_after.st_mode) != FileType::Socket
+                || (st_after.st_dev as u64, st_after.st_ino as u64) != expected_id
+            {
+                return Err(diverged());
+            }
+            match fs::symlink_metadata(path) {
+                Ok(meta) if (meta.dev(), meta.ino()) == expected_id => Ok(true),
+                _ => Err(diverged()),
+            }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             match statat(parent_dir, file_name, AtFlags::SYMLINK_NOFOLLOW) {
                 Err(rustix::io::Errno::NOENT) => Ok(false),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "refusing to unlink socket {}: probe path diverged from held directory",
-                        path.display()
-                    ),
-                )),
+                Ok(_) => Err(diverged()),
                 Err(se) => Err(io::Error::from(se)),
             }
         }
@@ -1069,5 +1110,36 @@ mod tests {
             0o755,
             "ensure_private_dir must never chmod through a symlink"
         );
+    }
+
+    #[test]
+    fn diverged_display_path_refuses_to_unlink_held_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tmp();
+        let held_dir = dir.path().join("held");
+        let decoy_dir = dir.path().join("decoy");
+        ensure_private_dir(&held_dir).unwrap();
+        ensure_private_dir(&decoy_dir).unwrap();
+
+        let held_sock = held_dir.join("daemon.sock");
+        let decoy_sock = decoy_dir.join("daemon.sock");
+
+        let prepared = validate_unix_socket_target(&held_sock).unwrap();
+        let live_listener = UnixListener::bind(&held_sock).unwrap();
+
+        {
+            let _dead_listener = UnixListener::bind(&decoy_sock).unwrap();
+        }
+        assert_eq!(entry_kind(&decoy_sock).unwrap(), EntryKind::Other);
+
+        let err = prepared.unlink_stale(&decoy_sock).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            entry_kind(&held_sock).unwrap(),
+            EntryKind::Other,
+            "diverged dead socket path must never unlink socket in held directory"
+        );
+        drop(live_listener);
     }
 }
