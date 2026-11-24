@@ -33,8 +33,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot, watch};
 
-const MAX_MIRROR_SCAN_PAGES: usize = 16;
-
 trait ErasedBackend: Send + Sync {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>>;
 }
@@ -1084,7 +1082,8 @@ impl T3Bridge {
         let completed = match check {
             TurnMirrorCheck::Ignore => return,
             TurnMirrorCheck::PostedViaTool => {
-                for _ in 0..MAX_MIRROR_SCAN_PAGES {
+                let mut tool_reached_end = false;
+                loop {
                     let Ok(WireReply::Read(page)) = backend
                         .call_as(
                             sys.clone(),
@@ -1095,19 +1094,26 @@ impl T3Bridge {
                         return;
                     };
                     let Some(last) = page.entries.last() else {
+                        tool_reached_end = true;
                         break;
                     };
+                    if last.seq <= cursor {
+                        break;
+                    }
                     cursor = last.seq;
                     room_head = last.seq;
                     if page.entries.len() < 500 {
+                        tool_reached_end = true;
                         break;
                     }
                 }
-                let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
-                    wave: wave.clone(),
-                    role: role.clone(),
-                    seq: room_head,
-                });
+                if tool_reached_end {
+                    let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        seq: room_head,
+                    });
+                }
                 return;
             }
             TurnMirrorCheck::Unposted(c) => c,
@@ -1120,7 +1126,7 @@ impl T3Bridge {
 
         let mut already_posted = false;
         let mut reached_end = false;
-        for _ in 0..MAX_MIRROR_SCAN_PAGES {
+        loop {
             let Ok(WireReply::Read(page)) = backend
                 .call_as(
                     sys.clone(),
@@ -1134,6 +1140,9 @@ impl T3Bridge {
                 reached_end = true;
                 break;
             };
+            if last.seq <= cursor {
+                break;
+            }
             cursor = last.seq;
             room_head = last.seq;
             let count = page.entries.len();
@@ -1160,7 +1169,11 @@ impl T3Bridge {
             }
         }
 
-        if already_posted || !reached_end {
+        if !already_posted && !reached_end {
+            return;
+        }
+
+        if already_posted {
             let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                 wave: wave.clone(),
                 role: role.clone(),
