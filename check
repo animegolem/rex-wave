@@ -85,6 +85,7 @@ unset \
 	T3_ACP_MCP_ENTRYPOINT \
 	T3_ACP_MCP_AUTHORIZATION \
 	REX_WAVE_TOKEN \
+	REX_WAVE_WORKER_THREAD_ID \
 	REX_WAVE_OPERATOR \
 	REX_WAVE_T3_HOME \
 	REX_WAVE_T3_URL \
@@ -278,9 +279,13 @@ SELECT_READ_MSG = (
 FOR_TEST_MSG = (
     "DecideCtx::for_test is test-only: route production commands through Router"
 )
+URANDOM_MSG = (
+    "manual /dev/urandom open: use rex_wave_transport::mint_random_token (OS CSPRNG)"
+)
 HTTP_GUARD_OWNER = "crates/rex-wave-api/src/http_guard.rs"
 RUNTIME_DECIDE_CTX_OWNER = "crates/rex-wave-runtime/src/lib.rs"
 src_rs_re = re.compile(r"^crates/[^/]+/src/.+\.rs$")
+urandom_re = re.compile(r"/dev/urandom")
 operator_pat_re = re.compile(r"Principal::Operator\s*\{\s*\.\.\s*\}")
 matches_open_re = re.compile(r"\bmatches!\s*\(")
 calendar_re = re.compile(r"\b(719_468|146_097)\b")
@@ -559,6 +564,8 @@ def structural_hits(rel, raw_text):
         for fut_start, fut_end in select_branch_future_spans(text, m.end(), end):
             for r in select_read_re.finditer(text, fut_start, fut_end):
                 hits.append((rel, line_of(text, r.start()), r.group(1) + "(", SELECT_READ_MSG))
+    for m in urandom_re.finditer(raw_text):
+        hits.append((rel, line_of(raw_text, m.start()), "/dev/urandom", URANDOM_MSG))
     return hits
 
 def has_digest(ns, token, table):

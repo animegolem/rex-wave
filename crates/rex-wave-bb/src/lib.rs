@@ -984,17 +984,6 @@ enum TurnMirrorCheck {
 
 const MAX_MIRROR_SCAN_PAGES: usize = 16;
 
-fn truncate_body_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck {
     if rows.is_empty() {
         return TurnMirrorCheck::Ignore;
@@ -1139,15 +1128,10 @@ fn extract_unposted_final_turn(rows: &[serde_json::Value]) -> Option<CompletedTu
     }
 }
 
-fn default_bb_data_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("BB_DATA_DIR")
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir));
-    }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".bb"))
+use rex_wave_waves::default_bb_data_dir;
+
+fn is_bb_thread_id(thread: &BbThreadId) -> bool {
+    thread.runner_kind() == RunnerKind::Bb
 }
 
 fn parse_project_rows(val: &serde_json::Value, out: &mut BTreeMap<BbProjectId, String>) {
@@ -1200,37 +1184,7 @@ pub fn load_bb_projects_from_dir(dir: &Path) -> BTreeMap<BbProjectId, String> {
     map
 }
 
-pub trait BridgeBackend: Send + Sync + 'static {
-    type C: Client + Clone + 'static;
-    fn client(&self, me: Principal) -> Self::C;
-    fn handles_worker_wait_parking(&self) -> bool {
-        false
-    }
-    fn parked_room_and_since(
-        &self,
-        worker: &Principal,
-        wait: &rex_wave_api::read::Wait,
-    ) -> Option<(Option<RoomId>, Seq)> {
-        parked_room_and_since(worker, wait)
-    }
-}
-
-impl BridgeBackend for Arc<Router> {
-    type C = LocalClient;
-    fn client(&self, me: Principal) -> LocalClient {
-        LocalClient::new(self.clone(), me)
-    }
-    fn handles_worker_wait_parking(&self) -> bool {
-        true
-    }
-    fn parked_room_and_since(
-        &self,
-        worker: &Principal,
-        wait: &rex_wave_api::read::Wait,
-    ) -> Option<(Option<RoomId>, Seq)> {
-        self.read.parked_room_and_since(worker, wait)
-    }
-}
+pub use rex_wave_runtime::BridgeBackend;
 
 trait ErasedBackend: Send + Sync {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>>;
@@ -1481,6 +1435,15 @@ impl BridgeOwner {
                     attempt,
                     thread,
                 } => {
+                    if !is_bb_thread_id(&thread) {
+                        continue;
+                    }
+                    if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone()))
+                        && let Some(ref prev_th) = prev.thread
+                        && prev_th != &thread
+                    {
+                        self.role_by_thread.remove(prev_th);
+                    }
                     self.role_by_thread
                         .insert(thread.clone(), (wave.clone(), role.clone()));
                     let entry = self
@@ -1517,6 +1480,7 @@ impl BridgeOwner {
                     for ((w, r), rec) in &self.workers_by_role {
                         if rec.live
                             && let Some(th) = &rec.thread
+                            && is_bb_thread_id(th)
                         {
                             list.push((
                                 w.clone(),
@@ -1603,6 +1567,11 @@ impl BridgeOwner {
         match event {
             WaveEvent::Started { .. } => {}
             WaveEvent::WorkerRequested { role, attempt, .. } => {
+                if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone()))
+                    && let Some(ref prev_th) = prev.thread
+                {
+                    self.role_by_thread.remove(prev_th);
+                }
                 self.workers_by_role.insert(
                     (wave, role),
                     TrackedWorker {
@@ -1618,6 +1587,24 @@ impl BridgeOwner {
             }
             WaveEvent::WorkerObserved { role, observation } => match observation {
                 Observation::Spawned { attempt, thread } => {
+                    if !is_bb_thread_id(&thread) {
+                        if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
+                            if let Some(ref prev_th) = rec.thread {
+                                self.role_by_thread.remove(prev_th);
+                            }
+                            rec.thread = None;
+                            rec.live = false;
+                            rec.pending_interaction = None;
+                            rec.last_seq = None;
+                        }
+                        return;
+                    }
+                    if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone()))
+                        && let Some(ref prev_th) = prev.thread
+                        && prev_th != &thread
+                    {
+                        self.role_by_thread.remove(prev_th);
+                    }
                     self.role_by_thread
                         .insert(thread.clone(), (wave.clone(), role.clone()));
                     let rec = self
@@ -2313,6 +2300,9 @@ impl BbBridge {
         thread: &BbThreadId,
         meta: Option<&protocol::WaveMeta>,
     ) -> Option<(WaveSlug, RoleName, u32)> {
+        if !is_bb_thread_id(thread) {
+            return None;
+        }
         let (tx, rx) = oneshot::channel();
         let _ = self.owner.send(OwnerMsg::LookupByThread {
             thread: thread.clone(),
@@ -2337,24 +2327,40 @@ impl BbBridge {
                 )
                 .await
         {
-            let valid = snap.workers.iter().any(|(r, _, phase)| {
-                r == &role
-                    && match phase {
-                        WorkerPhase::Live { thread: t, .. }
-                        | WorkerPhase::Retiring { thread: t, .. } => t == thread,
-                        WorkerPhase::Requested { attempt } => *attempt == m.attempt,
-                        _ => false,
+            let mut matched_live = false;
+            let mut matched_retiring = false;
+            for (r, spec, phase) in &snap.workers {
+                if r != &role {
+                    continue;
+                }
+                match phase {
+                    WorkerPhase::Live { thread: t, .. } if t == thread => {
+                        matched_live = true;
                     }
-            });
-            if !valid {
+                    WorkerPhase::Requested { attempt }
+                        if *attempt == m.attempt
+                            && rex_wave_waves::route_provider(&spec.provider, RunnerKind::Bb)
+                                .is_ok_and(|routed| routed.target == RunnerKind::Bb) =>
+                    {
+                        matched_live = true;
+                    }
+                    WorkerPhase::Retiring { thread: t, .. } if t == thread => {
+                        matched_retiring = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !matched_live && !matched_retiring {
                 return None;
             }
-            let _ = self.owner.send(OwnerMsg::BindThread {
-                wave: wave.clone(),
-                role: role.clone(),
-                attempt: m.attempt,
-                thread: thread.clone(),
-            });
+            if matched_live {
+                let _ = self.owner.send(OwnerMsg::BindThread {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    attempt: m.attempt,
+                    thread: thread.clone(),
+                });
+            }
             return Some((wave, role, m.attempt));
         }
 
@@ -2811,9 +2817,8 @@ impl BbBridge {
             TurnMirrorCheck::Unposted(c) => c,
         };
 
-        let raw_idem = format!("wave:{wave}:turn:{role}:{thread}:{}", completed.anchor);
-        let idem_str = truncate_body_utf8(&raw_idem, 256);
-        let Ok(idem_key) = IdemKey::parse(idem_str) else {
+        let Ok(idem_key) = rex_wave_waves::mirror_idem_key(wave, role, thread, &completed.anchor)
+        else {
             return;
         };
 
@@ -2872,10 +2877,7 @@ impl BbBridge {
         let Ok(body) = Body::parse(trimmed) else {
             return;
         };
-        let post_cmd = RoomPost {
-            idem: Some(idem_key),
-            ..RoomPost::new(RoomRef::Id { id: room.clone() }, body)
-        };
+        let post_cmd = RoomPost::mirrored_turn(RoomRef::Id { id: room.clone() }, body, idem_key);
         let first_try = backend
             .call_as(worker_principal.clone(), post_cmd.clone().into_wire())
             .await;
@@ -3121,7 +3123,8 @@ impl BbBridge {
             reply: tx,
         });
         if let Ok(Some(rec)) = rx.await
-            && rec.thread.is_some()
+            && let Some(ref th) = rec.thread
+            && is_bb_thread_id(th)
         {
             return Ok(rec);
         }
@@ -3139,7 +3142,7 @@ impl BbBridge {
             for (r, _, phase) in snap.workers {
                 if &r == role {
                     return match phase {
-                        WorkerPhase::Live { thread, activity } => {
+                        WorkerPhase::Live { thread, activity } if is_bb_thread_id(&thread) => {
                             let pending_interaction = match &activity {
                                 Activity::Blocked { interaction } => Some(interaction.clone()),
                                 _ => None,
@@ -3164,7 +3167,7 @@ impl BbBridge {
                         | WorkerPhase::Retired {
                             thread: Some(thread),
                             ..
-                        } => Ok(TrackedWorker {
+                        } if is_bb_thread_id(&thread) => Ok(TrackedWorker {
                             attempt: 1,
                             thread: Some(thread),
                             live: false,
@@ -3377,66 +3380,13 @@ impl BbBridge {
     }
 }
 
-fn can_worker_read_stream(worker: &Principal, stream: &StreamId) -> bool {
-    if worker.is_operator_or_system() {
-        return true;
-    }
-    match stream {
-        StreamId::Inbox { owner } => owner == worker,
-        StreamId::Room {
-            room: RoomId::Direct { pair },
-        } => pair.other_for_viewer(worker).is_some(),
-        StreamId::Room { .. }
-        | StreamId::Wave { .. }
-        | StreamId::Board { .. }
-        | StreamId::Mail
-        | StreamId::Presence => true,
-    }
-}
-
-fn parked_room_and_since(
-    worker: &Principal,
-    w: &rex_wave_api::read::Wait,
-) -> Option<(Option<RoomId>, Seq)> {
-    let effective = w.effective_cursor_for(worker).ok()?;
-    match &w.interest {
-        Interest::Everything if !worker.is_operator_or_system() => None,
-        Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
-            let id = room.resolve(worker).ok()?;
-            let s = StreamId::Room { room: id.clone() };
-            if !can_worker_read_stream(worker, &s) {
-                return None;
-            }
-            Some((Some(id), effective.at(&s)))
-        }
-        Interest::Streams { streams } => {
-            for s in streams {
-                if !can_worker_read_stream(worker, s) {
-                    return None;
-                }
-            }
-            if streams.len() == 1
-                && let StreamId::Room { room } = &streams[0]
-            {
-                Some((Some(room.clone()), effective.at(&streams[0])))
-            } else {
-                Some((None, Seq::ORIGIN))
-            }
-        }
-        _ => Some((None, Seq::ORIGIN)),
-    }
-}
-
 #[derive(Clone)]
 pub struct BbHost(pub Arc<BbBridge>);
 
 impl AgentHost for BbHost {
-    fn spawn(
-        &self,
-        req: SpawnRequest,
-    ) -> impl Future<Output = Result<BbThreadId, HostError>> + Send {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<BbThreadId, HostError>> {
         let bridge = self.0.clone();
-        async move { bridge.spawn_worker_thread(req).await }
+        Box::pin(async move { bridge.spawn_worker_thread(req).await })
     }
 
     fn tell(
@@ -3444,7 +3394,7 @@ impl AgentHost for BbHost {
         thread: &BbThreadId,
         body: &Body,
         mode: SteerDeliveryMode,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
+    ) -> BoxFut<'_, Result<(), HostError>> {
         let bridge = self.0.clone();
         let down = protocol::Down::Send {
             req_id: 0,
@@ -3452,7 +3402,7 @@ impl AgentHost for BbHost {
             mode: send_mode(mode).into(),
             text: body.as_str().into(),
         };
-        async move { bridge.rpc(down).await.map(|_| ()) }
+        Box::pin(async move { bridge.rpc(down).await.map(|_| ()) })
     }
 
     fn resolve(
@@ -3460,7 +3410,7 @@ impl AgentHost for BbHost {
         thread: &BbThreadId,
         interaction: &BbInteractionId,
         resolution: &InteractionResolution,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
+    ) -> BoxFut<'_, Result<(), HostError>> {
         let bridge = self.0.clone();
         let down = protocol::Down::Resolve {
             req_id: 0,
@@ -3468,25 +3418,25 @@ impl AgentHost for BbHost {
             interaction_id: interaction.to_string(),
             resolution: resolution_json(resolution),
         };
-        async move { bridge.rpc(down).await.map(|_| ()) }
+        Box::pin(async move { bridge.rpc(down).await.map(|_| ()) })
     }
 
-    fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send {
+    fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
         let bridge = self.0.clone();
         let down = protocol::Down::Retire {
             req_id: 0,
             thread_id: thread.to_string(),
         };
-        async move { bridge.rpc(down).await.map(|_| ()) }
+        Box::pin(async move { bridge.rpc(down).await.map(|_| ()) })
     }
 
     fn check_live(
         &self,
         thread: &BbThreadId,
-    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
         let bridge = self.0.clone();
         let thread = thread.clone();
-        async move { bridge.check_thread_live(&thread).await }
+        Box::pin(async move { bridge.check_thread_live(&thread).await })
     }
 }
 
@@ -4106,6 +4056,7 @@ mod tests {
                                         labels: c.labels,
                                         task: c.task,
                                         idem: c.idem.clone(),
+                                        origin: Default::default(),
                                     }),
                                     &harness.frame_tx,
                                 );
@@ -4705,6 +4656,7 @@ mod tests {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -4883,6 +4835,7 @@ mod tests {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -4968,7 +4921,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             live_frame,
-            Frame::Agent { event: AgentEvent { seq: BbSeq(251), kind: AgentEventKind::AssistantText { ref text }, .. }, .. }
+            Frame::Agent { event: AgentEvent { seq: HostSeq(251), kind: AgentEventKind::AssistantText { ref text }, .. }, .. }
                 if text == "Slice #4 looks clean"
         ));
 
@@ -5008,6 +4961,7 @@ mod tests {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -5500,6 +5454,7 @@ mod tests {
                 labels: Vec::new(),
                 task: None,
                 idem: None,
+                origin: Default::default(),
             })
             .await
             .unwrap();
@@ -6228,6 +6183,7 @@ mod tests {
                 labels: Vec::new(),
                 task: None,
                 idem: None,
+                origin: Default::default(),
             })
             .await
             .unwrap();
@@ -6281,6 +6237,7 @@ mod tests {
                     labels: Vec::new(),
                     task: None,
                     idem: None,
+                    origin: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -6347,6 +6304,7 @@ mod tests {
                     labels: Vec::new(),
                     task: None,
                     idem: None,
+                    origin: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -6513,5 +6471,140 @@ mod tests {
             let _ = bridge_runner.await;
             ws_srv.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn bb_bridge_ignores_non_bb_runner_threads_across_fold_lookup_and_reconcile() {
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let _ = bridge.backend.set(Arc::new(harness.clone()));
+
+        let op = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+        let sys = harness.client(Principal::System {
+            part: SystemPart::WaveConductor,
+        });
+        let wave = WaveSlug::parse("cross-host").unwrap();
+        let project = BbProjectId::parse("proj_demo_1").unwrap();
+        let make_worker = |role: &str, provider: &str| rex_wave_api::wave::WorkerSpec {
+            role: RoleName::parse(role).unwrap(),
+            brief: Body::parse(format!("@{role} go")).unwrap(),
+            agent: Some(rex_wave_api::wave::AgentSpec {
+                provider: ProviderId::parse(provider).unwrap(),
+                model: None,
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: rex_wave_api::wave::PermissionMode::Full,
+                workspace: rex_wave_api::wave::Workspace::ProjectDefault,
+            }),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        };
+        op.call(rex_wave_api::wave::WaveStart {
+            spec: rex_wave_api::wave::WaveSpec {
+                slug: wave.clone(),
+                project,
+                goal: Body::parse("mixed runner wave").unwrap(),
+                output_dir: None,
+                defaults: rex_wave_api::wave::AgentSpec {
+                    provider: ProviderId::parse("pi").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: rex_wave_api::wave::PermissionMode::Full,
+                    workspace: rex_wave_api::wave::Workspace::ProjectDefault,
+                },
+                workers: vec![
+                    make_worker("t3role", "antigravity"),
+                    make_worker("acprole", "acp:opencode"),
+                    make_worker("clrole", "claude:claude-code"),
+                    make_worker("cxrole", "codex:codex"),
+                    make_worker("bbrole", "pi"),
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+        for (role_str, tid_str) in [
+            ("t3role", "t3:cross-host:t3role:a1"),
+            ("acprole", "acp:cross-host:acprole:a1"),
+            ("clrole", "claude:cross-host:clrole:a1"),
+            ("cxrole", "codex:cross-host:cxrole:a1"),
+            ("bbrole", "th_bb_live_1"),
+        ] {
+            let role = RoleName::parse(role_str).unwrap();
+            let thread = BbThreadId::parse(tid_str).unwrap();
+            let obs = Observation::Spawned {
+                attempt: 1,
+                thread: thread.clone(),
+            };
+            sys.call(WaveObserve {
+                wave: wave.clone(),
+                role: role.clone(),
+                observation: obs.clone(),
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role,
+                    observation: obs,
+                },
+            );
+        }
+
+        let (list_tx, list_rx) = oneshot::channel();
+        bridge
+            .owner
+            .send(OwnerMsg::ListLiveWorkers { reply: list_tx })
+            .unwrap();
+        let live = list_rx.await.unwrap();
+        assert_eq!(live.len(), 1, "only BB threads may enter ListLiveWorkers");
+        assert_eq!(live[0].2.as_str(), "th_bb_live_1");
+
+        for non_bb_role in ["t3role", "acprole", "clrole", "cxrole"] {
+            let role = RoleName::parse(non_bb_role).unwrap();
+            assert!(
+                matches!(
+                    bridge.lookup_worker(&wave, &role).await,
+                    Err(ApiError::NotFound { .. })
+                ),
+                "BbBridge::lookup_worker must return NotFound for {non_bb_role}"
+            );
+        }
+
+        let spoof_meta = protocol::WaveMeta {
+            wave_id: wave.to_string(),
+            role: "t3role".into(),
+            attempt: 1,
+            room_id: String::new(),
+            run_stamp: None,
+            output_dir: None,
+            writes: Vec::new(),
+            account: None,
+        };
+        assert_eq!(
+            bridge
+                .resolve_worker_identity(
+                    &BbThreadId::parse("t3:cross-host:t3role:a1").unwrap(),
+                    Some(&spoof_meta),
+                )
+                .await,
+            None,
+            "BbBridge must reject non-BB thread IDs even with matching WaveMeta"
+        );
     }
 }

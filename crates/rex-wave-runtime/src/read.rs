@@ -300,19 +300,7 @@ impl ReadSide {
         // watch even if the new target fails validation.
         let (generation, mut gen_rx) = session.focus();
         let viewer = session.me().clone();
-        let inner_interest = match &target {
-            StageTarget::Inbox => Interest::MyInbox,
-            StageTarget::Kanban { board } => Interest::Streams {
-                streams: vec![StreamId::Board {
-                    board: board.clone(),
-                }],
-            },
-            StageTarget::Room { room } => Interest::Room { room: room.clone() },
-            StageTarget::Agent { wave, role } => Interest::Agent {
-                wave: wave.clone(),
-                role: role.clone(),
-            },
-        };
+        let inner_interest = target.to_inner_interest();
         let mut inner = match inner_interest {
             Interest::Agent { wave, role } => self.agents.live(&wave, &role).await?,
             other => self.watch_journal(viewer, other, from)?,

@@ -7,6 +7,7 @@
 //! structurally read-only shadow reactor ([`shadow`]), and Gate 2 scorer ([`score`]).
 
 pub mod acks;
+pub mod frontmatter;
 pub mod presence;
 pub mod score;
 pub mod shadow;
@@ -14,6 +15,10 @@ pub mod shadow;
 pub use acks::{
     AckIndex, AckRecord, AcksParseReport, AliasMap, NormalizedLetterPath, SkippedAckLine,
     letter_paths_match, normalize_letter_path, normalize_seat_token, parse_acks_jsonl,
+};
+pub use frontmatter::{
+    FrontmatterDoc, FrontmatterEntry, RecipientCandidate, parse_recipient_list, unquote_yaml,
+    yaml_quote, yaml_quote_if_needed, yaml_quote_inline,
 };
 pub use presence::{
     ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus, HOUSE_PROFILE_MAX_BYTES,
@@ -378,22 +383,6 @@ fn priority_word(p: LetterPriority) -> &'static str {
     }
 }
 
-fn yaml_quote(raw: &str) -> String {
-    let mut s = String::with_capacity(raw.len() + 2);
-    s.push('"');
-    for ch in raw.chars() {
-        match ch {
-            '\\' => s.push_str("\\\\"),
-            '"' => s.push_str("\\\""),
-            '\n' | '\r' => s.push(' '),
-            c if c.is_control() => {}
-            c => s.push(c),
-        }
-    }
-    s.push('"');
-    s
-}
-
 fn sanitize_topic_for_file(raw: &str) -> String {
     let mut out: String = raw
         .trim()
@@ -462,11 +451,14 @@ pub fn render_letter(req: &MailPromote, by: &Principal, entries: &[Envelope]) ->
     out.push_str("---\n");
     out.push_str(&format!("from: {from}\n"));
     out.push_str(&format!("to: {to_yaml}\n"));
-    out.push_str(&format!("subject: {}\n", yaml_quote(subject_clean.trim())));
+    out.push_str(&format!(
+        "subject: {}\n",
+        yaml_quote_inline(subject_clean.trim())
+    ));
     out.push_str(&format!("topic: {topic}\n"));
     out.push_str(&format!("round: {round}\n"));
     out.push_str(&format!("priority: {}\n", priority_word(req.priority)));
-    out.push_str(&format!("room: {}\n", yaml_quote(&room_label)));
+    out.push_str(&format!("room: {}\n", yaml_quote_inline(&room_label)));
     out.push_str(&format!(
         "range: [{}, {}]\n",
         req.range.first().0,
@@ -517,49 +509,16 @@ struct Frontmatter {
     in_reply_to: Option<String>,
 }
 
-pub(crate) fn unquote_yaml(val: &str) -> String {
-    let trimmed = val.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let mut out = String::with_capacity(inner.len());
-        let mut chars = inner.chars();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(next) = chars.next() {
-                    out.push(next);
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    } else if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        trimmed[1..trimmed.len() - 1].to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
 fn parse_frontmatter(text: &str) -> Frontmatter {
     let mut fm = Frontmatter::default();
-    let rest = if let Some(r) = text.strip_prefix("---\n") {
-        r
-    } else if let Some(r) = text.strip_prefix("---\r\n") {
-        r
-    } else {
+    let doc = FrontmatterDoc::parse(text);
+    if !doc.has_frontmatter {
         return fm;
-    };
+    }
 
-    for line in rest.lines() {
-        let trimmed = line.trim_end_matches('\r');
-        if trimmed == "---" {
-            break;
-        }
-        let Some((k, v)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let key = k.trim().to_ascii_lowercase();
-        let val = unquote_yaml(v);
+    for entry in doc.entries {
+        let key = entry.key.to_ascii_lowercase();
+        let val = entry.value;
         if val.is_empty() {
             continue;
         }

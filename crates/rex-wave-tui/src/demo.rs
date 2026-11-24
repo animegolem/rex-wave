@@ -519,7 +519,7 @@ impl DemoClient {
                         after: None,
                         labels: Vec::new(),
                         task: None,
-                        idem: None,
+                        idem: None, origin: Default::default(),
                     }),
                 },
                 Envelope {
@@ -540,7 +540,7 @@ impl DemoClient {
                         after: None,
                         labels: Vec::new(),
                         task: None,
-                        idem: None,
+                        idem: None, origin: Default::default(),
                     }),
                 },
             ],
@@ -566,6 +566,7 @@ impl DemoClient {
                     labels: Vec::new(),
                     task: None,
                     idem: None,
+                    origin: Default::default(),
                 }),
             }],
         );
@@ -617,6 +618,7 @@ impl DemoClient {
                     labels: Vec::new(),
                     task: None,
                     idem: None,
+                    origin: Default::default(),
                 }),
             });
         }
@@ -907,6 +909,7 @@ impl Client for DemoClient {
                             labels: post.labels,
                             task: post.task,
                             idem: post.idem,
+                            origin: Default::default(),
                         }),
                     });
                     let _ = sidebar_tx.send(st.sidebar_snapshot(&me));

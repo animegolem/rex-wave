@@ -9,7 +9,7 @@ use rex_wave_notify::Inbox;
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
     BoxFut, DecideCtx, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, Service,
-    SidebarProjection, Unavailable,
+    SidebarProjection,
 };
 use rex_wave_store::Journal;
 use rex_wave_transport::{Authenticator, StateDirAuthenticator, bind_unix, serve_listener};
@@ -74,16 +74,13 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
     let router = Arc::new(Router {
         room: Arc::new(ConflictInjectingRooms { inner: inner_rooms }),
         wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let (listener, daemon_uid) = bind_unix(&sock).unwrap();
@@ -462,6 +459,49 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
     .unwrap();
     assert!(!retired_post.status.success());
 
+    // Runner-agnostic `REX_WAVE_WORKER_THREAD_ID` authenticates ACP/native worker
+    // tokens and fails closed on missing/unlinked files regardless of scheme.
+    let acp_tid = rex_wave_api::HostThreadId::parse("acp:w1:author:a2").unwrap();
+    rex_wave_transport::provision_worker_token_in_state_dir(&dir.0, &wave, &role, &acp_tid)
+        .unwrap();
+    let s13 = sock_str.clone();
+    let acp_post = tokio::task::spawn_blocking(move || {
+        rex_wave_at(&s13)
+            .env("REX_WAVE_WORKER_THREAD_ID", acp_tid.as_str())
+            .args([
+                "--socket",
+                &s13,
+                "--json",
+                "post",
+                "#general",
+                "from acp worker",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        acp_post.status.success(),
+        "REX_WAVE_WORKER_THREAD_ID post failed: {}",
+        String::from_utf8_lossy(&acp_post.stderr)
+    );
+    rex_wave_transport::remove_worker_token_file(&dir.0, "acp:w1:author:a2").unwrap();
+    let s14 = sock_str.clone();
+    let acp_retired = tokio::task::spawn_blocking(move || {
+        rex_wave_at(&s14)
+            .env("REX_WAVE_WORKER_THREAD_ID", "unprefixed_worker_tid")
+            .args(["--socket", &s14, "post", "#general", "must fail closed"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        !acp_retired.status.success(),
+        "REX_WAVE_WORKER_THREAD_ID must fail closed even for unprefixed worker ids"
+    );
+
     server.abort();
 }
 
@@ -477,16 +517,13 @@ async fn cli_wave_honesty_enforces_one_writer_refusals_finish_gate_account_misma
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let (listener, daemon_uid) = bind_unix(&sock).unwrap();

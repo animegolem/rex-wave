@@ -55,6 +55,42 @@ pub enum StageTarget {
     Summary { key: NodeKey },
 }
 
+impl StageTarget {
+    /// Converts this UI stage target into the wire [`rex_wave_api::StageTarget`],
+    /// returning `None` for purely local summary panes.
+    pub fn to_wire_target(
+        &self,
+        overview: &SidebarTreeSnapshot,
+        me: &Principal,
+    ) -> Option<rex_wave_api::StageTarget> {
+        match self {
+            StageTarget::Inbox => Some(rex_wave_api::StageTarget::Inbox),
+            StageTarget::Kanban { board } => Some(rex_wave_api::StageTarget::Kanban {
+                board: board
+                    .clone()
+                    .unwrap_or_else(|| default_board_id(overview, me)),
+            }),
+            StageTarget::Room { room } => Some(rex_wave_api::StageTarget::Room {
+                room: RoomRef::Id { id: room.clone() },
+            }),
+            StageTarget::Agent { wave, role } => Some(rex_wave_api::StageTarget::Agent {
+                wave: wave.clone(),
+                role: role.clone(),
+            }),
+            StageTarget::Summary { .. } => None,
+        }
+    }
+
+    pub fn to_watch_interest(
+        &self,
+        overview: &SidebarTreeSnapshot,
+        me: &Principal,
+    ) -> Option<Interest> {
+        self.to_wire_target(overview, me)
+            .map(|target| Interest::Stage { target })
+    }
+}
+
 pub fn target_for(key: &NodeKey) -> StageTarget {
     match key {
         NodeKey::Inbox => StageTarget::Inbox,
@@ -95,73 +131,37 @@ pub fn default_board_id(overview: &SidebarTreeSnapshot, me: &Principal) -> Board
 }
 
 pub fn plan_for(target: &StageTarget, overview: &SidebarTreeSnapshot, me: &Principal) -> Plan {
-    match target {
-        StageTarget::Inbox => Plan {
-            initial: Some(WireCommand::InboxList(InboxList {
-                include_done: false,
-                limit: Some(100),
-            })),
-            watch: Some((
-                Interest::Stage {
-                    target: rex_wave_api::StageTarget::Inbox,
-                },
-                Cursor::live(),
-            )),
-        },
+    let watch = target
+        .to_watch_interest(overview, me)
+        .map(|interest| (interest, Cursor::live()));
+    let initial = match target {
+        StageTarget::Inbox => Some(WireCommand::InboxList(InboxList {
+            include_done: false,
+            limit: Some(100),
+        })),
         StageTarget::Kanban { board } => {
             let board_id = board
                 .clone()
                 .unwrap_or_else(|| default_board_id(overview, me));
-            Plan {
-                initial: Some(WireCommand::BoardView(BoardView {
-                    board: board_id.clone(),
-                    filter: None,
-                })),
-                watch: Some((
-                    Interest::Stage {
-                        target: rex_wave_api::StageTarget::Kanban { board: board_id },
-                    },
-                    Cursor::live(),
-                )),
-            }
+            Some(WireCommand::BoardView(BoardView {
+                board: board_id,
+                filter: None,
+            }))
         }
-        StageTarget::Room { room } => Plan {
-            initial: Some(WireCommand::Read(read::Read::stream(
-                StreamId::Room { room: room.clone() },
-                Seq::ORIGIN,
-                Some(200),
-            ))),
-            watch: Some((
-                Interest::Stage {
-                    target: rex_wave_api::StageTarget::Room {
-                        room: RoomRef::Id { id: room.clone() },
-                    },
-                },
-                Cursor::live(),
-            )),
-        },
-        StageTarget::Agent { wave, role } => Plan {
-            initial: Some(WireCommand::ThreadPage(ThreadPage {
-                wave: wave.clone(),
-                role: role.clone(),
-                after: None,
-                limit: Some(200),
-            })),
-            watch: Some((
-                Interest::Stage {
-                    target: rex_wave_api::StageTarget::Agent {
-                        wave: wave.clone(),
-                        role: role.clone(),
-                    },
-                },
-                Cursor::live(),
-            )),
-        },
-        StageTarget::Summary { .. } => Plan {
-            initial: None,
-            watch: None,
-        },
-    }
+        StageTarget::Room { room } => Some(WireCommand::Read(read::Read::stream(
+            StreamId::Room { room: room.clone() },
+            Seq::ORIGIN,
+            Some(200),
+        ))),
+        StageTarget::Agent { wave, role } => Some(WireCommand::ThreadPage(ThreadPage {
+            wave: wave.clone(),
+            role: role.clone(),
+            after: None,
+            limit: Some(200),
+        })),
+        StageTarget::Summary { .. } => None,
+    };
+    Plan { initial, watch }
 }
 
 pub enum Stage {

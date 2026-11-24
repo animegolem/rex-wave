@@ -108,6 +108,7 @@ impl Decider for ToyRooms {
                     labels: c.labels.clone(),
                     task: c.task.clone(),
                     idem: c.idem.clone(),
+                    origin: Default::default(),
                 }])
             }
             RoomCommand::RoomLabel(c) => {
@@ -411,19 +412,15 @@ fn harness(idle: Duration) -> (Arc<Router>, Journal, Arc<AtomicUsize>) {
     let leases = Arc::new(AtomicUsize::new(0));
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::with_idle(journal.clone(), hub.clone(), idle),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<ToyInbox>::with_idle(journal.clone(), hub.clone(), idle),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(LeaseCountingFeed {
                 active: leases.clone(),
             }),
-        }),
+        }))
     });
     (router, journal, leases)
 }
@@ -437,13 +434,8 @@ fn chan(name: &str) -> RoomRef {
 
 fn post(room: RoomRef, text: &str, idem: Option<&str>) -> RoomPost {
     RoomPost {
-        room,
-        body: Body::parse(text).unwrap(),
-        re: None,
-        after: None,
-        labels: Vec::new(),
-        task: None,
         idem: idem.map(|k| IdemKey::parse(k).unwrap()),
+        ..RoomPost::new(room, Body::parse(text).unwrap())
     }
 }
 
@@ -1021,17 +1013,13 @@ async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resol
     let (names_tx, names_rx) = tokio::sync::watch::channel(Arc::new(BTreeMap::new()));
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<ToyInbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(DynamicNamesFeed { names: names_rx }),
-        }),
+        }))
     });
 
     let owner = LocalClient::new(
@@ -1176,6 +1164,7 @@ async fn room_filtered_watch_matches_before_or_after_labels_and_threads_causally
             labels: vec![open_lbl.clone()],
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1188,6 +1177,7 @@ async fn room_filtered_watch_matches_before_or_after_labels_and_threads_causally
             labels: vec![other_lbl.clone()],
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1200,6 +1190,7 @@ async fn room_filtered_watch_matches_before_or_after_labels_and_threads_causally
             labels: vec![],
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1432,16 +1423,13 @@ async fn worker_wait_emits_parked_and_working_and_restores_on_cancel() {
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
         wave: waves,
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<ToyInbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let wave = WaveSlug::parse("w1").unwrap();

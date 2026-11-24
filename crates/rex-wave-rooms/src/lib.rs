@@ -963,6 +963,7 @@ impl Decider for Rooms {
                     labels,
                     task: normalized_task,
                     idem: c.idem.clone(),
+                    origin: c.origin,
                 });
                 Ok(events)
             }
@@ -1205,6 +1206,7 @@ impl Decider for Rooms {
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: PostOrigin::Direct,
                     });
                 }
                 Ok(events)

@@ -341,6 +341,36 @@ pub struct RoomEnsure {
     pub origin: Option<RoomOrigin>,
 }
 
+/// Provenance of a room post. Defaults to [`PostOrigin::Direct`] when omitted so
+/// existing journal rows and wire payloads stay 100% compatible.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PostOrigin {
+    #[default]
+    Direct,
+    /// Final assistant turn mirrored into a wave room by a host bridge.
+    MirroredTurn,
+}
+
+impl PostOrigin {
+    pub const fn is_direct(&self) -> bool {
+        matches!(self, PostOrigin::Direct)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RoomPost {
     pub room: RoomRef,
@@ -355,6 +385,8 @@ pub struct RoomPost {
     pub task: Option<TaskSpec>,
     #[serde(default, alias = "id", skip_serializing_if = "Option::is_none")]
     pub idem: Option<IdemKey>,
+    #[serde(default, skip_serializing_if = "PostOrigin::is_direct")]
+    pub origin: PostOrigin,
 }
 
 impl RoomPost {
@@ -367,6 +399,15 @@ impl RoomPost {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: PostOrigin::Direct,
+        }
+    }
+
+    pub fn mirrored_turn(room: RoomRef, body: Body, idem: IdemKey) -> Self {
+        Self {
+            idem: Some(idem),
+            origin: PostOrigin::MirroredTurn,
+            ..Self::new(room, body)
         }
     }
 }
@@ -583,6 +624,8 @@ pub enum RoomEvent {
         task: Option<TaskSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idem: Option<IdemKey>,
+        #[serde(default, skip_serializing_if = "PostOrigin::is_direct")]
+        origin: PostOrigin,
     },
     TopicSet {
         topic: String,

@@ -3,10 +3,13 @@
 //! `run_shadow_pass`). Zero write paths exist in this module.
 
 use crate::acks::{AckIndex, AcksParseReport, AliasMap, parse_acks_jsonl};
+use crate::frontmatter::{
+    FrontmatterDoc, RecipientCandidate, is_receipt_only_entry, parse_recipient_list,
+};
 use crate::presence::{
     IncarnationAffinity, PresenceState, select_binding_for_delivery, sender_delivery_notice,
 };
-use crate::{SandboxError, sha256_bytes, unquote_yaml};
+use crate::{SandboxError, sha256_bytes};
 use rex_wave_api::presence::*;
 use rex_wave_api::*;
 use serde::{Deserialize, Serialize};
@@ -553,11 +556,6 @@ impl ScannedLetter {
     }
 }
 
-struct RecipientCandidate {
-    raw: String,
-    require_known_alias: bool,
-}
-
 #[derive(Default)]
 struct ShadowFrontmatter {
     from: Option<String>,
@@ -573,102 +571,16 @@ struct ShadowFrontmatter {
     receipt_only: bool,
 }
 
-fn strip_recipient_prefix(raw: &str) -> &str {
-    let s = raw.trim();
-    for prefix in ["cc:", "to:", "cc ", "to ", "cc\t", "to\t"] {
-        if s.len() >= prefix.len()
-            && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-        {
-            return s[prefix.len()..].trim();
-        }
-    }
-    s
-}
-
-fn parse_recipient_list(val: &str) -> Vec<RecipientCandidate> {
-    let trimmed = val.trim().trim_start_matches('[').trim_end_matches(']');
-    let mut out = Vec::new();
-    for raw_unit in trimmed.split([',', ';']) {
-        let unit = unquote_yaml(raw_unit);
-        let unit = unit.trim_matches(['"', '\'']).trim();
-        if unit.is_empty() {
-            continue;
-        }
-        let (head_raw, paren_raw) = match unit.split_once('(') {
-            Some((h, rest)) => {
-                let inner = rest.split_once(')').map_or(rest, |(inside, _)| inside);
-                (h, Some(inner))
-            }
-            None => (unit, None),
-        };
-        let head_unquoted = unquote_yaml(head_raw);
-        let head_trimmed = head_unquoted.trim_matches(['"', '\'']).trim();
-        let head = strip_recipient_prefix(head_trimmed);
-        if head.contains('/') {
-            // Treat `/`-split segments like parenthetical candidates (known aliases only)
-            // so embedded file paths in `to:` never become bogus seats.
-            for seg in head.split('/') {
-                let seg_unquoted = unquote_yaml(seg);
-                let seg_clean =
-                    strip_recipient_prefix(seg_unquoted.trim_matches(['"', '\'']).trim());
-                if !seg_clean.is_empty() {
-                    out.push(RecipientCandidate {
-                        raw: seg_clean.to_owned(),
-                        require_known_alias: true,
-                    });
-                }
-            }
-        } else if !head.is_empty() {
-            out.push(RecipientCandidate {
-                raw: head.to_owned(),
-                require_known_alias: false,
-            });
-        }
-        if let Some(p_raw) = paren_raw {
-            for seg in p_raw.split('/') {
-                let inner_unquoted = unquote_yaml(seg);
-                let inner = inner_unquoted.trim_matches(['"', '\'']).trim();
-                if !inner.is_empty() {
-                    out.push(RecipientCandidate {
-                        raw: inner.to_owned(),
-                        require_known_alias: true,
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-fn is_receipt_only_status(val: &str) -> bool {
-    let lower = val.to_ascii_lowercase();
-    lower.contains("receipt only")
-        || lower.contains("receipt-only")
-        || lower.contains("no return ack")
-        || lower.contains("no ack requested")
-        || lower.contains("no-ack")
-}
-
 fn parse_shadow_frontmatter(text: &str) -> ShadowFrontmatter {
     let mut fm = ShadowFrontmatter::default();
-    let rest = if let Some(r) = text.strip_prefix("---\n") {
-        r
-    } else if let Some(r) = text.strip_prefix("---\r\n") {
-        r
-    } else {
+    let doc = FrontmatterDoc::parse(text);
+    if !doc.has_frontmatter {
         return fm;
-    };
+    }
 
-    for line in rest.lines() {
-        let trimmed = line.trim_end_matches('\r');
-        if trimmed == "---" {
-            break;
-        }
-        let Some((k, v)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let key = k.trim().to_ascii_lowercase();
-        let val = unquote_yaml(v);
+    for entry in doc.entries {
+        let key = entry.key.to_ascii_lowercase();
+        let val = entry.value;
         if val.is_empty() {
             continue;
         }
@@ -687,39 +599,8 @@ fn parse_shadow_frontmatter(text: &str) -> ShadowFrontmatter {
             "date" => fm.date = Some(val),
             "ts" => fm.ts = Some(val),
             "in_reply_to" => fm.in_reply_to = Some(val),
-            "receipt_only" | "receipt-only" | "no_ack" | "no-ack" => {
-                if matches!(val.to_ascii_lowercase().as_str(), "true" | "yes" | "1") {
-                    fm.receipt_only = true;
-                }
-            }
-            "ack_required" | "return_ack" => {
-                if matches!(
-                    val.to_ascii_lowercase().as_str(),
-                    "false" | "no" | "0" | "none"
-                ) {
-                    fm.receipt_only = true;
-                }
-            }
-            "ack" => {
-                if matches!(
-                    val.to_ascii_lowercase().as_str(),
-                    "none" | "false" | "no" | "receipt-only" | "receipt_only"
-                ) {
-                    fm.receipt_only = true;
-                }
-            }
-            "kind" => {
-                if matches!(
-                    val.to_ascii_lowercase().as_str(),
-                    "receipt" | "receipt-only"
-                ) {
-                    fm.receipt_only = true;
-                }
-            }
-            "status" => {
-                if is_receipt_only_status(&val) {
-                    fm.receipt_only = true;
-                }
+            other if is_receipt_only_entry(other, &val) => {
+                fm.receipt_only = true;
             }
             _ => {}
         }

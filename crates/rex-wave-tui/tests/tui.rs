@@ -188,6 +188,7 @@ fn hover_debounces_while_activate_retargets_immediately_and_filters_stale_genera
                 labels: Vec::new(),
                 task: None,
                 idem: None,
+                origin: Default::default(),
             }),
         })
     };
@@ -836,7 +837,7 @@ fn room_wraps_markdown_collapses_briefs_shortens_senders_and_opens_pager() {
             after: None,
             labels: Vec::new(),
             task: None,
-            idem: Some(rex_wave_api::IdemKey::parse("wave:auth-v2:brief:council-claude:1").unwrap()),
+            idem: Some(rex_wave_api::IdemKey::parse("wave:auth-v2:brief:council-claude:1").unwrap()), origin: Default::default(),
         }),
     };
     let review_env = Envelope {
@@ -859,7 +860,7 @@ fn room_wraps_markdown_collapses_briefs_shortens_senders_and_opens_pager() {
             after: None,
             labels: Vec::new(),
             task: None,
-            idem: None,
+            idem: None, origin: Default::default(),
         }),
     };
 

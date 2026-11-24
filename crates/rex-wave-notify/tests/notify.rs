@@ -15,7 +15,7 @@ use rex_wave_notify::{
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
     DecideCtx, Decider, EntryMeta, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router,
-    SidebarProjection, Unavailable, spawn_reactor,
+    SidebarProjection, spawn_reactor,
 };
 use rex_wave_store::Journal;
 use std::collections::BTreeMap;
@@ -301,16 +301,13 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let herald_client = LocalClient::new(
@@ -381,6 +378,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -396,6 +394,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -759,6 +758,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -845,16 +845,13 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let herald_task = spawn_reactor(
@@ -945,6 +942,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1120,16 +1118,13 @@ async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let owner = LocalClient::new(
@@ -1292,16 +1287,13 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let owner_p = Principal::Operator {
@@ -1748,17 +1740,13 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
 
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let owner = LocalClient::new(
@@ -2129,17 +2117,13 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
 
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let owner = LocalClient::new(
@@ -2558,16 +2542,13 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let herald_client = LocalClient::new(
         router.clone(),
@@ -2783,6 +2764,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                     labels: Vec::new(),
                     task: None,
                     idem: None,
+                    origin: Default::default(),
                 }),
             ],
         )
@@ -2793,17 +2775,13 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub: hub.clone(),
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let herald_1 = spawn_reactor(
@@ -2888,6 +2866,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -2975,6 +2954,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -3019,6 +2999,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                         labels: Vec::new(),
                         task: None,
                         idem: Some(shared_idem.clone()),
+                        origin: Default::default(),
                     }),
                 ],
             )
@@ -3047,6 +3028,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: Default::default(),
                     }),
                 ],
             )
@@ -3064,6 +3046,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                     labels: Vec::new(),
                     task: None,
                     idem: Some(shared_idem.clone()),
+                    origin: Default::default(),
                 })],
             )
             .unwrap();
@@ -3081,6 +3064,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: Default::default(),
                     }),
                     Event::Room(RoomEvent::Posted {
                         body: Body::parse("alice legacy #5").unwrap(),
@@ -3090,6 +3074,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: Default::default(),
                     }),
                 ],
             )
@@ -3099,17 +3084,13 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     let split_sidebar = SidebarProjection::spawn(split_journal.clone(), split_hub.clone());
     let split_router = Arc::new(Router {
         room: Registry::<Rooms>::new(split_journal.clone(), split_hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(split_journal.clone(), split_hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: split_journal,
             hub: split_hub,
             sidebar: split_sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let split_op = LocalClient::new(split_router.clone(), op_p);
     let retried = split_op
@@ -3123,6 +3104,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
             labels: Vec::new(),
             task: None,
             idem: Some(shared_idem.clone()),
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -3141,6 +3123,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
             labels: Vec::new(),
             task: None,
             idem: Some(shared_idem),
+            origin: Default::default(),
         })
         .await
         .unwrap_err();
@@ -3223,17 +3206,13 @@ async fn capped_multi_stream_wait_advances_cursor_without_looping() {
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let op = LocalClient::new(
         router,
@@ -3271,6 +3250,7 @@ async fn capped_multi_stream_wait_advances_cursor_without_looping() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -3356,6 +3336,7 @@ async fn capped_multi_stream_wait_advances_cursor_without_looping() {
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -3403,16 +3384,13 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let alice_p = Principal::Seat {
@@ -3443,6 +3421,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -3467,6 +3446,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -3478,6 +3458,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -3737,6 +3718,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -3793,6 +3775,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
                             labels: Vec::new(),
                             task: None,
                             idem: None,
+                            origin: Default::default(),
                         })
                         .await
                         .unwrap();
@@ -3946,16 +3929,12 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
     let disk_router = Arc::new(Router {
         room: Registry::<Rooms>::new(disk_journal.clone(), disk_hub.clone()),
         wave: Registry::<TestWaves>::new(disk_journal.clone(), disk_hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: disk_journal.clone(),
             hub: disk_hub,
             sidebar: disk_sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let disk_op = LocalClient::new(
         disk_router,
@@ -4063,6 +4042,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -4075,6 +4055,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -4145,6 +4126,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
                 labels: Vec::new(),
                 task: None,
                 idem: None,
+                origin: Default::default(),
             })];
             w_aaa
                 .append(&writer_me, UnixMs(10 + i), None, ev.clone())

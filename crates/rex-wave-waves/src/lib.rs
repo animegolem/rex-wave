@@ -1,16 +1,28 @@
 //! Wave decider (`Waves`), `AgentHost` port, and `WaveConductor` reactor.
 
+pub mod router;
+pub mod workspace;
+
+pub use rex_wave_runtime::BoxFut;
+pub use router::{HostRouter, RoutedProvider, route_provider, route_thread};
+pub use workspace::{
+    BbProjectLocation, ProjectWorkspaceLocation, default_bb_data_dir, expand_tilde,
+    looks_like_workspace_path, lookup_bb_project_location, normalize_workspace_path_key,
+    resolve_project_workspace_location,
+};
+
 use rex_wave_api::board::{BoardEnsure, BoardId, project_board};
 use rex_wave_api::room::{
-    Body, Mentions, RoomEnsure, RoomEvent, RoomId, RoomJoin, RoomOrigin, RoomPost, RoomRef,
-    RoomScope,
+    Body, Mentions, PostOrigin, RoomEnsure, RoomEvent, RoomId, RoomJoin, RoomOrigin, RoomPost,
+    RoomRef, RoomScope,
 };
 use rex_wave_api::wave::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, LocalClient, Reactor};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
     let name =
@@ -25,6 +37,35 @@ pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
 
 pub const MAX_SPAWN_ATTEMPTS: u32 = 3;
 pub const MAX_RETIRE_ATTEMPTS: u32 = 3;
+
+/// Builds a collision-free idempotency key for final-turn room mirroring while
+/// preserving the `wave:<wave>:turn:` prefix.
+pub fn mirror_idem_key(
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+    anchor: &str,
+) -> Result<IdemKey, InvalidId> {
+    let raw = format!("wave:{wave}:turn:{role}:{thread}:{anchor}");
+    if raw.len() <= 256 {
+        return IdemKey::parse(raw);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(thread.as_str().as_bytes());
+    hasher.update(b":");
+    hasher.update(anchor.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    IdemKey::parse(format!("wave:{wave}:turn:{role}:h{hex}"))
+}
+
+pub fn is_legacy_mirror_idem_key(idem: &IdemKey) -> bool {
+    idem.as_str().starts_with("wave:") && idem.as_str().contains(":turn:")
+}
 
 pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase, String> {
     match (phase, obs) {
@@ -798,36 +839,103 @@ pub struct SpawnRequest {
 }
 
 pub trait AgentHost: Send + Sync + 'static {
-    fn spawn(
-        &self,
-        req: SpawnRequest,
-    ) -> impl Future<Output = Result<BbThreadId, HostError>> + Send;
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>>;
     fn tell(
         &self,
-        thread: &BbThreadId,
+        thread: &HostThreadId,
         body: &Body,
         mode: SteerDeliveryMode,
-    ) -> impl Future<Output = Result<(), HostError>> + Send;
+    ) -> BoxFut<'_, Result<(), HostError>>;
     fn resolve(
         &self,
-        thread: &BbThreadId,
-        interaction: &BbInteractionId,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
         resolution: &InteractionResolution,
-    ) -> impl Future<Output = Result<(), HostError>> + Send;
-    fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send;
+    ) -> BoxFut<'_, Result<(), HostError>>;
+    fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>>;
     /// Probe whether a previously-`Live` host thread still exists after a reboot
     /// or reconnect. Returning `Ok(Some(obs))` submits a corrective `WaveObserve`
     /// (for example `Activity::Errored` when the host thread vanished after restart,
     /// or `Observation::Archived` when the thread was already archived).
     fn check_live(
         &self,
-        _thread: &BbThreadId,
-    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
-        async { Ok(None) }
+        _thread: &HostThreadId,
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
-pub struct WaveConductor<H: AgentHost> {
+impl<H: AgentHost + ?Sized> AgentHost for Arc<H> {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
+        (**self).spawn(req)
+    }
+
+    fn tell(
+        &self,
+        thread: &HostThreadId,
+        body: &Body,
+        mode: SteerDeliveryMode,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).tell(thread, body, mode)
+    }
+
+    fn resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).resolve(thread, interaction, resolution)
+    }
+
+    fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).retire(thread)
+    }
+
+    fn check_live(
+        &self,
+        thread: &HostThreadId,
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        (**self).check_live(thread)
+    }
+}
+
+impl<H: AgentHost + ?Sized> AgentHost for Box<H> {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
+        (**self).spawn(req)
+    }
+
+    fn tell(
+        &self,
+        thread: &HostThreadId,
+        body: &Body,
+        mode: SteerDeliveryMode,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).tell(thread, body, mode)
+    }
+
+    fn resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).resolve(thread, interaction, resolution)
+    }
+
+    fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).retire(thread)
+    }
+
+    fn check_live(
+        &self,
+        thread: &HostThreadId,
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        (**self).check_live(thread)
+    }
+}
+
+pub struct WaveConductor<H: AgentHost = Arc<dyn AgentHost>> {
     host: H,
     view: BTreeMap<WaveSlug, WaveState>,
     room_waves: BTreeMap<RoomId, WaveSlug>,
@@ -1180,6 +1288,7 @@ impl<H: AgentHost> WaveConductor<H> {
                     body,
                     mentions,
                     idem,
+                    origin,
                     ..
                 }),
             ) => {
@@ -1192,9 +1301,9 @@ impl<H: AgentHost> WaveConductor<H> {
                 ) {
                     return Ok(());
                 }
-                if idem.as_ref().is_some_and(|k| {
-                    k.as_str().starts_with("wave:") && k.as_str().contains(":turn:")
-                }) {
+                if *origin == PostOrigin::MirroredTurn
+                    || idem.as_ref().is_some_and(is_legacy_mirror_idem_key)
+                {
                     return Ok(());
                 }
                 self.route_post_wakeups(room, env.seq, &env.by, body, mentions)
@@ -2050,88 +2159,100 @@ mod tests {
     }
 
     impl AgentHost for FakeHost {
-        async fn spawn(&self, req: SpawnRequest) -> Result<BbThreadId, HostError> {
-            if self.unreachable_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
-                return Err(HostError::Unreachable("transient disconnect".into()));
-            }
-            if self.rejected_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
-                return Err(HostError::Rejected(
-                    "environment provider requires a machine".into(),
-                ));
-            }
-            self.calls.lock().unwrap().push(HostCall::Spawn {
-                wave: req.wave.to_string(),
-                role: req.role.to_string(),
-                attempt: req.attempt,
-                provider: req.agent.provider.to_string(),
-                workspace: req.agent.workspace.clone(),
-            });
-            let id =
-                BbThreadId::parse(format!("th_{}_{}_{}", req.wave, req.role, req.attempt)).unwrap();
-            self.spawn_requests.lock().unwrap().push(req);
-            Ok(id)
+        fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<BbThreadId, HostError>> {
+            Box::pin(async move {
+                if self.unreachable_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
+                    return Err(HostError::Unreachable("transient disconnect".into()));
+                }
+                if self.rejected_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
+                    return Err(HostError::Rejected(
+                        "environment provider requires a machine".into(),
+                    ));
+                }
+                self.calls.lock().unwrap().push(HostCall::Spawn {
+                    wave: req.wave.to_string(),
+                    role: req.role.to_string(),
+                    attempt: req.attempt,
+                    provider: req.agent.provider.to_string(),
+                    workspace: req.agent.workspace.clone(),
+                });
+                let id = BbThreadId::parse(format!("th_{}_{}_{}", req.wave, req.role, req.attempt))
+                    .unwrap();
+                self.spawn_requests.lock().unwrap().push(req);
+                Ok(id)
+            })
         }
 
-        async fn tell(
+        fn tell(
             &self,
             thread: &BbThreadId,
             body: &Body,
             mode: SteerDeliveryMode,
-        ) -> Result<(), HostError> {
-            self.calls.lock().unwrap().push(HostCall::Tell {
-                thread: thread.to_string(),
-                mode,
-                text: body.as_str().to_owned(),
-            });
-            Ok(())
+        ) -> BoxFut<'_, Result<(), HostError>> {
+            let thread = thread.to_string();
+            let text = body.as_str().to_owned();
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(HostCall::Tell { thread, mode, text });
+                Ok(())
+            })
         }
 
-        async fn resolve(
+        fn resolve(
             &self,
             thread: &BbThreadId,
             interaction: &BbInteractionId,
             resolution: &InteractionResolution,
-        ) -> Result<(), HostError> {
-            self.calls.lock().unwrap().push(HostCall::Resolve {
-                thread: thread.to_string(),
-                interaction: interaction.to_string(),
-                resolution: resolution.clone(),
-            });
-            Ok(())
+        ) -> BoxFut<'_, Result<(), HostError>> {
+            let thread = thread.to_string();
+            let interaction = interaction.to_string();
+            let resolution = resolution.clone();
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(HostCall::Resolve {
+                    thread,
+                    interaction,
+                    resolution,
+                });
+                Ok(())
+            })
         }
 
-        async fn retire(&self, thread: &BbThreadId) -> Result<(), HostError> {
-            *self.retire_attempts.lock().unwrap() += 1;
-            if *self.unreachable_retire.lock().unwrap() {
-                return Err(HostError::Unreachable("BB bridge disconnected".into()));
-            }
-            if *self.reject_retire.lock().unwrap() {
-                return Err(HostError::Rejected("thread remained stopping".into()));
-            }
-            self.calls.lock().unwrap().push(HostCall::Retire {
-                thread: thread.to_string(),
-            });
-            Ok(())
+        fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
+            let thread = thread.to_string();
+            Box::pin(async move {
+                *self.retire_attempts.lock().unwrap() += 1;
+                if *self.unreachable_retire.lock().unwrap() {
+                    return Err(HostError::Unreachable("BB bridge disconnected".into()));
+                }
+                if *self.reject_retire.lock().unwrap() {
+                    return Err(HostError::Rejected("thread remained stopping".into()));
+                }
+                self.calls.lock().unwrap().push(HostCall::Retire { thread });
+                Ok(())
+            })
         }
 
-        async fn check_live(&self, thread: &BbThreadId) -> Result<Option<Observation>, HostError> {
-            *self.check_live_calls.lock().unwrap() += 1;
-            if *self.unreachable_check_live.lock().unwrap() {
-                return Err(HostError::Unreachable("host disconnected".into()));
-            }
-            if self
-                .missing_threads
-                .lock()
-                .unwrap()
-                .contains(thread.as_str())
-            {
-                return Ok(Some(Observation::Activity {
-                    activity: Activity::Errored {
-                        error: "host thread missing after restart".into(),
-                    },
-                }));
-            }
-            Ok(None)
+        fn check_live(
+            &self,
+            thread: &BbThreadId,
+        ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+            let thread = thread.to_string();
+            Box::pin(async move {
+                *self.check_live_calls.lock().unwrap() += 1;
+                if *self.unreachable_check_live.lock().unwrap() {
+                    return Err(HostError::Unreachable("host disconnected".into()));
+                }
+                if self.missing_threads.lock().unwrap().contains(&thread) {
+                    return Ok(Some(Observation::Activity {
+                        activity: Activity::Errored {
+                            error: "host thread missing after restart".into(),
+                        },
+                    }));
+                }
+                Ok(None)
+            })
         }
     }
 
@@ -2323,6 +2444,7 @@ mod tests {
                                     labels: c.labels,
                                     task: c.task,
                                     idem: c.idem.clone(),
+                                    origin: Default::default(),
                                 }),
                             );
                             if let Some(idem) = c.idem {

@@ -199,16 +199,7 @@ pub fn default_t3_bin(t3_home: &Path) -> PathBuf {
     PathBuf::from("t3")
 }
 
-pub fn default_bb_data_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("BB_DATA_DIR")
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir));
-    }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".bb"))
-}
+pub use rex_wave_waves::default_bb_data_dir;
 
 #[derive(Clone, Debug)]
 pub enum T3EndpointSource {

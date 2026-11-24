@@ -131,11 +131,17 @@ branded_str!(
     /// A channel name *without* the leading `#`. Display adds it.
     ChannelName, "channel", |s| slug(&s, 64));
 branded_str!(
-    /// BB project id (opaque, owned by BB).
-    BbProjectId, "bb project id", |s| opaque(&s));
+    /// Host project id or workspace identifier (`proj_...`, T3 UUID, or path).
+    ProjectId, "bb project id", |s| opaque(&s));
+/// Compatibility alias for [`ProjectId`].
+pub type BbProjectId = ProjectId;
+
 branded_str!(
-    /// BB thread id (opaque, owned by BB).
-    BbThreadId, "bb thread id", |s| opaque(&s));
+    /// Host worker thread id (`t3:...`, `acp:...`, `claude:...`, `codex:...`, or BB thread id).
+    HostThreadId, "bb thread id", |s| opaque(&s));
+/// Compatibility alias for [`HostThreadId`].
+pub type BbThreadId = HostThreadId;
+
 branded_str!(
     /// T3 Code thread id (opaque, owned by T3 Code).
     T3ThreadId, "t3 thread id", |s| opaque(&s));
@@ -162,8 +168,93 @@ impl Label {
     }
 }
 branded_str!(
-    /// BB pending-interaction id (opaque, owned by BB).
-    BbInteractionId, "bb interaction id", |s| opaque(&s));
+    /// Host pending-interaction id (approval or user-input request id).
+    HostInteractionId, "bb interaction id", |s| opaque(&s));
+/// Compatibility alias for [`HostInteractionId`].
+pub type BbInteractionId = HostInteractionId;
+
+pub const T3_THREAD_PREFIX: &str = "t3:";
+pub const ACP_THREAD_PREFIX: &str = "acp:";
+pub const CLAUDE_THREAD_PREFIX: &str = "claude:";
+pub const CODEX_THREAD_PREFIX: &str = "codex:";
+
+/// Which agent runner backend owns a wave worker thread or explicit provider prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerKind {
+    Bb,
+    T3,
+    Acp,
+    Claude,
+    Codex,
+}
+
+impl RunnerKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RunnerKind::Bb => "bb",
+            RunnerKind::T3 => "t3",
+            RunnerKind::Acp => "acp",
+            RunnerKind::Claude => "claude",
+            RunnerKind::Codex => "codex",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            RunnerKind::Bb => "BB",
+            RunnerKind::T3 => "T3",
+            RunnerKind::Acp => "ACP",
+            RunnerKind::Claude => "Claude",
+            RunnerKind::Codex => "Codex",
+        }
+    }
+
+    pub const fn thread_prefix(self) -> Option<&'static str> {
+        match self {
+            RunnerKind::Bb => None,
+            RunnerKind::T3 => Some(T3_THREAD_PREFIX),
+            RunnerKind::Acp => Some(ACP_THREAD_PREFIX),
+            RunnerKind::Claude => Some(CLAUDE_THREAD_PREFIX),
+            RunnerKind::Codex => Some(CODEX_THREAD_PREFIX),
+        }
+    }
+
+    pub fn strip_provider_prefix(raw: &str) -> Option<(Self, &str)> {
+        let trimmed = raw.trim();
+        for (prefix, kind) in [
+            ("bb:", RunnerKind::Bb),
+            (T3_THREAD_PREFIX, RunnerKind::T3),
+            (ACP_THREAD_PREFIX, RunnerKind::Acp),
+            (CLAUDE_THREAD_PREFIX, RunnerKind::Claude),
+            (CODEX_THREAD_PREFIX, RunnerKind::Codex),
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                return Some((kind, rest.trim()));
+            }
+        }
+        None
+    }
+}
+
+impl HostThreadId {
+    /// Classifies which runner owns this thread ID by its canonical scheme prefix.
+    /// Unprefixed opaque IDs belong to BB (`RunnerKind::Bb`).
+    pub fn runner_kind(&self) -> RunnerKind {
+        let s = self.as_str();
+        if s.starts_with(T3_THREAD_PREFIX) {
+            RunnerKind::T3
+        } else if s.starts_with(ACP_THREAD_PREFIX) {
+            RunnerKind::Acp
+        } else if s.starts_with(CLAUDE_THREAD_PREFIX) {
+            RunnerKind::Claude
+        } else if s.starts_with(CODEX_THREAD_PREFIX) {
+            RunnerKind::Codex
+        } else {
+            RunnerKind::Bb
+        }
+    }
+}
 branded_str!(
     /// BB provider id: `claude-code`, `codex`, `acp-cursor`, `pi`, ... Validated
     /// against the live BB catalog at wave launch, not here.
@@ -204,7 +295,7 @@ impl Seq {
     }
 }
 
-/// BB's own per-thread event sequence (foreign cursor; never mixed with [`Seq`]).
+/// Host's own per-thread event sequence (foreign cursor; never mixed with [`Seq`]).
 #[derive(
     Clone,
     Copy,
@@ -220,7 +311,17 @@ impl Seq {
     JsonSchema,
 )]
 #[serde(transparent)]
-pub struct BbSeq(pub u64);
+#[schemars(rename = "BbSeq")]
+pub struct HostSeq(pub u64);
+
+/// Compatibility alias for [`HostSeq`].
+pub type BbSeq = HostSeq;
+
+/// Compatibility constructor for [`BbSeq`].
+#[allow(non_snake_case)]
+pub const fn BbSeq(v: u64) -> HostSeq {
+    HostSeq(v)
+}
 
 /// Monotonic task-lease fencing epoch incremented on every claim or expired-lease takeover.
 #[derive(

@@ -8,15 +8,13 @@ use rex_wave_api::wave::{
     BaseBranch, InteractionKind, InteractionResolution, PendingInteraction, PermissionMode,
     Question, SteerDeliveryMode, Workspace,
 };
-use rex_wave_api::{
-    BbInteractionId, BbSeq, BbThreadId, IdemKey, InvalidId, RoleName, UnixMs, WaveSlug,
-};
+use rex_wave_api::{BbInteractionId, BbSeq, BbThreadId, RoleName, RunnerKind, UnixMs, WaveSlug};
 use rex_wave_waves::{HostError, SpawnRequest};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const T3_THREAD_PREFIX: &str = "t3:";
+pub use rex_wave_api::T3_THREAD_PREFIX;
+pub use rex_wave_waves::mirror_idem_key;
 pub const ITEM_SEQ_STRIDE: u64 = 1_000;
 
 /// Maps `(turn_item_ordinal, is_terminal)` into a collision-free monotonic `BbSeq`.
@@ -127,33 +125,8 @@ impl LiveSeqTracker {
     }
 }
 
-/// Builds a collision-free idempotency key for final-turn room mirroring while
-/// preserving the `wave:<wave>:turn:` prefix required by `WaveConductor`.
-pub fn mirror_idem_key(
-    wave: &WaveSlug,
-    role: &RoleName,
-    thread: &BbThreadId,
-    anchor: &str,
-) -> Result<IdemKey, InvalidId> {
-    let raw = format!("wave:{wave}:turn:{role}:{thread}:{anchor}");
-    if raw.len() <= 256 {
-        return IdemKey::parse(raw);
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(thread.as_str().as_bytes());
-    hasher.update(b":");
-    hasher.update(anchor.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    IdemKey::parse(format!("wave:{wave}:turn:{role}:h{hex}"))
-}
-
 pub fn is_t3_thread_id(thread: &BbThreadId) -> bool {
-    thread.as_str().starts_with(T3_THREAD_PREFIX)
+    thread.runner_kind() == RunnerKind::T3
 }
 
 pub fn deterministic_thread_id(

@@ -11,6 +11,7 @@ use crate::board::BoardId;
 use crate::id::{RoleName, WaveSlug};
 use crate::read::InboxBadge;
 use crate::room::RoomRef;
+use crate::stream::{Interest, StreamId};
 use crate::wave::{Activity, InteractionKind, WorkerPhase};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,25 @@ pub enum StageTarget {
         wave: WaveSlug,
         role: RoleName,
     },
+}
+
+impl StageTarget {
+    /// Maps a focused stage target to its underlying journal or live agent [`Interest`].
+    pub fn to_inner_interest(&self) -> Interest {
+        match self {
+            StageTarget::Inbox => Interest::MyInbox,
+            StageTarget::Kanban { board } => Interest::Streams {
+                streams: vec![StreamId::Board {
+                    board: board.clone(),
+                }],
+            },
+            StageTarget::Room { room } => Interest::Room { room: room.clone() },
+            StageTarget::Agent { wave, role } => Interest::Agent {
+                wave: wave.clone(),
+                role: role.clone(),
+            },
+        }
+    }
 }
 
 /// `OSC 7501` program status for the Rex terminal.

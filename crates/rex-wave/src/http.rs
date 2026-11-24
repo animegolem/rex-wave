@@ -1146,6 +1146,7 @@ async fn dispatch_json_route(
                     labels: payload.labels,
                     task: payload.task,
                     idem: payload.idem,
+                    origin: Default::default(),
                 })
                 .await
                 .map_err(|e| mask_err(e, &format!("room {room}")))?;

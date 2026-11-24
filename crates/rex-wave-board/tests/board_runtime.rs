@@ -15,18 +15,13 @@ fn build_router(journal: Journal, idle: Duration) -> Arc<Router> {
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     Arc::new(Router {
-        room: Arc::new(Unavailable(Family::Room)),
-        wave: Arc::new(Unavailable(Family::Wave)),
         board: Registry::<Board>::with_idle(journal.clone(), hub.clone(), idle),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     })
 }
 

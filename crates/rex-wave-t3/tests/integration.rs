@@ -731,15 +731,12 @@ fn build_test_router(dir: &std::path::Path, agents: Arc<dyn AgentFeed>) -> Arc<R
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
-        inbox: Arc::new(rex_wave_runtime::Unavailable(Family::Inbox)),
-        mail: Arc::new(rex_wave_runtime::Unavailable(Family::Mail)),
-        presence: Arc::new(rex_wave_runtime::Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents,
-        }),
+        }))
     })
 }
 
@@ -1899,19 +1896,16 @@ struct RecordingBbHost {
 }
 
 impl AgentHost for RecordingBbHost {
-    fn spawn(
-        &self,
-        req: SpawnRequest,
-    ) -> impl Future<Output = Result<BbThreadId, HostError>> + Send {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<BbThreadId, HostError>> {
         let spawns = self.spawns.clone();
-        async move {
+        Box::pin(async move {
             let tid = format!("th_bb_{}_{}", req.wave, req.role);
             spawns
                 .lock()
                 .unwrap()
                 .push((req.agent.provider.to_string(), tid.clone()));
             Ok(BbThreadId::parse(tid).unwrap())
-        }
+        })
     }
 
     fn tell(
@@ -1919,13 +1913,13 @@ impl AgentHost for RecordingBbHost {
         thread: &BbThreadId,
         _body: &Body,
         _mode: SteerDeliveryMode,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
+    ) -> BoxFut<'_, Result<(), HostError>> {
         let tells = self.tells.clone();
         let tid = thread.to_string();
-        async move {
+        Box::pin(async move {
             tells.lock().unwrap().push(tid);
             Ok(())
-        }
+        })
     }
 
     fn resolve(
@@ -1933,22 +1927,22 @@ impl AgentHost for RecordingBbHost {
         thread: &BbThreadId,
         _interaction: &BbInteractionId,
         _resolution: &InteractionResolution,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
+    ) -> BoxFut<'_, Result<(), HostError>> {
         let resolves = self.resolves.clone();
         let tid = thread.to_string();
-        async move {
+        Box::pin(async move {
             resolves.lock().unwrap().push(tid);
             Ok(())
-        }
+        })
     }
 
-    fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send {
+    fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
         let retires = self.retires.clone();
         let tid = thread.to_string();
-        async move {
+        Box::pin(async move {
             retires.lock().unwrap().push(tid);
             Ok(())
-        }
+        })
     }
 }
 
@@ -2301,6 +2295,7 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();

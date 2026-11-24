@@ -30,6 +30,7 @@
 //! `watch` channel.
 
 mod actor;
+mod feed_router;
 mod hub;
 mod reactor;
 mod read;
@@ -37,13 +38,14 @@ mod router;
 mod sidebar;
 
 pub use actor::Registry;
+pub use feed_router::{FeedRouter, ThreadIdResolver, fallback_parked_room_and_since};
 pub use hub::Hub;
 pub use reactor::{Reactor, spawn_reactor};
 pub use read::{
     AgentFeed, NoAgentFeed, ReadSide, can_read, can_read_visible, frame_channel,
     labeled_event_matches, labels_match, mask_unauthorized_as_not_found,
 };
-pub use router::{LocalClient, Remote, Router, Session, Unavailable, authorize};
+pub use router::{BridgeBackend, LocalClient, Remote, Router, Session, Unavailable, authorize};
 pub use sidebar::SidebarProjection;
 
 use rex_wave_api::{

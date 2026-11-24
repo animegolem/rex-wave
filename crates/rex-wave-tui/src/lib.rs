@@ -1754,17 +1754,10 @@ async fn load_stage_target_with_guard<C: Client, F: Fn() -> bool>(
         if !still_current() {
             return (None, Ok(None));
         }
-        let watch_res = client
-            .watch(
-                Interest::Stage {
-                    target: rex_wave_api::StageTarget::Room {
-                        room: RoomRef::Id { id: room.clone() },
-                    },
-                },
-                cursor.clone(),
-            )
-            .await
-            .map(Some);
+        let watch_interest = target
+            .to_watch_interest(overview, client.me())
+            .expect("StageTarget::Room produces a stage watch interest");
+        let watch_res = client.watch(watch_interest, cursor.clone()).await.map(Some);
         let total_count = all_entries.len();
         let initial = WireReply::Read(Page {
             entries: all_entries,

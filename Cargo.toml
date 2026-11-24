@@ -29,7 +29,7 @@ publish = false
 [workspace.dependencies]
 # Versions pinned to what is already in the offline ~/.cargo cache
 # (/tmp/rex-proto-rust-tui and /tmp/rex-proto-bb-mcp/rex-actor-mcp).
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "net", "fs"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "net", "fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.18"
@@ -37,6 +37,7 @@ futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 sha2 = "0.10.9"
 base64 = "0.22.1"
+getrandom = "0.3.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "=1.2.2"
 tempfile = "3.24.0"

@@ -24,28 +24,16 @@ use rex_wave_api::wave::{
     WaveObserve, WaveView, WorkerPhase,
 };
 use rex_wave_api::*;
+pub use rex_wave_runtime::BridgeBackend;
 use rex_wave_runtime::{AgentFeed, BoxFut, LocalClient, Reactor, Router, spawn_reactor};
 use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_MIRROR_SCAN_PAGES: usize = 16;
-
-pub trait BridgeBackend: Send + Sync + 'static {
-    type C: Client + Clone + 'static;
-    fn client(&self, me: Principal) -> Self::C;
-}
-
-impl BridgeBackend for Arc<Router> {
-    type C = LocalClient;
-    fn client(&self, me: Principal) -> LocalClient {
-        LocalClient::new(self.clone(), me)
-    }
-}
 
 trait ErasedBackend: Send + Sync {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>>;
@@ -192,6 +180,11 @@ impl StateOwner {
         match event {
             WaveEvent::Started { .. } => {}
             WaveEvent::WorkerRequested { role, attempt, .. } => {
+                if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone()))
+                    && let Some(ref th) = prev.thread
+                {
+                    self.role_by_thread.remove(th);
+                }
                 self.workers_by_role.insert(
                     (wave, role),
                     TrackedWorker {
@@ -207,7 +200,21 @@ impl StateOwner {
             WaveEvent::WorkerObserved { role, observation } => match observation {
                 Observation::Spawned { attempt, thread } => {
                     if !is_t3_thread_id(&thread) {
+                        if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
+                            if let Some(ref prev_th) = rec.thread {
+                                self.role_by_thread.remove(prev_th);
+                            }
+                            rec.thread = None;
+                            rec.live = false;
+                            rec.pending_interaction = None;
+                        }
                         return;
+                    }
+                    if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone()))
+                        && let Some(ref prev_th) = prev.thread
+                        && prev_th != &thread
+                    {
+                        self.role_by_thread.remove(prev_th);
                     }
                     self.role_by_thread
                         .insert(thread.clone(), (wave.clone(), role.clone()));
@@ -738,7 +745,7 @@ impl T3Bridge {
         {
             let mut matched_live = false;
             let mut matched_retiring = false;
-            for (r, _, phase) in &snap.workers {
+            for (r, spec, phase) in &snap.workers {
                 if r != &role {
                     continue;
                 }
@@ -746,7 +753,14 @@ impl T3Bridge {
                     WorkerPhase::Live { thread: t, .. } if t == thread => {
                         matched_live = true;
                     }
-                    WorkerPhase::Requested { attempt: a } if *a == attempt => {
+                    WorkerPhase::Requested { attempt: a }
+                        if *a == attempt
+                            && rex_wave_waves::route_provider(
+                                &spec.provider,
+                                rex_wave_api::RunnerKind::T3,
+                            )
+                            .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3) =>
+                    {
                         matched_live = true;
                     }
                     WorkerPhase::Retiring { thread: t, .. } if t == thread => {
@@ -1149,15 +1163,7 @@ impl T3Bridge {
         let Ok(body) = Body::parse(trimmed) else {
             return;
         };
-        let post_cmd = RoomPost {
-            room: RoomRef::Id { id: room.clone() },
-            body,
-            re: None,
-            after: None,
-            labels: Vec::new(),
-            task: None,
-            idem: Some(idem_key),
-        };
+        let post_cmd = RoomPost::mirrored_turn(RoomRef::Id { id: room.clone() }, body, idem_key);
         let first_try = backend
             .call_as(worker_principal.clone(), post_cmd.clone().into_wire())
             .await;
@@ -1880,12 +1886,9 @@ fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
 pub struct T3Host(pub Arc<T3Bridge>);
 
 impl AgentHost for T3Host {
-    fn spawn(
-        &self,
-        req: SpawnRequest,
-    ) -> impl Future<Output = Result<BbThreadId, HostError>> + Send {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<BbThreadId, HostError>> {
         let bridge = self.0.clone();
-        async move { bridge.spawn_worker_thread(req).await }
+        Box::pin(async move { bridge.spawn_worker_thread(req).await })
     }
 
     fn tell(
@@ -1893,11 +1896,11 @@ impl AgentHost for T3Host {
         thread: &BbThreadId,
         body: &Body,
         mode: SteerDeliveryMode,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
+    ) -> BoxFut<'_, Result<(), HostError>> {
         let bridge = self.0.clone();
         let thread = thread.clone();
         let body = body.clone();
-        async move { bridge.tell_worker_thread(&thread, &body, mode).await }
+        Box::pin(async move { bridge.tell_worker_thread(&thread, &body, mode).await })
     }
 
     fn resolve(
@@ -1905,31 +1908,31 @@ impl AgentHost for T3Host {
         thread: &BbThreadId,
         interaction: &BbInteractionId,
         resolution: &InteractionResolution,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
+    ) -> BoxFut<'_, Result<(), HostError>> {
         let bridge = self.0.clone();
         let thread = thread.clone();
         let interaction = interaction.clone();
         let resolution = resolution.clone();
-        async move {
+        Box::pin(async move {
             bridge
                 .resolve_worker_interaction(&thread, &interaction, &resolution)
                 .await
-        }
+        })
     }
 
-    fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send {
+    fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
         let bridge = self.0.clone();
         let thread = thread.clone();
-        async move { bridge.retire_worker_thread(&thread).await }
+        Box::pin(async move { bridge.retire_worker_thread(&thread).await })
     }
 
     fn check_live(
         &self,
         thread: &BbThreadId,
-    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
         let bridge = self.0.clone();
         let thread = thread.clone();
-        async move { bridge.check_thread_live(&thread).await }
+        Box::pin(async move { bridge.check_thread_live(&thread).await })
     }
 }
 

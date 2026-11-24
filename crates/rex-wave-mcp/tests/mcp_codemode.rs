@@ -12,7 +12,7 @@ use rex_wave_mcp::codemode::{Budget, CodeError, run_code};
 use rex_wave_mcp::{MAX_RUN_CODE_TIMEOUT_MS, McpServer, PROTOCOL_VERSION, RUN_CODE_TOOL};
 use rex_wave_runtime::{
     DecideCtx, Decider, EntryMeta, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router,
-    SidebarProjection, Unavailable,
+    SidebarProjection,
 };
 use rex_wave_store::Journal;
 use serde_json::{Value, json};
@@ -119,6 +119,7 @@ impl Decider for TestRooms {
                 labels,
                 task,
                 idem,
+                ..
             }) => {
                 let mut events = Vec::new();
                 if state.id.is_none() {
@@ -157,6 +158,7 @@ impl Decider for TestRooms {
                     labels: labels.clone(),
                     task: task.clone(),
                     idem: idem.clone(),
+                    origin: Default::default(),
                 });
                 Ok(events)
             }
@@ -622,10 +624,7 @@ impl TestHarness {
             room: Registry::<TestRooms>::new(journal.clone(), hub.clone()),
             wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
             board: Registry::<TestBoards>::new(journal.clone(), hub),
-            inbox: Arc::new(Unavailable(Family::Inbox)),
-            mail: Arc::new(Unavailable(Family::Mail)),
-            presence: Arc::new(Unavailable(Family::Presence)),
-            read,
+            ..Router::unavailable_with(read)
         });
         TestHarness {
             _dir: dir,
@@ -1334,6 +1333,7 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .expect("alice post");
@@ -1405,6 +1405,7 @@ async fn mcp_duplex_stream_full_lifecycle_and_live_resource_subscriptions() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .expect("second alice post");
@@ -1680,6 +1681,7 @@ async fn resources_read_returns_latest_200_entries_for_long_rooms() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1743,6 +1745,7 @@ async fn operator_mcp_lists_and_reads_dm_addressed_to_its_seat() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();

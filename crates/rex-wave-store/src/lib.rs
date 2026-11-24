@@ -38,6 +38,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("stream {0:?} already has a live writer")]
@@ -46,6 +48,8 @@ pub enum StoreError {
     WrongStream(StreamId),
     #[error("head moved underneath writer (expected {expected:?}, found {found:?})")]
     HeadMoved { expected: Seq, found: Seq },
+    #[error("unsupported journal schema version {found} (max supported: {max_supported})")]
+    UnsupportedSchemaVersion { found: u32, max_supported: u32 },
     #[error("storage: {0}")]
     Backend(String),
 }
@@ -92,9 +96,56 @@ CREATE TABLE IF NOT EXISTS entries(
 ) STRICT;
 ";
 
+/// Sealed initialization handle passed to [`CommitHook::on_init`]. Keeps
+/// `rusqlite` private to `rex-wave-store`.
+pub struct InitContext<'a> {
+    conn: &'a Connection,
+}
+
+impl InitContext<'_> {
+    pub fn execute_ddl(&mut self, sql: &str) -> Result<(), StoreError> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+}
+
+/// Sealed transaction handle passed to [`CommitHook::on_append`] inside the
+/// same `IMMEDIATE` SQLite transaction that appends `entries`.
+pub struct TxContext<'a, 'conn> {
+    tx: &'a rusqlite::Transaction<'conn>,
+}
+
+impl TxContext<'_, '_> {
+    pub fn execute_sql(&self, sql: &str, text_params: &[&str]) -> Result<usize, StoreError> {
+        let count = self
+            .tx
+            .execute(sql, rusqlite::params_from_iter(text_params.iter()))?;
+        Ok(count)
+    }
+}
+
+/// Atomic side-table / outbox hook invoked inside [`StreamWriter::append`]'s
+/// `IMMEDIATE` transaction before `COMMIT`, plus an optional post-commit wakeup.
+pub trait CommitHook: Send + Sync + 'static {
+    fn on_init(&self, _ctx: &mut InitContext<'_>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn on_append(
+        &self,
+        _tx: &TxContext<'_, '_>,
+        _committed: &[Envelope],
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn after_commit(&self, _committed: &[Envelope]) {}
+}
+
 struct Inner {
     conn: Mutex<Connection>,
     claimed: Mutex<HashSet<String>>,
+    hook: Option<Arc<dyn CommitHook>>,
 }
 
 impl Inner {
@@ -223,6 +274,14 @@ fn legacy_dm_candidates(a: &Principal, b: &Principal) -> Vec<RoomId> {
 impl Journal {
     /// Open (creating if needed) the journal at `path` in WAL mode.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_hook(path, None)
+    }
+
+    /// Open the journal at `path` in WAL mode with an optional [`CommitHook`].
+    pub fn open_with_hook(
+        path: &Path,
+        hook: Option<Arc<dyn CommitHook>>,
+    ) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -231,22 +290,56 @@ impl Journal {
             )));
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
-        Self::init(conn)
+        Self::init(conn, hook)
     }
 
     /// In-memory journal for tests and embedded demos.
     pub fn in_memory() -> Result<Self, StoreError> {
-        Self::init(Connection::open_in_memory()?)
+        Self::in_memory_with_hook(None)
     }
 
-    fn init(conn: Connection) -> Result<Self, StoreError> {
-        conn.execute_batch(SCHEMA)?;
+    /// In-memory journal with an optional [`CommitHook`].
+    pub fn in_memory_with_hook(hook: Option<Arc<dyn CommitHook>>) -> Result<Self, StoreError> {
+        Self::init(Connection::open_in_memory()?, hook)
+    }
+
+    fn init(mut conn: Connection, hook: Option<Arc<dyn CommitHook>>) -> Result<Self, StoreError> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let raw_ver: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let found = u32::try_from(raw_ver)
+            .map_err(|_| StoreError::Backend(format!("negative SQLite user_version: {raw_ver}")))?;
+        if found > JOURNAL_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion {
+                found,
+                max_supported: JOURNAL_SCHEMA_VERSION,
+            });
+        }
+        tx.execute_batch(SCHEMA)?;
+        if found < JOURNAL_SCHEMA_VERSION {
+            tx.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+        }
+        if let Some(ref h) = hook {
+            let mut init_ctx = InitContext { conn: &tx };
+            h.on_init(&mut init_ctx)?;
+        }
+        tx.commit()?;
         Ok(Journal {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
                 claimed: Mutex::new(HashSet::new()),
+                hook,
             }),
         })
+    }
+
+    /// Current SQLite `PRAGMA user_version` recorded in this journal.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        let raw: i64 = self
+            .inner
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        u32::try_from(raw)
+            .map_err(|_| StoreError::Backend(format!("negative SQLite user_version: {raw}")))
     }
 
     /// The unique writer for `stream`. Fails while another one is alive.
@@ -337,7 +430,9 @@ impl Journal {
 
     /// Resolve a DM room for a command carrying an optional idempotency key:
     /// - When `allow_legacy_fallback` is false (explicit `RoomRef::Id`), keeps
-    ///   `room` pinned to its exact stream while verifying `idem` authorship.
+    ///   empty-canonical -> single-legacy routing so an explicit canonical ID
+    ///   never forks a legacy-only DM, while skipping cross-history `idem`
+    ///   lookup so an explicit `RoomRef::Id` still disambiguates split journals.
     /// - When `allow_legacy_fallback` is true (`RoomRef::Dm`), checks both
     ///   canonical and pre-PR-26 `(Operator, peer)` histories for `idem`,
     ///   routing to the unique stream where `by` (`same_actor`) committed `idem`,
@@ -357,7 +452,7 @@ impl Journal {
         let (a, b): (Principal, Principal) = pair.clone().into();
         let conn = self.inner.conn();
 
-        if !allow_legacy_fallback || a.is_operator() || b.is_operator() {
+        if a.is_operator() || b.is_operator() {
             if let Some(key) = idem
                 && let Some(batch) = find_idem(&conn, &StreamId::Room { room: room.clone() }, key)?
                 && batch.first().is_some_and(|env| !env.by.same_actor(by))
@@ -373,6 +468,27 @@ impl Journal {
             if head_of(&conn, &StreamId::Room { room: cand.clone() })? > Seq::ORIGIN {
                 legacy_existing.push(cand);
             }
+        }
+
+        if !allow_legacy_fallback {
+            let pinned = if canon_exists || legacy_existing.is_empty() {
+                room
+            } else {
+                legacy_existing.remove(0)
+            };
+            if let Some(key) = idem
+                && let Some(batch) = find_idem(
+                    &conn,
+                    &StreamId::Room {
+                        room: pinned.clone(),
+                    },
+                    key,
+                )?
+                && batch.first().is_some_and(|env| !env.by.same_actor(by))
+            {
+                return Ok(DmIdemResolution::CrossAuthor { room: pinned });
+            }
+            return Ok(DmIdemResolution::Route(pinned));
         }
         if let Some(key) = idem {
             let mut to_check = Vec::with_capacity(1 + legacy_existing.len());
@@ -505,8 +621,15 @@ impl StreamWriter {
                 });
             }
         }
+        if let Some(ref hook) = self.inner.hook {
+            let tx_ctx = TxContext { tx: &tx };
+            hook.on_append(&tx_ctx, &committed)?;
+        }
         tx.commit()?;
         self.head = seq;
+        if let Some(ref hook) = self.inner.hook {
+            hook.after_commit(&committed);
+        }
         Ok(Appended::Fresh(committed))
     }
 }
@@ -569,6 +692,7 @@ mod legacy_dm_tests {
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: rex_wave_api::room::PostOrigin::Direct,
                     }),
                 ],
             )
@@ -579,6 +703,13 @@ mod legacy_dm_tests {
             reopened.resolve_dm_room(canon_room.clone()).unwrap(),
             legacy_room,
             "single legacy DM stream continues without splitting"
+        );
+        assert_eq!(
+            reopened
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, None, false)
+                .unwrap(),
+            DmIdemResolution::Route(legacy_room.clone()),
+            "explicit canonical RoomRef::Id write on legacy-only DM continues legacy stream without forking"
         );
         assert_eq!(
             reopened
@@ -618,6 +749,7 @@ mod legacy_dm_tests {
                             labels: Vec::new(),
                             task: None,
                             idem: None,
+                            origin: rex_wave_api::room::PostOrigin::Direct,
                         }),
                     ],
                 )
@@ -646,6 +778,7 @@ mod legacy_dm_tests {
                             labels: Vec::new(),
                             task: None,
                             idem: None,
+                            origin: rex_wave_api::room::PostOrigin::Direct,
                         }),
                     ],
                 )
@@ -709,5 +842,132 @@ mod legacy_dm_tests {
                 .unwrap(),
             DmIdemResolution::CrossAuthor { .. }
         ));
+    }
+
+    #[test]
+    fn user_version_upgrades_from_zero_and_rejects_future_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ver.sqlite3");
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            raw.execute_batch(SCHEMA).unwrap();
+            let v0: i64 = raw
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v0, 0);
+        }
+        let upgraded = Journal::open(&db_path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), JOURNAL_SCHEMA_VERSION);
+        drop(upgraded);
+
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            raw.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION + 7)
+                .unwrap();
+        }
+        let err = match Journal::open(&db_path) {
+            Ok(_) => panic!("future schema version must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            StoreError::UnsupportedSchemaVersion {
+                found,
+                max_supported: JOURNAL_SCHEMA_VERSION,
+            } if found == JOURNAL_SCHEMA_VERSION + 7
+        ));
+    }
+
+    #[test]
+    fn commit_hook_is_atomic_with_append_and_skips_idempotent_replays() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct TestHook {
+            fail: AtomicBool,
+            on_append_calls: AtomicUsize,
+            after_commit_calls: AtomicUsize,
+        }
+
+        impl CommitHook for TestHook {
+            fn on_init(&self, ctx: &mut InitContext<'_>) -> Result<(), StoreError> {
+                ctx.execute_ddl(
+                    "CREATE TABLE IF NOT EXISTS side_index(seq INTEGER PRIMARY KEY, stream TEXT NOT NULL) STRICT;",
+                )
+            }
+
+            fn on_append(
+                &self,
+                tx: &TxContext<'_, '_>,
+                committed: &[Envelope],
+            ) -> Result<(), StoreError> {
+                self.on_append_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(StoreError::Backend("injected hook failure".into()));
+                }
+                for env in committed {
+                    let s = env.seq.0.to_string();
+                    let k = key(&env.stream);
+                    tx.execute_sql(
+                        "INSERT INTO side_index(seq, stream) VALUES (CAST(?1 AS INTEGER), ?2)",
+                        &[&s, &k],
+                    )?;
+                }
+                Ok(())
+            }
+
+            fn after_commit(&self, _committed: &[Envelope]) {
+                self.after_commit_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let hook = Arc::new(TestHook {
+            fail: AtomicBool::new(true),
+            on_append_calls: AtomicUsize::new(0),
+            after_commit_calls: AtomicUsize::new(0),
+        });
+        let j = Journal::in_memory_with_hook(Some(hook.clone())).unwrap();
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        };
+        let room = RoomRef::parse_str("#general")
+            .unwrap()
+            .resolve(&alice)
+            .unwrap();
+        let stream = StreamId::Room { room: room.clone() };
+        let mut w = j.claim(stream.clone()).unwrap();
+        let idem = IdemKey::parse("post-1").unwrap();
+        let ev = Event::Room(RoomEvent::Opened {
+            id: room,
+            origin: RoomOrigin::Manual,
+            topic: None,
+        });
+
+        // Failing hook rolls back `entries` and leaves `head` at ORIGIN.
+        assert!(
+            w.append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+                .is_err()
+        );
+        assert_eq!(w.head(), Seq::ORIGIN);
+        assert_eq!(j.head(&stream).unwrap(), Seq::ORIGIN);
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 0);
+
+        // Succeeding retry commits both `entries` and `side_index`.
+        hook.fail.store(false, Ordering::SeqCst);
+        let first = w
+            .append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+            .unwrap();
+        assert!(matches!(first, Appended::Fresh(_)));
+        assert_eq!(w.head(), Seq(1));
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
+
+        // Idempotent replay does NOT re-invoke `on_append` or `after_commit`.
+        let replay = w
+            .append(&alice, UnixMs(200), Some(&idem), vec![ev])
+            .unwrap();
+        assert!(matches!(replay, Appended::Replayed(_)));
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
     }
 }

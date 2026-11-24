@@ -18,7 +18,7 @@ use rex_wave_mailbridge::{
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
     DecideCtx, Decider, EntryMeta, Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router,
-    SidebarProjection, Unavailable,
+    SidebarProjection,
 };
 use rex_wave_store::Journal;
 use sha2::{Digest, Sha256};
@@ -203,17 +203,13 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
 
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
         presence: Registry::<Presence>::new(journal.clone(), hub.clone()),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let owner = LocalClient::new(
@@ -1633,9 +1629,6 @@ fn gate1_case_10_bank_before_ring() {
             let mail_writer = journal.claim(StreamId::Mail).unwrap();
             let router = Arc::new(Router {
                 room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-                wave: Arc::new(Unavailable(Family::Wave)),
-                board: Arc::new(Unavailable(Family::Board)),
-                inbox: Arc::new(Unavailable(Family::Inbox)),
                 mail: Arc::new(MailBridge::with_hub(
                     sandbox.clone(),
                     journal.clone(),
@@ -1643,12 +1636,12 @@ fn gate1_case_10_bank_before_ring() {
                     hub.clone(),
                 )),
                 presence: Registry::<Presence>::new(journal.clone(), hub.clone()),
-                read: Arc::new(ReadSide {
+                ..Router::unavailable_with(Arc::new(ReadSide {
                     journal,
                     hub,
                     sidebar,
                     agents: Arc::new(NoAgentFeed),
-                }),
+                }))
             });
 
             let owner = LocalClient::new(router.clone(), owner_p.clone());
