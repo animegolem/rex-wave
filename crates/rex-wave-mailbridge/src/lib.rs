@@ -39,6 +39,7 @@ pub use shadow::{
     extract_letter_timestamp_detailed, parse_recorded_datetime_ms, run_shadow_pass,
 };
 
+use rex_wave_api::http_guard::is_loopback_host;
 use rex_wave_api::mail::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{BoxFut, DecideCtx, Hub, LocalClient, Reactor, Service, can_read};
@@ -189,27 +190,6 @@ pub fn wake_id(seat: &SeatName, mailbox: &str, file: &str, full_sha256: &Sha256H
     h.update(format!("wake/1\n{seat}\n{mailbox}/{file}\n{full_sha256}").as_bytes());
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     WakeId(hex[..16].to_owned())
-}
-
-pub(crate) fn unix_secs_to_iso8601_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    let second = rem % 60;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn is_valid_address_segment(seg: &str) -> bool {
@@ -712,7 +692,7 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         ("1970-01-01T00:00:00Z".to_owned(), "recorded".to_owned())
     } else {
         (
-            unix_secs_to_iso8601_utc(parsed_time.ts.0 / 1_000),
+            parsed_time.ts.to_rfc3339_sec(),
             parsed_time.basis.as_mailbox_ts_basis().to_owned(),
         )
     };
@@ -1037,7 +1017,7 @@ impl MailBridge {
             )));
         }
 
-        let ts = unix_secs_to_iso8601_utc(ctx.at.0 / 1_000);
+        let ts = ctx.at.to_rfc3339_sec();
         let ack_json = serde_json::json!({
             "schema": 1,
             "seat": acker_seat,
@@ -1259,21 +1239,6 @@ impl Service<MailCommand> for MailBridge {
             }
         })
     }
-}
-
-fn is_loopback_host(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("[::1]") {
-        return rest.is_empty()
-            || rest
-                .strip_prefix(':')
-                .is_some_and(|p| p.parse::<u16>().is_ok());
-    }
-    let host = match trimmed.rsplit_once(':') {
-        Some((h, port)) if port.parse::<u16>().is_ok() => h,
-        _ => trimmed,
-    };
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
 }
 
 pub async fn serve_wake_bell_sink<C: Client + 'static>(

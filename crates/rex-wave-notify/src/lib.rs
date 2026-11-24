@@ -41,27 +41,6 @@ pub fn is_reconnectable_binding(binding: &presence::SeatBinding) -> bool {
         )
 }
 
-fn unix_secs_to_iso8601_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    let second = rem % 60;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
 /// Builds the single per-seat informational `MailUnrung` Operator status card.
 /// Phrased strictly as a status notice with zero decision prompts or buttons.
 pub fn mail_unrung_draft(
@@ -78,7 +57,7 @@ pub fn mail_unrung_draft(
     } else {
         "letters"
     };
-    let oldest_iso = unix_secs_to_iso8601_utc(oldest_at.0 / 1_000);
+    let oldest_iso = oldest_at.to_rfc3339_sec();
     NotificationDraft {
         kind: NotifyKind::MailUnrung {
             seat: seat.clone(),

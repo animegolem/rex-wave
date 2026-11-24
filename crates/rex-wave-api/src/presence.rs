@@ -216,7 +216,9 @@ pub const RESIDENT_MANIFEST_SCHEMA: &str = "rex-wave-resident-manifest/1";
 )]
 #[serde(rename_all = "snake_case")]
 pub enum WorkClass {
+    #[serde(alias = "class-a", alias = "a")]
     ClassA,
+    #[serde(alias = "class-b", alias = "b")]
     ClassB,
 }
 

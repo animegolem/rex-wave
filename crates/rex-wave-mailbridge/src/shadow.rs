@@ -50,25 +50,7 @@ impl TimeBasis {
 const MIN_EPOCH_MS: u64 = 1_000_000_000_000;
 const MAX_EPOCH_MS: u64 = 4_102_444_800_000;
 
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
+/// Unix seconds of a local civil time, for the years letters carry.
 fn civil_to_unix_secs(
     year: i64,
     month: u32,
@@ -77,24 +59,10 @@ fn civil_to_unix_secs(
     minute: u32,
     second: u32,
 ) -> Option<i64> {
-    if !(1970..=2200).contains(&year)
-        || !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if year > 2_200 || second > 59 {
         return None;
     }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = month as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (day as u64) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    Some(days * 86_400 + (hour as i64) * 3_600 + (minute as i64) * 60 + (second as i64))
+    UnixMs::from_ymd_hms_utc(year, month, day, hour, minute, second).map(|ms| (ms.0 / 1_000) as i64)
 }
 
 fn parse_epoch_ms_13(raw: &str, require_dash_suffix: bool) -> Option<UnixMs> {

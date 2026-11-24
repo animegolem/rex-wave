@@ -4,7 +4,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -320,7 +320,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -699,7 +699,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -981,7 +981,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -1243,7 +1243,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -1539,7 +1539,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -1847,7 +1847,7 @@
           "type": "integer"
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -2138,7 +2138,7 @@
           "type": "integer"
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -2463,7 +2463,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -2815,7 +2815,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -4032,7 +4032,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -4255,7 +4255,7 @@
           "type": "string"
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -4522,7 +4522,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -5392,7 +5392,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -5929,7 +5929,7 @@
           ]
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",

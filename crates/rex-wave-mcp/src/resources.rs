@@ -51,54 +51,44 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
         .collect::<Result<_, _>>()
         .map_err(ResourceError::InvalidUri)?;
 
-    let room_ref = match parts.as_slice() {
-        [name] => RoomRef::Channel {
-            scope: RoomScope::Global,
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        [kind, name] if kind == "channel" => RoomRef::Channel {
-            scope: RoomScope::Global,
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        [kind, seat] if kind == "dm" => RoomRef::Dm {
-            with: Principal::Seat {
-                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, sub, seat] if kind == "dm" && sub == "seat" => RoomRef::Dm {
-            with: Principal::Seat {
-                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, sub, seat] if kind == "dm" && sub == "operator" => RoomRef::Dm {
-            with: Principal::Operator {
-                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, sub, wave, role] if kind == "dm" && sub == "worker" => RoomRef::Dm {
-            with: Principal::Worker {
-                wave: WaveSlug::parse(wave).map_err(|e| ResourceError::Api(e.into()))?,
-                role: RoleName::parse(role).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, project, name] if kind == "project" => RoomRef::Channel {
-            scope: RoomScope::Project {
-                project: BbProjectId::parse(project).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        [project, name] if project != "project" => RoomRef::Channel {
-            scope: RoomScope::Project {
-                project: BbProjectId::parse(project).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        _ => {
-            return Err(ResourceError::InvalidUri(format!(
-                "unsupported room resource uri: {uri}"
-            )));
+    let api = |e: InvalidId| ResourceError::Api(e.into());
+    let unsupported = || ResourceError::InvalidUri(format!("unsupported room resource uri: {uri}"));
+    // Every segment but a project id is one name; a decoded `/` would
+    // change which room the canonical spelling names.
+    let one_name = |seg: &String| {
+        if seg.contains('/') {
+            Err(unsupported())
+        } else {
+            Ok(())
         }
     };
+    let canonical = match parts.as_slice() {
+        [name] => one_name(name).map(|()| format!("#{name}"))?,
+        [kind, name] if kind == "channel" => one_name(name).map(|()| format!("#{name}"))?,
+        [kind, seat] if kind == "dm" => one_name(seat).map(|()| format!("@{seat}"))?,
+        [kind, sub, seat] if kind == "dm" && sub == "seat" => {
+            one_name(seat).map(|()| format!("@{seat}"))?
+        }
+        [kind, sub, seat] if kind == "dm" && sub == "operator" => {
+            return Ok(ResourceTarget::Room(RoomRef::Dm {
+                with: Principal::Operator {
+                    seat: SeatName::parse(seat).map_err(api)?,
+                },
+            }));
+        }
+        [kind, sub, wave, role] if kind == "dm" && sub == "worker" => {
+            one_name(wave)?;
+            one_name(role).map(|()| format!("@{wave}/{role}"))?
+        }
+        [kind, project, name] if kind == "project" => {
+            one_name(name).map(|()| format!("#{project}/{name}"))?
+        }
+        [project, name] if project != "project" => {
+            one_name(name).map(|()| format!("#{project}/{name}"))?
+        }
+        _ => return Err(unsupported()),
+    };
+    let room_ref = RoomRef::parse_str(&canonical).map_err(api)?;
 
     Ok(ResourceTarget::Room(room_ref))
 }

@@ -905,35 +905,15 @@ fn ensure_cursor_from_head(cursor: Cursor) -> Cursor {
 }
 
 fn parse_task_status(s: &str) -> Result<TaskStatus, ApiError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "open" => Ok(TaskStatus::Open),
-        "claimed" => Ok(TaskStatus::Claimed),
-        "review" => Ok(TaskStatus::Review),
-        "blocked" => Ok(TaskStatus::Blocked),
-        "done" => Ok(TaskStatus::Done),
-        "cancelled" | "canceled" => Ok(TaskStatus::Cancelled),
-        _ => Err(invalid(
-            "status",
-            "expected open, claimed, review, blocked, done, or cancelled",
-        )),
-    }
+    rex_wave_api::parse_enum("status", s)
 }
 
 fn parse_seat_status(s: &str) -> Result<SeatStatus, ApiError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "active" => Ok(SeatStatus::Active),
-        "dormant" => Ok(SeatStatus::Dormant),
-        "retired" => Ok(SeatStatus::Retired),
-        _ => Err(invalid("status", "expected active, dormant, or retired")),
-    }
+    rex_wave_api::parse_enum("status", s)
 }
 
 fn parse_work_class(s: &str) -> Result<WorkClass, ApiError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "class_a" | "class-a" | "a" => Ok(WorkClass::ClassA),
-        "class_b" | "class-b" | "b" => Ok(WorkClass::ClassB),
-        _ => Err(invalid("work_class", "expected class_a or class_b")),
-    }
+    rex_wave_api::parse_enum("work_class", s)
 }
 
 fn parse_seq_range(s: &str) -> Result<SeqRange, ApiError> {
@@ -956,15 +936,7 @@ fn parse_seq_range(s: &str) -> Result<SeqRange, ApiError> {
 }
 
 fn parse_permission(s: &str) -> Result<PermissionMode, ApiError> {
-    match s {
-        "accept-edits" => Ok(PermissionMode::AcceptEdits),
-        "auto" => Ok(PermissionMode::Auto),
-        "full" => Ok(PermissionMode::Full),
-        _ => Err(invalid(
-            "permission",
-            "expected accept-edits, auto, or full",
-        )),
-    }
+    rex_wave_api::parse_enum("permission", s)
 }
 
 fn parse_workspace(s: &str) -> Result<Workspace, ApiError> {
@@ -993,43 +965,15 @@ fn parse_workspace(s: &str) -> Result<Workspace, ApiError> {
 }
 
 fn parse_steer_mode(s: &str) -> Result<SteerDeliveryMode, ApiError> {
-    match s {
-        "auto" => Ok(SteerDeliveryMode::Auto),
-        "start" => Ok(SteerDeliveryMode::Start),
-        "steer" => Ok(SteerDeliveryMode::Steer),
-        "steer-if-active" => Ok(SteerDeliveryMode::SteerIfActive),
-        "queue-if-active" => Ok(SteerDeliveryMode::QueueIfActive),
-        _ => Err(invalid(
-            "mode",
-            "expected auto, start, steer, steer-if-active, or queue-if-active",
-        )),
-    }
+    rex_wave_api::parse_enum("mode", s)
 }
 
 fn parse_card_priority(s: &str) -> Result<Priority, ApiError> {
-    match s {
-        "low" => Ok(Priority::Low),
-        "normal" => Ok(Priority::Normal),
-        "high" => Ok(Priority::High),
-        "blocking" => Ok(Priority::Blocking),
-        _ => Err(invalid(
-            "priority",
-            "expected low, normal, high, or blocking",
-        )),
-    }
+    rex_wave_api::parse_enum("priority", s)
 }
 
 fn parse_letter_priority(s: &str) -> Result<LetterPriority, ApiError> {
-    match s {
-        "low" => Ok(LetterPriority::Low),
-        "normal" => Ok(LetterPriority::Normal),
-        "high" => Ok(LetterPriority::High),
-        "blocking" => Ok(LetterPriority::Blocking),
-        _ => Err(invalid(
-            "priority",
-            "expected low, normal, high, or blocking",
-        )),
-    }
+    rex_wave_api::parse_enum("priority", s)
 }
 
 fn parse_worker_spec(

@@ -321,8 +321,9 @@ impl From<SeqRange> for (u64, u64) {
     }
 }
 
-/// Who did something. Bound at session open by the transport; never parsed
-/// from command arguments.
+/// Who did something. Bound at session open by the transport. Command
+/// arguments may name only a member (`Seat` or `Worker`, see
+/// `Principal::parse_member_ref`), never an `Operator` or `System`.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -351,6 +352,34 @@ pub enum SystemPart {
     MailBridge,
     WakeBell,
     PresenceMonitor,
+}
+
+impl Principal {
+    /// Parse a member reference, `@`-prefix optional: `<seat>` names a
+    /// `Seat` and `<wave>/<role>` a `Worker`. Never yields `Operator` or
+    /// `System`, which only the transport binds.
+    pub fn parse_member_ref(raw: &str) -> Result<Self, InvalidId> {
+        let trimmed = raw.strip_prefix('@').unwrap_or(raw);
+        match trimmed.split_once('/') {
+            Some((wave, role)) => Ok(Principal::Worker {
+                wave: WaveSlug::parse(wave)?,
+                role: RoleName::parse(role)?,
+            }),
+            None => Ok(Principal::Seat {
+                seat: SeatName::parse(trimmed)?,
+            }),
+        }
+    }
+
+    /// True for the human operator.
+    pub fn is_operator(&self) -> bool {
+        matches!(self, Principal::Operator { .. })
+    }
+
+    /// True for the human operator or the daemon's own parts.
+    pub fn is_operator_or_system(&self) -> bool {
+        matches!(self, Principal::Operator { .. } | Principal::System { .. })
+    }
 }
 
 impl fmt::Display for Principal {

@@ -961,7 +961,7 @@ pub fn format_delivery_status(
         SeatStatus::Active => {
             let since = state.last_live_at(seat);
             let since_str = match since {
-                Some(ts) => crate::unix_secs_to_iso8601_utc(ts.0 / 1_000),
+                Some(ts) => ts.to_rfc3339_sec(),
                 None => "never".to_owned(),
             };
             DeliveryStatus::Offline {
