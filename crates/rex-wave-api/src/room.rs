@@ -65,6 +65,19 @@ impl PrincipalPair {
             None
         }
     }
+    /// The other side of this pair as `viewer` sees it. An operator also sees
+    /// the pairs addressed to its own seat, because `@<seat>` names a
+    /// `Principal::Seat` and never a `Principal::Operator`.
+    pub fn other_for_viewer(&self, viewer: &Principal) -> Option<&Principal> {
+        if let Some(other) = self.other(viewer) {
+            return Some(other);
+        }
+        let Principal::Operator { seat } = viewer else {
+            return None;
+        };
+        let other = self.other(&Principal::Seat { seat: seat.clone() })?;
+        (other != viewer).then_some(other)
+    }
 }
 impl JsonSchema for PrincipalPair {
     fn schema_name() -> Cow<'static, str> {

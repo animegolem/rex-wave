@@ -888,6 +888,74 @@ async fn sidebar_projection_and_reactor_update_live() {
     reactor_handle.abort();
 }
 
+#[tokio::test]
+async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
+    let (router, _, _) = harness(Duration::from_secs(60));
+    let owner_seat = SeatName::parse("owner").unwrap();
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: owner_seat.clone(),
+        },
+    );
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let to_owner = RoomRef::Dm {
+        with: Principal::Seat { seat: owner_seat },
+    };
+
+    let mut sidebar = operator
+        .watch(Interest::Sidebar, Cursor::live())
+        .await
+        .unwrap();
+    let Some(Ok(Frame::Sidebar(initial))) = sidebar.next().await else {
+        panic!("expected initial sidebar")
+    };
+    assert!(initial.direct_messages.is_empty());
+
+    let first = alice
+        .call(post(to_owner.clone(), "one", None))
+        .await
+        .unwrap();
+    alice.call(post(to_owner, "two", None)).await.unwrap();
+
+    let snap = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
+                && snap.direct_messages.first().is_some_and(|d| d.unread == 2)
+            {
+                break *snap;
+            }
+        }
+    })
+    .await
+    .expect("operator sidebar lists the DM addressed to its seat");
+    assert_eq!(snap.direct_messages.len(), 1);
+    assert_eq!(snap.direct_messages[0].with, alice_p);
+    assert_eq!(snap.direct_messages[0].room, first.room);
+
+    operator
+        .call(InboxMarkRead {
+            room: first.room,
+            upto: first.seq,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
+                && snap.direct_messages.first().is_some_and(|d| d.unread == 1)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("marking the first DM read leaves one unread");
+}
+
 struct DynamicNamesFeed {
     names: tokio::sync::watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }

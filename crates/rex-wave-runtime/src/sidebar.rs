@@ -339,7 +339,7 @@ impl World {
 
     fn is_member(&self, room: &RoomId, who: &Principal) -> bool {
         match room {
-            RoomId::Direct { pair } => pair.contains(who),
+            RoomId::Direct { pair } => pair.other_for_viewer(who).is_some(),
             RoomId::Channel { .. } => self
                 .rooms
                 .get(room)
@@ -496,7 +496,7 @@ impl World {
                         });
                 }
                 RoomId::Direct { pair } => {
-                    if let Some(other) = pair.other(viewer) {
+                    if let Some(other) = pair.other_for_viewer(viewer) {
                         direct_messages.push(DmLeaf {
                             room: room.clone(),
                             with: other.clone(),
