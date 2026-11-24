@@ -844,9 +844,9 @@ impl Filter {
                         room: RoomId::Direct { pair },
                     },
                     Event::Room(RoomEvent::Posted { .. }),
-                ) => pair.contains(viewer) && &env.by != viewer,
+                ) => pair.other_for_viewer(viewer).is_some() && !viewer.same_actor(&env.by),
                 (StreamId::Room { room }, Event::Room(RoomEvent::Posted { mentions, .. })) => {
-                    if &env.by == viewer {
+                    if viewer.same_actor(&env.by) {
                         return false;
                     }
                     if mentions.principals.contains(viewer) {

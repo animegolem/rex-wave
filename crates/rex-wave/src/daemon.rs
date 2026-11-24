@@ -33,7 +33,7 @@ use rex_wave_waves::{WaveConductor, Waves};
 use std::collections::HashSet;
 use std::io::{self, Read as _};
 use std::net::SocketAddr;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -258,8 +258,7 @@ pub fn mint_principal_token(
         }
         let state_dir = state_dir_for(sock_path);
         let dir = worker_tokens_dir(&state_dir);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        rex_wave_fs::ensure_private_dir(&dir)?;
         let path = dir.join(tid);
         if let Ok(Some(raw)) = read_private_file(&path, None, "worker token file")
             && let Ok(existing) = serde_json::from_slice::<WorkerTokenFile>(&raw)

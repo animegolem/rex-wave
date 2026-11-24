@@ -1228,8 +1228,21 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             match room {
                 room::RoomId::Direct { pair } => {
                     let (a, b): (Principal, Principal) = pair.clone().into();
-                    for recipient in [a, b] {
-                        if recipient != entry.by && !matches!(recipient, Principal::System { .. }) {
+                    let mut recipients = BTreeSet::new();
+                    for side in [a, b] {
+                        match side {
+                            Principal::Seat { seat } => {
+                                recipients.extend(view.principals_for_seat(&seat));
+                            }
+                            other => {
+                                recipients.insert(other);
+                            }
+                        }
+                    }
+                    for recipient in recipients {
+                        if !recipient.same_actor(&entry.by)
+                            && !matches!(recipient, Principal::System { .. })
+                        {
                             out.push((
                                 recipient,
                                 NotificationDraft {

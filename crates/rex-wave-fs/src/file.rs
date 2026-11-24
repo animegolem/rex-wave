@@ -326,6 +326,40 @@ pub fn dir_metadata_nofollow(path: &Path) -> io::Result<Metadata> {
     Ok(meta)
 }
 
+/// Create `dir` (and missing parents) with mode `0700` when absent, then open
+/// `dir` with `O_DIRECTORY | O_NOFOLLOW` and `fchmod` the opened handle to
+/// `0700` so a symlink at `dir` is refused rather than followed.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    if entry_kind(dir)? == EntryKind::Missing {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let not_dir = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a real directory", dir.display()),
+        )
+    };
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| {
+            if is_symlink_refusal(&e) || e.raw_os_error() == Some(libc::ENOTDIR) {
+                not_dir()
+            } else {
+                e
+            }
+        })?;
+    if !handle.metadata()?.is_dir() {
+        return Err(not_dir());
+    }
+    handle.set_permissions(Permissions::from_mode(0o700))
+}
+
 /// The owner uid of the Unix socket at `path`, refusing anything else
 /// (sockets cannot be opened, so this is the one `lstat`-based judgment).
 pub fn socket_owner_uid(path: &Path) -> io::Result<u32> {
@@ -616,6 +650,21 @@ mod tests {
                 dir_metadata_nofollow(not_dir).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
             );
+            assert_eq!(
+                ensure_private_dir(not_dir).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
+        let victim_dir = dir.path().join("victim-dir");
+        fs::create_dir(&victim_dir).unwrap();
+        fs::set_permissions(&victim_dir, Permissions::from_mode(0o755)).unwrap();
+        let victim_link = dir.path().join("victim-link");
+        symlink(&victim_dir, &victim_link).unwrap();
+        assert!(ensure_private_dir(&victim_link).is_err());
+        assert_eq!(
+            fs::metadata(&victim_dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "ensure_private_dir must never chmod through a symlink"
+        );
     }
 }

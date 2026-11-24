@@ -21,9 +21,10 @@ mod name;
 mod protect;
 
 pub use file::{
-    ConfinedDir, EntryKind, dir_metadata_nofollow, entry_exists, entry_kind, open_append_nofollow,
-    open_regular_nofollow, read_private_regular, read_regular_bounded, read_regular_string,
-    socket_owner_uid, sync_dir, write_atomic_if_absent_path, write_atomic_path,
+    ConfinedDir, EntryKind, dir_metadata_nofollow, ensure_private_dir, entry_exists, entry_kind,
+    open_append_nofollow, open_regular_nofollow, read_private_regular, read_regular_bounded,
+    read_regular_string, socket_owner_uid, sync_dir, write_atomic_if_absent_path,
+    write_atomic_path,
 };
 pub use name::{
     MAX_NAME_BYTES, MAX_REL_SEGMENTS, NameError, RelPath, SafeName, normalize_no_parent,

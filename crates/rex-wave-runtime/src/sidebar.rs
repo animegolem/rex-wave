@@ -355,7 +355,7 @@ impl World {
         let mut unread = 0u32;
         let mut mentions = 0u32;
         for p in &r.posts {
-            if p.seq > upto && &p.by != viewer {
+            if p.seq > upto && !viewer.same_actor(&p.by) {
                 unread += 1;
                 let system_to_operator =
                     matches!(p.by, Principal::System { .. }) && viewer.is_operator();

@@ -8,7 +8,6 @@ use rex_wave_api::{BbThreadId, Principal, RoleName, WaveSlug};
 use rex_wave_waves::HostError;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read as _};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,16 +56,6 @@ fn mint_random_worker_token() -> io::Result<String> {
     Ok(token)
 }
 
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    if !dir.exists() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-}
-
 fn write_worker_token_bytes(
     state_dir: &Path,
     thread_id: &str,
@@ -74,7 +63,7 @@ fn write_worker_token_bytes(
 ) -> io::Result<PathBuf> {
     let target = worker_token_path(state_dir, thread_id)?;
     let dir = worker_tokens_dir(state_dir);
-    ensure_private_dir(&dir)?;
+    rex_wave_fs::ensure_private_dir(&dir)?;
 
     rex_wave_fs::write_atomic_path(&target, bytes, 0o600, false)?;
     Ok(target)
@@ -245,6 +234,7 @@ pub fn provision_worker_token(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn provisions_reads_reuses_and_unlinks_mode_0600_token() {

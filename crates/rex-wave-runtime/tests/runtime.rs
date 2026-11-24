@@ -921,6 +921,16 @@ async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
         .unwrap();
     alice.call(post(to_owner, "two", None)).await.unwrap();
 
+    let catchup = operator
+        .call(Wait {
+            interest: Interest::Mentions,
+            after: Cursor::default(),
+            timeout_ms: Some(1_000),
+        })
+        .await
+        .expect("operator Interest::Mentions wakes on DM addressed to its seat");
+    assert_eq!(catchup.entries.len(), 2);
+
     let snap = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
@@ -936,6 +946,21 @@ async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
     assert_eq!(snap.direct_messages[0].with, alice_p);
     assert_eq!(snap.direct_messages[0].room, first.room);
 
+    let op_reply = operator
+        .call(post(
+            RoomRef::Dm {
+                with: alice_p.clone(),
+            },
+            "ack from operator",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        op_reply.room, first.room,
+        "operator replying to @alice must land in the same DM room, never a second split DM"
+    );
+
     operator
         .call(InboxMarkRead {
             room: first.room,
@@ -946,6 +971,7 @@ async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
+                && snap.direct_messages.len() == 1
                 && snap.direct_messages.first().is_some_and(|d| d.unread == 1)
             {
                 break;
@@ -953,7 +979,7 @@ async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
         }
     })
     .await
-    .expect("marking the first DM read leaves one unread");
+    .expect("marking the first DM read leaves one unread (operator's own reply is not unread)");
 }
 
 struct DynamicNamesFeed {

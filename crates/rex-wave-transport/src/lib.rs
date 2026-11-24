@@ -734,8 +734,7 @@ pub fn write_worker_token_file(
     validate_token_principal(token, principal)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-    std::fs::create_dir_all(dir)?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    rex_wave_fs::ensure_private_dir(dir)?;
 
     let payload = WorkerTokenFile {
         token: token.to_owned(),

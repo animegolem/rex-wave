@@ -65,18 +65,16 @@ impl PrincipalPair {
             None
         }
     }
-    /// The other side of this pair as `viewer` sees it. An operator also sees
-    /// the pairs addressed to its own seat, because `@<seat>` names a
-    /// `Principal::Seat` and never a `Principal::Operator`.
+    /// The other side of this pair as `viewer` sees it. `Operator { seat }` and
+    /// `Seat { seat }` share the same `@<seat>` DM identity.
     pub fn other_for_viewer(&self, viewer: &Principal) -> Option<&Principal> {
-        if let Some(other) = self.other(viewer) {
-            return Some(other);
+        if self.lo.same_actor(viewer) && !self.hi.same_actor(viewer) {
+            Some(&self.hi)
+        } else if self.hi.same_actor(viewer) && !self.lo.same_actor(viewer) {
+            Some(&self.lo)
+        } else {
+            None
         }
-        let Principal::Operator { seat } = viewer else {
-            return None;
-        };
-        let other = self.other(&Principal::Seat { seat: seat.clone() })?;
-        (other != viewer).then_some(other)
     }
 }
 impl JsonSchema for PrincipalPair {
@@ -120,7 +118,7 @@ impl RoomRef {
                 name: name.clone(),
             }),
             RoomRef::Dm { with } => Ok(RoomId::Direct {
-                pair: PrincipalPair::new(me.clone(), with.clone())?,
+                pair: PrincipalPair::new(me.as_dm_member(), with.as_dm_member())?,
             }),
         }
     }

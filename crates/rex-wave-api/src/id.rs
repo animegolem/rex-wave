@@ -380,6 +380,27 @@ impl Principal {
     pub fn is_operator_or_system(&self) -> bool {
         matches!(self, Principal::Operator { .. } | Principal::System { .. })
     }
+
+    /// Canonical DM participant identity: `Operator { seat }` and `Seat { seat }`
+    /// share the same `@<seat>` DM room so both directions resolve identically.
+    pub fn as_dm_member(&self) -> Self {
+        match self {
+            Principal::Operator { seat } => Principal::Seat { seat: seat.clone() },
+            other => other.clone(),
+        }
+    }
+
+    /// True when `self` and `other` represent the same actor (`Operator { s }`
+    /// and `Seat { s }` are two authority levels of the same seat `s`).
+    pub fn same_actor(&self, other: &Self) -> bool {
+        self == other
+            || matches!(
+                (self, other),
+                (Principal::Operator { seat: a }, Principal::Seat { seat: b })
+                    | (Principal::Seat { seat: a }, Principal::Operator { seat: b })
+                    if a == b
+            )
+    }
 }
 
 impl fmt::Display for Principal {
