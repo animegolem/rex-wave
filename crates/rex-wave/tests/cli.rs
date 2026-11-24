@@ -107,6 +107,8 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
         let mut full = vec!["--socket".to_owned(), sock_str.clone(), "--json".to_owned()];
         full.extend(args);
         let out = Command::new(bin_path())
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
             .args(&full)
             .output()
             .expect("run rex-wave");
@@ -121,6 +123,8 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
     let sock_for_tok = sock_path.to_str().unwrap().to_owned();
     let tok_val = tokio::task::spawn_blocking(move || {
         let out = Command::new(bin_path())
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
             .args(["--socket", &sock_for_tok, "token", "--seat", "sam"])
             .output()
             .unwrap();
@@ -152,6 +156,8 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
     let sock_for_wait = sock_path.to_str().unwrap().to_owned();
     let wait_out = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
             .args([
                 "--socket",
                 &sock_for_wait,

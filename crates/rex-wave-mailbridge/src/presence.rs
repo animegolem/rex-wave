@@ -449,7 +449,8 @@ fn register_seed_seat<'a>(
 
 /// Pure read-only helper that derives durable [`PresenceClaim`]s with aliases
 /// and provenance from an interchange directory's `postmaster/state/roster.json`,
-/// `.watchers/mailwatch-routes.json`, `state/bb-knock-routes.tsv`,
+/// `.watchers/mailwatch-routes.json`, `tooling/t3-doorbell/targets.json`,
+/// `state/bb-knock-routes.tsv`,
 /// `state/codex-knock-routes.tsv`, `herdr-registry.tsv` (in `<dir>` or its
 /// parent house root), `state/ledger.md`, and [`CANONICAL_HOUSE_ALIASES`].
 ///
@@ -531,44 +532,52 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 2. Read `.watchers/mailwatch-routes.json` under `<interchange>` or its parent house root.
-    if let Some(routes_path) =
-        resolve_local_or_parent(&canon_dir, ".watchers/mailwatch-routes.json")
-        && let Some(routes_val) = read_regular_json_if_present(&routes_path)?
-    {
+    // 2. Read `.watchers/mailwatch-routes.json` and the T3 doorbell's
+    //    `tooling/t3-doorbell/targets.json` under `<interchange>` or its parent
+    //    house root. Both map `<seat>` -> `{.., "aliases": [..]}`.
+    for rel in [
+        ".watchers/mailwatch-routes.json",
+        "tooling/t3-doorbell/targets.json",
+    ] {
+        let Some(routes_path) = resolve_local_or_parent(&canon_dir, rel) else {
+            continue;
+        };
+        let Some(routes_val) = read_regular_json_if_present(&routes_path)? else {
+            continue;
+        };
         sources_read.push(routes_path);
-        if let Some(map) = routes_val.as_object() {
-            for (raw_key, entry) in map {
-                if !entry.is_object() {
-                    continue;
-                }
-                let Some((canon, set)) = register_seed_seat(
-                    raw_key,
-                    true,
-                    &canonical_fold,
-                    &mut skipped_targets,
-                    &mut machine_checked_seats,
-                    &mut seat_aliases,
-                ) else {
-                    continue;
-                };
-                if let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) {
-                    for item in arr {
-                        let Some(raw_alias) = item.as_str() else {
-                            continue;
-                        };
-                        let cleaned = raw_alias
-                            .trim()
-                            .strip_prefix("to-")
-                            .unwrap_or(raw_alias.trim());
-                        if let Some(alias_slug) = parse_seat_slug(cleaned)
-                            && alias_slug != canon
-                            && !is_operator_surface_seat(alias_slug.as_str())
-                            && !is_non_seat_target(alias_slug.as_str())
-                        {
-                            set.insert(alias_slug);
-                        }
-                    }
+        let Some(map) = routes_val.as_object() else {
+            continue;
+        };
+        for (raw_key, entry) in map {
+            // `_comment`, `_meta`, ... are annotations, never seats.
+            if raw_key.starts_with('_') || !entry.is_object() {
+                continue;
+            }
+            let Some((canon, set)) = register_seed_seat(
+                raw_key,
+                true,
+                &canonical_fold,
+                &mut skipped_targets,
+                &mut machine_checked_seats,
+                &mut seat_aliases,
+            ) else {
+                continue;
+            };
+            let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for raw_alias in arr.iter().filter_map(|v| v.as_str()) {
+                let cleaned = raw_alias
+                    .trim()
+                    .strip_prefix("to-")
+                    .unwrap_or(raw_alias.trim());
+                if let Some(alias_slug) = parse_seat_slug(cleaned)
+                    && alias_slug != canon
+                    && !is_operator_surface_seat(alias_slug.as_str())
+                    && !is_non_seat_target(alias_slug.as_str())
+                {
+                    set.insert(alias_slug);
                 }
             }
         }

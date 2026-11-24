@@ -35,9 +35,9 @@ use rex_wave_board::task_org::{
 };
 use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
-    RingPolicy, check_gate1_fixtures, compare_shadow_with_mailwatch_seen, extract_shadow_aliases,
-    load_claude_session_file, parse_acks_jsonl, parse_claude_session_json,
-    parse_mailwatch_seen_jsonl, run_shadow_pass, score_shadow_jsonl,
+    RingPolicy, ShadowWatchTracker, check_gate1_fixtures, compare_shadow_with_mailwatch_seen,
+    extract_shadow_aliases, load_claude_session_file, parse_acks_jsonl, parse_claude_session_json,
+    parse_mailwatch_seen_sources, run_shadow_pass, score_shadow_jsonl,
     seed_records_from_interchange_with_options,
 };
 use rex_wave_mcp::McpServer;
@@ -591,9 +591,10 @@ pub enum MailCmd {
         /// Optional Gate 1 fixture file (`cases.jsonl`) to check case coverage.
         #[arg(long)]
         fixtures: Option<PathBuf>,
-        /// Optional `mailwatch.py` ring log (`seen.jsonl`) to cross-check shadow rings against.
+        /// Ring watcher log (`seen.jsonl`, mailwatch or t3-doorbell format) to
+        /// cross-check shadow rings against. Repeat to merge several logs.
         #[arg(long = "mailwatch-seen")]
-        mailwatch_seen: Option<PathBuf>,
+        mailwatch_seen: Vec<PathBuf>,
     },
 }
 
@@ -3078,11 +3079,13 @@ fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result
 
 static SHADOW_OUT_NONCE: AtomicU64 = AtomicU64::new(1);
 
-fn write_file_atomic_outside(
+/// Resolves a shadow `--out` file to `(canonical_parent, file_name, final_path)`,
+/// creating the parent and refusing any location inside `interchange_root` or a
+/// symlinked leaf.
+fn resolve_shadow_out_target(
     target: &Path,
     interchange_root: &Path,
-    bytes: &[u8],
-) -> Result<(), CliError> {
+) -> Result<(PathBuf, std::ffi::OsString, PathBuf), CliError> {
     ensure_out_outside_interchange(target, interchange_root)?;
     let abs = if target.is_absolute() {
         target.to_path_buf()
@@ -3136,7 +3139,16 @@ fn write_file_atomic_outside(
             final_target.display()
         )));
     }
+    Ok((canon_parent, file_name, final_target))
+}
 
+fn write_file_atomic_outside(
+    target: &Path,
+    interchange_root: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    let (canon_parent, file_name, final_target) =
+        resolve_shadow_out_target(target, interchange_root)?;
     let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = file_name;
     tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
@@ -3160,6 +3172,79 @@ fn write_file_atomic_outside(
         )));
     }
     Ok(())
+}
+
+/// Appends `bytes` to the `--watch` shadow log at `final_target` (already
+/// resolved by [`resolve_shadow_out_target`]) and syncs. Refuses a symlinked
+/// or non-regular leaf, re-checked on every append: the leaf is checked before
+/// open and the opened handle must be the same inode the path names.
+fn append_shadow_delta(final_target: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt as _;
+    assert!(!bytes.is_empty(), "callers skip empty deltas");
+    if let Ok(meta) = std::fs::symlink_metadata(final_target)
+        && !meta.file_type().is_file()
+    {
+        return Err(CliError::Msg(format!(
+            "refusing to append shadow output to non-regular file {}",
+            final_target.display()
+        )));
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(final_target)
+        .map_err(|e| CliError::Msg(format!("open {}: {e}", final_target.display())))?;
+    let opened = f
+        .metadata()
+        .map_err(|e| CliError::Msg(format!("stat {}: {e}", final_target.display())))?;
+    let named = std::fs::symlink_metadata(final_target)
+        .map_err(|e| CliError::Msg(format!("lstat {}: {e}", final_target.display())))?;
+    if !named.file_type().is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(CliError::Msg(format!(
+            "refusing to append shadow output: {} changed under us (symlink swap?)",
+            final_target.display()
+        )));
+    }
+    f.write_all(bytes)
+        .and_then(|()| f.sync_data())
+        .map_err(|e| CliError::Msg(format!("append {}: {e}", final_target.display())))
+}
+
+/// Opens the `--watch` append log: resolves and validates `out`, then hydrates
+/// a [`ShadowWatchTracker`] from it when it already exists so a restarted
+/// watcher appends only new transitions. Returns `(final_path, tracker,
+/// needs_leading_newline)`; the last flag is set when the existing log does
+/// not end in `\n` (a torn final write that still parsed).
+fn open_shadow_watch_log(
+    out: &Path,
+    interchange_root: &Path,
+) -> Result<(PathBuf, ShadowWatchTracker, bool), CliError> {
+    let (_, _, final_target) = resolve_shadow_out_target(out, interchange_root)?;
+    let existing = match std::fs::symlink_metadata(&final_target) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::read_to_string(&final_target)
+            .map_err(|e| CliError::Msg(format!("read {}: {e}", final_target.display())))?,
+        Ok(_) => {
+            return Err(CliError::Msg(format!(
+                "refusing shadow --watch output {}: not a regular file",
+                final_target.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(CliError::Msg(format!(
+                "stat {}: {e}",
+                final_target.display()
+            )));
+        }
+    };
+    let tracker = ShadowWatchTracker::from_existing_jsonl(&existing).map_err(|e| {
+        CliError::Msg(format!(
+            "cannot resume shadow --watch log {}: {e}; move it aside or repair it",
+            final_target.display()
+        ))
+    })?;
+    let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
+    Ok((final_target, tracker, needs_newline))
 }
 
 async fn load_live_presence_state(
@@ -3233,6 +3318,18 @@ async fn execute_mail_shadow(
     let affinity = IncarnationAffinity::new();
     let retry_state = RetryState::new();
     let sleep_dur = Duration::from_millis(interval_ms.max(100));
+    let to_stdout = out == Path::new("-");
+    // `--watch` appends transitions (a fresh tracker for stdout); `--once`
+    // keeps the atomic snapshot overwrite.
+    let mut watch_log: Option<(Option<PathBuf>, ShadowWatchTracker, bool)> =
+        match (watch, to_stdout) {
+            (false, _) => None,
+            (true, true) => Some((None, ShadowWatchTracker::new(), false)),
+            (true, false) => {
+                let (path, tracker, needs_newline) = open_shadow_watch_log(out, ro.root())?;
+                Some((Some(path), tracker, needs_newline))
+            }
+        };
 
     loop {
         let (presence, live_presence) =
@@ -3249,12 +3346,36 @@ async fn execute_mail_shadow(
             now,
         )
         .map_err(|e| CliError::Msg(format!("shadow pass: {e}")))?;
-        let jsonl = report.to_jsonl_with_aliases(&aliases);
-        if out == Path::new("-") {
-            print!("{jsonl}");
+        let mut appended_decisions: Option<usize> = None;
+        if let Some((path, tracker, needs_newline)) = watch_log.as_mut() {
+            let delta = tracker
+                .observe_pass(&report.decisions, &aliases, now)
+                .map_err(|e| CliError::Msg(format!("shadow watch: {e}")))?;
+            appended_decisions = Some(delta.decision_lines);
+            match path {
+                None => {
+                    print!("{}", delta.jsonl);
+                    let _ = std::io::stdout().flush();
+                }
+                Some(path) if !delta.jsonl.is_empty() => {
+                    let mut bytes = Vec::with_capacity(delta.jsonl.len() + 1);
+                    if *needs_newline {
+                        bytes.push(b'\n');
+                    }
+                    bytes.extend_from_slice(delta.jsonl.as_bytes());
+                    append_shadow_delta(path, &bytes)?;
+                    *needs_newline = false;
+                }
+                Some(_) => {}
+            }
+        } else if to_stdout {
+            print!("{}", report.to_jsonl_with_aliases(&aliases));
             let _ = std::io::stdout().flush();
         } else {
+            let jsonl = report.to_jsonl_with_aliases(&aliases);
             write_file_atomic_outside(out, ro.root(), jsonl.as_bytes())?;
+        }
+        if !to_stdout {
             if as_json {
                 println!(
                     "{}",
@@ -3266,16 +3387,21 @@ async fn execute_mail_shadow(
                         "acks_records": report.acks_report.records.len(),
                         "acks_skipped_lines": report.acks_report.skipped_lines.len(),
                         "decisions": report.decisions.len(),
+                        "appended_decisions": appended_decisions,
                     }))
                     .expect("shadow summary json")
                 );
             } else {
+                let appended = appended_decisions
+                    .map(|n| format!(" appended_decisions={n}"))
+                    .unwrap_or_default();
                 println!(
-                    "mail shadow: scanned={} acks={} skipped_ack_lines={} decisions={} live_presence={} out={}",
+                    "mail shadow: scanned={} acks={} skipped_ack_lines={} decisions={}{} live_presence={} out={}",
                     report.letters_scanned,
                     report.acks_report.records.len(),
                     report.acks_report.skipped_lines.len(),
                     report.decisions.len(),
+                    appended,
                     live_presence,
                     out.display()
                 );
@@ -3295,7 +3421,7 @@ fn execute_mail_score(
     shadow_path: &Path,
     acks_path: &Path,
     fixtures_path: Option<&Path>,
-    mailwatch_seen_path: Option<&Path>,
+    mailwatch_seen_paths: &[PathBuf],
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
     let shadow_text = std::fs::read_to_string(shadow_path)
@@ -3316,18 +3442,25 @@ fn execute_mail_score(
         None => None,
     };
 
-    let mailwatch_seen = match mailwatch_seen_path {
-        Some(path) => {
+    let mailwatch_seen = if mailwatch_seen_paths.is_empty() {
+        None
+    } else {
+        let mut texts = Vec::with_capacity(mailwatch_seen_paths.len());
+        for path in mailwatch_seen_paths {
             let raw = std::fs::read_to_string(path).map_err(|e| {
                 CliError::Msg(format!("read mailwatch seen {}: {e}", path.display()))
             })?;
-            let seen_idx = parse_mailwatch_seen_jsonl(&raw, &aliases).map_err(CliError::Msg)?;
-            Some(
-                compare_shadow_with_mailwatch_seen(&shadow_text, &seen_idx, &aliases)
-                    .map_err(CliError::Msg)?,
-            )
+            texts.push((path.display().to_string(), raw));
         }
-        None => None,
+        let sources: Vec<(&str, &str)> = texts
+            .iter()
+            .map(|(label, raw)| (label.as_str(), raw.as_str()))
+            .collect();
+        let seen_idx = parse_mailwatch_seen_sources(&sources, &aliases).map_err(CliError::Msg)?;
+        Some(
+            compare_shadow_with_mailwatch_seen(&shadow_text, &seen_idx, &aliases)
+                .map_err(CliError::Msg)?,
+        )
     };
 
     if as_json {
@@ -4078,7 +4211,7 @@ async fn main() -> ExitCode {
             &shadow,
             &acks,
             fixtures.as_deref(),
-            mailwatch_seen.as_deref(),
+            &mailwatch_seen,
             cli.json,
         ),
         Cmd::Schema { bb } => {

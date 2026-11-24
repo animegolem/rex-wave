@@ -362,6 +362,8 @@ impl IsolatedDaemon {
     ) -> (PathBuf, SocketAddr, ChildGuard) {
         let sandbox = root.join("mail-sandbox");
         let cfg_dir = root.join("config");
+        let t3_home = root.join("t3-home");
+        std::fs::create_dir_all(&t3_home).unwrap();
         let bell_port = free_port().await;
         let unused_bb_port = free_port().await;
         let sock = root.join("daemon.sock");
@@ -369,6 +371,11 @@ impl IsolatedDaemon {
 
         let mut child = Command::new(bin_path())
             .env("XDG_CONFIG_HOME", &cfg_dir)
+            .env_remove("REX_WAVE_TOKEN")
+            .env_remove("T3CODE_THREAD_ID")
+            .env_remove("REX_WAVE_T3_HOME")
+            .env_remove("REX_WAVE_T3_URL")
+            .env_remove("REX_WAVE_T3_TOKEN")
             .args([
                 "--socket",
                 sock.to_str().unwrap(),
@@ -381,6 +388,8 @@ impl IsolatedDaemon {
                 "both",
                 "--bb-url",
                 &format!("ws://127.0.0.1:{unused_bb_port}/bridge"),
+                "--t3-home",
+                t3_home.to_str().unwrap(),
                 "--t3-url",
                 &format!("http://{t3_addr}"),
                 "--t3-token",
@@ -476,6 +485,8 @@ impl IsolatedDaemon {
         let owned_rem: Vec<String> = remove_envs.iter().map(|s| (*s).to_owned()).collect();
         tokio::task::spawn_blocking(move || {
             let mut cmd = Command::new(bin_path());
+            cmd.env_remove("REX_WAVE_TOKEN")
+                .env_remove("T3CODE_THREAD_ID");
             for k in &owned_rem {
                 cmd.env_remove(k);
             }
@@ -2611,4 +2622,229 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
         ),
         "stdout={stdout}"
     );
+}
+
+/// Spawns `mail shadow --watch --offline` and yields its text pass summaries.
+fn spawn_shadow_watch(
+    interchange: &Path,
+    out: &Path,
+    sock: &Path,
+) -> (ChildGuard, std::sync::mpsc::Receiver<String>) {
+    let mut child = Command::new(bin_path())
+        .env_remove("REX_WAVE_TOKEN")
+        .env_remove("T3CODE_THREAD_ID")
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "mail",
+            "shadow",
+            "--offline",
+            "--interchange",
+            interchange.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--watch",
+            "--interval-ms",
+            "100",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mail shadow --watch");
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in StdBufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    (ChildGuard(child), rx)
+}
+
+fn next_appended(rx: &std::sync::mpsc::Receiver<String>) -> u64 {
+    let line = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("mail shadow --watch pass summary");
+    let tail = line
+        .split("appended_decisions=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("summary lacks appended_decisions: {line}"));
+    tail.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+fn decision_lines(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v.get("decision").is_some())
+        .collect()
+}
+
+#[test]
+fn pr24_cli_shadow_watch_appends_transitions_across_restart_and_scores_two_seen_logs() {
+    let dir = fresh_dir("pr24-watch");
+    let interchange = dir.0.join("interchange");
+    std::fs::create_dir_all(interchange.join("mail")).unwrap();
+    std::fs::create_dir_all(interchange.join("state")).unwrap();
+    std::fs::write(interchange.join("state/acks.jsonl"), "").unwrap();
+    std::fs::write(
+        interchange.join("mail/1795000000001-to-alpha.md"),
+        "---\nfrom: ops\nto: alpha\nid: 1795000000001\nsubject: one\n---\none\n",
+    )
+    .unwrap();
+    let out = dir.0.join("shadow-watch.jsonl");
+    let sock = dir.0.join("unused.sock");
+    let tree_before = snapshot_tree(&interchange);
+
+    // Run 1: the offline letter banks once, then later passes append nothing.
+    {
+        let (_guard, rx) = spawn_shadow_watch(&interchange, &out, &sock);
+        assert_eq!(next_appended(&rx), 1);
+        assert_eq!(next_appended(&rx), 0);
+        assert_eq!(next_appended(&rx), 0);
+    }
+    let after_run1 = decision_lines(&out);
+    assert_eq!(after_run1.len(), 1);
+    assert_eq!(after_run1[0]["decision"], "raise_unrung");
+    assert!(after_run1[0]["observed_at_ms"].as_u64().is_some());
+
+    // Run 2: restart over the same log hydrates it -> no baseline duplicates;
+    // a new letter appends only its own transition.
+    {
+        let (_guard, rx) = spawn_shadow_watch(&interchange, &out, &sock);
+        assert_eq!(next_appended(&rx), 0, "restart must not re-append baseline");
+        assert_eq!(next_appended(&rx), 0);
+        std::fs::write(
+            interchange.join("mail/1795000000002-to-beta.md"),
+            "---\nfrom: ops\nto: beta\nid: 1795000000002\nsubject: two\n---\ntwo\n",
+        )
+        .unwrap();
+        let appended = (0..20)
+            .map(|_| next_appended(&rx))
+            .find(|n| *n > 0)
+            .expect("new letter appended within 20 passes");
+        assert_eq!(appended, 1);
+    }
+    let after_run2 = decision_lines(&out);
+    assert_eq!(after_run2.len(), 2);
+    assert_eq!(
+        after_run2[0], after_run1[0],
+        "existing lines are never rewritten"
+    );
+    assert_eq!(after_run2[1]["seat"], "beta");
+    assert_eq!(after_run2[1]["count"], 1);
+    assert_eq!(snapshot_tree(&interchange).len(), tree_before.len() + 1);
+
+    // A symlinked `--out` is refused before anything is appended.
+    let link = dir.0.join("link.jsonl");
+    std::os::unix::fs::symlink(&out, &link).unwrap();
+    let refused = Command::new(bin_path())
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "mail",
+            "shadow",
+            "--offline",
+            "--interchange",
+            interchange.to_str().unwrap(),
+            "--out",
+            link.to_str().unwrap(),
+            "--watch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("symlink"));
+
+    // `--once` keeps the atomic snapshot overwrite (no watch stamps).
+    let snap = dir.0.join("snapshot.jsonl");
+    let once = Command::new(bin_path())
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "mail",
+            "shadow",
+            "--offline",
+            "--interchange",
+            interchange.to_str().unwrap(),
+            "--out",
+            snap.to_str().unwrap(),
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert!(once.status.success());
+    let snap_lines = decision_lines(&snap);
+    assert_eq!(snap_lines.len(), 2);
+    assert!(snap_lines.iter().all(|v| v.get("observed_at_ms").is_none()));
+
+    // `mail score` merges a mailwatch and a t3-doorbell seen.jsonl in one run.
+    let (sha_a, sha_b) = ("c".repeat(64), "d".repeat(64));
+    let ring = |seat: &str, sha: &str| {
+        format!(
+            "{{\"decision\":\"ring\",\"seat\":\"{seat}\",\"incarnation_id\":\"inc_1\",\"channel\":\"t3_queue_if_active\",\"referent\":{{\"path\":\"mail/x.md\",\"sha16\":\"{}\",\"sha256\":\"{sha}\"}},\"time_basis\":\"letter_id_ms\"}}\n",
+            &sha[..16]
+        )
+    };
+    let shadow = dir.0.join("rings.jsonl");
+    std::fs::write(
+        &shadow,
+        format!(
+            "{}{}{}",
+            ring("alpha", &sha_a),
+            ring("beta", &sha_b),
+            ring("alpha", &sha_a)
+        ),
+    )
+    .unwrap();
+    let acks = dir.0.join("acks.jsonl");
+    std::fs::write(&acks, "").unwrap();
+    let mailwatch_seen = dir.0.join("mailwatch-seen.jsonl");
+    std::fs::write(
+        &mailwatch_seen,
+        format!(
+            "{{\"key\":\"shared-alpha:{}\",\"outcome\":\"rung\"}}\n",
+            &sha_a[..16]
+        ),
+    )
+    .unwrap();
+    let doorbell_seen = dir.0.join("doorbell-seen.jsonl");
+    std::fs::write(
+        &doorbell_seen,
+        format!(
+            "{{\"sha16\":\"{}\",\"seat\":\"beta\",\"outcome\":\"outcome_unknown\"}}\n",
+            &sha_b[..16]
+        ),
+    )
+    .unwrap();
+    let scored = Command::new(bin_path())
+        .args([
+            "--json",
+            "mail",
+            "score",
+            "--shadow",
+            shadow.to_str().unwrap(),
+            "--acks",
+            acks.to_str().unwrap(),
+            "--mailwatch-seen",
+            mailwatch_seen.to_str().unwrap(),
+            "--mailwatch-seen",
+            doorbell_seen.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        scored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scored.stderr)
+    );
+    let v: Value = serde_json::from_slice(&scored.stdout).unwrap();
+    assert_eq!(v["mailwatch_seen"]["seen_entries"], 2);
+    assert_eq!(v["mailwatch_seen"]["shadow_ring_referents"], 2);
+    assert_eq!(v["mailwatch_seen"]["agreed_rung"], 2);
+    assert_eq!(v["shadow_score"]["referents_rung"], 2);
+    assert_eq!(v["shadow_score"]["rings_emitted"], 2);
 }
