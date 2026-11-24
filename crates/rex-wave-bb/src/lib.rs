@@ -986,6 +986,48 @@ enum TurnMirrorCheck {
 }
 
 const MAX_MIRROR_SCAN_PAGES: usize = 16;
+const MAX_TURN_BACKSCAN_PAGES: usize = 512;
+
+fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> Option<u64> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0));
+
+    let end_idx = ordered
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
+    let status = ordered[end_idx]
+        .get("data")
+        .and_then(|d| d.get("status"))
+        .and_then(|v| v.as_str());
+    if matches!(
+        status,
+        Some("failed" | "cancelled" | "canceled" | "interrupted" | "aborted")
+    ) {
+        return None;
+    }
+    let prev_end_idx = ordered[..end_idx]
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
+    if prev_end_idx.is_some() {
+        return None;
+    }
+    let has_start = ordered[..=end_idx].iter().any(|r| {
+        matches!(
+            r.get("type").and_then(|v| v.as_str()),
+            Some("turn/started" | "client/turn/start")
+        )
+    });
+    if has_start {
+        return None;
+    }
+    ordered
+        .first()
+        .and_then(|r| r.get("seq").and_then(|v| v.as_u64()))
+        .filter(|&s| s > 1)
+}
 
 fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck {
     if rows.is_empty() {
@@ -1014,9 +1056,13 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
         .get("seq")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let upto_end = &ordered[..=end_idx];
+    let turn_floor_idx = ordered[..end_idx]
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+        .map_or(0, |idx| idx + 1);
+    let turn_window = &ordered[turn_floor_idx..=end_idx];
 
-    let start_idx = upto_end.iter().rposition(|r| {
+    let start_idx = turn_window.iter().rposition(|r| {
         matches!(
             r.get("type").and_then(|v| v.as_str()),
             Some("turn/started" | "client/turn/start")
@@ -1024,17 +1070,17 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
     });
     let (turn_start_seq, turn_start_at, slice) = match start_idx {
         Some(idx) => {
-            let seq = upto_end[idx]
+            let seq = turn_window[idx]
                 .get("seq")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let at = upto_end[idx]
+            let at = turn_window[idx]
                 .get("createdAt")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            (Some(seq), at, &upto_end[idx..])
+            (Some(seq), at, &turn_window[idx..])
         }
-        None => (None, 0, upto_end),
+        None => (None, 0, turn_window),
     };
 
     for row in slice {
@@ -1323,7 +1369,7 @@ enum OwnerMsg {
         wave: WaveSlug,
         role: RoleName,
         anchor: String,
-        reply: oneshot::Sender<(Seq, bool)>,
+        reply: oneshot::Sender<(Seq, bool, bool)>,
     },
     AdvanceMirrorWatermark {
         wave: WaveSlug,
@@ -1578,14 +1624,15 @@ impl BridgeOwner {
                     anchor,
                     reply,
                 } => {
-                    let state =
-                        self.workers_by_role
-                            .get(&(wave, role))
-                            .map_or((Seq::ORIGIN, false), |w| {
-                                let matched = !anchor.is_empty()
-                                    && w.last_mirrored_anchor.as_deref() == Some(anchor.as_str());
-                                (w.mirror_room_watermark, matched)
-                            });
+                    let ever_connected = self.conn_id > 0;
+                    let state = self.workers_by_role.get(&(wave, role)).map_or(
+                        (Seq::ORIGIN, false, ever_connected),
+                        |w| {
+                            let matched = !anchor.is_empty()
+                                && w.last_mirrored_anchor.as_deref() == Some(anchor.as_str());
+                            (w.mirror_room_watermark, matched, ever_connected)
+                        },
+                    );
                     let _ = reply.send(state);
                 }
                 OwnerMsg::AdvanceMirrorWatermark {
@@ -2823,6 +2870,67 @@ impl BbBridge {
         rows_val.as_array().cloned().unwrap_or_default()
     }
 
+    async fn backfill_latest_turn_rows(
+        &self,
+        thread: &BbThreadId,
+        initial_rows: &[serde_json::Value],
+        ever_connected: bool,
+    ) -> (Vec<serde_json::Value>, bool) {
+        let Some(mut before_seq) = latest_completed_turn_missing_start_boundary(initial_rows)
+        else {
+            return (initial_rows.to_vec(), false);
+        };
+        let mut combined = initial_rows.to_vec();
+        let mut failed_transiently = false;
+        for _ in 0..MAX_TURN_BACKSCAN_PAGES {
+            let rows_val = match self
+                .rpc(protocol::Down::EventsPage {
+                    req_id: 0,
+                    thread_id: thread.to_string(),
+                    after_seq: None,
+                    before_seq: Some(before_seq),
+                    limit: 200,
+                    order: Some(protocol::EventsOrder::Desc),
+                })
+                .await
+            {
+                Ok(val) => val,
+                Err(HostError::Unreachable(_)) => {
+                    failed_transiently = ever_connected;
+                    break;
+                }
+                Err(HostError::Rejected(_)) => break,
+            };
+            let Some(page) = rows_val.as_array() else {
+                break;
+            };
+            if page.is_empty() {
+                break;
+            }
+            let count = page.len();
+            let prev_before = before_seq;
+            let mut found_boundary = false;
+            for row in page {
+                if let Some(s) = row.get("seq").and_then(|v| v.as_u64())
+                    && s < before_seq
+                {
+                    before_seq = s;
+                }
+                if matches!(
+                    row.get("type").and_then(|v| v.as_str()),
+                    Some("turn/started" | "client/turn/start" | "turn/completed")
+                ) {
+                    found_boundary = true;
+                }
+                combined.push(row.clone());
+            }
+            if found_boundary || count < 200 || before_seq == prev_before || before_seq <= 1 {
+                break;
+            }
+        }
+        (combined, failed_transiently)
+    }
+
     async fn mirror_completed_turn_from_rows(
         &self,
         wave: &WaveSlug,
@@ -2836,8 +2944,8 @@ impl BbBridge {
                 TurnMirrorCheck::Ignore | TurnMirrorCheck::PostedViaTool => String::new(),
             }
         }
-        let check = inspect_latest_completed_turn(rows);
-        if matches!(check, TurnMirrorCheck::Ignore) {
+        let initial_check = inspect_latest_completed_turn(rows);
+        if matches!(initial_check, TurnMirrorCheck::Ignore) {
             return;
         }
         let Some(backend) = self.backend.get() else {
@@ -2862,13 +2970,24 @@ impl BbBridge {
         let _ = self.owner.send(OwnerMsg::MirrorState {
             wave: wave.clone(),
             role: role.clone(),
-            anchor: completed_turn_anchor_hint(&check),
+            anchor: completed_turn_anchor_hint(&initial_check),
             reply: wm_tx,
         });
-        let (watermark, already_mirrored) = wm_rx.await.unwrap_or((Seq::ORIGIN, false));
+        let (watermark, already_mirrored, ever_connected) =
+            wm_rx.await.unwrap_or((Seq::ORIGIN, false, false));
         if already_mirrored {
             return;
         }
+
+        let (check, backfill_failed_transiently) =
+            if latest_completed_turn_missing_start_boundary(rows).is_some() {
+                let (full_rows, failed) = self
+                    .backfill_latest_turn_rows(thread, rows, ever_connected)
+                    .await;
+                (inspect_latest_completed_turn(&full_rows), failed)
+            } else {
+                (initial_check, false)
+            };
 
         let stream = StreamId::Room { room: room.clone() };
         let mut cursor = watermark;
@@ -2952,20 +3071,34 @@ impl BbBridge {
                         };
                         if env.by == worker_principal
                             && let Some(existing_idem) = idem.as_ref()
-                            && let Some(exact) = rex_wave_waves::classify_legacy_bb_mirror_idem(
+                        {
+                            if let Some(exact) = rex_wave_waves::classify_legacy_bb_mirror_idem(
                                 existing_idem,
                                 wave,
                                 role,
                                 thread,
                                 completed.turn_start_seq,
                                 completed.turn_end_seq,
-                            )
-                            && (exact
+                            ) && (exact
                                 || (body.as_str() == trimmed
                                     && (legacy_min_at == 0 || env.at.0 >= legacy_min_at)))
-                        {
-                            already_posted = true;
-                            break;
+                            {
+                                already_posted = true;
+                                break;
+                            }
+                            if backfill_failed_transiently
+                                && completed.turn_start_seq.is_none()
+                                && body.as_str() == trimmed
+                                && rex_wave_waves::is_ambiguous_legacy_bb_start_idem(
+                                    existing_idem,
+                                    wave,
+                                    role,
+                                    thread,
+                                    completed.turn_end_seq,
+                                )
+                            {
+                                return;
+                            }
                         }
                     } else if env.by == worker_principal
                         && (completed.turn_start_at == 0 || env.at.0 >= completed.turn_start_at)
@@ -7197,5 +7330,327 @@ mod tests {
             5,
             "full-page-then-partial-page retry must not duplicate, while genuinely new missing-start turn mirrors"
         );
+    }
+
+    #[tokio::test]
+    async fn long_turn_backfills_start_seq_over_ws_for_delayed_legacy_s_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "tok_backfill_s_keys";
+
+        let mut turn2_events = vec![
+            serde_json::json!({ "seq": 10u64, "createdAt": 100u64, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 11u64,
+                "createdAt": 150u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "Identical verdict." } }
+            }),
+            serde_json::json!({ "seq": 15u64, "createdAt": 200u64, "type": "turn/completed", "data": { "status": "completed" } }),
+            serde_json::json!({ "seq": 20u64, "createdAt": 300u64, "type": "turn/started", "data": {} }),
+        ];
+        for s in 21u64..240u64 {
+            turn2_events.push(serde_json::json!({
+                "seq": s,
+                "createdAt": 300u64 + (s - 20),
+                "type": "item/agentMessage/delta",
+                "data": { "delta": "." }
+            }));
+        }
+        turn2_events.push(serde_json::json!({
+            "seq": 240u64,
+            "createdAt": 890u64,
+            "type": "item/completed",
+            "data": { "item": { "type": "agentMessage", "text": "Identical verdict." } }
+        }));
+        turn2_events.push(serde_json::json!({
+            "seq": 241u64,
+            "createdAt": 999u64,
+            "type": "turn/completed",
+            "data": { "status": "completed" }
+        }));
+
+        let mut single_long_turn_events = vec![serde_json::json!({
+            "seq": 300u64,
+            "createdAt": 100u64,
+            "type": "turn/started",
+            "data": {}
+        })];
+        for s in 301u64..524u64 {
+            single_long_turn_events.push(serde_json::json!({
+                "seq": s,
+                "createdAt": 100u64 + (s - 300),
+                "type": "item/agentMessage/delta",
+                "data": { "delta": "." }
+            }));
+        }
+        single_long_turn_events.push(serde_json::json!({
+            "seq": 524u64,
+            "createdAt": 890u64,
+            "type": "item/completed",
+            "data": { "item": { "type": "agentMessage", "text": "Long single turn." } }
+        }));
+        single_long_turn_events.push(serde_json::json!({
+            "seq": 525u64,
+            "createdAt": 999u64,
+            "type": "turn/completed",
+            "data": { "status": "completed" }
+        }));
+
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = ws::WsConn::accept(tcp, token).await.unwrap();
+            let (mut ws_reader, mut ws_writer) = ws.into_split();
+            ws_writer
+                .send_text(
+                    &serde_json::to_string(&protocol::Up::Hello {
+                        plugin_version: "0.1.0".into(),
+                        sdk_version: "0.6.132".into(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            while let Ok(Some(ws::WsInbound::Text(raw))) = ws_reader.recv().await {
+                let down: protocol::Down = serde_json::from_str(&raw).unwrap();
+                if let protocol::Down::EventsPage {
+                    req_id,
+                    thread_id,
+                    before_seq,
+                    limit,
+                    order,
+                    ..
+                } = down
+                {
+                    let source = if thread_id == "th_backfill_delayed" {
+                        &turn2_events
+                    } else {
+                        &single_long_turn_events
+                    };
+                    let mut filtered: Vec<serde_json::Value> = source
+                        .iter()
+                        .filter(|r| {
+                            let seq = r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                            before_seq.is_none_or(|b| seq < b)
+                        })
+                        .cloned()
+                        .collect();
+                    if order == Some(protocol::EventsOrder::Desc) {
+                        filtered.reverse();
+                    }
+                    filtered.truncate(limit as usize);
+                    let reply = protocol::Up::Result {
+                        req_id,
+                        ok: true,
+                        value: serde_json::Value::Array(filtered),
+                    };
+                    let _ = ws_writer
+                        .send_text(&serde_json::to_string(&reply).unwrap())
+                        .await;
+                }
+            }
+        });
+
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: format!("ws://{addr}/bridge"),
+                token: token.into(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bridge_runner = tokio::spawn({
+            let bridge = bridge.clone();
+            let harness = harness.clone();
+            async move { bridge.run_until(harness, shutdown_rx).await }
+        });
+        let (wc_tx, wc_rx) = oneshot::channel();
+        bridge
+            .owner
+            .send(OwnerMsg::WaitConnected { reply: wc_tx })
+            .unwrap();
+        wc_rx.await.unwrap();
+
+        let sys = harness.client(Principal::System {
+            part: SystemPart::WaveConductor,
+        });
+        let owner = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+        let wave = WaveSlug::parse("ws-backfill").unwrap();
+        let proj = BbProjectId::parse("proj_backfill").unwrap();
+        let role_a = RoleName::parse("delayed-turn2").unwrap();
+        let role_b = RoleName::parse("same-turn1").unwrap();
+
+        owner
+            .call(WaveStart {
+                spec: WaveSpec {
+                    slug: wave.clone(),
+                    project: proj.clone(),
+                    goal: Body::parse("test ws start backfill").unwrap(),
+                    output_dir: None,
+                    defaults: AgentSpec {
+                        provider: ProviderId::parse("pi").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::Full,
+                        workspace: Workspace::ProjectDefault,
+                    },
+                    workers: vec![
+                        WorkerSpec {
+                            role: role_a.clone(),
+                            agent: None,
+                            brief: Body::parse("a").unwrap(),
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
+                        },
+                        WorkerSpec {
+                            role: role_b.clone(),
+                            agent: None,
+                            brief: Body::parse("b").unwrap(),
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
+                        },
+                    ],
+                },
+                idem: None,
+            })
+            .await
+            .unwrap();
+
+        let room = rex_wave_waves::wave_room(&wave, &proj);
+        sys.call(RoomEnsure {
+            room: RoomRef::Id { id: room.clone() },
+            topic: None,
+            origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
+        })
+        .await
+        .unwrap();
+
+        let tid_a = BbThreadId::parse("th_backfill_delayed").unwrap();
+        let tid_b = BbThreadId::parse("th_backfill_same").unwrap();
+        for (role, tid) in [(&role_a, &tid_a), (&role_b, &tid_b)] {
+            let obs = Observation::Spawned {
+                attempt: 1,
+                thread: tid.clone(),
+            };
+            sys.call(WaveObserve {
+                wave: wave.clone(),
+                role: role.clone(),
+                observation: obs.clone(),
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role: role.clone(),
+                    observation: obs,
+                },
+            );
+            sys.call(RoomJoin {
+                room: RoomRef::Id { id: room.clone() },
+                member: Some(Principal::Worker {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                }),
+                handle: Handle::parse(role.as_str()).ok(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let worker_a_p = Principal::Worker {
+            wave: wave.clone(),
+            role: role_a.clone(),
+        };
+        let worker_b_p = Principal::Worker {
+            wave: wave.clone(),
+            role: role_b.clone(),
+        };
+
+        harness
+            .client(worker_a_p.clone())
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("Identical verdict.").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: Some(rex_wave_waves::mirror_idem_key(&wave, &role_a, &tid_a, "s10").unwrap()),
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+
+        harness
+            .client(worker_b_p.clone())
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("Long single turn.").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: Some(
+                    rex_wave_waves::mirror_idem_key(&wave, &role_b, &tid_b, "s300").unwrap(),
+                ),
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+
+        let page1_a = bridge.fetch_recent_thread_rows(&tid_a).await;
+        assert_eq!(page1_a.len(), 200);
+        assert!(latest_completed_turn_missing_start_boundary(&page1_a).is_some());
+        bridge
+            .mirror_completed_turn_from_rows(&wave, &role_a, &tid_a, &page1_a)
+            .await;
+
+        let page1_b = bridge.fetch_recent_thread_rows(&tid_b).await;
+        assert_eq!(page1_b.len(), 200);
+        assert!(latest_completed_turn_missing_start_boundary(&page1_b).is_some());
+        bridge
+            .mirror_completed_turn_from_rows(&wave, &role_b, &tid_b, &page1_b)
+            .await;
+
+        let read_page = owner
+            .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+            .await
+            .unwrap();
+        let posts_a: Vec<_> = read_page
+            .entries
+            .iter()
+            .filter(|e| {
+                e.by == worker_a_p && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+            })
+            .collect();
+        let posts_b: Vec<_> = read_page
+            .entries
+            .iter()
+            .filter(|e| {
+                e.by == worker_b_p && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+            })
+            .collect();
+        assert_eq!(
+            posts_a.len(),
+            2,
+            "delayed s10 legacy mirror (journaled at 1000, 1ms after e241 at 999) must not suppress s20..e241 once s20 is backfilled from BB history"
+        );
+        assert_eq!(
+            posts_b.len(),
+            1,
+            "pre-upgrade s300 legacy mirror on 225-event turn must deduplicate once s300 is backfilled from BB history"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = bridge_runner.await;
+        server_task.abort();
     }
 }
