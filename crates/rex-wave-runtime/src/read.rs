@@ -483,14 +483,16 @@ impl ReadSide {
         };
         let initial: BTreeMap<StreamId, Seq> = match &exact_streams {
             Some(streams) => {
-                let mut map = BTreeMap::new();
-                for s in streams {
-                    if can_read(&viewer, s).is_ok() {
-                        let h = self.journal.head(s).map_err(store_error)?;
-                        map.insert(s.clone(), h);
-                    }
-                }
-                map
+                let readable: Vec<StreamId> = streams
+                    .iter()
+                    .filter(|s| can_read(&viewer, s).is_ok())
+                    .cloned()
+                    .collect();
+                self.journal
+                    .heads(&readable)
+                    .map_err(store_error)?
+                    .into_iter()
+                    .collect()
             }
             None => self
                 .journal
@@ -652,25 +654,18 @@ impl ReadSide {
                         Err(RecvError::Lagged(_)) => {
                             let streams: Vec<(StreamId, Seq)> = match &exact_streams {
                                 Some(exact) => {
-                                    let mut v = Vec::with_capacity(exact.len());
-                                    let mut failed = false;
-                                    for s in exact {
-                                        if can_read(&viewer, s).is_err() {
-                                            continue;
-                                        }
-                                        match journal.head(s) {
-                                            Ok(h) => v.push((s.clone(), h)),
-                                            Err(e) => {
-                                                let _ = tx.send(Err(store_error(e))).await;
-                                                failed = true;
-                                                break;
-                                            }
+                                    let readable: Vec<StreamId> = exact
+                                        .iter()
+                                        .filter(|s| can_read(&viewer, s).is_ok())
+                                        .cloned()
+                                        .collect();
+                                    match journal.heads(&readable) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let _ = tx.send(Err(store_error(e))).await;
+                                            break;
                                         }
                                     }
-                                    if failed {
-                                        break;
-                                    }
-                                    v
                                 }
                                 None => match journal.streams() {
                                     Ok(s) => s,

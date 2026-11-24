@@ -4094,4 +4094,84 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         .await
         .expect("RoomFiltered wait must succeed despite corrupt unrelated wave and unknown stream");
     assert_eq!(filtered_page.entries.len(), 2);
+
+    // Concurrent writers advancing `#aaa` strictly before `#zzz` must never yield a live
+    // multi-stream exact-wait cursor where `#zzz` is ahead of `#aaa`.
+    let aaa = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("aaa").unwrap(),
+    };
+    let zzz = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("zzz").unwrap(),
+    };
+    let s_aaa = StreamId::Room { room: aaa.clone() };
+    let s_zzz = StreamId::Room { room: zzz.clone() };
+    let mut w_aaa = disk_journal.claim(s_aaa.clone()).unwrap();
+    let mut w_zzz = disk_journal.claim(s_zzz.clone()).unwrap();
+    w_aaa
+        .append(
+            disk_op.me(),
+            UnixMs(1),
+            None,
+            vec![Event::Room(RoomEvent::Opened {
+                id: aaa,
+                origin: RoomOrigin::Manual,
+                topic: None,
+            })],
+        )
+        .unwrap();
+    w_zzz
+        .append(
+            disk_op.me(),
+            UnixMs(1),
+            None,
+            vec![Event::Room(RoomEvent::Opened {
+                id: zzz,
+                origin: RoomOrigin::Manual,
+                topic: None,
+            })],
+        )
+        .unwrap();
+    let writer_me = disk_op.me().clone();
+    let writer_task = tokio::spawn(async move {
+        for i in 0..80u64 {
+            let ev = vec![Event::Room(RoomEvent::Posted {
+                body: Body::parse(format!("m{i}")).unwrap(),
+                mentions: rex_wave_api::room::Mentions::default(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: None,
+            })];
+            w_aaa
+                .append(&writer_me, UnixMs(10 + i), None, ev.clone())
+                .unwrap();
+            tokio::task::yield_now().await;
+            w_zzz.append(&writer_me, UnixMs(10 + i), None, ev).unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+    for _ in 0..80 {
+        let p = disk_op
+            .call(rex_wave_api::read::Wait {
+                timeout_ms: Some(0),
+                ..rex_wave_api::read::Wait::new(
+                    Interest::Streams {
+                        streams: vec![s_aaa.clone(), s_zzz.clone()],
+                    },
+                    Cursor::live(),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            p.cursor.at(&s_aaa) >= p.cursor.at(&s_zzz),
+            "multi-stream exact wait cursor violated snapshot order: {:?}",
+            p.cursor
+        );
+        tokio::task::yield_now().await;
+    }
+    writer_task.await.unwrap();
 }

@@ -795,6 +795,39 @@ fn proc_fd_dir_usable(dir: &File) -> bool {
     }
 }
 
+fn proc_fd_ancestor_usable(anc: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, fstat, open};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::SocketAddr;
+
+        let Ok(fd) = open(
+            anc,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let Ok(anc_st) = fstat(&fd) else {
+            return false;
+        };
+        let fd_dir = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+        let Ok(fd_meta) = fs::metadata(&fd_dir) else {
+            return false;
+        };
+        if stat_file_id(&anc_st) != (fd_meta.dev(), fd_meta.ino()) {
+            return false;
+        }
+        SocketAddr::from_pathname(fd_dir.join("s")).is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = anc;
+        false
+    }
+}
+
 fn ensure_same_device_as_verified_tmp(
     dir_meta: &fs::Metadata,
     uid: u32,
@@ -1159,12 +1192,9 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
                 }
             }
         }
-        let anc_dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY)
-            .open(anc)?;
-        if !proc_fd_dir_usable(&anc_dir) {
-            ensure_same_device_as_verified_tmp(&anc_dir.metadata()?, uid, path)?;
+        let anc_meta = fs::metadata(anc)?;
+        if !proc_fd_ancestor_usable(anc) {
+            ensure_same_device_as_verified_tmp(&anc_meta, uid, path)?;
         }
     }
     if entry_kind(parent)? == EntryKind::Missing {
@@ -1705,5 +1735,24 @@ mod tests {
             EntryKind::Missing,
             "armed PreparedUnixSocket must unlink bound socket when dropped"
         );
+
+        // Write+search (`0300`, no read bit) ancestor allows creating a `0700` child socket directory.
+        let wx_anc = dir.path().join("wx_only_anc");
+        fs::create_dir(&wx_anc).unwrap();
+        fs::set_permissions(&wx_anc, Permissions::from_mode(0o300)).unwrap();
+        let wx_sock = wx_anc.join("state").join("daemon.sock");
+        let wx_prep = prepare_unix_socket(&wx_sock);
+        let wx_listener = match wx_prep {
+            Ok(ref p) => Some(p.bind(&wx_sock).unwrap()),
+            Err(e) => {
+                fs::set_permissions(&wx_anc, Permissions::from_mode(0o700)).unwrap();
+                panic!("0300 ancestor must allow creating 0700 child socket dir: {e}");
+            }
+        };
+        drop(wx_listener);
+        if let Ok(p) = wx_prep {
+            p.cleanup_bound().unwrap();
+        }
+        fs::set_permissions(&wx_anc, Permissions::from_mode(0o700)).unwrap();
     }
 }

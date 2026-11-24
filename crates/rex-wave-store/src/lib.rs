@@ -280,6 +280,25 @@ impl Journal {
         head_of(&self.inner.conn(), stream)
     }
 
+    /// Current heads of `streams` read from a single consistent SQLite snapshot
+    /// (`Seq::ORIGIN` for any empty stream), without scanning unrelated streams.
+    pub fn heads(&self, streams: &[StreamId]) -> Result<Vec<(StreamId, Seq)>, StoreError> {
+        if streams.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.inner.conn();
+        let tx = conn.transaction()?;
+        let mut out = Vec::with_capacity(streams.len());
+        {
+            let mut stmt = tx.prepare_cached("SELECT max(seq) FROM entries WHERE stream = ?1")?;
+            for s in streams {
+                let max: Option<i64> = stmt.query_row(params![key(s)], |r| r.get(0))?;
+                out.push((s.clone(), Seq(max.unwrap_or(0) as u64)));
+            }
+        }
+        Ok(out)
+    }
+
     /// Non-destructive compatibility lookup for pre-PR-26 `(Operator, peer)`
     /// DM streams:
     /// - Never modifies SQLite rows (preserving append-only immutability,

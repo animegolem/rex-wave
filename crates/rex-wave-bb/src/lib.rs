@@ -1943,6 +1943,24 @@ impl BbBridge {
         Some((entry.epoch, entry.gate.clone()))
     }
 
+    fn reclaim_idle_fallback_wait(
+        &self,
+        key: &(WaveSlug, RoleName),
+        idle_epoch: u64,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let mut map = self
+            .fallback_active_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(key)
+            .is_some_and(|e| e.active == 0 && e.epoch == idle_epoch && Arc::ptr_eq(&e.gate, gate))
+        {
+            map.remove(key);
+        }
+    }
+
     async fn restore_fallback_working_if_idle(&self, key: &(WaveSlug, RoleName)) {
         let Some((epoch, gate)) = self.snapshot_idle_fallback_wait(key, None) else {
             return;
@@ -1951,23 +1969,20 @@ impl BbBridge {
         if self.snapshot_idle_fallback_wait(key, Some(epoch)).is_none() {
             return;
         }
-        let Ok(rec) = self.lookup_worker(&key.0, &key.1).await else {
-            return;
-        };
-        if !matches!(rec.activity, Activity::Parked { .. }) {
-            return;
+        if let Ok(rec) = self.lookup_worker(&key.0, &key.1).await
+            && matches!(rec.activity, Activity::Parked { .. })
+            && self.snapshot_idle_fallback_wait(key, Some(epoch)).is_some()
+        {
+            self.call_wave_observe(
+                key.0.clone(),
+                key.1.clone(),
+                Observation::Activity {
+                    activity: Activity::Working,
+                },
+            )
+            .await;
         }
-        if self.snapshot_idle_fallback_wait(key, Some(epoch)).is_none() {
-            return;
-        }
-        self.call_wave_observe(
-            key.0.clone(),
-            key.1.clone(),
-            Observation::Activity {
-                activity: Activity::Working,
-            },
-        )
-        .await;
+        self.reclaim_idle_fallback_wait(key, epoch, &gate);
     }
 
     fn refresh_local_project_names(&self) {
@@ -6188,6 +6203,10 @@ mod tests {
                 .await
                 .unwrap();
                 race_handle.await.unwrap();
+                assert!(
+                    bridge.fallback_active_waits.lock().unwrap().is_empty(),
+                    "completed fallback waits must reclaim per-worker gate entries"
+                );
             }
             let _ = shutdown_tx.send(true);
             let _ = bridge_runner.await;
