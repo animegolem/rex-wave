@@ -227,6 +227,17 @@ pub fn mint_principal_token(
             "cannot mint bearer token for Operator or System principals",
         ));
     }
+    if let Principal::Seat { seat } = principal {
+        let house = rex_wave_mailbridge::load_house_profile().unwrap_or_default();
+        if house.is_operator_seat(seat.as_str()) || seat.as_str() == "owner" {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "cannot mint a Seat token for operator seat '{seat}'; the operator authenticates via PeerUid or an Operator entry"
+                ),
+            ));
+        }
+    }
 
     let prefix = match principal {
         Principal::Worker { .. } => "rw_w_",

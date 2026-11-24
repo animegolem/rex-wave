@@ -2740,3 +2740,158 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
     assert_eq!(reopened.state, NotifyState::Unread);
     herald_task.abort();
 }
+
+#[tokio::test]
+async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notifications_and_continues_history()
+ {
+    use rex_wave_api::room::{Mentions, PrincipalPair, RoomOrigin};
+
+    let journal = Journal::in_memory().unwrap();
+    let op_p = Principal::Operator {
+        seat: SeatName::parse("zorro").unwrap(),
+    };
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let legacy_room = RoomId::Direct {
+        pair: PrincipalPair::new(op_p.clone(), alice_p.clone()).unwrap(),
+    };
+
+    // Simulate a 3e50dc4 journal where Operator("zorro") DMed Seat("alice")
+    // (where "alice" sorts before "zorro") and Herald already raised the card.
+    {
+        let mut rw = journal
+            .claim(StreamId::Room {
+                room: legacy_room.clone(),
+            })
+            .unwrap();
+        rw.append(
+            &op_p,
+            UnixMs(1_000),
+            Some(&IdemKey::parse("legacy-1").unwrap()),
+            vec![
+                Event::Room(RoomEvent::Opened {
+                    id: legacy_room.clone(),
+                    origin: RoomOrigin::Manual,
+                    topic: None,
+                }),
+                Event::Room(RoomEvent::Posted {
+                    body: Body::parse("old instruction 1").unwrap(),
+                    mentions: Mentions::default(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: None,
+                }),
+            ],
+        )
+        .unwrap();
+    }
+
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let herald_1 = spawn_reactor(
+        Herald::new(),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let zorro_op = LocalClient::new(router.clone(), op_p.clone());
+
+    let page_1 = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = alice
+                .call(InboxList {
+                    include_done: true,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.items.len() == 1 {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    alice
+        .call(InboxAck {
+            ids: vec![page_1.items[0].id],
+            state: NotifyState::Done,
+        })
+        .await
+        .unwrap();
+    let head_before_restart = alice
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .head;
+    herald_1.abort();
+
+    // Restart Herald over the upgraded runtime: zero duplicate notifications!
+    let herald_2 = spawn_reactor(
+        Herald::new(),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let after_restart = alice
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_restart.head, head_before_restart,
+        "Herald replay must raise zero duplicate notifications on pre-PR-26 operator DMs"
+    );
+    assert_eq!(after_restart.unread, 0);
+
+    // Operator posting to @alice continues the existing legacy room at seq 3 without splitting.
+    let continued = zorro_op
+        .call(RoomPost {
+            room: RoomRef::Dm {
+                with: alice_p.clone(),
+            },
+            body: Body::parse("follow-up after upgrade").unwrap(),
+            re: Some(Seq(2)),
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(continued.room, legacy_room);
+    assert_eq!(continued.seq, Seq(3));
+    herald_2.abort();
+}

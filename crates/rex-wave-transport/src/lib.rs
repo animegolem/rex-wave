@@ -1474,28 +1474,10 @@ impl Connection {
 /// Bind `endpoint`, recording the daemon process's own Unix uid from the bound
 /// socket inode so callers do not need `unsafe` `geteuid()`.
 pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match rex_wave_fs::entry_kind(path)? {
-        rex_wave_fs::EntryKind::Missing => {}
-        rex_wave_fs::EntryKind::Other => {
-            rex_wave_fs::socket_owner_uid(path)?;
-            let _ = std::fs::remove_file(path);
-        }
-        rex_wave_fs::EntryKind::Symlink
-        | rex_wave_fs::EntryKind::File
-        | rex_wave_fs::EntryKind::Dir => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("refusing to unlink non-socket entry at {}", path.display()),
-            ));
-        }
-    }
+    let prepared = rex_wave_fs::prepare_unix_socket(path)?;
     let listener = UnixListener::bind(path)?;
-    let uid = rex_wave_fs::socket_owner_uid(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok((listener, uid))
+    prepared.finalize_permissions(path)?;
+    Ok((listener, prepared.uid()))
 }
 
 /// Lifecycle callbacks fired around each authenticated UDS connection.

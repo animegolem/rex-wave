@@ -97,24 +97,62 @@ fn decrement_active_wait(key: &ActiveWaitKey) -> usize {
 }
 
 fn parked_room_and_since(
+    read: &ReadSide,
     worker: &Principal,
     wait: &rex_wave_api::read::Wait,
 ) -> (Option<RoomId>, Seq) {
+    let since_at = |room: &RoomId| -> Seq {
+        wait.after
+            .try_map_streams(|s| read.resolve_stream(s))
+            .unwrap_or_else(|_| wait.after.clone())
+            .at(&StreamId::Room { room: room.clone() })
+    };
     match &wait.interest {
-        Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
-        {
-            Ok(id) => {
-                let since = wait.after.at(&StreamId::Room { room: id.clone() });
-                (Some(id), since)
+        Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
+            match read.resolve_room_ref(room, worker) {
+                Ok(id) => {
+                    let since = since_at(&id);
+                    (Some(id), since)
+                }
+                Err(_) => (None, Seq::ORIGIN),
             }
-            Err(_) => (None, Seq::ORIGIN),
-        },
+        }
         Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
-            StreamId::Room { room } => (Some(room.clone()), wait.after.at(&streams[0])),
+            StreamId::Room { room } => match read.journal.resolve_dm_room(room.clone()) {
+                Ok(id) => {
+                    let since = since_at(&id);
+                    (Some(id), since)
+                }
+                Err(_) => (Some(room.clone()), wait.after.at(&streams[0])),
+            },
             _ => (None, Seq::ORIGIN),
         },
         _ => (None, Seq::ORIGIN),
     }
+}
+
+fn resolve_room_cmd(
+    read: &ReadSide,
+    by: &Principal,
+    mut cmd: RoomCommand,
+) -> Result<RoomCommand, ApiError> {
+    use rex_wave_api::room::RoomRef;
+    let slot = match &mut cmd {
+        RoomCommand::RoomEnsure(c) => &mut c.room,
+        RoomCommand::RoomPost(c) => &mut c.room,
+        RoomCommand::RoomJoin(c) => &mut c.room,
+        RoomCommand::RoomLeave(c) => &mut c.room,
+        RoomCommand::RoomLabel(c) => &mut c.room,
+        RoomCommand::TaskClaim(c) => &mut c.room,
+        RoomCommand::TaskHeartbeat(c) => &mut c.room,
+        RoomCommand::TaskTransition(c) => &mut c.room,
+        RoomCommand::TaskUpdate(c) => &mut c.room,
+        RoomCommand::RoomTasks(c) => &mut c.room,
+    };
+    *slot = RoomRef::Id {
+        id: read.resolve_room_ref(slot, by)?,
+    };
+    Ok(cmd)
 }
 
 fn system_ctx() -> DecideCtx {
@@ -227,11 +265,44 @@ impl Router {
         authorize(cmd.meta().audience, by)?;
         let ctx = DecideCtx::new(by.clone(), now());
         match cmd.route() {
-            Routed::Room(c) => self.room.dispatch(c, ctx).await,
+            Routed::Room(c) => {
+                let resolved = resolve_room_cmd(&self.read, by, c)?;
+                self.room.dispatch(resolved, ctx).await
+            }
             Routed::Wave(c) => self.wave.dispatch(c, ctx).await,
             Routed::Board(c) => self.board.dispatch(c, ctx).await,
-            Routed::Inbox(c) => self.inbox.dispatch(c, ctx).await,
-            Routed::Mail(c) => self.mail.dispatch(c, ctx).await,
+            Routed::Inbox(mut c) => {
+                match &mut c {
+                    InboxCommand::InboxMarkRead(m) => {
+                        m.room = self
+                            .read
+                            .journal
+                            .resolve_dm_room(m.room.clone())
+                            .map_err(crate::store_error)?;
+                    }
+                    InboxCommand::SetArchived(s) => {
+                        if let rex_wave_api::read::ArchiveTarget::Room { room } = &mut s.target {
+                            *room = self
+                                .read
+                                .journal
+                                .resolve_dm_room(room.clone())
+                                .map_err(crate::store_error)?;
+                        }
+                    }
+                    _ => {}
+                }
+                self.inbox.dispatch(c, ctx).await
+            }
+            Routed::Mail(mut c) => {
+                if let MailCommand::MailPromote(p) = &mut c {
+                    p.room = self
+                        .read
+                        .journal
+                        .resolve_dm_room(p.room.clone())
+                        .map_err(crate::store_error)?;
+                }
+                self.mail.dispatch(c, ctx).await
+            }
             Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
             Routed::Read(ReadCommand::Wait(mut wait)) => {
                 let guard = if wait.timeout_ms != Some(0)
@@ -240,7 +311,7 @@ impl Router {
                     if wait.timeout_ms.is_none() {
                         wait.timeout_ms = Some(MAX_UNBOUNDED_WORKER_WAIT_MS);
                     }
-                    let (room, since) = parked_room_and_since(by, &wait);
+                    let (room, since) = parked_room_and_since(&self.read, by, &wait);
                     let guard =
                         WorkerWaitGuard::enter(self.wave.clone(), wave.clone(), role.clone());
                     let _ = self

@@ -607,16 +607,21 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
     out
 }
 
+struct SandboxAckScan {
+    matched: bool,
+    needs_leading_newline: bool,
+}
+
 fn read_bounded_line<R: std::io::BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     max_bytes: usize,
-) -> std::io::Result<bool> {
+) -> std::io::Result<Option<bool>> {
     buf.clear();
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(!buf.is_empty());
+            return Ok((!buf.is_empty()).then_some(false));
         }
         if let Some(nl) = available.iter().position(|&b| b == b'\n') {
             if buf.len().saturating_add(nl) > max_bytes {
@@ -627,7 +632,7 @@ fn read_bounded_line<R: std::io::BufRead>(
             }
             buf.extend_from_slice(&available[..nl]);
             reader.consume(nl + 1);
-            return Ok(true);
+            return Ok(Some(true));
         }
         if buf.len().saturating_add(available.len()) > max_bytes {
             return Err(std::io::Error::new(
@@ -641,17 +646,23 @@ fn read_bounded_line<R: std::io::BufRead>(
     }
 }
 
-fn is_acked_in_sandbox(
+fn scan_sandbox_acks(
     root: &SandboxRoot,
     to_seat: &str,
     rel_path: &str,
     sha256: &Sha256Hex,
-) -> Result<bool, ApiError> {
+    strict_lines: bool,
+) -> Result<SandboxAckScan, ApiError> {
     let rel = RelPath::parse("state/acks.jsonl")
         .map_err(|e| ApiError::Internal(format!("invalid acks relpath: {e}")))?;
     let (file, _) = match root.dir.open_regular(&rel) {
         Ok(pair) => pair,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SandboxAckScan {
+                matched: false,
+                needs_leading_newline: false,
+            });
+        }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
             return Err(ApiError::Denied {
                 principal: "mailbridge".into(),
@@ -663,23 +674,61 @@ fn is_acked_in_sandbox(
     let mut reader = std::io::BufReader::new(file);
     let mut line_buf = Vec::new();
     let aliases = acks::AliasMap::empty();
-    while read_bounded_line(&mut reader, &mut line_buf, MAX_ACK_LINE_BYTES)
+    let mut matched = false;
+    let mut any_bytes = false;
+    let mut last_had_newline = true;
+    while let Some(had_nl) = read_bounded_line(&mut reader, &mut line_buf, MAX_ACK_LINE_BYTES)
         .map_err(|e| ApiError::Internal(format!("read acks.jsonl: {e}")))?
     {
-        let Ok(line) = std::str::from_utf8(&line_buf) else {
-            continue;
+        any_bytes = true;
+        last_had_newline = had_nl;
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(s) => s,
+            Err(_) if !strict_lines => continue,
+            Err(_) => {
+                return Err(ApiError::Internal(
+                    "corrupt non-UTF-8 line in state/acks.jsonl".into(),
+                ));
+            }
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases)
-        {
-            return Ok(true);
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) if !strict_lines => continue,
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "corrupt JSON line in state/acks.jsonl: {e}"
+                )));
+            }
+        };
+        if !val.is_object() {
+            if !strict_lines {
+                continue;
+            }
+            return Err(ApiError::Internal(
+                "corrupt non-object JSON line in state/acks.jsonl".into(),
+            ));
+        }
+        if !matched && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases) {
+            matched = true;
         }
     }
-    Ok(false)
+    Ok(SandboxAckScan {
+        matched,
+        needs_leading_newline: any_bytes && !last_had_newline,
+    })
+}
+
+fn is_acked_in_sandbox(
+    root: &SandboxRoot,
+    to_seat: &str,
+    rel_path: &str,
+    sha256: &Sha256Hex,
+) -> Result<bool, ApiError> {
+    Ok(scan_sandbox_acks(root, to_seat, rel_path, sha256, false)?.matched)
 }
 
 fn ack_row_matches(
@@ -1094,7 +1143,8 @@ impl MailBridge {
         let state_dir = self.root.ensure_dir(&["state"])?;
         let acks_file = state_dir.join("acks.jsonl");
 
-        if !is_acked_in_sandbox(&self.root, &acker_seat, &rel_path, &req.sha256)? {
+        let scan = scan_sandbox_acks(&self.root, &acker_seat, &rel_path, &req.sha256, true)?;
+        if !scan.matched {
             let (mut f, _) = rex_wave_fs::open_append_nofollow(&acks_file, SANDBOX_FILE_MODE)
                 .map_err(|e| {
                     if e.kind() == std::io::ErrorKind::InvalidInput {
@@ -1106,8 +1156,12 @@ impl MailBridge {
                         ApiError::Internal(format!("open acks.jsonl: {e}"))
                     }
                 })?;
-            let mut line =
-                serde_json::to_vec(&ack_json).map_err(|e| ApiError::Internal(e.to_string()))?;
+            let mut line = Vec::new();
+            if scan.needs_leading_newline {
+                line.push(b'\n');
+            }
+            serde_json::to_writer(&mut line, &ack_json)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
             line.push(b'\n');
             f.write_all(&line)
                 .map_err(|e| ApiError::Internal(format!("append acks.jsonl: {e}")))?;

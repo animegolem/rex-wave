@@ -874,13 +874,15 @@ fn mask_err(err: ApiError, resource: &str) -> HttpError {
 }
 
 fn check_room_visible(
+    router: &Router,
     principal: &Principal,
     room_ref: &RoomRef,
     raw_label: &str,
 ) -> Result<RoomId, HttpError> {
-    let room_id = room_ref
-        .resolve(principal)
-        .map_err(|e| HttpError::from_api(e.into()))?;
+    let room_id = router
+        .read
+        .resolve_room_ref(room_ref, principal)
+        .map_err(HttpError::from_api)?;
     can_read_visible(
         principal,
         &StreamId::Room {
@@ -975,7 +977,7 @@ async fn dispatch_json_route(
     router: Arc<Router>,
     principal: Principal,
 ) -> Result<(&'static str, Value), HttpError> {
-    let client = LocalClient::new(router, principal.clone());
+    let client = LocalClient::new(router.clone(), principal.clone());
 
     match route {
         Route::Health => Ok((
@@ -1087,7 +1089,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessagesGet { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let room_id = check_room_visible(&principal, &room_ref, &room)?;
+            let room_id = check_room_visible(&router, &principal, &room_ref, &room)?;
             let after = match req.query_param("after") {
                 Some(raw) => Seq(raw.parse::<u64>().map_err(|_| {
                     HttpError::new("400 Bad Request", "invalid", "invalid after seq")
@@ -1154,7 +1156,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessagesPost { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: PostMessagePayload = parse_json_body(&req.body)?;
             let posted = client
                 .call(RoomPost {
@@ -1172,7 +1174,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessageLabelsPatch { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: PatchLabelsPayload = parse_json_body(&req.body)?;
             let labeled = client
                 .call(RoomLabel {
@@ -1188,7 +1190,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTasksGet { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let status = match req.query_param("status") {
                 Some(raw) => Some(parse_task_status_str(raw).map_err(HttpError::from_api)?),
                 None => None,
@@ -1244,7 +1246,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskClaim { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: ClaimTaskPayload = parse_json_body(&req.body)?;
             let receipt = client
                 .call(TaskClaim {
@@ -1261,7 +1263,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskHeartbeat { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: HeartbeatTaskPayload = parse_json_body(&req.body)?;
             let receipt = client
                 .call(TaskHeartbeat {
@@ -1276,7 +1278,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskTransition { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: TransitionTaskPayload = parse_json_body(&req.body)?;
             let view = client
                 .call(TaskTransition {
@@ -1294,7 +1296,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskUpdate { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: UpdateTaskPayload = parse_json_body(&req.body)?;
             let view = client
                 .call(TaskUpdate {
@@ -1327,7 +1329,11 @@ async fn dispatch_json_route(
                 )
             })?;
             if let WireCommand::Read(ref r) = cmd {
-                can_read_visible(&principal, &r.stream, &tool).map_err(HttpError::from_api)?;
+                let target_stream = router
+                    .read
+                    .resolve_stream(r.stream.clone())
+                    .map_err(HttpError::from_api)?;
+                can_read_visible(&principal, &target_stream, &tool).map_err(HttpError::from_api)?;
             }
             if let WireCommand::PresenceBind(ref b) = cmd
                 && matches!(
@@ -1352,13 +1358,14 @@ async fn dispatch_json_route(
 }
 
 fn parse_sse_interest_and_cursor(
+    router: &Router,
     req: &ParsedRequest,
     principal: &Principal,
 ) -> Result<(Interest, Cursor), HttpError> {
     let mut single_stream: Option<StreamId> = None;
     let interest = if let Some(room_raw) = req.query_param("room") {
         let room_ref = parse_http_room_ref(room_raw).map_err(HttpError::from_api)?;
-        let room_id = check_room_visible(principal, &room_ref, room_raw)?;
+        let room_id = check_room_visible(router, principal, &room_ref, room_raw)?;
         single_stream = Some(StreamId::Room { room: room_id });
         let re = match req.query_param("re") {
             Some(raw) => Some(Seq(raw.parse::<u64>().map_err(|_| {
@@ -1382,6 +1389,10 @@ fn parse_sse_interest_and_cursor(
         }
     } else if let Some(stream_raw) = req.query_param("stream") {
         let stream = parse_sse_stream_param(stream_raw).map_err(HttpError::from_api)?;
+        let stream = router
+            .read
+            .resolve_stream(stream)
+            .map_err(HttpError::from_api)?;
         can_read_visible(principal, &stream, "stream").map_err(HttpError::from_api)?;
         single_stream = Some(stream.clone());
         Interest::Streams {
@@ -1504,7 +1515,7 @@ async fn handle_sse_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     principal: Principal,
     config: HttpConfig,
 ) -> io::Result<()> {
-    let (interest, initial_cursor) = match parse_sse_interest_and_cursor(req, &principal) {
+    let (interest, initial_cursor) = match parse_sse_interest_and_cursor(&router, req, &principal) {
         Ok(pair) => pair,
         Err(err) => return write_error_response(writer, &err).await,
     };

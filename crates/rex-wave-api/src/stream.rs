@@ -156,6 +156,19 @@ impl Cursor {
             .map(|(_, q)| *q)
             .unwrap_or(Seq::ORIGIN)
     }
+    pub fn try_map_streams<F, E>(&self, mut f: F) -> Result<Cursor, E>
+    where
+        F: FnMut(StreamId) -> Result<StreamId, E>,
+    {
+        let mut out = Cursor {
+            positions: Vec::with_capacity(self.positions.len()),
+            from_head: self.from_head,
+        };
+        for (stream, seq) in &self.positions {
+            out.advance(&f(stream.clone())?, *seq);
+        }
+        Ok(out)
+    }
     /// Advance monotonically (never moves backwards; idempotent on replays).
     pub fn advance(&mut self, stream: &StreamId, seq: Seq) {
         match self.positions.iter_mut().find(|(s, _)| s == stream) {

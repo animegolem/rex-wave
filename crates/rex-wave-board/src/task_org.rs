@@ -708,9 +708,32 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), OrgSyncError> {
     })
 }
 
-/// Read an org file (bounded, following user symlinks).
+/// Resolve an operator-supplied `.org` path (following symlinks in filesystem
+/// order) so lock checks, `O_NOFOLLOW` regular-file reads, and atomic temp-sibling
+/// writes all act on the same underlying regular file without breaking symlinks.
+fn resolve_org_target(path: &Path) -> Result<PathBuf, OrgSyncError> {
+    rex_wave_fs::resolve_path_preserving_symlinks(path).map_err(|e| OrgSyncError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
+    })
+}
+
+fn find_active_emacs_lock(given: &Path, resolved: &Path) -> Option<PathBuf> {
+    for candidate in [given, resolved] {
+        if let Some(lock_path) = emacs_lock_path(candidate)
+            && rex_wave_fs::entry_exists(&lock_path)
+        {
+            return Some(lock_path);
+        }
+    }
+    None
+}
+
+/// Read a resolved org file (`O_NOFOLLOW` regular file, bounded).
 pub fn read_org_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    rex_wave_fs::read_input_bounded(path, MAX_ORG_FILE_BYTES)
+    let resolved = rex_wave_fs::resolve_path_preserving_symlinks(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    rex_wave_fs::read_regular_bounded(&resolved, MAX_ORG_FILE_BYTES)
 }
 
 fn write_conflict_sidecar(
@@ -932,16 +955,19 @@ pub async fn sync_org_to_room<C: Client>(
     if is_emacs_lock_or_autosave(path) {
         return Ok(OrgToRoomOutcome::IgnoredEphemeral);
     }
-    if let Some(lock_path) = emacs_lock_path(path)
-        && rex_wave_fs::entry_exists(&lock_path)
-    {
+    let resolved_target = resolve_org_target(path)?;
+    if is_emacs_lock_or_autosave(&resolved_target) {
+        return Ok(OrgToRoomOutcome::IgnoredEphemeral);
+    }
+    if let Some(lock_path) = find_active_emacs_lock(path, &resolved_target) {
         return Ok(OrgToRoomOutcome::DeferredLock { lock_path });
     }
 
-    let initial_bytes = read_org_file(path).map_err(|source| OrgSyncError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let initial_bytes = rex_wave_fs::read_regular_bounded(&resolved_target, MAX_ORG_FILE_BYTES)
+        .map_err(|source| OrgSyncError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let text = String::from_utf8(initial_bytes.clone()).map_err(|source| OrgSyncError::Utf8 {
         path: path.to_path_buf(),
         source,
@@ -1546,12 +1572,12 @@ pub async fn sync_org_to_room<C: Client>(
 
     let wrote_back = if projected != edoc {
         let rendered = render_emacs_document(&projected).into_bytes();
-        let still_clean = !has_emacs_lock(path)
-            && read_org_file(path)
+        let still_clean = find_active_emacs_lock(path, &resolved_target).is_none()
+            && rex_wave_fs::read_regular_bounded(&resolved_target, MAX_ORG_FILE_BYTES)
                 .map(|cur| cur == initial_bytes)
                 .unwrap_or(false);
         if still_clean {
-            write_atomic(path, &rendered)?;
+            write_atomic(&resolved_target, &rendered)?;
             state.last_synced_bytes = Some(rendered);
             state.tasks = baseline_from_tasks(&fresh_tasks);
             state.pending_created.clear();
@@ -1590,37 +1616,41 @@ pub async fn sync_room_to_org<C: Client>(
     if is_emacs_lock_or_autosave(path) {
         return Ok(RoomToOrgOutcome::IgnoredEphemeral);
     }
-    if let Some(lock_path) = emacs_lock_path(path)
-        && rex_wave_fs::entry_exists(&lock_path)
-    {
+    let resolved_target = resolve_org_target(path)?;
+    if is_emacs_lock_or_autosave(&resolved_target) {
+        return Ok(RoomToOrgOutcome::IgnoredEphemeral);
+    }
+    if let Some(lock_path) = find_active_emacs_lock(path, &resolved_target) {
         return Ok(RoomToOrgOutcome::DeferredLock { lock_path });
     }
 
-    let (existing_bytes, existing_doc) = match read_org_file(path) {
-        Ok(bytes) => {
-            if state.last_synced_bytes.as_deref() != Some(bytes.as_slice()) {
-                return Ok(RoomToOrgOutcome::DeferredLocalEdits);
+    let (existing_bytes, existing_doc) =
+        match rex_wave_fs::read_regular_bounded(&resolved_target, MAX_ORG_FILE_BYTES) {
+            Ok(bytes) => {
+                if state.last_synced_bytes.as_deref() != Some(bytes.as_slice()) {
+                    return Ok(RoomToOrgOutcome::DeferredLocalEdits);
+                }
+                let text =
+                    String::from_utf8(bytes.clone()).map_err(|source| OrgSyncError::Utf8 {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                let edoc = parse_emacs_document(&text)?;
+                (Some(bytes), Some(edoc))
             }
-            let text = String::from_utf8(bytes.clone()).map_err(|source| OrgSyncError::Utf8 {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            let edoc = parse_emacs_document(&text)?;
-            (Some(bytes), Some(edoc))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if state.last_synced_bytes.is_some() {
-                return Ok(RoomToOrgOutcome::DeferredLocalEdits);
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if state.last_synced_bytes.is_some() {
+                    return Ok(RoomToOrgOutcome::DeferredLocalEdits);
+                }
+                (None, None)
             }
-            (None, None)
-        }
-        Err(source) => {
-            return Err(OrgSyncError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
+            Err(source) => {
+                return Err(OrgSyncError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
 
     let (resolved_room, room_tasks) = fetch_room_tasks(client, room).await?;
     let label = room_title_label(room, resolved_room.as_ref());
@@ -1632,22 +1662,21 @@ pub async fn sync_room_to_org<C: Client>(
         return Ok(RoomToOrgOutcome::Unchanged);
     }
 
-    if let Some(lock_path) = emacs_lock_path(path)
-        && rex_wave_fs::entry_exists(&lock_path)
-    {
+    if let Some(lock_path) = find_active_emacs_lock(path, &resolved_target) {
         return Ok(RoomToOrgOutcome::DeferredLock { lock_path });
     }
     if let Some(prev_bytes) = &existing_bytes {
-        let current = read_org_file(path).map_err(|source| OrgSyncError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let current = rex_wave_fs::read_regular_bounded(&resolved_target, MAX_ORG_FILE_BYTES)
+            .map_err(|source| OrgSyncError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
         if current != *prev_bytes {
             return Ok(RoomToOrgOutcome::DeferredLocalEdits);
         }
     }
 
-    write_atomic(path, &rendered)?;
+    write_atomic(&resolved_target, &rendered)?;
     state.last_synced_bytes = Some(rendered);
     state.tasks = baseline_from_tasks(&room_tasks);
     state.pending_created.clear();

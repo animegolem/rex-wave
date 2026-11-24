@@ -1009,8 +1009,9 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
         .unwrap();
 
     fs::create_dir_all(sandbox.path().join("state")).unwrap();
-    // Corrupt single line without newline exceeding per-line bound must fail closed, never duplicate-append.
     let acks_path = sandbox.path().join("state/acks.jsonl");
+
+    // 1. Corrupt oversized line without newline fails closed.
     fs::write(&acks_path, vec![b'a'; 2 * 1024 * 1024]).unwrap();
     let ack_err = alice
         .call(MailAck {
@@ -1021,4 +1022,64 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
         .unwrap_err();
     assert!(matches!(ack_err, ApiError::Internal(_)), "got {ack_err:?}");
     assert_eq!(fs::metadata(&acks_path).unwrap().len(), 2 * 1024 * 1024);
+
+    fs::write(&acks_path, b"{\"truncated\":\n").unwrap();
+    let bad_json_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(bad_json_err, ApiError::Internal(_)),
+        "got {bad_json_err:?}"
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), b"{\"truncated\":\n");
+
+    fs::write(&acks_path, b"{\"truncated\":").unwrap();
+    let bad_tail_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(bad_tail_err, ApiError::Internal(_)),
+        "got {bad_tail_err:?}"
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), b"{\"truncated\":");
+
+    // 3. Invalid UTF-8 line fails closed without appending.
+    fs::write(&acks_path, [0xff, 0xfe, b'\n']).unwrap();
+    let bad_utf8_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(bad_utf8_err, ApiError::Internal(_)),
+        "got {bad_utf8_err:?}"
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), [0xff, 0xfe, b'\n']);
+
+    // 4. Valid final JSON row without trailing newline separates cleanly on append.
+    let prior_unterminated = b"{\"schema\":1,\"seat\":\"sam\",\"path\":\"to-sam/other.md\",\"sha256_full\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
+    fs::write(&acks_path, prior_unterminated).unwrap();
+    alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap();
+    let merged_text = fs::read_to_string(&acks_path).unwrap();
+    let parsed_lines: Vec<serde_json::Value> = merged_text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line must remain valid JSON"))
+        .collect();
+    assert_eq!(parsed_lines.len(), 2);
 }

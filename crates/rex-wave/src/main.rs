@@ -3050,13 +3050,28 @@ fn open_shadow_watch_log(
     out: &Path,
     interchange_root: &Path,
 ) -> Result<(ShadowWatchLogFile, ShadowWatchTracker, bool), CliError> {
-    let final_target = resolve_shadow_out_target(out, interchange_root)?;
-    let (file, meta) = rex_wave_fs::open_rw_append_nofollow(&final_target, 0o644).map_err(|e| {
-        CliError::Msg(format!(
-            "refusing shadow --watch output {}: {e}",
-            final_target.display()
-        ))
-    })?;
+    let (final_target, file, meta) =
+        rex_wave_fs::open_outside_rw_append_confined(out, interchange_root, 0o644).map_err(
+            |e| match e {
+                rex_wave_fs::OutsideError::Inside(_, ref root) => CliError::Msg(format!(
+                    "refusing shadow output {} inside read-only interchange {}",
+                    out.display(),
+                    root.display()
+                )),
+                rex_wave_fs::OutsideError::Symlink(_) => CliError::Msg(format!(
+                    "refusing to write shadow output through symlink {}",
+                    out.display()
+                )),
+                rex_wave_fs::OutsideError::ParentDir(_) => CliError::Msg(format!(
+                    "refusing shadow output {} containing '..' parent traversal",
+                    out.display()
+                )),
+                other => CliError::Msg(format!(
+                    "refusing shadow --watch output {}: {other}",
+                    out.display()
+                )),
+            },
+        )?;
     let id = rex_wave_fs::file_id(&meta);
     let reader_copy = file.try_clone().map_err(|e| {
         CliError::Msg(format!(

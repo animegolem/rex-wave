@@ -14,6 +14,36 @@ const ROOM_SCAN_BATCH: u32 = 500;
 pub(crate) enum ResourceTarget {
     Sidebar,
     Room(RoomRef),
+    LegacyOperatorDm(Principal),
+}
+
+impl ResourceTarget {
+    fn into_room_ref(self, viewer: &Principal) -> Result<RoomRef, InvalidId> {
+        match self {
+            ResourceTarget::Sidebar => Err(InvalidId {
+                what: "room".into(),
+                reason: "sidebar is not a room".into(),
+            }),
+            ResourceTarget::Room(r) => Ok(r),
+            ResourceTarget::LegacyOperatorDm(other) => {
+                let me_op = match viewer {
+                    Principal::Operator { seat } | Principal::Seat { seat } => {
+                        Principal::Operator { seat: seat.clone() }
+                    }
+                    other_me => other_me.clone(),
+                };
+                let pair = match &other {
+                    Principal::Operator { .. } => {
+                        rex_wave_api::room::PrincipalPair::new(viewer.clone(), other)?
+                    }
+                    _ => rex_wave_api::room::PrincipalPair::new(me_op, other)?,
+                };
+                Ok(RoomRef::Id {
+                    id: RoomId::Direct { pair },
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,10 +100,19 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
             one_name(seat).map(|()| format!("@{seat}"))?
         }
         [kind, sub, seat] if kind == "dm" && sub == "operator" => {
-            return Ok(ResourceTarget::Room(RoomRef::Dm {
-                with: Principal::Seat {
-                    seat: SeatName::parse(seat).map_err(api)?,
-                },
+            return Ok(ResourceTarget::LegacyOperatorDm(Principal::Operator {
+                seat: SeatName::parse(seat).map_err(api)?,
+            }));
+        }
+        [kind, sub, seat] if kind == "dm" && sub == "legacy-seat" => {
+            return Ok(ResourceTarget::LegacyOperatorDm(Principal::Seat {
+                seat: SeatName::parse(seat).map_err(api)?,
+            }));
+        }
+        [kind, sub, wave, role] if kind == "dm" && sub == "legacy-worker" => {
+            return Ok(ResourceTarget::LegacyOperatorDm(Principal::Worker {
+                wave: WaveSlug::parse(wave).map_err(api)?,
+                role: RoleName::parse(role).map_err(api)?,
             }));
         }
         [kind, sub, wave, role] if kind == "dm" && sub == "worker" => {
@@ -117,9 +156,17 @@ pub(crate) fn room_uri(room: &RoomId, viewer: &Principal) -> Option<(String, Str
         }
         RoomId::Direct { pair } => {
             let other = pair.other_for_viewer(viewer)?;
+            let (a, b): (Principal, Principal) = pair.clone().into();
+            let has_legacy_op = a.is_operator() || b.is_operator();
             let uri = match other {
+                Principal::Seat { seat } if has_legacy_op => {
+                    format!("rex://room/dm/legacy-seat/{seat}")
+                }
                 Principal::Seat { seat } => format!("rex://room/dm/seat/{seat}"),
-                Principal::Operator { seat } => format!("rex://room/dm/seat/{seat}"),
+                Principal::Operator { seat } => format!("rex://room/dm/operator/{seat}"),
+                Principal::Worker { wave, role } if has_legacy_op => {
+                    format!("rex://room/dm/legacy-worker/{wave}/{role}")
+                }
                 Principal::Worker { wave, role } => format!("rex://room/dm/worker/{wave}/{role}"),
                 Principal::System { .. } => return None,
             };
@@ -203,7 +250,10 @@ pub(crate) async fn read_resource<C: Client>(
             let snap = client.call(read::Sidebar {}).await?;
             serde_json::to_string(&snap).map_err(|e| ApiError::Internal(e.to_string()))?
         }
-        ResourceTarget::Room(room_ref) => {
+        other_target => {
+            let room_ref = other_target
+                .into_room_ref(client.me())
+                .map_err(ApiError::from)?;
             let room = room_ref.resolve(client.me()).map_err(ApiError::from)?;
             let page = read_room_tail(client, StreamId::Room { room }).await?;
             serde_json::to_string(&page).map_err(|e| ApiError::Internal(e.to_string()))?
@@ -261,7 +311,10 @@ pub(crate) async fn subscribe_resource<C: Client>(
             });
             Ok(handle.abort_handle())
         }
-        ResourceTarget::Room(room_ref) => {
+        other_target => {
+            let room_ref = other_target
+                .into_room_ref(client.me())
+                .map_err(ApiError::from)?;
             room_ref.resolve(client.me()).map_err(ApiError::from)?;
             let mut stream = client
                 .watch(Interest::Room { room: room_ref }, Cursor::live())

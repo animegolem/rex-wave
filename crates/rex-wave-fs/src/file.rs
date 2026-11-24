@@ -468,6 +468,174 @@ pub fn socket_owner_uid(path: &Path) -> io::Result<u32> {
     Ok(meta.uid())
 }
 
+/// Derive the current process's effective Unix uid from an anonymous kernel
+/// temporary file descriptor (`fstat`), independent of any replaceable path.
+pub fn current_process_uid() -> io::Result<u32> {
+    Ok(tempfile::tempfile()?.metadata()?.uid())
+}
+
+/// Descriptor-pinned parent directory for safe Unix-domain socket setup.
+pub struct PreparedUnixSocket {
+    parent_dir: File,
+    file_name: std::ffi::OsString,
+    uid: u32,
+}
+
+impl PreparedUnixSocket {
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// Verify via `statat(AT_SYMLINK_NOFOLLOW)` on the held parent directory
+    /// that the bound entry is a socket owned by `self.uid` and tighten its
+    /// mode to `0600` without following symlinks.
+    pub fn finalize_permissions(&self, display_path: &Path) -> io::Result<()> {
+        use rustix::fs::{AtFlags, FileType, Mode, chmodat, statat};
+        let st = statat(&self.parent_dir, &self.file_name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)?;
+        if FileType::from_raw_mode(st.st_mode) != FileType::Socket {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a socket", display_path.display()),
+            ));
+        }
+        if st.st_uid != self.uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is owned by another uid", display_path.display()),
+            ));
+        }
+        match chmodat(
+            &self.parent_dir,
+            &self.file_name,
+            Mode::from_raw_mode(0o600),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if e == rustix::io::Errno::OPNOTSUPP
+                    || e == rustix::io::Errno::NOSYS
+                    || e == rustix::io::Errno::INVAL =>
+            {
+                // Parent directory is already verified owner-only and non-group/world-writable.
+                chmodat(
+                    &self.parent_dir,
+                    &self.file_name,
+                    Mode::from_raw_mode(0o600),
+                    AtFlags::empty(),
+                )
+                .map_err(io::Error::from)
+            }
+            Err(e) => Err(io::Error::from(e)),
+        }
+    }
+}
+
+/// Prepare `path` for `UnixListener::bind`:
+/// 1. Derives the process UID independently of `path`.
+/// 2. Creates missing parent directories with mode `0700`, opens the parent
+///    directory with `O_DIRECTORY | O_NOFOLLOW`, and requires it to be owned
+///    by this UID and not writable by group or others (`mode & 0o022 == 0`).
+/// 3. Uses `statat(AT_SYMLINK_NOFOLLOW)` + `unlinkat` on the held parent
+///    descriptor to remove a stale socket owned by this UID while refusing
+///    symlinks, regular files, directories, or foreign sockets.
+pub fn prepare_unix_socket(path: &Path) -> io::Result<PreparedUnixSocket> {
+    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let uid = current_process_uid()?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} has no socket file name", path.display()),
+            )
+        })?
+        .to_os_string();
+    let parent = parent_of(path)?;
+    if entry_kind(parent)? == EntryKind::Missing {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let parent_dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | libc::O_DIRECTORY)
+        .open(parent)
+        .map_err(|e| {
+            if is_symlink_refusal(&e) || e.raw_os_error() == Some(libc::ENOTDIR) {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "socket parent {} must be a real directory",
+                        parent.display()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
+    let parent_meta = parent_dir.metadata()?;
+    if !parent_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket parent {} is not a directory", parent.display()),
+        ));
+    }
+    if parent_meta.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket parent {} is owned by uid {}, expected {}",
+                parent.display(),
+                parent_meta.uid(),
+                uid
+            ),
+        ));
+    }
+    if parent_meta.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket parent {} must not be group- or world-writable (mode {:o})",
+                parent.display(),
+                parent_meta.permissions().mode() & 0o7777
+            ),
+        ));
+    }
+
+    match statat(&parent_dir, &file_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            if FileType::from_raw_mode(st.st_mode) != FileType::Socket {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to unlink non-socket entry at {}", path.display()),
+                ));
+            }
+            if st.st_uid != uid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to unlink socket {} owned by another uid",
+                        path.display()
+                    ),
+                ));
+            }
+            unlinkat(&parent_dir, &file_name, AtFlags::empty()).map_err(io::Error::from)?;
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+
+    Ok(PreparedUnixSocket {
+        parent_dir,
+        file_name,
+        uid,
+    })
+}
+
 /// The real, symlink-free absolute location of an existing `path`.
 pub(crate) fn real_path(path: &Path) -> io::Result<PathBuf> {
     fs::canonicalize(path)

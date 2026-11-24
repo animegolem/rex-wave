@@ -27,10 +27,11 @@ mod name;
 mod protect;
 
 pub use file::{
-    ConfinedDir, EntryKind, FileId, dir_metadata_nofollow, ensure_private_dir, entry_exists,
-    entry_kind, file_id, open_append_nofollow, open_lock_nofollow, open_regular_nofollow,
-    open_rw_append_nofollow, read_input_bounded, read_input_string, read_open_bounded,
-    read_private_regular, read_regular_bounded, read_regular_string, socket_owner_uid, sync_dir,
+    ConfinedDir, EntryKind, FileId, PreparedUnixSocket, current_process_uid, dir_metadata_nofollow,
+    ensure_private_dir, entry_exists, entry_kind, file_id, open_append_nofollow,
+    open_lock_nofollow, open_regular_nofollow, open_rw_append_nofollow, prepare_unix_socket,
+    read_input_bounded, read_input_string, read_open_bounded, read_private_regular,
+    read_regular_bounded, read_regular_string, socket_owner_uid, sync_dir,
     verify_same_regular_nofollow, write_atomic_if_absent_path, write_atomic_path,
 };
 pub use name::{
@@ -38,7 +39,8 @@ pub use name::{
 };
 pub use protect::{
     MAX_PROTECTED_ROOTS, MAX_PROTECTED_ROOTS_FILE_BYTES, OutsideError, OutsidePath,
-    ProtectedRootsGuard, Protection, SandboxError, canonicalize_existing_prefix, lexical_normalize,
-    load_protected_roots, load_protected_roots_from, parse_protected_roots, protected_roots_file,
-    resolve_links,
+    ProtectedRootsGuard, Protection, SandboxError, canonicalize_existing_prefix,
+    is_case_insensitive_dir, lexical_normalize, load_protected_roots, load_protected_roots_from,
+    open_outside_rw_append_confined, parse_protected_roots, protected_roots_file, resolve_links,
+    resolve_path_preserving_symlinks,
 };

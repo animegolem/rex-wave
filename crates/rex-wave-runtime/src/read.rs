@@ -85,7 +85,7 @@ pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
         StreamId::Inbox { owner } => owner == viewer,
         StreamId::Room {
             room: RoomId::Direct { pair },
-        } => pair.contains(viewer),
+        } => pair.other_for_viewer(viewer).is_some(),
         StreamId::Room { .. }
         | StreamId::Wave { .. }
         | StreamId::Board { .. }
@@ -142,6 +142,28 @@ pub struct ReadSide {
 }
 
 impl ReadSide {
+    /// Resolve `room` for `viewer`, routing `@<peer>` (`RoomRef::Dm`) to an
+    /// existing pre-PR-26 `(Operator, peer)` DM stream when the canonical
+    /// `(Seat, peer)` stream does not exist yet, while keeping explicit
+    /// `RoomRef::Id` targets untouched.
+    pub fn resolve_room_ref(
+        &self,
+        room: &rex_wave_api::room::RoomRef,
+        viewer: &Principal,
+    ) -> Result<RoomId, ApiError> {
+        let resolved = room.resolve(viewer)?;
+        self.journal.resolve_dm_room(resolved).map_err(store_error)
+    }
+
+    pub fn resolve_stream(&self, stream: StreamId) -> Result<StreamId, ApiError> {
+        match stream {
+            StreamId::Room { room } => Ok(StreamId::Room {
+                room: self.journal.resolve_dm_room(room).map_err(store_error)?,
+            }),
+            other => Ok(other),
+        }
+    }
+
     /// Tap first, replay second, dedupe by `(stream, seq)`.
     pub fn watch(
         &self,
@@ -304,7 +326,8 @@ impl ReadSide {
         interest: Interest,
         from: Cursor,
     ) -> Result<FrameStream, ApiError> {
-        let mut filter = Filter::build(&viewer, interest, self.sidebar.clone())?;
+        let from = from.try_map_streams(|s| self.resolve_stream(s))?;
+        let mut filter = Filter::build(&viewer, interest, &self.journal, self.sidebar.clone())?;
         let mut tap = self.hub.tap();
         let initial: BTreeMap<StreamId, Seq> = self
             .journal
@@ -560,25 +583,38 @@ impl Filter {
     fn build(
         viewer: &Principal,
         interest: Interest,
+        journal: &Journal,
         sidebar: Arc<SidebarProjection>,
     ) -> Result<Self, ApiError> {
+        let resolve_ref = |room: &rex_wave_api::room::RoomRef| -> Result<RoomId, ApiError> {
+            let resolved = room.resolve(viewer)?;
+            journal.resolve_dm_room(resolved).map_err(store_error)
+        };
         match interest {
             Interest::Streams { streams } => {
-                for s in &streams {
-                    can_read(viewer, s)?;
+                let mut resolved_streams = BTreeSet::new();
+                for s in streams {
+                    let s = match s {
+                        StreamId::Room { room } => StreamId::Room {
+                            room: journal.resolve_dm_room(room).map_err(store_error)?,
+                        },
+                        other => other,
+                    };
+                    can_read(viewer, &s)?;
+                    resolved_streams.insert(s);
                 }
-                Ok(Filter::Exact(streams.into_iter().collect()))
+                Ok(Filter::Exact(resolved_streams))
             }
             Interest::Room { room } => {
                 let s = StreamId::Room {
-                    room: room.resolve(viewer)?,
+                    room: resolve_ref(&room)?,
                 };
                 can_read(viewer, &s)?;
                 Ok(Filter::Exact(BTreeSet::from([s])))
             }
             Interest::RoomFiltered { room, re, labels } => {
                 let s = StreamId::Room {
-                    room: room.resolve(viewer)?,
+                    room: resolve_ref(&room)?,
                 };
                 can_read(viewer, &s)?;
                 Ok(Filter::RoomFiltered {
@@ -871,18 +907,24 @@ impl Service<ReadCommand> for ReadSide {
         Box::pin(async move {
             match cmd {
                 ReadCommand::Read(r) => {
-                    can_read(ctx.by(), &r.stream)?;
+                    let target_stream = match r.stream {
+                        StreamId::Room { room } => StreamId::Room {
+                            room: self.journal.resolve_dm_room(room).map_err(store_error)?,
+                        },
+                        other => other,
+                    };
+                    can_read(ctx.by(), &target_stream)?;
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
                     let entries = self
                         .journal
-                        .read(&r.stream, r.after, limit)
+                        .read(&target_stream, r.after, limit)
                         .map_err(store_error)?;
-                    let head = self.journal.head(&r.stream).map_err(store_error)?;
+                    let head = self.journal.head(&target_stream).map_err(store_error)?;
                     let total_count =
                         (head.0.saturating_sub(r.after.0) as usize).max(entries.len());
                     let truncated = entries.len() < total_count;
                     let last = entries.last().map_or(r.after, |e| e.seq);
-                    let cursor = Cursor::default().with(r.stream, last);
+                    let cursor = Cursor::default().with(target_stream, last);
                     Ok(WireReply::Read(Page {
                         entries,
                         cursor,

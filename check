@@ -287,7 +287,9 @@ http_guard_fn_re = re.compile(r"\bfn\s+(is_loopback_host|strip_bearer)\b")
 select_open_re = re.compile(r"\bselect!\s*\{")
 select_read_re = re.compile(r"\b(read_frame|read_message|read_exact)\s*\(")
 for_test_re = re.compile(r"\bDecideCtx::for_test\s*\(")
-cfg_test_mod_re = re.compile(r"#\s*\[\s*cfg\s*\([^]]*\btest\b[^]]*\)\s*\]")
+cfg_attr_open_re = re.compile(r"#\s*\[\s*cfg\s*\(")
+not_test_re = re.compile(r"\bnot\s*\(\s*test\s*\)")
+has_test_re = re.compile(r"\btest\b")
 MAX_MACRO_SCAN = 1 << 20
 
 def scrub_rust_noncode(text):
@@ -404,6 +406,7 @@ def select_branch_future_spans(text, body_start, body_end):
     depth_paren = 0
     depth_bracket = 0
     in_handler = False
+    handler_is_block = False
     while i < body_end:
         c = text[i]
         if c == "{":
@@ -411,8 +414,15 @@ def select_branch_future_spans(text, body_start, body_end):
         elif c == "}":
             if depth_brace > 0:
                 depth_brace -= 1
-                if in_handler and depth_brace == 0 and depth_paren == 0 and depth_bracket == 0:
+                if (
+                    in_handler
+                    and handler_is_block
+                    and depth_brace == 0
+                    and depth_paren == 0
+                    and depth_bracket == 0
+                ):
                     in_handler = False
+                    handler_is_block = False
                     j = i + 1
                     while j < body_end and text[j] in (" ", "\t", "\r", "\n", ","):
                         j += 1
@@ -431,9 +441,13 @@ def select_branch_future_spans(text, body_start, body_end):
             if not in_handler and c == "=" and i + 1 < body_end and text[i + 1] == ">":
                 spans.append((arm_start, i))
                 in_handler = True
-                i += 2
+                j = i + 2
+                while j < body_end and text[j] in (" ", "\t", "\r", "\n"):
+                    j += 1
+                handler_is_block = j < body_end and text[j] == "{"
+                i = j
                 continue
-            if in_handler and c == ",":
+            if in_handler and not handler_is_block and c == ",":
                 in_handler = False
                 arm_start = i + 1
         i += 1
@@ -441,9 +455,19 @@ def select_branch_future_spans(text, body_start, body_end):
 
 def cfg_test_ranges(text):
     ranges = []
-    for m in cfg_test_mod_re.finditer(text):
-        brace = text.find("{", m.end())
-        if brace != -1:
+    for m in cfg_attr_open_re.finditer(text):
+        cfg_end = balanced_end(text, m.end(), "(", ")")
+        inner = text[m.end():cfg_end]
+        if not has_test_re.search(inner) or not_test_re.search(inner):
+            continue
+        close_bracket = text.find("]", cfg_end)
+        if close_bracket == -1:
+            continue
+        semi = text.find(";", close_bracket + 1)
+        brace = text.find("{", close_bracket + 1)
+        if semi != -1 and (brace == -1 or semi < brace):
+            ranges.append((m.start(), semi + 1))
+        elif brace != -1:
             end = balanced_end(text, brace + 1, "{", "}")
             ranges.append((m.start(), end))
     return ranges

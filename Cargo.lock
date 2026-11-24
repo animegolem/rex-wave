@@ -1393,6 +1393,7 @@ name = "rex-wave-fs"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
  "tempfile",
  "thiserror 2.0.21",
 ]

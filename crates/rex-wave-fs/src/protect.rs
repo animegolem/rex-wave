@@ -443,26 +443,36 @@ pub enum OutsideError {
     Io(String),
 }
 
-/// Canonicalize the deepest existing prefix of `path` (resolving both
-/// symlinks and filesystem case on case-insensitive volumes such as macOS
-/// APFS), then re-attach any not-yet-existing trailing components.
+/// Make `path` absolute against `current_dir` WITHOUT collapsing `..` first,
+/// then resolve symlinks and `..` left-to-right in filesystem order.
+pub fn resolve_path_preserving_symlinks(path: &Path) -> Result<PathBuf, SandboxError> {
+    let abs_raw = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| SandboxError::Io(e.to_string()))?
+            .join(path)
+    };
+    resolve_links(&abs_raw)
+}
+
+/// Resolve `path` in filesystem order (so `./link/../repo` follows `link`
+/// before applying `..`), then `canonicalize` its deepest existing prefix to
+/// normalize filesystem case on case-insensitive volumes such as macOS APFS.
 pub fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, SandboxError> {
-    let lex = lexical_normalize(path)?;
-    let resolved = resolve_links(&lex)?;
-    for base in [&resolved, &lex] {
-        let mut anc = base.as_path();
-        loop {
-            if let Ok(canon_anc) = real_path(anc) {
-                return Ok(match base.strip_prefix(anc) {
-                    Ok(suffix) if !suffix.as_os_str().is_empty() => canon_anc.join(suffix),
-                    _ => canon_anc,
-                });
-            }
-            let Some(parent) = anc.parent() else {
-                break;
-            };
-            anc = parent;
+    let resolved = resolve_path_preserving_symlinks(path)?;
+    let mut anc = resolved.as_path();
+    loop {
+        if let Ok(canon_anc) = real_path(anc) {
+            return Ok(match resolved.strip_prefix(anc) {
+                Ok(suffix) if !suffix.as_os_str().is_empty() => canon_anc.join(suffix),
+                _ => canon_anc,
+            });
         }
+        let Some(parent) = anc.parent() else {
+            break;
+        };
+        anc = parent;
     }
     Ok(resolved)
 }
@@ -488,6 +498,10 @@ fn flip_ascii_case_first(s: &str) -> Option<String> {
 /// Probe whether `existing_dir` resides on a case-insensitive filesystem by
 /// toggling the ASCII case of one existing path component and checking whether
 /// it resolves to the same `(dev, ino)` inode.
+pub fn is_case_insensitive_dir(existing_dir: &Path) -> bool {
+    is_case_insensitive_volume(existing_dir)
+}
+
 fn is_case_insensitive_volume(existing_dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let Ok(orig) = std::fs::metadata(existing_dir) else {
@@ -586,6 +600,208 @@ impl OutsidePath {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Descriptor-relative startup open for `mail shadow --watch --out`:
+/// 1. Validates `out` against `protected_root` via [`OutsidePath::verify`].
+/// 2. Walks from `/` component-by-component with `openat(O_DIRECTORY | O_NOFOLLOW)`
+///    (following ancestor directory symlinks via `readlinkat` with a hop cap
+///    and creating missing parent directories via `mkdirat`), tracking the
+///    held directory descriptor's path and verifying at every step that the
+///    held directory's `(dev, ino)` is never `protected_root` (nor inside it).
+/// 3. Opens/creates the leaf directly inside the verified parent descriptor
+///    with `openat(O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK)` so
+///    concurrent ancestor renames cannot redirect file creation into
+///    `protected_root`.
+pub fn open_outside_rw_append_confined(
+    out: &Path,
+    protected_root: &Path,
+    mode: u32,
+) -> Result<(PathBuf, std::fs::File, std::fs::Metadata), OutsideError> {
+    use rustix::fs::{Mode, OFlags, fstat, mkdirat, openat, readlinkat};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let verified = OutsidePath::verify(out, protected_root)?;
+    let abs = lexical_normalize(out).map_err(|e| OutsideError::Io(e.to_string()))?;
+    let file_name = abs
+        .file_name()
+        .ok_or_else(|| OutsideError::NoFileName(out.to_path_buf()))?
+        .to_os_string();
+    let parent = abs.parent().unwrap_or(Path::new("/"));
+
+    let canon_protected = canonicalize_existing_prefix(protected_root)
+        .map_err(|e| OutsideError::Io(e.to_string()))?;
+    let protected_dev_ino = std::fs::metadata(&canon_protected)
+        .ok()
+        .map(|m| (m.dev(), m.ino()));
+    let ci = {
+        let mut anc = canon_protected.as_path();
+        while !anc.exists() {
+            let Some(p) = anc.parent() else {
+                break;
+            };
+            anc = p;
+        }
+        is_case_insensitive_volume(anc)
+    };
+
+    let open_root = || -> Result<rustix::fd::OwnedFd, OutsideError> {
+        let f = std::fs::File::open("/").map_err(|e| OutsideError::Io(e.to_string()))?;
+        Ok(f.into())
+    };
+
+    let mut dir_fd = open_root()?;
+    let mut cur_path = PathBuf::from("/");
+    let mut pending: Vec<std::ffi::OsString> = parent
+        .components()
+        .rev()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut hops = 0usize;
+
+    while let Some(seg) = pending.pop() {
+        match Path::new(&seg).components().next() {
+            Some(Component::Prefix(_) | Component::RootDir | Component::CurDir) | None => continue,
+            Some(Component::ParentDir) => {
+                return Err(OutsideError::ParentDir(out.to_path_buf()));
+            }
+            Some(Component::Normal(_)) => {}
+        }
+
+        let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let next_fd = match openat(&dir_fd, &seg, dir_flags, Mode::empty()) {
+            Ok(fd) => {
+                cur_path.push(&seg);
+                fd
+            }
+            Err(rustix::io::Errno::NOENT) => {
+                let candidate_dir = cur_path.join(&seg);
+                if candidate_dir.starts_with(&canon_protected)
+                    || (ci && starts_with_ascii_ci(&candidate_dir, &canon_protected))
+                {
+                    return Err(OutsideError::Inside(
+                        out.to_path_buf(),
+                        canon_protected.clone(),
+                    ));
+                }
+                match mkdirat(&dir_fd, &seg, Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => {
+                        return Err(OutsideError::Io(format!(
+                            "mkdir {}: {e}",
+                            seg.to_string_lossy()
+                        )));
+                    }
+                }
+                let fd = openat(&dir_fd, &seg, dir_flags, Mode::empty()).map_err(|e| {
+                    if e == rustix::io::Errno::LOOP
+                        || e == rustix::io::Errno::MLINK
+                        || e == rustix::io::Errno::NOTDIR
+                    {
+                        OutsideError::Symlink(candidate_dir.clone())
+                    } else {
+                        OutsideError::Io(format!("open dir {}: {e}", candidate_dir.display()))
+                    }
+                })?;
+                cur_path.push(&seg);
+                fd
+            }
+            Err(e)
+                if e == rustix::io::Errno::LOOP
+                    || e == rustix::io::Errno::MLINK
+                    || e == rustix::io::Errno::NOTDIR =>
+            {
+                let target = match readlinkat(&dir_fd, &seg, Vec::new()) {
+                    Ok(cstr) => {
+                        use std::os::unix::ffi::OsStringExt as _;
+                        PathBuf::from(std::ffi::OsString::from_vec(cstr.into_bytes()))
+                    }
+                    Err(_) => {
+                        return Err(OutsideError::Io(format!(
+                            "{} is not a directory",
+                            cur_path.join(&seg).display()
+                        )));
+                    }
+                };
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(OutsideError::Io("too many symlinks".into()));
+                }
+                if target.is_absolute() {
+                    dir_fd = open_root()?;
+                    cur_path = PathBuf::from("/");
+                }
+                for comp in target.components().rev() {
+                    match comp {
+                        Component::ParentDir => {
+                            return Err(OutsideError::ParentDir(out.to_path_buf()));
+                        }
+                        _ => pending.push(comp.as_os_str().to_owned()),
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                return Err(OutsideError::Io(format!(
+                    "open {}: {e}",
+                    cur_path.join(&seg).display()
+                )));
+            }
+        };
+
+        let st = fstat(&next_fd).map_err(|e| OutsideError::Io(e.to_string()))?;
+        if Some((st.st_dev as u64, st.st_ino as u64)) == protected_dev_ino
+            || cur_path.starts_with(&canon_protected)
+            || (ci && starts_with_ascii_ci(&cur_path, &canon_protected))
+        {
+            return Err(OutsideError::Inside(
+                out.to_path_buf(),
+                canon_protected.clone(),
+            ));
+        }
+        dir_fd = next_fd;
+    }
+
+    let final_path = cur_path.join(&file_name);
+    if final_path.starts_with(&canon_protected)
+        || (ci && starts_with_ascii_ci(&final_path, &canon_protected))
+    {
+        return Err(OutsideError::Inside(out.to_path_buf(), canon_protected));
+    }
+    let _ = verified;
+
+    let leaf_flags = OFlags::RDWR
+        | OFlags::APPEND
+        | OFlags::CREATE
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::CLOEXEC;
+    #[allow(clippy::unnecessary_cast)]
+    let raw_mode = mode as rustix::fs::RawMode;
+    let leaf_fd = openat(
+        &dir_fd,
+        &file_name,
+        leaf_flags,
+        Mode::from_raw_mode(raw_mode),
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::MLINK {
+            OutsideError::Symlink(out.to_path_buf())
+        } else {
+            OutsideError::Io(format!("open {}: {e}", final_path.display()))
+        }
+    })?;
+    let file = std::fs::File::from(leaf_fd);
+    let meta = file
+        .metadata()
+        .map_err(|e| OutsideError::Io(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(OutsideError::Io(format!(
+            "{} is not a regular file",
+            final_path.display()
+        )));
+    }
+    Ok((final_path, file, meta))
 }
 
 #[cfg(test)]

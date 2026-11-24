@@ -493,11 +493,26 @@ mod tests {
         if let Ok(rel_from_cwd) = strip_or_rel(&cwd, &repo_dir) {
             assert_eq!(normalize_path_key(&rel_from_cwd), abs_key);
         }
-        #[cfg(target_os = "macos")]
-        {
+        if rex_wave_fs::is_case_insensitive_dir(tmp.path()) {
             let upper = tmp.path().join("SAMPLEREPO");
             assert_eq!(normalize_path_key(&upper.to_string_lossy()), abs_key);
         }
+
+        let real_parent = tmp.path().join("real-parent");
+        let real_sub = real_parent.join("sub");
+        let target_repo = real_parent.join("target-repo");
+        let other_dir = tmp.path().join("other-dir");
+        std::fs::create_dir_all(&real_sub).unwrap();
+        std::fs::create_dir_all(&target_repo).unwrap();
+        std::fs::create_dir_all(other_dir.join("target-repo")).unwrap();
+        let link = other_dir.join("link");
+        std::os::unix::fs::symlink(&real_sub, &link).unwrap();
+        let via_link = format!("{}/../target-repo", link.to_string_lossy());
+        assert_eq!(
+            normalize_path_key(&via_link),
+            normalize_path_key(&target_repo.to_string_lossy()),
+            "symlink preceding .. must resolve link target before parent traversal"
+        );
     }
 
     fn strip_or_rel(cwd: &Path, target: &Path) -> Result<String, ()> {
