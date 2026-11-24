@@ -972,6 +972,7 @@ fn classify_missing_or_archived_thread(msg: &str) -> Option<Observation> {
 struct CompletedTurn {
     anchor: String,
     turn_start_at: u64,
+    turn_end_at: u64,
     text: String,
 }
 
@@ -1112,10 +1113,22 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
         Some(s) => format!("s{s}"),
         None => format!("e{turn_end_seq}"),
     };
+    let turn_end_at = ordered[end_idx]
+        .get("createdAt")
+        .and_then(|v| v.as_u64())
+        .filter(|&at| at > 0)
+        .unwrap_or_else(|| {
+            slice
+                .iter()
+                .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
+                .max()
+                .unwrap_or(0)
+        });
 
     TurnMirrorCheck::Unposted(CompletedTurn {
         anchor,
         turn_start_at,
+        turn_end_at,
         text,
     })
 }
@@ -2927,11 +2940,16 @@ impl BbBridge {
                             .as_ref()
                             .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
                     if is_mirrored_row {
+                        let legacy_min_at = if completed.turn_start_at > 0 {
+                            completed.turn_start_at
+                        } else {
+                            completed.turn_end_at
+                        };
                         if legacy_truncated_idem.is_some()
                             && idem == &legacy_truncated_idem
                             && env.by == worker_principal
                             && body.as_str() == trimmed
-                            && (completed.turn_start_at == 0 || env.at.0 >= completed.turn_start_at)
+                            && (legacy_min_at == 0 || env.at.0 >= legacy_min_at)
                         {
                             already_posted = true;
                             break;
@@ -7022,6 +7040,49 @@ mod tests {
             .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &third_turn_rows)
             .await;
 
+        let fourth_cold_bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let _ = fourth_cold_bridge.backend.set(Arc::new(harness.clone()));
+        fourth_cold_bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: long_tid.clone(),
+                },
+            },
+        );
+        let missing_start_turn_rows = vec![
+            serde_json::json!({
+                "seq": 1_000_000_250u64,
+                "createdAt": 8_100u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "pre-upgrade mirrored turn" } }
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_251u64,
+                "createdAt": 8_200u64,
+                "type": "turn/completed",
+                "data": {}
+            }),
+        ];
+        let missing_start_extracted =
+            extract_unposted_final_turn(&missing_start_turn_rows).expect("unposted without start");
+        assert_eq!(missing_start_extracted.turn_start_at, 0);
+        assert_eq!(missing_start_extracted.turn_end_at, 8_200);
+        fourth_cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &missing_start_turn_rows)
+            .await;
+        fourth_cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &missing_start_turn_rows)
+            .await;
+
         let page2 = owner
             .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
             .await
@@ -7033,8 +7094,8 @@ mod tests {
             .collect();
         assert_eq!(
             posts2.len(),
-            3,
-            "cold bridge must mirror new turns even when legacy 256-byte truncation or body collides"
+            4,
+            "cold bridge must mirror new turns even when turn/started fell outside the 200-event page"
         );
     }
 }

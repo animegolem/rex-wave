@@ -230,25 +230,26 @@ pub fn provision_worker_token_locked(
         && let Ok(raw) = String::from_utf8(bytes)
     {
         let trimmed = raw.trim();
-        if trimmed.starts_with('{') {
-            if let Ok(rec) = serde_json::from_str::<WorkerTokenFile>(trimmed) {
-                let tok = rec.token.trim();
-                if rec.principal == principal
-                    && !tok.is_empty()
-                    && !tok.chars().any(char::is_control)
-                {
-                    return Ok(ProvisionedWorkerToken {
-                        path,
-                        token: tok.to_owned(),
-                        created: false,
-                    });
+        let tokens_path = state_dir.join("tokens.json");
+        if let Ok(table) = PrincipalTokenTable::load_tokens_file(&tokens_path, None) {
+            if trimmed.starts_with('{') {
+                if let Ok(rec) = serde_json::from_str::<WorkerTokenFile>(trimmed) {
+                    let tok = rec.token.trim();
+                    if rec.principal == principal
+                        && !tok.is_empty()
+                        && !tok.chars().any(char::is_control)
+                        && table.allows_worker_token_reuse(tok, &principal, thread.as_str(), true)
+                    {
+                        return Ok(ProvisionedWorkerToken {
+                            path,
+                            token: tok.to_owned(),
+                            created: false,
+                        });
+                    }
                 }
-            }
-        } else if !trimmed.is_empty() && !trimmed.chars().any(char::is_control) {
-            let tokens_path = state_dir.join("tokens.json");
-            if let Ok(table) = PrincipalTokenTable::load_tokens_file(&tokens_path, None)
-                && table.get(trimmed) == Some(&principal)
-                && table.legacy_thread_id(trimmed) == Some(thread.as_str())
+            } else if !trimmed.is_empty()
+                && !trimmed.chars().any(char::is_control)
+                && table.allows_worker_token_reuse(trimmed, &principal, thread.as_str(), false)
             {
                 let upgraded =
                     write_worker_token_record(state_dir, thread.as_str(), trimmed, &principal)?;

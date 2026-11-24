@@ -476,7 +476,7 @@ fn verify_legacy_worker_thread_token(
             return false;
         };
         parsed.principal == *expected_principal
-            && constant_time_eq(parsed.token.as_bytes(), expected_token.as_bytes())
+            && constant_time_eq(parsed.token.trim().as_bytes(), expected_token.as_bytes())
     } else {
         constant_time_eq(trimmed.as_bytes(), expected_token.as_bytes())
     }
@@ -488,6 +488,7 @@ fn verify_legacy_worker_thread_token(
 pub struct PrincipalTokenTable {
     tokens: BTreeMap<String, Principal>,
     legacy_thread_ids: BTreeMap<String, String>,
+    skipped_file_tokens: std::collections::BTreeSet<String>,
 }
 
 impl PrincipalTokenTable {
@@ -566,6 +567,7 @@ impl PrincipalTokenTable {
                 self.legacy_thread_ids.insert(token, tid.clone());
             }
         }
+        self.skipped_file_tokens.extend(other.skipped_file_tokens);
         Ok(())
     }
 
@@ -587,6 +589,28 @@ impl PrincipalTokenTable {
             }
         }
         matched
+    }
+
+    pub fn allows_worker_token_reuse(
+        &self,
+        candidate: &str,
+        principal: &Principal,
+        thread_id: &str,
+        is_structured: bool,
+    ) -> bool {
+        let mut in_file = self.get(candidate).is_some();
+        for skipped in &self.skipped_file_tokens {
+            if constant_time_eq(skipped.as_bytes(), candidate.as_bytes()) {
+                in_file = true;
+            }
+        }
+        let verified_thread_match = self.get(candidate) == Some(principal)
+            && self.legacy_thread_id(candidate) == Some(thread_id);
+        if is_structured {
+            !in_file || verified_thread_match
+        } else {
+            verified_thread_match
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -649,6 +673,7 @@ impl PrincipalTokenTable {
             if let Some(tid) = legacy_tid {
                 if !verify_legacy_worker_thread_token(path, &tid, &token, &principal, expected_uid)
                 {
+                    table.skipped_file_tokens.insert(token);
                     continue;
                 }
                 table.insert(token.clone(), principal)?;

@@ -873,6 +873,54 @@ async fn worker_credentials_fail_closed_and_legacy_tokens_do_not_rebind_across_p
         "deleting the upgraded worker token file must revoke authentication immediately"
     );
 
+    rex_wave_transport::write_worker_token_record(
+        &state_dir,
+        tid.as_str(),
+        "rw_w_principal_scoped",
+        &Principal::Worker {
+            wave: wave.clone(),
+            role: target_role.clone(),
+        },
+    )
+    .unwrap();
+    let rotated_structured =
+        provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
+    assert!(
+        rotated_structured.created,
+        "already-upgraded structured worker file sharing an independent tokens.json grant must rotate"
+    );
+    assert_ne!(rotated_structured.token, "rw_w_principal_scoped");
+    let reused_fresh =
+        provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
+    assert!(
+        !reused_fresh.created && reused_fresh.token == rotated_structured.token,
+        "thread-only structured worker token reuses idempotently across provision calls"
+    );
+    assert_eq!(
+        auth.authenticate(
+            None,
+            &rex_wave_transport::Credential::Token {
+                token: rotated_structured.token.clone()
+            },
+        )
+        .unwrap(),
+        Principal::Worker {
+            wave: wave.clone(),
+            role: target_role.clone()
+        }
+    );
+    rex_wave_transport::remove_worker_token_file(&state_dir, tid.as_str()).unwrap();
+    assert!(
+        auth.authenticate(
+            None,
+            &rex_wave_transport::Credential::Token {
+                token: rotated_structured.token
+            },
+        )
+        .is_err(),
+        "deleting rotated structured worker file revokes its thread bearer immediately"
+    );
+
     // 3. Explicit canonical RoomRef::Id write + Read + RoomFiltered Wait on a legacy-only DM stay symmetric,
     //    while raw StreamId reads/subscriptions remain exact, and Seat/Operator cannot spoof MirroredTurn.
     let db_path = tmp.path().join("legacy-dm.sqlite3");
