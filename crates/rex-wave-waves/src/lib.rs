@@ -86,6 +86,65 @@ pub fn is_legacy_mirror_idem_key(idem: &IdemKey) -> bool {
     idem.as_str().starts_with("wave:") && idem.as_str().contains(":turn:")
 }
 
+/// Classifies whether `idem` matches an existing pre-upgrade BB turn-mirror row for
+/// `(wave, role, thread)`. Returns `Some(true)` for an exact full start-anchor match
+/// (`s<turn_start_seq>`), `Some(false)` for a 256-byte-truncated or missing-start
+/// compatibility candidate that must additionally match worker principal, body, and
+/// timestamp floor, or `None` when `idem` cannot belong to this completed turn.
+pub fn classify_legacy_bb_mirror_idem(
+    idem: &IdemKey,
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+    turn_start_seq: Option<u64>,
+    turn_end_seq: u64,
+) -> Option<bool> {
+    let end_anchor = format!("e{turn_end_seq}");
+    if legacy_truncated_mirror_idem_key(wave, role, thread, &end_anchor).as_ref() == Some(idem) {
+        return Some(false);
+    }
+    if let Some(s) = turn_start_seq {
+        let start_anchor = format!("s{s}");
+        if mirror_idem_key(wave, role, thread, &start_anchor)
+            .ok()
+            .as_ref()
+            == Some(idem)
+        {
+            return Some(true);
+        }
+        if legacy_truncated_mirror_idem_key(wave, role, thread, &start_anchor).as_ref()
+            == Some(idem)
+        {
+            return Some(false);
+        }
+        return None;
+    }
+
+    let s_prefix = format!("wave:{wave}:turn:{role}:{thread}:s");
+    let raw_idem = idem.as_str();
+    if raw_idem.len() < 256 {
+        if let Some(digits) = raw_idem.strip_prefix(&s_prefix)
+            && !digits.is_empty()
+            && digits.parse::<u64>().is_ok_and(|s| s < turn_end_seq)
+        {
+            return Some(false);
+        }
+        return None;
+    }
+    if raw_idem.len() == 256 {
+        let mut shared = s_prefix.len().min(256);
+        while !s_prefix.is_char_boundary(shared) {
+            shared -= 1;
+        }
+        if raw_idem.starts_with(&s_prefix[..shared])
+            && raw_idem[shared..].bytes().all(|b| b.is_ascii_digit())
+        {
+            return Some(false);
+        }
+    }
+    None
+}
+
 pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase, String> {
     match (phase, obs) {
         (WorkerPhase::Requested { attempt }, Observation::Spawned { attempt: a, thread })

@@ -971,6 +971,8 @@ fn classify_missing_or_archived_thread(msg: &str) -> Option<Observation> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompletedTurn {
     anchor: String,
+    turn_start_seq: Option<u64>,
+    turn_end_seq: u64,
     turn_start_at: u64,
     turn_end_at: u64,
     text: String,
@@ -1109,9 +1111,12 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
         return TurnMirrorCheck::Ignore;
     };
 
-    let anchor = match turn_start_seq {
-        Some(s) => format!("s{s}"),
-        None => format!("e{turn_end_seq}"),
+    let anchor = if turn_end_seq > 0 {
+        format!("e{turn_end_seq}")
+    } else if let Some(s) = turn_start_seq {
+        format!("s{s}")
+    } else {
+        "e0".to_owned()
     };
     let turn_end_at = ordered[end_idx]
         .get("createdAt")
@@ -1127,6 +1132,8 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
 
     TurnMirrorCheck::Unposted(CompletedTurn {
         anchor,
+        turn_start_seq,
+        turn_end_seq,
         turn_start_at,
         turn_end_at,
         text,
@@ -2903,8 +2910,6 @@ impl BbBridge {
         else {
             return;
         };
-        let legacy_truncated_idem =
-            rex_wave_waves::legacy_truncated_mirror_idem_key(wave, role, thread, &completed.anchor);
         let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
 
         let mut already_posted = false;
@@ -2945,11 +2950,19 @@ impl BbBridge {
                         } else {
                             completed.turn_end_at
                         };
-                        if legacy_truncated_idem.is_some()
-                            && idem == &legacy_truncated_idem
-                            && env.by == worker_principal
-                            && body.as_str() == trimmed
-                            && (legacy_min_at == 0 || env.at.0 >= legacy_min_at)
+                        if env.by == worker_principal
+                            && let Some(existing_idem) = idem.as_ref()
+                            && let Some(exact) = rex_wave_waves::classify_legacy_bb_mirror_idem(
+                                existing_idem,
+                                wave,
+                                role,
+                                thread,
+                                completed.turn_start_seq,
+                                completed.turn_end_seq,
+                            )
+                            && (exact
+                                || (body.as_str() == trimmed
+                                    && (legacy_min_at == 0 || env.at.0 >= legacy_min_at)))
                         {
                             already_posted = true;
                             break;
@@ -5145,7 +5158,9 @@ mod tests {
         let mut desc = unposted_rows.clone();
         desc.reverse();
         let extracted = extract_unposted_final_turn(&desc).expect("final turn extracted");
-        assert_eq!(extracted.anchor, "s10");
+        assert_eq!(extracted.anchor, "e15");
+        assert_eq!(extracted.turn_start_seq, Some(10));
+        assert_eq!(extracted.turn_end_seq, 15);
         assert_eq!(extracted.turn_start_at, 1000);
         assert_eq!(extracted.text, "Final audit: 0 regressions.");
 
@@ -7058,7 +7073,13 @@ mod tests {
                 },
             },
         );
-        let missing_start_turn_rows = vec![
+        let full_page_turn4_rows = vec![
+            serde_json::json!({
+                "seq": 1_000_000_249u64,
+                "createdAt": 8_000u64,
+                "type": "turn/started",
+                "data": {}
+            }),
             serde_json::json!({
                 "seq": 1_000_000_250u64,
                 "createdAt": 8_100u64,
@@ -7072,15 +7093,94 @@ mod tests {
                 "data": {}
             }),
         ];
-        let missing_start_extracted =
-            extract_unposted_final_turn(&missing_start_turn_rows).expect("unposted without start");
-        assert_eq!(missing_start_extracted.turn_start_at, 0);
-        assert_eq!(missing_start_extracted.turn_end_at, 8_200);
+        let partial_page_turn4_rows = vec![
+            serde_json::json!({
+                "seq": 1_000_000_250u64,
+                "createdAt": 8_100u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "pre-upgrade mirrored turn" } }
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_251u64,
+                "createdAt": 8_200u64,
+                "type": "turn/completed",
+                "data": {}
+            }),
+        ];
+        let full_extracted =
+            extract_unposted_final_turn(&full_page_turn4_rows).expect("unposted with start");
+        let partial_extracted =
+            extract_unposted_final_turn(&partial_page_turn4_rows).expect("unposted without start");
+        assert_eq!(full_extracted.anchor, "e1000000251");
+        assert_eq!(partial_extracted.anchor, "e1000000251");
+        assert_eq!(partial_extracted.turn_start_at, 0);
+        assert_eq!(partial_extracted.turn_end_at, 8_200);
         fourth_cold_bridge
-            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &missing_start_turn_rows)
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &full_page_turn4_rows)
             .await;
         fourth_cold_bridge
-            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &missing_start_turn_rows)
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &partial_page_turn4_rows)
+            .await;
+
+        let fifth_cold_bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let _ = fifth_cold_bridge.backend.set(Arc::new(harness.clone()));
+        fifth_cold_bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: long_tid.clone(),
+                },
+            },
+        );
+        fifth_cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &partial_page_turn4_rows)
+            .await;
+
+        let sixth_cold_bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let _ = sixth_cold_bridge.backend.set(Arc::new(harness.clone()));
+        sixth_cold_bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: long_tid.clone(),
+                },
+            },
+        );
+        let missing_start_turn5_rows = vec![
+            serde_json::json!({
+                "seq": 1_000_000_500u64,
+                "createdAt": 9_100u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "pre-upgrade mirrored turn" } }
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_501u64,
+                "createdAt": 9_200u64,
+                "type": "turn/completed",
+                "data": {}
+            }),
+        ];
+        sixth_cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &missing_start_turn5_rows)
+            .await;
+        sixth_cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &missing_start_turn5_rows)
             .await;
 
         let page2 = owner
@@ -7094,8 +7194,8 @@ mod tests {
             .collect();
         assert_eq!(
             posts2.len(),
-            4,
-            "cold bridge must mirror new turns even when turn/started fell outside the 200-event page"
+            5,
+            "full-page-then-partial-page retry must not duplicate, while genuinely new missing-start turn mirrors"
         );
     }
 }
