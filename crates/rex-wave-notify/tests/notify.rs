@@ -4095,8 +4095,8 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         .expect("RoomFiltered wait must succeed despite corrupt unrelated wave and unknown stream");
     assert_eq!(filtered_page.entries.len(), 2);
 
-    // Concurrent writers advancing `#aaa` strictly before `#zzz` must never yield a live
-    // multi-stream exact-wait cursor where `#zzz` is ahead of `#aaa`.
+    // Concurrent OS-thread writer advancing `#aaa` strictly before `#zzz` must never yield a
+    // live multi-stream exact-wait cursor where `#zzz` is ahead of `#aaa`.
     let aaa = RoomId::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("aaa").unwrap(),
@@ -4107,8 +4107,9 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
     };
     let s_aaa = StreamId::Room { room: aaa.clone() };
     let s_zzz = StreamId::Room { room: zzz.clone() };
-    let mut w_aaa = disk_journal.claim(s_aaa.clone()).unwrap();
-    let mut w_zzz = disk_journal.claim(s_zzz.clone()).unwrap();
+    let writer_journal = Journal::open(&db_path).unwrap();
+    let mut w_aaa = writer_journal.claim(s_aaa.clone()).unwrap();
+    let mut w_zzz = writer_journal.claim(s_zzz.clone()).unwrap();
     w_aaa
         .append(
             disk_op.me(),
@@ -4134,8 +4135,8 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         )
         .unwrap();
     let writer_me = disk_op.me().clone();
-    let writer_task = tokio::spawn(async move {
-        for i in 0..80u64 {
+    let writer_thread = std::thread::spawn(move || {
+        for i in 0..120u64 {
             let ev = vec![Event::Room(RoomEvent::Posted {
                 body: Body::parse(format!("m{i}")).unwrap(),
                 mentions: rex_wave_api::room::Mentions::default(),
@@ -4148,12 +4149,11 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
             w_aaa
                 .append(&writer_me, UnixMs(10 + i), None, ev.clone())
                 .unwrap();
-            tokio::task::yield_now().await;
+            std::thread::yield_now();
             w_zzz.append(&writer_me, UnixMs(10 + i), None, ev).unwrap();
-            tokio::task::yield_now().await;
         }
     });
-    for _ in 0..80 {
+    for _ in 0..120 {
         let p = disk_op
             .call(rex_wave_api::read::Wait {
                 timeout_ms: Some(0),
@@ -4173,5 +4173,5 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         );
         tokio::task::yield_now().await;
     }
-    writer_task.await.unwrap();
+    writer_thread.join().unwrap();
 }

@@ -23,7 +23,7 @@ use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1745,14 +1745,73 @@ struct WaitFlightGuard {
     bridge: Arc<BbBridge>,
     key: (WaveSlug, RoleName),
     aborted: Arc<AtomicBool>,
+    decremented: bool,
+    spawned_restore: bool,
     completed: bool,
+}
+
+impl WaitFlightGuard {
+    fn enter(
+        bridge: Arc<BbBridge>,
+        key: (WaveSlug, RoleName),
+        aborted: Arc<AtomicBool>,
+    ) -> (Self, u64, Arc<tokio::sync::Mutex<()>>) {
+        let (epoch, gate) = bridge.increment_fallback_wait(&key);
+        (
+            WaitFlightGuard {
+                bridge,
+                key,
+                aborted,
+                decremented: false,
+                spawned_restore: false,
+                completed: false,
+            },
+            epoch,
+            gate,
+        )
+    }
+
+    async fn finish(mut self) {
+        self.decremented = true;
+        if self.bridge.decrement_fallback_wait(&self.key) == 0 {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                self.spawned_restore = true;
+                let b = self.bridge.clone();
+                let key = self.key.clone();
+                let _ = handle
+                    .spawn(async move {
+                        b.restore_fallback_working_if_idle(&key).await;
+                    })
+                    .await;
+            } else {
+                self.bridge
+                    .restore_fallback_working_if_idle(&self.key)
+                    .await;
+            }
+        }
+        self.completed = true;
+    }
 }
 
 impl Drop for WaitFlightGuard {
     fn drop(&mut self) {
-        self.bridge.decrement_fallback_wait(&self.key);
-        if !self.completed {
-            self.aborted.store(true, Ordering::Relaxed);
+        if self.completed {
+            return;
+        }
+        self.aborted.store(true, Ordering::Relaxed);
+        let should_restore = if !self.decremented {
+            self.decremented = true;
+            self.bridge.decrement_fallback_wait(&self.key) == 0
+        } else {
+            !self.spawned_restore
+        };
+        if should_restore && let Ok(handle) = tokio::runtime::Handle::try_current() {
+            self.spawned_restore = true;
+            let b = self.bridge.clone();
+            let key = self.key.clone();
+            handle.spawn(async move {
+                b.restore_fallback_working_if_idle(&key).await;
+            });
         }
     }
 }
@@ -1794,15 +1853,11 @@ impl Client for WorkerToolClient {
             let mut wait_guard = None;
             if let Some((room, since)) = manual_parked_scope {
                 let key = (wave.clone(), role.clone());
-                let (epoch, gate) = bridge.increment_fallback_wait(&key);
-                wait_guard = Some(WaitFlightGuard {
-                    bridge: bridge.clone(),
-                    key: key.clone(),
-                    aborted: aborted_wait,
-                    completed: false,
-                });
+                let (guard, epoch, gate) =
+                    WaitFlightGuard::enter(bridge.clone(), key.clone(), aborted_wait);
+                wait_guard = Some(guard);
                 let _guard_lock = gate.lock().await;
-                if bridge.fallback_wait_is_live(&key, epoch) {
+                if bridge.fallback_wait_is_live(&key, epoch, &gate) {
                     bridge
                         .call_wave_observe(
                             wave.clone(),
@@ -1817,11 +1872,8 @@ impl Client for WorkerToolClient {
 
             let outcome = backend.call_as(me, cmd).await;
 
-            if let Some(mut guard) = wait_guard {
-                let key = guard.key.clone();
-                guard.completed = true;
-                drop(guard);
-                bridge.restore_fallback_working_if_idle(&key).await;
+            if let Some(guard) = wait_guard {
+                guard.finish().await;
             }
             outcome
         }
@@ -1846,6 +1898,7 @@ pub struct BbBridge {
     owner: mpsc::UnboundedSender<OwnerMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     code_runner: Option<CodeRunner>,
+    fallback_epoch_seq: AtomicU64,
     fallback_active_waits: std::sync::Mutex<HashMap<(WaveSlug, RoleName), FallbackWaitEntry>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
@@ -1877,6 +1930,7 @@ impl BbBridge {
             owner: BridgeOwner::spawn(),
             backend: OnceLock::new(),
             code_runner,
+            fallback_epoch_seq: AtomicU64::new(0),
             fallback_active_waits: std::sync::Mutex::new(HashMap::new()),
             project_names_tx,
             project_names_rx,
@@ -1889,6 +1943,10 @@ impl BbBridge {
         &self,
         key: &(WaveSlug, RoleName),
     ) -> (u64, Arc<tokio::sync::Mutex<()>>) {
+        let next_epoch = self
+            .fallback_epoch_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let mut map = self
             .fallback_active_waits
             .lock()
@@ -1899,33 +1957,40 @@ impl BbBridge {
             gate: Arc::new(tokio::sync::Mutex::new(())),
         });
         entry.active += 1;
-        entry.epoch = entry.epoch.wrapping_add(1);
+        entry.epoch = next_epoch;
         (entry.epoch, entry.gate.clone())
     }
 
-    fn decrement_fallback_wait(&self, key: &(WaveSlug, RoleName)) {
+    fn decrement_fallback_wait(&self, key: &(WaveSlug, RoleName)) -> usize {
         let mut map = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = map.get_mut(key) {
-            entry.active = entry.active.saturating_sub(1);
-        }
+        let Some(entry) = map.get_mut(key) else {
+            return 0;
+        };
+        entry.active = entry.active.saturating_sub(1);
+        entry.active
     }
 
-    fn fallback_wait_is_live(&self, key: &(WaveSlug, RoleName), expected_epoch: u64) -> bool {
+    fn fallback_wait_is_live(
+        &self,
+        key: &(WaveSlug, RoleName),
+        expected_epoch: u64,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
         let map = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.get(key)
-            .is_some_and(|e| e.active > 0 && e.epoch >= expected_epoch)
+        map.get(key).is_some_and(|e| {
+            e.active > 0 && e.epoch >= expected_epoch && Arc::ptr_eq(&e.gate, gate)
+        })
     }
 
     fn snapshot_idle_fallback_wait(
         &self,
         key: &(WaveSlug, RoleName),
-        expected_epoch: Option<u64>,
     ) -> Option<(u64, Arc<tokio::sync::Mutex<()>>)> {
         let map = self
             .fallback_active_waits
@@ -1935,12 +2000,21 @@ impl BbBridge {
         if entry.active > 0 {
             return None;
         }
-        if let Some(exp) = expected_epoch
-            && entry.epoch != exp
-        {
-            return None;
-        }
         Some((entry.epoch, entry.gate.clone()))
+    }
+
+    fn fallback_idle_matches(
+        &self,
+        key: &(WaveSlug, RoleName),
+        idle_epoch: u64,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        let map = self
+            .fallback_active_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.get(key)
+            .is_some_and(|e| e.active == 0 && e.epoch == idle_epoch && Arc::ptr_eq(&e.gate, gate))
     }
 
     fn reclaim_idle_fallback_wait(
@@ -1962,16 +2036,16 @@ impl BbBridge {
     }
 
     async fn restore_fallback_working_if_idle(&self, key: &(WaveSlug, RoleName)) {
-        let Some((epoch, gate)) = self.snapshot_idle_fallback_wait(key, None) else {
+        let Some((epoch, gate)) = self.snapshot_idle_fallback_wait(key) else {
             return;
         };
         let _guard = gate.lock().await;
-        if self.snapshot_idle_fallback_wait(key, Some(epoch)).is_none() {
+        if !self.fallback_idle_matches(key, epoch, &gate) {
             return;
         }
         if let Ok(rec) = self.lookup_worker(&key.0, &key.1).await
             && matches!(rec.activity, Activity::Parked { .. })
-            && self.snapshot_idle_fallback_wait(key, Some(epoch)).is_some()
+            && self.fallback_idle_matches(key, epoch, &gate)
         {
             self.call_wave_observe(
                 key.0.clone(),
@@ -5964,7 +6038,7 @@ mod tests {
                             Interest::Room {
                                 room: RoomRef::Id { id: room },
                             },
-                            Cursor::default().with(room_stream, Seq(1)),
+                            Cursor::default().with(room_stream, Seq(999)),
                         )
                     };
                     if mode == "abort" {
@@ -6177,7 +6251,7 @@ mod tests {
                         .await;
                 });
                 tokio::time::sleep(Duration::from_millis(45)).await;
-                let race_snap = op.call(WaveView { wave }).await.unwrap();
+                let race_snap = op.call(WaveView { wave: wave.clone() }).await.unwrap();
                 assert!(
                     matches!(
                         &race_snap.workers[0].2,
@@ -6206,6 +6280,177 @@ mod tests {
                 assert!(
                     bridge.fallback_active_waits.lock().unwrap().is_empty(),
                     "completed fallback waits must reclaim per-worker gate entries"
+                );
+
+                // Obsolete gate queued across entry reclamation + recreation must never publish Working.
+                let key = (wave.clone(), role.clone());
+                let (e_old, g_old) = bridge.increment_fallback_wait(&key);
+                assert_eq!(bridge.decrement_fallback_wait(&key), 0);
+                let held_old = g_old.lock().await;
+                let stale_cleanup = tokio::spawn({
+                    let b = bridge.clone();
+                    let k = key.clone();
+                    async move {
+                        b.restore_fallback_working_if_idle(&k).await;
+                    }
+                });
+                tokio::task::yield_now().await;
+                bridge.reclaim_idle_fallback_wait(&key, e_old, &g_old);
+
+                let b_hold2 = bridge.clone();
+                let hold2 = tokio::spawn(async move {
+                    b_hold2
+                        .on_tool_call(
+                            "call_hold_after_recreate".into(),
+                            "th_cancel_1".into(),
+                            None,
+                            "run_code".into(),
+                            serde_json::json!({ "mode": "hold" }),
+                        )
+                        .await;
+                });
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                drop(held_old);
+                stale_cleanup.await.unwrap();
+                let after_stale = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+                assert!(
+                    matches!(
+                        &after_stale.workers[0].2,
+                        WorkerPhase::Live {
+                            activity: Activity::Parked { .. },
+                            ..
+                        }
+                    ),
+                    "obsolete gate cleanup must not overwrite recreated active wait: {:?}",
+                    after_stale.workers[0].2
+                );
+                op.call(RoomPost {
+                    room: RoomRef::Id {
+                        id: started.room.clone(),
+                    },
+                    body: Body::parse("wake recreated hold").unwrap(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: None,
+                })
+                .await
+                .unwrap();
+                hold2.await.unwrap();
+                assert!(bridge.fallback_active_waits.lock().unwrap().is_empty());
+
+                // Cancelling a fallback wait after `Wait` returned while `Working` restoration is
+                // in flight still completes `Working` and reclaims the map entry.
+                #[derive(Clone)]
+                struct SlowWorkingClient(HarnessClient);
+                impl Client for SlowWorkingClient {
+                    fn me(&self) -> &Principal {
+                        self.0.me()
+                    }
+                    fn call_wire(
+                        &self,
+                        cmd: WireCommand,
+                    ) -> impl Future<Output = Result<WireReply, ApiError>> + Send
+                    {
+                        let inner = self.0.clone();
+                        let delay_working = matches!(
+                            &cmd,
+                            WireCommand::WaveObserve(WaveObserve {
+                                observation: Observation::Activity {
+                                    activity: Activity::Working,
+                                },
+                                ..
+                            })
+                        );
+                        async move {
+                            if delay_working {
+                                tokio::time::sleep(Duration::from_millis(40)).await;
+                            }
+                            inner.call_wire(cmd).await
+                        }
+                    }
+                    fn watch(
+                        &self,
+                        interest: Interest,
+                        from: Cursor,
+                    ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send
+                    {
+                        self.0.watch(interest, from)
+                    }
+                }
+                #[derive(Clone)]
+                struct SlowWorkingBackend(LoopbackHarness);
+                impl BridgeBackend for SlowWorkingBackend {
+                    type C = SlowWorkingClient;
+                    fn client(&self, me: Principal) -> SlowWorkingClient {
+                        SlowWorkingClient(self.0.client(me))
+                    }
+                }
+
+                let bridge_slow = BbBridge::with_options(
+                    BridgeConfig {
+                        url: "ws://127.0.0.1:1/disabled".into(),
+                        token: "tok".into(),
+                    },
+                    None,
+                    None,
+                );
+                let _ = bridge_slow
+                    .backend
+                    .set(Arc::new(SlowWorkingBackend(harness.clone())));
+                let slow_aborted = Arc::new(AtomicBool::new(false));
+                let direct_client = WorkerToolClient {
+                    bridge: bridge_slow.clone(),
+                    backend: bridge_slow.backend.get().unwrap().clone(),
+                    me: Principal::Worker {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                    },
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    aborted_wait: slow_aborted.clone(),
+                };
+                let short_wait = rex_wave_api::read::Wait {
+                    timeout_ms: Some(10),
+                    ..rex_wave_api::read::Wait::new(
+                        Interest::Room {
+                            room: RoomRef::Id {
+                                id: started.room.clone(),
+                            },
+                        },
+                        Cursor::default().with(
+                            StreamId::Room {
+                                room: started.room.clone(),
+                            },
+                            Seq(999),
+                        ),
+                    )
+                };
+                let timed =
+                    tokio::time::timeout(Duration::from_millis(25), direct_client.call(short_wait))
+                        .await;
+                assert!(timed.is_err(), "cancelled mid-restoration");
+                assert!(
+                    slow_aborted.load(Ordering::Relaxed),
+                    "mid-restoration cancel must mark aborted_wait"
+                );
+                tokio::time::sleep(Duration::from_millis(55)).await;
+                let restored_snap = op.call(WaveView { wave }).await.unwrap();
+                assert!(
+                    matches!(
+                        &restored_snap.workers[0].2,
+                        WorkerPhase::Live {
+                            activity: Activity::Working,
+                            ..
+                        }
+                    ),
+                    "detached restoration must still transition worker back to Working: {:?}",
+                    restored_snap.workers[0].2
+                );
+                assert!(
+                    bridge_slow.fallback_active_waits.lock().unwrap().is_empty(),
+                    "detached restoration must reclaim fallback map entry"
                 );
             }
             let _ = shutdown_tx.send(true);
