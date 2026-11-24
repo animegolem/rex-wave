@@ -6,15 +6,15 @@ use std::io::{BufRead, BufReader as StdBufReader};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-static NONCE: AtomicU64 = AtomicU64::new(1);
+mod common;
+use common::{DirGuard, fresh_dir, rex_wave, rex_wave_at, t3_home, write_house_profile};
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -24,11 +24,21 @@ impl Drop for ChildGuard {
     }
 }
 
-struct DirGuard(PathBuf);
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// The house profile the seeding soaks run under: a seat witness, one
+/// permanently excluded pane, and canonical alias folds.
+fn house_fixture() -> Value {
+    json!({
+        "witness_seat": "carol",
+        "excluded_herdr_targets": ["w9:p1S"],
+        "aliases": {
+            "carol": ["carol_old", "carol-legacy"],
+            "dave": ["dave_old", "dave-opus-5"],
+            "heidi": ["heidi-old", "heidi-typo", "muse"],
+            "ivan-supervisor": ["ivan", "ivan-sup"],
+            "loupe": ["loupe-rev"],
+            "neon": []
+        }
+    })
 }
 
 fn snapshot_tree(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
@@ -51,18 +61,6 @@ fn snapshot_tree(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
     let mut out = Vec::new();
     walk(root, root, &mut out);
     out
-}
-
-fn fresh_dir(label: &str) -> DirGuard {
-    let n = NONCE.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("rex-wave-e2e3-{label}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    DirGuard(p)
-}
-
-fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_rex-wave")
 }
 
 async fn free_port() -> u16 {
@@ -338,6 +336,7 @@ async fn spawn_mock_t3(
 }
 
 struct IsolatedDaemon {
+    herald_grace_ms: u64,
     dir: DirGuard,
     sock: PathBuf,
     http_addr: SocketAddr,
@@ -359,23 +358,16 @@ impl IsolatedDaemon {
         root: &Path,
         t3_addr: SocketAddr,
         t3_token: &str,
+        herald_grace_ms: u64,
     ) -> (PathBuf, SocketAddr, ChildGuard) {
         let sandbox = root.join("mail-sandbox");
-        let cfg_dir = root.join("config");
-        let t3_home = root.join("t3-home");
-        std::fs::create_dir_all(&t3_home).unwrap();
+        let t3_home = t3_home(root);
         let bell_port = free_port().await;
         let unused_bb_port = free_port().await;
         let sock = root.join("daemon.sock");
         let journal = root.join("journal.sqlite3");
 
-        let mut child = Command::new(bin_path())
-            .env("XDG_CONFIG_HOME", &cfg_dir)
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
-            .env_remove("REX_WAVE_T3_HOME")
-            .env_remove("REX_WAVE_T3_URL")
-            .env_remove("REX_WAVE_T3_TOKEN")
+        let mut child = rex_wave_at(&sock)
             .args([
                 "--socket",
                 sock.to_str().unwrap(),
@@ -398,6 +390,8 @@ impl IsolatedDaemon {
                 &format!("127.0.0.1:{bell_port}"),
                 "--http",
                 "127.0.0.1:0",
+                "--herald-grace-ms",
+                &herald_grace_ms.to_string(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -439,20 +433,36 @@ impl IsolatedDaemon {
     }
 
     async fn start(label: &str) -> Self {
+        Self::start_with(label, rex_wave_notify::RECONNECT_GRACE_MS, None).await
+    }
+
+    /// Starts a daemon whose `MailUnrung` reconnect grace window is
+    /// `herald_grace_ms` (the hidden `--herald-grace-ms` flag).
+    async fn start_with_grace(label: &str, herald_grace_ms: u64) -> Self {
+        Self::start_with(label, herald_grace_ms, None).await
+    }
+
+    /// Starts a daemon (and its CLI calls) with `house` as `house.json`.
+    async fn start_with_house(label: &str, house: Value) -> Self {
+        Self::start_with(label, rex_wave_notify::RECONNECT_GRACE_MS, Some(house)).await
+    }
+
+    async fn start_with(label: &str, herald_grace_ms: u64, house: Option<Value>) -> Self {
         let dir = fresh_dir(label);
+        if let Some(house) = house {
+            write_house_profile(&dir.0, &house);
+        }
         let sandbox = dir.0.join("mail-sandbox");
-        let cfg_dir = dir.0.join("config");
         std::fs::create_dir_all(&sandbox).unwrap();
-        std::fs::create_dir_all(cfg_dir.join("rex-wave")).unwrap();
         std::fs::write(sandbox.join(".rex-wave-sandbox"), "e2e\n").unwrap();
-        std::fs::write(cfg_dir.join("rex-wave/protected-roots"), "").unwrap();
 
         let t3_token = "t3_e2e_secret_tok".to_owned();
         let (t3_addr, t3_state, t3_task) = spawn_mock_t3(&t3_token).await;
         let (sock, http_addr, _child) =
-            Self::spawn_daemon_process(&dir.0, t3_addr, &t3_token).await;
+            Self::spawn_daemon_process(&dir.0, t3_addr, &t3_token, herald_grace_ms).await;
 
         Self {
+            herald_grace_ms,
             dir,
             sock,
             http_addr,
@@ -468,8 +478,13 @@ impl IsolatedDaemon {
         let _ = self._child.0.kill();
         let _ = self._child.0.wait();
         let _ = std::fs::remove_file(&self.sock);
-        let (sock, http_addr, child) =
-            Self::spawn_daemon_process(&self.dir.0, self.t3_addr, &self.t3_token).await;
+        let (sock, http_addr, child) = Self::spawn_daemon_process(
+            &self.dir.0,
+            self.t3_addr,
+            &self.t3_token,
+            self.herald_grace_ms,
+        )
+        .await;
         self.sock = sock;
         self.http_addr = http_addr;
         self._child = child;
@@ -484,9 +499,7 @@ impl IsolatedDaemon {
             .collect();
         let owned_rem: Vec<String> = remove_envs.iter().map(|s| (*s).to_owned()).collect();
         tokio::task::spawn_blocking(move || {
-            let mut cmd = Command::new(bin_path());
-            cmd.env_remove("REX_WAVE_TOKEN")
-                .env_remove("T3CODE_THREAD_ID");
+            let mut cmd = rex_wave_at(&sock);
             for k in &owned_rem {
                 cmd.env_remove(k);
             }
@@ -881,7 +894,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     assert!(exported_text.contains(":REX_REV: 1"));
 
     let lock_path = daemon.dir.0.join(".#tasks.org");
-    std::os::unix::fs::symlink("golem@host.99999", &lock_path).unwrap();
+    std::os::unix::fs::symlink("operator@host.99999", &lock_path).unwrap();
     let deferred_json = daemon
         .cli_json(&["tasks", "org-sync", "#org-e2e", org_path_str, "--once"])
         .await;
@@ -970,9 +983,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
 
     let sidecar_path = rex_wave_board::conflict_sidecar_path(&org_file);
     let mut watch_child = ChildGuard(
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
+        rex_wave_at(&daemon.sock)
             .args([
                 "--socket",
                 daemon.sock.to_str().unwrap(),
@@ -1139,7 +1150,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         "sessionId": "sess-bg-1",
         "messagingSocketPath": "/tmp/cc-socks/bg.sock",
         "kind": "bg",
-        "name": "Tally-5.2",
+        "name": "Carol-5.2",
         "nameSource": "user"
     });
     std::fs::write(
@@ -1149,7 +1160,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     .unwrap();
 
     daemon
-        .cli_json(&["presence", "claim", "tally", "--alias", "tally-desk"])
+        .cli_json(&["presence", "claim", "carol", "--alias", "carol-desk"])
         .await;
 
     let bind_bg = daemon
@@ -1159,7 +1170,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
                 "presence",
                 "bind",
                 "--seat",
-                "tally",
+                "carol",
                 "--from-claude-session",
                 "--pid",
                 &my_pid.to_string(),
@@ -1192,7 +1203,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
             "sessionId": "sess-fork-1",
             "messagingSocketPath": "/tmp/cc-socks/fork.sock",
             "kind": "interactive",
-            "name": "Tally-5.2 ⑂",
+            "name": "Carol-5.2 ⑂",
             "nameSource": "user"
         }))
         .unwrap(),
@@ -1204,7 +1215,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
                 "presence",
                 "bind",
                 "--seat",
-                "tally",
+                "carol",
                 "--from-claude-session",
                 fork_path.to_str().unwrap(),
             ],
@@ -1225,11 +1236,11 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     let synth_interchange = daemon.dir.0.join("synth-interchange");
     std::fs::create_dir_all(synth_interchange.join("mail")).unwrap();
     std::fs::create_dir_all(synth_interchange.join("state")).unwrap();
-    let letter1_bytes = b"---\nfrom: crest\nto: tally\nsubject: Live shadow check\n---\nping\n";
-    std::fs::write(synth_interchange.join("mail/01-to-tally.md"), letter1_bytes).unwrap();
+    let letter1_bytes = b"---\nfrom: eve\nto: carol\nsubject: Live shadow check\n---\nping\n";
+    std::fs::write(synth_interchange.join("mail/01-to-carol.md"), letter1_bytes).unwrap();
     std::fs::write(
-        synth_interchange.join("mail/02-to-genga.md"),
-        "---\nfrom: crest\nto: genga\nsubject: Offline shadow check\n---\nping\n",
+        synth_interchange.join("mail/02-to-dave.md"),
+        "---\nfrom: eve\nto: dave\nsubject: Offline shadow check\n---\nping\n",
     )
     .unwrap();
     std::fs::write(synth_interchange.join("state/acks.jsonl"), "").unwrap();
@@ -1274,9 +1285,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
         let interchange = synth_interchange.clone();
         let out_file = daemon.dir.0.join("unreachable-shadow.jsonl");
         move || {
-            Command::new(bin_path())
-                .env_remove("REX_WAVE_TOKEN")
-                .env_remove("T3CODE_THREAD_ID")
+            rex_wave_at(&sock)
                 .args([
                     "--socket",
                     sock.to_str().unwrap(),
@@ -1323,13 +1332,13 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     let sha1 = shadow_raw
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|v| v["decision"] == "ring" && v["seat"] == "tally")
+        .find(|v| v["decision"] == "ring" && v["seat"] == "carol")
         .and_then(|v| v["referent"]["sha256"].as_str().map(str::to_owned))
-        .expect("shadow.jsonl must contain ring referent sha256 for tally");
+        .expect("shadow.jsonl must contain ring referent sha256 for carol");
     let alias_acks_path = daemon.dir.0.join("alias-acks.jsonl");
     std::fs::write(
         &alias_acks_path,
-        format!("{{\"acked_by\":\"Tally-Desk\",\"letter\":\"mail/01-to-tally.md\",\"sha256\":\"{sha1}\"}}\n"),
+        format!("{{\"acked_by\":\"Carol-Desk\",\"letter\":\"mail/01-to-carol.md\",\"sha256\":\"{sha1}\"}}\n"),
     )
     .unwrap();
 
@@ -1370,7 +1379,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
     );
 
     let partial_fixtures_path = daemon.dir.0.join("gate1-partial.jsonl");
-    std::fs::write(&partial_fixtures_path, r#"{"id":"genga-stale-six-days"}"#).unwrap();
+    std::fs::write(&partial_fixtures_path, r#"{"id":"seat-stale-six-days"}"#).unwrap();
     let partial_score = daemon
         .cli(
             &[
@@ -1406,7 +1415,11 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
 
 #[tokio::test]
 async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
-    let daemon = IsolatedDaemon::start("presence-grace").await;
+    // A shortened reconnect grace window keeps this lifecycle test fast; the
+    // 15 s production constant is pinned by `rex-wave-notify`'s unit tests.
+    const GRACE_MS: u64 = 1_000;
+    let grace = Duration::from_millis(GRACE_MS);
+    let daemon = IsolatedDaemon::start_with_grace("presence-grace", GRACE_MS).await;
 
     daemon.cli_json(&["presence", "claim", "sam"]).await;
     let sam_tok = daemon.cli_json(&["token", "--seat", "sam"]).await["token"]
@@ -1414,9 +1427,7 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
         .unwrap()
         .to_owned();
 
-    let mut hold_child = Command::new(bin_path())
-        .env_remove("REX_WAVE_TOKEN")
-        .env_remove("T3CODE_THREAD_ID")
+    let mut hold_child = rex_wave_at(&daemon.sock)
         .args([
             "--socket",
             daemon.sock.to_str().unwrap(),
@@ -1521,7 +1532,8 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
     let letter_path = promoted["value"]["path"].as_str().unwrap().to_owned();
     let letter_sha = promoted["value"]["sha256"].as_str().unwrap().to_owned();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Let Herald fold the Banked event, then confirm the card is held back.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let inbox_during_grace = http_request(daemon.http_addr, "GET", "/v1/inbox", &[], None).await;
     assert_eq!(inbox_during_grace.status, 200);
     assert!(
@@ -1530,10 +1542,15 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
             .unwrap()
             .iter()
             .any(|n| n["draft"]["dedupe"] == "mail-unrung:sam"),
-        "MailUnrung must stay suppressed during the 15 s reconnect grace window"
+        "MailUnrung must stay suppressed during the reconnect grace window"
+    );
+    assert!(
+        unbind_instant.elapsed() < grace,
+        "the suppression check must run inside the {grace:?} grace window, ran at {:?}",
+        unbind_instant.elapsed()
     );
 
-    let raised_card = tokio::time::timeout(Duration::from_secs(20), async {
+    let raised_card = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let resp = http_request(daemon.http_addr, "GET", "/v1/inbox", &[], None).await;
             assert_eq!(resp.status, 200);
@@ -1550,11 +1567,13 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
         }
     })
     .await
-    .expect("HeraldHandle grace timer flushed MailUnrung after 15 s with zero extra events");
+    .expect(
+        "HeraldHandle grace timer flushed MailUnrung after the grace window with zero extra events",
+    );
     let grace_elapsed = unbind_instant.elapsed();
     assert!(
-        grace_elapsed >= Duration::from_millis(14_500),
-        "MailUnrung must wait for the 15 s reconnect grace window, fired after {grace_elapsed:?}"
+        grace_elapsed >= grace * 4 / 5 && grace_elapsed < Duration::from_secs(5),
+        "MailUnrung must wait for the {grace:?} reconnect grace window, fired after {grace_elapsed:?}"
     );
     assert_eq!(raised_card["draft"]["kind"]["kind"], "mail_unrung");
     assert_eq!(raised_card["draft"]["kind"]["unread_count"], 1);
@@ -1649,9 +1668,7 @@ async fn e2e_phase3_presence_hold_restart_rebinds_until_replaced() {
         .to_owned();
 
     let mut hold_child = ChildGuard(
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
+        rex_wave_at(&daemon.sock)
             .args([
                 "--socket",
                 daemon.sock.to_str().unwrap(),
@@ -1755,11 +1772,11 @@ async fn e2e_phase3_presence_hold_restart_rebinds_until_replaced() {
 }
 
 #[tokio::test]
-async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
-    let daemon = IsolatedDaemon::start("pr20-soak").await;
+async fn e2e_pr20_seed_interchange_horizon_operator_guard_and_resident_manifest() {
+    let daemon = IsolatedDaemon::start_with_house("pr20-soak", house_fixture()).await;
 
     // 1. Build a synthetic interchange dir with roster.json, sibling .watchers/mailwatch-routes.json,
-    //    and historical + post-horizon letters plus golem/cc letters.
+    //    and historical + post-horizon letters plus operator/cc letters.
     let estate = daemon.dir.0.join("estate");
     let interchange = estate.join("interchange");
     std::fs::create_dir_all(interchange.join("postmaster/state")).unwrap();
@@ -1772,9 +1789,9 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
         serde_json::to_vec(&json!({
             "schema": "house-roster/2",
             "seats": {
-                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
-                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" },
-                "rd-3": { "name": "auburn-cepheus", "box": "/tmp/interchange/to-muse" }
+                "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
+                "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" },
+                "rd-3": { "name": "heidi", "box": "/tmp/interchange/to-muse" }
             }
         }))
         .unwrap(),
@@ -1783,15 +1800,15 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
     std::fs::write(
         estate.join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&json!({
-            "tally": { "aliases": ["tally", "tally_votp", "Tally-VampOTP-CTO"] },
-            "auburn-cepheus": { "aliases": ["muse", "auburn-cephus"] }
+            "carol": { "aliases": ["carol", "carol_old", "Carol-legacy"] },
+            "heidi": { "aliases": ["muse", "heidi-old"] }
         }))
         .unwrap(),
     )
     .unwrap();
     std::fs::write(interchange.join("state/acks.jsonl"), "").unwrap();
 
-    // 2. Dry-run seed-interchange works offline and skips `golem`.
+    // 2. Dry-run seed-interchange works offline and skips `operator`.
     let dry_seed = daemon
         .cli_json(&[
             "presence",
@@ -1807,7 +1824,7 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v == "golem")
+            .any(|v| v == "operator")
     );
 
     // 3. Live seed-interchange applies durable aliases BEFORE any seat binds.
@@ -1822,14 +1839,14 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
     assert_eq!(live_seed["dry_run"], false);
     assert!(live_seed["applied_count"].as_u64().unwrap() >= 3);
 
-    // 4. Q3 structural guard: binding or claiming `golem` as Active is denied by the daemon.
-    let golem_bind = daemon
+    // 4. Q3 structural guard: binding or claiming `operator` as Active is denied by the daemon.
+    let operator_bind = daemon
         .cli(
             &[
                 "presence",
                 "bind",
                 "--seat",
-                "golem",
+                "operator",
                 "--self-watcher",
                 "desktop",
             ],
@@ -1837,65 +1854,66 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
             &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
         )
         .await;
-    assert!(!golem_bind.status.success(), "golem bind must be denied");
+    assert!(
+        !operator_bind.status.success(),
+        "operator bind must be denied"
+    );
 
-    let golem_claim = daemon
+    let operator_claim = daemon
         .cli(
-            &["presence", "claim", "golem", "--status", "active"],
+            &["presence", "claim", "operator", "--status", "active"],
             &[],
             &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
         )
         .await;
     assert!(
-        !golem_claim.status.success(),
-        "golem active claim must be denied"
+        !operator_claim.status.success(),
+        "operator active claim must be denied"
     );
 
-    // 5. Bind `tally` with explicit `--mail-horizon` (no `--alias` needed; seeded aliases remain!).
+    // 5. Bind `carol` with explicit `--mail-horizon` (no `--alias` needed; seeded aliases remain!).
     let horizon_ms: u64 = 1_795_000_000_000;
-    let tally_bind = daemon
+    let carol_bind = daemon
         .cli_json(&[
             "presence",
             "bind",
             "--seat",
-            "tally",
+            "carol",
             "--self-watcher",
             "claude-hook",
             "--mail-horizon",
             &horizon_ms.to_string(),
         ])
         .await;
-    assert_eq!(tally_bind["value"]["seat"], "tally");
+    assert_eq!(carol_bind["value"]["seat"], "carol");
 
-    let resolved_alias = daemon
-        .cli_json(&["presence", "resolve", "tally_votp"])
-        .await;
-    assert_eq!(resolved_alias["value"]["record"]["seat"], "tally");
+    let resolved_alias = daemon.cli_json(&["presence", "resolve", "carol_old"]).await;
+    assert_eq!(resolved_alias["value"]["record"]["seat"], "carol");
     assert_eq!(
         resolved_alias["value"]["record"]["mail_horizon_at"],
         horizon_ms
     );
 
-    // 6. Write pre-horizon letter to `tally_votp`, post-horizon letter to `tally_votp`,
-    //    plus letters to `golem` and `cc`.
+    // 6. Write pre-horizon letter to `carol_old`, post-horizon letter to `carol_old`,
+    //    plus letters to `operator` and `cc`.
     std::fs::write(
-        interchange.join("mail/1792431783570-old-to-tally-votp.md"),
-        "---\nfrom: genga\nto: tally_votp\nsubject: Old history\n---\nold\n",
+        interchange.join("mail/1792431783570-old-to-carol-votp.md"),
+        "---\nfrom: dave\nto: carol_old\nsubject: Old history\n---\nold\n",
     )
     .unwrap();
     std::fs::write(
-        interchange.join("mail/1795284326392-new-to-tally-votp.md"),
-        "---\nfrom: genga\nto: tally_votp\nsubject: Post horizon\n---\nnew\n",
+        interchange.join("mail/1795284326392-new-to-carol-votp.md"),
+        "---\nfrom: dave\nto: carol_old\nsubject: Post horizon\n---\nnew\n",
     )
     .unwrap();
     std::fs::write(
-        interchange.join("mail/1795284326400-to-golem.md"),
-        "---\nfrom: tally\nto: golem\nsubject: Operator note\n---\noperator\n",
+        interchange.join("mail/1795284326400-to-operator.md"),
+        "---\nfrom: carol\nto: operator\nsubject: Operator note\n---\noperator\n",
     )
     .unwrap();
     std::fs::write(
         interchange.join("mail/1795284326401-to-cc.md"),
-        "---\nfrom: tally\nto: cc\nsubject: Group note\n---\ncc\n",
+        "---\nfrom: carol\nto: cc\nsubject: Group note\n---\ncc\n",
     )
     .unwrap();
 
@@ -1932,25 +1950,25 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
         .cli_json(&[
             "presence",
             "claim",
-            "fathom",
+            "frank",
             "--role",
             "card-resident",
             "--work-class",
             "class_b",
             "--avatar",
-            "avatars/fathom.png",
+            "avatars/frank.png",
             "--home-dir",
-            "/Users/golem/agent-folder/resident_memories/fathom",
+            "/workspace/seats/frank",
             "--start-cmd",
-            "claude --seat fathom",
+            "claude --seat frank",
             "--resume-cmd",
-            "claude --resume fathom",
+            "claude --resume frank",
             "--rex-target",
-            "block:fathom-card",
+            "block:frank-card",
         ])
         .await;
     assert_eq!(claimed["value"]["work_class"], "class_b");
-    assert_eq!(claimed["value"]["rex_target"], "block:fathom-card");
+    assert_eq!(claimed["value"]["rex_target"], "block:frank-card");
 
     let manifest_path = daemon.dir.0.join("residents.json");
     let exported = daemon
@@ -1973,36 +1991,33 @@ async fn e2e_pr20_seed_interchange_horizon_golem_guard_and_resident_manifest() {
         .await;
     assert_eq!(imported["imported_count"], exported["seat_count"]);
 
-    let fathom_res = daemon2.cli_json(&["presence", "resolve", "fathom"]).await;
-    assert_eq!(fathom_res["value"]["record"]["work_class"], "class_b");
+    let frank_res = daemon2.cli_json(&["presence", "resolve", "frank"]).await;
+    assert_eq!(frank_res["value"]["record"]["work_class"], "class_b");
+    assert_eq!(frank_res["value"]["record"]["avatar"], "avatars/frank.png");
     assert_eq!(
-        fathom_res["value"]["record"]["avatar"],
-        "avatars/fathom.png"
+        frank_res["value"]["record"]["home_dir"],
+        "/workspace/seats/frank"
     );
     assert_eq!(
-        fathom_res["value"]["record"]["home_dir"],
-        "/Users/golem/agent-folder/resident_memories/fathom"
+        frank_res["value"]["record"]["start_cmd"],
+        "claude --seat frank"
     );
     assert_eq!(
-        fathom_res["value"]["record"]["start_cmd"],
-        "claude --seat fathom"
+        frank_res["value"]["record"]["resume_cmd"],
+        "claude --resume frank"
     );
     assert_eq!(
-        fathom_res["value"]["record"]["resume_cmd"],
-        "claude --resume fathom"
-    );
-    assert_eq!(
-        fathom_res["value"]["record"]["rex_target"],
-        "block:fathom-card"
+        frank_res["value"]["record"]["rex_target"],
+        "block:frank-card"
     );
 }
 
 #[tokio::test]
-async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
+async fn e2e_pr21_operator_only_manifest_exec_fields_and_carol_1seat_soak() {
     let daemon = IsolatedDaemon::start("pr21-guard").await;
 
-    // Mint a Seat token for `tally` and a Worker token for `w1/coder`.
-    let tally_tok = daemon.cli_json(&["token", "--seat", "tally"]).await["token"]
+    // Mint a Seat token for `carol` and a Worker token for `w1/coder`.
+    let carol_tok = daemon.cli_json(&["token", "--seat", "carol"]).await["token"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2012,8 +2027,8 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         .to_owned();
 
     // Build a synthetic interchange directory + two manifests:
-    //  - a 1-seat manifest for `tally` with NO exec fields (tests upfront operator check)
-    //  - a manifest for `tally` WITH `start_cmd` / `resume_cmd`
+    //  - a 1-seat manifest for `carol` with NO exec fields (tests upfront operator check)
+    //  - a manifest for `carol` WITH `start_cmd` / `resume_cmd`
     let estate = daemon.dir.0.join("estate");
     let interchange = estate.join("interchange");
     std::fs::create_dir_all(interchange.join("postmaster/state")).unwrap();
@@ -2025,8 +2040,8 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         serde_json::to_vec(&json!({
             "schema": "house-roster/2",
             "seats": {
-                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
-                "rd-2": { "name": "golem", "box": "/tmp/interchange/to-golem" },
+                "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
+                "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" },
                 "rd-3": { "name": "nodal", "box": "/tmp/interchange/to-nodal" }
             }
         }))
@@ -2036,20 +2051,20 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
     std::fs::write(
         estate.join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&json!({
-            "tally": { "aliases": ["tally", "tally_votp"] }
+            "carol": { "aliases": ["carol", "carol_old"] }
         }))
         .unwrap(),
     )
     .unwrap();
     std::fs::write(interchange.join("state/acks.jsonl"), "").unwrap();
 
-    let self_manifest = daemon.dir.0.join("tally-only.json");
+    let self_manifest = daemon.dir.0.join("carol-only.json");
     std::fs::write(
         &self_manifest,
         serde_json::to_vec_pretty(&json!({
             "schema": "rex-wave-resident-manifest/1",
             "seats": [{
-                "seat": "tally",
+                "seat": "carol",
                 "role": "estate-desk"
             }]
         }))
@@ -2057,15 +2072,15 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
     )
     .unwrap();
 
-    let exec_manifest = daemon.dir.0.join("tally-exec.json");
+    let exec_manifest = daemon.dir.0.join("carol-exec.json");
     std::fs::write(
         &exec_manifest,
         serde_json::to_vec_pretty(&json!({
             "schema": "rex-wave-resident-manifest/1",
             "seats": [{
-                "seat": "tally",
+                "seat": "carol",
                 "role": "estate-desk",
-                "start_cmd": "claude --name Tally-5.2",
+                "start_cmd": "claude --name Carol-5.2",
                 "resume_cmd": "claude --resume 59e9053e"
             }]
         }))
@@ -2092,12 +2107,12 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         );
     };
 
-    // 1. Both Seat (`tally`) and Worker (`w1/coder`) tokens are DENIED on:
-    //    - `presence import-manifest` (even a 1-seat manifest for `tally` with no exec fields!)
+    // 1. Both Seat (`carol`) and Worker (`w1/coder`) tokens are DENIED on:
+    //    - `presence import-manifest` (even a 1-seat manifest for `carol` with no exec fields!)
     //    - `presence seed-interchange`
-    //    - `presence claim tally --start-cmd ...` / `--resume-cmd ...`
+    //    - `presence claim carol --start-cmd ...` / `--resume-cmd ...`
     for (who, tok) in [
-        ("seat:tally", tally_tok.as_str()),
+        ("seat:carol", carol_tok.as_str()),
         ("worker:w1/coder", worker_tok.as_str()),
     ] {
         let out_import = daemon
@@ -2141,7 +2156,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
                     tok,
                     "presence",
                     "claim",
-                    "tally",
+                    "carol",
                     "--start-cmd",
                     "sh -c evil",
                 ],
@@ -2159,7 +2174,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
                     tok,
                     "presence",
                     "claim",
-                    "tally",
+                    "carol",
                     "--resume-cmd",
                     "sh -c evil",
                 ],
@@ -2180,7 +2195,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
                 ("Authorization", &auth_hdr),
                 ("Content-Type", "application/json"),
             ],
-            Some(r#"{"seat":"tally","start_cmd":"sh -c evil"}"#),
+            Some(r#"{"seat":"carol","start_cmd":"sh -c evil"}"#),
         )
         .await;
         assert_eq!(
@@ -2192,7 +2207,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         assert_eq!(http_res.json()["error"], "not_found");
     }
 
-    // Verify no denied call created `tally`.
+    // Verify no denied call created `carol`.
     let list_before = daemon.cli_json(&["presence", "list"]).await;
     assert_eq!(
         list_before["value"]["seats"].as_array().unwrap().len(),
@@ -2216,7 +2231,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         "POST",
         "/v1/call/presence_claim",
         &[("Content-Type", "application/json")],
-        Some(r#"{"seat":"tally","start_cmd":"claude --name Tally-5.2"}"#),
+        Some(r#"{"seat":"carol","start_cmd":"claude --name Carol-5.2"}"#),
     )
     .await;
     assert_eq!(
@@ -2225,45 +2240,45 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         "operator HTTP presence_claim with start_cmd must succeed: {}",
         String::from_utf8_lossy(&op_http.body)
     );
-    let resolved = daemon.cli_json(&["presence", "resolve", "tally"]).await;
+    let resolved = daemon.cli_json(&["presence", "resolve", "carol"]).await;
     assert_eq!(
         resolved["value"]["record"]["start_cmd"],
-        "claude --name Tally-5.2"
+        "claude --name Carol-5.2"
     );
     assert_eq!(
         resolved["value"]["record"]["resume_cmd"],
         "claude --resume 59e9053e"
     );
 
-    // 3. `tally`'s seat token cannot clear operator-set `start_cmd`/`resume_cmd` via `--replace`,
+    // 3. `carol`'s seat token cannot clear operator-set `start_cmd`/`resume_cmd` via `--replace`,
     //    but CAN still update its own non-exec metadata while preserving them.
     let replace_denied = daemon
         .cli(
             &[
                 "--json",
                 "--token",
-                &tally_tok,
+                &carol_tok,
                 "presence",
                 "claim",
-                "tally",
+                "carol",
                 "--replace",
-                "tally",
+                "carol",
             ],
             &[],
             &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
         )
         .await;
-    assert_denied("seat:tally --replace clearing exec fields", &replace_denied);
+    assert_denied("seat:carol --replace clearing exec fields", &replace_denied);
 
     let role_update = daemon
         .cli(
             &[
                 "--json",
                 "--token",
-                &tally_tok,
+                &carol_tok,
                 "presence",
                 "claim",
-                "tally",
+                "carol",
                 "--role",
                 "desk-keeper",
             ],
@@ -2276,22 +2291,22 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         "seat updating its own non-exec role must succeed: {}",
         String::from_utf8_lossy(&role_update.stderr)
     );
-    let after_role = daemon.cli_json(&["presence", "resolve", "tally"]).await;
+    let after_role = daemon.cli_json(&["presence", "resolve", "carol"]).await;
     assert_eq!(
         after_role["value"]["record"]["role"]["value"],
         "desk-keeper"
     );
     assert_eq!(
         after_role["value"]["record"]["start_cmd"],
-        "claude --name Tally-5.2"
+        "claude --name Carol-5.2"
     );
     assert_eq!(
         after_role["value"]["record"]["resume_cmd"],
         "claude --resume 59e9053e"
     );
 
-    // 4. Smoke-test Tally's exact 4-step 1-seat live-soak flow on a clean isolated daemon.
-    let soak = IsolatedDaemon::start("pr21-tally-soak").await;
+    // 4. Smoke-test Carol's exact 4-step 1-seat live-soak flow on a clean isolated daemon.
+    let soak = IsolatedDaemon::start("pr21-carol-soak").await;
     let soak_estate = soak.dir.0.join("estate");
     let soak_interchange = soak_estate.join("interchange");
     std::fs::create_dir_all(soak_interchange.join("postmaster/state")).unwrap();
@@ -2303,9 +2318,9 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         serde_json::to_vec(&json!({
             "schema": "house-roster/2",
             "seats": {
-                "rd-1": { "name": "tally", "box": "/tmp/interchange/to-tally" },
+                "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
                 "rd-2": { "name": "nodal", "box": "/tmp/interchange/to-nodal" },
-                "rd-3": { "name": "golem", "box": "/tmp/interchange/to-golem" }
+                "rd-3": { "name": "operator", "box": "/tmp/interchange/to-operator" }
             }
         }))
         .unwrap(),
@@ -2314,16 +2329,16 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
     std::fs::write(
         soak_estate.join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&json!({
-            "tally": { "aliases": ["tally", "tally_votp"] }
+            "carol": { "aliases": ["carol", "carol_old"] }
         }))
         .unwrap(),
     )
     .unwrap();
     std::fs::write(soak_interchange.join("state/acks.jsonl"), "").unwrap();
-    // Pre-bind historical letter to `tally` (must be skipped by auto mail horizon on bind).
+    // Pre-bind historical letter to `carol` (must be skipped by auto mail horizon on bind).
     std::fs::write(
-        soak_interchange.join("mail/1792431783570-pre-bind-to-tally.md"),
-        "---\nfrom: crest\nto: tally\ndate: 2026-10-18 12:00 UTC\nsubject: Historical\n---\nold\n",
+        soak_interchange.join("mail/1792431783570-pre-bind-to-carol.md"),
+        "---\nfrom: eve\nto: carol\ndate: 2026-10-18 12:00 UTC\nsubject: Historical\n---\nold\n",
     )
     .unwrap();
     let tree_before_seed = snapshot_tree(&soak_interchange);
@@ -2357,24 +2372,24 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v == "golem")
+            .any(|v| v == "operator")
     );
     assert_eq!(snapshot_tree(&soak_interchange), tree_before_seed);
 
-    // Step 3: Manual `presence bind --seat tally --from-claude-session <mock_session_json> --ttl 24h`
+    // Step 3: Manual `presence bind --seat carol --from-claude-session <mock_session_json> --ttl 24h`
     let my_pid = std::process::id();
     let my_start = current_process_start().expect("current process start time");
-    let session_json_path = soak.dir.0.join("tally-claude-session.json");
-    let mock_sock = soak.dir.0.join("tally-claude.sock");
+    let session_json_path = soak.dir.0.join("carol-claude-session.json");
+    let mock_sock = soak.dir.0.join("carol-claude.sock");
     std::fs::write(
         &session_json_path,
         serde_json::to_vec(&json!({
             "pid": my_pid,
             "procStart": my_start,
-            "sessionId": "sess-tally-soak-1",
+            "sessionId": "sess-carol-soak-1",
             "messagingSocketPath": mock_sock.to_str().unwrap(),
             "kind": "interactive",
-            "name": "Tally-5.2",
+            "name": "Carol-5.2",
             "nameSource": "user"
         }))
         .unwrap(),
@@ -2386,7 +2401,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
             "presence",
             "bind",
             "--seat",
-            "tally",
+            "carol",
             "--from-claude-session",
             session_json_path.to_str().unwrap(),
             "--ttl",
@@ -2394,29 +2409,27 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         ])
         .await;
     assert_eq!(bind["reply"], "presence_bind");
-    assert_eq!(bind["value"]["seat"], "tally");
+    assert_eq!(bind["value"]["seat"], "carol");
     assert_eq!(bind["value"]["endpoint"]["transport"], "claude_session");
     assert!(
         !mock_sock.exists(),
         "presence bind must never create or connect to messagingSocketPath"
     );
 
-    let tally_rec = soak.cli_json(&["presence", "resolve", "tally_votp"]).await;
-    assert_eq!(tally_rec["value"]["record"]["seat"], "tally");
-    let horizon_ms = tally_rec["value"]["record"]["mail_horizon_at"]
+    let carol_rec = soak.cli_json(&["presence", "resolve", "carol_old"]).await;
+    assert_eq!(carol_rec["value"]["record"]["seat"], "carol");
+    let horizon_ms = carol_rec["value"]["record"]["mail_horizon_at"]
         .as_u64()
         .expect("bind auto-sets mail_horizon_at");
     let live_list = soak.cli_json(&["presence", "list", "--live-only"]).await;
     let live_seats = live_list["value"]["seats"].as_array().unwrap();
     assert_eq!(live_seats.len(), 1);
-    assert_eq!(live_seats[0]["record"]["seat"], "tally");
+    assert_eq!(live_seats[0]["record"]["seat"], "carol");
 
     // Step 4: `mail shadow --watch` writing outside `interchange/`
-    let shadow_out = soak.dir.0.join("tally-soak-shadow.jsonl");
+    let shadow_out = soak.dir.0.join("carol-soak-shadow.jsonl");
     let _watch_guard = ChildGuard(
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
-            .env_remove("T3CODE_THREAD_ID")
+        rex_wave_at(&soak.sock)
             .args([
                 "--socket",
                 soak.sock.to_str().unwrap(),
@@ -2455,26 +2468,26 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         "mail shadow --watch must never mutate interchange"
     );
 
-    // Drop a new post-bind letter addressed to Tally's alias (`tally_votp`).
+    // Drop a new post-bind letter addressed to Carol's alias (`carol_old`).
     let post_id_ms = horizon_ms + 1_000;
-    let new_letter_name = format!("{post_id_ms}-post-bind-to-tally-votp.md");
+    let new_letter_name = format!("{post_id_ms}-post-bind-to-carol-votp.md");
     std::fs::write(
         soak_interchange.join("mail").join(&new_letter_name),
         format!(
-            "---\nfrom: crest\nto: tally_votp\nid: {post_id_ms}\nsubject: Live 1-seat soak ring\n---\nhello tally\n"
+            "---\nfrom: eve\nto: carol_old\nid: {post_id_ms}\nsubject: Live 1-seat soak ring\n---\nhello carol\n"
         ),
     )
     .unwrap();
     let tree_after_letter = snapshot_tree(&soak_interchange);
 
-    // Wait for the running `--watch` loop to emit a Ring decision for `tally`.
+    // Wait for the running `--watch` loop to emit a Ring decision for `carol`.
     let ring_line = tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             if let Ok(text) = std::fs::read_to_string(&shadow_out) {
                 for line in text.lines() {
                     if let Ok(v) = serde_json::from_str::<Value>(line)
                         && v["decision"] == "ring"
-                        && v["seat"] == "tally"
+                        && v["seat"] == "carol"
                     {
                         return v;
                     }
@@ -2484,7 +2497,7 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
         }
     })
     .await
-    .expect("mail shadow --watch emitted ring for post-bind letter to tally_votp");
+    .expect("mail shadow --watch emitted ring for post-bind letter to carol_old");
 
     assert_eq!(ring_line["channel"], "claude_messaging_socket");
     assert_eq!(
@@ -2504,7 +2517,11 @@ async fn e2e_pr21_operator_only_manifest_exec_fields_and_tally_1seat_soak() {
 
 #[tokio::test]
 async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
-    let daemon = IsolatedDaemon::start("pr22-cli-soak").await;
+    // A non-default operator surface proves `house.json` reaches both the CLI
+    // and the running daemon's Presence decider.
+    let mut house = house_fixture();
+    house["operator_seat"] = json!("bob");
+    let daemon = IsolatedDaemon::start_with_house("pr22-cli-soak", house).await;
     let estate = daemon.dir.0.join("estate");
     let interchange = estate.join("interchange");
     std::fs::create_dir_all(interchange.join("state")).unwrap();
@@ -2513,7 +2530,7 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
 
     std::fs::write(
         interchange.join("state/bb-knock-routes.tsv"),
-        "seat\tbb_thread_id\tnote\nfathom\tthr_abc\treview\n",
+        "seat\tbb_thread_id\tnote\nfrank\tthr_abc\treview\nbob\tthr_op\toperator surface\n",
     )
     .unwrap();
     let seats_tsv = estate.join("seats.tsv");
@@ -2536,9 +2553,61 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
         .iter()
         .filter_map(|c| c["seat"].as_str())
         .collect();
-    assert!(seeded_seats.contains(&"fathom"));
+    assert!(seeded_seats.contains(&"frank"));
     assert!(seeded_seats.contains(&"chroma"));
     assert!(seeded_seats.contains(&"neon"));
+    assert!(!seeded_seats.contains(&"bob"));
+    assert!(
+        dry_seed["skipped_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "bob"),
+        "the profile's operator seat is skipped by seeding: {dry_seed}"
+    );
+
+    let bob_bind = daemon
+        .cli(
+            &[
+                "presence",
+                "bind",
+                "--seat",
+                "bob",
+                "--self-watcher",
+                "desktop",
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert!(
+        !bob_bind.status.success(),
+        "profile operator bind must be denied"
+    );
+    assert!(
+        String::from_utf8_lossy(&bob_bind.stderr).contains("operator surface"),
+        "stderr: {}",
+        String::from_utf8_lossy(&bob_bind.stderr)
+    );
+    let default_name_bind = daemon
+        .cli(
+            &[
+                "presence",
+                "bind",
+                "--seat",
+                "operator",
+                "--self-watcher",
+                "desktop",
+            ],
+            &[],
+            &["REX_WAVE_TOKEN", "T3CODE_THREAD_ID"],
+        )
+        .await;
+    assert!(
+        default_name_bind.status.success(),
+        "with a profile operator of `bob`, `operator` is an ordinary seat: {}",
+        String::from_utf8_lossy(&default_name_bind.stderr)
+    );
 
     // Score a synthetic shadow log with `--mailwatch-seen` in both `--json` and text modes.
     let sha1 = "a".repeat(64);
@@ -2550,9 +2619,9 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
         &shadow_path,
         format!(
             concat!(
-                "{{\"meta\":\"aliases\",\"aliases\":{{\"tally_votp\":\"tally\"}}}}\n",
-                "{{\"decision\":\"ring\",\"seat\":\"tally\",\"incarnation_id\":\"inc_1\",\"channel\":\"claude_messaging_socket\",\"referent\":{{\"path\":\"mail/1.md\",\"sha16\":\"{s1_16}\",\"sha256\":\"{sha1}\"}},\"time_basis\":\"letter_id_ms\"}}\n",
-                "{{\"decision\":\"ring\",\"seat\":\"crest\",\"incarnation_id\":\"inc_2\",\"channel\":\"self_watcher_lease\",\"referent\":{{\"path\":\"mail/2.md\",\"sha16\":\"{s2_16}\",\"sha256\":\"{sha2}\"}},\"time_basis\":\"letter_id_ms\"}}\n"
+                "{{\"meta\":\"aliases\",\"aliases\":{{\"carol_old\":\"carol\"}}}}\n",
+                "{{\"decision\":\"ring\",\"seat\":\"carol\",\"incarnation_id\":\"inc_1\",\"channel\":\"claude_messaging_socket\",\"referent\":{{\"path\":\"mail/1.md\",\"sha16\":\"{s1_16}\",\"sha256\":\"{sha1}\"}},\"time_basis\":\"letter_id_ms\"}}\n",
+                "{{\"decision\":\"ring\",\"seat\":\"eve\",\"incarnation_id\":\"inc_2\",\"channel\":\"self_watcher_lease\",\"referent\":{{\"path\":\"mail/2.md\",\"sha16\":\"{s2_16}\",\"sha256\":\"{sha2}\"}},\"time_basis\":\"letter_id_ms\"}}\n"
             ),
             s1_16 = &sha1[..16],
             s2_16 = &sha2[..16],
@@ -2563,16 +2632,16 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
     .unwrap();
     std::fs::write(
         &acks_path,
-        format!(r#"{{"acked_by":"tally","letter":"mail/1.md","sha256":"{sha1}"}}"#),
+        format!(r#"{{"acked_by":"carol","letter":"mail/1.md","sha256":"{sha1}"}}"#),
     )
     .unwrap();
     std::fs::write(
         &seen_path,
         format!(
             concat!(
-                "{{\"key\":\"shared-tally_votp:{s1_16}\",\"outcome\":\"defer:missing\",\"attempts\":1,\"ts\":\"2026-11-21T19:00:00Z\"}}\n",
-                "{{\"key\":\"shared-tally_votp:{s1_16}\",\"outcome\":\"rung\",\"attempts\":2,\"ts\":\"2026-11-21T19:01:00Z\"}}\n",
-                "{{\"key\":\"shared-crest:{s2_16}\",\"outcome\":\"own-knocker\",\"attempts\":1,\"ts\":\"2026-11-21T19:02:00Z\"}}\n"
+                "{{\"key\":\"shared-carol_old:{s1_16}\",\"outcome\":\"defer:missing\",\"attempts\":1,\"ts\":\"2026-11-21T19:00:00Z\"}}\n",
+                "{{\"key\":\"shared-carol_old:{s1_16}\",\"outcome\":\"rung\",\"attempts\":2,\"ts\":\"2026-11-21T19:01:00Z\"}}\n",
+                "{{\"key\":\"shared-eve:{s2_16}\",\"outcome\":\"own-knocker\",\"attempts\":1,\"ts\":\"2026-11-21T19:02:00Z\"}}\n"
             ),
             s1_16 = &sha1[..16],
             s2_16 = &sha2[..16],
@@ -2630,9 +2699,7 @@ fn spawn_shadow_watch(
     out: &Path,
     sock: &Path,
 ) -> (ChildGuard, std::sync::mpsc::Receiver<String>) {
-    let mut child = Command::new(bin_path())
-        .env_remove("REX_WAVE_TOKEN")
-        .env_remove("T3CODE_THREAD_ID")
+    let mut child = rex_wave_at(sock)
         .args([
             "--socket",
             sock.to_str().unwrap(),
@@ -2741,7 +2808,7 @@ fn pr24_cli_shadow_watch_appends_transitions_across_restart_and_scores_two_seen_
     // A symlinked `--out` is refused before anything is appended.
     let link = dir.0.join("link.jsonl");
     std::os::unix::fs::symlink(&out, &link).unwrap();
-    let refused = Command::new(bin_path())
+    let refused = rex_wave_at(&sock)
         .args([
             "--socket",
             sock.to_str().unwrap(),
@@ -2761,7 +2828,7 @@ fn pr24_cli_shadow_watch_appends_transitions_across_restart_and_scores_two_seen_
 
     // `--once` keeps the atomic snapshot overwrite (no watch stamps).
     let snap = dir.0.join("snapshot.jsonl");
-    let once = Command::new(bin_path())
+    let once = rex_wave_at(&sock)
         .args([
             "--socket",
             sock.to_str().unwrap(),
@@ -2820,7 +2887,7 @@ fn pr24_cli_shadow_watch_appends_transitions_across_restart_and_scores_two_seen_
         ),
     )
     .unwrap();
-    let scored = Command::new(bin_path())
+    let scored = rex_wave(&dir.0)
         .args([
             "--json",
             "mail",

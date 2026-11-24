@@ -86,6 +86,9 @@ pub struct DaemonArgs {
     /// without Unix peer-UID checks, while `Authorization: Bearer <token>` pins to a seat or worker.
     #[arg(long)]
     pub http: Option<SocketAddr>,
+    /// `MailUnrung` reconnect grace window in milliseconds (tests shorten it).
+    #[arg(long, default_value_t = rex_wave_notify::RECONNECT_GRACE_MS, hide = true)]
+    pub herald_grace_ms: u64,
 }
 
 pub fn default_t3_home() -> Option<PathBuf> {
@@ -508,6 +511,12 @@ fn journal_thread_resolver(journal: Journal) -> ThreadIdResolver {
 
 pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(), String> {
     let operator = SeatName::parse(&args.operator).map_err(|e| e.to_string())?;
+    if args.herald_grace_ms == 0 {
+        return Err("--herald-grace-ms must be positive".into());
+    }
+    let house =
+        rex_wave_mailbridge::load_house_profile().map_err(|e| format!("house profile: {e}"))?;
+    let presence = Presence::with_house_profile(house);
     let sock_path = resolve_socket_path(socket_override.as_deref());
     let state_dir = state_dir_for(&sock_path);
     let journal_path = args
@@ -593,7 +602,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             mail_writer,
             hub.clone(),
         )),
-        presence: Registry::<Presence>::new(journal.clone(), hub.clone()),
+        presence: presence.registry(journal.clone(), hub.clone()),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -617,7 +626,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         WaveConductor::new(composite_host),
         system(SystemPart::WaveConductor),
     );
-    let (herald, herald_handle) = Herald::with_handle();
+    let herald = Herald::with_grace(Duration::from_millis(args.herald_grace_ms))
+        .with_operator_surface_seat(presence.house().operator_seat.clone());
+    let herald_handle = herald.handle();
     let herald_client = system(SystemPart::Herald);
     let herald_task = spawn_reactor(herald, herald_client.clone());
     let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client);

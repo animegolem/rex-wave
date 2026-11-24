@@ -2,6 +2,7 @@
 //! `(canonical_seat, sha256)` receipt index covering historical house schemas.
 
 use crate::presence::PresenceState;
+use rex_wave_api::presence::is_default_operator_surface_seat;
 use rex_wave_api::{SeatName, Sha256Hex};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,6 +20,9 @@ pub fn normalize_seat_token(raw: &str) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct AliasMap {
     aliases: BTreeMap<String, String>,
+    /// The house's operator surface seat; `None` means
+    /// [`rex_wave_api::presence::DEFAULT_OPERATOR_SURFACE_SEAT`].
+    operator_seat: Option<SeatName>,
 }
 
 impl AliasMap {
@@ -36,10 +40,27 @@ impl AliasMap {
         map
     }
 
+    /// Names the house's operator surface seat (from its `HouseProfile`).
+    pub fn with_operator_seat(mut self, seat: SeatName) -> Self {
+        self.operator_seat = Some(seat);
+        self
+    }
+
+    /// Returns `true` when `raw` names the house's operator surface seat.
+    pub fn is_operator_surface(&self, raw: &str) -> bool {
+        match &self.operator_seat {
+            Some(seat) => raw
+                .trim()
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case(seat.as_str()),
+            None => is_default_operator_surface_seat(raw),
+        }
+    }
+
     /// Builds an alias map from every durable `SeatRecord`'s canonical name and
-    /// aliases in `PresenceState`.
+    /// aliases in `PresenceState`, carrying the state's operator surface seat.
     pub fn from_presence(presence: &PresenceState) -> Self {
-        let mut map = Self::empty();
+        let mut map = Self::empty().with_operator_seat(presence.house().operator_seat.clone());
         for (seat, rec) in presence.seats() {
             let canon = seat.as_str();
             map.insert(canon, canon);
@@ -103,14 +124,33 @@ pub struct NormalizedLetterPath {
     pub basename: String,
 }
 
+/// Strips any house-root prefix ending at `/interchange/` (`~/house/interchange/`,
+/// `/abs/root/interchange/`), unless the prefix is itself inside the interchange
+/// (`mail/...`, `to-<seat>/...`).
+fn strip_house_root_prefix(s: &str) -> Option<&str> {
+    const MARKER: &str = "/interchange/";
+    if s.starts_with("mail/") || s.starts_with("to-") {
+        return None;
+    }
+    let idx = s.find(MARKER)?;
+    Some(&s[idx + MARKER.len()..])
+}
+
 pub fn normalize_letter_path(raw: &str) -> Option<NormalizedLetterPath> {
     let mut s = raw.trim().replace('\\', "/");
+    // Every round strips at least one byte, so the input length bounds the loop.
+    let max_rounds = s.len();
+    let mut rounds = 0usize;
     loop {
+        assert!(
+            rounds <= max_rounds,
+            "normalize_letter_path: prefix stripping must shrink the path"
+        );
+        rounds += 1;
         let next = s
             .strip_prefix("./")
             .or_else(|| s.strip_prefix('/'))
-            .or_else(|| s.strip_prefix("~/agent-folder/"))
-            .or_else(|| s.strip_prefix("agent-folder/"))
+            .or_else(|| strip_house_root_prefix(&s))
             .or_else(|| s.strip_prefix("interchange/"));
         match next {
             Some(rest) => s = rest.to_owned(),

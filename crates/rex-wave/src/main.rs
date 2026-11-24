@@ -3252,8 +3252,9 @@ async fn load_live_presence_state(
     explicit_token: Option<&str>,
     offline: bool,
 ) -> Result<(PresenceState, bool), CliError> {
+    let house = rex_wave_mailbridge::load_house_profile()?;
     if offline {
-        return Ok((PresenceState::default(), false));
+        return Ok((PresenceState::with_house_profile(house), false));
     }
     let cred = resolve_cli_credential(sock_path, explicit_token)?;
     let client = match RemoteClient::connect(
@@ -3272,7 +3273,7 @@ async fn load_live_presence_state(
         }
         Err(e) => return Err(CliError::Api(e)),
     };
-    let mut state = PresenceState::default();
+    let mut state = PresenceState::with_house_profile(house);
     let mut after = Seq::ORIGIN;
     loop {
         let page = client
@@ -3735,7 +3736,8 @@ async fn execute_presence_seed_interchange(
     explicit_token: Option<&str>,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let plan = seed_records_from_interchange_with_options(interchange, seats_tsv)?;
+    let house = rex_wave_mailbridge::load_house_profile()?;
+    let plan = seed_records_from_interchange_with_options(interchange, seats_tsv, &house)?;
     if dry_run {
         if as_json {
             let mut val = plan.to_json_value();

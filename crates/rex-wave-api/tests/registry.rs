@@ -339,7 +339,7 @@ fn phase3_branded_types_conflict_data_and_legacy_room_events_round_trip() {
     }
 
     let op = Principal::Operator {
-        seat: SeatName::parse("golem").unwrap(),
+        seat: SeatName::parse("operator").unwrap(),
     };
     let conflicts = [
         ConflictData::NewerMessage {
@@ -367,7 +367,7 @@ fn phase3_branded_types_conflict_data_and_legacy_room_events_round_trip() {
             actual: 4,
         },
         ConflictData::DuplicateLiveSession {
-            seat: SeatName::parse("genga").unwrap(),
+            seat: SeatName::parse("dave").unwrap(),
             active: IncarnationId::parse("inc-1").unwrap(),
         },
     ];
@@ -520,22 +520,20 @@ fn phase3_branded_types_conflict_data_and_legacy_room_events_round_trip() {
 
 #[test]
 fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
-    let crest = SeatName::parse("crest").unwrap();
-    let tally = SeatName::parse("tally").unwrap();
-    let by_crest = Principal::Seat {
-        seat: crest.clone(),
-    };
+    let eve = SeatName::parse("eve").unwrap();
+    let carol = SeatName::parse("carol").unwrap();
+    let by_eve = Principal::Seat { seat: eve.clone() };
     let prov_self = Provenance {
-        asserted_by: by_crest.clone(),
+        asserted_by: by_eve.clone(),
         verified_how: VerificationKind::SelfWord,
         at: UnixMs(1_795_261_554_000),
     };
     let prov_witnessed = Provenance {
         asserted_by: Principal::Seat {
-            seat: tally.clone(),
+            seat: carol.clone(),
         },
         verified_how: VerificationKind::WitnessedBy {
-            seat: tally.clone(),
+            seat: carol.clone(),
         },
         at: UnixMs(1_795_261_555_000),
     };
@@ -548,7 +546,7 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
     };
 
     let record = SeatRecord {
-        seat: crest.clone(),
+        seat: eve.clone(),
         status: SeatStatus::Active,
         status_provenance: Some(prov_witnessed.clone()),
         aliases: vec![Attested {
@@ -567,12 +565,12 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
         retired_at: None,
         mail_horizon_at: Some(UnixMs(1_795_261_555_000)),
         work_class: Some(WorkClass::ClassA),
-        avatar: Some("avatars/crest.png".into()),
-        home_dir: Some("/Users/golem/agent-folder/resident_memories/crest".into()),
-        start_cmd: Some("claude --seat crest".into()),
+        avatar: Some("avatars/eve.png".into()),
+        home_dir: Some("/workspace/seats/eve".into()),
+        start_cmd: Some("claude --seat eve".into()),
         resume_cmd: Some("claude --resume".into()),
-        rex_target: Some("block:crest-main".into()),
-        claimed_by: by_crest,
+        rex_target: Some("block:eve-main".into()),
+        claimed_by: by_eve,
         claimed_at: UnixMs(1_795_261_554_000),
     };
 
@@ -585,11 +583,11 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
             pid: 8195,
             proc_start: "Sat Nov 21 05:30:00 2026".into(),
             started_at_ms: 1_795_260_600_000,
-            session_id: "sess-tally-1".into(),
+            session_id: "sess-carol-1".into(),
             messaging_socket: PathBuf::from("/tmp/cc-socks/8195.sock"),
             kind: "bg".into(),
             name_source: Some("user".into()),
-            display_name: Some("Tally-5.2".into()),
+            display_name: Some("Carol-5.2".into()),
         },
         TransportEndpoint::BbThread {
             thread_id: BbThreadId::parse("thr_123").unwrap(),
@@ -611,14 +609,14 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
     assert!(TransportEndpoint::is_allowed_claude_kind("interactive"));
     assert!(TransportEndpoint::is_allowed_claude_kind("bg"));
     assert!(!TransportEndpoint::is_allowed_claude_kind("subagent"));
-    assert!(TransportEndpoint::is_fork_display_name("⑂ Tally-5.2"));
-    assert!(!TransportEndpoint::is_fork_display_name("Tally-5.2"));
+    assert!(TransportEndpoint::is_fork_display_name("⑂ Carol-5.2"));
+    assert!(!TransportEndpoint::is_fork_display_name("Carol-5.2"));
     assert!(TransportEndpoint::is_derived_name_source(Some("derived")));
     assert!(!TransportEndpoint::is_derived_name_source(Some("user")));
 
     for (idx, ep) in endpoints.into_iter().enumerate() {
         let binding = SeatBinding {
-            seat: crest.clone(),
+            seat: eve.clone(),
             incarnation_id: IncarnationId::parse(format!("inc-{idx}")).unwrap(),
             epoch: idx as u64 + 1,
             lane: None,
@@ -656,7 +654,7 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
 
     let notify_kinds = [
         NotifyKind::MailUnrung {
-            seat: crest.clone(),
+            seat: eve.clone(),
             unread_count: 3,
             oldest_at: UnixMs(1_795_261_000_000),
         },
@@ -677,7 +675,7 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
 
     let minimal_unrung: NotifyKind = serde_json::from_value(serde_json::json!({
         "kind": "mail_unrung",
-        "seat": "crest"
+        "seat": "eve"
     }))
     .expect("default fields on MailUnrung deserialize");
     assert!(matches!(

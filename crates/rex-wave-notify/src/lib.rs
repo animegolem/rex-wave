@@ -373,8 +373,23 @@ struct RaisedMailUnrungState {
     operators: BTreeSet<Principal>,
 }
 
+/// Reconnect grace window a [`HeraldView`] applies; defaults to
+/// [`RECONNECT_GRACE_MS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraceMs(u64);
+
+impl Default for GraceMs {
+    fn default() -> Self {
+        GraceMs(RECONNECT_GRACE_MS)
+    }
+}
+
 #[derive(Default)]
 pub struct HeraldView {
+    grace: GraceMs,
+    /// The house's operator surface seat; `None` means
+    /// [`presence::DEFAULT_OPERATOR_SURFACE_SEAT`].
+    operator_surface_seat: Option<SeatName>,
     latest_at: UnixMs,
     members: BTreeMap<room::RoomId, BTreeSet<Principal>>,
     wave_owners: BTreeMap<WaveSlug, Principal>,
@@ -775,7 +790,7 @@ impl HeraldView {
 
         let operator_set: BTreeSet<Principal> = self.all_operators().into_iter().collect();
         for seat in check_seats {
-            match self.evaluate_mail_unrung_with_grace(&seat, entry.at, RECONNECT_GRACE_MS) {
+            match self.evaluate_mail_unrung_with_grace(&seat, entry.at, self.grace.0) {
                 MailUnrungEval::Raise {
                     unread_count,
                     oldest_at,
@@ -891,6 +906,18 @@ impl HeraldView {
             || (self.operator_seats.is_empty() && seat.as_str() == "owner")
     }
 
+    fn is_operator_surface_seat(&self, seat: &SeatName) -> bool {
+        match &self.operator_surface_seat {
+            Some(surface) => surface == seat,
+            None => presence::is_default_operator_surface_seat(seat.as_str()),
+        }
+    }
+
+    /// The reconnect grace window (ms) this view applies.
+    pub fn grace_ms(&self) -> u64 {
+        self.grace.0
+    }
+
     fn has_live_binding(&self, seat: &SeatName, now: UnixMs) -> bool {
         self.live_bindings.get(seat).is_some_and(|m| {
             m.values().any(|b| {
@@ -920,9 +947,11 @@ impl HeraldView {
     }
 
     /// Evaluates whether `seat` should raise, hold in reconnect grace, suppress,
-    /// or resolve a `MailUnrung` Operator card at `now` using [`RECONNECT_GRACE_MS`].
+    /// or resolve a `MailUnrung` Operator card at `now` using this view's grace
+    /// window ([`RECONNECT_GRACE_MS`] unless the [`Herald`] was built with
+    /// [`Herald::with_grace`]).
     pub fn evaluate_mail_unrung(&self, seat: &SeatName, now: UnixMs) -> MailUnrungEval {
-        self.evaluate_mail_unrung_with_grace(seat, now, RECONNECT_GRACE_MS)
+        self.evaluate_mail_unrung_with_grace(seat, now, self.grace.0)
     }
 
     /// Evaluates `MailUnrung` policy for `seat` at `now` with an explicit grace duration.
@@ -933,7 +962,7 @@ impl HeraldView {
         grace_ms: u64,
     ) -> MailUnrungEval {
         if self.is_operator_seat(seat)
-            || presence::is_operator_surface_seat(seat.as_str())
+            || self.is_operator_surface_seat(seat)
             || presence::is_non_seat_target(seat.as_str())
         {
             return if self.raised_mail_unrung.contains_key(seat) {
@@ -2177,16 +2206,38 @@ pub struct Herald {
 
 impl Herald {
     pub fn new() -> Self {
+        Self::with_grace(std::time::Duration::from_millis(RECONNECT_GRACE_MS))
+    }
+
+    /// A [`Herald`] whose `MailUnrung` reconnect grace window is `grace`
+    /// instead of [`RECONNECT_GRACE_MS`].
+    pub fn with_grace(grace: std::time::Duration) -> Self {
+        let grace_ms = u64::try_from(grace.as_millis()).expect("grace window fits in u64 ms");
+        assert!(grace_ms > 0, "reconnect grace window must be positive");
+        let view = HeraldView {
+            grace: GraceMs(grace_ms),
+            ..HeraldView::default()
+        };
         Herald {
-            view: std::sync::Arc::new(std::sync::Mutex::new(HeraldView::default())),
+            view: std::sync::Arc::new(std::sync::Mutex::new(view)),
             grace_signal: std::sync::Arc::new(GraceSignal::default()),
             caught_up: false,
             replay: std::sync::Arc::new(std::sync::Mutex::new(ReplayBuffer::default())),
         }
     }
 
+    /// Names the house's operator surface seat: letters to it never raise
+    /// `MailUnrung` cards. Defaults to [`presence::DEFAULT_OPERATOR_SURFACE_SEAT`].
+    pub fn with_operator_surface_seat(self, seat: SeatName) -> Self {
+        self.view
+            .lock()
+            .expect("herald view lock")
+            .operator_surface_seat = Some(seat);
+        self
+    }
+
     /// Constructs a [`Herald`] paired with a [`HeraldHandle`] so a timer task
-    /// can flush 15 s reconnect grace deadlines while `spawn_reactor` owns `Herald`.
+    /// can flush reconnect grace deadlines while `spawn_reactor` owns `Herald`.
     pub fn with_handle() -> (Self, HeraldHandle) {
         let herald = Self::new();
         let handle = herald.handle();

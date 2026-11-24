@@ -18,6 +18,10 @@ struct ActorMsg<C> {
 
 type Mailbox<C> = mpsc::Sender<ActorMsg<C>>;
 
+/// Builds the empty state a stream actor folds its journal into. Runs on every
+/// (re)hydration, so passivated actors come back with the same seed.
+type StateSeed<S> = std::sync::Arc<dyn Fn() -> S + Send + Sync>;
+
 enum RegistryMsg<C> {
     Lookup {
         stream: StreamId,
@@ -47,11 +51,36 @@ impl<D: Decider> Registry<D> {
     /// `idle` is how long a stream actor waits for a command before it
     /// passivates (drops its state and its writer claim).
     pub fn with_idle(journal: Journal, hub: Hub, idle: Duration) -> std::sync::Arc<Self> {
+        Self::with_seed(journal, hub, idle, std::sync::Arc::new(D::State::default))
+    }
+
+    /// Like [`Registry::new`], but every stream actor starts from a clone of
+    /// `initial` instead of `D::State::default()`. For read-only configuration
+    /// a decider consults (its `evolve` must leave that part untouched).
+    pub fn with_initial_state(journal: Journal, hub: Hub, initial: D::State) -> std::sync::Arc<Self>
+    where
+        D::State: Clone + Sync,
+    {
+        Self::with_seed(
+            journal,
+            hub,
+            DEFAULT_IDLE,
+            std::sync::Arc::new(move || initial.clone()),
+        )
+    }
+
+    fn with_seed(
+        journal: Journal,
+        hub: Hub,
+        idle: Duration,
+        seed: StateSeed<D::State>,
+    ) -> std::sync::Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let owner = RegistryTask::<D> {
             journal,
             hub,
             idle,
+            seed,
             me: tx.downgrade(),
             live: HashMap::new(),
             waiting: HashMap::new(),
@@ -106,6 +135,7 @@ struct RegistryTask<D: Decider> {
     journal: Journal,
     hub: Hub,
     idle: Duration,
+    seed: StateSeed<D::State>,
     me: mpsc::WeakUnboundedSender<RegistryMsg<D::Cmd>>,
     live: HashMap<StreamId, Slot<D::Cmd>>,
     waiting: HashMap<StreamId, Vec<oneshot::Sender<Mailbox<D::Cmd>>>>,
@@ -161,6 +191,7 @@ impl<D: Decider> RegistryTask<D> {
             stream.clone(),
             self.journal.clone(),
             self.hub.clone(),
+            (self.seed)(),
             inbox,
             self.idle,
             gone,
@@ -197,11 +228,12 @@ async fn run_actor<D: Decider>(
     stream: StreamId,
     journal: Journal,
     hub: Hub,
+    initial: D::State,
     mut inbox: mpsc::Receiver<ActorMsg<D::Cmd>>,
     idle: Duration,
     gone: GoneOnDrop<D>,
 ) {
-    let mut actor = match StreamActor::<D>::rehydrate(&journal, stream, hub) {
+    let mut actor = match StreamActor::<D>::rehydrate(&journal, stream, hub, initial) {
         Ok(actor) => actor,
         Err(e) => {
             inbox.close();
@@ -244,11 +276,16 @@ struct StreamActor<D: Decider> {
 }
 
 impl<D: Decider> StreamActor<D> {
-    fn rehydrate(journal: &Journal, stream: StreamId, hub: Hub) -> Result<Self, ApiError> {
+    fn rehydrate(
+        journal: &Journal,
+        stream: StreamId,
+        hub: Hub,
+        initial: D::State,
+    ) -> Result<Self, ApiError> {
         let writer = journal.claim(stream).map_err(store_error)?;
         let mut actor = StreamActor::<D> {
             writer,
-            state: D::State::default(),
+            state: initial,
             hub,
             stale: false,
         };

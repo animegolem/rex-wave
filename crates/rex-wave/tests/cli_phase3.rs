@@ -16,32 +16,12 @@ use rex_wave_waves::Waves;
 use serde_json::Value;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-static NONCE: AtomicU64 = AtomicU64::new(1);
-
-struct DirGuard(PathBuf);
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_dir(label: &str) -> DirGuard {
-    let n = NONCE.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("rex-wave-cli3-{label}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    DirGuard(p)
-}
-
-fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_rex-wave")
-}
+mod common;
+use common::{fresh_dir, rex_wave_at};
 
 /// Wraps `Registry<Rooms>` so `RoomPost { after: Some(Seq(1)), .. }` triggers a
 /// structured `ConflictData::NewerMessage` even before PR-3B merges into `rex-wave-rooms`.
@@ -116,7 +96,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s1 = sock_str.clone();
     let root_out = tokio::task::spawn_blocking(move || {
-        let mut child = Command::new(bin_path())
+        let mut child = rex_wave_at(&s1)
             .args(["--socket", &s1, "--json", "post", "#general", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -143,7 +123,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s2 = sock_str.clone();
     let reply_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s2)
             .args([
                 "--socket",
                 &s2,
@@ -165,7 +145,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s3 = sock_str.clone();
     let read_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s3)
             .args([
                 "--socket",
                 &s3,
@@ -188,7 +168,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s4 = sock_str.clone();
     let wait_hit = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s4)
             .args([
                 "--socket",
                 &s4,
@@ -217,7 +197,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s5 = sock_str.clone();
     let wait_to = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s5)
             .args([
                 "--socket",
                 &s5,
@@ -241,7 +221,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s6 = sock_str.clone();
     let conflict_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s6)
             .args([
                 "--socket",
                 &s6,
@@ -320,7 +300,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s7 = sock_str.clone();
     let mint_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s7)
             .args([
                 "--socket",
                 &s7,
@@ -348,8 +328,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s8 = sock_str.clone();
     let worker_post = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
+        rex_wave_at(&s8)
             .env("T3CODE_THREAD_ID", thread_id)
             .args([
                 "--socket",
@@ -374,7 +353,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s9 = sock_str.clone();
     let check_read = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s9)
             .args([
                 "--socket",
                 &s9,
@@ -397,8 +376,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s10 = sock_str.clone();
     let worker_wait = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
+        rex_wave_at(&s10)
             .env("T3CODE_THREAD_ID", thread_id)
             .args([
                 "--socket",
@@ -443,7 +421,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
 
     let s11 = sock_str.clone();
     let wake_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&s11)
             .args(["--socket", &s11, "post", "#general", "wake worker"])
             .output()
             .unwrap()
@@ -473,8 +451,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
     rex_wave_t3::remove_worker_token_file(&dir.0, thread_id).unwrap();
     let s12 = sock_str.clone();
     let retired_post = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
+        rex_wave_at(&s12)
             .env("T3CODE_THREAD_ID", thread_id)
             .args(["--socket", &s12, "post", "#general", "should fail closed"])
             .output()
@@ -523,7 +500,7 @@ async fn cli_wave_honesty_enforces_one_writer_refusals_finish_gate_account_misma
         let s = sock_str.clone();
         let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
         tokio::task::spawn_blocking(move || {
-            Command::new(bin_path())
+            rex_wave_at(&s)
                 .arg("--socket")
                 .arg(&s)
                 .args(&owned)

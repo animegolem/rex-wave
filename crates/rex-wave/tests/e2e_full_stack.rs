@@ -13,22 +13,17 @@ use rex_wave_transport::{Credential, Endpoint, RemoteClient};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
-static E2E_NONCE: AtomicU64 = AtomicU64::new(1);
+mod common;
+use common::{fresh_dir, rex_wave, rex_wave_at, t3_home};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_rex-wave")
-}
 
 struct ChildGuard(Child);
 
@@ -36,14 +31,6 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-struct DirGuard(PathBuf);
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -360,23 +347,17 @@ async fn http_post(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
-    let nonce = E2E_NONCE.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(format!("/tmp/rex-e2e-{}-{nonce}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create e2e temp dir");
-    let _dir_guard = DirGuard(dir.clone());
+    let dir_guard = fresh_dir("e2e-full");
+    let dir = dir_guard.0.clone();
 
     let sock_path = dir.join("d.sock");
     let sandbox_dir = dir.join("mail-sandbox");
     std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
     std::fs::write(sandbox_dir.join(".rex-wave-sandbox"), b"e2e-sandbox\n")
         .expect("write sandbox marker");
-    // The daemon refuses to start without a protected-roots file; an empty one
-    // says this test has nothing to protect.
-    let config_dir = dir.join("config");
-    std::fs::create_dir_all(config_dir.join("rex-wave")).expect("create config dir");
-    std::fs::write(config_dir.join("rex-wave").join("protected-roots"), b"")
-        .expect("write protected-roots");
+    // `rex_wave_at` gives the daemon an empty protected-roots file (nothing to
+    // protect) and an empty T3 home, so the BB-only runner never sees live state.
+    let t3_home = t3_home(&dir);
 
     let bb_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -528,7 +509,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     });
 
     let sink_addr = free_loopback_addr();
-    let daemon_child = Command::new(bin_path())
+    let daemon_child = rex_wave_at(&sock_path)
         .args([
             "--socket",
             sock_path.to_str().unwrap(),
@@ -539,12 +520,15 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
             &format!("ws://{bb_addr}/api/v1/plugins/rex-wave/http/bridge"),
             "--bb-token",
             bb_token,
+            "--runner",
+            "bb",
+            "--t3-home",
+            t3_home.to_str().unwrap(),
             "--operator",
             "owner",
             "--wake-bell",
             &sink_addr.to_string(),
         ])
-        .env("XDG_CONFIG_HOME", &config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -810,7 +794,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .await
     .expect("builder reached Parked and verifier reached Idle");
 
-    let tok_output = Command::new(bin_path())
+    let tok_output = rex_wave_at(&sock_path)
         .args([
             "--socket",
             sock_path.to_str().unwrap(),
@@ -828,7 +812,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     assert!(sam_token.starts_with("rw_"));
 
     let mcp_addr = free_loopback_addr();
-    let mcp_child = Command::new(bin_path())
+    let mcp_child = rex_wave_at(&sock_path)
         .args([
             "--socket",
             sock_path.to_str().unwrap(),
@@ -1371,7 +1355,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .await
     .expect("both BB worker threads retired cleanly");
 
-    let self_test = Command::new(bin_path())
+    let self_test = rex_wave(&dir)
         .args(["tui", "--self-test"])
         .output()
         .expect("run rex-wave tui --self-test");

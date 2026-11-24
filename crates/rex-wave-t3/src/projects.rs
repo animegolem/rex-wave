@@ -83,6 +83,14 @@ pub fn load_t3_project_names_from_sqlite(db_path: &Path) -> BTreeMap<BbProjectId
     let Ok(conn) = Connection::open_with_flags(db_path, flags) else {
         return map;
     };
+    // T3 writes this database live; wait briefly on its write lock instead of
+    // failing the read with SQLITE_BUSY.
+    if conn
+        .busy_timeout(std::time::Duration::from_millis(1_000))
+        .is_err()
+    {
+        return map;
+    }
     let Ok(mut stmt) =
         conn.prepare("SELECT project_id, title FROM projection_projects WHERE deleted_at IS NULL")
     else {

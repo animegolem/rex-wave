@@ -866,7 +866,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         ),
     );
     let owner_p = Principal::Operator {
-        seat: SeatName::parse("genga").unwrap(),
+        seat: SeatName::parse("dave").unwrap(),
     };
     let owner = LocalClient::new(router.clone(), owner_p.clone());
     let conductor = LocalClient::new(
@@ -882,13 +882,13 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         },
     );
 
-    let wave_slug = WaveSlug::parse("pancake-spec-r2").unwrap();
+    let wave_slug = WaveSlug::parse("demo-spec-r2").unwrap();
     let role = RoleName::parse("council-gemini").unwrap();
     let started = owner
         .call(WaveStart {
             spec: WaveSpec {
                 slug: wave_slug.clone(),
-                project: BbProjectId::parse("proj_edaym59nyn").unwrap(),
+                project: BbProjectId::parse("proj_demo_alpha").unwrap(),
                 goal: Body::parse("Review spec").unwrap(),
                 defaults: AgentSpec {
                     provider: ProviderId::parse("acp-opencode").unwrap(),
@@ -902,7 +902,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
                 output_dir: None,
                 workers: vec![WorkerSpec {
                     role: role.clone(),
-                    brief: Body::parse("Post review to @genga").unwrap(),
+                    brief: Body::parse("Post review to @dave").unwrap(),
                     agent: None,
                     output_dir: None,
                     writes: Vec::new(),
@@ -938,7 +938,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
     conductor
         .call(RoomPost {
             room: room_ref.clone(),
-            body: Body::parse("@council-gemini Post your review to @genga when done.").unwrap(),
+            body: Body::parse("@council-gemini Post your review to @dave when done.").unwrap(),
             re: None,
             after: None,
             labels: Vec::new(),
@@ -1016,7 +1016,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
     );
     assert_eq!(
         inbox.items[0].draft.dedupe,
-        "worker-stuck:pancake-spec-r2:council-gemini"
+        "worker-stuck:demo-spec-r2:council-gemini"
     );
     assert!(matches!(
         &inbox.items[0].draft.kind,
@@ -1026,7 +1026,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
     let sb = owner.call(Sidebar::default()).await.unwrap();
     assert_eq!(
         sb.projects[0].waves[0].mentions, 0,
-        "system post naming @genga must not bump operator sidebar mention badge"
+        "system post naming @dave must not bump operator sidebar mention badge"
     );
 
     let stuck_id = inbox.items[0].id;
@@ -1144,8 +1144,8 @@ async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
         },
     );
 
-    let project = BbProjectId::parse("proj_edaym59nyn").unwrap();
-    let wave = WaveSlug::parse("pancake-spec-r2").unwrap();
+    let project = BbProjectId::parse("proj_demo_alpha").unwrap();
+    let wave = WaveSlug::parse("demo-spec-r2").unwrap();
     let lounge = RoomRef::Channel {
         scope: RoomScope::Global,
         name: ChannelName::parse("lounge").unwrap(),
@@ -1304,7 +1304,7 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
     });
 
     let owner_p = Principal::Operator {
-        seat: SeatName::parse("genga").unwrap(),
+        seat: SeatName::parse("dave").unwrap(),
     };
     let owner = LocalClient::new(router.clone(), owner_p.clone());
     let bb_bridge = LocalClient::new(
@@ -1320,13 +1320,13 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
         },
     );
 
-    let wave = WaveSlug::parse("pancake-spec").unwrap();
+    let wave = WaveSlug::parse("demo-spec").unwrap();
     let role = RoleName::parse("council-claude").unwrap();
     owner
         .call(WaveStart {
             spec: WaveSpec {
                 slug: wave.clone(),
-                project: BbProjectId::parse("proj_edaym59nyn").unwrap(),
+                project: BbProjectId::parse("proj_demo_alpha").unwrap(),
                 goal: Body::parse("Spec").unwrap(),
                 defaults: AgentSpec {
                     provider: ProviderId::parse("claude-code").unwrap(),
@@ -1451,7 +1451,7 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
     assert_eq!(adopted.items[0].id, NotificationId(1));
     assert_eq!(
         adopted.items[0].draft.dedupe,
-        "worker-stuck:pancake-spec:council-claude"
+        "worker-stuck:demo-spec:council-claude"
     );
     herald_task.abort();
 }
@@ -1462,7 +1462,7 @@ fn letter_ref_for(seat: &str, name: &str, sha_char: char) -> LetterRef {
     let item = MailboxItem {
         schema: MailSchemaV1,
         id: format!("letter:to-{seat}/{name}"),
-        from: "tally".into(),
+        from: "carol".into(),
         to: seat.into(),
         kind: "letter".into(),
         state: "open".into(),
@@ -1542,7 +1542,7 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
     let owner_p = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    let genga = SeatName::parse("genga").unwrap();
+    let dave = SeatName::parse("dave").unwrap();
     let nodal = SeatName::parse("nodal").unwrap();
     let quire = SeatName::parse("quire").unwrap();
     let room = RoomId::Channel {
@@ -1550,9 +1550,9 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         name: ChannelName::parse("lounge").unwrap(),
     };
 
-    // Claim genga=Active, nodal=Dormant, quire=Retired.
+    // Claim dave=Active, nodal=Dormant, quire=Retired.
     for (seq, seat, status) in [
-        (1, "genga", SeatStatus::Active),
+        (1, "dave", SeatStatus::Active),
         (2, "nodal", SeatStatus::Dormant),
         (3, "quire", SeatStatus::Retired),
     ] {
@@ -1575,7 +1575,7 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
             seq: Seq(seq),
             at: UnixMs(2_000),
             by: Principal::Seat {
-                seat: SeatName::parse("tally").unwrap(),
+                seat: SeatName::parse("carol").unwrap(),
             },
             event: Event::Mail(MailEvent::Banked {
                 from_room: room.clone(),
@@ -1607,12 +1607,12 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         seq: Seq(3),
         at: UnixMs(3_000),
         by: Principal::Seat {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
         },
         event: Event::Mail(MailEvent::Banked {
             from_room: room.clone(),
             range: (Seq(1), Seq(1)),
-            letter: letter_ref_for("genga", "first-r1.md", 'c'),
+            letter: letter_ref_for("dave", "first-r1.md", 'c'),
         }),
     };
     view.observe(&first_letter);
@@ -1624,7 +1624,7 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
     assert_eq!(unrung.len(), 1);
     let (to, draft) = unrung[0];
     assert_eq!(to, &owner_p);
-    assert_eq!(draft.dedupe, "mail-unrung:genga");
+    assert_eq!(draft.dedupe, "mail-unrung:dave");
     assert!(
         draft.actions.is_empty(),
         "informational status notice must carry zero decision buttons"
@@ -1639,37 +1639,35 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
             ref seat,
             unread_count: 1,
             oldest_at: UnixMs(3_000),
-        } if seat == &genga
+        } if seat == &dave
     ));
 
     // Reconnectable binding drop enforces the exact 15 s grace window.
-    let crest = SeatName::parse("crest").unwrap();
-    let claim_crest = Envelope {
+    let eve = SeatName::parse("eve").unwrap();
+    let claim_eve = Envelope {
         stream: StreamId::Presence,
         seq: Seq(4),
         at: UnixMs(10_000),
         by: owner_p.clone(),
         event: Event::Presence(PresenceEvent::SeatClaimed {
-            record: sample_seat_record("crest", SeatStatus::Active, UnixMs(10_000)),
+            record: sample_seat_record("eve", SeatStatus::Active, UnixMs(10_000)),
         }),
     };
-    view.observe(&claim_crest);
+    view.observe(&claim_eve);
 
-    let bind_crest = Envelope {
+    let bind_eve = Envelope {
         stream: StreamId::Presence,
         seq: Seq(5),
         at: UnixMs(10_000),
-        by: Principal::Seat {
-            seat: crest.clone(),
-        },
+        by: Principal::Seat { seat: eve.clone() },
         event: Event::Presence(PresenceEvent::Bound {
-            binding: sample_uds_binding("crest", "inc-crest-1", UnixMs(10_000)),
+            binding: sample_uds_binding("eve", "inc-eve-1", UnixMs(10_000)),
             superseded: Vec::new(),
         }),
     };
-    view.observe(&bind_crest);
+    view.observe(&bind_eve);
 
-    let drop_crest = Envelope {
+    let drop_eve = Envelope {
         stream: StreamId::Presence,
         seq: Seq(6),
         at: UnixMs(20_000),
@@ -1677,13 +1675,13 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
             part: SystemPart::PresenceMonitor,
         },
         event: Event::Presence(PresenceEvent::Unbound {
-            seat: crest.clone(),
-            incarnation_id: IncarnationId::parse("inc-crest-1").unwrap(),
+            seat: eve.clone(),
+            incarnation_id: IncarnationId::parse("inc-eve-1").unwrap(),
             status: BindingStatus::Unbound,
             reason: Some("socket EOF".into()),
         }),
     };
-    view.observe(&drop_crest);
+    view.observe(&drop_eve);
 
     // Letter arrives 5 s after socket drop -> still within 15 s grace window.
     let mail_during_grace = Envelope {
@@ -1691,23 +1689,23 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         seq: Seq(4),
         at: UnixMs(25_000),
         by: Principal::Seat {
-            seat: SeatName::parse("tally").unwrap(),
+            seat: SeatName::parse("carol").unwrap(),
         },
         event: Event::Mail(MailEvent::Banked {
             from_room: room.clone(),
             range: (Seq(1), Seq(1)),
-            letter: letter_ref_for("crest", "grace-r1.md", 'd'),
+            letter: letter_ref_for("eve", "grace-r1.md", 'd'),
         }),
     };
     view.observe(&mail_during_grace);
     assert!(
         !classify(&mail_during_grace, &view)
             .iter()
-            .any(|(_, d)| d.dedupe == "mail-unrung:crest"),
+            .any(|(_, d)| d.dedupe == "mail-unrung:eve"),
         "must suppress MailUnrung while inside the 15 s reconnect grace window"
     );
     assert_eq!(
-        view.evaluate_mail_unrung(&crest, UnixMs(20_000 + RECONNECT_GRACE_MS - 1)),
+        view.evaluate_mail_unrung(&eve, UnixMs(20_000 + RECONNECT_GRACE_MS - 1)),
         MailUnrungEval::WithinGrace {
             ready_at: UnixMs(35_000),
             unread_count: 1,
@@ -1715,7 +1713,7 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         }
     );
     assert_eq!(
-        view.evaluate_mail_unrung(&crest, UnixMs(20_000 + RECONNECT_GRACE_MS)),
+        view.evaluate_mail_unrung(&eve, UnixMs(20_000 + RECONNECT_GRACE_MS)),
         MailUnrungEval::Raise {
             unread_count: 1,
             oldest_at: UnixMs(25_000),
@@ -1727,17 +1725,15 @@ fn mail_unrung_policy_enforces_status_grace_window_and_informational_copy() {
         stream: StreamId::Presence,
         seq: Seq(7),
         at: UnixMs(27_000),
-        by: Principal::Seat {
-            seat: crest.clone(),
-        },
+        by: Principal::Seat { seat: eve.clone() },
         event: Event::Presence(PresenceEvent::Bound {
-            binding: sample_uds_binding("crest", "inc-crest-2", UnixMs(27_000)),
+            binding: sample_uds_binding("eve", "inc-eve-2", UnixMs(27_000)),
             superseded: Vec::new(),
         }),
     };
     view.observe(&rebind_fast);
     assert_eq!(
-        view.evaluate_mail_unrung(&crest, UnixMs(50_000)),
+        view.evaluate_mail_unrung(&eve, UnixMs(50_000)),
         MailUnrungEval::Suppress,
         "fast reconnect within grace window must never raise MailUnrung"
     );
@@ -1784,30 +1780,30 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
         scope: RoomScope::Global,
         name: ChannelName::parse("lounge").unwrap(),
     };
-    let genga = SeatName::parse("genga").unwrap();
-    let tally = Principal::Seat {
-        seat: SeatName::parse("tally").unwrap(),
+    let dave = SeatName::parse("dave").unwrap();
+    let carol = Principal::Seat {
+        seat: SeatName::parse("carol").unwrap(),
     };
 
-    // Register Active seat genga (never bound -> 0 s grace).
+    // Register Active seat dave (never bound -> 0 s grace).
     let claim = presence_writer
         .append(
             owner.me(),
             UnixMs(1_700_000_000_000),
             None,
             vec![Event::Presence(PresenceEvent::SeatClaimed {
-                record: sample_seat_record("genga", SeatStatus::Active, UnixMs(1_700_000_000_000)),
+                record: sample_seat_record("dave", SeatStatus::Active, UnixMs(1_700_000_000_000)),
             })],
         )
         .unwrap();
     hub.publish(claim.envelopes());
 
-    // Two letters arrive while genga has no live binding -> ONE deduped card with unread_count = 2.
-    let l1 = letter_ref_for("genga", "first-r1.md", '1');
-    let l2 = letter_ref_for("genga", "second-r1.md", '2');
+    // Two letters arrive while dave has no live binding -> ONE deduped card with unread_count = 2.
+    let l1 = letter_ref_for("dave", "first-r1.md", '1');
+    let l2 = letter_ref_for("dave", "second-r1.md", '2');
     let b1 = mail_writer
         .append(
-            &tally,
+            &carol,
             UnixMs(1_700_000_010_000),
             None,
             vec![Event::Mail(MailEvent::Banked {
@@ -1821,7 +1817,7 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
 
     let b2 = mail_writer
         .append(
-            &tally,
+            &carol,
             UnixMs(1_700_000_020_000),
             None,
             vec![Event::Mail(MailEvent::Banked {
@@ -1849,7 +1845,7 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
                         seat,
                         unread_count: 2,
                         oldest_at: UnixMs(1_700_000_010_000),
-                    } if seat == &genga
+                    } if seat == &dave
                 )
             });
             if hit.is_some() {
@@ -1871,19 +1867,17 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
         1,
         "must emit at most ONE MailUnrung card per Active seat"
     );
-    assert_eq!(unrung_cards[0].draft.dedupe, "mail-unrung:genga");
+    assert_eq!(unrung_cards[0].draft.dedupe, "mail-unrung:dave");
     assert!(unrung_cards[0].draft.actions.is_empty());
 
-    // Rebinding genga BEFORE ACKing must NOT auto-resolve the card yet.
+    // Rebinding dave BEFORE ACKing must NOT auto-resolve the card yet.
     let rebind = presence_writer
         .append(
-            &Principal::Seat {
-                seat: genga.clone(),
-            },
+            &Principal::Seat { seat: dave.clone() },
             UnixMs(1_700_000_030_000),
             None,
             vec![Event::Presence(PresenceEvent::Bound {
-                binding: sample_uds_binding("genga", "inc-genga-1", UnixMs(1_700_000_030_000)),
+                binding: sample_uds_binding("dave", "inc-dave-1", UnixMs(1_700_000_030_000)),
                 superseded: Vec::new(),
             })],
         )
@@ -1910,9 +1904,7 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
     // Partial ACK (letter 1 of 2) decrements unread_count to 1, still open.
     let ack1 = mail_writer
         .append(
-            &Principal::Seat {
-                seat: genga.clone(),
-            },
+            &Principal::Seat { seat: dave.clone() },
             UnixMs(1_700_000_040_000),
             None,
             vec![Event::Mail(MailEvent::Acked {
@@ -1939,7 +1931,7 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
                         seat,
                         unread_count: 1,
                         oldest_at: UnixMs(1_700_000_020_000),
-                    } if seat == &genga
+                    } if seat == &dave
                 )
             }) {
                 break;
@@ -1953,9 +1945,7 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
     // Final ACK (letter 2 of 2) auto-resolves MailUnrung to Done.
     let ack2 = mail_writer
         .append(
-            &Principal::Seat {
-                seat: genga.clone(),
-            },
+            &Principal::Seat { seat: dave.clone() },
             UnixMs(1_700_000_050_000),
             None,
             vec![Event::Mail(MailEvent::Acked {
@@ -1977,7 +1967,7 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
                 .unwrap();
             if p.items
                 .iter()
-                .any(|n| n.draft.dedupe == "mail-unrung:genga" && n.state == NotifyState::Done)
+                .any(|n| n.draft.dedupe == "mail-unrung:dave" && n.state == NotifyState::Done)
             {
                 break;
             }
@@ -2118,8 +2108,8 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
     }));
 
     // Verify clean helper constructors for MailUnrung and TransportDown directly too.
-    let sample_mu = mail_unrung_draft(&genga, 3, UnixMs(1_700_000_000_000));
-    assert_eq!(sample_mu.dedupe, "mail-unrung:genga");
+    let sample_mu = mail_unrung_draft(&dave, 3, UnixMs(1_700_000_000_000));
+    assert_eq!(sample_mu.dedupe, "mail-unrung:dave");
     assert!(sample_mu.actions.is_empty());
     let sample_td = transport_down_draft(TransportKind::BbThread, None);
     assert_eq!(sample_td.dedupe, "transport-down:bb_thread");
@@ -2172,9 +2162,9 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         scope: RoomScope::Global,
         name: ChannelName::parse("lounge").unwrap(),
     };
-    let crest = SeatName::parse("crest").unwrap();
-    let tally = Principal::Seat {
-        seat: SeatName::parse("tally").unwrap(),
+    let eve = SeatName::parse("eve").unwrap();
+    let carol = Principal::Seat {
+        seat: SeatName::parse("carol").unwrap(),
     };
 
     let t0 = std::time::SystemTime::now()
@@ -2188,15 +2178,15 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
             None,
             vec![
                 Event::Presence(PresenceEvent::SeatClaimed {
-                    record: sample_seat_record("crest", SeatStatus::Active, UnixMs(t0)),
+                    record: sample_seat_record("eve", SeatStatus::Active, UnixMs(t0)),
                 }),
                 Event::Presence(PresenceEvent::Bound {
-                    binding: sample_uds_binding("crest", "inc-crest-1", UnixMs(t0)),
+                    binding: sample_uds_binding("eve", "inc-eve-1", UnixMs(t0)),
                     superseded: Vec::new(),
                 }),
                 Event::Presence(PresenceEvent::Unbound {
-                    seat: crest.clone(),
-                    incarnation_id: IncarnationId::parse("inc-crest-1").unwrap(),
+                    seat: eve.clone(),
+                    incarnation_id: IncarnationId::parse("inc-eve-1").unwrap(),
                     status: BindingStatus::Unbound,
                     reason: Some("socket EOF".into()),
                 }),
@@ -2207,13 +2197,13 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
 
     let banked = mail_writer
         .append(
-            &tally,
+            &carol,
             UnixMs(t0 + 2_000),
             None,
             vec![Event::Mail(MailEvent::Banked {
                 from_room: room.clone(),
                 range: (Seq(1), Seq(1)),
-                letter: letter_ref_for("crest", "quiet-grace-r1.md", '9'),
+                letter: letter_ref_for("eve", "quiet-grace-r1.md", '9'),
             })],
         )
         .unwrap();
@@ -2249,7 +2239,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         !before_due
             .items
             .iter()
-            .any(|n| n.draft.dedupe == "mail-unrung:crest"),
+            .any(|n| n.draft.dedupe == "mail-unrung:eve"),
         "must not raise before 15 s deadline"
     );
 
@@ -2268,7 +2258,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         after_due
             .items
             .iter()
-            .filter(|n| n.draft.dedupe == "mail-unrung:crest")
+            .filter(|n| n.draft.dedupe == "mail-unrung:eve")
             .count(),
         1,
         "flush_due_at raises MailUnrung after 15 s quiet period"
@@ -2284,25 +2274,25 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         at: UnixMs(1_000),
         by: owner_p.clone(),
         event: Event::Presence(PresenceEvent::SeatClaimed {
-            record: sample_seat_record("genga", SeatStatus::Active, UnixMs(1_000)),
+            record: sample_seat_record("dave", SeatStatus::Active, UnixMs(1_000)),
         }),
     });
     let mail_env = Envelope {
         stream: StreamId::Mail,
         seq: Seq(1),
         at: UnixMs(2_000),
-        by: tally.clone(),
+        by: carol.clone(),
         event: Event::Mail(MailEvent::Banked {
             from_room: room.clone(),
             range: (Seq(1), Seq(1)),
-            letter: letter_ref_for("genga", "once-r1.md", 'e'),
+            letter: letter_ref_for("dave", "once-r1.md", 'e'),
         }),
     };
     view.observe(&mail_env);
     assert_eq!(
         classify(&mail_env, &view)
             .iter()
-            .filter(|(_, d)| d.dedupe == "mail-unrung:genga")
+            .filter(|(_, d)| d.dedupe == "mail-unrung:dave")
             .count(),
         1
     );
@@ -2365,7 +2355,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         stream: StreamId::Mail,
         seq: Seq(1),
         at: UnixMs(2_000),
-        by: tally,
+        by: carol,
         event: Event::Mail(MailEvent::Banked {
             from_room: room,
             range: (Seq(1), Seq(1)),
@@ -2451,7 +2441,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
 
     // R2-3: A custom operator seen after the first MailUnrung raise receives the card.
     let custom_op = Principal::Operator {
-        seat: SeatName::parse("golem").unwrap(),
+        seat: SeatName::parse("operator").unwrap(),
     };
     let custom_op_env = Envelope {
         stream: StreamId::Room {
@@ -2480,29 +2470,29 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
 }
 
 #[test]
-fn mail_unrung_suppresses_golem_non_seat_targets_and_pre_horizon_history() {
+fn mail_unrung_suppresses_operator_non_seat_targets_and_pre_horizon_history() {
     let mut view = HeraldView::default();
     let owner = Principal::Operator {
         seat: SeatName::parse("owner").unwrap(),
     };
-    let mut tally_rec = sample_seat_record("tally", SeatStatus::Active, UnixMs(10_000));
-    tally_rec.mail_horizon_at = Some(UnixMs(10_000));
+    let mut carol_rec = sample_seat_record("carol", SeatStatus::Active, UnixMs(10_000));
+    carol_rec.mail_horizon_at = Some(UnixMs(10_000));
 
-    // Claim tally with mail_horizon_at = 10_000.
+    // Claim carol with mail_horizon_at = 10_000.
     view.observe(&Envelope {
         stream: StreamId::Presence,
         seq: Seq(1),
         at: UnixMs(10_000),
         by: owner.clone(),
-        event: Event::Presence(PresenceEvent::SeatClaimed { record: tally_rec }),
+        event: Event::Presence(PresenceEvent::SeatClaimed { record: carol_rec }),
     });
 
-    // Letters to `golem`, `cc`, and pre-horizon letter to `tally` (at 5_000 < 10_000).
+    // Letters to `operator`, `cc`, and pre-horizon letter to `carol` (at 5_000 < 10_000).
     for (idx, (to, sha_ch, at)) in [
-        ("golem", '1', UnixMs(20_000)),
+        ("operator", '1', UnixMs(20_000)),
         ("cc", '2', UnixMs(20_000)),
         ("all-seats", '3', UnixMs(20_000)),
-        ("tally", '4', UnixMs(5_000)),
+        ("carol", '4', UnixMs(5_000)),
     ]
     .into_iter()
     .enumerate()
@@ -2527,7 +2517,7 @@ fn mail_unrung_suppresses_golem_non_seat_targets_and_pre_horizon_history() {
     }
 
     assert_eq!(
-        view.evaluate_mail_unrung(&SeatName::parse("golem").unwrap(), UnixMs(30_000)),
+        view.evaluate_mail_unrung(&SeatName::parse("operator").unwrap(), UnixMs(30_000)),
         MailUnrungEval::Suppress
     );
     assert_eq!(
@@ -2535,23 +2525,23 @@ fn mail_unrung_suppresses_golem_non_seat_targets_and_pre_horizon_history() {
         MailUnrungEval::Suppress
     );
     assert_eq!(
-        view.evaluate_mail_unrung(&SeatName::parse("tally").unwrap(), UnixMs(30_000)),
+        view.evaluate_mail_unrung(&SeatName::parse("carol").unwrap(), UnixMs(30_000)),
         MailUnrungEval::Suppress
     );
 
-    // Post-horizon letter to offline `tally` (at 12_000 >= 10_000) DOES raise MailUnrung.
+    // Post-horizon letter to offline `carol` (at 12_000 >= 10_000) DOES raise MailUnrung.
     let fresh_env = Envelope {
         stream: StreamId::Mail,
         seq: Seq(10),
         at: UnixMs(12_000),
         by: owner,
         event: Event::Mail(MailEvent::Projected {
-            item: letter_ref_for("tally", "fresh.md", '5').item,
+            item: letter_ref_for("carol", "fresh.md", '5').item,
         }),
     };
     view.observe(&fresh_env);
     assert_eq!(
-        view.evaluate_mail_unrung(&SeatName::parse("tally").unwrap(), UnixMs(30_000)),
+        view.evaluate_mail_unrung(&SeatName::parse("carol").unwrap(), UnixMs(30_000)),
         MailUnrungEval::Raise {
             unread_count: 1,
             oldest_at: UnixMs(12_000),

@@ -1508,7 +1508,7 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     let sam = Principal::Seat {
         seat: SeatName::parse("sam").unwrap(),
     };
-    let proj = BbProjectId::parse("proj_edaym59nyn").unwrap();
+    let proj = BbProjectId::parse("proj_demo_alpha").unwrap();
     let active_wave = WaveSlug::parse("auth-v2").unwrap();
     let done_wave = WaveSlug::parse("release-v1").unwrap();
     let active_room = RoomId::Channel {
@@ -1536,7 +1536,7 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     let mut overview = SidebarTreeSnapshot {
         projects: vec![rex_wave_api::read::ProjectBranch {
             project: proj.clone(),
-            name: Some("pancake-work".to_owned()),
+            name: Some("demo-work".to_owned()),
             archived: false,
             channels: vec![rex_wave_api::read::ChannelLeaf {
                 room: proj_chan.clone(),
@@ -1620,11 +1620,11 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     let mut model = Model::new(me, overview.clone());
     let rows = flatten(&model.sidebar.roots, &model.sidebar.folds);
     assert!(
-        rows.iter().any(|r| r.node.label == "pancake-work"),
+        rows.iter().any(|r| r.node.label == "demo-work"),
         "sidebar must render human BB project name"
     );
     assert!(
-        !rows.iter().any(|r| r.node.label == "proj_edaym59nyn"),
+        !rows.iter().any(|r| r.node.label == "proj_demo_alpha"),
         "raw project id must not replace human project name in sidebar"
     );
     assert!(
@@ -1667,7 +1667,7 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     );
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .unwrap();
-    assert!(screen_text(&term).contains("Project · pancake-work"));
+    assert!(screen_text(&term).contains("Project · demo-work"));
 
     let _ = update(&mut model, Msg::Action(Action::Activate(done_key.clone())));
     let room_seq = model.stage_req_seq;
@@ -1686,7 +1686,7 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     );
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .unwrap();
-    assert!(screen_text(&term).contains("Room · #pancake-work/wave-release-v1"));
+    assert!(screen_text(&term).contains("Room · #demo-work/wave-release-v1"));
 
     let _ = update(&mut model, Msg::Action(Action::Activate(NodeKey::Kanban)));
     let board_seq = model.stage_req_seq;
@@ -1703,7 +1703,7 @@ fn retired_errored_glyph_human_names_auto_fold_and_archive_round_trip() {
     );
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .unwrap();
-    assert!(screen_text(&term).contains("Kanban · pancake-work"));
+    assert!(screen_text(&term).contains("Kanban · demo-work"));
 
     let crash_key = NodeKey::Agent {
         wave: done_wave.clone(),

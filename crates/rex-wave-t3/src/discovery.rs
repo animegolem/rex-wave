@@ -261,7 +261,6 @@ pub struct T3Config {
     pub bb_data_dir: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
     /// Principal used for `WaveObserve` and room operations.
-    // TODO(PR-3E): switch default to SystemPart::T3Bridge once PR #13 merges.
     pub system_principal: Principal,
     pub default_models: BTreeMap<String, String>,
     pub rpc_timeout: Duration,
@@ -284,9 +283,8 @@ impl T3Config {
             t3_home: Some(t3_home),
             bb_data_dir: default_bb_data_dir(),
             state_dir: None,
-            // TODO(PR-3E): switch to SystemPart::T3Bridge once PR #13 merges.
             system_principal: Principal::System {
-                part: SystemPart::BbBridge,
+                part: SystemPart::T3Bridge,
             },
             default_models: BTreeMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
@@ -304,9 +302,8 @@ impl T3Config {
             t3_home: None,
             bb_data_dir: None,
             state_dir: None,
-            // TODO(PR-3E): switch to SystemPart::T3Bridge once PR #13 merges.
             system_principal: Principal::System {
-                part: SystemPart::BbBridge,
+                part: SystemPart::T3Bridge,
             },
             default_models: BTreeMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,

@@ -8,7 +8,7 @@ use rex_wave_mailbridge::{
     RingDecision, RingPolicy, RingReferent, ShadowWatchTracker, TimeBasis, WatchDecisionState,
     compare_shadow_with_mailwatch_seen, parse_acks_jsonl, parse_mailwatch_seen_jsonl,
     parse_mailwatch_seen_sources, run_shadow_pass, score_shadow_jsonl,
-    seed_records_from_interchange,
+    seed_records_from_interchange_with_profile,
 };
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
 use sha2::{Digest, Sha256};
@@ -596,7 +596,8 @@ fn seed_records_reads_t3_doorbell_targets_with_aliases() {
     )
     .unwrap();
 
-    let plan = seed_records_from_interchange(&interchange).unwrap();
+    let plan =
+        seed_records_from_interchange_with_profile(&interchange, &HouseProfile::default()).unwrap();
     let canon_targets = fs::canonicalize(&targets).unwrap();
     assert!(
         plan.sources_read

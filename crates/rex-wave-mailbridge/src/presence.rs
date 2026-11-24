@@ -325,24 +325,78 @@ impl ClaudeSessionFile {
     }
 }
 
-/// Canonical house alias pairs witnessed by Tally's desk so first-live-bind hooks
-/// (`presence bind --seat tally`) automatically cover historical alias names
-/// (`tally_votp`, `genga_votp`, all three spellings of `auburn-cepheus`, etc.).
-pub const CANONICAL_HOUSE_ALIASES: &[(&str, &[&str])] = &[
-    ("tally", &["tally_votp", "tally-vampotp-cto"]),
-    ("genga", &["genga_votp", "genga-opus-5"]),
-    (
-        "auburn-cepheus",
-        &["auburn-cephus", "auburn-chepheus", "muse"],
-    ),
-    ("kuti-supervisor", &["kuti", "kuti-ren-sup"]),
-    ("loupe", &["loupe-reviewer"]),
-    ("neon", &[]),
-];
+/// Largest `house.json` the loader accepts. A house profile is a handful of
+/// names; anything bigger is a mistake, not a configuration.
+pub const HOUSE_PROFILE_MAX_BYTES: u64 = 64 * 1024;
 
-/// Permanently excluded pane targets from `herdr-registry.tsv` (mirrors
-/// `mailwatch.py`'s `EXCLUDED_TARGETS`).
-const HERDR_EXCLUDED_TARGETS: &[&str] = &["w4:p1S"];
+/// Resolves the optional house profile path:
+/// `$XDG_CONFIG_HOME/rex-wave/house.json` when `XDG_CONFIG_HOME` is absolute,
+/// otherwise `$HOME/.config/rex-wave/house.json`. Relative `XDG_CONFIG_HOME`
+/// values are ignored per the XDG base directory spec.
+pub fn house_profile_path_from(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("rex-wave").join("house.json"))
+}
+
+/// Reads one house profile file. `NotFound` yields [`HouseProfile::default`];
+/// a symlink, non-regular file, oversized file, malformed JSON, unknown field,
+/// invalid seat name, or out-of-bounds list fails closed.
+pub fn load_house_profile_from(path: &Path) -> Result<HouseProfile, ApiError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HouseProfile::default()),
+        Err(e) => {
+            return Err(ApiError::Internal(format!("stat {}: {e}", path.display())));
+        }
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() || !ft.is_file() {
+        return Err(ApiError::Denied {
+            principal: "presence".into(),
+            action: format!("read non-regular house profile {}", path.display()),
+        });
+    }
+    if meta.len() > HOUSE_PROFILE_MAX_BYTES {
+        return Err(invalid(
+            "house_profile",
+            format!(
+                "{}: {} bytes exceeds limit {HOUSE_PROFILE_MAX_BYTES}",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
+    let house: HouseProfile = serde_json::from_str(&raw)
+        .map_err(|e| invalid("house_profile", format!("{}: {e}", path.display())))?;
+    house
+        .validate()
+        .map_err(|e| invalid("house_profile", format!("{}: {e}", path.display())))?;
+    Ok(house)
+}
+
+/// Loads the optional house profile from the environment-resolved path (see
+/// [`house_profile_path_from`]). With no resolvable path or no file, returns
+/// [`HouseProfile::default`].
+pub fn load_house_profile() -> Result<HouseProfile, ApiError> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    match house_profile_path_from(xdg.as_deref(), home.as_deref()) {
+        Some(path) => load_house_profile_from(&path),
+        None => Ok(HouseProfile::default()),
+    }
+}
 
 /// Output of [`seed_records_from_interchange`]: durable [`PresenceClaim`]s ready
 /// to apply (or preview under `--dry-run`) before seats run live `presence bind`.
@@ -420,7 +474,9 @@ fn parse_seat_slug(raw: &str) -> Option<SeatName> {
     SeatName::parse(norm).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_seed_seat<'a>(
+    house: &HouseProfile,
     raw_name: &str,
     machine_checked: bool,
     canonical_fold: &BTreeMap<String, SeatName>,
@@ -428,7 +484,7 @@ fn register_seed_seat<'a>(
     machine_checked_seats: &mut BTreeSet<SeatName>,
     seat_aliases: &'a mut BTreeMap<SeatName, BTreeSet<SeatName>>,
 ) -> Option<(SeatName, &'a mut BTreeSet<SeatName>)> {
-    if is_operator_surface_seat(raw_name) || is_non_seat_target(raw_name) {
+    if house.is_operator_seat(raw_name) || is_non_seat_target(raw_name) {
         skipped_targets.insert(raw_name.trim().to_ascii_lowercase());
         return None;
     }
@@ -452,22 +508,34 @@ fn register_seed_seat<'a>(
 /// `.watchers/mailwatch-routes.json`, `tooling/t3-doorbell/targets.json`,
 /// `state/bb-knock-routes.tsv`,
 /// `state/codex-knock-routes.tsv`, `herdr-registry.tsv` (in `<dir>` or its
-/// parent house root), `state/ledger.md`, and [`CANONICAL_HOUSE_ALIASES`].
+/// parent house root), `state/ledger.md`, and the house profile's canonical
+/// alias folds ([`load_house_profile`]).
 ///
-/// Never writes to disk and never emits `Active` claims for reserved operator
-/// surfaces (`golem`) or non-seat pseudo-targets (`cc`, `desk`, etc.).
+/// Never writes to disk and never emits `Active` claims for the house's
+/// operator surface seat or non-seat pseudo-targets (`cc`, `desk`, etc.).
 pub fn seed_records_from_interchange(
     interchange_dir: &Path,
 ) -> Result<SeedInterchangePlan, ApiError> {
-    seed_records_from_interchange_with_options(interchange_dir, None)
+    let house = load_house_profile()?;
+    seed_records_from_interchange_with_profile(interchange_dir, &house)
 }
 
-/// Extended variant of [`seed_records_from_interchange`] that also ingests an
-/// optional external `seats.tsv` (`session_name\tseat\troom_path`) file when
-/// supplied.
+/// [`seed_records_from_interchange`] with an explicit [`HouseProfile`] instead
+/// of the environment-resolved one.
+pub fn seed_records_from_interchange_with_profile(
+    interchange_dir: &Path,
+    house: &HouseProfile,
+) -> Result<SeedInterchangePlan, ApiError> {
+    seed_records_from_interchange_with_options(interchange_dir, None, house)
+}
+
+/// Extended variant of [`seed_records_from_interchange_with_profile`] that
+/// also ingests an optional external `seats.tsv`
+/// (`session_name\tseat\troom_path`) file when supplied.
 pub fn seed_records_from_interchange_with_options(
     interchange_dir: &Path,
     seats_tsv: Option<&Path>,
+    house: &HouseProfile,
 ) -> Result<SeedInterchangePlan, ApiError> {
     let canon_dir = fs::canonicalize(interchange_dir)
         .map_err(|e| invalid("interchange", format!("{}: {e}", interchange_dir.display())))?;
@@ -484,16 +552,12 @@ pub fn seed_records_from_interchange_with_options(
     let mut machine_checked_seats: BTreeSet<SeatName> = BTreeSet::new();
 
     // Reverse lookup for canonical pairs so roster/route entries under an alias
-    // name fold into their canonical seat (e.g., `tally_votp` -> `tally`).
+    // name fold into their canonical seat (e.g., `alice_old` -> `alice`).
     let mut canonical_fold: BTreeMap<String, SeatName> = BTreeMap::new();
-    for &(canon_raw, alias_list) in CANONICAL_HOUSE_ALIASES {
-        if let Some(canon_seat) = parse_seat_slug(canon_raw) {
-            canonical_fold.insert(canon_seat.as_str().to_owned(), canon_seat.clone());
-            for &alias_raw in alias_list {
-                if let Some(alias_seat) = parse_seat_slug(alias_raw) {
-                    canonical_fold.insert(alias_seat.as_str().to_owned(), canon_seat.clone());
-                }
-            }
+    for (canon_seat, alias_list) in &house.aliases {
+        canonical_fold.insert(canon_seat.as_str().to_owned(), canon_seat.clone());
+        for alias_seat in alias_list {
+            canonical_fold.insert(alias_seat.as_str().to_owned(), canon_seat.clone());
         }
     }
 
@@ -507,6 +571,7 @@ pub fn seed_records_from_interchange_with_options(
                     continue;
                 };
                 let Some((canon, set)) = register_seed_seat(
+                    house,
                     raw_name,
                     true,
                     &canonical_fold,
@@ -517,13 +582,13 @@ pub fn seed_records_from_interchange_with_options(
                     continue;
                 };
                 // If `box` points to `.../interchange/to-<alias>`, register `<alias>` as an alias
-                // when distinct from the canonical seat (e.g. `auburn-cepheus` -> `to-muse`).
+                // when distinct from the canonical seat (e.g. `alice` -> `to-alice-desk`).
                 if let Some(box_str) = entry.get("box").and_then(|v| v.as_str())
                     && let Some(last_seg) = box_str.trim_end_matches('/').rsplit('/').next()
                     && let Some(box_alias) = last_seg.strip_prefix("to-")
                     && let Some(alias_slug) = parse_seat_slug(box_alias)
                     && alias_slug != canon
-                    && !is_operator_surface_seat(alias_slug.as_str())
+                    && !house.is_operator_seat(alias_slug.as_str())
                     && !is_non_seat_target(alias_slug.as_str())
                 {
                     set.insert(alias_slug);
@@ -555,6 +620,7 @@ pub fn seed_records_from_interchange_with_options(
                 continue;
             }
             let Some((canon, set)) = register_seed_seat(
+                house,
                 raw_key,
                 true,
                 &canonical_fold,
@@ -574,7 +640,7 @@ pub fn seed_records_from_interchange_with_options(
                     .unwrap_or(raw_alias.trim());
                 if let Some(alias_slug) = parse_seat_slug(cleaned)
                     && alias_slug != canon
-                    && !is_operator_surface_seat(alias_slug.as_str())
+                    && !house.is_operator_seat(alias_slug.as_str())
                     && !is_non_seat_target(alias_slug.as_str())
                 {
                     set.insert(alias_slug);
@@ -606,6 +672,7 @@ pub fn seed_records_from_interchange_with_options(
                 continue;
             }
             let _ = register_seed_seat(
+                house,
                 raw_seat,
                 true,
                 &canonical_fold,
@@ -639,6 +706,7 @@ pub fn seed_records_from_interchange_with_options(
                 continue;
             }
             let _ = register_seed_seat(
+                house,
                 raw_seat,
                 true,
                 &canonical_fold,
@@ -672,10 +740,11 @@ pub fn seed_records_from_interchange_with_options(
             {
                 continue;
             }
-            if HERDR_EXCLUDED_TARGETS.contains(&col1) {
+            if house.is_excluded_herdr_target(col1) {
                 continue;
             }
             let _ = register_seed_seat(
+                house,
                 raw_seat,
                 true,
                 &canonical_fold,
@@ -700,6 +769,7 @@ pub fn seed_records_from_interchange_with_options(
                 continue;
             }
             let _ = register_seed_seat(
+                house,
                 raw_name,
                 false,
                 &canonical_fold,
@@ -738,6 +808,7 @@ pub fn seed_records_from_interchange_with_options(
                 continue;
             }
             let Some((canon, set)) = register_seed_seat(
+                house,
                 raw_seat,
                 true,
                 &canonical_fold,
@@ -754,7 +825,7 @@ pub fn seed_records_from_interchange_with_options(
             if !has_noise
                 && let Some(alias_slug) = parse_seat_slug(raw_session)
                 && alias_slug != canon
-                && !is_operator_surface_seat(alias_slug.as_str())
+                && !house.is_operator_seat(alias_slug.as_str())
                 && !is_non_seat_target(alias_slug.as_str())
             {
                 set.insert(alias_slug);
@@ -762,17 +833,12 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 8. Merge canonical house alias pairs.
-    for &(canon_raw, alias_list) in CANONICAL_HOUSE_ALIASES {
-        let Some(canon) = parse_seat_slug(canon_raw) else {
-            continue;
-        };
+    // 8. Merge the house profile's canonical alias folds.
+    for (canon, alias_list) in &house.aliases {
         let set = seat_aliases.entry(canon.clone()).or_default();
-        for &alias_raw in alias_list {
-            if let Some(alias_slug) = parse_seat_slug(alias_raw)
-                && alias_slug != canon
-            {
-                set.insert(alias_slug);
+        for alias_slug in alias_list {
+            if alias_slug != canon {
+                set.insert(alias_slug.clone());
             }
         }
     }
@@ -780,11 +846,11 @@ pub fn seed_records_from_interchange_with_options(
     // 9. Remove any alias that collides with a canonical seat or an earlier seat's alias.
     let canonical_seats: BTreeSet<SeatName> = seat_aliases.keys().cloned().collect();
     let mut claimed_aliases: BTreeSet<SeatName> = BTreeSet::new();
-    let tally_witness = SeatName::parse("tally").expect("valid tally seat");
+    let witness = &house.witness_seat;
     let mut claims = Vec::with_capacity(seat_aliases.len());
 
     for (seat, raw_aliases) in seat_aliases {
-        if is_operator_surface_seat(seat.as_str()) || is_non_seat_target(seat.as_str()) {
+        if house.is_operator_seat(seat.as_str()) || is_non_seat_target(seat.as_str()) {
             skipped_targets.insert(seat.as_str().to_owned());
             continue;
         }
@@ -792,7 +858,7 @@ pub fn seed_records_from_interchange_with_options(
         for alias in raw_aliases {
             if alias == seat
                 || canonical_seats.contains(&alias)
-                || is_operator_surface_seat(alias.as_str())
+                || house.is_operator_seat(alias.as_str())
                 || is_non_seat_target(alias.as_str())
             {
                 continue;
@@ -805,7 +871,7 @@ pub fn seed_records_from_interchange_with_options(
             Some(VerificationKind::MachineChecked)
         } else {
             Some(VerificationKind::WitnessedBy {
-                seat: tally_witness.clone(),
+                seat: witness.clone(),
             })
         };
         claims.push(PresenceClaim {
@@ -1176,6 +1242,9 @@ fn binding_is_live_at(binding: &SeatBinding, now: UnixMs) -> bool {
 /// Materialized projection of `StreamId::Presence`.
 #[derive(Clone, Debug, Default)]
 pub struct PresenceState {
+    /// Read-only deployment config consulted by the decider; `evolve` never
+    /// touches it and it is not derived from the journal.
+    house: HouseProfile,
     head: Seq,
     latest_at: UnixMs,
     seats: BTreeMap<SeatName, SeatRecord>,
@@ -1189,6 +1258,19 @@ pub struct PresenceState {
 }
 
 impl PresenceState {
+    /// Empty state carrying an explicit [`HouseProfile`] (the decider's only
+    /// source of operator-surface identity).
+    pub fn with_house_profile(house: HouseProfile) -> Self {
+        Self {
+            house,
+            ..Self::default()
+        }
+    }
+
+    pub fn house(&self) -> &HouseProfile {
+        &self.house
+    }
+
     pub fn head(&self) -> Seq {
         self.head
     }
@@ -1508,9 +1590,49 @@ impl PresenceState {
 }
 
 /// Pure `StreamId::Presence` decider wired into `rex_wave_runtime::Registry<Presence>`.
-pub struct Presence;
+///
+/// `Decider` is static, so the [`HouseProfile`] held here reaches `decide`
+/// through the seeded [`PresenceState`] ([`Presence::registry`]); `decide`
+/// itself never reads disk.
+#[derive(Clone, Debug, Default)]
+pub struct Presence {
+    house: HouseProfile,
+}
 
 impl Presence {
+    /// A decider configured with [`HouseProfile::default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A decider configured with an explicit, already-loaded [`HouseProfile`].
+    pub fn with_house_profile(house: HouseProfile) -> Self {
+        Self { house }
+    }
+
+    pub fn house(&self) -> &HouseProfile {
+        &self.house
+    }
+
+    /// The empty state every Presence stream actor folds its journal into.
+    pub fn initial_state(&self) -> PresenceState {
+        PresenceState::with_house_profile(self.house.clone())
+    }
+
+    /// A Presence registry whose actors (including rehydrated ones) are seeded
+    /// with this decider's [`HouseProfile`].
+    pub fn registry(
+        &self,
+        journal: rex_wave_store::Journal,
+        hub: rex_wave_runtime::Hub,
+    ) -> std::sync::Arc<rex_wave_runtime::Registry<Presence>> {
+        rex_wave_runtime::Registry::<Presence>::with_initial_state(
+            journal,
+            hub,
+            self.initial_state(),
+        )
+    }
+
     /// Policy evaluation with an injectable process liveness probe for
     /// deterministic unit tests as well as real `ps`-backed checks.
     pub fn decide_with_probe<F>(
@@ -1552,26 +1674,28 @@ impl Presence {
             .or_else(|| existing.map(|r| r.status))
             .unwrap_or(SeatStatus::Active);
 
-        // Structural Q3 guard: `golem` is the human operator surface and may
-        // never become an `Active` seat or be claimed as another seat's alias.
-        if is_operator_surface_seat(c.seat.as_str()) && status == SeatStatus::Active {
+        // Structural Q3 guard: the house's operator surface seat is the human
+        // operator and may never become an `Active` seat or be claimed as
+        // another seat's alias.
+        let house = &state.house;
+        if house.is_operator_seat(c.seat.as_str()) && status == SeatStatus::Active {
             return Err(ApiError::Denied {
                 principal: ctx.by.to_string(),
                 action: format!(
-                    "claim operator surface seat '{}' as active (golem cannot become an active seat)",
+                    "claim operator surface seat '{}' as active (the operator surface cannot become an active seat)",
                     c.seat
                 ),
             });
         }
         if c.aliases
             .iter()
-            .any(|alias| is_operator_surface_seat(alias.as_str()))
+            .any(|alias| house.is_operator_seat(alias.as_str()))
         {
             return Err(ApiError::Denied {
                 principal: ctx.by.to_string(),
                 action: format!(
                     "claim reserved operator surface '{}' as an alias of '{}'",
-                    OPERATOR_SURFACE_SEAT, c.seat
+                    house.operator_seat, c.seat
                 ),
             });
         }
@@ -1838,11 +1962,11 @@ impl Presence {
         c: &PresenceSetStatus,
         ctx: &DecideCtx,
     ) -> Result<Vec<PresenceEvent>, ApiError> {
-        if is_operator_surface_seat(c.seat.as_str()) && c.status == SeatStatus::Active {
+        if state.house.is_operator_seat(c.seat.as_str()) && c.status == SeatStatus::Active {
             return Err(ApiError::Denied {
                 principal: ctx.by.to_string(),
                 action: format!(
-                    "set operator surface seat '{}' to active (golem cannot become an active seat)",
+                    "set operator surface seat '{}' to active (the operator surface cannot become an active seat)",
                     c.seat
                 ),
             });
@@ -1891,13 +2015,13 @@ impl Presence {
     where
         F: Fn(u32, &str) -> bool,
     {
-        // Structural Q3 guard: `golem` is the human operator surface and may
-        // never be bound as an active seat by any hook or principal.
-        if is_operator_surface_seat(c.seat.as_str()) {
+        // Structural Q3 guard: the house's operator surface seat may never be
+        // bound as an active seat by any hook or principal.
+        if state.house.is_operator_seat(c.seat.as_str()) {
             return Err(ApiError::Denied {
                 principal: ctx.by.to_string(),
                 action: format!(
-                    "bind operator surface seat '{}' (golem cannot be bound as an active seat)",
+                    "bind operator surface seat '{}' (the operator surface cannot be bound as an active seat)",
                     c.seat
                 ),
             });

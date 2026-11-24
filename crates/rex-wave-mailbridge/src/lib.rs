@@ -16,12 +16,13 @@ pub use acks::{
     letter_paths_match, normalize_letter_path, normalize_seat_token, parse_acks_jsonl,
 };
 pub use presence::{
-    CANONICAL_HOUSE_ALIASES, ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus,
+    ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus, HOUSE_PROFILE_MAX_BYTES,
     IncarnationAffinity, Presence, PresenceState, SeedInterchangePlan, current_process_start,
-    format_delivery_status, is_process_alive, load_claude_session_file,
-    load_claude_session_file_from, normalize_proc_start, parse_claude_session_json,
-    proc_start_matches, query_process_start, seed_records_from_interchange,
-    seed_records_from_interchange_with_options, select_binding_for_delivery,
+    format_delivery_status, house_profile_path_from, is_process_alive, load_claude_session_file,
+    load_claude_session_file_from, load_house_profile, load_house_profile_from,
+    normalize_proc_start, parse_claude_session_json, proc_start_matches, query_process_start,
+    seed_records_from_interchange, seed_records_from_interchange_with_options,
+    seed_records_from_interchange_with_profile, select_binding_for_delivery,
     sender_delivery_notice, try_query_process_start,
 };
 pub use score::{

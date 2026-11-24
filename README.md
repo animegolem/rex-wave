@@ -36,7 +36,7 @@ REX_WAVE_BB_TOKEN="$BB_PLUGIN_TOKEN" rex-wave daemon \
 	--http 127.0.0.1:7783
 ```
 
-The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. Place `--mail-sandbox` outside `~/agent-folder` and every other path listed in `protected-roots`—never inside a seat's own room under the house folder. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
+The daemon refuses a sandbox that is the filesystem root, your home folder, or anything you have protected. Place `--mail-sandbox` outside your house folder (for example `~/mail-house`) and every other path listed in `protected-roots`—never inside a seat's own room under the house folder. It reads what to protect from `$XDG_CONFIG_HOME/rex-wave/protected-roots` (`~/.config/rex-wave/protected-roots` by default) and will not start without that file. If you have nothing to protect, create it empty:
 
 ```sh
 mkdir -p ~/.config/rex-wave
@@ -54,6 +54,19 @@ name: archive
 ```
 
 A folder line is an absolute path or starts with `~/`, and cannot contain `..`. The file holds at most 64 entries. The daemon exits on a file that is missing, unreadable or malformed, so a mistake never leaves a folder unprotected.
+
+Facts about your house live in an optional `$XDG_CONFIG_HOME/rex-wave/house.json` (`~/.config/rex-wave/house.json` by default). Without it, the operator surface seat is `operator` and seeded claims that no machine record confirms are witnessed by `postmaster`. Every field is optional:
+
+```json
+{
+  "operator_seat": "operator",
+  "witness_seat": "postmaster",
+  "excluded_herdr_targets": ["w9:p1S"],
+  "aliases": { "alice": ["alice_old", "alice-desk"] }
+}
+```
+
+The operator surface seat can never be bound or claimed as an active seat, and letters to it never ring or raise `MailUnrung`. `aliases` folds historical names into a canonical seat when `presence seed-interchange` runs. `excluded_herdr_targets` lists multiplexer panes that never name a seat. The daemon and CLI refuse a `house.json` that is a symlink, malformed, larger than 64 KiB, or names an invalid seat.
 
 By default, the daemon listens on `$XDG_STATE_HOME/rex-wave/daemon.sock`, stores its SQLite WAL journal in `journal.sqlite3` beside that socket, and binds `wake-bell` HTTP `/sink` on `127.0.0.1:7781`. Pass `--socket <path>` to any `rex-wave` command to target a custom Unix socket.
 

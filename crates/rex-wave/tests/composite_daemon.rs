@@ -3,16 +3,15 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
-static NONCE: AtomicU64 = AtomicU64::new(1);
+mod common;
+use common::{fresh_dir, rex_wave_at, t3_home};
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -20,28 +19,6 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-struct DirGuard(PathBuf);
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_dir(label: &str) -> DirGuard {
-    let n = NONCE.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "rex-wave-composite-{label}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    DirGuard(p)
-}
-
-fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_rex-wave")
 }
 
 async fn free_port() -> u16 {
@@ -339,15 +316,12 @@ async fn http_get_json(addr: SocketAddr, path: &str) -> (u16, Value) {
 async fn daemon_refuses_non_loopback_http_and_runs_composite_t3_host_with_worker_token_minter() {
     let dir = fresh_dir("daemon");
     let sandbox = dir.0.join("mail-sandbox");
-    let cfg_dir = dir.0.join("config");
+    let t3_home = t3_home(&dir.0);
     std::fs::create_dir_all(&sandbox).unwrap();
-    std::fs::create_dir_all(cfg_dir.join("rex-wave")).unwrap();
     std::fs::write(sandbox.join(".rex-wave-sandbox"), "test\n").unwrap();
-    std::fs::write(cfg_dir.join("rex-wave/protected-roots"), "").unwrap();
 
     let bad_sock = dir.0.join("bad.sock");
-    let bad_out = Command::new(bin_path())
-        .env("XDG_CONFIG_HOME", &cfg_dir)
+    let bad_out = rex_wave_at(&bad_sock)
         .args([
             "--socket",
             bad_sock.to_str().unwrap(),
@@ -356,6 +330,8 @@ async fn daemon_refuses_non_loopback_http_and_runs_composite_t3_host_with_worker
             sandbox.to_str().unwrap(),
             "--runner",
             "bb",
+            "--t3-home",
+            t3_home.to_str().unwrap(),
             "--http",
             "0.0.0.0:0",
         ])
@@ -376,8 +352,7 @@ async fn daemon_refuses_non_loopback_http_and_runs_composite_t3_host_with_worker
     let sock = dir.0.join("daemon.sock");
     let journal = dir.0.join("journal.sqlite3");
 
-    let child = Command::new(bin_path())
-        .env("XDG_CONFIG_HOME", &cfg_dir)
+    let child = rex_wave_at(&sock)
         .args([
             "--socket",
             sock.to_str().unwrap(),
@@ -388,6 +363,8 @@ async fn daemon_refuses_non_loopback_http_and_runs_composite_t3_host_with_worker
             sandbox.to_str().unwrap(),
             "--runner",
             "both",
+            "--t3-home",
+            t3_home.to_str().unwrap(),
             "--bb-url",
             &format!("ws://127.0.0.1:{unused_bb_port}/bridge"),
             "--t3-url",
@@ -424,7 +401,7 @@ async fn daemon_refuses_non_loopback_http_and_runs_composite_t3_host_with_worker
 
     let sock_str = sock.to_str().unwrap().to_owned();
     let start_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
+        rex_wave_at(&sock_str)
             .args([
                 "--socket",
                 &sock_str,
@@ -471,8 +448,7 @@ async fn daemon_refuses_non_loopback_http_and_runs_composite_t3_host_with_worker
 
     let sock_str2 = sock.to_str().unwrap().to_owned();
     let post_out = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
-            .env_remove("REX_WAVE_TOKEN")
+        rex_wave_at(&sock_str2)
             .env("T3CODE_THREAD_ID", expected_tid)
             .args([
                 "--socket",

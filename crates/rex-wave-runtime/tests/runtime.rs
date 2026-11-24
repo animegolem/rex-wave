@@ -953,7 +953,7 @@ async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resol
             seat: SeatName::parse("owner").unwrap(),
         },
     );
-    let proj = BbProjectId::parse("proj_edaym59nyn").unwrap();
+    let proj = BbProjectId::parse("proj_demo_alpha").unwrap();
     owner
         .call(RoomEnsure {
             room: RoomRef::Channel {
@@ -990,13 +990,13 @@ async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resol
     );
 
     let mut map = BTreeMap::new();
-    map.insert(proj.clone(), "pancake-work".to_owned());
+    map.insert(proj.clone(), "demo-work".to_owned());
     names_tx.send(Arc::new(map)).unwrap();
 
     let named = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(Ok(Frame::Sidebar(snap))) = stream.next().await
-                && snap.projects.first().and_then(|p| p.name.as_deref()) == Some("pancake-work")
+                && snap.projects.first().and_then(|p| p.name.as_deref()) == Some("demo-work")
             {
                 break *snap;
             }
@@ -1004,7 +1004,7 @@ async fn sidebar_surfaces_human_project_names_and_pushes_updates_when_feed_resol
     })
     .await
     .expect("live sidebar watch emitted updated human project name");
-    assert_eq!(named.projects[0].name.as_deref(), Some("pancake-work"));
+    assert_eq!(named.projects[0].name.as_deref(), Some("demo-work"));
 }
 
 #[tokio::test]
