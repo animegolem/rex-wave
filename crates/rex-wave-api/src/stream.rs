@@ -141,6 +141,10 @@ impl Cursor {
     pub fn from_head(&self) -> bool {
         self.from_head
     }
+    pub fn with_from_head(mut self, from_head: bool) -> Self {
+        self.from_head = from_head;
+        self
+    }
     /// Is `stream` positioned explicitly (rather than by the default)?
     pub fn lists(&self, stream: &StreamId) -> bool {
         self.positions.iter().any(|(s, _)| s == stream)

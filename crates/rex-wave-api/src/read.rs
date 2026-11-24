@@ -103,6 +103,19 @@ impl Read {
 pub struct Wait {
     pub interest: Interest,
     pub after: Cursor,
+    /// Optional target room reference (`#channel`, `@seat`); when present, the
+    /// server resolves `since` and `cursor` against the server-selected stream
+    /// (while `after` carries a compatibility fallback for older daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomRef>,
+    /// Optional room-relative sequence offset (`--since` / `--after`), applied
+    /// exclusively to the server-selected `room` stream when `room` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<Seq>,
+    /// Optional resume cursor; when present, takes precedence over `after`'s
+    /// single-stream fallback and combines with `room` / `since`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Cursor>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,26 +123,31 @@ pub struct Wait {
 }
 
 impl Wait {
+    pub fn new(interest: Interest, after: Cursor) -> Self {
+        Wait {
+            interest,
+            after,
+            room: None,
+            since: None,
+            cursor: None,
+            timeout_ms: None,
+            limit: None,
+        }
+    }
+
     /// Wait on one room after `since`. With `mentions_only`, wake on mentions
     /// of me in `room` after `since` or in any other room from now on.
     pub fn room(room: RoomId, since: Seq, mentions_only: bool) -> Self {
         let stream = StreamId::Room { room: room.clone() };
         if mentions_only {
-            Wait {
-                interest: Interest::Mentions,
-                after: Cursor::live().with(stream, since),
-                timeout_ms: None,
-                limit: None,
-            }
+            Wait::new(Interest::Mentions, Cursor::live().with(stream, since))
         } else {
-            Wait {
-                interest: Interest::Room {
+            Wait::new(
+                Interest::Room {
                     room: RoomRef::Id { id: room },
                 },
-                after: Cursor::default().with(stream, since),
-                timeout_ms: None,
-                limit: None,
-            }
+                Cursor::default().with(stream, since),
+            )
         }
     }
 
@@ -139,47 +157,42 @@ impl Wait {
         since: Seq,
         mentions_only: bool,
     ) -> Result<Self, crate::id::InvalidId> {
-        let id = room.resolve(me)?;
-        let stream = StreamId::Room { room: id };
-        let legacy = legacy_operator_dm_stream(&room, me)?;
-        let mut after = if mentions_only {
+        let canon_stream = StreamId::Room {
+            room: room.resolve(me)?,
+        };
+        let fallback_stream = legacy_operator_dm_stream(&room, me)?.unwrap_or(canon_stream);
+        let after = if mentions_only {
             Cursor::live()
         } else {
             Cursor::default()
         }
-        .with(stream, since);
-        if let Some(leg) = legacy {
-            after = after.with(leg, since);
-        }
-        if mentions_only {
-            Ok(Wait {
-                interest: Interest::Mentions,
-                after,
-                timeout_ms: None,
-                limit: None,
-            })
+        .with(fallback_stream, since);
+        let interest = if mentions_only {
+            Interest::Mentions
         } else {
-            Ok(Wait {
-                interest: Interest::Room { room },
-                after,
-                timeout_ms: None,
-                limit: None,
-            })
-        }
+            Interest::Room { room: room.clone() }
+        };
+        Ok(Wait {
+            interest,
+            after,
+            room: Some(room),
+            since: Some(since),
+            cursor: None,
+            timeout_ms: None,
+            limit: None,
+        })
     }
 
     pub fn room_filtered(room: RoomId, since: Seq, re: Option<Seq>, labels: Vec<Label>) -> Self {
         let stream = StreamId::Room { room: room.clone() };
-        Wait {
-            interest: Interest::RoomFiltered {
+        Wait::new(
+            Interest::RoomFiltered {
                 room: RoomRef::Id { id: room },
                 re,
                 labels,
             },
-            after: Cursor::default().with(stream, since),
-            timeout_ms: None,
-            limit: None,
-        }
+            Cursor::default().with(stream, since),
+        )
     }
 
     pub fn room_ref_filtered(
@@ -189,15 +202,20 @@ impl Wait {
         re: Option<Seq>,
         labels: Vec<Label>,
     ) -> Result<Self, crate::id::InvalidId> {
-        let id = room.resolve(me)?;
-        let stream = StreamId::Room { room: id };
-        let mut after = Cursor::default().with(stream, since);
-        if let Some(leg) = legacy_operator_dm_stream(&room, me)? {
-            after = after.with(leg, since);
-        }
+        let canon_stream = StreamId::Room {
+            room: room.resolve(me)?,
+        };
+        let fallback_stream = legacy_operator_dm_stream(&room, me)?.unwrap_or(canon_stream);
         Ok(Wait {
-            interest: Interest::RoomFiltered { room, re, labels },
-            after,
+            interest: Interest::RoomFiltered {
+                room: room.clone(),
+                re,
+                labels,
+            },
+            after: Cursor::default().with(fallback_stream, since),
+            room: Some(room),
+            since: Some(since),
+            cursor: None,
             timeout_ms: None,
             limit: None,
         })

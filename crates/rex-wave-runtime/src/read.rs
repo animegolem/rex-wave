@@ -331,6 +331,15 @@ impl ReadSide {
         interest: Interest,
         from: Cursor,
     ) -> Result<FrameStream, ApiError> {
+        Ok(self.watch_journal_with_baseline(viewer, interest, from)?.0)
+    }
+
+    fn watch_journal_with_baseline(
+        &self,
+        viewer: Principal,
+        interest: Interest,
+        from: Cursor,
+    ) -> Result<(FrameStream, Cursor), ApiError> {
         let remap_dm_cursor = matches!(
             &interest,
             Interest::Room {
@@ -354,17 +363,29 @@ impl ReadSide {
             .into_iter()
             .collect();
 
+        let candidates: Vec<StreamId> = match &filter {
+            Filter::Exact(set) => set.iter().cloned().collect(),
+            Filter::RoomFiltered { stream, .. } => vec![stream.clone()],
+            _ => initial.keys().cloned().collect(),
+        };
+        let mut baseline = from.clone();
+        if from.from_head() {
+            for s in &candidates {
+                if !baseline.lists(s) {
+                    let start = initial.get(s).copied().unwrap_or(Seq::ORIGIN);
+                    baseline.advance(s, start);
+                }
+            }
+            baseline = baseline.with_from_head(false);
+        }
+
         let journal = self.journal.clone();
+        let task_baseline = baseline.clone();
         let (tx, stream) = frame_channel(WATCH_BUFFER);
         tokio::spawn(async move {
             let mut seen: BTreeMap<StreamId, Seq> = BTreeMap::new();
-            let mut cursor = from.clone();
+            let mut cursor = task_baseline;
 
-            let candidates: Vec<StreamId> = match &filter {
-                Filter::Exact(set) => set.iter().cloned().collect(),
-                Filter::RoomFiltered { stream, .. } => vec![stream.clone()],
-                _ => initial.keys().cloned().collect(),
-            };
             for s in candidates {
                 let start = start_seq(&from, &initial, &s);
                 filter.seed_stream(&journal, &s, start);
@@ -440,30 +461,51 @@ impl ReadSide {
                 }
             }
         });
-        Ok(stream)
+        Ok((stream, baseline))
+    }
+
+    fn resolve_wait_cursor(
+        &self,
+        viewer: &Principal,
+        req: &read::Wait,
+    ) -> Result<Cursor, ApiError> {
+        let target_stream = match &req.room {
+            Some(room_ref) => Some(StreamId::Room {
+                room: self.resolve_room_ref(room_ref, viewer)?,
+            }),
+            None => None,
+        };
+        if let Some(ref c) = req.cursor {
+            let mut out = c.clone();
+            if let Some(ref target) = target_stream {
+                if let Some(since) = req.since {
+                    out.advance(target, since);
+                } else if matches!(req.interest, Interest::Mentions) && !out.lists(target) {
+                    out.advance(target, Seq::ORIGIN);
+                }
+            }
+            return Ok(out);
+        }
+        if let (Some(target), Some(since)) = (target_stream, req.since) {
+            let base = if req.after.from_head() {
+                Cursor::live()
+            } else {
+                Cursor::default()
+            };
+            return Ok(base.with(target, since));
+        }
+        Ok(req.after.clone())
     }
 
     async fn wait_for(&self, viewer: Principal, req: read::Wait) -> Result<Page, ApiError> {
-        let remap_dm_cursor = matches!(
-            &req.interest,
-            Interest::Room {
-                room: rex_wave_api::room::RoomRef::Dm { .. }
-            } | Interest::RoomFiltered {
-                room: rex_wave_api::room::RoomRef::Dm { .. },
-                ..
-            } | Interest::Mentions
-        );
-        let initial_cursor = if remap_dm_cursor {
-            req.after.try_map_streams(|s| self.resolve_stream(s))?
-        } else {
-            req.after.clone()
-        };
-        let mut stream = self.watch_journal(viewer, req.interest, req.after)?;
+        let effective_after = self.resolve_wait_cursor(&viewer, &req)?;
+        let (mut stream, baseline) =
+            self.watch_journal_with_baseline(viewer, req.interest, effective_after)?;
         let cap = req.limit.map(|n| n.clamp(1, 1000) as usize);
         let mut entries = Vec::new();
         let mut total_matched = 0usize;
-        let mut cursor = initial_cursor.clone();
-        let mut retained_cursor = initial_cursor;
+        let mut cursor = baseline.clone();
+        let mut retained_cursor = baseline;
         let mut caught_up = false;
         let deadline = req
             .timeout_ms
@@ -495,8 +537,6 @@ impl ReadSide {
             if cap.is_none_or(|c| entries.len() < c) {
                 retained_cursor.advance(&env.stream, env.seq);
                 entries.push(env);
-            } else if retained_cursor.from_head() && !retained_cursor.lists(&env.stream) {
-                retained_cursor.advance(&env.stream, Seq(env.seq.0.saturating_sub(1)));
             }
         };
 

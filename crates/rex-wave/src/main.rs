@@ -1248,7 +1248,9 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                 if after.is_none()
                     && let Some(c) = parsed_cursor
                 {
-                    wait.after = c;
+                    wait.after = c.clone();
+                    wait.since = None;
+                    wait.cursor = Some(c);
                 }
                 wait.timeout_ms = Some(0);
                 wait.limit = Some(limit.unwrap_or(200).clamp(1, 1000));
@@ -1287,17 +1289,23 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                     let stream = StreamId::Room {
                         room: room_id.clone(),
                     };
+                    let fallback_stream =
+                        rex_wave_api::read::legacy_operator_dm_stream(&room_ref, me)?
+                            .unwrap_or_else(|| stream.clone());
                     if has_filter {
                         if *since == 0
                             && let Some(c) = base_cursor
                         {
                             Wait {
                                 interest: Interest::RoomFiltered {
-                                    room: room_ref,
+                                    room: room_ref.clone(),
                                     re: re.map(Seq),
                                     labels: parsed_labels,
                                 },
-                                after: c,
+                                after: c.clone(),
+                                room: Some(room_ref),
+                                since: None,
+                                cursor: Some(c),
                                 timeout_ms: *timeout,
                                 limit: None,
                             }
@@ -1309,38 +1317,38 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                                 re.map(Seq),
                                 parsed_labels,
                             )?;
+                            if let Some(c) = base_cursor {
+                                let mut wire_c = c.clone();
+                                wire_c.advance(&fallback_stream, Seq(*since));
+                                w.after = wire_c;
+                                w.cursor = Some(c);
+                            }
                             w.timeout_ms = *timeout;
                             w
                         }
                     } else {
                         let mentions = !*all;
-                        let legacy_stream =
-                            rex_wave_api::read::legacy_operator_dm_stream(&room_ref, me)?;
                         let mut w = Wait::room_ref(room_ref, me, Seq(*since), mentions)?;
                         if let Some(c) = base_cursor {
-                            let mut c = if mentions {
+                            let base_c = if mentions {
                                 ensure_cursor_from_head(c)
                             } else {
                                 c
                             };
+                            let mut wire_c = base_c.clone();
                             if *since > 0 {
-                                c.advance(&stream, Seq(*since));
-                                if let Some(ref leg) = legacy_stream {
-                                    c.advance(leg, Seq(*since));
-                                }
-                            } else if mentions {
-                                let lists_canon = c.lists(&stream);
-                                if !lists_canon {
-                                    c.advance(&stream, Seq::ORIGIN);
-                                }
-                                if !lists_canon
-                                    && let Some(ref leg) = legacy_stream
-                                    && !c.lists(leg)
+                                wire_c.advance(&fallback_stream, Seq(*since));
+                            } else {
+                                w.since = None;
+                                if mentions
+                                    && !wire_c.lists(&stream)
+                                    && !wire_c.lists(&fallback_stream)
                                 {
-                                    c.advance(leg, Seq::ORIGIN);
+                                    wire_c.advance(&fallback_stream, Seq::ORIGIN);
                                 }
                             }
-                            w.after = c;
+                            w.after = wire_c;
+                            w.cursor = Some(base_c);
                         }
                         w.timeout_ms = *timeout;
                         w
@@ -1359,14 +1367,15 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         None => Cursor::live(),
                     };
                     Wait {
-                        interest: if *all {
-                            Interest::Everything
-                        } else {
-                            Interest::Mentions
-                        },
-                        after,
                         timeout_ms: *timeout,
-                        limit: None,
+                        ..Wait::new(
+                            if *all {
+                                Interest::Everything
+                            } else {
+                                Interest::Mentions
+                            },
+                            after,
+                        )
                     }
                 }
             };
@@ -3898,8 +3907,8 @@ async fn execute_remote<C: Client>(
     }
 
     let wire = to_command_for(cmd, client.me())?;
-    let wait_after = match &wire {
-        WireCommand::Wait(w) => Some(w.after.clone()),
+    let read_user_cursor = match &wire {
+        WireCommand::Wait(w) => w.cursor.clone(),
         _ => None,
     };
     let mut reply = client.call_wire(wire).await?;
@@ -3912,7 +3921,7 @@ async fn execute_remote<C: Client>(
         if page.entries.len() > cap {
             let total_count = page.total_count.max(page.entries.len());
             page.entries.truncate(cap);
-            let mut retained = wait_after.unwrap_or_default();
+            let mut retained = read_user_cursor.unwrap_or_default();
             for env in &page.entries {
                 retained.advance(&env.stream, env.seq);
             }

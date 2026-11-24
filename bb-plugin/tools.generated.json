@@ -6468,6 +6468,17 @@
         "after": {
           "$ref": "#/$defs/Cursor"
         },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional resume cursor; when present, takes precedence over `after`'s\nsingle-stream fallback and combines with `room` / `since`."
+        },
         "interest": {
           "$ref": "#/$defs/Interest"
         },
@@ -6478,6 +6489,28 @@
             "integer",
             "null"
           ]
+        },
+        "room": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoomRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional target room reference (`#channel`, `@seat`); when present, the\nserver resolves `since` and `cursor` against the server-selected stream\n(while `after` carries a compatibility fallback for older daemons)."
+        },
+        "since": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Seq"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional room-relative sequence offset (`--since` / `--after`), applied\nexclusively to the server-selected `room` stream when `room` is present."
         },
         "timeout_ms": {
           "default": null,

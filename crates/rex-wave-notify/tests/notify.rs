@@ -2906,14 +2906,15 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     };
     let explicit_canon_wait = zorro_op
         .call(rex_wave_api::read::Wait {
-            interest: Interest::Room {
-                room: RoomRef::Id {
-                    id: canon_room.clone(),
-                },
-            },
-            after: Cursor::default(),
             timeout_ms: Some(0),
-            limit: None,
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Id {
+                        id: canon_room.clone(),
+                    },
+                },
+                Cursor::default(),
+            )
         })
         .await
         .unwrap();
@@ -3066,6 +3067,33 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
                 })],
             )
             .unwrap();
+        w_leg
+            .append(
+                &alice_p,
+                UnixMs(2_600),
+                None,
+                vec![
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice legacy #4").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice legacy #5").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                ],
+            )
+            .unwrap();
     }
     let split_hub = Hub::new(64);
     let split_sidebar = SidebarProjection::spawn(split_journal.clone(), split_hub.clone());
@@ -3127,14 +3155,16 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     );
     let split_wait_page = split_op
         .call(rex_wave_api::read::Wait {
-            interest: Interest::Room {
-                room: RoomRef::Dm {
-                    with: alice_p.clone(),
-                },
-            },
-            after: legacy_cursor,
             timeout_ms: Some(0),
             limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Dm {
+                        with: alice_p.clone(),
+                    },
+                },
+                legacy_cursor,
+            )
         })
         .await
         .unwrap();
@@ -3142,6 +3172,26 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     assert_eq!(split_wait_page.total_count, 2);
     assert!(split_wait_page.truncated);
     assert_eq!(split_wait_page.entries[0].seq, Seq(1));
+
+    // Mentions wait on a split journal applies `--since` only to the server-selected canonical stream
+    // and starts the legacy DM stream at its current head (never replaying old legacy peer posts).
+    let mut split_mentions_wait = rex_wave_api::read::Wait::room_ref(
+        RoomRef::Dm {
+            with: alice_p.clone(),
+        },
+        &Principal::Operator {
+            seat: SeatName::parse("zorro").unwrap(),
+        },
+        Seq(2),
+        true,
+    )
+    .unwrap();
+    split_mentions_wait.timeout_ms = Some(0);
+    let split_mentions_page = split_op.call(split_mentions_wait).await.unwrap();
+    assert!(
+        split_mentions_page.entries.is_empty(),
+        "mentions wait at canonical head must not replay legacy DM history"
+    );
 
     // Live cursor (`from_head: true`) omitting target stream starts at head on `Read` (matching `Wait`).
     let live_read = split_op
@@ -3231,12 +3281,14 @@ async fn capped_multi_stream_wait_advances_cursor_without_looping() {
     for _ in 0..8 {
         let page = op
             .call(rex_wave_api::read::Wait {
-                interest: Interest::Streams {
-                    streams: vec![first_stream.clone(), second_stream.clone()],
-                },
-                after: cursor,
                 timeout_ms: Some(0),
                 limit: Some(1),
+                ..rex_wave_api::read::Wait::new(
+                    Interest::Streams {
+                        streams: vec![first_stream.clone(), second_stream.clone()],
+                    },
+                    cursor,
+                )
             })
             .await
             .unwrap();
@@ -3262,15 +3314,83 @@ async fn capped_multi_stream_wait_advances_cursor_without_looping() {
 
     let done = op
         .call(rex_wave_api::read::Wait {
-            interest: Interest::Streams {
-                streams: vec![first_stream, second_stream],
-            },
-            after: cursor,
             timeout_ms: Some(0),
             limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![first_stream.clone(), second_stream.clone()],
+                },
+                cursor,
+            )
         })
         .await
         .unwrap();
     assert!(done.entries.is_empty());
     assert!(done.timed_out);
+
+    // Unlisted `from_head` stream preserves its subscription-time head (`4`) across truncated
+    // pages so a post arriving between pages (`Seq(5)`) is never skipped.
+    let live_p1 = op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![first_stream.clone(), second_stream.clone()],
+                },
+                Cursor::live().with(first_stream.clone(), Seq::ORIGIN),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(live_p1.entries.len(), 1);
+    assert!(live_p1.truncated);
+    assert_eq!(live_p1.entries[0].stream, first_stream);
+    assert_eq!(live_p1.entries[0].seq, Seq(1));
+
+    op.call(RoomPost {
+        room: second_ref,
+        body: Body::parse("second-between-pages").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    let mut live_cursor = live_p1.cursor;
+    let mut live_rest = Vec::new();
+    for _ in 0..4 {
+        let page = op
+            .call(rex_wave_api::read::Wait {
+                timeout_ms: Some(0),
+                limit: Some(1),
+                ..rex_wave_api::read::Wait::new(
+                    Interest::Streams {
+                        streams: vec![first_stream.clone(), second_stream.clone()],
+                    },
+                    live_cursor,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        live_rest.push((page.entries[0].stream.clone(), page.entries[0].seq));
+        live_cursor = page.cursor;
+    }
+    assert_eq!(
+        live_rest,
+        vec![
+            (first_stream, Seq(2)),
+            (first_stream_clone(&live_rest[0].0), Seq(3)),
+            (first_stream_clone(&live_rest[0].0), Seq(4)),
+            (second_stream, Seq(5)),
+        ]
+    );
+}
+
+fn first_stream_clone(s: &StreamId) -> StreamId {
+    s.clone()
 }
