@@ -3394,3 +3394,203 @@ async fn capped_multi_stream_wait_advances_cursor_without_looping() {
 fn first_stream_clone(s: &StreamId) -> StreamId {
     s.clone()
 }
+
+#[tokio::test]
+async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_since() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let bob_p = Principal::Seat {
+        seat: SeatName::parse("bob").unwrap(),
+    };
+    let carol_p = Principal::Seat {
+        seat: SeatName::parse("carol").unwrap(),
+    };
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let bob = LocalClient::new(router.clone(), bob_p.clone());
+    let op = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+
+    bob.call(RoomPost {
+        room: RoomRef::Dm {
+            with: carol_p.clone(),
+        },
+        body: Body::parse("secret bob-carol dm").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    let general = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    };
+    alice
+        .call(RoomJoin {
+            room: general.clone(),
+            member: None,
+            handle: None,
+        })
+        .await
+        .unwrap();
+    bob.call(RoomPost {
+        room: general.clone(),
+        body: Body::parse("hi @alice #1").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+    bob.call(RoomPost {
+        room: general.clone(),
+        body: Body::parse("hi @alice #2").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    let p1 = alice
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Mentions,
+                Cursor::live().with(
+                    StreamId::Room {
+                        room: general.resolve(&alice_p).unwrap(),
+                    },
+                    Seq::ORIGIN,
+                ),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1.entries.len(), 1);
+    assert!(p1.cursor.is_pinned());
+    assert!(!p1.cursor.from_head());
+    let cursor_json = serde_json::to_string(&p1.cursor).unwrap();
+    assert!(
+        !cursor_json.contains("carol"),
+        "wait cursor must never disclose unrelated private DM participants: {cursor_json}"
+    );
+
+    let wave_slug = WaveSlug::parse("w-park").unwrap();
+    let role_name = RoleName::parse("coder").unwrap();
+    op.call(WaveStart {
+        spec: WaveSpec {
+            slug: wave_slug.clone(),
+            project: BbProjectId::parse("proj_park").unwrap(),
+            goal: Body::parse("check parked since").unwrap(),
+            defaults: AgentSpec {
+                provider: ProviderId::parse("claude").unwrap(),
+                model: Some(ModelId::parse("sonnet").unwrap()),
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::AcceptEdits,
+                workspace: Workspace::ProjectDefault,
+            },
+            workers: vec![WorkerSpec {
+                role: role_name.clone(),
+                agent: None,
+                brief: Body::parse("wait test").unwrap(),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            }],
+            output_dir: None,
+        },
+        idem: None,
+    })
+    .await
+    .unwrap();
+    let worker_p = Principal::Worker {
+        wave: wave_slug.clone(),
+        role: role_name.clone(),
+    };
+    let sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
+    );
+    sys.call(WaveObserve {
+        wave: wave_slug.clone(),
+        role: role_name.clone(),
+        observation: Observation::Spawned {
+            attempt: 1,
+            thread: BbThreadId::parse("th_park").unwrap(),
+        },
+    })
+    .await
+    .unwrap();
+    let worker = LocalClient::new(router.clone(), worker_p.clone());
+
+    let general_id = general.resolve(&worker_p).unwrap();
+    let mut w =
+        rex_wave_api::read::Wait::room_ref(general.clone(), &worker_p, Seq::ORIGIN, false).unwrap();
+    w.since = None;
+    w.cursor = Some(Cursor::default().with(
+        StreamId::Room {
+            room: general_id.clone(),
+        },
+        Seq(5),
+    ));
+    w.timeout_ms = Some(200);
+    let wait_handle = tokio::spawn(async move { worker.call(w).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let snap = op
+        .call(WaveView {
+            wave: wave_slug.clone(),
+        })
+        .await
+        .unwrap();
+    let (_, _, phase) = &snap.workers[0];
+    let _ = wait_handle.await.unwrap();
+    assert!(
+        matches!(
+            phase,
+            WorkerPhase::Live {
+                activity: Activity::Parked {
+                    room: Some(r),
+                    since: Seq(5),
+                },
+                ..
+            } if r == &general_id
+        ),
+        "worker Activity::Parked must record resolved cursor offset Seq(5), got {phase:?}"
+    );
+}

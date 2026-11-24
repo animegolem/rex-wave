@@ -220,6 +220,37 @@ impl Wait {
             limit: None,
         })
     }
+
+    /// Resolves the effective resume cursor for `viewer` without consulting the
+    /// journal (used by host bridges that lack direct journal access).
+    pub fn effective_cursor_for(&self, viewer: &Principal) -> Result<Cursor, crate::id::InvalidId> {
+        let target_stream = match &self.room {
+            Some(r) => Some(StreamId::Room {
+                room: r.resolve(viewer)?,
+            }),
+            None => None,
+        };
+        if let Some(ref c) = self.cursor {
+            let mut out = c.clone();
+            if let Some(ref target) = target_stream {
+                if let Some(since) = self.since {
+                    out.advance(target, since);
+                } else if matches!(self.interest, Interest::Mentions) && !out.lists(target) {
+                    out.advance(target, Seq::ORIGIN);
+                }
+            }
+            return Ok(out);
+        }
+        if let (Some(target), Some(since)) = (target_stream, self.since) {
+            let base = if self.after.from_head() {
+                Cursor::live()
+            } else {
+                Cursor::default()
+            };
+            return Ok(base.with(target, since));
+        }
+        Ok(self.after.clone())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]

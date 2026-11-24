@@ -1477,15 +1477,15 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
     bind_unix_prepared(path, &prepared)
 }
 
-/// Unlink any stale socket, bind `path`, and apply mode `0600` using a
-/// previously validated [`rex_wave_fs::PreparedUnixSocket`].
+/// Unlink any stale socket, bind inside the held parent directory, and apply
+/// mode `0600` using a previously validated [`rex_wave_fs::PreparedUnixSocket`].
 pub fn bind_unix_prepared(
     path: &std::path::Path,
     prepared: &rex_wave_fs::PreparedUnixSocket,
 ) -> io::Result<(UnixListener, u32)> {
-    prepared.unlink_stale(path)?;
-    let listener = UnixListener::bind(path)?;
-    prepared.finalize_permissions(path)?;
+    let std_listener = prepared.bind(path)?;
+    std_listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(std_listener)?;
     Ok((listener, prepared.uid()))
 }
 

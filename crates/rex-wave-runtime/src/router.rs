@@ -101,29 +101,7 @@ fn parked_room_and_since(
     worker: &Principal,
     wait: &rex_wave_api::read::Wait,
 ) -> (Option<RoomId>, Seq) {
-    match &wait.interest {
-        Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
-            match read.resolve_room_ref(room, worker) {
-                Ok(id) => {
-                    let since = if matches!(room, rex_wave_api::room::RoomRef::Dm { .. }) {
-                        wait.after
-                            .try_map_streams(|s| read.resolve_stream(s))
-                            .unwrap_or_else(|_| wait.after.clone())
-                            .at(&StreamId::Room { room: id.clone() })
-                    } else {
-                        wait.after.at(&StreamId::Room { room: id.clone() })
-                    };
-                    (Some(id), since)
-                }
-                Err(_) => (None, Seq::ORIGIN),
-            }
-        }
-        Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
-            StreamId::Room { room } => (Some(room.clone()), wait.after.at(&streams[0])),
-            _ => (None, Seq::ORIGIN),
-        },
-        _ => (None, Seq::ORIGIN),
-    }
+    read.parked_room_and_since(worker, wait)
 }
 
 fn resolve_room_cmd(

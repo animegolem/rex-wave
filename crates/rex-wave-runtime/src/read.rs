@@ -363,20 +363,31 @@ impl ReadSide {
             .into_iter()
             .collect();
 
-        let candidates: Vec<StreamId> = match &filter {
+        let raw_candidates: Vec<StreamId> = match &filter {
             Filter::Exact(set) => set.iter().cloned().collect(),
             Filter::RoomFiltered { stream, .. } => vec![stream.clone()],
             _ => initial.keys().cloned().collect(),
         };
+        let mut candidates = Vec::with_capacity(raw_candidates.len());
+        for s in raw_candidates {
+            if can_read(&viewer, &s).is_err() {
+                continue;
+            }
+            let start = start_seq(&from, &initial, &s);
+            filter.seed_stream(&self.journal, &s, start);
+            if !filter.considers_stream(&viewer, &s) {
+                continue;
+            }
+            candidates.push((s, start));
+        }
         let mut baseline = from.clone();
         if from.from_head() {
-            for s in &candidates {
+            for (s, start) in &candidates {
                 if !baseline.lists(s) {
-                    let start = initial.get(s).copied().unwrap_or(Seq::ORIGIN);
-                    baseline.advance(s, start);
+                    baseline.advance(s, *start);
                 }
             }
-            baseline = baseline.with_from_head(false);
+            baseline = baseline.pin_head_snapshot();
         }
 
         let journal = self.journal.clone();
@@ -386,9 +397,7 @@ impl ReadSide {
             let mut seen: BTreeMap<StreamId, Seq> = BTreeMap::new();
             let mut cursor = task_baseline;
 
-            for s in candidates {
-                let start = start_seq(&from, &initial, &s);
-                filter.seed_stream(&journal, &s, start);
+            for (s, start) in candidates {
                 seen.insert(s.clone(), start);
                 cursor.advance(&s, start);
                 if from.from_head() && !from.lists(&s) {
@@ -425,8 +434,11 @@ impl ReadSide {
                     () = tx.closed() => break,
                     item = tap.recv() => match item {
                         Ok(env) => {
+                            if can_read(&viewer, &env.stream).is_err() {
+                                continue;
+                            }
                             filter.observe(&env);
-                            if !filter.considers_stream(&env.stream) {
+                            if !filter.considers_stream(&viewer, &env.stream) {
                                 continue;
                             }
                             let cur = *seen.entry(env.stream.clone()).or_insert_with(|| start_seq(&from, &initial, &env.stream));
@@ -446,9 +458,12 @@ impl ReadSide {
                         Err(RecvError::Lagged(_)) => {
                             let Ok(streams) = journal.streams() else { break };
                             for (s, head) in streams {
+                                if can_read(&viewer, &s).is_err() {
+                                    continue;
+                                }
                                 let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq(&from, &initial, &s));
                                 filter.seed_stream(&journal, &s, cur);
-                                if !filter.considers_stream(&s) {
+                                if !filter.considers_stream(&viewer, &s) {
                                     continue;
                                 }
                                 if cur < head && !replay_stream(&journal, &s, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
@@ -464,7 +479,7 @@ impl ReadSide {
         Ok((stream, baseline))
     }
 
-    fn resolve_wait_cursor(
+    pub fn resolve_wait_cursor(
         &self,
         viewer: &Principal,
         req: &read::Wait,
@@ -495,6 +510,40 @@ impl ReadSide {
             return Ok(base.with(target, since));
         }
         Ok(req.after.clone())
+    }
+
+    pub fn parked_room_and_since(
+        &self,
+        worker: &Principal,
+        wait: &read::Wait,
+    ) -> (Option<RoomId>, Seq) {
+        let effective = match self.resolve_wait_cursor(worker, wait) {
+            Ok(c) => c,
+            Err(_) => return (None, Seq::ORIGIN),
+        };
+        match &wait.interest {
+            Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
+                match self.resolve_room_ref(room, worker) {
+                    Ok(id) => {
+                        let mapped = if matches!(room, rex_wave_api::room::RoomRef::Dm { .. }) {
+                            effective
+                                .try_map_streams(|s| self.resolve_stream(s))
+                                .unwrap_or(effective)
+                        } else {
+                            effective
+                        };
+                        let since = mapped.at(&StreamId::Room { room: id.clone() });
+                        (Some(id), since)
+                    }
+                    Err(_) => (None, Seq::ORIGIN),
+                }
+            }
+            Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
+                StreamId::Room { room } => (Some(room.clone()), effective.at(&streams[0])),
+                _ => (None, Seq::ORIGIN),
+            },
+            _ => (None, Seq::ORIGIN),
+        }
     }
 
     async fn wait_for(&self, viewer: Principal, req: read::Wait) -> Result<Page, ApiError> {
@@ -900,7 +949,10 @@ impl Filter {
         }
     }
 
-    fn considers_stream(&self, stream: &StreamId) -> bool {
+    fn considers_stream(&self, viewer: &Principal, stream: &StreamId) -> bool {
+        if can_read(viewer, stream).is_err() {
+            return false;
+        }
         match self {
             Filter::Exact(set) => set.contains(stream),
             Filter::RoomFiltered { stream: target, .. } => stream == target,
@@ -926,7 +978,7 @@ impl Filter {
     }
 
     fn matches(&self, viewer: &Principal, env: &Envelope) -> bool {
-        if !self.considers_stream(&env.stream) || can_read(viewer, &env.stream).is_err() {
+        if !self.considers_stream(viewer, &env.stream) {
             return false;
         }
         match self {

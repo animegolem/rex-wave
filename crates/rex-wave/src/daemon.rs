@@ -751,7 +751,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         t.abort();
     }
     sink_task.abort();
-    let _ = std::fs::remove_file(&sock_path);
+    let _ = prepared_sock.cleanup_bound();
 
     serve_result
 }

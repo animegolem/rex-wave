@@ -128,6 +128,11 @@ pub struct Cursor {
     /// Streams not listed start at their head at subscribe time instead of origin.
     #[serde(default)]
     from_head: bool,
+    /// True once `Wait` has materialized all subscription-time visible stream
+    /// heads into `positions` and cleared `from_head`, so subsequent CLI
+    /// mentions waits keep `from_head: false` for streams created between waits.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pinned: bool,
 }
 
 impl Cursor {
@@ -136,13 +141,25 @@ impl Cursor {
         Cursor {
             positions: Vec::new(),
             from_head: true,
+            pinned: false,
         }
     }
     pub fn from_head(&self) -> bool {
         self.from_head
     }
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
     pub fn with_from_head(mut self, from_head: bool) -> Self {
         self.from_head = from_head;
+        if from_head {
+            self.pinned = false;
+        }
+        self
+    }
+    pub fn pin_head_snapshot(mut self) -> Self {
+        self.from_head = false;
+        self.pinned = true;
         self
     }
     /// Is `stream` positioned explicitly (rather than by the default)?
@@ -167,6 +184,7 @@ impl Cursor {
         let mut out = Cursor {
             positions: Vec::with_capacity(self.positions.len()),
             from_head: self.from_head,
+            pinned: self.pinned,
         };
         for (stream, seq) in &self.positions {
             out.advance(&f(stream.clone())?, *seq);

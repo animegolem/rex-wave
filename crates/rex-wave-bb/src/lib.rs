@@ -1203,6 +1203,13 @@ pub fn load_bb_projects_from_dir(dir: &Path) -> BTreeMap<BbProjectId, String> {
 pub trait BridgeBackend: Send + Sync + 'static {
     type C: Client + Clone + 'static;
     fn client(&self, me: Principal) -> Self::C;
+    fn parked_room_and_since(
+        &self,
+        worker: &Principal,
+        wait: &rex_wave_api::read::Wait,
+    ) -> (Option<RoomId>, Seq) {
+        parked_room_and_since(worker, wait)
+    }
 }
 
 impl BridgeBackend for Arc<Router> {
@@ -1210,16 +1217,35 @@ impl BridgeBackend for Arc<Router> {
     fn client(&self, me: Principal) -> LocalClient {
         LocalClient::new(self.clone(), me)
     }
+    fn parked_room_and_since(
+        &self,
+        worker: &Principal,
+        wait: &rex_wave_api::read::Wait,
+    ) -> (Option<RoomId>, Seq) {
+        self.read.parked_room_and_since(worker, wait)
+    }
 }
 
 trait ErasedBackend: Send + Sync {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>>;
+    fn parked_scope(
+        &self,
+        worker: &Principal,
+        wait: &rex_wave_api::read::Wait,
+    ) -> (Option<RoomId>, Seq);
 }
 
 impl<B: BridgeBackend> ErasedBackend for B {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>> {
         let client = self.client(me);
         Box::pin(async move { client.call_wire(cmd).await })
+    }
+    fn parked_scope(
+        &self,
+        worker: &Principal,
+        wait: &rex_wave_api::read::Wait,
+    ) -> (Option<RoomId>, Seq) {
+        self.parked_room_and_since(worker, wait)
     }
 }
 
@@ -1743,7 +1769,7 @@ impl Client for WorkerToolClient {
         let aborted_wait = self.aborted_wait.clone();
         async move {
             let parked_scope = match &cmd {
-                WireCommand::Wait(w) => Some(parked_room_and_since(&me, w)),
+                WireCommand::Wait(w) => Some(backend.parked_scope(&me, w)),
                 _ => None,
             };
             let mut wait_guard = None;
@@ -3173,17 +3199,21 @@ fn parked_room_and_since(
     worker: &Principal,
     w: &rex_wave_api::read::Wait,
 ) -> (Option<RoomId>, Seq) {
+    let effective = match w.effective_cursor_for(worker) {
+        Ok(c) => c,
+        Err(_) => return (None, Seq::ORIGIN),
+    };
     match &w.interest {
         Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
         {
             Ok(id) => {
-                let since = w.after.at(&StreamId::Room { room: id.clone() });
+                let since = effective.at(&StreamId::Room { room: id.clone() });
                 (Some(id), since)
             }
             Err(_) => (None, Seq::ORIGIN),
         },
         Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
-            StreamId::Room { room } => (Some(room.clone()), w.after.at(&streams[0])),
+            StreamId::Room { room } => (Some(room.clone()), effective.at(&streams[0])),
             _ => (None, Seq::ORIGIN),
         },
         _ => (None, Seq::ORIGIN),

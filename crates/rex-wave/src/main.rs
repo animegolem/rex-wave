@@ -890,18 +890,10 @@ fn parse_cursor_arg(raw: &str) -> Result<Cursor, ApiError> {
 }
 
 fn ensure_cursor_from_head(cursor: Cursor) -> Cursor {
-    if cursor.from_head() {
+    if cursor.from_head() || cursor.is_pinned() {
         return cursor;
     }
-    if let Ok(mut val) = serde_json::to_value(&cursor)
-        && let Some(obj) = val.as_object_mut()
-    {
-        obj.insert("from_head".to_owned(), serde_json::Value::Bool(true));
-        if let Ok(live) = serde_json::from_value(val) {
-            return live;
-        }
-    }
-    Cursor::live()
+    cursor.with_from_head(true)
 }
 
 fn parse_task_status(s: &str) -> Result<TaskStatus, ApiError> {

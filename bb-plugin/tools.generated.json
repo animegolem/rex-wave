@@ -5399,6 +5399,10 @@
               "description": "Streams not listed start at their head at subscribe time instead of origin.",
               "type": "boolean"
             },
+            "pinned": {
+              "description": "True once `Wait` has materialized all subscription-time visible stream\nheads into `positions` and cleared `from_head`, so subsequent CLI\nmentions waits keep `from_head: false` for streams created between waits.",
+              "type": "boolean"
+            },
             "positions": {
               "items": {
                 "maxItems": 2,
@@ -5829,6 +5833,10 @@
             "from_head": {
               "default": false,
               "description": "Streams not listed start at their head at subscribe time instead of origin.",
+              "type": "boolean"
+            },
+            "pinned": {
+              "description": "True once `Wait` has materialized all subscription-time visible stream\nheads into `positions` and cleared `from_head`, so subsequent CLI\nmentions waits keep `from_head: false` for streams created between waits.",
               "type": "boolean"
             },
             "positions": {
