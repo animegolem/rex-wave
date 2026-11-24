@@ -166,10 +166,15 @@ fn write_temp_sibling(path: &Path, bytes: &[u8], mode: u32) -> io::Result<PathBu
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(opened(&tmp, e)),
         };
-        let filled = file
-            .set_permissions(Permissions::from_mode(mode))
-            .and_then(|()| file.write_all(bytes))
-            .and_then(|()| file.sync_all());
+        // A private mode is set exactly; a shared one keeps the umask's say.
+        let private = mode & 0o077 == 0;
+        let filled = (if private {
+            file.set_permissions(Permissions::from_mode(mode))
+        } else {
+            Ok(())
+        })
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all());
         if let Err(e) = filled {
             drop(file);
             let _ = fs::remove_file(&tmp);
@@ -295,17 +300,28 @@ pub fn entry_exists(path: &Path) -> bool {
 /// Open the directory at `path` without following a symlink there and
 /// return its metadata from the handle: for permission and owner checks.
 pub fn dir_metadata_nofollow(path: &Path) -> io::Result<Metadata> {
+    let not_dir = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a real directory", path.display()),
+        )
+    };
+    // A symlink or non-directory fails as ELOOP, EMLINK or ENOTDIR
+    // depending on the platform; all mean the same thing here.
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(NOFOLLOW | libc::O_DIRECTORY)
         .open(path)
-        .map_err(|e| opened(path, e))?;
+        .map_err(|e| {
+            if is_symlink_refusal(&e) || e.raw_os_error() == Some(libc::ENOTDIR) {
+                not_dir()
+            } else {
+                e
+            }
+        })?;
     let meta = dir.metadata()?;
     if !meta.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", path.display()),
-        ));
+        return Err(not_dir());
     }
     Ok(meta)
 }
@@ -593,6 +609,13 @@ mod tests {
         assert!(dir_metadata_nofollow(dir.path()).is_ok());
         let dlink = dir.path().join("dl");
         symlink(dir.path(), &dlink).unwrap();
-        assert!(dir_metadata_nofollow(&dlink).is_err());
+        let plain = dir.path().join("plain");
+        fs::write(&plain, b"").unwrap();
+        for not_dir in [&dlink, &plain] {
+            assert_eq!(
+                dir_metadata_nofollow(not_dir).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 }

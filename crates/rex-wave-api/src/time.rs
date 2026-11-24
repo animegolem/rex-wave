@@ -94,6 +94,7 @@ impl UnixMs {
         let s = raw.trim();
         let b = s.as_bytes();
         if b.len() < 19
+            || !b[..19].is_ascii()
             || b[4] != b'-'
             || b[7] != b'-'
             || !matches!(b[10], b'T' | b't' | b' ')
@@ -216,6 +217,8 @@ mod tests {
             "2026-11-21T00:00:00+0200",
             "2026-11-21T00:00:00Q",
             "+026-11-21T00:00:00Z",
+            "2026-11-21T00:00:0\u{e9}",
+            "2026-11-21T00:00:\u{e9}0Z",
         ] {
             assert_eq!(UnixMs::parse_rfc3339(bad), None, "{bad:?}");
         }
