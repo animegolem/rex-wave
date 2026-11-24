@@ -85,6 +85,7 @@ unset \
 	T3_ACP_MCP_ENTRYPOINT \
 	T3_ACP_MCP_AUTHORIZATION \
 	REX_WAVE_TOKEN \
+	REX_WAVE_OPERATOR \
 	REX_WAVE_T3_HOME \
 	REX_WAVE_T3_URL \
 	REX_WAVE_T3_TOKEN \
@@ -261,6 +262,304 @@ TODO_MSG = (
 )
 
 digest_cache = {}
+
+# Structural lints over crates/*/src/**/*.rs. Each names the replacement.
+OPERATOR_MATCH_MSG = (
+    "use Principal::is_operator() / is_operator_or_system() or an Audience::Operator command"
+)
+CALENDAR_MSG = "use rex_wave_api::UnixMs civil-calendar / RFC 3339 methods"
+HTTP_GUARD_MSG = (
+    "use the shared loopback HTTP guard module (rex_wave_api::http_guard)"
+)
+SELECT_READ_MSG = (
+    "cancel-unsafe frame read in select!: read frames in a spawned reader task "
+    "and select on its channel Receiver"
+)
+FOR_TEST_MSG = (
+    "DecideCtx::for_test is test-only: route production commands through Router"
+)
+HTTP_GUARD_OWNER = "crates/rex-wave-api/src/http_guard.rs"
+RUNTIME_DECIDE_CTX_OWNER = "crates/rex-wave-runtime/src/lib.rs"
+src_rs_re = re.compile(r"^crates/[^/]+/src/.+\.rs$")
+operator_pat_re = re.compile(r"Principal::Operator\s*\{\s*\.\.\s*\}")
+matches_open_re = re.compile(r"\bmatches!\s*\(")
+calendar_re = re.compile(r"\b(719_468|146_097)\b")
+http_guard_fn_re = re.compile(r"\bfn\s+(is_loopback_host|strip_bearer)\b")
+select_open_re = re.compile(r"\bselect!\s*\{")
+select_read_re = re.compile(r"\b(read_frame|read_message|read_exact)\s*\(")
+for_test_re = re.compile(r"\bDecideCtx::for_test\s*\(")
+cfg_attr_open_re = re.compile(r"#\s*\[\s*cfg\s*\(")
+has_test_re = re.compile(r"\btest\b")
+MAX_MACRO_SCAN = 1 << 20
+
+def scrub_rust_noncode(text):
+    out = []
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            depth = 1
+            out.extend((" ", " "))
+            i += 2
+            while i < n and depth > 0:
+                if text[i] == "/" and i + 1 < n and text[i + 1] == "*":
+                    depth += 1
+                    out.extend((" ", " "))
+                    i += 2
+                elif text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                    depth -= 1
+                    out.extend((" ", " "))
+                    i += 2
+                else:
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+            continue
+        if c in ("r", "b") and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            j = i + 1
+            is_raw = c == "r"
+            if c == "b" and j < n and text[j] == "r":
+                is_raw = True
+                j += 1
+            if is_raw:
+                hashes = 0
+                while j < n and text[j] == "#":
+                    hashes += 1
+                    j += 1
+                if j < n and text[j] == '"':
+                    while i <= j:
+                        out.append(" ")
+                        i += 1
+                    closer = '"' + ("#" * hashes)
+                    end_pos = text.find(closer, i)
+                    if end_pos == -1:
+                        end_pos = n
+                    else:
+                        end_pos += len(closer)
+                    while i < end_pos:
+                        out.append("\n" if text[i] == "\n" else " ")
+                        i += 1
+                    continue
+        if c == '"':
+            out.append(" ")
+            i += 1
+            while i < n:
+                ch = text[i]
+                if ch == "\\":
+                    out.append(" ")
+                    i += 1
+                    if i < n:
+                        out.append("\n" if text[i] == "\n" else " ")
+                        i += 1
+                    continue
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+                if ch == '"':
+                    break
+            continue
+        if c == "'":
+            if i + 2 < n and text[i + 1] == "\\":
+                end_q = text.find("'", i + 2, min(n, i + 12))
+                if end_q != -1:
+                    while i <= end_q:
+                        out.append(" ")
+                        i += 1
+                    continue
+            elif i + 2 < n and text[i + 2] == "'" and text[i + 1] != "\n":
+                out.extend((" ", " ", " "))
+                i += 3
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+def balanced_end(text, start, open_ch, close_ch):
+    depth = 1
+    i = start
+    limit = min(len(text), start + MAX_MACRO_SCAN)
+    while i < limit:
+        c = text[i]
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return limit
+
+def line_of(text, offset):
+    return text.count("\n", 0, offset) + 1
+
+def select_branch_future_spans(text, body_start, body_end):
+    """Yield (start, end) slices for each top-level select! branch future (before `=>`),
+    skipping handler expressions that run after a branch is selected."""
+    spans = []
+    i = body_start
+    arm_start = body_start
+    depth_brace = 0
+    depth_paren = 0
+    depth_bracket = 0
+    in_handler = False
+    handler_is_block = False
+    while i < body_end:
+        c = text[i]
+        if c == "{":
+            depth_brace += 1
+        elif c == "}":
+            if depth_brace > 0:
+                depth_brace -= 1
+                if (
+                    in_handler
+                    and handler_is_block
+                    and depth_brace == 0
+                    and depth_paren == 0
+                    and depth_bracket == 0
+                ):
+                    in_handler = False
+                    handler_is_block = False
+                    j = i + 1
+                    while j < body_end and text[j] in (" ", "\t", "\r", "\n", ","):
+                        j += 1
+                    arm_start = j
+                    i = j
+                    continue
+        elif c == "(":
+            depth_paren += 1
+        elif c == ")" and depth_paren > 0:
+            depth_paren -= 1
+        elif c == "[":
+            depth_bracket += 1
+        elif c == "]" and depth_bracket > 0:
+            depth_bracket -= 1
+        elif depth_brace == 0 and depth_paren == 0 and depth_bracket == 0:
+            if not in_handler and c == "=" and i + 1 < body_end and text[i + 1] == ">":
+                spans.append((arm_start, i))
+                in_handler = True
+                j = i + 2
+                while j < body_end and text[j] in (" ", "\t", "\r", "\n"):
+                    j += 1
+                handler_is_block = j < body_end and text[j] == "{"
+                i = j
+                continue
+            if in_handler and not handler_is_block and c == ",":
+                in_handler = False
+                arm_start = i + 1
+        i += 1
+    return spans
+
+def eval_cfg_when_not_test(expr):
+    """Evaluate (can_be_true, can_be_false) for a Rust cfg(...) expression under test=False."""
+    n = len(expr)
+    pos = [0]
+
+    def skip_ws():
+        while pos[0] < n and expr[pos[0]].isspace():
+            pos[0] += 1
+
+    def parse_node():
+        skip_ws()
+        start = pos[0]
+        while pos[0] < n and (expr[pos[0]].isalnum() or expr[pos[0]] == "_"):
+            pos[0] += 1
+        ident = expr[start:pos[0]]
+        skip_ws()
+        if pos[0] < n and expr[pos[0]] == "(":
+            pos[0] += 1
+            args = []
+            while True:
+                skip_ws()
+                if pos[0] >= n:
+                    break
+                if expr[pos[0]] == ")":
+                    pos[0] += 1
+                    break
+                args.append(parse_node())
+                skip_ws()
+                if pos[0] < n and expr[pos[0]] == ",":
+                    pos[0] += 1
+            if ident == "not":
+                t, f = args[0] if len(args) == 1 else (True, True)
+                return (f, t)
+            if ident == "all":
+                return (
+                    all(t for t, _ in args),
+                    any(f for _, f in args),
+                )
+            if ident == "any":
+                return (
+                    any(t for t, _ in args),
+                    all(f for _, f in args),
+                )
+            return (True, True)
+        if pos[0] < n and expr[pos[0]] == "=":
+            pos[0] += 1
+            while pos[0] < n and expr[pos[0]] not in (",", ")"):
+                pos[0] += 1
+            return (True, True)
+        if not ident and pos[0] < n and expr[pos[0]] not in (",", ")"):
+            pos[0] += 1
+            return (True, True)
+        if ident == "test":
+            return (False, True)
+        return (True, True)
+
+    can_true, _ = parse_node()
+    return can_true
+
+
+def cfg_test_ranges(text):
+    ranges = []
+    for m in cfg_attr_open_re.finditer(text):
+        cfg_end = balanced_end(text, m.end(), "(", ")")
+        inner = text[m.end():cfg_end]
+        if not has_test_re.search(inner) or eval_cfg_when_not_test(inner):
+            continue
+        close_bracket = text.find("]", cfg_end)
+        if close_bracket == -1:
+            continue
+        semi = text.find(";", close_bracket + 1)
+        brace = text.find("{", close_bracket + 1)
+        if semi != -1 and (brace == -1 or semi < brace):
+            ranges.append((m.start(), semi + 1))
+        elif brace != -1:
+            end = balanced_end(text, brace + 1, "{", "}")
+            ranges.append((m.start(), end))
+    return ranges
+
+def structural_hits(rel, raw_text):
+    text = scrub_rust_noncode(raw_text)
+    hits = []
+    in_api = rel.startswith("crates/rex-wave-api/")
+    if not in_api:
+        for m in matches_open_re.finditer(text):
+            end = balanced_end(text, m.end(), "(", ")")
+            if operator_pat_re.search(text, m.end(), end):
+                hits.append((rel, line_of(text, m.start()), "matches!(.., Principal::Operator { .. })", OPERATOR_MATCH_MSG))
+        for m in calendar_re.finditer(text):
+            hits.append((rel, line_of(text, m.start()), m.group(1), CALENDAR_MSG))
+    if rel != HTTP_GUARD_OWNER:
+        for m in http_guard_fn_re.finditer(text):
+            hits.append((rel, line_of(text, m.start()), "fn " + m.group(1), HTTP_GUARD_MSG))
+    if rel != RUNTIME_DECIDE_CTX_OWNER:
+        test_ranges = None
+        for m in for_test_re.finditer(text):
+            if test_ranges is None:
+                test_ranges = cfg_test_ranges(text)
+            pos = m.start()
+            if not any(lo <= pos <= hi for lo, hi in test_ranges):
+                hits.append((rel, line_of(text, pos), "DecideCtx::for_test(", FOR_TEST_MSG))
+    for m in select_open_re.finditer(text):
+        end = balanced_end(text, m.end(), "{", "}")
+        for fut_start, fut_end in select_branch_future_spans(text, m.end(), end):
+            for r in select_read_re.finditer(text, fut_start, fut_end):
+                hits.append((rel, line_of(text, r.start()), r.group(1) + "(", SELECT_READ_MSG))
+    return hits
 
 def has_digest(ns, token, table):
     key = (ns, token)
@@ -482,6 +781,7 @@ def iter_entries():
 path_hits = []
 seat_hits = []
 todo_hits = []
+struct_hits = []
 licenses_nonempty = {"LICENSE-MIT": False, "LICENSE-APACHE": False}
 
 for rel, data in iter_entries():
@@ -498,6 +798,8 @@ for rel, data in iter_entries():
     check_seats = rel not in LOCKFILES_SKIP_SEAT_WORDS
     check_todos = rel != "check"
     text = data.decode("utf-8", errors="replace")
+    if src_rs_re.match(rel):
+        struct_hits.extend(structural_hits(rel, text))
     for lineno, line in enumerate(text.splitlines(), 1):
         m_path = find_private_path_match(line)
         if m_path is not None:
@@ -515,7 +817,7 @@ if missing_lic:
         sys.stderr.write("error: {} is missing or empty\n".format(lic))
     sys.exit(1)
 
-total = len(path_hits) + len(seat_hits) + len(todo_hits)
+total = len(path_hits) + len(seat_hits) + len(todo_hits) + len(struct_hits)
 if total == 0:
     sys.exit(0)
 
@@ -535,9 +837,15 @@ def report(label, hits, msg):
 report("private path/ID literals", path_hits, PATH_MSG)
 report("private seat literals", seat_hits, SEAT_MSG)
 report("stale PR TODOs", todo_hits, TODO_MSG)
+if struct_hits:
+    sys.stderr.write("\n[hygiene] structural lints ({} violation(s)):\n".format(len(struct_hits)))
+    for rel, lineno, detail, msg in struct_hits[:MAX_PER_CAT]:
+        sys.stderr.write("  {}:{} ({}): {}\n".format(rel, lineno, detail, msg))
+    if len(struct_hits) > MAX_PER_CAT:
+        sys.stderr.write("  ... and {} more structural violation(s)\n".format(len(struct_hits) - MAX_PER_CAT))
 sys.stderr.write(
-    "\nhygiene failed: {} violation(s) total ({} path/ID, {} seat, {} TODO).\n".format(
-        total, len(path_hits), len(seat_hits), len(todo_hits)
+    "\nhygiene failed: {} violation(s) total ({} path/ID, {} seat, {} TODO, {} structural).\n".format(
+        total, len(path_hits), len(seat_hits), len(todo_hits), len(struct_hits)
     )
 )
 sys.exit(1)

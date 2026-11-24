@@ -7,8 +7,7 @@
 use rex_wave_api::{BbThreadId, Principal, RoleName, WaveSlug};
 use rex_wave_waves::HostError;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,19 +23,16 @@ struct WorkerTokenRecord {
 pub type WorkerTokenMinter =
     Arc<dyn Fn(&WaveSlug, &RoleName, &BbThreadId) -> Result<String, HostError> + Send + Sync>;
 
+/// The largest worker token file read.
+const MAX_WORKER_TOKEN_FILE_BYTES: u64 = 16 * 1024;
+
 fn validate_thread_filename(thread_id: &str) -> io::Result<()> {
-    if thread_id.is_empty()
-        || thread_id.starts_with('.')
-        || thread_id.contains('/')
-        || thread_id.contains('\\')
-        || thread_id.contains("..")
-        || thread_id.chars().any(char::is_control)
-    {
-        return Err(io::Error::new(
+    rex_wave_fs::SafeName::parse_plain(thread_id).map_err(|e| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid worker thread filename: {thread_id}"),
-        ));
-    }
+            format!("invalid worker thread filename: {e}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -60,16 +56,6 @@ fn mint_random_worker_token() -> io::Result<String> {
     Ok(token)
 }
 
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    if !dir.exists() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-}
-
 fn write_worker_token_bytes(
     state_dir: &Path,
     thread_id: &str,
@@ -77,32 +63,9 @@ fn write_worker_token_bytes(
 ) -> io::Result<PathBuf> {
     let target = worker_token_path(state_dir, thread_id)?;
     let dir = worker_tokens_dir(state_dir);
-    ensure_private_dir(&dir)?;
+    rex_wave_fs::ensure_private_dir(&dir)?;
 
-    let mut suffix = [0u8; 4];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut suffix)?;
-    let tmp = dir.join(format!(
-        ".{thread_id}.tmp.{}.{:02x}{:02x}{:02x}{:02x}",
-        std::process::id(),
-        suffix[0],
-        suffix[1],
-        suffix[2],
-        suffix[3],
-    ));
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    if let Err(e) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    rex_wave_fs::write_atomic_path(&target, bytes, 0o600, false)?;
     Ok(target)
 }
 
@@ -141,24 +104,18 @@ pub fn write_worker_token_record(
 /// single-line plain token files.
 pub fn read_worker_token_file(state_dir: &Path, thread_id: &str) -> io::Result<Option<String>> {
     let path = worker_token_path(state_dir, thread_id)?;
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(m) => m,
+    let bytes = match rex_wave_fs::read_private_regular(&path, None, MAX_WORKER_TOKEN_FILE_BYTES) {
+        Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("worker token file must be a regular mode-0600 file: {e}"),
+            ));
+        }
     };
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "worker token path must be a regular file",
-        ));
-    }
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "worker token file must be mode 0600",
-        ));
-    }
-    let raw = std::fs::read_to_string(&path)?;
+    let raw =
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -235,7 +192,10 @@ pub fn provision_worker_token(
     if let Ok(path) = worker_token_path(state_dir, thread.as_str())
         && let Ok(Some(existing)) = read_worker_token_file(state_dir, thread.as_str())
     {
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let raw = rex_wave_fs::read_private_regular(&path, None, MAX_WORKER_TOKEN_FILE_BYTES)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
         let trimmed = raw.trim();
         if trimmed.starts_with('{') {
             if let Ok(rec) = serde_json::from_str::<WorkerTokenRecord>(trimmed)
@@ -271,8 +231,10 @@ pub fn provision_worker_token(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn provisions_reads_reuses_and_unlinks_mode_0600_token() {

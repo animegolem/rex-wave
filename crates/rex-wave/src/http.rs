@@ -6,12 +6,14 @@
 //! token authentication, and `404 Not Found` visibility masking.
 
 use rex_wave_api::board::{Priority, Title};
+use rex_wave_api::http_guard::{is_json_content_type, strip_bearer};
+pub use rex_wave_api::http_guard::{is_loopback_host, is_matching_loopback_origin};
 use rex_wave_api::notify::{InboxAck, InboxList};
 use rex_wave_api::presence::{PresenceList, PresenceResolve};
 use rex_wave_api::read::{Page, Read, Sidebar, Wait};
 use rex_wave_api::room::{
-    Body, RoomId, RoomLabel, RoomPost, RoomRef, RoomScope, RoomTasks, TaskClaim, TaskFilter,
-    TaskHeartbeat, TaskSpec, TaskStatus, TaskTransition, TaskUpdate,
+    Body, RoomId, RoomLabel, RoomPost, RoomRef, RoomTasks, TaskClaim, TaskFilter, TaskHeartbeat,
+    TaskSpec, TaskStatus, TaskTransition, TaskUpdate,
 };
 use rex_wave_api::*;
 use rex_wave_runtime::{LocalClient, Router, can_read_visible, mask_unauthorized_as_not_found};
@@ -19,7 +21,7 @@ use rex_wave_transport::{Authenticator, Credential};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -624,68 +626,6 @@ fn authenticate_request(
     })
 }
 
-pub fn is_loopback_host(authority: &str) -> bool {
-    let trimmed = authority.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        let Some((ipv6_str, tail)) = rest.split_once(']') else {
-            return false;
-        };
-        let port_ok = tail.is_empty()
-            || tail
-                .strip_prefix(':')
-                .is_some_and(|p| p.parse::<u16>().is_ok_and(|n| n > 0));
-        return port_ok
-            && ipv6_str
-                .parse::<Ipv6Addr>()
-                .is_ok_and(|ip| ip.is_loopback());
-    }
-    let (host, port_ok) = match trimmed.split_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().is_ok_and(|n| n > 0)),
-        None => (trimmed, true),
-    };
-    if !port_ok {
-        return false;
-    }
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
-}
-
-pub fn is_matching_loopback_origin(origin: &str, host: &str) -> bool {
-    let trimmed = origin.trim();
-    let authority = if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
-        &trimmed[7..]
-    } else if trimmed.len() > 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
-        &trimmed[8..]
-    } else {
-        return false;
-    };
-    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
-        return false;
-    }
-    is_loopback_host(authority) && authority.eq_ignore_ascii_case(host.trim())
-}
-
-fn is_json_content_type(ct: &str) -> bool {
-    let media = ct.split(';').next().unwrap_or_default().trim();
-    media.eq_ignore_ascii_case("application/json")
-}
-
-fn strip_bearer(header: &str) -> Option<&str> {
-    let (scheme, rest) = header.trim().split_once(char::is_whitespace)?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-    let token = rest.trim();
-    if token.is_empty() || token.chars().any(char::is_whitespace) {
-        None
-    } else {
-        Some(token)
-    }
-}
-
 fn match_route(method: HttpMethod, raw_path: &str) -> Result<Route, HttpError> {
     let trimmed = raw_path.strip_prefix('/').unwrap_or(raw_path);
     let segments: Vec<&str> = if trimmed.is_empty() {
@@ -907,43 +847,11 @@ pub fn parse_http_room_ref(raw: &str) -> Result<RoomRef, ApiError> {
     if trimmed.starts_with('#') || trimmed.starts_with('@') {
         return crate::parse_room_ref(trimmed);
     }
-    if let Some(rest) = trimmed.strip_prefix("proj:")
-        && let Some((proj, chan)) = rest.rsplit_once('/')
-    {
-        return Ok(RoomRef::Channel {
-            scope: RoomScope::Project {
-                project: BbProjectId::parse(proj)?,
-            },
-            name: ChannelName::parse(chan)?,
-        });
-    }
-    if let Some((proj, chan)) = trimmed.rsplit_once('/') {
-        return Ok(RoomRef::Channel {
-            scope: RoomScope::Project {
-                project: BbProjectId::parse(proj)?,
-            },
-            name: ChannelName::parse(chan)?,
-        });
-    }
-    Ok(RoomRef::Channel {
-        scope: RoomScope::Global,
-        name: ChannelName::parse(trimmed)?,
-    })
+    crate::parse_room_ref(&format!("#{trimmed}"))
 }
 
 fn parse_task_status_str(raw: &str) -> Result<TaskStatus, ApiError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "open" => Ok(TaskStatus::Open),
-        "claimed" => Ok(TaskStatus::Claimed),
-        "review" => Ok(TaskStatus::Review),
-        "blocked" => Ok(TaskStatus::Blocked),
-        "done" => Ok(TaskStatus::Done),
-        "cancelled" | "canceled" => Ok(TaskStatus::Cancelled),
-        other => Err(ApiError::Invalid(InvalidId {
-            what: "status".into(),
-            reason: format!("unknown task status '{other}'"),
-        })),
-    }
+    rex_wave_api::parse_enum("status", raw)
 }
 
 fn parse_json_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HttpError> {
@@ -966,13 +874,15 @@ fn mask_err(err: ApiError, resource: &str) -> HttpError {
 }
 
 fn check_room_visible(
+    router: &Router,
     principal: &Principal,
     room_ref: &RoomRef,
     raw_label: &str,
 ) -> Result<RoomId, HttpError> {
-    let room_id = room_ref
-        .resolve(principal)
-        .map_err(|e| HttpError::from_api(e.into()))?;
+    let room_id = router
+        .read
+        .resolve_room_ref(room_ref, principal)
+        .map_err(HttpError::from_api)?;
     can_read_visible(
         principal,
         &StreamId::Room {
@@ -1067,7 +977,7 @@ async fn dispatch_json_route(
     router: Arc<Router>,
     principal: Principal,
 ) -> Result<(&'static str, Value), HttpError> {
-    let client = LocalClient::new(router, principal.clone());
+    let client = LocalClient::new(router.clone(), principal.clone());
 
     match route {
         Route::Health => Ok((
@@ -1110,11 +1020,7 @@ async fn dispatch_json_route(
                         None => Seq::ORIGIN,
                     };
                     let page = client
-                        .call(Read {
-                            stream: StreamId::Inbox { owner },
-                            after,
-                            limit,
-                        })
+                        .call(Read::stream(StreamId::Inbox { owner }, after, limit))
                         .await
                         .map_err(|e| mask_err(e, "inbox"))?;
                     return Ok(("200 OK", to_json_value(&page)?));
@@ -1179,7 +1085,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessagesGet { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let room_id = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let after = match req.query_param("after") {
                 Some(raw) => Seq(raw.parse::<u64>().map_err(|_| {
                     HttpError::new("400 Bad Request", "invalid", "invalid after seq")
@@ -1206,38 +1112,21 @@ async fn dispatch_json_route(
                 .map_err(|e| HttpError::from_api(e.into()))?;
 
             let mut page: Page = if re.is_some() || !labels.is_empty() {
-                let mut wait = Wait::room_filtered(room_id.clone(), after, re, labels);
+                let mut wait = Wait::room_ref_filtered(room_ref, &principal, after, re, labels)
+                    .map_err(|e| HttpError::from_api(e.into()))?;
                 wait.timeout_ms = Some(0);
+                wait.limit = Some(limit.unwrap_or(200).clamp(1, 1000));
                 let mut p = client
                     .call(wait)
                     .await
                     .map_err(|e| mask_err(e, &format!("room {room}")))?;
                 p.timed_out = false;
-                let total_count = p.entries.len();
-                if let Some(lim) = limit {
-                    let cap = lim.clamp(1, 1000) as usize;
-                    if p.entries.len() > cap {
-                        p.entries.truncate(cap);
-                        if let Some(last) = p.entries.last() {
-                            p.cursor = Cursor::default().with(
-                                StreamId::Room {
-                                    room: room_id.clone(),
-                                },
-                                last.seq,
-                            );
-                        }
-                    }
-                }
-                p.total_count = total_count;
-                p.truncated = p.entries.len() < total_count;
                 p
             } else {
+                let read_cmd = Read::room_ref(room_ref, &principal, after, None, limit)
+                    .map_err(|e| HttpError::from_api(e.into()))?;
                 client
-                    .call(Read {
-                        stream: StreamId::Room { room: room_id },
-                        after,
-                        limit,
-                    })
+                    .call(read_cmd)
                     .await
                     .map_err(|e| mask_err(e, &format!("room {room}")))?
             };
@@ -1246,7 +1135,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessagesPost { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: PostMessagePayload = parse_json_body(&req.body)?;
             let posted = client
                 .call(RoomPost {
@@ -1264,7 +1153,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessageLabelsPatch { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: PatchLabelsPayload = parse_json_body(&req.body)?;
             let labeled = client
                 .call(RoomLabel {
@@ -1280,7 +1169,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTasksGet { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let status = match req.query_param("status") {
                 Some(raw) => Some(parse_task_status_str(raw).map_err(HttpError::from_api)?),
                 None => None,
@@ -1336,7 +1225,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskClaim { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: ClaimTaskPayload = parse_json_body(&req.body)?;
             let receipt = client
                 .call(TaskClaim {
@@ -1353,7 +1242,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskHeartbeat { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: HeartbeatTaskPayload = parse_json_body(&req.body)?;
             let receipt = client
                 .call(TaskHeartbeat {
@@ -1368,7 +1257,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskTransition { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: TransitionTaskPayload = parse_json_body(&req.body)?;
             let view = client
                 .call(TaskTransition {
@@ -1386,7 +1275,7 @@ async fn dispatch_json_route(
         }
         Route::RoomTaskUpdate { room, seq } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let _ = check_room_visible(&principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let payload: UpdateTaskPayload = parse_json_body(&req.body)?;
             let view = client
                 .call(TaskUpdate {
@@ -1419,7 +1308,16 @@ async fn dispatch_json_route(
                 )
             })?;
             if let WireCommand::Read(ref r) = cmd {
-                can_read_visible(&principal, &r.stream, &tool).map_err(HttpError::from_api)?;
+                let target_stream = match &r.room {
+                    Some(room_ref) => StreamId::Room {
+                        room: router
+                            .read
+                            .resolve_room_ref(room_ref, &principal)
+                            .map_err(HttpError::from_api)?,
+                    },
+                    None => r.stream.clone(),
+                };
+                can_read_visible(&principal, &target_stream, &tool).map_err(HttpError::from_api)?;
             }
             if let WireCommand::PresenceBind(ref b) = cmd
                 && matches!(
@@ -1444,13 +1342,14 @@ async fn dispatch_json_route(
 }
 
 fn parse_sse_interest_and_cursor(
+    router: &Router,
     req: &ParsedRequest,
     principal: &Principal,
 ) -> Result<(Interest, Cursor), HttpError> {
     let mut single_stream: Option<StreamId> = None;
     let interest = if let Some(room_raw) = req.query_param("room") {
         let room_ref = parse_http_room_ref(room_raw).map_err(HttpError::from_api)?;
-        let room_id = check_room_visible(principal, &room_ref, room_raw)?;
+        let room_id = check_room_visible(router, principal, &room_ref, room_raw)?;
         single_stream = Some(StreamId::Room { room: room_id });
         let re = match req.query_param("re") {
             Some(raw) => Some(Seq(raw.parse::<u64>().map_err(|_| {
@@ -1505,7 +1404,7 @@ fn parse_sse_interest_and_cursor(
                 ));
             }
         }
-    } else if matches!(principal, Principal::Operator { .. }) {
+    } else if principal.is_operator() {
         Interest::Everything
     } else {
         Interest::MyInbox
@@ -1596,7 +1495,7 @@ async fn handle_sse_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     principal: Principal,
     config: HttpConfig,
 ) -> io::Result<()> {
-    let (interest, initial_cursor) = match parse_sse_interest_and_cursor(req, &principal) {
+    let (interest, initial_cursor) = match parse_sse_interest_and_cursor(&router, req, &principal) {
         Ok(pair) => pair,
         Err(err) => return write_error_response(writer, &err).await,
     };
@@ -1708,33 +1607,6 @@ mod tests {
 
     #[test]
     fn validates_loopback_host_origin_sec_fetch_site_and_csrf_guards() {
-        assert!(is_loopback_host("127.0.0.1:7782"));
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(is_loopback_host("[::1]:7782"));
-        assert!(is_loopback_host("localhost:7782"));
-        assert!(!is_loopback_host("0.0.0.0:7782"));
-        assert!(!is_loopback_host("evil.example:7782"));
-        assert!(!is_loopback_host("127.0.0.1:0"));
-        assert!(!is_loopback_host("192.168.1.5:7782"));
-
-        assert!(is_matching_loopback_origin(
-            "http://127.0.0.1:7782",
-            "127.0.0.1:7782"
-        ));
-        assert!(is_matching_loopback_origin(
-            "https://localhost:7782",
-            "localhost:7782"
-        ));
-        assert!(!is_matching_loopback_origin(
-            "http://127.0.0.1:9999",
-            "127.0.0.1:7782"
-        ));
-        assert!(!is_matching_loopback_origin(
-            "http://evil.example",
-            "127.0.0.1:7782"
-        ));
-        assert!(!is_matching_loopback_origin("null", "127.0.0.1:7782"));
-
         let mut hdrs = RequestHeaders {
             host: Some("127.0.0.1:7782".into()),
             ..RequestHeaders::default()

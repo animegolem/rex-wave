@@ -19,7 +19,7 @@ use crate::presence::*;
 use crate::read::*;
 use crate::room::*;
 use crate::wave::*;
-use crate::{Ack, ApiError};
+use crate::{Ack, ApiError, Principal};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -27,14 +27,39 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Audience {
-    /// Any authenticated non-system principal (operator, seat, worker).
-    /// Finer, per-resource policy (room membership, wave roster) lives in the
-    /// owning decider.
+    /// Any authenticated principal: operator, seat, worker, and the daemon's
+    /// own parts (reactors post to rooms, unbind presence and raise
+    /// notifications as `System`). Finer, per-resource policy (room
+    /// membership, wave roster) lives in the owning decider.
     Member,
     /// Only the human operator (approvals, wave launch).
     Operator,
     /// Only daemon-internal parts (`Principal::System`).
     System,
+}
+
+impl Audience {
+    /// Whether `by` may issue a command of this audience.
+    pub fn allows(self, by: &Principal) -> bool {
+        match self {
+            Audience::Member => true,
+            Audience::Operator => by.is_operator(),
+            Audience::System => matches!(by, Principal::System { .. }),
+        }
+    }
+}
+
+/// The audience check the router runs once per command. Finer policy
+/// belongs to deciders.
+pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
+    if audience.allows(by) {
+        Ok(())
+    } else {
+        Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("{audience:?} command"),
+        })
+    }
 }
 
 /// Catalog entry for MCP `tools/list`, BB `registerTool`, and `rex.*` in Code Mode.
@@ -208,5 +233,68 @@ commands! {
         Wait       -> Page                : "wait",        Member, false, "Block until an interest matches after a cursor; returns the full catch-up slice.";
         Sidebar    -> SidebarTreeSnapshot : "sidebar",     Member, false, "Sidebar tree: inbox and kanban badges, projects > rooms > wave agents, channels, DMs.";
         ThreadPage -> ThreadPageView      : "thread_page", Member, false, "One wave agent's BB thread events and context usage (BB-owned, proxied).";
+    }
+}
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for &b in bytes {
+        hash ^= u128::from(b);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    hash
+}
+
+fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn scoped_room_idem(prefix: &str, key: &crate::id::IdemKey) -> crate::id::IdemKey {
+    let raw = key.as_str();
+    let max_raw = 256 - prefix.len() - 2;
+    let encoded = if raw.len() <= max_raw {
+        format!("{prefix}r:{raw}")
+    } else {
+        let h_fwd = fnv1a_128(raw.as_bytes());
+        let rev_bytes: Vec<u8> = raw.as_bytes().iter().rev().copied().collect();
+        let h_rev = fnv1a_128(&rev_bytes) as u64;
+        let max_prefix = 256 - prefix.len() - 2 - 48 - 1;
+        let head = truncate_utf8_prefix(raw, max_prefix);
+        format!("{prefix}h:{h_fwd:032x}{h_rev:016x}:{head}")
+    };
+    crate::id::IdemKey::parse(encoded)
+        .expect("scoped idempotency key is valid printable <= 256 bytes")
+}
+
+impl RoomCommand {
+    /// Journal-stored idempotency key for this room command, if any.
+    pub fn effective_idem(&self) -> Option<crate::id::IdemKey> {
+        match self {
+            RoomCommand::RoomPost(c) => c.idem.as_ref().map(|k| {
+                if k.as_str().starts_with("__rw_") {
+                    scoped_room_idem("__rw_pst:", k)
+                } else {
+                    k.clone()
+                }
+            }),
+            RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_room_idem("__rw_lbl:", k)),
+            RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_room_idem("__rw_clm:", k)),
+            RoomCommand::TaskTransition(c) => {
+                c.idem.as_ref().map(|k| scoped_room_idem("__rw_trn:", k))
+            }
+            RoomCommand::TaskUpdate(c) => c.idem.as_ref().map(|k| scoped_room_idem("__rw_upd:", k)),
+            RoomCommand::RoomEnsure(_)
+            | RoomCommand::RoomJoin(_)
+            | RoomCommand::RoomLeave(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::RoomTasks(_) => None,
+        }
     }
 }

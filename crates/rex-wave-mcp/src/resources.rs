@@ -14,6 +14,36 @@ const ROOM_SCAN_BATCH: u32 = 500;
 pub(crate) enum ResourceTarget {
     Sidebar,
     Room(RoomRef),
+    LegacyOperatorDm(Principal),
+}
+
+impl ResourceTarget {
+    fn into_room_ref(self, viewer: &Principal) -> Result<RoomRef, InvalidId> {
+        match self {
+            ResourceTarget::Sidebar => Err(InvalidId {
+                what: "room".into(),
+                reason: "sidebar is not a room".into(),
+            }),
+            ResourceTarget::Room(r) => Ok(r),
+            ResourceTarget::LegacyOperatorDm(other) => {
+                let me_op = match viewer {
+                    Principal::Operator { seat } | Principal::Seat { seat } => {
+                        Principal::Operator { seat: seat.clone() }
+                    }
+                    other_me => other_me.clone(),
+                };
+                let pair = match &other {
+                    Principal::Operator { .. } => {
+                        rex_wave_api::room::PrincipalPair::new(viewer.clone(), other)?
+                    }
+                    _ => rex_wave_api::room::PrincipalPair::new(me_op, other)?,
+                };
+                Ok(RoomRef::Id {
+                    id: RoomId::Direct { pair },
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,54 +81,59 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
         .collect::<Result<_, _>>()
         .map_err(ResourceError::InvalidUri)?;
 
-    let room_ref = match parts.as_slice() {
-        [name] => RoomRef::Channel {
-            scope: RoomScope::Global,
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        [kind, name] if kind == "channel" => RoomRef::Channel {
-            scope: RoomScope::Global,
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        [kind, seat] if kind == "dm" => RoomRef::Dm {
-            with: Principal::Seat {
-                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, sub, seat] if kind == "dm" && sub == "seat" => RoomRef::Dm {
-            with: Principal::Seat {
-                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, sub, seat] if kind == "dm" && sub == "operator" => RoomRef::Dm {
-            with: Principal::Operator {
-                seat: SeatName::parse(seat).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, sub, wave, role] if kind == "dm" && sub == "worker" => RoomRef::Dm {
-            with: Principal::Worker {
-                wave: WaveSlug::parse(wave).map_err(|e| ResourceError::Api(e.into()))?,
-                role: RoleName::parse(role).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-        },
-        [kind, project, name] if kind == "project" => RoomRef::Channel {
-            scope: RoomScope::Project {
-                project: BbProjectId::parse(project).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        [project, name] if project != "project" => RoomRef::Channel {
-            scope: RoomScope::Project {
-                project: BbProjectId::parse(project).map_err(|e| ResourceError::Api(e.into()))?,
-            },
-            name: ChannelName::parse(name).map_err(|e| ResourceError::Api(e.into()))?,
-        },
-        _ => {
-            return Err(ResourceError::InvalidUri(format!(
-                "unsupported room resource uri: {uri}"
-            )));
+    let api = |e: InvalidId| ResourceError::Api(e.into());
+    let unsupported = || ResourceError::InvalidUri(format!("unsupported room resource uri: {uri}"));
+    // Every segment but a project id is one name; a decoded `/` would
+    // change which room the canonical spelling names.
+    let one_name = |seg: &String| {
+        if seg.contains('/') {
+            Err(unsupported())
+        } else {
+            Ok(())
         }
     };
+    let canonical = match parts.as_slice() {
+        [name] => one_name(name).map(|()| format!("#{name}"))?,
+        [kind, name] if kind == "channel" => one_name(name).map(|()| format!("#{name}"))?,
+        [kind, seat] if kind == "dm" => one_name(seat).map(|()| format!("@{seat}"))?,
+        [kind, sub, seat] if kind == "dm" && sub == "seat" => {
+            one_name(seat).map(|()| format!("@{seat}"))?
+        }
+        [kind, sub, seat] if kind == "dm" && sub == "operator" => {
+            return Ok(ResourceTarget::LegacyOperatorDm(Principal::Operator {
+                seat: SeatName::parse(seat).map_err(api)?,
+            }));
+        }
+        [kind, sub, seat] if kind == "dm" && sub == "legacy-seat" => {
+            return Ok(ResourceTarget::LegacyOperatorDm(Principal::Seat {
+                seat: SeatName::parse(seat).map_err(api)?,
+            }));
+        }
+        [kind, sub, wave, role] if kind == "dm" && sub == "legacy-worker" => {
+            return Ok(ResourceTarget::LegacyOperatorDm(Principal::Worker {
+                wave: WaveSlug::parse(wave).map_err(api)?,
+                role: RoleName::parse(role).map_err(api)?,
+            }));
+        }
+        [kind, sub, wave, role] if kind == "dm" && sub == "worker" => {
+            one_name(wave)?;
+            one_name(role).map(|()| format!("@{wave}/{role}"))?
+        }
+        [kind, project, name] if kind == "project" => {
+            one_name(name)?;
+            return Ok(ResourceTarget::Room(RoomRef::Channel {
+                scope: RoomScope::Project {
+                    project: BbProjectId::parse(project.clone()).map_err(api)?,
+                },
+                name: ChannelName::parse(name.clone()).map_err(api)?,
+            }));
+        }
+        [project, name] if project != "project" => {
+            one_name(name).map(|()| format!("#{project}/{name}"))?
+        }
+        _ => return Err(unsupported()),
+    };
+    let room_ref = RoomRef::parse_str(&canonical).map_err(api)?;
 
     Ok(ResourceTarget::Room(room_ref))
 }
@@ -120,10 +155,18 @@ pub(crate) fn room_uri(room: &RoomId, viewer: &Principal) -> Option<(String, Str
             ))
         }
         RoomId::Direct { pair } => {
-            let other = pair.other(viewer)?;
+            let other = pair.other_for_viewer(viewer)?;
+            let (a, b): (Principal, Principal) = pair.clone().into();
+            let has_legacy_op = a.is_operator() || b.is_operator();
             let uri = match other {
+                Principal::Seat { seat } if has_legacy_op => {
+                    format!("rex://room/dm/legacy-seat/{seat}")
+                }
                 Principal::Seat { seat } => format!("rex://room/dm/seat/{seat}"),
                 Principal::Operator { seat } => format!("rex://room/dm/operator/{seat}"),
+                Principal::Worker { wave, role } if has_legacy_op => {
+                    format!("rex://room/dm/legacy-worker/{wave}/{role}")
+                }
                 Principal::Worker { wave, role } => format!("rex://room/dm/worker/{wave}/{role}"),
                 Principal::System { .. } => return None,
             };
@@ -207,9 +250,11 @@ pub(crate) async fn read_resource<C: Client>(
             let snap = client.call(read::Sidebar {}).await?;
             serde_json::to_string(&snap).map_err(|e| ApiError::Internal(e.to_string()))?
         }
-        ResourceTarget::Room(room_ref) => {
-            let room = room_ref.resolve(client.me()).map_err(ApiError::from)?;
-            let page = read_room_tail(client, StreamId::Room { room }).await?;
+        other_target => {
+            let room_ref = other_target
+                .into_room_ref(client.me())
+                .map_err(ApiError::from)?;
+            let page = read_room_tail(client, room_ref).await?;
             serde_json::to_string(&page).map_err(|e| ApiError::Internal(e.to_string()))?
         }
     };
@@ -265,7 +310,10 @@ pub(crate) async fn subscribe_resource<C: Client>(
             });
             Ok(handle.abort_handle())
         }
-        ResourceTarget::Room(room_ref) => {
+        other_target => {
+            let room_ref = other_target
+                .into_room_ref(client.me())
+                .map_err(ApiError::from)?;
             room_ref.resolve(client.me()).map_err(ApiError::from)?;
             let mut stream = client
                 .watch(Interest::Room { room: room_ref }, Cursor::live())
@@ -288,19 +336,23 @@ pub(crate) async fn subscribe_resource<C: Client>(
     }
 }
 
-async fn read_room_tail<C: Client>(client: &C, stream: StreamId) -> Result<read::Page, ApiError> {
+async fn read_room_tail<C: Client>(client: &C, room_ref: RoomRef) -> Result<read::Page, ApiError> {
     let mut after = Seq::ORIGIN;
     let mut tail = VecDeque::with_capacity(DEFAULT_ROOM_READ_LIMIT);
     let mut cursor;
+    let mut head_total = 0usize;
 
     loop {
-        let page = client
-            .call(read::Read {
-                stream: stream.clone(),
-                after,
-                limit: Some(ROOM_SCAN_BATCH),
-            })
-            .await?;
+        let req = read::Read::room_ref(
+            room_ref.clone(),
+            client.me(),
+            after,
+            None,
+            Some(ROOM_SCAN_BATCH),
+        )
+        .map_err(ApiError::from)?;
+        let page = client.call(req).await?;
+        head_total = head_total.max((after.0 as usize).saturating_add(page.total_count));
         cursor = page.cursor;
         let count = page.entries.len();
         let last_seq = page.entries.last().map_or(after, |e| e.seq);
@@ -317,7 +369,7 @@ async fn read_room_tail<C: Client>(client: &C, stream: StreamId) -> Result<read:
     }
 
     let entries: Vec<_> = tail.into_iter().collect();
-    let total_count = (cursor.at(&stream).0 as usize).max(entries.len());
+    let total_count = head_total.max(entries.len());
     let truncated = entries.len() < total_count;
     Ok(read::Page {
         entries,
@@ -393,5 +445,46 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rex_wave_api::room::PrincipalPair;
+
+    #[test]
+    fn room_uri_and_parse_uri_preserve_proj_prefixed_ids_and_operator_dms() {
+        let operator = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        };
+        let dm = RoomId::Direct {
+            pair: PrincipalPair::new(operator.as_dm_member(), alice.clone()).unwrap(),
+        };
+        let (dm_uri, _) = room_uri(&dm, &operator).expect("operator must see seat-keyed DM uri");
+        assert_eq!(dm_uri, "rex://room/dm/seat/alice");
+        assert_eq!(
+            parse_uri(&dm_uri).unwrap(),
+            ResourceTarget::Room(RoomRef::Dm { with: alice })
+        );
+
+        let proj = BbProjectId::parse("proj:alpha/sub").unwrap();
+        let chan = RoomId::Channel {
+            scope: RoomScope::Project {
+                project: proj.clone(),
+            },
+            name: ChannelName::parse("general").unwrap(),
+        };
+        let (chan_uri, _) = room_uri(&chan, &operator).unwrap();
+        assert_eq!(
+            parse_uri(&chan_uri).unwrap(),
+            ResourceTarget::Room(RoomRef::Channel {
+                scope: RoomScope::Project { project: proj },
+                name: ChannelName::parse("general").unwrap(),
+            })
+        );
     }
 }

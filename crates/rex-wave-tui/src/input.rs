@@ -215,7 +215,6 @@ use KeyCode::{
 };
 
 pub static KEYMAP: &[Binding] = &[
-    // Global
     bind(Char('c'), C, ANY, "ctrl+c", "Global", "quit", |_| {
         Action::Quit
     }),
@@ -259,7 +258,6 @@ pub static KEYMAP: &[Binding] = &[
     bind(Esc, N, NAV, "esc", "Global", "clear selection", |_| {
         Action::Cancel
     }),
-    // Sidebar
     bind(Char('j'), N, SIDEBAR, "j", "Sidebar", "next node", |_| {
         Action::Move(Dir::Down)
     }),
@@ -371,7 +369,6 @@ pub static KEYMAP: &[Binding] = &[
         "show / hide archived",
         |_| Action::ToggleShowArchived,
     ),
-    // Stage
     bind(
         Char('j'),
         N,
@@ -472,7 +469,6 @@ pub static KEYMAP: &[Binding] = &[
         "compose / steer / new task",
         |_| Action::Compose,
     ),
-    // Inbox and approvals
     bind(Char('a'), N, NAV, "a", "Inbox", "approve", |_| {
         Action::Accelerator('a')
     }),
@@ -497,7 +493,6 @@ pub static KEYMAP: &[Binding] = &[
         "dismiss all of this kind",
         |_| Action::Accelerator('X'),
     ),
-    // Room
     bind(
         Char('P'),
         N,
@@ -507,7 +502,6 @@ pub static KEYMAP: &[Binding] = &[
         "promote to canon letter",
         |_| Action::Promote,
     ),
-    // Kanban
     bind(
         Char('B'),
         N,
@@ -535,7 +529,6 @@ pub static KEYMAP: &[Binding] = &[
     bind(Char('n'), N, NAV, "n", "Kanban", "new task", |_| {
         Action::NewTask
     }),
-    // Composer
     bind(Enter, N, COMPOSER, "enter", "Composer", "send", |_| {
         Action::Submit
     }),
@@ -665,7 +658,6 @@ pub static KEYMAP: &[Binding] = &[
         "delete previous word",
         |_| Action::Edit(EditOp::KillWord),
     ),
-    // Pager and help overlays
     bind(
         Char('j'),
         N,

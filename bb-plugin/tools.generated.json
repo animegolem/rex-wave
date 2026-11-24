@@ -4,7 +4,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -320,7 +320,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -699,7 +699,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -981,7 +981,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -1243,7 +1243,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -1539,7 +1539,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -1847,7 +1847,7 @@
           "type": "integer"
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -2138,7 +2138,7 @@
           "type": "integer"
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -2463,7 +2463,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -2815,7 +2815,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -4032,7 +4032,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -4255,7 +4255,7 @@
           "type": "string"
         },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -4522,7 +4522,7 @@
     "inputSchema": {
       "$defs": {
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -5391,327 +5391,6 @@
     "description": "Page one stream after a seq.",
     "inputSchema": {
       "$defs": {
-        "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
-          "oneOf": [
-            {
-              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
-              "properties": {
-                "kind": {
-                  "const": "operator",
-                  "type": "string"
-                },
-                "seat": {
-                  "description": "seat",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "kind",
-                "seat"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
-              "properties": {
-                "kind": {
-                  "const": "seat",
-                  "type": "string"
-                },
-                "seat": {
-                  "description": "seat",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "kind",
-                "seat"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
-              "properties": {
-                "kind": {
-                  "const": "worker",
-                  "type": "string"
-                },
-                "role": {
-                  "description": "role",
-                  "type": "string"
-                },
-                "wave": {
-                  "description": "wave slug",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "kind",
-                "wave",
-                "role"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "The daemon's own reactors and adapters.",
-              "properties": {
-                "kind": {
-                  "const": "system",
-                  "type": "string"
-                },
-                "part": {
-                  "$ref": "#/$defs/SystemPart"
-                }
-              },
-              "required": [
-                "kind",
-                "part"
-              ],
-              "type": "object"
-            }
-          ]
-        },
-        "PrincipalPair": {
-          "maxItems": 2,
-          "minItems": 2,
-          "prefixItems": [
-            {
-              "$ref": "#/$defs/Principal"
-            },
-            {
-              "$ref": "#/$defs/Principal"
-            }
-          ],
-          "type": "array"
-        },
-        "RoomId": {
-          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
-          "oneOf": [
-            {
-              "properties": {
-                "name": {
-                  "description": "channel",
-                  "type": "string"
-                },
-                "room": {
-                  "const": "channel",
-                  "type": "string"
-                },
-                "scope": {
-                  "$ref": "#/$defs/RoomScope"
-                }
-              },
-              "required": [
-                "room",
-                "scope",
-                "name"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "pair": {
-                  "$ref": "#/$defs/PrincipalPair"
-                },
-                "room": {
-                  "const": "direct",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "room",
-                "pair"
-              ],
-              "type": "object"
-            }
-          ]
-        },
-        "RoomScope": {
-          "description": "Where a channel lives in the sidebar tree.",
-          "oneOf": [
-            {
-              "description": "The `Channels` section (non-project).",
-              "properties": {
-                "scope": {
-                  "const": "global",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "scope"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "Under `Projects > <project>`.",
-              "properties": {
-                "project": {
-                  "description": "bb project id",
-                  "type": "string"
-                },
-                "scope": {
-                  "const": "project",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "scope",
-                "project"
-              ],
-              "type": "object"
-            }
-          ]
-        },
-        "Seq": {
-          "description": "Per-stream monotonically increasing position. `Seq(0)` means \"before the first entry\".",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "StreamId": {
-          "description": "The identity of one single-writer log. Also the actor address.",
-          "oneOf": [
-            {
-              "properties": {
-                "room": {
-                  "$ref": "#/$defs/RoomId"
-                },
-                "stream": {
-                  "const": "room",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "stream",
-                "room"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "stream": {
-                  "const": "wave",
-                  "type": "string"
-                },
-                "wave": {
-                  "description": "wave slug",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "stream",
-                "wave"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "board": {
-                  "description": "board id",
-                  "type": "string"
-                },
-                "stream": {
-                  "const": "board",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "stream",
-                "board"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "One inbox per principal: notifications + read cursors. The only owner\nof \"what has X seen\", so unread = room head (room) - cursor (inbox),\nmerged at the read boundary (per separate-before-serializing-shared-state).",
-              "properties": {
-                "owner": {
-                  "$ref": "#/$defs/Principal"
-                },
-                "stream": {
-                  "const": "inbox",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "stream",
-                "owner"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "The mail bridge's promotion / ack ledger (sandbox only).",
-              "properties": {
-                "stream": {
-                  "const": "mail",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "stream"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "Durable seat records and ephemeral live session bindings.",
-              "properties": {
-                "stream": {
-                  "const": "presence",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "stream"
-              ],
-              "type": "object"
-            }
-          ]
-        },
-        "SystemPart": {
-          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
-          "enum": [
-            "wave_conductor",
-            "herald",
-            "bb_bridge",
-            "t3_bridge",
-            "mail_bridge",
-            "wake_bell",
-            "presence_monitor"
-          ],
-          "type": "string"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "after": {
-          "$ref": "#/$defs/Seq",
-          "default": 0
-        },
-        "limit": {
-          "default": null,
-          "format": "uint32",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "stream": {
-          "$ref": "#/$defs/StreamId"
-        }
-      },
-      "required": [
-        "stream"
-      ],
-      "title": "Read",
-      "type": "object"
-    },
-    "name": "read"
-  },
-  {
-    "description": "Block until an interest matches after a cursor; returns the full catch-up slice.",
-    "inputSchema": {
-      "$defs": {
         "Cursor": {
           "description": "A multi-stream resume position. Missing streams mean `Seq::ORIGIN`.",
           "properties": {
@@ -5735,6 +5414,17 @@
                 "type": "array"
               },
               "type": "array"
+            },
+            "snapshot": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SnapshotScope"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Scope of streams whose subscription-time heads were materialized into\n`positions` by `Wait`, allowing new streams inside that scope to start at\n`Seq::ORIGIN` while broader waits initialize newly included streams at head."
             }
           },
           "required": [
@@ -5742,194 +5432,8 @@
           ],
           "type": "object"
         },
-        "Interest": {
-          "description": "What a watcher wants. Resolved server-side against the session principal.",
-          "oneOf": [
-            {
-              "description": "Exactly these streams.",
-              "properties": {
-                "interest": {
-                  "const": "streams",
-                  "type": "string"
-                },
-                "streams": {
-                  "items": {
-                    "$ref": "#/$defs/StreamId"
-                  },
-                  "type": "array"
-                }
-              },
-              "required": [
-                "interest",
-                "streams"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "One room by reference (DM refs resolve with the session principal).",
-              "properties": {
-                "interest": {
-                  "const": "room",
-                  "type": "string"
-                },
-                "room": {
-                  "$ref": "#/$defs/RoomRef"
-                }
-              },
-              "required": [
-                "interest",
-                "room"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "One room filtered by optional thread root (`re`) and/or `key=value` labels\n(`RoomEvent::Labeled` matches when `labels` match `before || after`).",
-              "properties": {
-                "interest": {
-                  "const": "room_filtered",
-                  "type": "string"
-                },
-                "labels": {
-                  "items": {
-                    "description": "label",
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                "re": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Seq"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "room": {
-                  "$ref": "#/$defs/RoomRef"
-                }
-              },
-              "required": [
-                "interest",
-                "room"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "Only entries that @mention me (or @all) in rooms I belong to, plus DMs to me.\nThis is `channel_wait(mentions_only: true)`.",
-              "properties": {
-                "interest": {
-                  "const": "mentions",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "interest"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "My inbox stream (notifications), for the TUI `Inbox` node and OSC 7501.",
-              "properties": {
-                "interest": {
-                  "const": "my_inbox",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "interest"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "Everything under one BB project: its rooms, waves, and board.",
-              "properties": {
-                "interest": {
-                  "const": "project",
-                  "type": "string"
-                },
-                "project": {
-                  "description": "bb project id",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "interest",
-                "project"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "Live BB thread events of one wave agent (BB-owned; proxied, not journaled).\nOpened when the TUI focuses an agent node and dropped on blur.",
-              "properties": {
-                "interest": {
-                  "const": "agent",
-                  "type": "string"
-                },
-                "role": {
-                  "description": "role",
-                  "type": "string"
-                },
-                "wave": {
-                  "description": "wave slug",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "interest",
-                "wave",
-                "role"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "Operator only: all journaled streams (debug, GUI dashboards).",
-              "properties": {
-                "interest": {
-                  "const": "everything",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "interest"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "The left-pane tree: a `Frame::Sidebar` now and after every change that\naffects it. Bursts of changes coalesce into one frame.",
-              "properties": {
-                "interest": {
-                  "const": "sidebar",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "interest"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "The right-pane stage. One per session: opening a new one ends the old\none, and its frames arrive wrapped in `Frame::Stage` with the new\ngeneration.",
-              "properties": {
-                "interest": {
-                  "const": "stage",
-                  "type": "string"
-                },
-                "target": {
-                  "$ref": "#/$defs/StageTarget"
-                }
-              },
-              "required": [
-                "interest",
-                "target"
-              ],
-              "type": "object"
-            }
-          ]
-        },
         "Principal": {
-          "description": "Who did something. Bound at session open by the transport; never parsed\nfrom command arguments.",
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
             {
               "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
@@ -6164,6 +5668,727 @@
           "minimum": 0,
           "type": "integer"
         },
+        "SnapshotScope": {
+          "description": "Which stream universe a `from_head` `Wait` cursor has already snapshotted\ninto explicit `positions`.",
+          "oneOf": [
+            {
+              "properties": {
+                "scope": {
+                  "const": "mentions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "scope": {
+                  "const": "everything",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamId": {
+          "description": "The identity of one single-writer log. Also the actor address.",
+          "oneOf": [
+            {
+              "properties": {
+                "room": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "stream": {
+                  "const": "room",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "stream": {
+                  "const": "wave",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "wave"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "board": {
+                  "description": "board id",
+                  "type": "string"
+                },
+                "stream": {
+                  "const": "board",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "board"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One inbox per principal: notifications + read cursors. The only owner\nof \"what has X seen\", so unread = room head (room) - cursor (inbox),\nmerged at the read boundary (per separate-before-serializing-shared-state).",
+              "properties": {
+                "owner": {
+                  "$ref": "#/$defs/Principal"
+                },
+                "stream": {
+                  "const": "inbox",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream",
+                "owner"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The mail bridge's promotion / ack ledger (sandbox only).",
+              "properties": {
+                "stream": {
+                  "const": "mail",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Durable seat records and ephemeral live session bindings.",
+              "properties": {
+                "stream": {
+                  "const": "presence",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SystemPart": {
+          "description": "The daemon-internal parts allowed to issue `Audience::System` commands.",
+          "enum": [
+            "wave_conductor",
+            "herald",
+            "bb_bridge",
+            "t3_bridge",
+            "mail_bridge",
+            "wake_bell",
+            "presence_monitor"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/Seq",
+          "default": 0,
+          "description": "Sequence to read after when `cursor` is omitted (also populated as a\nsingle-stream fallback for older daemons when `cursor` is set)."
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional resume cursor; when present, takes precedence over `after` and\nresolves against the server-selected stream (`from_head` starts unlisted\nstreams at `head`, otherwise `Seq::ORIGIN`)."
+        },
+        "limit": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "room": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoomRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional room reference (`#channel`, `@seat`); when present, resolved\nserver-side (`RoomRef::Dm` falls back to an existing pre-PR-26\n`(Operator, peer)` stream when canonical `head == 0`, while\n`RoomRef::Id` stays pinned to its exact stream)."
+        },
+        "stream": {
+          "$ref": "#/$defs/StreamId"
+        }
+      },
+      "required": [
+        "stream"
+      ],
+      "title": "Read",
+      "type": "object"
+    },
+    "name": "read"
+  },
+  {
+    "description": "Block until an interest matches after a cursor; returns the full catch-up slice.",
+    "inputSchema": {
+      "$defs": {
+        "Cursor": {
+          "description": "A multi-stream resume position. Missing streams mean `Seq::ORIGIN`.",
+          "properties": {
+            "from_head": {
+              "default": false,
+              "description": "Streams not listed start at their head at subscribe time instead of origin.",
+              "type": "boolean"
+            },
+            "positions": {
+              "items": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "$ref": "#/$defs/StreamId"
+                  },
+                  {
+                    "$ref": "#/$defs/Seq"
+                  }
+                ],
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "snapshot": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SnapshotScope"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Scope of streams whose subscription-time heads were materialized into\n`positions` by `Wait`, allowing new streams inside that scope to start at\n`Seq::ORIGIN` while broader waits initialize newly included streams at head."
+            }
+          },
+          "required": [
+            "positions"
+          ],
+          "type": "object"
+        },
+        "Interest": {
+          "description": "What a watcher wants. Resolved server-side against the session principal.",
+          "oneOf": [
+            {
+              "description": "Exactly these streams.",
+              "properties": {
+                "interest": {
+                  "const": "streams",
+                  "type": "string"
+                },
+                "streams": {
+                  "items": {
+                    "$ref": "#/$defs/StreamId"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "interest",
+                "streams"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One room by reference (DM refs resolve with the session principal).",
+              "properties": {
+                "interest": {
+                  "const": "room",
+                  "type": "string"
+                },
+                "room": {
+                  "$ref": "#/$defs/RoomRef"
+                }
+              },
+              "required": [
+                "interest",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One room filtered by optional thread root (`re`) and/or `key=value` labels\n(`RoomEvent::Labeled` matches when `labels` match `before || after`).",
+              "properties": {
+                "interest": {
+                  "const": "room_filtered",
+                  "type": "string"
+                },
+                "labels": {
+                  "items": {
+                    "description": "label",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "re": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Seq"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "room": {
+                  "$ref": "#/$defs/RoomRef"
+                }
+              },
+              "required": [
+                "interest",
+                "room"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Only entries that @mention me (or @all) in rooms I belong to, plus DMs to me.\nThis is `channel_wait(mentions_only: true)`.",
+              "properties": {
+                "interest": {
+                  "const": "mentions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "My inbox stream (notifications), for the TUI `Inbox` node and OSC 7501.",
+              "properties": {
+                "interest": {
+                  "const": "my_inbox",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Everything under one BB project: its rooms, waves, and board.",
+              "properties": {
+                "interest": {
+                  "const": "project",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Live BB thread events of one wave agent (BB-owned; proxied, not journaled).\nOpened when the TUI focuses an agent node and dropped on blur.",
+              "properties": {
+                "interest": {
+                  "const": "agent",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Operator only: all journaled streams (debug, GUI dashboards).",
+              "properties": {
+                "interest": {
+                  "const": "everything",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The left-pane tree: a `Frame::Sidebar` now and after every change that\naffects it. Bursts of changes coalesce into one frame.",
+              "properties": {
+                "interest": {
+                  "const": "sidebar",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The right-pane stage. One per session: opening a new one ends the old\none, and its frames arrive wrapped in `Frame::Stage` with the new\ngeneration.",
+              "properties": {
+                "interest": {
+                  "const": "stage",
+                  "type": "string"
+                },
+                "target": {
+                  "$ref": "#/$defs/StageTarget"
+                }
+              },
+              "required": [
+                "interest",
+                "target"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Principal": {
+          "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
+          "oneOf": [
+            {
+              "description": "The human operator at the TUI / CLI (authenticated by Unix peer uid).",
+              "properties": {
+                "kind": {
+                  "const": "operator",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A seat using a minted capability token (MCP stdio/HTTP).",
+              "properties": {
+                "kind": {
+                  "const": "seat",
+                  "type": "string"
+                },
+                "seat": {
+                  "description": "seat",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "seat"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A BB thread spawned by a wave; resolved server-side from its BB thread id.",
+              "properties": {
+                "kind": {
+                  "const": "worker",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "role",
+                  "type": "string"
+                },
+                "wave": {
+                  "description": "wave slug",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "wave",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The daemon's own reactors and adapters.",
+              "properties": {
+                "kind": {
+                  "const": "system",
+                  "type": "string"
+                },
+                "part": {
+                  "$ref": "#/$defs/SystemPart"
+                }
+              },
+              "required": [
+                "kind",
+                "part"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PrincipalPair": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "$ref": "#/$defs/Principal"
+            }
+          ],
+          "type": "array"
+        },
+        "RoomId": {
+          "description": "Canonical room identity (also the actor address). Natural keys: creating\n`#wave-auth-v2` twice is the same room, so `room_ensure` is idempotent.",
+          "oneOf": [
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "room": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "room",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pair": {
+                  "$ref": "#/$defs/PrincipalPair"
+                },
+                "room": {
+                  "const": "direct",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room",
+                "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomScope": {
+          "description": "Where a channel lives in the sidebar tree.",
+          "oneOf": [
+            {
+              "description": "The `Channels` section (non-project).",
+              "properties": {
+                "scope": {
+                  "const": "global",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Under `Projects > <project>`.",
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Seq": {
+          "description": "Per-stream monotonically increasing position. `Seq(0)` means \"before the first entry\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "SnapshotScope": {
+          "description": "Which stream universe a `from_head` `Wait` cursor has already snapshotted\ninto explicit `positions`.",
+          "oneOf": [
+            {
+              "properties": {
+                "scope": {
+                  "const": "mentions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "scope": {
+                  "const": "everything",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "StageTarget": {
           "description": "What the focused sidebar node shows on the stage.",
           "oneOf": [
@@ -6357,8 +6582,49 @@
         "after": {
           "$ref": "#/$defs/Cursor"
         },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional resume cursor; when present, takes precedence over `after`'s\nsingle-stream fallback and combines with `room` / `since`."
+        },
         "interest": {
           "$ref": "#/$defs/Interest"
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "room": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoomRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional target room reference (`#channel`, `@seat`); when present, the\nserver resolves `since` and `cursor` against the server-selected stream\n(while `after` carries a compatibility fallback for older daemons)."
+        },
+        "since": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Seq"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional room-relative sequence offset (`--since` / `--after`), applied\nexclusively to the server-selected `room` stream when `room` is present."
         },
         "timeout_ms": {
           "default": null,

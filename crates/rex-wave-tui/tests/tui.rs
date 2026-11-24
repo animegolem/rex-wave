@@ -322,13 +322,13 @@ async fn kanban_room_and_agent_stages_dispatch_typed_wire_commands() {
         Msg::Action(Action::Activate(NodeKey::Room(wave_room.clone()))),
     );
     let read_reply = client
-        .call_wire(WireCommand::Read(rex_wave_api::read::Read {
-            stream: StreamId::Room {
+        .call_wire(WireCommand::Read(rex_wave_api::read::Read::stream(
+            StreamId::Room {
                 room: wave_room.clone(),
             },
-            after: Seq::ORIGIN,
-            limit: Some(200),
-        }))
+            Seq::ORIGIN,
+            Some(200),
+        )))
         .await;
     let req_seq = model.stage_req_seq;
     let _ = update(

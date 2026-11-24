@@ -47,7 +47,6 @@ use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const EXIT_CONFLICT: u8 = 3;
@@ -60,7 +59,7 @@ const EXIT_TIMEOUT: u8 = 124;
     about = "Waves, #channels, DMs, kanban, tasks, presence, and notifications for BB + T3 + Rex"
 )]
 pub struct Cli {
-    /// Daemon Unix socket path (default: `$XDG_STATE_HOME/rex-wave/daemon.sock`).
+    /// Daemon Unix socket path (default: `$XDG_STATE_HOME/rex-wave/daemon.sock`; on macOS, must share `/tmp`'s filesystem).
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
     /// Capability token for seat or worker authentication (falls back to `T3CODE_THREAD_ID` worker token, then Unix peer UID).
@@ -891,50 +890,22 @@ fn parse_cursor_arg(raw: &str) -> Result<Cursor, ApiError> {
 }
 
 fn ensure_cursor_from_head(cursor: Cursor) -> Cursor {
-    if cursor.from_head() {
+    if cursor.from_head() || cursor.snapshot().is_some() {
         return cursor;
     }
-    if let Ok(mut val) = serde_json::to_value(&cursor)
-        && let Some(obj) = val.as_object_mut()
-    {
-        obj.insert("from_head".to_owned(), serde_json::Value::Bool(true));
-        if let Ok(live) = serde_json::from_value(val) {
-            return live;
-        }
-    }
-    Cursor::live()
+    cursor.with_from_head(true)
 }
 
 fn parse_task_status(s: &str) -> Result<TaskStatus, ApiError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "open" => Ok(TaskStatus::Open),
-        "claimed" => Ok(TaskStatus::Claimed),
-        "review" => Ok(TaskStatus::Review),
-        "blocked" => Ok(TaskStatus::Blocked),
-        "done" => Ok(TaskStatus::Done),
-        "cancelled" | "canceled" => Ok(TaskStatus::Cancelled),
-        _ => Err(invalid(
-            "status",
-            "expected open, claimed, review, blocked, done, or cancelled",
-        )),
-    }
+    rex_wave_api::parse_enum("status", s)
 }
 
 fn parse_seat_status(s: &str) -> Result<SeatStatus, ApiError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "active" => Ok(SeatStatus::Active),
-        "dormant" => Ok(SeatStatus::Dormant),
-        "retired" => Ok(SeatStatus::Retired),
-        _ => Err(invalid("status", "expected active, dormant, or retired")),
-    }
+    rex_wave_api::parse_enum("status", s)
 }
 
 fn parse_work_class(s: &str) -> Result<WorkClass, ApiError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "class_a" | "class-a" | "a" => Ok(WorkClass::ClassA),
-        "class_b" | "class-b" | "b" => Ok(WorkClass::ClassB),
-        _ => Err(invalid("work_class", "expected class_a or class_b")),
-    }
+    rex_wave_api::parse_enum("work_class", s)
 }
 
 fn parse_seq_range(s: &str) -> Result<SeqRange, ApiError> {
@@ -957,15 +928,7 @@ fn parse_seq_range(s: &str) -> Result<SeqRange, ApiError> {
 }
 
 fn parse_permission(s: &str) -> Result<PermissionMode, ApiError> {
-    match s {
-        "accept-edits" => Ok(PermissionMode::AcceptEdits),
-        "auto" => Ok(PermissionMode::Auto),
-        "full" => Ok(PermissionMode::Full),
-        _ => Err(invalid(
-            "permission",
-            "expected accept-edits, auto, or full",
-        )),
-    }
+    rex_wave_api::parse_enum("permission", s)
 }
 
 fn parse_workspace(s: &str) -> Result<Workspace, ApiError> {
@@ -994,43 +957,15 @@ fn parse_workspace(s: &str) -> Result<Workspace, ApiError> {
 }
 
 fn parse_steer_mode(s: &str) -> Result<SteerDeliveryMode, ApiError> {
-    match s {
-        "auto" => Ok(SteerDeliveryMode::Auto),
-        "start" => Ok(SteerDeliveryMode::Start),
-        "steer" => Ok(SteerDeliveryMode::Steer),
-        "steer-if-active" => Ok(SteerDeliveryMode::SteerIfActive),
-        "queue-if-active" => Ok(SteerDeliveryMode::QueueIfActive),
-        _ => Err(invalid(
-            "mode",
-            "expected auto, start, steer, steer-if-active, or queue-if-active",
-        )),
-    }
+    rex_wave_api::parse_enum("mode", s)
 }
 
 fn parse_card_priority(s: &str) -> Result<Priority, ApiError> {
-    match s {
-        "low" => Ok(Priority::Low),
-        "normal" => Ok(Priority::Normal),
-        "high" => Ok(Priority::High),
-        "blocking" => Ok(Priority::Blocking),
-        _ => Err(invalid(
-            "priority",
-            "expected low, normal, high, or blocking",
-        )),
-    }
+    rex_wave_api::parse_enum("priority", s)
 }
 
 fn parse_letter_priority(s: &str) -> Result<LetterPriority, ApiError> {
-    match s {
-        "low" => Ok(LetterPriority::Low),
-        "normal" => Ok(LetterPriority::Normal),
-        "high" => Ok(LetterPriority::High),
-        "blocking" => Ok(LetterPriority::Blocking),
-        _ => Err(invalid(
-            "priority",
-            "expected low, normal, high, or blocking",
-        )),
-    }
+    rex_wave_api::parse_enum("priority", s)
 }
 
 fn parse_worker_spec(
@@ -1077,6 +1012,16 @@ fn parse_role_kv<'a>(raw: &'a str, flag: &str) -> Result<(RoleName, &'a str), Ap
     Ok((role, val))
 }
 
+/// The largest file the CLI reads as command input (bodies, briefs,
+/// manifests, shadow and acks logs).
+const MAX_CLI_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest `mail shadow --watch` log resumed.
+const MAX_SHADOW_LOG_BYTES: u64 = 256 * 1024 * 1024;
+
+fn read_cli_text(path: &Path) -> std::io::Result<String> {
+    rex_wave_fs::read_input_string(path, MAX_CLI_INPUT_BYTES)
+}
+
 fn read_text_source(
     inline: Option<&String>,
     file: Option<&PathBuf>,
@@ -1084,7 +1029,7 @@ fn read_text_source(
 ) -> Result<String, ApiError> {
     match (inline, file) {
         (Some(s), _) => Ok(s.clone()),
-        (None, Some(path)) => std::fs::read_to_string(path)
+        (None, Some(path)) => read_cli_text(path)
             .map_err(|e| invalid(what, format!("failed reading {}: {e}", path.display()))),
         (None, None) => Err(invalid(what, format!("provide --{what} or --{what}-file"))),
     }
@@ -1158,23 +1103,18 @@ fn load_claude_session_endpoint(
             ));
         }
         let path = PathBuf::from(path_arg.trim());
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            invalid(
-                "from-claude-session",
-                format!("failed statting {}: {e}", path.display()),
-            )
-        })?;
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return Err(ApiError::Denied {
-                principal: "presence".into(),
-                action: format!("read non-regular session file {}", path.display()),
-            });
-        }
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            invalid(
-                "from-claude-session",
-                format!("failed reading {}: {e}", path.display()),
-            )
+        let raw = read_cli_text(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                ApiError::Denied {
+                    principal: "presence".into(),
+                    action: format!("read non-regular session file {}: {e}", path.display()),
+                }
+            } else {
+                invalid(
+                    "from-claude-session",
+                    format!("failed reading {}: {e}", path.display()),
+                )
+            }
         })?;
         parse_claude_session_json(&raw)?
     } else {
@@ -1287,26 +1227,34 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
             cursor,
             limit,
         } => {
-            let room_id = parse_room_ref(room)?.resolve(me)?;
-            let stream = StreamId::Room {
-                room: room_id.clone(),
-            };
+            let room_ref = parse_room_ref(room)?;
             let parsed_labels = parse_labels(labels)?;
-            let start_seq = match (after, cursor) {
-                (Some(n), _) => Seq(*n),
-                (None, Some(c)) => parse_cursor_arg(c)?.at(&stream),
-                (None, None) => Seq::ORIGIN,
+            let parsed_cursor = match cursor {
+                Some(c) => Some(parse_cursor_arg(c)?),
+                None => None,
             };
+            let start_seq = after.map_or(Seq::ORIGIN, Seq);
             if re.is_some() || !parsed_labels.is_empty() {
-                let mut wait = Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
+                let mut wait =
+                    Wait::room_ref_filtered(room_ref, me, start_seq, re.map(Seq), parsed_labels)?;
+                if after.is_none()
+                    && let Some(c) = parsed_cursor
+                {
+                    wait.after = c.clone();
+                    wait.since = None;
+                    wait.cursor = Some(c);
+                }
                 wait.timeout_ms = Some(0);
+                wait.limit = Some(limit.unwrap_or(200).clamp(1, 1000));
                 Ok(WireCommand::Wait(wait))
             } else {
-                Ok(WireCommand::Read(Read {
-                    stream,
-                    after: start_seq,
-                    limit: *limit,
-                }))
+                Ok(WireCommand::Read(Read::room_ref(
+                    room_ref,
+                    me,
+                    start_seq,
+                    if after.is_some() { None } else { parsed_cursor },
+                    *limit,
+                )?))
             }
         }
         Cmd::Wait {
@@ -1328,33 +1276,74 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
 
             let wait = match room {
                 Some(r) => {
-                    let room_id = parse_room_ref(r)?.resolve(me)?;
+                    let room_ref = parse_room_ref(r)?;
+                    let room_id = room_ref.resolve(me)?;
                     let stream = StreamId::Room {
                         room: room_id.clone(),
                     };
+                    let fallback_stream =
+                        rex_wave_api::read::legacy_operator_dm_stream(&room_ref, me)?
+                            .unwrap_or_else(|| stream.clone());
                     if has_filter {
-                        let start_seq = if *since > 0 {
-                            Seq(*since)
+                        if *since == 0
+                            && let Some(c) = base_cursor
+                        {
+                            Wait {
+                                interest: Interest::RoomFiltered {
+                                    room: room_ref.clone(),
+                                    re: re.map(Seq),
+                                    labels: parsed_labels,
+                                },
+                                after: c.clone(),
+                                room: Some(room_ref),
+                                since: None,
+                                cursor: Some(c),
+                                timeout_ms: *timeout,
+                                limit: None,
+                            }
                         } else {
-                            base_cursor.as_ref().map_or(Seq::ORIGIN, |c| c.at(&stream))
-                        };
-                        let mut w =
-                            Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
-                        w.timeout_ms = *timeout;
-                        w
+                            let mut w = Wait::room_ref_filtered(
+                                room_ref,
+                                me,
+                                Seq(*since),
+                                re.map(Seq),
+                                parsed_labels,
+                            )?;
+                            if let Some(c) = base_cursor {
+                                let mut wire_c = c.clone();
+                                wire_c.advance(&fallback_stream, Seq(*since));
+                                w.after = wire_c;
+                                w.cursor = Some(c);
+                            }
+                            w.timeout_ms = *timeout;
+                            w
+                        }
                     } else {
                         let mentions = !*all;
-                        let mut w = Wait::room(room_id, Seq(*since), mentions);
+                        let mut w = Wait::room_ref(room_ref, me, Seq(*since), mentions)?;
                         if let Some(c) = base_cursor {
-                            let mut c = if mentions {
+                            let was_unscoped = !c.from_head() && c.snapshot().is_none();
+                            let base_c = if mentions {
                                 ensure_cursor_from_head(c)
                             } else {
                                 c
                             };
-                            if *since > 0 || (mentions && !c.lists(&stream)) {
-                                c.advance(&stream, Seq(*since));
+                            let mut wire_c = base_c.clone();
+                            if *since > 0 {
+                                wire_c.advance(&fallback_stream, Seq(*since));
+                            } else if was_unscoped {
+                                w.since = Some(Seq::ORIGIN);
+                                if mentions
+                                    && !wire_c.lists(&stream)
+                                    && !wire_c.lists(&fallback_stream)
+                                {
+                                    wire_c.advance(&fallback_stream, Seq::ORIGIN);
+                                }
+                            } else {
+                                w.since = None;
                             }
-                            w.after = c;
+                            w.after = wire_c;
+                            w.cursor = Some(base_c);
                         }
                         w.timeout_ms = *timeout;
                         w
@@ -1373,13 +1362,15 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         None => Cursor::live(),
                     };
                     Wait {
-                        interest: if *all {
-                            Interest::Everything
-                        } else {
-                            Interest::Mentions
-                        },
-                        after,
                         timeout_ms: *timeout,
+                        ..Wait::new(
+                            if *all {
+                                Interest::Everything
+                            } else {
+                                Interest::Mentions
+                            },
+                            after,
+                        )
                     }
                 }
             };
@@ -1473,7 +1464,7 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                 let brief_str = if let Some(dir) = brief_dir {
                     let candidate = dir.join(format!("{role_part}.md"));
                     if candidate.exists() {
-                        std::fs::read_to_string(&candidate).map_err(|e| {
+                        read_cli_text(&candidate).map_err(|e| {
                             invalid(
                                 "brief",
                                 format!("failed reading {}: {e}", candidate.display()),
@@ -2812,7 +2803,7 @@ async fn run_org_sync_step<C: Client>(
     let use_org_to_room = if !file.exists() {
         false
     } else if let Some(ref synced) = state.last_synced_bytes {
-        std::fs::read(file)
+        rex_wave_board::task_org::read_org_file(file)
             .map(|cur| cur != *synced)
             .unwrap_or(true)
     } else {
@@ -2953,7 +2944,7 @@ async fn execute_tasks_org_sync<C: Client>(
     let mut last_conflict_bytes: Option<Vec<u8>> = None;
     loop {
         let skip_same_conflict = if let Some(ref prev_conflict) = last_conflict_bytes {
-            match std::fs::read(file) {
+            match rex_wave_board::task_org::read_org_file(file) {
                 Ok(cur) if cur == *prev_conflict => true,
                 Ok(_) => {
                     last_conflict_bytes = None;
@@ -2971,7 +2962,7 @@ async fn execute_tasks_org_sync<C: Client>(
                     consecutive_errors = 0;
                     let (payload, summary, is_conflict) = format_org_sync_step(&step);
                     if is_conflict {
-                        last_conflict_bytes = std::fs::read(file).ok();
+                        last_conflict_bytes = rex_wave_board::task_org::read_org_file(file).ok();
                         if as_json {
                             eprintln!(
                                 "{}",
@@ -3015,131 +3006,40 @@ async fn execute_tasks_org_sync<C: Client>(
     }
 }
 
-fn canonicalize_deepest_existing_no_parent(path: &Path) -> PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon;
-    }
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cursor = path;
-    while let Some(name) = cursor.file_name() {
-        tail.push(name.to_os_string());
-        let Some(parent) = cursor.parent() else {
-            break;
-        };
-        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
-            let mut resolved = canon_parent;
-            for part in tail.into_iter().rev() {
-                resolved.push(part);
-            }
-            return resolved;
-        }
-        cursor = parent;
-    }
-    path.to_path_buf()
-}
-
-fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result<(), CliError> {
-    if out == Path::new("-") {
-        return Ok(());
-    }
-    if out
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(CliError::Msg(format!(
-            "refusing shadow output {} containing '..' parent traversal",
-            out.display()
-        )));
-    }
-    let abs = if out.is_absolute() {
-        out.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
-            .join(out)
-    };
-    if let Ok(meta) = std::fs::symlink_metadata(&abs)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to write shadow output through symlink {}",
-            out.display()
-        )));
-    }
-    let candidate = canonicalize_deepest_existing_no_parent(&abs);
-    if candidate.starts_with(interchange_root) {
-        return Err(CliError::Msg(format!(
+fn format_outside_shadow_err(
+    out: &Path,
+    interchange_root: &Path,
+    err: rex_wave_fs::OutsideError,
+) -> CliError {
+    use rex_wave_fs::OutsideError;
+    CliError::Msg(match err {
+        OutsideError::Inside(_, ref root) => format!(
             "refusing to write shadow output {} inside read-only interchange {}",
             out.display(),
-            interchange_root.display()
-        )));
-    }
-    Ok(())
+            if root.as_os_str().is_empty() {
+                interchange_root.display()
+            } else {
+                root.display()
+            }
+        ),
+        OutsideError::Symlink(_) => format!(
+            "refusing to write shadow output through symlink {}",
+            out.display()
+        ),
+        OutsideError::ParentDir(_) => format!(
+            "refusing shadow output {} containing '..' parent traversal",
+            out.display()
+        ),
+        other => format!("shadow output {}: {other}", out.display()),
+    })
 }
 
-static SHADOW_OUT_NONCE: AtomicU64 = AtomicU64::new(1);
-
-/// Resolves a shadow `--out` file to `(canonical_parent, file_name, final_path)`,
-/// creating the parent and refusing any location inside `interchange_root` or a
-/// symlinked leaf.
-fn resolve_shadow_out_target(
-    target: &Path,
-    interchange_root: &Path,
-) -> Result<(PathBuf, std::ffi::OsString, PathBuf), CliError> {
-    ensure_out_outside_interchange(target, interchange_root)?;
-    let abs = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
-            .join(target)
-    };
-    let file_name = abs
-        .file_name()
-        .ok_or_else(|| {
-            CliError::Msg(format!(
-                "shadow output {} has no file name",
-                target.display()
-            ))
-        })?
-        .to_os_string();
-    let parent = abs
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| {
-            CliError::Msg(format!(
-                "shadow output {} has no parent directory",
-                target.display()
-            ))
-        })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
-    let canon_parent = std::fs::canonicalize(parent)
-        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
-    if canon_parent.starts_with(interchange_root) {
-        return Err(CliError::Msg(format!(
-            "refusing to write shadow output {} inside read-only interchange {}",
-            target.display(),
-            interchange_root.display()
-        )));
-    }
-    let final_target = canon_parent.join(&file_name);
-    if final_target.starts_with(interchange_root) {
-        return Err(CliError::Msg(format!(
-            "refusing to write shadow output {} inside read-only interchange {}",
-            target.display(),
-            interchange_root.display()
-        )));
-    }
-    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to overwrite symlink {}",
-            final_target.display()
-        )));
-    }
-    Ok((canon_parent, file_name, final_target))
+/// Read-only verification that shadow output `out` resolves outside
+/// `interchange_root` without creating or mutating any filesystem entries.
+fn verify_shadow_out_target(out: &Path, interchange_root: &Path) -> Result<PathBuf, CliError> {
+    rex_wave_fs::OutsidePath::verify(out, interchange_root)
+        .map(|p| p.path().to_path_buf())
+        .map_err(|e| format_outside_shadow_err(out, interchange_root, e))
 }
 
 fn write_file_atomic_outside(
@@ -3147,96 +3047,90 @@ fn write_file_atomic_outside(
     interchange_root: &Path,
     bytes: &[u8],
 ) -> Result<(), CliError> {
-    let (canon_parent, file_name, final_target) =
-        resolve_shadow_out_target(target, interchange_root)?;
-    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let mut tmp_name = file_name;
-    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
-    let tmp = canon_parent.join(tmp_name);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", tmp.display())))?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        drop(f);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &final_target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!(
-            "rename {}: {e}",
-            final_target.display()
-        )));
-    }
-    Ok(())
+    rex_wave_fs::write_outside_atomic_confined(target, interchange_root, bytes, 0o644)
+        .map(|_| ())
+        .map_err(|e| format_outside_shadow_err(target, interchange_root, e))
 }
 
-/// Appends `bytes` to the `--watch` shadow log at `final_target` (already
-/// resolved by [`resolve_shadow_out_target`]) and syncs. Refuses a symlinked
-/// or non-regular leaf, re-checked on every append: the leaf is checked before
-/// open and the opened handle must be the same inode the path names.
-fn append_shadow_delta(final_target: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    use std::os::unix::fs::MetadataExt as _;
+struct ShadowWatchLogFile {
+    out_arg: PathBuf,
+    file: std::fs::File,
+    id: rex_wave_fs::FileId,
+}
+
+/// Appends `bytes` to the retained `--watch` shadow log handle after
+/// read-only verification that `out_arg` still resolves outside
+/// `interchange_root` to the exact same regular file `(dev, ino)` opened at
+/// startup.
+fn append_shadow_delta(
+    log: &mut ShadowWatchLogFile,
+    interchange_root: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
     assert!(!bytes.is_empty(), "callers skip empty deltas");
-    if let Ok(meta) = std::fs::symlink_metadata(final_target)
-        && !meta.file_type().is_file()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to append shadow output to non-regular file {}",
-            final_target.display()
-        )));
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(final_target)
-        .map_err(|e| CliError::Msg(format!("open {}: {e}", final_target.display())))?;
-    let opened = f
-        .metadata()
-        .map_err(|e| CliError::Msg(format!("stat {}: {e}", final_target.display())))?;
-    let named = std::fs::symlink_metadata(final_target)
-        .map_err(|e| CliError::Msg(format!("lstat {}: {e}", final_target.display())))?;
-    if !named.file_type().is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
-        return Err(CliError::Msg(format!(
-            "refusing to append shadow output: {} changed under us (symlink swap?)",
-            final_target.display()
-        )));
-    }
-    f.write_all(bytes)
-        .and_then(|()| f.sync_data())
-        .map_err(|e| CliError::Msg(format!("append {}: {e}", final_target.display())))
+    let cur_target = verify_shadow_out_target(&log.out_arg, interchange_root)?;
+    rex_wave_fs::verify_same_regular_nofollow(&cur_target, log.id).map_err(|e| {
+        CliError::Msg(format!(
+            "refusing to append shadow output to {}: {e}",
+            cur_target.display()
+        ))
+    })?;
+    log.file
+        .write_all(bytes)
+        .and_then(|()| log.file.sync_data())
+        .map_err(|e| CliError::Msg(format!("append {}: {e}", cur_target.display())))
 }
 
-/// Opens the `--watch` append log: resolves and validates `out`, then hydrates
-/// a [`ShadowWatchTracker`] from it when it already exists so a restarted
-/// watcher appends only new transitions. Returns `(final_path, tracker,
-/// needs_leading_newline)`; the last flag is set when the existing log does
-/// not end in `\n` (a torn final write that still parsed).
+/// Opens and retains the `--watch` append log handle (`O_NOFOLLOW`), hydrating
+/// a [`ShadowWatchTracker`] from any existing bytes on that exact handle so a
+/// restarted watcher appends only new transitions.
 fn open_shadow_watch_log(
     out: &Path,
     interchange_root: &Path,
-) -> Result<(PathBuf, ShadowWatchTracker, bool), CliError> {
-    let (_, _, final_target) = resolve_shadow_out_target(out, interchange_root)?;
-    let existing = match std::fs::symlink_metadata(&final_target) {
-        Ok(meta) if meta.file_type().is_file() => std::fs::read_to_string(&final_target)
-            .map_err(|e| CliError::Msg(format!("read {}: {e}", final_target.display())))?,
-        Ok(_) => {
-            return Err(CliError::Msg(format!(
-                "refusing shadow --watch output {}: not a regular file",
-                final_target.display()
-            )));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(CliError::Msg(format!(
-                "stat {}: {e}",
-                final_target.display()
-            )));
-        }
-    };
+) -> Result<(ShadowWatchLogFile, ShadowWatchTracker, bool), CliError> {
+    let (final_target, file, meta) =
+        rex_wave_fs::open_outside_rw_append_confined(out, interchange_root, 0o644).map_err(
+            |e| match e {
+                rex_wave_fs::OutsideError::Inside(_, ref root) => CliError::Msg(format!(
+                    "refusing shadow output {} inside read-only interchange {}",
+                    out.display(),
+                    root.display()
+                )),
+                rex_wave_fs::OutsideError::Symlink(_) => CliError::Msg(format!(
+                    "refusing to write shadow output through symlink {}",
+                    out.display()
+                )),
+                rex_wave_fs::OutsideError::ParentDir(_) => CliError::Msg(format!(
+                    "refusing shadow output {} containing '..' parent traversal",
+                    out.display()
+                )),
+                other => CliError::Msg(format!(
+                    "refusing shadow --watch output {}: {other}",
+                    out.display()
+                )),
+            },
+        )?;
+    let id = rex_wave_fs::file_id(&meta);
+    let reader_copy = file.try_clone().map_err(|e| {
+        CliError::Msg(format!(
+            "clone shadow --watch output handle {}: {e}",
+            final_target.display()
+        ))
+    })?;
+    let raw_bytes =
+        rex_wave_fs::read_open_bounded(&final_target, reader_copy, &meta, MAX_SHADOW_LOG_BYTES)
+            .map_err(|e| {
+                CliError::Msg(format!(
+                    "refusing shadow --watch output {}: {e}",
+                    final_target.display()
+                ))
+            })?;
+    let existing = String::from_utf8(raw_bytes).map_err(|_| {
+        CliError::Msg(format!(
+            "refusing shadow --watch output {}: not UTF-8",
+            final_target.display()
+        ))
+    })?;
     let tracker = ShadowWatchTracker::from_existing_jsonl(&existing).map_err(|e| {
         CliError::Msg(format!(
             "cannot resume shadow --watch log {}: {e}; move it aside or repair it",
@@ -3244,7 +3138,15 @@ fn open_shadow_watch_log(
         ))
     })?;
     let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
-    Ok((final_target, tracker, needs_newline))
+    Ok((
+        ShadowWatchLogFile {
+            out_arg: out.to_path_buf(),
+            file,
+            id,
+        },
+        tracker,
+        needs_newline,
+    ))
 }
 
 async fn load_live_presence_state(
@@ -3277,11 +3179,7 @@ async fn load_live_presence_state(
     let mut after = Seq::ORIGIN;
     loop {
         let page = client
-            .call(Read {
-                stream: StreamId::Presence,
-                after,
-                limit: Some(1000),
-            })
+            .call(Read::stream(StreamId::Presence, after, Some(1000)))
             .await?;
         if page.entries.is_empty() {
             break;
@@ -3314,7 +3212,9 @@ async fn execute_mail_shadow(
 ) -> Result<ExitCode, CliError> {
     let ro = ReadOnlyInterchange::open(interchange)
         .map_err(|e| CliError::Msg(format!("open read-only interchange: {e}")))?;
-    ensure_out_outside_interchange(out, ro.root())?;
+    if out != Path::new("-") {
+        verify_shadow_out_target(out, ro.root())?;
+    }
     let policy = RingPolicy::default();
     let affinity = IncarnationAffinity::new();
     let retry_state = RetryState::new();
@@ -3322,13 +3222,13 @@ async fn execute_mail_shadow(
     let to_stdout = out == Path::new("-");
     // `--watch` appends transitions (a fresh tracker for stdout); `--once`
     // keeps the atomic snapshot overwrite.
-    let mut watch_log: Option<(Option<PathBuf>, ShadowWatchTracker, bool)> =
+    let mut watch_log: Option<(Option<ShadowWatchLogFile>, ShadowWatchTracker, bool)> =
         match (watch, to_stdout) {
             (false, _) => None,
             (true, true) => Some((None, ShadowWatchTracker::new(), false)),
             (true, false) => {
-                let (path, tracker, needs_newline) = open_shadow_watch_log(out, ro.root())?;
-                Some((Some(path), tracker, needs_newline))
+                let (log_file, tracker, needs_newline) = open_shadow_watch_log(out, ro.root())?;
+                Some((Some(log_file), tracker, needs_newline))
             }
         };
 
@@ -3348,23 +3248,23 @@ async fn execute_mail_shadow(
         )
         .map_err(|e| CliError::Msg(format!("shadow pass: {e}")))?;
         let mut appended_decisions: Option<usize> = None;
-        if let Some((path, tracker, needs_newline)) = watch_log.as_mut() {
+        if let Some((log_file, tracker, needs_newline)) = watch_log.as_mut() {
             let delta = tracker
                 .observe_pass(&report.decisions, &aliases, now)
                 .map_err(|e| CliError::Msg(format!("shadow watch: {e}")))?;
             appended_decisions = Some(delta.decision_lines);
-            match path {
+            match log_file {
                 None => {
                     print!("{}", delta.jsonl);
                     let _ = std::io::stdout().flush();
                 }
-                Some(path) if !delta.jsonl.is_empty() => {
+                Some(log_file) if !delta.jsonl.is_empty() => {
                     let mut bytes = Vec::with_capacity(delta.jsonl.len() + 1);
                     if *needs_newline {
                         bytes.push(b'\n');
                     }
                     bytes.extend_from_slice(delta.jsonl.as_bytes());
-                    append_shadow_delta(path, &bytes)?;
+                    append_shadow_delta(log_file, ro.root(), &bytes)?;
                     *needs_newline = false;
                 }
                 Some(_) => {}
@@ -3425,9 +3325,9 @@ fn execute_mail_score(
     mailwatch_seen_paths: &[PathBuf],
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let shadow_text = std::fs::read_to_string(shadow_path)
+    let shadow_text = read_cli_text(shadow_path)
         .map_err(|e| CliError::Msg(format!("read shadow {}: {e}", shadow_path.display())))?;
-    let acks_text = std::fs::read_to_string(acks_path)
+    let acks_text = read_cli_text(acks_path)
         .map_err(|e| CliError::Msg(format!("read acks {}: {e}", acks_path.display())))?;
     let aliases = extract_shadow_aliases(&shadow_text).map_err(CliError::Msg)?;
     let acks_report = parse_acks_jsonl(&acks_text, &aliases);
@@ -3438,7 +3338,7 @@ fn execute_mail_score(
         Some(path) => {
             let house = load_house_profile()
                 .map_err(|e| CliError::Msg(format!("load house profile: {e}")))?;
-            let raw = std::fs::read_to_string(path)
+            let raw = read_cli_text(path)
                 .map_err(|e| CliError::Msg(format!("read fixtures {}: {e}", path.display())))?;
             Some(check_gate1_fixtures_with_profile(&raw, &house).map_err(CliError::Msg)?)
         }
@@ -3450,7 +3350,7 @@ fn execute_mail_score(
     } else {
         let mut texts = Vec::with_capacity(mailwatch_seen_paths.len());
         for path in mailwatch_seen_paths {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
+            let raw = read_cli_text(path).map_err(|e| {
                 CliError::Msg(format!("read mailwatch seen {}: {e}", path.display()))
             })?;
             texts.push((path.display().to_string(), raw));
@@ -3681,52 +3581,12 @@ async fn execute_presence_hold(
 }
 
 fn write_file_atomic_plain(target: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .ok_or_else(|| {
-            CliError::Msg(format!("target path {} has no file name", target.display()))
-        })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
-    let canon_parent = std::fs::canonicalize(parent)
-        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
-    let final_target = canon_parent.join(&file_name);
-    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to overwrite symlink {}",
-            final_target.display()
-        )));
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
     }
-    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let mut tmp_name = file_name;
-    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
-    let tmp = canon_parent.join(tmp_name);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", tmp.display())))?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        drop(f);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &final_target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!(
-            "rename {}: {e}",
-            final_target.display()
-        )));
-    }
-    Ok(())
+    rex_wave_fs::write_atomic_path(target, bytes, 0o644, false)
+        .map_err(|e| CliError::Msg(format!("write {}: {e}", target.display())))
 }
 
 async fn execute_presence_seed_interchange(
@@ -3772,7 +3632,7 @@ async fn execute_presence_seed_interchange(
 
     let cred = resolve_cli_credential(sock_path, explicit_token)?;
     let client = RemoteClient::connect(endpoint, cred, "presence-seed").await?;
-    if !matches!(client.me(), Principal::Operator { .. }) {
+    if !client.me().is_operator() {
         return Err(CliError::Api(ApiError::Denied {
             principal: client.me().to_string(),
             action: "presence seed-interchange".to_owned(),
@@ -3928,16 +3788,12 @@ async fn execute_presence_import_manifest(
     explicit_token: Option<&str>,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| CliError::Msg(format!("stat {}: {e}", path.display())))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(CliError::Msg(format!(
-            "refusing to read non-regular manifest file {}",
+    let raw = rex_wave_fs::read_regular_string(path, MAX_CLI_INPUT_BYTES).map_err(|e| {
+        CliError::Msg(format!(
+            "refusing to read manifest file {}: {e}",
             path.display()
-        )));
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| CliError::Msg(format!("read {}: {e}", path.display())))?;
+        ))
+    })?;
     let manifest: ResidentManifest = serde_json::from_str(&raw)
         .map_err(|e| CliError::Msg(format!("parse manifest {}: {e}", path.display())))?;
     if manifest.schema != RESIDENT_MANIFEST_SCHEMA {
@@ -3982,7 +3838,7 @@ async fn execute_presence_import_manifest(
 
     let cred = resolve_cli_credential(sock_path, explicit_token)?;
     let client = RemoteClient::connect(endpoint, cred, "presence-import-manifest").await?;
-    if !matches!(client.me(), Principal::Operator { .. }) {
+    if !client.me().is_operator() {
         return Err(CliError::Api(ApiError::Denied {
             principal: client.me().to_string(),
             action: "presence import-manifest".to_owned(),
@@ -4046,24 +3902,28 @@ async fn execute_remote<C: Client>(
     }
 
     let wire = to_command_for(cmd, client.me())?;
+    let read_user_cursor = match &wire {
+        WireCommand::Wait(w) => w.cursor.clone(),
+        _ => None,
+    };
     let mut reply = client.call_wire(wire).await?;
 
     if let Cmd::Read { limit, .. } = cmd
         && let WireReply::Wait(mut page) = reply
     {
         page.timed_out = false;
-        let total_count = page.entries.len();
-        if let Some(lim) = limit {
-            let cap = (*lim).clamp(1, 1000) as usize;
-            if page.entries.len() > cap {
-                page.entries.truncate(cap);
-                if let Some(last) = page.entries.last() {
-                    page.cursor = Cursor::default().with(last.stream.clone(), last.seq);
-                }
+        let cap = limit.unwrap_or(200).clamp(1, 1000) as usize;
+        if page.entries.len() > cap {
+            let total_count = page.total_count.max(page.entries.len());
+            page.entries.truncate(cap);
+            let mut retained = read_user_cursor.unwrap_or_default();
+            for env in &page.entries {
+                retained.advance(&env.stream, env.seq);
             }
+            page.cursor = retained;
+            page.total_count = total_count;
+            page.truncated = true;
         }
-        page.total_count = total_count;
-        page.truncated = page.entries.len() < total_count;
         reply = WireReply::Read(page);
     }
 

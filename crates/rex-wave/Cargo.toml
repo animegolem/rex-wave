@@ -12,6 +12,7 @@ name = "rex-wave"
 path = "src/main.rs"
 
 [dependencies]
+rex-wave-fs.workspace = true
 rex-wave-api.workspace = true
 rex-wave-store.workspace = true
 rex-wave-runtime.workspace = true

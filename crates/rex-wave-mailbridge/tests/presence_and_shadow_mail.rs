@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::mail::{LetterPriority, MailPromote};
 use rex_wave_api::presence::*;
 use rex_wave_api::room::{Body, RoomPost, RoomRef, RoomScope};
@@ -97,7 +98,7 @@ fn apply_presence_with_probe<F: Fn(u32, &str) -> bool>(
     cmd: PresenceCommand,
     probe: F,
 ) -> Result<WireReply, ApiError> {
-    let ctx = DecideCtx { by: by.clone(), at };
+    let ctx = DecideCtx::for_test(by.clone(), at);
     let events = Presence::decide_with_probe(state, &cmd, &ctx, probe)?;
     let mut committed = Vec::new();
     for ev in events {
@@ -3849,12 +3850,12 @@ fn house_profile_loader_defaults_when_absent_and_applies_custom_profile_when_pre
 
     // The decider enforces the profile's operator surface, not the default.
     let st = PresenceState::with_house_profile(house.clone());
-    let ctx = DecideCtx {
-        by: Principal::Operator {
+    let ctx = DecideCtx::for_test(
+        Principal::Operator {
             seat: seat("owner"),
         },
-        at: UnixMs(1_000),
-    };
+        UnixMs(1_000),
+    );
     let claim = |name: &str| PresenceCommand::PresenceClaim(empty_claim(name));
     assert!(matches!(
         Presence::decide(&st, &claim("bob"), &ctx),

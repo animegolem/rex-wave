@@ -22,6 +22,7 @@
 
 pub mod board;
 pub mod client;
+pub mod http_guard;
 pub mod id;
 pub mod mail;
 pub mod notify;
@@ -31,6 +32,7 @@ pub mod registry;
 pub mod room;
 pub mod stage;
 pub mod stream;
+mod time;
 pub mod wave;
 
 pub use client::{ApiError, Client, ConflictData, FrameStream};
@@ -39,10 +41,10 @@ pub use read::{ArchiveTarget, SetArchived};
 pub use registry::{
     Audience, BoardCommand, Command, Family, InboxCommand, MailCommand, PresenceCommand,
     ReadCommand, RoomCommand, Routed, TOOLS, ToolMeta, WaveCommand, WireCommand, WireReply,
-    tool_catalog,
+    authorize, tool_catalog,
 };
 pub use stage::{FocusGeneration, StageTarget};
-pub use stream::{Cursor, Envelope, Event, Frame, Interest, StreamId};
+pub use stream::{Cursor, Envelope, Event, Frame, Interest, SnapshotScope, StreamId};
 
 /// Empty success reply for commands whose only result is "it is now true".
 #[derive(
@@ -92,4 +94,95 @@ pub fn truncate_with_notice(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     s[..end].to_owned()
+}
+
+/// Parse a CLI or HTTP spelling of a unit-variant enum by its serde name
+/// (or a `#[serde(alias)]`), trimmed and case-insensitive. The error names
+/// `what` and lists the accepted spellings.
+pub fn parse_enum<T: serde::de::DeserializeOwned>(what: &str, raw: &str) -> Result<T, ApiError> {
+    use serde::de::IntoDeserializer as _;
+    let norm = raw.trim().to_ascii_lowercase();
+    let de: serde::de::value::StrDeserializer<'_, serde::de::value::Error> =
+        norm.as_str().into_deserializer();
+    T::deserialize(de).map_err(|e| {
+        ApiError::Invalid(InvalidId {
+            what: what.into(),
+            reason: e.to_string(),
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mail::LetterPriority;
+    use crate::presence::{SeatStatus, WorkClass};
+    use crate::room::TaskStatus;
+    use crate::wave::{PermissionMode, SteerDeliveryMode};
+
+    #[test]
+    fn parse_enum_accepts_every_spelling_the_cli_tables_did() {
+        for (raw, want) in [
+            ("open", TaskStatus::Open),
+            (" Claimed ", TaskStatus::Claimed),
+            ("review", TaskStatus::Review),
+            ("blocked", TaskStatus::Blocked),
+            ("DONE", TaskStatus::Done),
+            ("cancelled", TaskStatus::Cancelled),
+            ("canceled", TaskStatus::Cancelled),
+        ] {
+            assert_eq!(parse_enum::<TaskStatus>("status", raw).unwrap(), want);
+        }
+        for (raw, want) in [
+            ("active", SeatStatus::Active),
+            ("dormant", SeatStatus::Dormant),
+            ("Retired", SeatStatus::Retired),
+        ] {
+            assert_eq!(parse_enum::<SeatStatus>("status", raw).unwrap(), want);
+        }
+        for (raw, want) in [
+            ("class_a", WorkClass::ClassA),
+            ("class-a", WorkClass::ClassA),
+            ("a", WorkClass::ClassA),
+            ("class_b", WorkClass::ClassB),
+            ("class-b", WorkClass::ClassB),
+            ("B", WorkClass::ClassB),
+        ] {
+            assert_eq!(parse_enum::<WorkClass>("work_class", raw).unwrap(), want);
+        }
+        for (raw, want) in [
+            ("accept-edits", PermissionMode::AcceptEdits),
+            ("auto", PermissionMode::Auto),
+            ("full", PermissionMode::Full),
+        ] {
+            assert_eq!(
+                parse_enum::<PermissionMode>("permission", raw).unwrap(),
+                want
+            );
+        }
+        for (raw, want) in [
+            ("auto", SteerDeliveryMode::Auto),
+            ("start", SteerDeliveryMode::Start),
+            ("steer", SteerDeliveryMode::Steer),
+            ("steer-if-active", SteerDeliveryMode::SteerIfActive),
+            ("queue-if-active", SteerDeliveryMode::QueueIfActive),
+        ] {
+            assert_eq!(parse_enum::<SteerDeliveryMode>("mode", raw).unwrap(), want);
+        }
+        for (raw, want) in [
+            ("low", LetterPriority::Low),
+            ("normal", LetterPriority::Normal),
+            ("high", LetterPriority::High),
+            ("blocking", LetterPriority::Blocking),
+        ] {
+            assert_eq!(parse_enum::<LetterPriority>("priority", raw).unwrap(), want);
+        }
+        let err = parse_enum::<TaskStatus>("status", "nope").unwrap_err();
+        assert!(err.to_string().contains("open"), "{err}");
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+            "\"cancelled\"",
+            "the alias never changes the wire spelling"
+        );
+    }
 }

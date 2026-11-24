@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::mail::*;
 use rex_wave_api::notify::*;
 use rex_wave_api::presence::*;
@@ -2738,4 +2739,1439 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
     .unwrap();
     assert_eq!(reopened.state, NotifyState::Unread);
     herald_task.abort();
+}
+
+#[tokio::test]
+async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notifications_and_continues_history()
+ {
+    use rex_wave_api::room::{Mentions, PrincipalPair, RoomOrigin};
+
+    let journal = Journal::in_memory().unwrap();
+    let op_p = Principal::Operator {
+        seat: SeatName::parse("zorro").unwrap(),
+    };
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let legacy_room = RoomId::Direct {
+        pair: PrincipalPair::new(op_p.clone(), alice_p.clone()).unwrap(),
+    };
+
+    // Simulate a 3e50dc4 journal where Operator("zorro") DMed Seat("alice")
+    // (where "alice" sorts before "zorro") and Herald already raised the card.
+    {
+        let mut rw = journal
+            .claim(StreamId::Room {
+                room: legacy_room.clone(),
+            })
+            .unwrap();
+        rw.append(
+            &op_p,
+            UnixMs(1_000),
+            Some(&IdemKey::parse("legacy-1").unwrap()),
+            vec![
+                Event::Room(RoomEvent::Opened {
+                    id: legacy_room.clone(),
+                    origin: RoomOrigin::Manual,
+                    topic: None,
+                }),
+                Event::Room(RoomEvent::Posted {
+                    body: Body::parse("old instruction 1").unwrap(),
+                    mentions: Mentions::default(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: None,
+                }),
+            ],
+        )
+        .unwrap();
+    }
+
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let herald_1 = spawn_reactor(
+        Herald::new(),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let zorro_op = LocalClient::new(router.clone(), op_p.clone());
+
+    let page_1 = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let p = alice
+                .call(InboxList {
+                    include_done: true,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if p.items.len() == 1 {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    alice
+        .call(InboxAck {
+            ids: vec![page_1.items[0].id],
+            state: NotifyState::Done,
+        })
+        .await
+        .unwrap();
+    let head_before_restart = alice
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .head;
+    herald_1.abort();
+
+    // Restart Herald over the upgraded runtime: zero duplicate notifications!
+    let herald_2 = spawn_reactor(
+        Herald::new(),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::Herald,
+            },
+        ),
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let after_restart = alice
+        .call(InboxList {
+            include_done: true,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_restart.head, head_before_restart,
+        "Herald replay must raise zero duplicate notifications on pre-PR-26 operator DMs"
+    );
+    assert_eq!(after_restart.unread, 0);
+
+    // Operator posting to @alice continues the existing legacy room at seq 3 without splitting.
+    let continued = zorro_op
+        .call(RoomPost {
+            room: RoomRef::Dm {
+                with: alice_p.clone(),
+            },
+            body: Body::parse("follow-up after upgrade").unwrap(),
+            re: Some(Seq(2)),
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(continued.room, legacy_room);
+    assert_eq!(continued.seq, Seq(3));
+
+    // Paging a legacy-only DM via RoomRef::Dm + returned cursor advances cleanly [1] -> [2] -> [3],
+    // while explicit canonical RoomId / Wait return 0 entries until the canonical stream is opened.
+    let canon_room = RoomRef::Dm {
+        with: alice_p.clone(),
+    }
+    .resolve(&op_p)
+    .unwrap();
+    let dm_ref = RoomRef::Dm {
+        with: alice_p.clone(),
+    };
+    let explicit_canon_wait = zorro_op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Id {
+                        id: canon_room.clone(),
+                    },
+                },
+                Cursor::default(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        explicit_canon_wait.entries.is_empty(),
+        "explicit canonical RoomRef::Id wait must not return legacy entries"
+    );
+
+    let p1 = zorro_op
+        .call(
+            rex_wave_api::read::Read::room_ref(dm_ref.clone(), &op_p, Seq::ORIGIN, None, Some(1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p1.entries[0].seq, Seq(1));
+    assert!(!p1.cursor.lists(&StreamId::Room {
+        room: canon_room.clone()
+    }));
+    let p2 = zorro_op
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                dm_ref.clone(),
+                &op_p,
+                Seq::ORIGIN,
+                Some(p1.cursor),
+                Some(1),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p2.entries[0].seq, Seq(2));
+    let p3 = zorro_op
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                dm_ref.clone(),
+                &op_p,
+                Seq::ORIGIN,
+                Some(p2.cursor),
+                Some(1),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p3.entries[0].seq, Seq(3));
+
+    // Opening the canonical stream via explicit RoomRef::Id and resuming with p3.cursor does NOT skip canonical entries!
+    zorro_op
+        .call(RoomPost {
+            room: RoomRef::Id {
+                id: canon_room.clone(),
+            },
+            body: Body::parse("first canonical post").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let resumed_after_canon_open = zorro_op
+        .call(
+            rex_wave_api::read::Read::room_ref(dm_ref, &op_p, Seq::ORIGIN, Some(p3.cursor), None)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !resumed_after_canon_open.entries.is_empty(),
+        "legacy-stream cursor must not skip newly opened canonical DM entries"
+    );
+    herald_2.abort();
+
+    // Split DM journal: Operator retry with shared idem key returns Operator's legacy receipt, not Alice's canonical post.
+    let split_journal = Journal::in_memory().unwrap();
+    let shared_idem = IdemKey::parse("shared-retry-key").unwrap();
+    {
+        let mut w_canon = split_journal
+            .claim(StreamId::Room {
+                room: canon_room.clone(),
+            })
+            .unwrap();
+        w_canon
+            .append(
+                &alice_p,
+                UnixMs(1_000),
+                Some(&shared_idem),
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: canon_room.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice canonical #2").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: Some(shared_idem.clone()),
+                    }),
+                ],
+            )
+            .unwrap();
+        let mut w_leg = split_journal
+            .claim(StreamId::Room {
+                room: legacy_room.clone(),
+            })
+            .unwrap();
+        w_leg
+            .append(
+                &op_p,
+                UnixMs(2_000),
+                None,
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: legacy_room.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice earlier").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                ],
+            )
+            .unwrap();
+        w_leg
+            .append(
+                &op_p,
+                UnixMs(2_500),
+                Some(&shared_idem),
+                vec![Event::Room(RoomEvent::Posted {
+                    body: Body::parse("operator legacy #3").unwrap(),
+                    mentions: Mentions::default(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: Some(shared_idem.clone()),
+                })],
+            )
+            .unwrap();
+        w_leg
+            .append(
+                &alice_p,
+                UnixMs(2_600),
+                None,
+                vec![
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice legacy #4").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice legacy #5").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                ],
+            )
+            .unwrap();
+    }
+    let split_hub = Hub::new(64);
+    let split_sidebar = SidebarProjection::spawn(split_journal.clone(), split_hub.clone());
+    let split_router = Arc::new(Router {
+        room: Registry::<Rooms>::new(split_journal.clone(), split_hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(split_journal.clone(), split_hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: split_journal,
+            hub: split_hub,
+            sidebar: split_sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let split_op = LocalClient::new(split_router.clone(), op_p);
+    let retried = split_op
+        .call(RoomPost {
+            room: RoomRef::Dm {
+                with: alice_p.clone(),
+            },
+            body: Body::parse("operator legacy #3").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: Some(shared_idem.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried.room, legacy_room);
+    assert_eq!(retried.seq, Seq(3));
+
+    // Explicit canonical RoomRef::Id stays pinned to canonical stream and rejects peer's idem key.
+    let explicit_cross_author = split_op
+        .call(RoomPost {
+            room: RoomRef::Id {
+                id: canon_room.clone(),
+            },
+            body: Body::parse("explicit canonical").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: Some(shared_idem),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(explicit_cross_author, ApiError::Conflict { .. }));
+
+    // A legacy cursor at seq 3 does not skip canonical entries on a split journal.
+    let legacy_cursor = Cursor::default().with(
+        StreamId::Room {
+            room: legacy_room.clone(),
+        },
+        Seq(3),
+    );
+    let split_wait_page = split_op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Dm {
+                        with: alice_p.clone(),
+                    },
+                },
+                legacy_cursor,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(split_wait_page.entries.len(), 1);
+    assert_eq!(split_wait_page.total_count, 2);
+    assert!(split_wait_page.truncated);
+    assert_eq!(split_wait_page.entries[0].seq, Seq(1));
+
+    // Mentions wait on a split journal applies `--since` only to the server-selected canonical stream
+    // and starts the legacy DM stream at its current head (never replaying old legacy peer posts).
+    let mut split_mentions_wait = rex_wave_api::read::Wait::room_ref(
+        RoomRef::Dm {
+            with: alice_p.clone(),
+        },
+        &Principal::Operator {
+            seat: SeatName::parse("zorro").unwrap(),
+        },
+        Seq(2),
+        true,
+    )
+    .unwrap();
+    split_mentions_wait.timeout_ms = Some(0);
+    let split_mentions_page = split_op.call(split_mentions_wait).await.unwrap();
+    assert!(
+        split_mentions_page.entries.is_empty(),
+        "mentions wait at canonical head must not replay legacy DM history"
+    );
+
+    // Live cursor (`from_head: true`) omitting target stream starts at head on `Read` (matching `Wait`).
+    let live_read = split_op
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                RoomRef::Dm { with: alice_p },
+                &Principal::Operator {
+                    seat: SeatName::parse("zorro").unwrap(),
+                },
+                Seq::ORIGIN,
+                Some(Cursor::live()),
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(live_read.entries.is_empty());
+    assert_eq!(
+        live_read.cursor.at(&StreamId::Room { room: canon_room }),
+        Seq(2)
+    );
+}
+
+#[tokio::test]
+async fn capped_multi_stream_wait_advances_cursor_without_looping() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let op = LocalClient::new(
+        router,
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+
+    let first_ref = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("first").unwrap(),
+    };
+    let second_ref = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("second").unwrap(),
+    };
+    let first_stream = StreamId::Room {
+        room: first_ref.resolve(op.me()).unwrap(),
+    };
+    let second_stream = StreamId::Room {
+        room: second_ref.resolve(op.me()).unwrap(),
+    };
+
+    for (room, text) in [
+        (&first_ref, "first-1"),
+        (&first_ref, "first-2"),
+        (&second_ref, "second-1"),
+        (&second_ref, "second-2"),
+    ] {
+        op.call(RoomPost {
+            room: room.clone(),
+            body: Body::parse(text).unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let mut cursor = Cursor::default();
+    let mut delivered = Vec::new();
+    for _ in 0..8 {
+        let page = op
+            .call(rex_wave_api::read::Wait {
+                timeout_ms: Some(0),
+                limit: Some(1),
+                ..rex_wave_api::read::Wait::new(
+                    Interest::Streams {
+                        streams: vec![first_stream.clone(), second_stream.clone()],
+                    },
+                    cursor,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let env = &page.entries[0];
+        delivered.push((env.stream.clone(), env.seq));
+        cursor = page.cursor;
+    }
+
+    assert_eq!(
+        delivered,
+        vec![
+            (first_stream.clone(), Seq(1)),
+            (first_stream.clone(), Seq(2)),
+            (first_stream.clone(), Seq(3)),
+            (first_stream.clone(), Seq(4)),
+            (second_stream.clone(), Seq(1)),
+            (second_stream.clone(), Seq(2)),
+            (second_stream.clone(), Seq(3)),
+            (second_stream.clone(), Seq(4)),
+        ]
+    );
+
+    let done = op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![first_stream.clone(), second_stream.clone()],
+                },
+                cursor,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(done.entries.is_empty());
+    assert!(done.timed_out);
+
+    // Unlisted `from_head` stream preserves its subscription-time head (`4`) across truncated
+    // pages so a post arriving between pages (`Seq(5)`) is never skipped.
+    let live_p1 = op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![first_stream.clone(), second_stream.clone()],
+                },
+                Cursor::live().with(first_stream.clone(), Seq::ORIGIN),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(live_p1.entries.len(), 1);
+    assert!(live_p1.truncated);
+    assert_eq!(live_p1.entries[0].stream, first_stream);
+    assert_eq!(live_p1.entries[0].seq, Seq(1));
+
+    op.call(RoomPost {
+        room: second_ref,
+        body: Body::parse("second-between-pages").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    let mut live_cursor = live_p1.cursor;
+    let mut live_rest = Vec::new();
+    for _ in 0..4 {
+        let page = op
+            .call(rex_wave_api::read::Wait {
+                timeout_ms: Some(0),
+                limit: Some(1),
+                ..rex_wave_api::read::Wait::new(
+                    Interest::Streams {
+                        streams: vec![first_stream.clone(), second_stream.clone()],
+                    },
+                    live_cursor,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        live_rest.push((page.entries[0].stream.clone(), page.entries[0].seq));
+        live_cursor = page.cursor;
+    }
+    assert_eq!(
+        live_rest,
+        vec![
+            (first_stream, Seq(2)),
+            (first_stream_clone(&live_rest[0].0), Seq(3)),
+            (first_stream_clone(&live_rest[0].0), Seq(4)),
+            (second_stream, Seq(5)),
+        ]
+    );
+}
+
+fn first_stream_clone(s: &StreamId) -> StreamId {
+    s.clone()
+}
+
+#[tokio::test]
+async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_since() {
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<TestWaves>::new(journal.clone(), hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let bob_p = Principal::Seat {
+        seat: SeatName::parse("bob").unwrap(),
+    };
+    let carol_p = Principal::Seat {
+        seat: SeatName::parse("carol").unwrap(),
+    };
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let bob = LocalClient::new(router.clone(), bob_p.clone());
+    let op = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+
+    bob.call(RoomPost {
+        room: RoomRef::Dm {
+            with: carol_p.clone(),
+        },
+        body: Body::parse("secret bob-carol dm").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    let general = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    };
+    alice
+        .call(RoomJoin {
+            room: general.clone(),
+            member: None,
+            handle: None,
+        })
+        .await
+        .unwrap();
+    bob.call(RoomPost {
+        room: general.clone(),
+        body: Body::parse("hi @alice #1").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+    bob.call(RoomPost {
+        room: general.clone(),
+        body: Body::parse("hi @alice #2").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    // Seed a legacy `(Operator("owner"), Seat("bob"))` DM and verify `alice` supplying
+    // `Direct(Seat("bob"), Seat("owner"))` in `Wait.after` cannot probe or retain it.
+    let legacy_owner_bob = RoomId::Direct {
+        pair: PrincipalPair::new(
+            Principal::Operator {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+            bob_p.clone(),
+        )
+        .unwrap(),
+    };
+    {
+        let mut w_ob = router
+            .read
+            .journal
+            .claim(StreamId::Room {
+                room: legacy_owner_bob.clone(),
+            })
+            .unwrap();
+        w_ob.append(
+            op.me(),
+            UnixMs(900),
+            None,
+            vec![Event::Room(RoomEvent::Opened {
+                id: legacy_owner_bob,
+                origin: RoomOrigin::Manual,
+                topic: None,
+            })],
+        )
+        .unwrap();
+    }
+    let canon_owner_bob = RoomId::Direct {
+        pair: PrincipalPair::new(
+            Principal::Seat {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+            bob_p.clone(),
+        )
+        .unwrap(),
+    };
+
+    let p1 = alice
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            limit: Some(1),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Mentions,
+                Cursor::live()
+                    .with(
+                        StreamId::Room {
+                            room: general.resolve(&alice_p).unwrap(),
+                        },
+                        Seq::ORIGIN,
+                    )
+                    .with(
+                        StreamId::Room {
+                            room: canon_owner_bob,
+                        },
+                        Seq::ORIGIN,
+                    ),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1.entries.len(), 1);
+    assert_eq!(p1.cursor.snapshot(), Some(&SnapshotScope::Mentions));
+    assert!(!p1.cursor.from_head());
+    let cursor_json = serde_json::to_string(&p1.cursor).unwrap();
+    assert!(
+        !cursor_json.contains("carol") && !cursor_json.contains("bob"),
+        "wait cursor must never disclose unrelated private or legacy DM streams: {cursor_json}"
+    );
+
+    // A one-room live wait cursor leaves `snapshot: None` so broadening to Mentions starts
+    // other rooms at their current heads instead of replaying old DM posts.
+    let one_room_wait = alice
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: general.clone(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(one_room_wait.cursor.snapshot(), None);
+    assert!(!one_room_wait.cursor.from_head());
+
+    let wave_slug = WaveSlug::parse("w-park").unwrap();
+    let role_name = RoleName::parse("coder").unwrap();
+    op.call(WaveStart {
+        spec: WaveSpec {
+            slug: wave_slug.clone(),
+            project: BbProjectId::parse("proj_park").unwrap(),
+            goal: Body::parse("check parked since").unwrap(),
+            defaults: AgentSpec {
+                provider: ProviderId::parse("claude").unwrap(),
+                model: Some(ModelId::parse("sonnet").unwrap()),
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::AcceptEdits,
+                workspace: Workspace::ProjectDefault,
+            },
+            workers: vec![WorkerSpec {
+                role: role_name.clone(),
+                agent: None,
+                brief: Body::parse("wait test").unwrap(),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            }],
+            output_dir: None,
+        },
+        idem: None,
+    })
+    .await
+    .unwrap();
+    let worker_p = Principal::Worker {
+        wave: wave_slug.clone(),
+        role: role_name.clone(),
+    };
+    let sys = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::BbBridge,
+        },
+    );
+    sys.call(WaveObserve {
+        wave: wave_slug.clone(),
+        role: role_name.clone(),
+        observation: Observation::Spawned {
+            attempt: 1,
+            thread: BbThreadId::parse("th_park").unwrap(),
+        },
+    })
+    .await
+    .unwrap();
+    let worker = LocalClient::new(router.clone(), worker_p.clone());
+
+    let general_id = general.resolve(&worker_p).unwrap();
+    let w_live = rex_wave_api::read::Wait {
+        timeout_ms: Some(200),
+        ..rex_wave_api::read::Wait::new(
+            Interest::Room {
+                room: general.clone(),
+            },
+            Cursor::live(),
+        )
+    };
+    let worker_live = worker.clone();
+    let wait_handle = tokio::spawn(async move { worker_live.call(w_live).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let snap = op
+        .call(WaveView {
+            wave: wave_slug.clone(),
+        })
+        .await
+        .unwrap();
+    let (_, _, phase) = &snap.workers[0];
+    let _ = wait_handle.await.unwrap();
+    assert!(
+        matches!(
+            phase,
+            WorkerPhase::Live {
+                activity: Activity::Parked {
+                    room: Some(r),
+                    since: Seq(5),
+                },
+                ..
+            } if r == &general_id
+        ),
+        "live worker Wait must record subscription head Seq(5) in Activity::Parked, got {phase:?}"
+    );
+
+    // Denied worker wait on a private DM fails before emitting any `Activity::Parked` wave event.
+    let wave_head_before = router
+        .read
+        .journal
+        .head(&StreamId::Wave {
+            wave: wave_slug.clone(),
+        })
+        .unwrap();
+    let secret_dm = RoomId::Direct {
+        pair: PrincipalPair::new(bob_p, carol_p).unwrap(),
+    };
+    let denied_wait = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(200),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Id { id: secret_dm },
+                },
+                Cursor::live(),
+            )
+        })
+        .await;
+    assert!(matches!(denied_wait, Err(ApiError::Denied { .. })));
+    let wave_head_after = router
+        .read
+        .journal
+        .head(&StreamId::Wave { wave: wave_slug })
+        .unwrap();
+    assert_eq!(
+        wave_head_after, wave_head_before,
+        "denied worker wait must not publish private DM head to wave journal"
+    );
+
+    // Project wait cursor uses the same scoped start rule for plain `Read` as for `Wait`.
+    let proj_wait = alice
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_park").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    let global_read = alice
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                general,
+                &alice_p,
+                Seq::ORIGIN,
+                Some(proj_wait.cursor.clone()),
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        global_read.entries.is_empty(),
+        "plain Read with project cursor must start unlisted global room at head"
+    );
+
+    let new_proj_room = RoomRef::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("proj_park").unwrap(),
+        },
+        name: ChannelName::parse("alerts").unwrap(),
+    };
+    bob.call(RoomPost {
+        room: new_proj_room.clone(),
+        body: Body::parse("alert in new project room").unwrap(),
+        re: None,
+        after: None,
+        labels: Vec::new(),
+        task: None,
+        idem: None,
+    })
+    .await
+    .unwrap();
+    let proj_room_read = alice
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                new_proj_room,
+                &alice_p,
+                Seq::ORIGIN,
+                Some(proj_wait.cursor),
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !proj_room_read.entries.is_empty(),
+        "plain Read with project cursor must start newly created project room at origin"
+    );
+
+    // Post committed while `WaveObserve(Parked)` is still in flight must be delivered, not skipped.
+    struct PostDuringParkWave {
+        inner: Arc<dyn rex_wave_runtime::Service<rex_wave_api::WaveCommand>>,
+        poster: LocalClient,
+        room: RoomId,
+    }
+    impl rex_wave_runtime::Service<rex_wave_api::WaveCommand> for PostDuringParkWave {
+        fn dispatch(
+            &self,
+            cmd: rex_wave_api::WaveCommand,
+            ctx: rex_wave_runtime::DecideCtx,
+        ) -> rex_wave_runtime::BoxFut<'_, Result<WireReply, ApiError>> {
+            let is_park = matches!(
+                &cmd,
+                rex_wave_api::WaveCommand::WaveObserve(WaveObserve {
+                    observation: Observation::Activity {
+                        activity: Activity::Parked { .. },
+                    },
+                    ..
+                })
+            );
+            Box::pin(async move {
+                let res = self.inner.dispatch(cmd, ctx).await;
+                if is_park {
+                    self.poster
+                        .call(RoomPost {
+                            room: RoomRef::Id {
+                                id: self.room.clone(),
+                            },
+                            body: Body::parse("arrived during Parked observe").unwrap(),
+                            re: None,
+                            after: None,
+                            labels: Vec::new(),
+                            task: None,
+                            idem: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                res
+            })
+        }
+    }
+
+    let race_router = Arc::new(Router {
+        room: router.room.clone(),
+        wave: Arc::new(PostDuringParkWave {
+            inner: router.wave.clone(),
+            poster: alice.clone(),
+            room: general_id.clone(),
+        }),
+        board: router.board.clone(),
+        inbox: router.inbox.clone(),
+        mail: router.mail.clone(),
+        presence: router.presence.clone(),
+        read: router.read.clone(),
+    });
+    let race_worker = LocalClient::new(race_router.clone(), worker_p.clone());
+    let race_page = race_worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(150),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: RoomRef::Id { id: general_id },
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        !race_page.timed_out && race_page.entries.len() == 1,
+        "worker Wait must deliver post committed while WaveObserve(Parked) was in flight, got {race_page:?}"
+    );
+
+    // Worker waiting on its own wave or project must NOT wake on its own Parked/Working bookkeeping.
+    let self_wave_slug = WaveSlug::parse("w-park").unwrap();
+    let self_wave_wait_1 = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(60),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![StreamId::Wave {
+                        wave: self_wave_slug.clone(),
+                    }],
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        self_wave_wait_1.timed_out && self_wave_wait_1.entries.is_empty(),
+        "live worker wait on own wave must not wake on its own Parked event: {self_wave_wait_1:?}"
+    );
+
+    let self_wave_wait_2 = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(60),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![StreamId::Wave {
+                        wave: self_wave_slug,
+                    }],
+                },
+                self_wave_wait_1.cursor,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        self_wave_wait_2.timed_out && self_wave_wait_2.entries.is_empty(),
+        "resuming worker wait from previous timeout cursor must not wake on Working/Parked bookkeeping: {self_wave_wait_2:?}"
+    );
+
+    let self_proj_wait = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(60),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_park").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        self_proj_wait.timed_out && self_proj_wait.entries.is_empty(),
+        "live worker wait on own project must not wake on its own Parked event: {self_proj_wait:?}"
+    );
+
+    // Project wait with intervening project-room post during Parked delivers ONLY the room post.
+    let proj_room_id = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("proj_park").unwrap(),
+        },
+        name: ChannelName::parse("alerts").unwrap(),
+    };
+    let proj_race_router = Arc::new(Router {
+        room: router.room.clone(),
+        wave: Arc::new(PostDuringParkWave {
+            inner: router.wave.clone(),
+            poster: alice.clone(),
+            room: proj_room_id,
+        }),
+        board: router.board.clone(),
+        inbox: router.inbox.clone(),
+        mail: router.mail.clone(),
+        presence: router.presence.clone(),
+        read: router.read.clone(),
+    });
+    let proj_race_worker = LocalClient::new(proj_race_router, worker_p);
+    let proj_race_page = proj_race_worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(150),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_park").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        !proj_race_page.timed_out
+            && !proj_race_page.entries.is_empty()
+            && proj_race_page
+                .entries
+                .iter()
+                .all(|e| matches!(e.stream, StreamId::Room { .. })),
+        "project worker wait must deliver intervening room post without Parked bookkeeping: {proj_race_page:?}"
+    );
+
+    // Project-scoped single-wave Read inspects that wave's header directly (unaffected by
+    // unrelated unrecognized stream rows) and propagates errors if that wave's header is corrupt.
+    let tmp = tempfile::Builder::new()
+        .prefix("rw_proj_wave_")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let db_path = tmp.path().join("journal.sqlite3");
+    let disk_journal = Journal::open(&db_path).unwrap();
+    let disk_hub = Hub::new(64);
+    let disk_sidebar = SidebarProjection::spawn(disk_journal.clone(), disk_hub.clone());
+    let disk_router = Arc::new(Router {
+        room: Registry::<Rooms>::new(disk_journal.clone(), disk_hub.clone()),
+        wave: Registry::<TestWaves>::new(disk_journal.clone(), disk_hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: disk_journal.clone(),
+            hub: disk_hub,
+            sidebar: disk_sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let disk_op = LocalClient::new(
+        disk_router,
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let saved_proj = disk_op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_disk").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap()
+        .cursor;
+    let w_disk = WaveSlug::parse("w-disk").unwrap();
+    disk_op
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_disk.clone(),
+                project: BbProjectId::parse("proj_disk").unwrap(),
+                goal: Body::parse("disk wave").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                workers: vec![WorkerSpec {
+                    role: RoleName::parse("coder").unwrap(),
+                    agent: None,
+                    brief: Body::parse("check").unwrap(),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+                output_dir: None,
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+    raw_conn
+        .execute(
+            "INSERT INTO entries(stream, seq, at, by, idem, batch, event) VALUES (?1, 1, 1, '\"operator\"', NULL, 1, '{}')",
+            ["{\"stream\":\"future_unknown\"}"],
+        )
+        .unwrap();
+    assert!(
+        disk_journal.streams().is_err(),
+        "unrecognized stream row makes full stream listing fail"
+    );
+
+    let mut wave_read = rex_wave_api::read::Read::stream(
+        StreamId::Wave {
+            wave: w_disk.clone(),
+        },
+        Seq::ORIGIN,
+        None,
+    );
+    wave_read.cursor = Some(saved_proj.clone());
+    let ok_page = disk_op.call(wave_read.clone()).await.unwrap();
+    assert_eq!(
+        ok_page.entries.len(),
+        2,
+        "single-wave project Read must still return all wave entries despite unrelated unknown stream"
+    );
+
+    raw_conn
+        .execute(
+            "UPDATE entries SET event = '{corrupt' WHERE seq = 1 AND stream LIKE '%w-disk%'",
+            [],
+        )
+        .unwrap();
+    let err_res = disk_op.call(wave_read).await;
+    assert!(
+        err_res.is_err(),
+        "corrupt wave header must return an error instead of advancing cursor over skipped history"
+    );
+
+    // Filtered room Wait (`RoomFiltered`, used by CLI `read --re`) on a healthy project room
+    // must NOT fail when an unrelated wave has a corrupt header or an unknown stream exists.
+    let disk_proj_room = RoomRef::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("proj_disk").unwrap(),
+        },
+        name: ChannelName::parse("ops").unwrap(),
+    };
+    let root_post = disk_op
+        .call(RoomPost {
+            room: disk_proj_room.clone(),
+            body: Body::parse("root thread msg").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    disk_op
+        .call(RoomPost {
+            room: disk_proj_room.clone(),
+            body: Body::parse("thread reply msg").unwrap(),
+            re: Some(root_post.seq),
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let mut filtered_wait = rex_wave_api::read::Wait::room_ref_filtered(
+        disk_proj_room,
+        disk_op.me(),
+        Seq::ORIGIN,
+        Some(root_post.seq),
+        Vec::new(),
+    )
+    .unwrap();
+    filtered_wait.cursor = Some(saved_proj);
+    filtered_wait.since = None;
+    filtered_wait.timeout_ms = Some(0);
+    let filtered_page = disk_op
+        .call(filtered_wait)
+        .await
+        .expect("RoomFiltered wait must succeed despite corrupt unrelated wave and unknown stream");
+    assert_eq!(filtered_page.entries.len(), 2);
+
+    // Concurrent OS-thread writer advancing `#aaa` strictly before `#zzz` must never yield a
+    // live multi-stream exact-wait cursor where `#zzz` is ahead of `#aaa`.
+    let aaa = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("aaa").unwrap(),
+    };
+    let zzz = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("zzz").unwrap(),
+    };
+    let s_aaa = StreamId::Room { room: aaa.clone() };
+    let s_zzz = StreamId::Room { room: zzz.clone() };
+    let writer_journal = Journal::open(&db_path).unwrap();
+    let mut w_aaa = writer_journal.claim(s_aaa.clone()).unwrap();
+    let mut w_zzz = writer_journal.claim(s_zzz.clone()).unwrap();
+    w_aaa
+        .append(
+            disk_op.me(),
+            UnixMs(1),
+            None,
+            vec![Event::Room(RoomEvent::Opened {
+                id: aaa,
+                origin: RoomOrigin::Manual,
+                topic: None,
+            })],
+        )
+        .unwrap();
+    w_zzz
+        .append(
+            disk_op.me(),
+            UnixMs(1),
+            None,
+            vec![Event::Room(RoomEvent::Opened {
+                id: zzz,
+                origin: RoomOrigin::Manual,
+                topic: None,
+            })],
+        )
+        .unwrap();
+    let writer_me = disk_op.me().clone();
+    let writer_thread = std::thread::spawn(move || {
+        for i in 0..120u64 {
+            let ev = vec![Event::Room(RoomEvent::Posted {
+                body: Body::parse(format!("m{i}")).unwrap(),
+                mentions: rex_wave_api::room::Mentions::default(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: None,
+            })];
+            w_aaa
+                .append(&writer_me, UnixMs(10 + i), None, ev.clone())
+                .unwrap();
+            std::thread::yield_now();
+            w_zzz.append(&writer_me, UnixMs(10 + i), None, ev).unwrap();
+        }
+    });
+    for _ in 0..120 {
+        let p = disk_op
+            .call(rex_wave_api::read::Wait {
+                timeout_ms: Some(0),
+                ..rex_wave_api::read::Wait::new(
+                    Interest::Streams {
+                        streams: vec![s_aaa.clone(), s_zzz.clone()],
+                    },
+                    Cursor::live(),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            p.cursor.at(&s_aaa) >= p.cursor.at(&s_zzz),
+            "multi-stream exact wait cursor violated snapshot order: {:?}",
+            p.cursor
+        );
+        tokio::task::yield_now().await;
+    }
+    writer_thread.join().unwrap();
 }

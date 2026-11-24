@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/rex-kanban",
     "crates/rex-wave-api",
+    "crates/rex-wave-fs",
     "crates/rex-wave-store",
     "crates/rex-wave-runtime",
     "crates/rex-wave-rooms",
@@ -43,9 +44,12 @@ rquickjs = { version = "0.14.0", default-features = false, features = ["futures"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+libc = "0.2.191"
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
 
 rex-kanban = { path = "crates/rex-kanban" }
 rex-wave-api = { path = "crates/rex-wave-api" }
+rex-wave-fs = { path = "crates/rex-wave-fs" }
 rex-wave-store = { path = "crates/rex-wave-store" }
 rex-wave-runtime = { path = "crates/rex-wave-runtime" }
 rex-wave-rooms = { path = "crates/rex-wave-rooms" }

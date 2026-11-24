@@ -10,7 +10,7 @@ use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, LocalClient, Reactor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
     let name =
@@ -99,34 +99,12 @@ fn bounded_body(raw: String) -> Body {
 /// Normalize a wave/worker-owned lexical path (`output_dir` or `writes` entry).
 /// Rejects empty paths, `"."`-only paths, and any `..` parent traversal.
 pub fn normalize_owned_path(path: &Path, what: &str) -> Result<PathBuf, ApiError> {
-    if path.as_os_str().is_empty() {
-        return Err(ApiError::Invalid(InvalidId {
+    rex_wave_fs::normalize_no_parent(path).map_err(|e| {
+        ApiError::Invalid(InvalidId {
             what: what.into(),
-            reason: "path must not be empty".into(),
-        }));
-    }
-    let mut normalized = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::ParentDir => {
-                return Err(ApiError::Invalid(InvalidId {
-                    what: what.into(),
-                    reason: format!("path '{}' must not contain '..'", path.display()),
-                }));
-            }
-            Component::CurDir => {}
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                normalized.push(comp.as_os_str());
-            }
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return Err(ApiError::Invalid(InvalidId {
-            what: what.into(),
-            reason: format!("path '{}' must not be empty or '.'", path.display()),
-        }));
-    }
-    Ok(normalized)
+            reason: e.to_string(),
+        })
+    })
 }
 
 /// Resolve a worker's effective output directory: explicit `worker_output_dir`
@@ -253,9 +231,7 @@ impl WaveState {
         who: &Principal,
         action: &str,
     ) -> Result<(), ApiError> {
-        if matches!(who, Principal::Operator { .. } | Principal::System { .. })
-            || self.is_live_member(wave, who)
-        {
+        if who.is_operator_or_system() || self.is_live_member(wave, who) {
             Ok(())
         } else {
             Err(ApiError::Denied {
@@ -299,12 +275,6 @@ impl Decider for Waves {
     ) -> Result<Vec<WaveEvent>, ApiError> {
         match cmd {
             WaveCommand::WaveStart(c) => {
-                if !matches!(ctx.by, Principal::Operator { .. }) {
-                    return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
-                        action: "start wave".into(),
-                    });
-                }
                 if let Some(base) = c.spec.output_dir.as_deref() {
                     normalize_owned_path(base, "wave output_dir")?;
                 }
@@ -369,7 +339,7 @@ impl Decider for Waves {
             }
             WaveCommand::WaveAddWorker(c) => {
                 let spec = state.require_started(&c.wave)?;
-                state.authorize_wave_mutation(&c.wave, &ctx.by, "add worker")?;
+                state.authorize_wave_mutation(&c.wave, ctx.by(), "add worker")?;
                 if !matches!(state.status, Some(WaveStatus::Running)) {
                     return Err(ApiError::conflict(format!(
                         "wave {} is already finished",
@@ -400,12 +370,12 @@ impl Decider for Waves {
                     .agent
                     .clone()
                     .unwrap_or_else(|| spec.defaults.clone());
-                if matches!(ctx.by, Principal::Worker { .. })
+                if matches!(ctx.by(), Principal::Worker { .. })
                     && let Some(req_acct) = agent.account.as_deref()
                     && Some(req_acct) != spec.defaults.account.as_deref()
                 {
                     return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
+                        principal: ctx.by().to_string(),
                         action: format!("override wave paying account in wave {}", c.wave),
                     });
                 }
@@ -424,7 +394,7 @@ impl Decider for Waves {
             }
             WaveCommand::WaveRetireWorker(c) => {
                 state.require_started(&c.wave)?;
-                state.authorize_wave_mutation(&c.wave, &ctx.by, "retire worker")?;
+                state.authorize_wave_mutation(&c.wave, ctx.by(), "retire worker")?;
                 let rec = state
                     .workers
                     .get(&c.role)
@@ -447,11 +417,11 @@ impl Decider for Waves {
                 state.require_started(&c.wave)?;
                 if let Principal::Worker {
                     wave: caller_wave, ..
-                } = &ctx.by
-                    && (caller_wave != &c.wave || !state.is_live_member(&c.wave, &ctx.by))
+                } = ctx.by()
+                    && (caller_wave != &c.wave || !state.is_live_member(&c.wave, ctx.by()))
                 {
                     return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
+                        principal: ctx.by().to_string(),
                         action: format!("steer worker in wave {}", c.wave),
                     });
                 }
@@ -474,12 +444,6 @@ impl Decider for Waves {
                 }])
             }
             WaveCommand::WaveResolve(c) => {
-                if !matches!(ctx.by, Principal::Operator { .. }) {
-                    return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
-                        action: "resolve interaction".into(),
-                    });
-                }
                 state.require_started(&c.wave)?;
                 let rec = state
                     .workers
@@ -523,7 +487,7 @@ impl Decider for Waves {
             }
             WaveCommand::WaveFinish(c) => {
                 state.require_started(&c.wave)?;
-                state.authorize_wave_mutation(&c.wave, &ctx.by, "finish wave")?;
+                state.authorize_wave_mutation(&c.wave, ctx.by(), "finish wave")?;
                 if let Some(WaveStatus::Finished { outcome }) = &state.status {
                     if outcome == &c.outcome {
                         return Ok(vec![]);
@@ -533,9 +497,9 @@ impl Decider for Waves {
                         c.wave
                     )));
                 }
-                if c.allow_incomplete && !matches!(ctx.by, Principal::Operator { .. }) {
+                if c.allow_incomplete && !ctx.by().is_operator() {
                     return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
+                        principal: ctx.by().to_string(),
                         action: format!("override incomplete finish gate in wave {}", c.wave),
                     });
                 }
@@ -557,7 +521,7 @@ impl Decider for Waves {
                         if !errored.is_empty() {
                             parts.push(format!("errored: {}", errored.join(", ")));
                         }
-                        let override_hint = if matches!(ctx.by, Principal::Operator { .. }) {
+                        let override_hint = if ctx.by().is_operator() {
                             "pass --allow-incomplete to override"
                         } else {
                             "an operator must pass --allow-incomplete to override"
@@ -586,9 +550,9 @@ impl Decider for Waves {
                 Ok(events)
             }
             WaveCommand::WaveObserve(c) => {
-                if !matches!(ctx.by, Principal::System { .. }) {
+                if !matches!(ctx.by(), Principal::System { .. }) {
                     return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
+                        principal: ctx.by().to_string(),
                         action: "observe worker".into(),
                     });
                 }
@@ -1643,10 +1607,7 @@ mod tests {
         by: Principal,
         cmd: WaveCommand,
     ) -> Result<(Vec<Envelope>, WireReply), ApiError> {
-        let ctx = DecideCtx {
-            by: by.clone(),
-            at: UnixMs(1_000),
-        };
+        let ctx = DecideCtx::for_test(by.clone(), UnixMs(1_000));
         let stream = Waves::address(&cmd, &ctx)?;
         let events = Waves::decide(state, &cmd, &ctx)?;
         let mut committed = Vec::new();
@@ -1654,7 +1615,7 @@ mod tests {
             *seq += 1;
             let meta = EntryMeta {
                 seq: Seq(*seq),
-                at: ctx.at,
+                at: ctx.at(),
                 by: by.clone(),
             };
             Waves::evolve(state, &ev, &meta);
@@ -2237,10 +2198,7 @@ mod tests {
                 let mut g = bus.lock().unwrap();
                 match cmd.route() {
                     Routed::Wave(wc) => {
-                        let ctx = DecideCtx {
-                            by: me.clone(),
-                            at: UnixMs(100),
-                        };
+                        let ctx = DecideCtx::for_test(me.clone(), UnixMs(100));
                         let stream = Waves::address(&wc, &ctx)?;
                         let StreamId::Wave { wave } = &stream else {
                             unreachable!()
@@ -3207,7 +3165,7 @@ mod tests {
             Some("auth-v2:author:attempt-1:at-1000")
         );
 
-        // S2: a racing Activity::Errored must never overwrite Activity::Refused on the same attempt.
+        // A racing Activity::Errored must never overwrite Activity::Refused on the same attempt.
         let (dup_evs, _) = apply_cmd(
             &mut state,
             &mut seq,
@@ -3228,7 +3186,7 @@ mod tests {
             "Errored must not overwrite Refused on the same live attempt"
         );
 
-        // S5: a Live worker cannot bypass allow_incomplete or override paying account.
+        // A Live worker cannot bypass allow_incomplete or override paying account.
         let worker_caller = Principal::Worker {
             wave: spec.slug.clone(),
             role: verifier.clone(),
@@ -3511,12 +3469,12 @@ mod tests {
                 .as_str()
                 .contains("output_dir: runs/auth-v2/author (relative to workspace root)")
         );
-        // S14: return_schema appears after Assignment so a large schema never clips the brief.
+        // Return_schema appears after Assignment so a large schema never clips the brief.
         let assign_pos = author_req.prompt.as_str().find("Assignment:").unwrap();
         let schema_pos = author_req.prompt.as_str().find("return_schema:").unwrap();
         assert!(schema_pos > assign_pos);
 
-        // S3: unreachable check_live during reconcile must not fail or leave reconcile dirty.
+        // Unreachable check_live during reconcile must not fail or leave reconcile dirty.
         *host.unreachable_check_live.lock().unwrap() = true;
         let mut offline_restarted = WaveConductor::new(host.clone());
         let history = bus.lock().unwrap().history.clone();
@@ -3580,7 +3538,7 @@ mod tests {
             "reconcile must surface missing host thread instead of fake Live/Working: {author_phase:?}"
         );
 
-        // Lesson 4: doorbell_text marks truncation explicitly instead of silently clipping.
+        // Doorbell_text marks truncation explicitly instead of silently clipping.
         let huge = Body::parse("a".repeat(64 * 1024)).unwrap();
         let room = RoomId::Channel {
             scope: RoomScope::Global,

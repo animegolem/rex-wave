@@ -16,10 +16,84 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Read {
     pub stream: StreamId,
+    /// Optional room reference (`#channel`, `@seat`); when present, resolved
+    /// server-side (`RoomRef::Dm` falls back to an existing pre-PR-26
+    /// `(Operator, peer)` stream when canonical `head == 0`, while
+    /// `RoomRef::Id` stays pinned to its exact stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomRef>,
+    /// Sequence to read after when `cursor` is omitted (also populated as a
+    /// single-stream fallback for older daemons when `cursor` is set).
     #[serde(default)]
     pub after: Seq,
+    /// Optional resume cursor; when present, takes precedence over `after` and
+    /// resolves against the server-selected stream (`from_head` starts unlisted
+    /// streams at `head`, otherwise `Seq::ORIGIN`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Cursor>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Legacy pre-PR-26 `(Operator, peer)` DM stream when `me` is an operator
+/// addressing `@peer` (`RoomRef::Dm`). Populated alongside canonical DM wire
+/// fields so a newer CLI stays compatible with an older daemon during a
+/// rolling upgrade.
+pub fn legacy_operator_dm_stream(
+    room: &RoomRef,
+    me: &Principal,
+) -> Result<Option<StreamId>, crate::id::InvalidId> {
+    match (room, me) {
+        (RoomRef::Dm { with }, Principal::Operator { .. }) => {
+            let peer = with.as_dm_member();
+            if me.same_actor(&peer) {
+                Ok(None)
+            } else {
+                Ok(Some(StreamId::Room {
+                    room: RoomId::Direct {
+                        pair: crate::room::PrincipalPair::new(me.clone(), peer)?,
+                    },
+                }))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+impl Read {
+    pub fn stream(stream: StreamId, after: Seq, limit: Option<u32>) -> Self {
+        Read {
+            stream,
+            room: None,
+            after,
+            cursor: None,
+            limit,
+        }
+    }
+
+    pub fn room_ref(
+        room: RoomRef,
+        viewer: &Principal,
+        after: Seq,
+        cursor: Option<Cursor>,
+        limit: Option<u32>,
+    ) -> Result<Self, crate::id::InvalidId> {
+        let canon_stream = StreamId::Room {
+            room: room.resolve(viewer)?,
+        };
+        let fallback_stream = legacy_operator_dm_stream(&room, viewer)?.unwrap_or(canon_stream);
+        let wire_after = match &cursor {
+            Some(c) => c.at(&fallback_stream),
+            None => after,
+        };
+        Ok(Read {
+            stream: fallback_stream,
+            room: Some(room),
+            after: wire_after,
+            cursor,
+            limit,
+        })
+    }
 }
 
 /// `channel_wait`. Returns as soon as `interest` matches anything after
@@ -29,43 +103,157 @@ pub struct Read {
 pub struct Wait {
     pub interest: Interest,
     pub after: Cursor,
+    /// Optional target room reference (`#channel`, `@seat`); when present, the
+    /// server resolves `since` and `cursor` against the server-selected stream
+    /// (while `after` carries a compatibility fallback for older daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomRef>,
+    /// Optional room-relative sequence offset (`--since` / `--after`), applied
+    /// exclusively to the server-selected `room` stream when `room` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<Seq>,
+    /// Optional resume cursor; when present, takes precedence over `after`'s
+    /// single-stream fallback and combines with `room` / `since`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Cursor>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 impl Wait {
+    pub fn new(interest: Interest, after: Cursor) -> Self {
+        Wait {
+            interest,
+            after,
+            room: None,
+            since: None,
+            cursor: None,
+            timeout_ms: None,
+            limit: None,
+        }
+    }
+
     /// Wait on one room after `since`. With `mentions_only`, wake on mentions
     /// of me in `room` after `since` or in any other room from now on.
     pub fn room(room: RoomId, since: Seq, mentions_only: bool) -> Self {
         let stream = StreamId::Room { room: room.clone() };
         if mentions_only {
-            Wait {
-                interest: Interest::Mentions,
-                after: Cursor::live().with(stream, since),
-                timeout_ms: None,
-            }
+            Wait::new(Interest::Mentions, Cursor::live().with(stream, since))
         } else {
-            Wait {
-                interest: Interest::Room {
+            Wait::new(
+                Interest::Room {
                     room: RoomRef::Id { id: room },
                 },
-                after: Cursor::default().with(stream, since),
-                timeout_ms: None,
-            }
+                Cursor::default().with(stream, since),
+            )
         }
+    }
+
+    pub fn room_ref(
+        room: RoomRef,
+        me: &Principal,
+        since: Seq,
+        mentions_only: bool,
+    ) -> Result<Self, crate::id::InvalidId> {
+        let canon_stream = StreamId::Room {
+            room: room.resolve(me)?,
+        };
+        let fallback_stream = legacy_operator_dm_stream(&room, me)?.unwrap_or(canon_stream);
+        let after = if mentions_only {
+            Cursor::live()
+        } else {
+            Cursor::default()
+        }
+        .with(fallback_stream, since);
+        let interest = if mentions_only {
+            Interest::Mentions
+        } else {
+            Interest::Room { room: room.clone() }
+        };
+        Ok(Wait {
+            interest,
+            after,
+            room: Some(room),
+            since: Some(since),
+            cursor: None,
+            timeout_ms: None,
+            limit: None,
+        })
     }
 
     pub fn room_filtered(room: RoomId, since: Seq, re: Option<Seq>, labels: Vec<Label>) -> Self {
         let stream = StreamId::Room { room: room.clone() };
-        Wait {
-            interest: Interest::RoomFiltered {
+        Wait::new(
+            Interest::RoomFiltered {
                 room: RoomRef::Id { id: room },
                 re,
                 labels,
             },
-            after: Cursor::default().with(stream, since),
+            Cursor::default().with(stream, since),
+        )
+    }
+
+    pub fn room_ref_filtered(
+        room: RoomRef,
+        me: &Principal,
+        since: Seq,
+        re: Option<Seq>,
+        labels: Vec<Label>,
+    ) -> Result<Self, crate::id::InvalidId> {
+        let canon_stream = StreamId::Room {
+            room: room.resolve(me)?,
+        };
+        let fallback_stream = legacy_operator_dm_stream(&room, me)?.unwrap_or(canon_stream);
+        Ok(Wait {
+            interest: Interest::RoomFiltered {
+                room: room.clone(),
+                re,
+                labels,
+            },
+            after: Cursor::default().with(fallback_stream, since),
+            room: Some(room),
+            since: Some(since),
+            cursor: None,
             timeout_ms: None,
+            limit: None,
+        })
+    }
+
+    /// Resolves the effective resume cursor for `viewer` without consulting the
+    /// journal (used by host bridges that lack direct journal access).
+    pub fn effective_cursor_for(&self, viewer: &Principal) -> Result<Cursor, crate::id::InvalidId> {
+        let target_stream = match &self.room {
+            Some(r) => Some(StreamId::Room {
+                room: r.resolve(viewer)?,
+            }),
+            None => None,
+        };
+        if let Some(ref c) = self.cursor {
+            let mut out = c.clone();
+            if let Some(ref target) = target_stream {
+                if let Some(since) = self.since {
+                    out.advance(target, since);
+                } else if matches!(self.interest, Interest::Mentions)
+                    && !c.from_head()
+                    && c.snapshot().is_none()
+                    && !out.lists(target)
+                {
+                    out.advance(target, Seq::ORIGIN);
+                }
+            }
+            return Ok(out);
         }
+        if let (Some(target), Some(since)) = (target_stream, self.since) {
+            let base = if self.after.from_head() {
+                Cursor::live()
+            } else {
+                Cursor::default()
+            };
+            return Ok(base.with(target, since));
+        }
+        Ok(self.after.clone())
     }
 }
 

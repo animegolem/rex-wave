@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::room::{Body, RoomMessageSummary};
 use rex_wave_api::wave::{
     Activity, AgentSpec, Observation, PermissionMode, WaveObserve, WaveSpec, WaveStart, WaveView,
@@ -47,7 +48,7 @@ impl Service<RoomCommand> for ConflictInjectingRooms {
                         newer_message: Box::new(RoomMessageSummary {
                             seq: Seq(expected.0 + 1),
                             at: UnixMs(1234),
-                            by: ctx.by.clone(),
+                            by: ctx.by().clone(),
                             body: Body::parse("landed first").unwrap(),
                             re: p.re,
                             labels: vec![],

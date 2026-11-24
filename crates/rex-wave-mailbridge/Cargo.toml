@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+rex-wave-fs.workspace = true
 rex-wave-api.workspace = true
 rex-wave-runtime.workspace = true
 rex-wave-store.workspace = true
@@ -19,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rex-wave-rooms.workspace = true
+rex-wave-runtime = { path = "../rex-wave-runtime", features = ["test-support"] }
 
 [lints]
 workspace = true

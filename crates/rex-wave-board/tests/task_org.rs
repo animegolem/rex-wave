@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_kanban::Priority;
 use rex_wave_api::notify::{InboxRaise, NotifyKind};
 use rex_wave_api::room::*;
@@ -1220,4 +1221,47 @@ async fn emacs_title_edit_does_not_remove_concurrent_room_labels() {
             .unwrap()
             .contains(":area%3Dcore:x%3D1:tier%3Dp0:")
     );
+}
+
+#[tokio::test]
+async fn symlinked_org_file_imports_and_writes_back_without_breaking_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let real_dir = dir.path().join("real");
+    fs::create_dir_all(&real_dir).unwrap();
+    let real_org = real_dir.join("tasks.org");
+    fs::write(&real_org, "#+TITLE: #sprint\n\n* TODO Linked heading\n").unwrap();
+    let link_org = dir.path().join("tasks-link.org");
+    std::os::unix::fs::symlink(&real_org, &link_org).unwrap();
+
+    let client = FakeTaskRoomClient::new(operator("owner"));
+    let room = tasks_room();
+    let mut state = OrgSyncState::default();
+
+    let outcome = sync_org_to_room(
+        &client,
+        &room,
+        &link_org,
+        &mut state,
+        &OrgSyncOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        OrgToRoomOutcome::Synced {
+            ref created,
+            wrote_back: true,
+            ..
+        } if created.len() == 1
+    ));
+    assert!(
+        fs::symlink_metadata(&link_org)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "writeback must update the real target while keeping the user's symlink intact"
+    );
+    let updated_real = fs::read_to_string(&real_org).unwrap();
+    assert!(updated_real.contains(":REX_REV: 1"));
+    assert!(updated_real.contains(":REX_SEQ: 1"));
 }

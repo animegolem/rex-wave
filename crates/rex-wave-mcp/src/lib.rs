@@ -109,7 +109,7 @@ impl<C: Client> McpServer<C> {
                 input_schema: args_schema(tool),
             })
             .collect();
-        if allowed_for(Audience::Member, self.client.me()) {
+        if session_allows(Audience::Member, self.client.me()) {
             out.push(run_code_descriptor(&allowed, &self.budget));
         }
         out
@@ -118,7 +118,7 @@ impl<C: Client> McpServer<C> {
     /// Dispatch one `tools/call`.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> ToolResult {
         if name == RUN_CODE_TOOL {
-            if !allowed_for(Audience::Member, self.client.me()) {
+            if !session_allows(Audience::Member, self.client.me()) {
                 let denied = ApiError::Denied {
                     principal: self.client.me().to_string(),
                     action: format!("call {RUN_CODE_TOOL}"),
@@ -148,7 +148,7 @@ impl<C: Client> McpServer<C> {
         let Some(meta) = TOOLS.iter().find(|t| t.name == name) else {
             return ToolResult::error(format!("unknown tool: {name}"));
         };
-        if !allowed_for(meta.audience, self.client.me()) {
+        if !session_allows(meta.audience, self.client.me()) {
             let denied = ApiError::Denied {
                 principal: self.client.me().to_string(),
                 action: format!("call {}", meta.name),
@@ -222,21 +222,16 @@ fn parse_run_code_args(arguments: Value) -> Result<RunCodeArgs, String> {
     serde_json::from_value(arguments).map_err(|e| format!("invalid run_code arguments: {e}"))
 }
 
-pub(crate) fn allowed_for(audience: Audience, principal: &Principal) -> bool {
-    match audience {
-        Audience::System => false,
-        Audience::Operator => matches!(principal, Principal::Operator { .. }),
-        Audience::Member => matches!(
-            principal,
-            Principal::Operator { .. } | Principal::Seat { .. } | Principal::Worker { .. }
-        ),
-    }
+/// MCP sessions are members or the operator; the daemon's own parts never
+/// reach tools through MCP, whatever the audience admits.
+fn session_allows(audience: Audience, principal: &Principal) -> bool {
+    !matches!(principal, Principal::System { .. }) && audience.allows(principal)
 }
 
 pub(crate) fn allowed_tools(principal: &Principal) -> Vec<&'static ToolMeta> {
     TOOLS
         .iter()
-        .filter(|t| allowed_for(t.audience, principal))
+        .filter(|t| session_allows(t.audience, principal))
         .collect()
 }
 

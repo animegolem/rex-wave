@@ -54,7 +54,7 @@ impl Decider for TestRooms {
             RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
-            room: room_ref.resolve(&ctx.by)?,
+            room: room_ref.resolve(ctx.by())?,
         })
     }
 
@@ -79,22 +79,22 @@ impl Decider for TestRooms {
                 if state.id.is_some() {
                     return Ok(Vec::new());
                 }
-                let id = room.resolve(&ctx.by)?;
+                let id = room.resolve(ctx.by())?;
                 let mut events = vec![RoomEvent::Opened {
                     id,
                     origin: origin.clone().unwrap_or(RoomOrigin::Manual),
                     topic: topic.clone(),
                 }];
-                if let Some(h) = default_handle(&ctx.by) {
+                if let Some(h) = default_handle(ctx.by()) {
                     events.push(RoomEvent::MemberJoined {
-                        member: ctx.by.clone(),
+                        member: ctx.by().clone(),
                         handle: h,
                     });
                 }
                 Ok(events)
             }
             RoomCommand::RoomJoin(j) => {
-                let who = j.member.clone().unwrap_or_else(|| ctx.by.clone());
+                let who = j.member.clone().unwrap_or_else(|| ctx.by().clone());
                 if state.members.iter().any(|(_, p)| p == &who) {
                     return Ok(Vec::new());
                 }
@@ -109,7 +109,7 @@ impl Decider for TestRooms {
                 }])
             }
             RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft {
-                member: ctx.by.clone(),
+                member: ctx.by().clone(),
             }]),
             RoomCommand::RoomPost(RoomPost {
                 room,
@@ -122,7 +122,7 @@ impl Decider for TestRooms {
             }) => {
                 let mut events = Vec::new();
                 if state.id.is_none() {
-                    let id = room.resolve(&ctx.by)?;
+                    let id = room.resolve(ctx.by())?;
                     events.push(RoomEvent::Opened {
                         id,
                         origin: RoomOrigin::Manual,
@@ -1719,6 +1719,77 @@ async fn resources_read_returns_latest_200_entries_for_long_rooms() {
     assert_eq!(
         entries.last().unwrap()["event"]["event"]["body"],
         json!("entry-210")
+    );
+
+    cli_w.shutdown().await.unwrap();
+    drop(cli_w);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn operator_mcp_lists_and_reads_dm_addressed_to_its_seat() {
+    let harness = TestHarness::new();
+    let alice = harness.client(seat_principal("alice"));
+    let operator = harness.client(operator_principal("owner"));
+
+    alice
+        .call(RoomPost {
+            room: RoomRef::Dm {
+                with: seat_principal("owner"),
+            },
+            body: Body::parse("hello owner via seat dm").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_io);
+    let (cli_r, mut cli_w) = tokio::io::split(client_io);
+    let mut cli_lines = BufReader::new(cli_r).lines();
+
+    let server_task =
+        tokio::spawn(async move { McpServer::new(operator).serve_stream(srv_r, srv_w).await });
+
+    for req in [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {} }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": { "uri": "rex://room/dm/seat/alice" } }),
+    ] {
+        cli_w
+            .write_all(&serde_json::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+        cli_w.write_all(b"\n").await.unwrap();
+    }
+    cli_w.flush().await.unwrap();
+
+    let list_resp: Value =
+        serde_json::from_str(&cli_lines.next_line().await.unwrap().unwrap()).unwrap();
+    let uris: Vec<&str> = list_resp["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .collect();
+    assert!(
+        uris.contains(&"rex://room/dm/seat/alice"),
+        "operator resources/list must include seat-keyed DM: {uris:?}"
+    );
+
+    let read_resp: Value =
+        serde_json::from_str(&cli_lines.next_line().await.unwrap().unwrap()).unwrap();
+    let page: Value =
+        serde_json::from_str(read_resp["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event"]["event"]["body"] == json!("hello owner via seat dm"))
     );
 
     cli_w.shutdown().await.unwrap();

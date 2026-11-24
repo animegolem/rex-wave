@@ -1207,85 +1207,9 @@ pub fn parse_timestamp_ms(val: &Value) -> UnixMs {
     UnixMs(0)
 }
 
-/// Parses an RFC 3339 / ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS(.sss)?(Z|±HH:MM)`) into Unix ms.
+/// Parses an RFC 3339 / ISO-8601 timestamp into Unix ms (see [`UnixMs::parse_rfc3339`]).
 pub fn parse_rfc3339_ms(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    let bytes = s.as_bytes();
-    if bytes.len() < 20
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !matches!(bytes[10], b'T' | b't' | b' ')
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-    {
-        return None;
-    }
-    let year: i64 = s[0..4].parse().ok()?;
-    let month: u32 = s[5..7].parse().ok()?;
-    let day: u32 = s[8..10].parse().ok()?;
-    let hour: u64 = s[11..13].parse().ok()?;
-    let min: u64 = s[14..16].parse().ok()?;
-    let sec: u64 = s[17..19].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
-        return None;
-    }
-
-    let mut idx = 19usize;
-    let mut millis: u64 = 0;
-    if idx < bytes.len() && bytes[idx] == b'.' {
-        idx += 1;
-        let frac_start = idx;
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        let frac = &s[frac_start..idx];
-        if !frac.is_empty() {
-            let mut scaled = 0u64;
-            for (pos, b) in frac.bytes().take(3).enumerate() {
-                let digit = (b - b'0') as u64;
-                let factor = match pos {
-                    0 => 100,
-                    1 => 10,
-                    _ => 1,
-                };
-                scaled += digit * factor;
-            }
-            millis = scaled;
-        }
-    }
-
-    let tz = &s[idx..];
-    let offset_secs: i64 = if tz == "Z" || tz == "z" || tz.is_empty() {
-        0
-    } else if tz.len() == 6
-        && (tz.starts_with('+') || tz.starts_with('-'))
-        && tz.as_bytes()[3] == b':'
-    {
-        let sign = if tz.starts_with('-') { -1i64 } else { 1i64 };
-        let th: i64 = tz[1..3].parse().ok()?;
-        let tm: i64 = tz[4..6].parse().ok()?;
-        sign * (th * 3600 + tm * 60)
-    } else {
-        return None;
-    };
-
-    let days = days_from_civil(year, month, day);
-    let secs = days * 86_400 + (hour * 3600 + min * 60 + sec) as i64 - offset_secs;
-    if secs < 0 {
-        return None;
-    }
-    Some((secs as u64).saturating_mul(1000).saturating_add(millis))
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = month as u64;
-    let d = day as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64 - 719_468
+    UnixMs::parse_rfc3339(raw).map(|ms| ms.0)
 }
 
 #[cfg(test)]
@@ -1731,7 +1655,7 @@ mod tests {
         );
         assert_eq!(run_acct.as_deref(), Some("work-acct@example.com"));
 
-        // S11: stale lastError on a later clean idle/completed shell must NOT trigger Refused.
+        // Stale lastError on a later clean idle/completed shell must NOT trigger Refused.
         let stale_idle = json!({
             "status": "idle",
             "lastError": "Request blocked by cyber_safeguard policy"

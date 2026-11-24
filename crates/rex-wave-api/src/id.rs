@@ -264,6 +264,18 @@ impl LeaseEpoch {
 #[serde(transparent)]
 pub struct UnixMs(pub u64);
 
+impl UnixMs {
+    /// The wall clock. The workspace's one `SystemTime::now` call: deciders
+    /// take time from `DecideCtx::at`, and daemons from `rex_wave_runtime::now`.
+    #[allow(clippy::disallowed_methods)]
+    pub fn now_wall() -> Self {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        UnixMs(ms)
+    }
+}
+
 /// Inclusive range of seqs inside one stream (used by `promote_to_letter`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "(u64, u64)", into = "(u64, u64)")]
@@ -309,8 +321,9 @@ impl From<SeqRange> for (u64, u64) {
     }
 }
 
-/// Who did something. Bound at session open by the transport; never parsed
-/// from command arguments.
+/// Who did something. Bound at session open by the transport. Command
+/// arguments may name only a member (`Seat` or `Worker`, see
+/// `Principal::parse_member_ref`), never an `Operator` or `System`.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -339,6 +352,55 @@ pub enum SystemPart {
     MailBridge,
     WakeBell,
     PresenceMonitor,
+}
+
+impl Principal {
+    /// Parse a member reference, `@`-prefix optional: `<seat>` names a
+    /// `Seat` and `<wave>/<role>` a `Worker`. Never yields `Operator` or
+    /// `System`, which only the transport binds.
+    pub fn parse_member_ref(raw: &str) -> Result<Self, InvalidId> {
+        let trimmed = raw.strip_prefix('@').unwrap_or(raw);
+        match trimmed.split_once('/') {
+            Some((wave, role)) => Ok(Principal::Worker {
+                wave: WaveSlug::parse(wave)?,
+                role: RoleName::parse(role)?,
+            }),
+            None => Ok(Principal::Seat {
+                seat: SeatName::parse(trimmed)?,
+            }),
+        }
+    }
+
+    /// True for the human operator.
+    pub fn is_operator(&self) -> bool {
+        matches!(self, Principal::Operator { .. })
+    }
+
+    /// True for the human operator or the daemon's own parts.
+    pub fn is_operator_or_system(&self) -> bool {
+        matches!(self, Principal::Operator { .. } | Principal::System { .. })
+    }
+
+    /// Canonical DM participant identity: `Operator { seat }` and `Seat { seat }`
+    /// share the same `@<seat>` DM room so both directions resolve identically.
+    pub fn as_dm_member(&self) -> Self {
+        match self {
+            Principal::Operator { seat } => Principal::Seat { seat: seat.clone() },
+            other => other.clone(),
+        }
+    }
+
+    /// True when `self` and `other` represent the same actor (`Operator { s }`
+    /// and `Seat { s }` are two authority levels of the same seat `s`).
+    pub fn same_actor(&self, other: &Self) -> bool {
+        self == other
+            || matches!(
+                (self, other),
+                (Principal::Operator { seat: a }, Principal::Seat { seat: b })
+                    | (Principal::Seat { seat: a }, Principal::Operator { seat: b })
+                    if a == b
+            )
+    }
 }
 
 impl fmt::Display for Principal {

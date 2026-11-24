@@ -50,25 +50,7 @@ impl TimeBasis {
 const MIN_EPOCH_MS: u64 = 1_000_000_000_000;
 const MAX_EPOCH_MS: u64 = 4_102_444_800_000;
 
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
+/// Unix seconds of a local civil time, for the years letters carry.
 fn civil_to_unix_secs(
     year: i64,
     month: u32,
@@ -77,24 +59,10 @@ fn civil_to_unix_secs(
     minute: u32,
     second: u32,
 ) -> Option<i64> {
-    if !(1970..=2200).contains(&year)
-        || !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if year > 2_200 || second > 59 {
         return None;
     }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = month as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (day as u64) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    Some(days * 86_400 + (hour as i64) * 3_600 + (minute as i64) * 60 + (second as i64))
+    UnixMs::from_ymd_hms_utc(year, month, day, hour, minute, second).map(|ms| (ms.0 / 1_000) as i64)
 }
 
 fn parse_epoch_ms_13(raw: &str, require_dash_suffix: bool) -> Option<UnixMs> {
@@ -414,6 +382,11 @@ pub const DEFAULT_DIGEST_THRESHOLD: usize = 3;
 /// never from attempt/pass count.
 pub const DEFAULT_RETRY_DEADLINE_MS: u64 = 3_600_000;
 
+/// The largest live `state/acks.jsonl` read.
+const MAX_ACKS_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest letter read while scanning.
+const MAX_LETTER_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Default reconnect grace window (`15 s`) matching `rex-wave-notify`.
 pub const DEFAULT_RECONNECT_GRACE_MS: u64 = 15_000;
 
@@ -427,15 +400,11 @@ pub struct ReadOnlyInterchange {
 
 impl ReadOnlyInterchange {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SandboxError> {
-        let canon = fs::canonicalize(root.as_ref()).map_err(|e| SandboxError::Io(e.to_string()))?;
-        let meta = fs::metadata(&canon).map_err(|e| SandboxError::Io(e.to_string()))?;
-        if !meta.is_dir() {
-            return Err(SandboxError::Io(format!(
-                "{} is not a directory",
-                canon.display()
-            )));
-        }
-        Ok(Self { root: canon })
+        let dir = rex_wave_fs::ConfinedDir::open(root.as_ref())
+            .map_err(|e| SandboxError::Io(format!("{}: {e}", root.as_ref().display())))?;
+        Ok(Self {
+            root: dir.path().to_path_buf(),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -446,20 +415,13 @@ impl ReadOnlyInterchange {
     /// or creating any file.
     pub fn read_acks(&self, aliases: &AliasMap) -> Result<AcksParseReport, SandboxError> {
         let acks_path = self.root.join("state").join("acks.jsonl");
-        let meta = match fs::symlink_metadata(&acks_path) {
-            Ok(m) => m,
+        let bytes = match rex_wave_fs::read_regular_bounded(&acks_path, MAX_ACKS_BYTES) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(AcksParseReport::default());
             }
             Err(e) => return Err(SandboxError::Io(e.to_string())),
         };
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return Err(SandboxError::Io(format!(
-                "{} is not a regular file",
-                acks_path.display()
-            )));
-        }
-        let bytes = fs::read(&acks_path).map_err(|e| SandboxError::Io(e.to_string()))?;
         let text = String::from_utf8_lossy(&bytes);
         Ok(parse_acks_jsonl(&text, aliases))
     }
@@ -771,7 +733,8 @@ fn read_scanned_letter(
     box_seat: Option<&SeatName>,
     aliases: &AliasMap,
 ) -> Result<ScannedLetter, SandboxError> {
-    let bytes = fs::read(path).map_err(|e| SandboxError::Io(e.to_string()))?;
+    let bytes = rex_wave_fs::read_regular_bounded(path, MAX_LETTER_BYTES)
+        .map_err(|e| SandboxError::Io(e.to_string()))?;
     let sha256 = sha256_bytes(&bytes);
     let sha16 = sha256.as_str()[..16].to_owned();
     let mtime_ms = fs::metadata(path)
@@ -1020,6 +983,55 @@ pub enum DeferReason {
     TransportDown { transport: TransportKind },
 }
 
+/// Which [`DeferReason`] deferred a ring, without its per-pass details: the
+/// part of a deferral that counts as a `--watch` transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeferKind {
+    ReconnectGrace,
+    TargetBusy,
+    TransportDown,
+}
+
+impl DeferKind {
+    const ALL: [DeferKind; 3] = [
+        DeferKind::ReconnectGrace,
+        DeferKind::TargetBusy,
+        DeferKind::TransportDown,
+    ];
+
+    /// The `reason_kind` spelling in shadow JSONL.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeferKind::ReconnectGrace => "ReconnectGrace",
+            DeferKind::TargetBusy => "TargetBusy",
+            DeferKind::TransportDown => "TransportDown",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == raw)
+    }
+
+    /// The kind a logged `reason` names. Logs written before `reason_kind`
+    /// existed carry only `reason`, which begins with the kind's name.
+    fn from_logged_reason(reason: &str) -> Option<Self> {
+        let name_end = reason
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(reason.len());
+        Self::parse(&reason[..name_end])
+    }
+}
+
+impl DeferReason {
+    pub fn kind(&self) -> DeferKind {
+        match self {
+            DeferReason::ReconnectGrace { .. } => DeferKind::ReconnectGrace,
+            DeferReason::TargetBusy { .. } => DeferKind::TargetBusy,
+            DeferReason::TransportDown { .. } => DeferKind::TransportDown,
+        }
+    }
+}
+
 /// Pure output of the mail-ring decision engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RingDecision {
@@ -1243,6 +1255,7 @@ impl RingDecision {
                 "seat": seat.as_str(),
                 "referent": referent.to_json_value(),
                 "reason": format!("{reason:?}"),
+                "reason_kind": reason.kind().as_str(),
                 "deadline_at_ms": deadline_at.0,
                 "time_basis": time_basis.as_str(),
             }),
@@ -1701,7 +1714,7 @@ pub enum WatchDecisionState {
     SkipNonSeatTarget,
     FlagMutatedAfterAck { prior_ack_sha: String },
     Ring,
-    Defer { reason_kind: String },
+    Defer { reason_kind: DeferKind },
     RaiseUnrung,
 }
 
@@ -1799,18 +1812,11 @@ fn watch_line_facts(
         ),
         "ring" => single(referent_sha()?, WatchDecisionState::Ring),
         "defer" => {
-            // `reason` is `Debug` output such as `TargetBusy { pass_count: 2 }`;
-            // only the variant name is a transition.
-            let reason = watch_str(obj, "reason", line_no)?;
-            let reason_kind: String = reason
-                .chars()
-                .take_while(char::is_ascii_alphanumeric)
-                .collect();
-            if reason_kind.is_empty() {
-                return Err(format!(
-                    "shadow line {line_no}: defer `reason` '{reason}' has no kind"
-                ));
+            let reason_kind = match obj.get("reason_kind").and_then(|v| v.as_str()) {
+                Some(kind) => DeferKind::parse(kind),
+                None => DeferKind::from_logged_reason(watch_str(obj, "reason", line_no)?),
             }
+            .ok_or_else(|| format!("shadow line {line_no}: defer names no known reason kind"))?;
             single(referent_sha()?, WatchDecisionState::Defer { reason_kind })
         }
         "ring_digest" => multi(WatchDecisionState::Ring)?,

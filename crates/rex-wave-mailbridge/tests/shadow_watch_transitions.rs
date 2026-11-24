@@ -1,5 +1,6 @@
 //! `mail shadow --watch` append-only transitions, multi-pass scoring, ring
 //! watcher `seen.jsonl` formats, and T3 doorbell target seeding.
+#![allow(clippy::disallowed_methods)]
 
 use rex_wave_api::presence::*;
 use rex_wave_api::*;
@@ -55,7 +56,7 @@ fn seat(name: &str) -> SeatName {
 
 fn apply(state: &mut PresenceState, seq: &mut u64, by: Principal, cmd: PresenceCommand) {
     let at = UnixMs(1_000);
-    let ctx = DecideCtx { by: by.clone(), at };
+    let ctx = DecideCtx::for_test(by.clone(), at);
     let events = Presence::decide_with_probe(state, &cmd, &ctx, |_, _| true).unwrap();
     for ev in events {
         *seq += 1;
@@ -623,4 +624,47 @@ fn seed_records_reads_t3_doorbell_targets_with_aliases() {
             .all(|c| !c.seat.as_str().starts_with('_')),
         "`_` annotation keys are never seats"
     );
+}
+
+#[test]
+fn defer_kind_hydrates_from_reason_kind_and_from_legacy_reason_lines() {
+    use rex_wave_mailbridge::{DeferKind, DeferReason};
+    let sha = rex_wave_api::Sha256Hex::parse("ab".repeat(32)).unwrap();
+    let defer = |reason: DeferReason| RingDecision::Defer {
+        seat: seat("gamma"),
+        referent: RingReferent::new("mail/y.md", sha.clone()).unwrap(),
+        reason,
+        deadline_at: UnixMs(99),
+        time_basis: TimeBasis::LetterIdMs,
+    };
+    let busy = |n| DeferReason::TargetBusy { pass_count: n };
+    assert_eq!(busy(3).kind(), DeferKind::TargetBusy);
+    let none = AliasMap::empty();
+
+    let mut first = ShadowWatchTracker::new();
+    let line = first
+        .observe_pass(&[defer(busy(0))], &none, UnixMs(1))
+        .unwrap()
+        .jsonl;
+    let mut parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(parsed["reason_kind"], "TargetBusy");
+    assert_eq!(parsed["reason"], "TargetBusy { pass_count: 0 }");
+
+    let legacy = {
+        parsed.as_object_mut().unwrap().remove("reason_kind");
+        format!("{parsed}\n")
+    };
+    for log in [line.clone(), legacy] {
+        let mut t = ShadowWatchTracker::from_existing_jsonl(&log).unwrap();
+        let same_kind = t.observe_pass(&[defer(busy(7))], &none, UnixMs(2)).unwrap();
+        assert_eq!(same_kind.decision_lines, 0, "{log}");
+        let grace = DeferReason::ReconnectGrace {
+            ready_at: UnixMs(50),
+        };
+        let new_kind = t.observe_pass(&[defer(grace)], &none, UnixMs(3)).unwrap();
+        assert_eq!(new_kind.decision_lines, 1, "{log}");
+    }
+
+    let bogus = line.replace("\"TargetBusy\"", "\"Bogus\"");
+    assert!(ShadowWatchTracker::from_existing_jsonl(&bogus).is_err());
 }

@@ -1,6 +1,5 @@
 use crate::read::ReadSide;
 use crate::{BoxFut, DecideCtx, Service, now};
-use rex_wave_api::room::RoomId;
 use rex_wave_api::wave::{Activity, Observation, WaveObserve, WaveView, WorkerPhase};
 use rex_wave_api::*;
 use std::collections::HashMap;
@@ -52,22 +51,7 @@ pub struct Router {
     pub read: Arc<ReadSide>,
 }
 
-/// Pure audience check. Finer policy belongs to deciders.
-pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
-    let ok = match (audience, by) {
-        (Audience::System, by) => matches!(by, Principal::System { .. }),
-        (Audience::Operator, by) => matches!(by, Principal::Operator { .. }),
-        (Audience::Member, _) => true,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::Denied {
-            principal: by.to_string(),
-            action: format!("{audience:?} command"),
-        })
-    }
-}
+pub use rex_wave_api::authorize;
 
 type ActiveWaitKey = (usize, WaveSlug, RoleName);
 
@@ -111,34 +95,58 @@ fn decrement_active_wait(key: &ActiveWaitKey) -> usize {
     remaining
 }
 
-fn parked_room_and_since(
-    worker: &Principal,
-    wait: &rex_wave_api::read::Wait,
-) -> (Option<RoomId>, Seq) {
-    match &wait.interest {
-        Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
-        {
-            Ok(id) => {
-                let since = wait.after.at(&StreamId::Room { room: id.clone() });
-                (Some(id), since)
-            }
-            Err(_) => (None, Seq::ORIGIN),
-        },
-        Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
-            StreamId::Room { room } => (Some(room.clone()), wait.after.at(&streams[0])),
-            _ => (None, Seq::ORIGIN),
-        },
-        _ => (None, Seq::ORIGIN),
-    }
+fn resolve_room_cmd(
+    read: &ReadSide,
+    by: &Principal,
+    mut cmd: RoomCommand,
+) -> Result<RoomCommand, ApiError> {
+    use rex_wave_api::room::RoomRef;
+    use rex_wave_store::DmIdemResolution;
+    let idem = cmd.effective_idem();
+    let slot = match &mut cmd {
+        RoomCommand::RoomEnsure(c) => &mut c.room,
+        RoomCommand::RoomPost(c) => &mut c.room,
+        RoomCommand::RoomJoin(c) => &mut c.room,
+        RoomCommand::RoomLeave(c) => &mut c.room,
+        RoomCommand::RoomLabel(c) => &mut c.room,
+        RoomCommand::TaskClaim(c) => &mut c.room,
+        RoomCommand::TaskHeartbeat(c) => &mut c.room,
+        RoomCommand::TaskTransition(c) => &mut c.room,
+        RoomCommand::TaskUpdate(c) => &mut c.room,
+        RoomCommand::RoomTasks(c) => &mut c.room,
+    };
+    let allow_legacy_fallback = matches!(slot, RoomRef::Dm { .. });
+    let resolved = slot.resolve(by)?;
+    let target = match read
+        .journal
+        .resolve_dm_room_with_idem(resolved, by, idem.as_ref(), allow_legacy_fallback)
+        .map_err(crate::store_error)?
+    {
+        DmIdemResolution::Route(room) => room,
+        DmIdemResolution::CrossAuthor { .. } => {
+            return Err(ApiError::conflict(format!(
+                "idempotency key {:?} in this DM was already used by another participant",
+                idem.as_ref().map(IdemKey::as_str).unwrap_or_default()
+            )));
+        }
+        DmIdemResolution::Ambiguous(_) => {
+            return Err(ApiError::conflict(format!(
+                "ambiguous idempotency key {:?} exists on both legacy and canonical DM histories; specify an explicit RoomId or a fresh idem key",
+                idem.as_ref().map(IdemKey::as_str).unwrap_or_default()
+            )));
+        }
+    };
+    *slot = RoomRef::Id { id: target };
+    Ok(cmd)
 }
 
 fn system_ctx() -> DecideCtx {
-    DecideCtx {
-        by: Principal::System {
+    DecideCtx::new(
+        Principal::System {
             part: SystemPart::WaveConductor,
         },
-        at: now(),
-    }
+        now(),
+    )
 }
 
 async fn restore_worker_working(
@@ -240,25 +248,59 @@ impl Drop for WorkerWaitGuard {
 impl Router {
     pub async fn dispatch(&self, by: &Principal, cmd: WireCommand) -> Result<WireReply, ApiError> {
         authorize(cmd.meta().audience, by)?;
-        let ctx = DecideCtx {
-            by: by.clone(),
-            at: now(),
-        };
+        let ctx = DecideCtx::new(by.clone(), now());
         match cmd.route() {
-            Routed::Room(c) => self.room.dispatch(c, ctx).await,
+            Routed::Room(c) => {
+                let resolved = resolve_room_cmd(&self.read, by, c)?;
+                self.room.dispatch(resolved, ctx).await
+            }
             Routed::Wave(c) => self.wave.dispatch(c, ctx).await,
             Routed::Board(c) => self.board.dispatch(c, ctx).await,
-            Routed::Inbox(c) => self.inbox.dispatch(c, ctx).await,
-            Routed::Mail(c) => self.mail.dispatch(c, ctx).await,
+            Routed::Inbox(mut c) => {
+                match &mut c {
+                    InboxCommand::InboxMarkRead(m) => {
+                        m.room = self
+                            .read
+                            .journal
+                            .resolve_dm_room(m.room.clone())
+                            .map_err(crate::store_error)?;
+                    }
+                    InboxCommand::SetArchived(s) => {
+                        if let rex_wave_api::read::ArchiveTarget::Room { room } = &mut s.target {
+                            *room = self
+                                .read
+                                .journal
+                                .resolve_dm_room(room.clone())
+                                .map_err(crate::store_error)?;
+                        }
+                    }
+                    _ => {}
+                }
+                self.inbox.dispatch(c, ctx).await
+            }
+            Routed::Mail(mut c) => {
+                if let MailCommand::MailPromote(p) = &mut c {
+                    p.room = self
+                        .read
+                        .journal
+                        .resolve_dm_room(p.room.clone())
+                        .map_err(crate::store_error)?;
+                }
+                self.mail.dispatch(c, ctx).await
+            }
             Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
             Routed::Read(ReadCommand::Wait(mut wait)) => {
-                let guard = if wait.timeout_ms != Some(0)
+                if wait.timeout_ms != Some(0)
+                    && matches!(by, Principal::Worker { .. })
+                    && wait.timeout_ms.is_none()
+                {
+                    wait.timeout_ms = Some(MAX_UNBOUNDED_WORKER_WAIT_MS);
+                }
+                let prepared = self.read.prepare_wait(by.clone(), wait)?;
+                let guard = if prepared.timeout_ms() != Some(0)
                     && let Principal::Worker { wave, role } = by
                 {
-                    if wait.timeout_ms.is_none() {
-                        wait.timeout_ms = Some(MAX_UNBOUNDED_WORKER_WAIT_MS);
-                    }
-                    let (room, since) = parked_room_and_since(by, &wait);
+                    let (room, since) = prepared.parked_scope();
                     let guard =
                         WorkerWaitGuard::enter(self.wave.clone(), wave.clone(), role.clone());
                     let _ = self
@@ -278,7 +320,11 @@ impl Router {
                 } else {
                     None
                 };
-                let outcome = self.read.dispatch(ReadCommand::Wait(wait), ctx).await;
+                let outcome = self
+                    .read
+                    .run_prepared_wait(prepared)
+                    .await
+                    .map(WireReply::Wait);
                 if let Some(g) = guard {
                     g.finish().await;
                 }
@@ -311,7 +357,7 @@ impl<C: Send + 'static> Service<C> for Unavailable {
 
 /// Forwards a family to another process (e.g. a split-out Kanban app) through
 /// the same `Client` trait. The remote authorizes the forwarding daemon's own
-/// session principal; carrying `ctx.by` across is an open question (see
+/// session principal; carrying `ctx.by()` across is an open question (see
 /// ARCHITECTURE.md).
 pub struct Remote<C: Client> {
     pub client: C,

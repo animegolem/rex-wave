@@ -6,7 +6,6 @@ use rex_wave_api::presence::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -213,23 +212,15 @@ pub fn load_claude_session_file_from(
         return Err(invalid("pid", "pid must be positive"));
     }
     let path = sessions_dir.join(format!("{pid}.json"));
-    let meta = fs::symlink_metadata(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ApiError::NotFound {
-                what: format!("claude session file {}", path.display()),
-            }
-        } else {
-            ApiError::Internal(format!("stat {}: {e}", path.display()))
-        }
+    let raw = read_text_nofollow(
+        &path,
+        MAX_SESSION_FILE_BYTES,
+        "claude_session",
+        "session file",
+    )?
+    .ok_or_else(|| ApiError::NotFound {
+        what: format!("claude session file {}", path.display()),
     })?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(ApiError::Denied {
-            principal: "presence".into(),
-            action: format!("read non-regular session file {}", path.display()),
-        });
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
     let parsed = parse_claude_session_json(&raw)?;
     if parsed.pid != pid {
         return Err(invalid(
@@ -352,32 +343,15 @@ pub fn house_profile_path_from(
 /// a symlink, non-regular file, oversized file, malformed JSON, unknown field,
 /// invalid seat name, or out-of-bounds list fails closed.
 pub fn load_house_profile_from(path: &Path) -> Result<HouseProfile, ApiError> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HouseProfile::default()),
-        Err(e) => {
-            return Err(ApiError::Internal(format!("stat {}: {e}", path.display())));
-        }
+    let Some(raw) = read_text_nofollow(
+        path,
+        HOUSE_PROFILE_MAX_BYTES,
+        "house_profile",
+        "house profile",
+    )?
+    else {
+        return Ok(HouseProfile::default());
     };
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() {
-        return Err(ApiError::Denied {
-            principal: "presence".into(),
-            action: format!("read non-regular house profile {}", path.display()),
-        });
-    }
-    if meta.len() > HOUSE_PROFILE_MAX_BYTES {
-        return Err(invalid(
-            "house_profile",
-            format!(
-                "{}: {} bytes exceeds limit {HOUSE_PROFILE_MAX_BYTES}",
-                path.display(),
-                meta.len()
-            ),
-        ));
-    }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
     let house: HouseProfile = serde_json::from_str(&raw)
         .map_err(|e| invalid("house_profile", format!("{}: {e}", path.display())))?;
     house
@@ -422,23 +396,34 @@ impl SeedInterchangePlan {
     }
 }
 
-fn read_regular_text_if_present(path: &Path) -> Result<Option<String>, ApiError> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(ApiError::Internal(format!("stat {}: {e}", path.display())));
-        }
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(ApiError::Denied {
+/// The largest Claude session file read.
+const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024;
+/// The largest interchange seed file read.
+const MAX_SEED_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a UTF-8 regular file of at most `max_bytes` through an `O_NOFOLLOW`
+/// handle. Missing is `None`; a symlink or non-regular file is `Denied`; an
+/// oversized or non-UTF-8 file is invalid `what`.
+fn read_text_nofollow(
+    path: &Path,
+    max_bytes: u64,
+    what: &str,
+    label: &str,
+) -> Result<Option<String>, ApiError> {
+    match rex_wave_fs::read_regular_string(path, max_bytes) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(ApiError::Denied {
             principal: "presence".into(),
-            action: format!("read non-regular seed file {}", path.display()),
-        });
+            action: format!("read non-regular {label} {}", path.display()),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(invalid(what, e.to_string())),
+        Err(e) => Err(ApiError::Internal(format!("read {}: {e}", path.display()))),
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
-    Ok(Some(raw))
+}
+
+fn read_regular_text_if_present(path: &Path) -> Result<Option<String>, ApiError> {
+    read_text_nofollow(path, MAX_SEED_FILE_BYTES, "seed_file", "seed file")
 }
 
 fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
@@ -456,13 +441,13 @@ fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>
 
 fn resolve_local_or_parent(canon_dir: &Path, rel: &str) -> Option<PathBuf> {
     let local = canon_dir.join(rel);
-    if fs::symlink_metadata(&local).is_ok() {
+    if rex_wave_fs::entry_exists(&local) {
         Some(local)
     } else {
         canon_dir
             .parent()
             .map(|p| p.join(rel))
-            .filter(|p| fs::symlink_metadata(p).is_ok())
+            .filter(|p| rex_wave_fs::entry_exists(p))
     }
 }
 
@@ -527,14 +512,9 @@ pub fn seed_records_from_interchange_with_options(
     seats_tsv: Option<&Path>,
     house: &HouseProfile,
 ) -> Result<SeedInterchangePlan, ApiError> {
-    let canon_dir = fs::canonicalize(interchange_dir)
+    let interchange = rex_wave_fs::ConfinedDir::open(interchange_dir)
         .map_err(|e| invalid("interchange", format!("{}: {e}", interchange_dir.display())))?;
-    if !canon_dir.is_dir() {
-        return Err(invalid(
-            "interchange",
-            format!("{} is not a directory", canon_dir.display()),
-        ));
-    }
+    let canon_dir = interchange.path().to_path_buf();
 
     let mut sources_read = Vec::new();
     let mut skipped_targets = BTreeSet::new();
@@ -551,7 +531,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 1. Read `<interchange>/postmaster/state/roster.json` if present.
     let roster_path = canon_dir.join("postmaster/state/roster.json");
     if let Some(roster_val) = read_regular_json_if_present(&roster_path)? {
         sources_read.push(roster_path);
@@ -587,9 +566,8 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 2. Read `.watchers/mailwatch-routes.json` and the T3 doorbell's
-    //    `tooling/t3-doorbell/targets.json` under `<interchange>` or its parent
-    //    house root. Both map `<seat>` -> `{.., "aliases": [..]}`.
+    // `.watchers/mailwatch-routes.json` and the T3 doorbell's
+    // `tooling/t3-doorbell/targets.json` both map `<seat>` -> `{.., "aliases": [..]}`.
     for rel in [
         ".watchers/mailwatch-routes.json",
         "tooling/t3-doorbell/targets.json",
@@ -639,7 +617,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 3. Read `<interchange>/state/bb-knock-routes.tsv` if present.
     let bb_routes_path = canon_dir.join("state/bb-knock-routes.tsv");
     if let Some(raw) = read_regular_text_if_present(&bb_routes_path)? {
         sources_read.push(bb_routes_path);
@@ -673,7 +650,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 4. Read `<interchange>/state/codex-knock-routes.tsv` if present.
     let codex_routes_path = canon_dir.join("state/codex-knock-routes.tsv");
     if let Some(raw) = read_regular_text_if_present(&codex_routes_path)? {
         sources_read.push(codex_routes_path);
@@ -707,7 +683,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 5. Read `herdr-registry.tsv` under `<interchange>` or its parent house root.
     if let Some(herdr_path) = resolve_local_or_parent(&canon_dir, "herdr-registry.tsv")
         && let Some(raw) = read_regular_text_if_present(&herdr_path)?
     {
@@ -745,7 +720,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 6. Read `<interchange>/state/ledger.md` CLAIM rows if present.
     let ledger_path = canon_dir.join("state/ledger.md");
     if let Some(raw) = read_regular_text_if_present(&ledger_path)? {
         sources_read.push(ledger_path);
@@ -770,9 +744,8 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 7. Read optional external `seats.tsv` (`session_name\tseat\troom_path`).
-    //    When the caller explicitly supplies a path, surface `NotFound` rather
-    //    than silently dropping a mistyped `--seats-tsv` flag.
+    // An explicitly supplied `seats.tsv` surfaces `NotFound` rather than
+    // silently dropping a mistyped `--seats-tsv` flag.
     if let Some(seats_path) = seats_tsv {
         let Some(raw) = read_regular_text_if_present(seats_path)? else {
             return Err(ApiError::NotFound {
@@ -823,7 +796,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 8. Merge the house profile's canonical alias folds.
     for (canon, alias_list) in &house.aliases {
         let set = seat_aliases.entry(canon.clone()).or_default();
         for alias_slug in alias_list {
@@ -833,7 +805,7 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 9. Remove any alias that collides with a canonical seat or an earlier seat's alias.
+    // An alias that collides with a canonical seat or an earlier seat's alias is dropped.
     let canonical_seats: BTreeSet<SeatName> = seat_aliases.keys().cloned().collect();
     let mut claimed_aliases: BTreeSet<SeatName> = BTreeSet::new();
     let witness = &house.witness_seat;
@@ -981,7 +953,7 @@ pub fn format_delivery_status(
         SeatStatus::Active => {
             let since = state.last_live_at(seat);
             let since_str = match since {
-                Some(ts) => crate::unix_secs_to_iso8601_utc(ts.0 / 1_000),
+                Some(ts) => ts.to_rfc3339_sec(),
                 None => "never".to_owned(),
             };
             DeliveryStatus::Offline {
@@ -1470,14 +1442,13 @@ impl PresenceState {
         }
         let lane = normalize_lane(&query.lane)?;
 
-        // 1. Exact canonical seat name (works even when all bindings are offline).
+        // An exact canonical seat name resolves even when all bindings are offline.
         if let Ok(seat_name) = SeatName::parse(q.to_ascii_lowercase())
             && let Some(record) = self.seats.get(&seat_name)
         {
             return Ok(self.build_resolution(record, lane.as_deref(), now));
         }
 
-        // 2. Registered alias match across durable records.
         let alias_matches: Vec<&SeatRecord> = self
             .seats
             .values()
@@ -1498,7 +1469,7 @@ impl PresenceState {
             )));
         }
 
-        // 3. Project or role ownership match (non-retired first, then retired fallback).
+        // Project or role owners: non-retired first, then retired as a fallback.
         let matches_project_or_role = |rec: &SeatRecord| {
             rec.projects.iter().any(|p| p.value.eq_ignore_ascii_case(q))
                 || rec
@@ -1644,7 +1615,7 @@ impl Presence {
             PresenceCommand::PresenceTransportHealth(c) => Self::decide_transport_health(state, c),
             PresenceCommand::PresenceList(_) => Ok(vec![]),
             PresenceCommand::PresenceResolve(q) => {
-                state.resolve_at(q, ctx.at)?;
+                state.resolve_at(q, ctx.at())?;
                 Ok(vec![])
             }
         }
@@ -1670,7 +1641,7 @@ impl Presence {
         let house = &state.house;
         if house.is_operator_seat(c.seat.as_str()) && status == SeatStatus::Active {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "claim operator surface seat '{}' as active (the operator surface cannot become an active seat)",
                     c.seat
@@ -1682,7 +1653,7 @@ impl Presence {
             .any(|alias| house.is_operator_seat(alias.as_str()))
         {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "claim reserved operator surface '{}' as an alias of '{}'",
                     house.operator_seat, c.seat
@@ -1692,11 +1663,9 @@ impl Presence {
 
         // `start_cmd` and `resume_cmd` are operator-only command fields: no
         // seat, worker, or system principal may set or mutate them.
-        if !matches!(ctx.by, Principal::Operator { .. })
-            && (c.start_cmd.is_some() || c.resume_cmd.is_some())
-        {
+        if !ctx.by().is_operator() && (c.start_cmd.is_some() || c.resume_cmd.is_some()) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "set start_cmd/resume_cmd on seat '{}' (operator-only)",
                     c.seat
@@ -1710,19 +1679,19 @@ impl Presence {
                     what: format!("seat '{old_seat}' to replace"),
                 });
             };
-            if !can_manage_seat(&ctx.by, old_seat, Some(old_rec)) {
+            if !can_manage_seat(ctx.by(), old_seat, Some(old_rec)) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("replace seat '{old_seat}'"),
                 });
             }
         }
 
         if let Some(rec) = existing {
-            if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+            if !can_manage_seat(ctx.by(), &c.seat, Some(rec)) {
                 if replacing_self {
                     return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
+                        principal: ctx.by().to_string(),
                         action: format!("replace seat '{}'", c.seat),
                     });
                 }
@@ -1732,11 +1701,11 @@ impl Presence {
                 )));
             }
             if replacing_self
-                && !matches!(ctx.by, Principal::Operator { .. })
+                && !ctx.by().is_operator()
                 && (rec.start_cmd.is_some() || rec.resume_cmd.is_some())
             {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!(
                         "clear start_cmd/resume_cmd on seat '{}' via replace (operator-only)",
                         c.seat
@@ -1744,9 +1713,9 @@ impl Presence {
                 });
             }
         } else {
-            if !can_manage_seat(&ctx.by, &c.seat, None) {
+            if !can_manage_seat(ctx.by(), &c.seat, None) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("claim seat '{}'", c.seat),
                 });
             }
@@ -1773,7 +1742,7 @@ impl Presence {
             }
         }
 
-        let prov = make_provenance(&ctx.by, &c.seat, c.verified_how.clone(), ctx.at);
+        let prov = make_provenance(ctx.by(), &c.seat, c.verified_how.clone(), ctx.at());
         let mut events = Vec::new();
 
         if let Some(old_seat) = replacing_other
@@ -1872,7 +1841,7 @@ impl Presence {
         };
 
         let retired_at = if status == SeatStatus::Retired {
-            existing.and_then(|r| r.retired_at).or(Some(ctx.at))
+            existing.and_then(|r| r.retired_at).or(Some(ctx.at()))
         } else {
             None
         };
@@ -1913,15 +1882,12 @@ impl Presence {
             None => existing.and_then(|r| r.rex_target.clone()),
         };
 
-        let can_reassign_owner = matches!(
-            ctx.by,
-            Principal::Operator { .. } | Principal::System { .. }
-        );
+        let can_reassign_owner = ctx.by().is_operator_or_system();
         let (claimed_by, claimed_at) = match existing {
             Some(rec) if !(replacing_self && can_reassign_owner) => {
                 (rec.claimed_by.clone(), rec.claimed_at)
             }
-            _ => (ctx.by.clone(), ctx.at),
+            _ => (ctx.by().clone(), ctx.at()),
         };
 
         let record = SeatRecord {
@@ -1954,7 +1920,7 @@ impl Presence {
     ) -> Result<Vec<PresenceEvent>, ApiError> {
         if state.house.is_operator_seat(c.seat.as_str()) && c.status == SeatStatus::Active {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "set operator surface seat '{}' to active (the operator surface cannot become an active seat)",
                     c.seat
@@ -1966,13 +1932,13 @@ impl Presence {
                 what: format!("seat '{}'", c.seat),
             });
         };
-        if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+        if !can_manage_seat(ctx.by(), &c.seat, Some(rec)) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("set status for seat '{}'", c.seat),
             });
         }
-        let provenance = make_provenance(&ctx.by, &c.seat, c.verified_how.clone(), ctx.at);
+        let provenance = make_provenance(ctx.by(), &c.seat, c.verified_how.clone(), ctx.at());
         let mut events = vec![PresenceEvent::SeatStatusSet {
             seat: c.seat.clone(),
             status: c.status,
@@ -2009,7 +1975,7 @@ impl Presence {
         // bound as an active seat by any hook or principal.
         if state.house.is_operator_seat(c.seat.as_str()) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "bind operator surface seat '{}' (the operator surface cannot be bound as an active seat)",
                     c.seat
@@ -2024,9 +1990,9 @@ impl Presence {
 
         let existing_seat = state.seats.get(&c.seat);
         if let Some(rec) = existing_seat {
-            if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+            if !can_manage_seat(ctx.by(), &c.seat, Some(rec)) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("bind seat '{}'", c.seat),
                 });
             }
@@ -2037,9 +2003,9 @@ impl Presence {
                 )));
             }
         } else {
-            if !can_manage_seat(&ctx.by, &c.seat, None) {
+            if !can_manage_seat(ctx.by(), &c.seat, None) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("bind seat '{}'", c.seat),
                 });
             }
@@ -2053,11 +2019,11 @@ impl Presence {
 
         let expires_at = match c.liveness {
             LivenessMode::SocketLifetime => {
-                c.ttl_ms.map(|ttl| UnixMs(ctx.at.0.saturating_add(ttl)))
+                c.ttl_ms.map(|ttl| UnixMs(ctx.at().0.saturating_add(ttl)))
             }
             LivenessMode::ProcessAndLease | LivenessMode::LeaseOnly => {
                 let ttl = c.ttl_ms.unwrap_or(DEFAULT_LEASE_TTL_MS);
-                Some(UnixMs(ctx.at.0.saturating_add(ttl)))
+                Some(UnixMs(ctx.at().0.saturating_add(ttl)))
             }
         };
 
@@ -2074,7 +2040,7 @@ impl Presence {
                 }
 
                 // Lease already elapsed -> dead, auto-superseded.
-                if b.expires_at.is_some_and(|exp| exp <= ctx.at) {
+                if b.expires_at.is_some_and(|exp| exp <= ctx.at()) {
                     superseded.push(b.incarnation_id.clone());
                     continue;
                 }
@@ -2144,7 +2110,7 @@ impl Presence {
         let effective_horizon = c
             .mail_horizon_at
             .or_else(|| existing_seat.and_then(|r| r.mail_horizon_at))
-            .or(Some(ctx.at));
+            .or(Some(ctx.at()));
 
         let mut events = Vec::new();
         if let Some(rec) = existing_seat {
@@ -2154,7 +2120,7 @@ impl Presence {
                 events.push(PresenceEvent::SeatClaimed { record: updated });
             }
         } else {
-            let prov = make_provenance(&ctx.by, &c.seat, None, ctx.at);
+            let prov = make_provenance(ctx.by(), &c.seat, None, ctx.at());
             events.push(PresenceEvent::SeatClaimed {
                 record: SeatRecord {
                     seat: c.seat.clone(),
@@ -2172,8 +2138,8 @@ impl Presence {
                     start_cmd: None,
                     resume_cmd: None,
                     rex_target: None,
-                    claimed_by: ctx.by.clone(),
-                    claimed_at: ctx.at,
+                    claimed_by: ctx.by().clone(),
+                    claimed_at: ctx.at(),
                 },
             });
         }
@@ -2185,7 +2151,7 @@ impl Presence {
             lane,
             endpoint: c.endpoint.clone(),
             liveness: c.liveness,
-            bound_at: ctx.at,
+            bound_at: ctx.at(),
             expires_at,
             status,
         };
@@ -2205,9 +2171,9 @@ impl Presence {
             return Err(invalid("ttl_ms", "ttl_ms must be positive"));
         }
         let existing_seat = state.seats.get(&c.seat);
-        if !can_manage_seat(&ctx.by, &c.seat, existing_seat) {
+        if !can_manage_seat(ctx.by(), &c.seat, existing_seat) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("heartbeat seat '{}'", c.seat),
             });
         }
@@ -2229,7 +2195,7 @@ impl Presence {
                 c.seat, c.incarnation_id, binding.status
             )));
         }
-        if binding.expires_at.is_some_and(|exp| exp <= ctx.at) {
+        if binding.expires_at.is_some_and(|exp| exp <= ctx.at()) {
             return Err(ApiError::conflict(format!(
                 "binding '{}/{}' lease already expired; rebind",
                 c.seat, c.incarnation_id
@@ -2238,11 +2204,11 @@ impl Presence {
         let expires_at = match binding.liveness {
             LivenessMode::SocketLifetime => c
                 .ttl_ms
-                .map(|ttl| UnixMs(ctx.at.0.saturating_add(ttl)))
+                .map(|ttl| UnixMs(ctx.at().0.saturating_add(ttl)))
                 .or(binding.expires_at),
             LivenessMode::ProcessAndLease | LivenessMode::LeaseOnly => {
                 let ttl = c.ttl_ms.unwrap_or(DEFAULT_LEASE_TTL_MS);
-                Some(UnixMs(ctx.at.0.saturating_add(ttl)))
+                Some(UnixMs(ctx.at().0.saturating_add(ttl)))
             }
         };
         Ok(vec![PresenceEvent::Heartbeated {
@@ -2258,9 +2224,9 @@ impl Presence {
         ctx: &DecideCtx,
     ) -> Result<Vec<PresenceEvent>, ApiError> {
         let existing_seat = state.seats.get(&c.seat);
-        if !can_manage_seat(&ctx.by, &c.seat, existing_seat) {
+        if !can_manage_seat(ctx.by(), &c.seat, existing_seat) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("unbind seat '{}'", c.seat),
             });
         }

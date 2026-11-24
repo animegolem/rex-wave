@@ -121,6 +121,16 @@ pub enum Interest {
     Stage { target: StageTarget },
 }
 
+/// Which stream universe a `from_head` `Wait` cursor has already snapshotted
+/// into explicit `positions`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum SnapshotScope {
+    Mentions,
+    Project { project: BbProjectId },
+    Everything,
+}
+
 /// A multi-stream resume position. Missing streams mean `Seq::ORIGIN`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Cursor {
@@ -128,6 +138,11 @@ pub struct Cursor {
     /// Streams not listed start at their head at subscribe time instead of origin.
     #[serde(default)]
     from_head: bool,
+    /// Scope of streams whose subscription-time heads were materialized into
+    /// `positions` by `Wait`, allowing new streams inside that scope to start at
+    /// `Seq::ORIGIN` while broader waits initialize newly included streams at head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot: Option<SnapshotScope>,
 }
 
 impl Cursor {
@@ -136,10 +151,26 @@ impl Cursor {
         Cursor {
             positions: Vec::new(),
             from_head: true,
+            snapshot: None,
         }
     }
     pub fn from_head(&self) -> bool {
         self.from_head
+    }
+    pub fn snapshot(&self) -> Option<&SnapshotScope> {
+        self.snapshot.as_ref()
+    }
+    pub fn with_from_head(mut self, from_head: bool) -> Self {
+        self.from_head = from_head;
+        if from_head {
+            self.snapshot = None;
+        }
+        self
+    }
+    pub fn with_snapshot(mut self, scope: SnapshotScope) -> Self {
+        self.from_head = false;
+        self.snapshot = Some(scope);
+        self
     }
     /// Is `stream` positioned explicitly (rather than by the default)?
     pub fn lists(&self, stream: &StreamId) -> bool {
@@ -155,6 +186,36 @@ impl Cursor {
             .find(|(s, _)| s == stream)
             .map(|(_, q)| *q)
             .unwrap_or(Seq::ORIGIN)
+    }
+    pub fn try_map_streams<F, E>(&self, mut f: F) -> Result<Cursor, E>
+    where
+        F: FnMut(StreamId) -> Result<StreamId, E>,
+    {
+        let mut out = Cursor {
+            positions: Vec::with_capacity(self.positions.len()),
+            from_head: self.from_head,
+            snapshot: self.snapshot.clone(),
+        };
+        for (stream, seq) in &self.positions {
+            out.advance(&f(stream.clone())?, *seq);
+        }
+        Ok(out)
+    }
+    pub fn filter_map_streams<F>(&self, mut f: F) -> Cursor
+    where
+        F: FnMut(&StreamId) -> Option<StreamId>,
+    {
+        let mut out = Cursor {
+            positions: Vec::with_capacity(self.positions.len()),
+            from_head: self.from_head,
+            snapshot: self.snapshot.clone(),
+        };
+        for (stream, seq) in &self.positions {
+            if let Some(mapped) = f(stream) {
+                out.advance(&mapped, *seq);
+            }
+        }
+        out
     }
     /// Advance monotonically (never moves backwards; idempotent on replays).
     pub fn advance(&mut self, stream: &StreamId, seq: Seq) {

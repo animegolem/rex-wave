@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use futures_util::StreamExt;
 use rex_wave_api::read::{AgentEventKind, Read, ThreadPageView};
 use rex_wave_api::room::{Body, RoomEvent};
@@ -1301,11 +1302,11 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
 
     let room = wave_room(&wave, &project);
     let room_page = operator
-        .call(Read {
-            stream: StreamId::Room { room: room.clone() },
-            after: Seq::ORIGIN,
-            limit: Some(100),
-        })
+        .call(Read::stream(
+            StreamId::Room { room: room.clone() },
+            Seq::ORIGIN,
+            Some(100),
+        ))
         .await
         .unwrap();
     let mirrored: Vec<&Envelope> = room_page
@@ -2358,11 +2359,7 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
     .await;
 
     let room_page = operator
-        .call(Read {
-            stream: StreamId::Room { room },
-            after: Seq::ORIGIN,
-            limit: Some(50),
-        })
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
         .await
         .unwrap();
     let worker_posts: Vec<&Envelope> = room_page

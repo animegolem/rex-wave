@@ -29,7 +29,10 @@
 //!
 //! The SQLite schema is private; nothing outside this crate sees rusqlite.
 
-use rex_wave_api::{Envelope, Event, IdemKey, Principal, Seq, StreamId, UnixMs};
+use rex_wave_api::{
+    Envelope, Event, IdemKey, Principal, Seq, StreamId, UnixMs,
+    room::{PrincipalPair, RoomId},
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
@@ -188,6 +191,35 @@ fn find_idem(
     )?))
 }
 
+/// Outcome of resolving a DM room for an idempotent command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DmIdemResolution {
+    Route(RoomId),
+    CrossAuthor { room: RoomId },
+    Ambiguous(Vec<RoomId>),
+}
+
+fn legacy_dm_candidates(a: &Principal, b: &Principal) -> Vec<RoomId> {
+    let mut pairs = Vec::new();
+    if let Principal::Seat { seat } = a {
+        pairs.push((Principal::Operator { seat: seat.clone() }, b.clone()));
+    }
+    if let Principal::Seat { seat } = b {
+        pairs.push((a.clone(), Principal::Operator { seat: seat.clone() }));
+    }
+    if let (Principal::Seat { seat: sa }, Principal::Seat { seat: sb }) = (a, b) {
+        pairs.push((
+            Principal::Operator { seat: sa.clone() },
+            Principal::Operator { seat: sb.clone() },
+        ));
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(la, lb)| PrincipalPair::new(la, lb).ok())
+        .map(|pair| RoomId::Direct { pair })
+        .collect()
+}
+
 impl Journal {
     /// Open (creating if needed) the journal at `path` in WAL mode.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -246,6 +278,135 @@ impl Journal {
     /// Current head of a stream (`Seq::ORIGIN` if empty).
     pub fn head(&self, stream: &StreamId) -> Result<Seq, StoreError> {
         head_of(&self.inner.conn(), stream)
+    }
+
+    /// Current heads of `streams` read from a single consistent SQLite snapshot
+    /// (`Seq::ORIGIN` for any empty stream), without scanning unrelated streams.
+    pub fn heads(&self, streams: &[StreamId]) -> Result<Vec<(StreamId, Seq)>, StoreError> {
+        if streams.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.inner.conn();
+        let tx = conn.transaction()?;
+        let mut out = Vec::with_capacity(streams.len());
+        {
+            let mut stmt = tx.prepare_cached("SELECT max(seq) FROM entries WHERE stream = ?1")?;
+            for s in streams {
+                let max: Option<i64> = stmt.query_row(params![key(s)], |r| r.get(0))?;
+                out.push((s.clone(), Seq(max.unwrap_or(0) as u64)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Non-destructive compatibility lookup for pre-PR-26 `(Operator, peer)`
+    /// DM streams:
+    /// - Never modifies SQLite rows (preserving append-only immutability,
+    ///   `Herald` dedupe keys, `Inbox` cursors, `idem` keys, and `Banked` ranges).
+    /// - If `room` is not a canonical `(Seat, peer)` DM, or `room` already has
+    ///   committed entries (`head > 0`), returns `room` unchanged.
+    /// - Otherwise (`room` is a canonical `(Seat, peer)` DM with `head == 0`),
+    ///   checks whether a pre-upgrade `(Operator, peer)` stream already exists
+    ///   (`head > 0`) and returns it so existing operator DM history continues
+    ///   without splitting.
+    pub fn resolve_dm_room(&self, room: RoomId) -> Result<RoomId, StoreError> {
+        let RoomId::Direct { ref pair } = room else {
+            return Ok(room);
+        };
+        let (a, b): (Principal, Principal) = pair.clone().into();
+        if a.is_operator() || b.is_operator() {
+            return Ok(room);
+        }
+        let conn = self.inner.conn();
+        if head_of(&conn, &StreamId::Room { room: room.clone() })? > Seq::ORIGIN {
+            return Ok(room);
+        }
+        for legacy_room in legacy_dm_candidates(&a, &b) {
+            if head_of(
+                &conn,
+                &StreamId::Room {
+                    room: legacy_room.clone(),
+                },
+            )? > Seq::ORIGIN
+            {
+                return Ok(legacy_room);
+            }
+        }
+        Ok(room)
+    }
+
+    /// Resolve a DM room for a command carrying an optional idempotency key:
+    /// - When `allow_legacy_fallback` is false (explicit `RoomRef::Id`), keeps
+    ///   `room` pinned to its exact stream while verifying `idem` authorship.
+    /// - When `allow_legacy_fallback` is true (`RoomRef::Dm`), checks both
+    ///   canonical and pre-PR-26 `(Operator, peer)` histories for `idem`,
+    ///   routing to the unique stream where `by` (`same_actor`) committed `idem`,
+    ///   returning [`DmIdemResolution::Ambiguous`] when `idem` exists for `by`
+    ///   on multiple histories, and [`DmIdemResolution::CrossAuthor`] when
+    ///   `idem` was committed by another participant.
+    pub fn resolve_dm_room_with_idem(
+        &self,
+        room: RoomId,
+        by: &Principal,
+        idem: Option<&IdemKey>,
+        allow_legacy_fallback: bool,
+    ) -> Result<DmIdemResolution, StoreError> {
+        let RoomId::Direct { ref pair } = room else {
+            return Ok(DmIdemResolution::Route(room));
+        };
+        let (a, b): (Principal, Principal) = pair.clone().into();
+        let conn = self.inner.conn();
+
+        if !allow_legacy_fallback || a.is_operator() || b.is_operator() {
+            if let Some(key) = idem
+                && let Some(batch) = find_idem(&conn, &StreamId::Room { room: room.clone() }, key)?
+                && batch.first().is_some_and(|env| !env.by.same_actor(by))
+            {
+                return Ok(DmIdemResolution::CrossAuthor { room });
+            }
+            return Ok(DmIdemResolution::Route(room));
+        }
+
+        let canon_exists = head_of(&conn, &StreamId::Room { room: room.clone() })? > Seq::ORIGIN;
+        let mut legacy_existing = Vec::new();
+        for cand in legacy_dm_candidates(&a, &b) {
+            if head_of(&conn, &StreamId::Room { room: cand.clone() })? > Seq::ORIGIN {
+                legacy_existing.push(cand);
+            }
+        }
+        if let Some(key) = idem {
+            let mut to_check = Vec::with_capacity(1 + legacy_existing.len());
+            if canon_exists {
+                to_check.push(room.clone());
+            }
+            to_check.extend(legacy_existing.iter().cloned());
+
+            let mut same_actor_rooms = Vec::new();
+            let mut other_actor_rooms = Vec::new();
+            for r in to_check {
+                if let Some(batch) = find_idem(&conn, &StreamId::Room { room: r.clone() }, key)? {
+                    if batch.first().is_some_and(|env| env.by.same_actor(by)) {
+                        same_actor_rooms.push(r);
+                    } else {
+                        other_actor_rooms.push(r);
+                    }
+                }
+            }
+            if same_actor_rooms.len() == 1 {
+                return Ok(DmIdemResolution::Route(same_actor_rooms.remove(0)));
+            }
+            if same_actor_rooms.len() > 1 {
+                return Ok(DmIdemResolution::Ambiguous(same_actor_rooms));
+            }
+            if let Some(other_room) = other_actor_rooms.into_iter().next() {
+                return Ok(DmIdemResolution::CrossAuthor { room: other_room });
+            }
+        }
+        if canon_exists || legacy_existing.is_empty() {
+            Ok(DmIdemResolution::Route(room))
+        } else {
+            Ok(DmIdemResolution::Route(legacy_existing.remove(0)))
+        }
     }
 
     /// Every stream with at least one entry, with its head.
@@ -353,5 +514,200 @@ impl StreamWriter {
 impl Drop for StreamWriter {
     fn drop(&mut self) {
         self.inner.claimed().remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+mod legacy_dm_tests {
+    use super::*;
+    use rex_wave_api::SeatName;
+    use rex_wave_api::room::{Body, Mentions, RoomEvent, RoomOrigin, RoomRef};
+
+    #[test]
+    fn resolves_pre_pr26_operator_dm_without_mutating_single_or_split_journals() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        };
+        let legacy_room = RoomId::Direct {
+            pair: PrincipalPair::new(op.clone(), alice.clone()).unwrap(),
+        };
+        let canon_room = RoomRef::Dm {
+            with: alice.clone(),
+        }
+        .resolve(&op)
+        .unwrap();
+        assert_ne!(legacy_room, canon_room);
+
+        // Case 1: Only the pre-PR-26 (Operator, Seat) stream exists.
+        let single_db = dir.path().join("single.sqlite3");
+        {
+            let j = Journal::open(&single_db).unwrap();
+            let mut w = j
+                .claim(StreamId::Room {
+                    room: legacy_room.clone(),
+                })
+                .unwrap();
+            w.append(
+                &op,
+                UnixMs(1_000),
+                Some(&IdemKey::parse("op-1").unwrap()),
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: legacy_room.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("pre-upgrade dm").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                ],
+            )
+            .unwrap();
+        }
+        let reopened = Journal::open(&single_db).unwrap();
+        assert_eq!(
+            reopened.resolve_dm_room(canon_room.clone()).unwrap(),
+            legacy_room,
+            "single legacy DM stream continues without splitting"
+        );
+        assert_eq!(
+            reopened
+                .head(&StreamId::Room {
+                    room: legacy_room.clone()
+                })
+                .unwrap(),
+            Seq(2)
+        );
+
+        // Case 2: Both (Seat, Seat) and (Operator, Seat) already exist in a 3e50dc4 journal.
+        let split_db = dir.path().join("split.sqlite3");
+        {
+            let j = Journal::open(&split_db).unwrap();
+            let same_idem = IdemKey::parse("same-idem").unwrap();
+            let mut w_canon = j
+                .claim(StreamId::Room {
+                    room: canon_room.clone(),
+                })
+                .unwrap();
+            w_canon
+                .append(
+                    &alice,
+                    UnixMs(1_000),
+                    Some(&same_idem),
+                    vec![
+                        Event::Room(RoomEvent::Opened {
+                            id: canon_room.clone(),
+                            origin: RoomOrigin::Manual,
+                            topic: None,
+                        }),
+                        Event::Room(RoomEvent::Posted {
+                            body: Body::parse("canon post").unwrap(),
+                            mentions: Mentions::default(),
+                            re: None,
+                            after: None,
+                            labels: Vec::new(),
+                            task: None,
+                            idem: None,
+                        }),
+                    ],
+                )
+                .unwrap();
+            let mut w_legacy = j
+                .claim(StreamId::Room {
+                    room: legacy_room.clone(),
+                })
+                .unwrap();
+            w_legacy
+                .append(
+                    &op,
+                    UnixMs(2_000),
+                    Some(&same_idem),
+                    vec![
+                        Event::Room(RoomEvent::Opened {
+                            id: legacy_room.clone(),
+                            origin: RoomOrigin::Manual,
+                            topic: None,
+                        }),
+                        Event::Room(RoomEvent::Posted {
+                            body: Body::parse("legacy post").unwrap(),
+                            mentions: Mentions::default(),
+                            re: None,
+                            after: None,
+                            labels: Vec::new(),
+                            task: None,
+                            idem: None,
+                        }),
+                    ],
+                )
+                .unwrap();
+        }
+        let split = Journal::open(&split_db).unwrap();
+        assert_eq!(
+            split.resolve_dm_room(canon_room.clone()).unwrap(),
+            canon_room
+        );
+        assert_eq!(
+            split.resolve_dm_room(legacy_room.clone()).unwrap(),
+            legacy_room
+        );
+        assert_eq!(
+            split
+                .head(&StreamId::Room {
+                    room: canon_room.clone()
+                })
+                .unwrap(),
+            Seq(2)
+        );
+        assert_eq!(
+            split
+                .head(&StreamId::Room {
+                    room: legacy_room.clone()
+                })
+                .unwrap(),
+            Seq(2)
+        );
+        let same_idem = IdemKey::parse("same-idem").unwrap();
+        assert_eq!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, Some(&same_idem), true)
+                .unwrap(),
+            DmIdemResolution::Route(legacy_room.clone()),
+            "operator retry via RoomRef::Dm resolves to operator's legacy batch"
+        );
+        assert_eq!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, Some(&same_idem), false)
+                .unwrap(),
+            DmIdemResolution::CrossAuthor {
+                room: canon_room.clone()
+            },
+            "explicit canonical RoomRef::Id stays pinned to canonical stream and flags cross-author idem"
+        );
+        assert_eq!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &alice, Some(&same_idem), true)
+                .unwrap(),
+            DmIdemResolution::Route(canon_room.clone()),
+            "peer retry resolves to peer's canonical batch"
+        );
+        let bob = Principal::Seat {
+            seat: SeatName::parse("bob").unwrap(),
+        };
+        assert!(matches!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &bob, Some(&same_idem), true)
+                .unwrap(),
+            DmIdemResolution::CrossAuthor { .. }
+        ));
     }
 }

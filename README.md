@@ -76,7 +76,7 @@ Facts about your house live in an optional `$XDG_CONFIG_HOME/rex-wave/house.json
 
 The operator surface seat can never be bound or claimed as an active seat, and letters to it never ring or raise `MailUnrung`. `aliases` folds historical names into a canonical seat when `presence seed-interchange` runs. `excluded_herdr_targets` lists multiplexer panes that never name a seat. The daemon and CLI refuse a `house.json` that is a symlink, malformed, larger than 64 KiB, or names an invalid seat.
 
-By default, the daemon listens on `$XDG_STATE_HOME/rex-wave/daemon.sock`, stores its SQLite WAL journal in `journal.sqlite3` beside that socket, and binds `wake-bell` HTTP `/sink` on `127.0.0.1:7781`. Pass `--socket <path>` to any `rex-wave` command to target a custom Unix socket.
+By default, the daemon listens on `$XDG_STATE_HOME/rex-wave/daemon.sock`, stores its SQLite WAL journal in `journal.sqlite3` beside that socket, and binds `wake-bell` HTTP `/sink` on `127.0.0.1:7781`. Pass `--socket <path>` to any `rex-wave` command to target a custom Unix socket (on macOS and targets without `/proc/self/fd`, the socket parent directory must reside on the same filesystem as `/tmp` so staging stays descriptor-anchored).
 
 ## Open the two-pane TUI
 

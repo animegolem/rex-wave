@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use futures_util::StreamExt;
 use rex_wave_api::read::{AgentEvent, AgentEventKind, Read, ThreadPageView, Wait};
 use rex_wave_api::room::*;
@@ -61,7 +62,7 @@ impl Decider for ToyRooms {
             RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
-            room: r.resolve(&ctx.by)?,
+            room: r.resolve(ctx.by())?,
         })
     }
 
@@ -323,13 +324,13 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         name: ChannelName::parse("general").unwrap(),
     };
     let page = sam
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: general_id.clone(),
             },
-            after: Seq(8),
-            limit: None,
-        })
+            Seq(8),
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(page.entries.len(), 2);
@@ -815,7 +816,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
                     lane: bind.lane,
                     endpoint: bind.endpoint,
                     liveness: bind.liveness,
-                    bound_at: ctx.at,
+                    bound_at: ctx.at(),
                     expires_at: None,
                     status: BindingStatus::Live,
                 }))

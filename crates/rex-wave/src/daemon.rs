@@ -26,14 +26,13 @@ use rex_wave_t3::{
 };
 use rex_wave_transport::{
     Authenticator, ConnectionHooks, Endpoint, PrincipalTokenTable, StateDirAuthenticator,
-    WorkerTokenFile, bind_unix, check_private_file, is_safe_worker_token_id,
+    WorkerTokenFile, bind_unix_prepared, is_safe_worker_token_id, read_private_file,
     serve_listener_with_hooks, write_worker_token_file,
 };
 use rex_wave_waves::{WaveConductor, Waves};
 use std::collections::HashSet;
 use std::io::{self, Read as _};
 use std::net::SocketAddr;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -76,7 +75,7 @@ pub struct DaemonArgs {
     #[arg(long, env = "REX_WAVE_T3_TOKEN")]
     pub t3_token: Option<String>,
     /// Operator seat name bound to peer-UID sessions and unauthenticated loopback HTTP.
-    #[arg(long, default_value = "owner")]
+    #[arg(long, env = "REX_WAVE_OPERATOR", default_value = "owner")]
     pub operator: String,
     /// Loopback HTTP listener for `wake-bell` `/sink` delivery.
     #[arg(long, default_value = "127.0.0.1:7781")]
@@ -188,21 +187,49 @@ struct TokenStoreGuard {
 fn lock_token_store(tokens_path: &Path) -> io::Result<TokenStoreGuard> {
     let in_proc = token_store_lock().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(parent) = tokens_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        rex_wave_fs::create_missing_private_dir(parent)?;
     }
     let lock_path = tokens_path.with_extension("json.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)?;
+    let lock_file = rex_wave_fs::open_lock_nofollow(&lock_path)?;
     lock_file.lock()?;
     Ok(TokenStoreGuard {
         _in_proc: in_proc,
         _lock_file: lock_file,
     })
+}
+
+fn operator_seat_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("operator-seat")
+}
+
+fn persist_operator_seat(state_dir: &Path, operator: &SeatName) -> io::Result<()> {
+    let path = operator_seat_path(state_dir);
+    rex_wave_fs::write_atomic_path(&path, format!("{operator}\n").as_bytes(), 0o600, false)
+}
+
+/// Resolves the effective operator seat for `sock_path` using the same source
+/// of truth as the daemon: `<state_dir>/operator-seat` when written by a daemon
+/// on `sock_path`, then `REX_WAVE_OPERATOR`, then `"owner"`.
+pub fn resolve_effective_operator(sock_path: &Path) -> SeatName {
+    let env_val = std::env::var("REX_WAVE_OPERATOR").ok();
+    resolve_effective_operator_with_env(sock_path, env_val.as_deref())
+}
+
+fn resolve_effective_operator_with_env(sock_path: &Path, env_val: Option<&str>) -> SeatName {
+    let state_dir = state_dir_for(sock_path);
+    if let Ok(Some(bytes)) =
+        read_private_file(&operator_seat_path(&state_dir), None, "operator-seat")
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && let Ok(seat) = SeatName::parse(text.trim())
+    {
+        return seat;
+    }
+    if let Some(raw) = env_val
+        && let Ok(seat) = SeatName::parse(raw.trim())
+    {
+        return seat;
+    }
+    SeatName::parse("owner").expect("valid default operator seat")
 }
 
 fn random_token(prefix: &str) -> io::Result<String> {
@@ -228,13 +255,30 @@ pub fn mint_principal_token(
     principal: &Principal,
     thread_id: Option<&str>,
 ) -> io::Result<String> {
-    if matches!(
-        principal,
-        Principal::System { .. } | Principal::Operator { .. }
-    ) {
+    let effective_operator = resolve_effective_operator(sock_path);
+    mint_principal_token_for_operator(sock_path, principal, thread_id, &effective_operator)
+}
+
+fn mint_principal_token_for_operator(
+    sock_path: &Path,
+    principal: &Principal,
+    thread_id: Option<&str>,
+    effective_operator: &SeatName,
+) -> io::Result<String> {
+    if principal.is_operator_or_system() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "cannot mint bearer token for Operator or System principals",
+        ));
+    }
+    if let Principal::Seat { seat } = principal
+        && seat == effective_operator
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cannot mint a Seat token for operator seat '{seat}'; the operator authenticates via PeerUid or an Operator entry"
+            ),
         ));
     }
 
@@ -261,11 +305,9 @@ pub fn mint_principal_token(
         }
         let state_dir = state_dir_for(sock_path);
         let dir = worker_tokens_dir(&state_dir);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        rex_wave_fs::ensure_private_dir(&dir)?;
         let path = dir.join(tid);
-        if check_private_file(&path, None, "worker token file").unwrap_or(false)
-            && let Ok(raw) = std::fs::read(&path)
+        if let Ok(Some(raw)) = read_private_file(&path, None, "worker token file")
             && let Ok(existing) = serde_json::from_slice::<WorkerTokenFile>(&raw)
             && existing.principal == *principal
             && !existing.token.is_empty()
@@ -523,10 +565,19 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         .journal
         .clone()
         .unwrap_or_else(|| sock_path.with_file_name("journal.sqlite3"));
-    if let Some(parent) = journal_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create state dir: {e}"))?;
+    let sandbox =
+        SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
+    let mut prepared_sock = rex_wave_fs::validate_unix_socket_target(&sock_path)
+        .map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
+    prepared_sock.arm_cleanup_on_drop();
+    rex_wave_fs::create_missing_private_dir(&state_dir)
+        .map_err(|e| format!("create socket dir {}: {e}", state_dir.display()))?;
+    if let Some(parent) = journal_path.parent()
+        && parent != state_dir.as_path()
+    {
+        rex_wave_fs::create_missing_private_dir(parent)
+            .map_err(|e| format!("create state dir {}: {e}", parent.display()))?;
     }
-    std::fs::create_dir_all(&state_dir).map_err(|e| format!("create socket dir: {e}"))?;
 
     let runner_mode = resolve_runner_mode(&args);
     let t3_cfg = match runner_mode {
@@ -550,11 +601,13 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let journal = Journal::open(&journal_path).map_err(|e| format!("open journal: {e}"))?;
     let hub = Hub::new(4096);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
-    let sandbox =
-        SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
     let mail_writer = journal
         .claim(StreamId::Mail)
         .map_err(|e| format!("claim mail stream: {e}"))?;
+    let (listener, daemon_uid) = bind_unix_prepared(&sock_path, &prepared_sock)
+        .map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
+    persist_operator_seat(&state_dir, &operator)
+        .map_err(|e| format!("persist operator seat: {e}"))?;
 
     let bb_bridge = match runner_mode {
         RunnerMode::Bb | RunnerMode::Both => Some(BbBridge::with_code_runner(
@@ -597,7 +650,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
-            sandbox,
+            sandbox.clone(),
             journal.clone(),
             mail_writer,
             hub.clone(),
@@ -632,7 +685,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let herald_client = system(SystemPart::Herald);
     let herald_task = spawn_reactor(herald, herald_client.clone());
     let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client);
-    let bell_task = spawn_reactor(BellCourier, system(SystemPart::WakeBell));
+    let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
     let sink_task = tokio::spawn(rex_wave_mailbridge::serve_wake_bell_sink(
@@ -657,8 +710,6 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         disconnect_tx,
     });
 
-    let (listener, daemon_uid) =
-        bind_unix(&sock_path).map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
     let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
         operator.clone(),
         Some(daemon_uid),
@@ -701,7 +752,167 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         t.abort();
     }
     sink_task.abort();
-    let _ = std::fs::remove_file(&sock_path);
+    let _ = prepared_sock.cleanup_bound();
 
     serve_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn mint_seat_token_tracks_configured_operator_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("state/daemon.sock");
+        let owner = SeatName::parse("owner").unwrap();
+        let ops = SeatName::parse("ops").unwrap();
+        let alice = SeatName::parse("alice").unwrap();
+
+        let eff_default = resolve_effective_operator_with_env(&sock, None);
+        assert_eq!(eff_default, owner);
+        assert!(
+            mint_principal_token_for_operator(
+                &sock,
+                &Principal::Seat {
+                    seat: owner.clone()
+                },
+                None,
+                &eff_default,
+            )
+            .is_err()
+        );
+        assert!(
+            mint_principal_token_for_operator(
+                &sock,
+                &Principal::Seat { seat: ops.clone() },
+                None,
+                &eff_default,
+            )
+            .is_ok()
+        );
+
+        let eff_env = resolve_effective_operator_with_env(&sock, Some("ops"));
+        assert_eq!(eff_env, ops);
+
+        let state_dir = state_dir_for(&sock);
+        persist_operator_seat(&state_dir, &ops).unwrap();
+        assert_eq!(resolve_effective_operator_with_env(&sock, None), ops);
+        assert!(mint_seat_token(&sock, &ops).is_err());
+        assert!(mint_seat_token(&sock, &owner).is_ok());
+        assert!(mint_seat_token(&sock, &alice).is_ok());
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_invalid_sandbox_and_live_socket_without_clobbering_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let unmarked_sb = dir.path().join("unmarked");
+        std::fs::create_dir(&unmarked_sb).unwrap();
+
+        let sock = state_dir.join("daemon.sock");
+        let journal = state_dir.join("journal.sqlite3");
+        let bad_args = DaemonArgs {
+            journal: Some(journal.clone()),
+            mail_sandbox: unmarked_sb,
+            bb_url: "ws://127.0.0.1:1/disabled".into(),
+            bb_token: String::new(),
+            runner: Some(RunnerMode::Bb),
+            t3_home: None,
+            t3_url: None,
+            t3_token: None,
+            operator: "ops".into(),
+            wake_bell: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            herald_grace_ms: 100,
+        };
+        assert!(run(bad_args, Some(sock.clone())).await.is_err());
+        assert!(!sock.exists(), "failed start must not leave socket file");
+        assert!(
+            !operator_seat_path(&state_dir).exists(),
+            "failed start must not publish operator-seat"
+        );
+        assert!(!journal.exists());
+
+        let (live_listener, _) = rex_wave_transport::bind_unix(&sock).unwrap();
+        persist_operator_seat(&state_dir, &SeatName::parse("owner").unwrap()).unwrap();
+        let valid_sb = dir.path().join("sb");
+        std::fs::create_dir(&valid_sb).unwrap();
+        std::fs::write(valid_sb.join(".rex-wave-sandbox"), b"ok\n").unwrap();
+        let second_args = DaemonArgs {
+            journal: Some(journal),
+            mail_sandbox: valid_sb,
+            bb_url: "ws://127.0.0.1:1/disabled".into(),
+            bb_token: String::new(),
+            runner: Some(RunnerMode::Bb),
+            t3_home: None,
+            t3_url: None,
+            t3_token: None,
+            operator: "intruder".into(),
+            wake_bell: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            herald_grace_ms: 100,
+        };
+        let second_err = run(second_args, Some(sock.clone())).await.unwrap_err();
+        assert!(
+            second_err.contains("already listening"),
+            "unexpected error: {second_err}"
+        );
+        assert!(
+            std::os::unix::net::UnixStream::connect(&sock).is_ok(),
+            "healthy listener must remain reachable after failed second start"
+        );
+        assert_eq!(
+            resolve_effective_operator_with_env(&sock, None).as_str(),
+            "owner"
+        );
+        drop(live_listener);
+
+        let held_prepare = rex_wave_fs::validate_unix_socket_target(&sock).unwrap();
+        let concurrent_err = rex_wave_fs::validate_unix_socket_target(&sock)
+            .err()
+            .expect("concurrent startup lock must reject second caller");
+        assert_eq!(concurrent_err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(held_prepare);
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_insecure_preexisting_socket_dir_before_opening_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("insecure-state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let sandbox_dir = dir.path().join("sb");
+        std::fs::create_dir(&sandbox_dir).unwrap();
+        std::fs::write(sandbox_dir.join(".rex-wave-sandbox"), b"ok\n").unwrap();
+
+        let sock = state_dir.join("daemon.sock");
+        let journal = state_dir.join("journal.sqlite3");
+        let args = DaemonArgs {
+            journal: Some(journal.clone()),
+            mail_sandbox: sandbox_dir,
+            bb_url: "ws://127.0.0.1:1/disabled".into(),
+            bb_token: String::new(),
+            runner: Some(RunnerMode::Bb),
+            t3_home: None,
+            t3_url: None,
+            t3_token: None,
+            operator: "owner".into(),
+            wake_bell: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            herald_grace_ms: 100,
+        };
+        let err = run(args, Some(sock)).await.unwrap_err();
+        assert!(
+            err.contains("group- or world-writable"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !journal.exists(),
+            "daemon must validate socket directory before opening journal"
+        );
+    }
 }

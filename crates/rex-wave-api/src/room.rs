@@ -65,6 +65,17 @@ impl PrincipalPair {
             None
         }
     }
+    /// The other side of this pair as `viewer` sees it. `Operator { seat }` and
+    /// `Seat { seat }` share the same `@<seat>` DM identity.
+    pub fn other_for_viewer(&self, viewer: &Principal) -> Option<&Principal> {
+        if self.lo.same_actor(viewer) && !self.hi.same_actor(viewer) {
+            Some(&self.hi)
+        } else if self.hi.same_actor(viewer) && !self.lo.same_actor(viewer) {
+            Some(&self.lo)
+        } else {
+            None
+        }
+    }
 }
 impl JsonSchema for PrincipalPair {
     fn schema_name() -> Cow<'static, str> {
@@ -107,8 +118,73 @@ impl RoomRef {
                 name: name.clone(),
             }),
             RoomRef::Dm { with } => Ok(RoomId::Direct {
-                pair: PrincipalPair::new(me.clone(), with.clone())?,
+                pair: PrincipalPair::new(me.as_dm_member(), with.as_dm_member())?,
             }),
+        }
+    }
+
+    /// Parse the canonical spelling: `#<channel>`, `#<project>/<channel>`
+    /// (the project may itself contain `/`, and an optional `proj:` prefix
+    /// is dropped), `@<seat>`, or `@<wave>/<role>`. The inverse of
+    /// [`RoomRef`]'s `Display` for channel and member-DM refs.
+    pub fn parse_str(raw: &str) -> Result<Self, InvalidId> {
+        if let Some(rest) = raw.strip_prefix('#') {
+            let Some((project, name)) = rest.rsplit_once('/') else {
+                return Ok(RoomRef::Channel {
+                    scope: RoomScope::Global,
+                    name: ChannelName::parse(rest)?,
+                });
+            };
+            return Ok(RoomRef::Channel {
+                scope: RoomScope::Project {
+                    project: BbProjectId::parse(project.strip_prefix("proj:").unwrap_or(project))?,
+                },
+                name: ChannelName::parse(name)?,
+            });
+        }
+        if raw.starts_with('@') {
+            return Ok(RoomRef::Dm {
+                with: Principal::parse_member_ref(raw)?,
+            });
+        }
+        Err(InvalidId {
+            what: "room".into(),
+            reason: "expected #<channel>, #<project>/<channel>, @<seat>, or @<wave>/<role>".into(),
+        })
+    }
+}
+
+impl std::str::FromStr for RoomRef {
+    type Err = InvalidId;
+    fn from_str(raw: &str) -> Result<Self, InvalidId> {
+        Self::parse_str(raw)
+    }
+}
+
+fn fmt_channel(
+    f: &mut std::fmt::Formatter<'_>,
+    scope: &RoomScope,
+    name: &ChannelName,
+) -> std::fmt::Result {
+    match scope {
+        RoomScope::Global => write!(f, "#{}", name.as_str()),
+        RoomScope::Project { project } => write!(f, "#{}/{}", project.as_str(), name.as_str()),
+    }
+}
+
+/// `#<channel>`, `#<project>/<channel>`, `@<member>`; a resolved DM id shows
+/// as `dm:<a>,<b>`.
+impl std::fmt::Display for RoomRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoomRef::Channel { scope, name }
+            | RoomRef::Id {
+                id: RoomId::Channel { scope, name },
+            } => fmt_channel(f, scope, name),
+            RoomRef::Dm { with } => write!(f, "{with}"),
+            RoomRef::Id {
+                id: RoomId::Direct { pair },
+            } => write!(f, "dm:{},{}", pair.lo, pair.hi),
         }
     }
 }
@@ -186,6 +262,7 @@ pub enum TaskStatus {
     Review,
     Blocked,
     Done,
+    #[serde(alias = "canceled")]
     Cancelled,
 }
 
@@ -552,4 +629,84 @@ pub enum RoomEvent {
         #[serde(default)]
         clear_due: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::{RoleName, SeatName};
+
+    #[test]
+    fn room_ref_from_str_inverts_display() {
+        let channels = ["general", "wave-alpha", "ops_1"];
+        let projects = ["proj_demo_1", "/workspace/repo", "/tmp/work/sample-repo"];
+        let mut refs = Vec::new();
+        for name in channels {
+            let name = ChannelName::parse(name).unwrap();
+            refs.push(RoomRef::Channel {
+                scope: RoomScope::Global,
+                name: name.clone(),
+            });
+            for project in projects {
+                refs.push(RoomRef::Channel {
+                    scope: RoomScope::Project {
+                        project: BbProjectId::parse(project).unwrap(),
+                    },
+                    name: name.clone(),
+                });
+            }
+        }
+        for seat in ["alice", "bob-2"] {
+            refs.push(RoomRef::Dm {
+                with: Principal::Seat {
+                    seat: SeatName::parse(seat).unwrap(),
+                },
+            });
+        }
+        for (wave, role) in [("auth-v2", "author"), ("council-v1", "critic")] {
+            refs.push(RoomRef::Dm {
+                with: Principal::Worker {
+                    wave: WaveSlug::parse(wave).unwrap(),
+                    role: RoleName::parse(role).unwrap(),
+                },
+            });
+        }
+        for r in refs {
+            let text = r.to_string();
+            assert_eq!(text.parse::<RoomRef>().unwrap(), r, "{text}");
+        }
+    }
+
+    #[test]
+    fn room_ref_parses_path_projects_and_proj_prefix() {
+        let expected = RoomRef::Channel {
+            scope: RoomScope::Project {
+                project: BbProjectId::parse("/workspace/repo").unwrap(),
+            },
+            name: ChannelName::parse("wave-alpha").unwrap(),
+        };
+        assert_eq!(
+            RoomRef::parse_str("#/workspace/repo/wave-alpha").unwrap(),
+            expected
+        );
+        assert_eq!(
+            RoomRef::parse_str("#proj:/workspace/repo/wave-alpha").unwrap(),
+            expected
+        );
+        for bad in ["general", "", "#", "@", "@a/b/c", "#proj/"] {
+            assert!(RoomRef::parse_str(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn member_refs_never_name_operator_or_system() {
+        assert!(matches!(
+            Principal::parse_member_ref("@sam").unwrap(),
+            Principal::Seat { .. }
+        ));
+        assert!(matches!(
+            Principal::parse_member_ref("auth-v2/author").unwrap(),
+            Principal::Worker { .. }
+        ));
+    }
 }

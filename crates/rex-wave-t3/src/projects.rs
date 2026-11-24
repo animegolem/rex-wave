@@ -116,12 +116,15 @@ pub fn load_t3_project_names_from_sqlite(db_path: &Path) -> BTreeMap<BbProjectId
 
 /// Resolves a BB project ID (`proj_...`) to its local workspace root using
 /// `<bb_data_dir>/projects.json` and read-only `<bb_data_dir>/bb.db`.
+/// The largest BB `projects.json` cache read.
+const MAX_PROJECT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub fn lookup_bb_project_location(
     bb_data_dir: &Path,
     project_id: &str,
 ) -> Option<BbProjectLocation> {
     let json_path = bb_data_dir.join("projects.json");
-    if let Ok(raw) = std::fs::read(&json_path)
+    if let Ok(raw) = rex_wave_fs::read_regular_bounded(&json_path, MAX_PROJECT_CACHE_BYTES)
         && let Ok(val) = serde_json::from_slice::<Value>(&raw)
         && let Some(found) = lookup_bb_project_in_json(&val, project_id)
     {
@@ -242,15 +245,27 @@ fn lookup_bb_project_in_sqlite(db_path: &Path, project_id: &str) -> Option<BbPro
 }
 
 fn normalize_path_key(raw: &str) -> String {
-    let path = Path::new(raw);
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon.to_string_lossy().trim_end_matches('/').to_owned();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
     }
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() && raw.starts_with('/') {
+    if looks_like_path(trimmed) || Path::new(trimmed).is_absolute() {
+        let expanded = expand_tilde(trimmed);
+        if let Ok(real) = rex_wave_fs::canonicalize_existing_prefix(&expanded) {
+            let s = real.to_string_lossy();
+            let stripped = s.trim_end_matches('/');
+            return if stripped.is_empty() {
+                "/".to_owned()
+            } else {
+                stripped.to_owned()
+            };
+        }
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    if stripped.is_empty() && raw.starts_with('/') {
         "/".to_owned()
     } else {
-        trimmed.to_owned()
+        stripped.to_owned()
     }
 }
 
@@ -321,8 +336,9 @@ pub async fn resolve_or_ensure_t3_project(
 
     let (target_root, desired_title) = if looks_like_path(raw) {
         let expanded = expand_tilde(raw);
-        let root_str = expanded.to_string_lossy().into_owned();
-        let title = expanded
+        let resolved = rex_wave_fs::canonicalize_existing_prefix(&expanded).unwrap_or(expanded);
+        let root_str = resolved.to_string_lossy().into_owned();
+        let title = resolved
             .file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
@@ -469,5 +485,52 @@ mod tests {
         let loc = lookup_bb_project_location(&bb_dir, "proj_alpha").unwrap();
         assert_eq!(loc.name.as_deref(), Some("alpha-repo"));
         assert_eq!(loc.workspace_root, PathBuf::from("/tmp/alpha-main"));
+
+        let repo_dir = tmp.path().join("SampleRepo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let abs_key = normalize_path_key(&repo_dir.to_string_lossy());
+        let cwd = std::env::current_dir().unwrap();
+        if let Ok(rel_from_cwd) = strip_or_rel(&cwd, &repo_dir) {
+            assert_eq!(normalize_path_key(&rel_from_cwd), abs_key);
+        }
+        if rex_wave_fs::is_case_insensitive_dir(tmp.path()) {
+            let upper = tmp.path().join("SAMPLEREPO");
+            assert_eq!(normalize_path_key(&upper.to_string_lossy()), abs_key);
+        }
+
+        let real_parent = tmp.path().join("real-parent");
+        let real_sub = real_parent.join("sub");
+        let target_repo = real_parent.join("target-repo");
+        let other_dir = tmp.path().join("other-dir");
+        std::fs::create_dir_all(&real_sub).unwrap();
+        std::fs::create_dir_all(&target_repo).unwrap();
+        std::fs::create_dir_all(other_dir.join("target-repo")).unwrap();
+        let link = other_dir.join("link");
+        std::os::unix::fs::symlink(&real_sub, &link).unwrap();
+        let via_link = format!("{}/../target-repo", link.to_string_lossy());
+        assert_eq!(
+            normalize_path_key(&via_link),
+            normalize_path_key(&target_repo.to_string_lossy()),
+            "symlink preceding .. must resolve link target before parent traversal"
+        );
+    }
+
+    fn strip_or_rel(cwd: &Path, target: &Path) -> Result<String, ()> {
+        let mut ups = Vec::new();
+        let mut anc = cwd;
+        while !target.starts_with(anc) {
+            ups.push("..");
+            anc = anc.parent().ok_or(())?;
+        }
+        let tail = target.strip_prefix(anc).map_err(|_| ())?;
+        let mut out = if ups.is_empty() {
+            PathBuf::from(".")
+        } else {
+            ups.into_iter().collect::<PathBuf>()
+        };
+        if !tail.as_os_str().is_empty() {
+            out.push(tail);
+        }
+        Ok(out.to_string_lossy().into_owned())
     }
 }

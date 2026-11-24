@@ -42,7 +42,7 @@ impl Decider for ToyRooms {
             RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
-            room: r.resolve(&ctx.by)?,
+            room: r.resolve(ctx.by())?,
         })
     }
 
@@ -61,7 +61,7 @@ impl Decider for ToyRooms {
     ) -> Result<Vec<RoomEvent>, ApiError> {
         match cmd {
             RoomCommand::RoomEnsure(c) => {
-                let id = c.room.resolve(&ctx.by)?;
+                let id = c.room.resolve(ctx.by())?;
                 if state.head == Seq::ORIGIN {
                     Ok(vec![RoomEvent::Opened {
                         id,
@@ -73,7 +73,7 @@ impl Decider for ToyRooms {
                 }
             }
             RoomCommand::RoomJoin(c) => {
-                let who = c.member.clone().unwrap_or_else(|| ctx.by.clone());
+                let who = c.member.clone().unwrap_or_else(|| ctx.by().clone());
                 let handle = match &c.handle {
                     Some(h) => h.clone(),
                     None => Handle::parse(who.to_string().trim_start_matches('@'))?,
@@ -84,7 +84,7 @@ impl Decider for ToyRooms {
                 }])
             }
             RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft {
-                member: ctx.by.clone(),
+                member: ctx.by().clone(),
             }]),
             RoomCommand::RoomPost(c) => {
                 let mut principals = Vec::new();
@@ -267,7 +267,7 @@ impl Decider for ToyInbox {
     fn address(cmd: &InboxCommand, ctx: &DecideCtx) -> Result<StreamId, ApiError> {
         let owner = match cmd {
             InboxCommand::InboxRaise(c) => c.to.clone(),
-            _ => ctx.by.clone(),
+            _ => ctx.by().clone(),
         };
         Ok(StreamId::Inbox { owner })
     }
@@ -490,16 +490,16 @@ async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
     );
 
     let page = sam
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: RoomId::Channel {
                     scope: RoomScope::Global,
                     name: ChannelName::parse("general").unwrap(),
                 },
             },
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+            Seq::ORIGIN,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -560,11 +560,7 @@ async fn audience_and_privacy_boundaries_hold() {
         .unwrap();
     let dm = RoomRef::Dm { with: alice }.resolve(&sam).unwrap();
     let denied = nora_c
-        .call(Read {
-            stream: StreamId::Room { room: dm },
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+        .call(Read::stream(StreamId::Room { room: dm }, Seq::ORIGIN, None))
         .await
         .unwrap_err();
     assert!(
@@ -652,9 +648,8 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
 
     let quiet = alice
         .call(Wait {
-            interest: Interest::Mentions,
-            after: Cursor::live(),
             timeout_ms: Some(15),
+            ..Wait::new(Interest::Mentions, Cursor::live())
         })
         .await
         .unwrap();
@@ -666,9 +661,8 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
         async move {
             alice
                 .call(Wait {
-                    interest: Interest::Mentions,
-                    after: wake_cursor,
                     timeout_ms: Some(2000),
+                    ..Wait::new(Interest::Mentions, wake_cursor)
                 })
                 .await
                 .unwrap()
@@ -886,6 +880,99 @@ async fn sidebar_projection_and_reactor_update_live() {
     .expect("marking read and acking cleared badges");
 
     reactor_handle.abort();
+}
+
+#[tokio::test]
+async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
+    let (router, _, _) = harness(Duration::from_secs(60));
+    let owner_seat = SeatName::parse("owner").unwrap();
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: owner_seat.clone(),
+        },
+    );
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let alice = LocalClient::new(router.clone(), alice_p.clone());
+    let to_owner = RoomRef::Dm {
+        with: Principal::Seat { seat: owner_seat },
+    };
+
+    let mut sidebar = operator
+        .watch(Interest::Sidebar, Cursor::live())
+        .await
+        .unwrap();
+    let Some(Ok(Frame::Sidebar(initial))) = sidebar.next().await else {
+        panic!("expected initial sidebar")
+    };
+    assert!(initial.direct_messages.is_empty());
+
+    let first = alice
+        .call(post(to_owner.clone(), "one", None))
+        .await
+        .unwrap();
+    alice.call(post(to_owner, "two", None)).await.unwrap();
+
+    let catchup = operator
+        .call(Wait {
+            timeout_ms: Some(1_000),
+            ..Wait::new(Interest::Mentions, Cursor::default())
+        })
+        .await
+        .expect("operator Interest::Mentions wakes on DM addressed to its seat");
+    assert_eq!(catchup.entries.len(), 2);
+
+    let snap = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
+                && snap.direct_messages.first().is_some_and(|d| d.unread == 2)
+            {
+                break *snap;
+            }
+        }
+    })
+    .await
+    .expect("operator sidebar lists the DM addressed to its seat");
+    assert_eq!(snap.direct_messages.len(), 1);
+    assert_eq!(snap.direct_messages[0].with, alice_p);
+    assert_eq!(snap.direct_messages[0].room, first.room);
+
+    let op_reply = operator
+        .call(post(
+            RoomRef::Dm {
+                with: alice_p.clone(),
+            },
+            "ack from operator",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        op_reply.room, first.room,
+        "operator replying to @alice must land in the same DM room, never a second split DM"
+    );
+
+    operator
+        .call(InboxMarkRead {
+            room: first.room,
+            upto: first.seq,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Frame::Sidebar(snap))) = sidebar.next().await
+                && snap.direct_messages.len() == 1
+                && snap.direct_messages.first().is_some_and(|d| d.unread == 1)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("marking the first DM read leaves one unread (operator's own reply is not unread)");
 }
 
 struct DynamicNamesFeed {
@@ -1377,16 +1464,18 @@ async fn worker_wait_emits_parked_and_working_and_restores_on_cancel() {
 
     let _ = worker
         .call(Wait {
-            interest: Interest::Room {
-                room: room_ref.clone(),
-            },
-            after: Cursor::default().with(
-                StreamId::Room {
-                    room: room_id.clone(),
-                },
-                Seq(0),
-            ),
             timeout_ms: Some(0),
+            ..Wait::new(
+                Interest::Room {
+                    room: room_ref.clone(),
+                },
+                Cursor::default().with(
+                    StreamId::Room {
+                        room: room_id.clone(),
+                    },
+                    Seq(0),
+                ),
+            )
         })
         .await
         .unwrap();

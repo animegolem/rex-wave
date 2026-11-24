@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::mail::*;
 use rex_wave_api::read::Read;
 use rex_wave_api::room::*;
@@ -587,11 +588,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     );
 
     let mail_page = owner
-        .call(Read {
-            stream: StreamId::Mail,
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+        .call(Read::stream(StreamId::Mail, Seq::ORIGIN, None))
         .await
         .unwrap();
     assert_eq!(
@@ -746,7 +743,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let mail_service = Arc::new(MailBridge::with_hub(
-        sandbox,
+        sandbox.clone(),
         journal.clone(),
         journal.claim(StreamId::Mail).unwrap(),
         hub.clone(),
@@ -772,7 +769,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
             part: SystemPart::WakeBell,
         },
     );
-    let courier_task = spawn_reactor(BellCourier, bell_client.clone());
+    let courier_task = spawn_reactor(BellCourier::new(sandbox.clone()), bell_client.clone());
 
     let (sink_addr, sink_task) = loop {
         let candidate: SocketAddr = {
@@ -877,7 +874,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
         }
     })
     .await
-    .expect("BellCourier delivered live wake prompt even via 3-arg MailBridge::new");
+    .expect("BellCourier delivered live wake prompt from the sandbox it was handed");
 
     tokio::time::sleep(Duration::from_millis(40)).await;
     let after_retries = room_history(&sam, dm_with_bell.clone(), Seq::ORIGIN, Some(10))
@@ -925,4 +922,160 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
 
     courier_task.abort();
     sink_task.abort();
+}
+
+#[tokio::test]
+async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_read_errors() {
+    let (_guard, sandbox) = TempSandbox::marked();
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let mail_service = Arc::new(MailBridge::with_hub(
+        sandbox.clone(),
+        journal.clone(),
+        journal.claim(StreamId::Mail).unwrap(),
+        hub.clone(),
+    ));
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: mail_service,
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let sam = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: SeatName::parse("sam").unwrap(),
+        },
+    );
+    let alice = LocalClient::new(
+        router,
+        Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        },
+    );
+    let chan = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("bulk").unwrap(),
+    };
+    let big_body = Body::parse("x".repeat(64 * 1024)).unwrap();
+    let mut first_seq = None;
+    let mut last_seq = Seq::ORIGIN;
+    for _ in 0..260 {
+        let posted = sam
+            .call(RoomPost::new(chan.clone(), big_body.clone()))
+            .await
+            .unwrap();
+        first_seq.get_or_insert(posted.seq);
+        last_seq = posted.seq;
+    }
+    let room_id = chan.resolve(sam.me()).unwrap();
+    let err = sam
+        .call(MailPromote {
+            room: room_id.clone(),
+            range: SeqRange::new(first_seq.unwrap(), last_seq).unwrap(),
+            to: vec![SeatName::parse("alice").unwrap()],
+            subject: "Too large to read back".into(),
+            topic: "too-large".into(),
+            priority: LetterPriority::Low,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Invalid(_)), "got {err:?}");
+    assert!(!sandbox.path().join("to-alice").exists());
+
+    let ok_ref = sam
+        .call(MailPromote {
+            room: room_id,
+            range: SeqRange::new(first_seq.unwrap(), first_seq.unwrap()).unwrap(),
+            to: vec![SeatName::parse("alice").unwrap()],
+            subject: "Small letter".into(),
+            topic: "small".into(),
+            priority: LetterPriority::Normal,
+        })
+        .await
+        .unwrap();
+
+    fs::create_dir_all(sandbox.path().join("state")).unwrap();
+    let acks_path = sandbox.path().join("state/acks.jsonl");
+
+    // 1. Corrupt oversized line without newline fails closed.
+    fs::write(&acks_path, vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let ack_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(ack_err, ApiError::Internal(_)), "got {ack_err:?}");
+    assert_eq!(fs::metadata(&acks_path).unwrap().len(), 2 * 1024 * 1024);
+
+    fs::write(&acks_path, b"{\"truncated\":\n").unwrap();
+    let bad_json_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(bad_json_err, ApiError::Internal(_)),
+        "got {bad_json_err:?}"
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), b"{\"truncated\":\n");
+
+    fs::write(&acks_path, b"{\"truncated\":").unwrap();
+    let bad_tail_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(bad_tail_err, ApiError::Internal(_)),
+        "got {bad_tail_err:?}"
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), b"{\"truncated\":");
+
+    // 3. Invalid UTF-8 line fails closed without appending.
+    fs::write(&acks_path, [0xff, 0xfe, b'\n']).unwrap();
+    let bad_utf8_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(bad_utf8_err, ApiError::Internal(_)),
+        "got {bad_utf8_err:?}"
+    );
+    assert_eq!(fs::read(&acks_path).unwrap(), [0xff, 0xfe, b'\n']);
+
+    // 4. Valid final JSON row without trailing newline separates cleanly on append.
+    let prior_unterminated = b"{\"schema\":1,\"seat\":\"sam\",\"path\":\"to-sam/other.md\",\"sha256_full\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
+    fs::write(&acks_path, prior_unterminated).unwrap();
+    alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap();
+    let merged_text = fs::read_to_string(&acks_path).unwrap();
+    let parsed_lines: Vec<serde_json::Value> = merged_text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line must remain valid JSON"))
+        .collect();
+    assert_eq!(parsed_lines.len(), 2);
 }

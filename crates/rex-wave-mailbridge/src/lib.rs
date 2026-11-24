@@ -31,31 +31,37 @@ pub use score::{
     parse_mailwatch_seen_sources, score_shadow_against_acks, score_shadow_jsonl,
 };
 pub use shadow::{
-    DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,
-    LetterCandidate, ParsedLetterTime, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
-    RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowAction, ShadowPassReport,
-    ShadowWatchTracker, TimeBasis, WATCH_TRACKER_MAX_ENTRIES, WatchDecisionState, WatchDelta,
-    decide_mail_ring, decide_mail_rings_for_seat, extract_letter_timestamp,
+    DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferKind,
+    DeferReason, LetterCandidate, ParsedLetterTime, ReadOnlyInterchange, RetryEntry, RetryState,
+    RingDecision, RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowAction,
+    ShadowPassReport, ShadowWatchTracker, TimeBasis, WATCH_TRACKER_MAX_ENTRIES, WatchDecisionState,
+    WatchDelta, decide_mail_ring, decide_mail_rings_for_seat, extract_letter_timestamp,
     extract_letter_timestamp_detailed, parse_recorded_datetime_ms, run_shadow_pass,
 };
 
+use rex_wave_api::http_guard::is_loopback_host;
 use rex_wave_api::mail::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{BoxFut, DecideCtx, Hub, LocalClient, Reactor, Service, can_read};
 use rex_wave_store::{Appended, Journal, StreamWriter};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
+
+use rex_wave_fs::{ConfinedDir, EntryKind, RelPath, SafeName};
+pub use rex_wave_fs::{
+    MAX_PROTECTED_ROOTS, ProtectedRootsGuard, Protection, SandboxError, load_protected_roots,
+    load_protected_roots_from, parse_protected_roots, protected_roots_file, resolve_links,
+};
 
 const MARKER_FILE: &str = ".rex-wave-sandbox";
 const MAX_PROMOTE_SPAN: u64 = 1_000;
@@ -63,369 +69,21 @@ const MAX_HTTP_HEADER: usize = 16 * 1024;
 const MAX_HTTP_BODY: usize = 128 * 1024;
 const MAX_SINK_CONNS: usize = 32;
 
-static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
-static SANDBOX_ROOTS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
-
-fn sandbox_registry() -> &'static RwLock<Vec<PathBuf>> {
-    SANDBOX_ROOTS.get_or_init(|| RwLock::new(Vec::new()))
-}
-
-fn register_sandbox_root(path: &Path) {
-    let mut guard = sandbox_registry()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    if !guard.iter().any(|p| p == path) {
-        guard.push(path.to_path_buf());
-    }
-}
-
-fn regular_file_without_symlinks(root: &Path, segments: &[&str]) -> Option<PathBuf> {
-    let mut cur = root.to_path_buf();
-    for (idx, seg) in segments.iter().enumerate() {
-        cur.push(seg);
-        let meta = fs::symlink_metadata(&cur).ok()?;
-        if meta.file_type().is_symlink() {
-            return None;
-        }
-        if idx + 1 < segments.len() {
-            if !meta.file_type().is_dir() {
-                return None;
-            }
-        } else if !meta.file_type().is_file() {
-            return None;
-        }
-    }
-    Some(cur)
-}
-
-fn read_bell_prompt_from_root(root: &Path, digest16: &str) -> Option<String> {
-    let fname = format!("{digest16}.json");
-    let path = regular_file_without_symlinks(root, &["state", "bells", &fname])?;
-    let raw = fs::read_to_string(&path).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    val.get("prompt")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-}
-
-fn read_bell_prompt_any_sandbox(digest16: &str) -> Option<String> {
-    let roots = sandbox_registry()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    for root in roots.iter().rev() {
-        if let Some(prompt) = read_bell_prompt_from_root(root, digest16) {
-            return Some(prompt);
-        }
-    }
-    None
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SandboxError {
-    #[error("{0} is, contains, or is under a protected folder")]
-    Production(PathBuf),
-    #[error("protected roots: {0}")]
-    Config(String),
-    #[error("{0} lacks the .rex-wave-sandbox marker")]
-    Unmarked(PathBuf),
-    #[error("io: {0}")]
-    Io(String),
-}
+/// The largest banked wake-bell record read.
+const MAX_BELL_FILE_BYTES: u64 = 1024 * 1024;
+/// The largest single JSONL line inside `state/acks.jsonl`.
+const MAX_ACK_LINE_BYTES: usize = 1024 * 1024;
+/// The largest letter read for projection or acknowledgement.
+const MAX_LETTER_BYTES: u64 = 16 * 1024 * 1024;
+/// Mode of letters, bells and acks written into the sandbox.
+const SANDBOX_FILE_MODE: u32 = 0o644;
+/// Mode of directories created in the sandbox.
+const SANDBOX_DIR_MODE: u32 = 0o755;
 
 #[derive(Clone, Debug)]
 pub struct SandboxRoot {
-    root: PathBuf,
-    policy: Policy,
-}
-
-/// The most entries, folders and names together, one deployment may protect.
-pub const MAX_PROTECTED_ROOTS: usize = 64;
-
-/// What a sandbox may never touch on this machine, as a deployment lists it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Protection {
-    /// Absolute folders. A sandbox may not be one, contain one, or sit inside one.
-    pub roots: Vec<PathBuf>,
-    /// Folder names refused anywhere in a sandbox path.
-    pub names: Vec<String>,
-}
-
-/// A `Protection` resolved once against the filesystem and the home folder,
-/// so every later check sees the same answer.
-#[derive(Clone, Debug)]
-struct Policy {
-    roots: Vec<PathBuf>,
-    names: Vec<String>,
-    homes: Vec<PathBuf>,
-}
-
-/// The most symlinks followed while resolving one protected folder.
-const MAX_LINK_HOPS: usize = 40;
-
-/// Resolve every symlink on the way to `path`, component by component, the
-/// way the filesystem would, including links whose targets do not exist yet.
-/// Components that do not exist are kept as written. A folder whose real
-/// location cannot be established is an error, never a guess.
-fn resolve_links(path: &Path) -> Result<PathBuf, SandboxError> {
-    let unresolved = |at: &Path, why: &dyn std::fmt::Display| {
-        SandboxError::Config(format!("cannot resolve `{}`: {why}", at.display()))
-    };
-    let mut out = PathBuf::new();
-    let mut pending: Vec<std::ffi::OsString> = Vec::new();
-    for comp in path.components().rev() {
-        pending.push(comp.as_os_str().to_owned());
-    }
-    let mut hops = 0;
-    while let Some(seg) = pending.pop() {
-        match Path::new(&seg).components().next() {
-            Some(Component::Prefix(_) | Component::RootDir) => {
-                out.push(&seg);
-                continue;
-            }
-            Some(Component::CurDir) | None => continue,
-            Some(Component::ParentDir) => {
-                out.pop();
-                continue;
-            }
-            Some(Component::Normal(_)) => {}
-        }
-        let next = out.join(&seg);
-        match fs::symlink_metadata(&next) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                hops += 1;
-                if hops > MAX_LINK_HOPS {
-                    return Err(unresolved(path, &"too many symlinks"));
-                }
-                let target = fs::read_link(&next).map_err(|e| unresolved(&next, &e))?;
-                if target.is_absolute() {
-                    out = PathBuf::new();
-                }
-                for comp in target.components().rev() {
-                    pending.push(comp.as_os_str().to_owned());
-                }
-            }
-            Ok(_) => out = next,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
-            Err(e) => return Err(unresolved(&next, &e)),
-        }
-    }
-    Ok(out)
-}
-
-/// A protected folder must be absolute and free of `..`, because removing
-/// `..` by spelling can name a different folder than the filesystem would.
-fn checked_root(path: &Path) -> Result<PathBuf, SandboxError> {
-    if !path.is_absolute() {
-        return Err(SandboxError::Config(format!(
-            "`{}` is not an absolute path",
-            path.display()
-        )));
-    }
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(SandboxError::Config(format!(
-            "`{}` contains `..`",
-            path.display()
-        )));
-    }
-    lexical_normalize(path)
-}
-
-fn checked_name(name: &str) -> Result<String, SandboxError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-        return Err(SandboxError::Config(format!(
-            "`{name}` is not a single folder name"
-        )));
-    }
-    Ok(name.to_owned())
-}
-
-impl Policy {
-    fn resolve(protection: &Protection) -> Result<Self, SandboxError> {
-        if protection.roots.len() + protection.names.len() > MAX_PROTECTED_ROOTS {
-            return Err(SandboxError::Config(format!(
-                "more than {MAX_PROTECTED_ROOTS} protected entries"
-            )));
-        }
-        // Hold each folder under both its given and its resolved name, so a
-        // symlinked location cannot be used to step around it.
-        let mut roots = BTreeSet::new();
-        for root in &protection.roots {
-            let given = checked_root(root)?;
-            roots.insert(resolve_links(&given)?);
-            roots.insert(given);
-        }
-        let mut names = BTreeSet::new();
-        for name in &protection.names {
-            names.insert(checked_name(name)?);
-        }
-        Ok(Policy {
-            roots: roots.into_iter().collect(),
-            names: names.into_iter().collect(),
-            homes: home_dirs().into_iter().collect(),
-        })
-    }
-}
-
-fn lexical_normalize(path: &Path) -> Result<PathBuf, SandboxError> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| SandboxError::Io(e.to_string()))?
-            .join(path)
-    };
-    let mut out = PathBuf::new();
-    for comp in abs.components() {
-        match comp {
-            Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir => out.push(comp.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Normal(seg) => out.push(seg),
-        }
-    }
-    Ok(out)
-}
-
-fn home_dirs() -> BTreeSet<PathBuf> {
-    let mut homes = BTreeSet::new();
-    if let Some(h) = std::env::var_os("HOME") {
-        let hp = PathBuf::from(h);
-        if !hp.as_os_str().is_empty() {
-            if let Ok(canon) = fs::canonicalize(&hp) {
-                homes.insert(canon);
-            }
-            if let Ok(lex) = lexical_normalize(&hp) {
-                homes.insert(lex);
-            }
-        }
-    }
-    homes
-}
-
-/// Parse a protected-roots file, one entry per line. Blank lines and lines
-/// starting with `#` are skipped. `name: <folder name>` refuses that name
-/// anywhere in a sandbox path. Every other line is a folder: an absolute
-/// path, or one starting with `~/` for `home`, and never containing `..`.
-pub fn parse_protected_roots(text: &str, home: Option<&Path>) -> Result<Protection, SandboxError> {
-    let mut roots = BTreeSet::new();
-    let mut names = BTreeSet::new();
-    for (index, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let at_line = |e: SandboxError| match e {
-            SandboxError::Config(detail) => {
-                SandboxError::Config(format!("line {}: {detail}", index + 1))
-            }
-            other => other,
-        };
-        if let Some(name) = line.strip_prefix("name:") {
-            names.insert(checked_name(name.trim()).map_err(at_line)?);
-        } else {
-            let path = match line.strip_prefix("~/") {
-                Some(rest) => home
-                    .ok_or_else(|| {
-                        SandboxError::Config(format!(
-                            "line {}: `~/` needs HOME to be set",
-                            index + 1
-                        ))
-                    })?
-                    .join(rest),
-                None => PathBuf::from(line),
-            };
-            roots.insert(checked_root(&path).map_err(at_line)?);
-        }
-        if roots.len() + names.len() > MAX_PROTECTED_ROOTS {
-            return Err(SandboxError::Config(format!(
-                "more than {MAX_PROTECTED_ROOTS} protected entries"
-            )));
-        }
-    }
-    Ok(Protection {
-        roots: roots.into_iter().collect(),
-        names: names.into_iter().collect(),
-    })
-}
-
-/// Where a deployment lists what it protects: `rex-wave/protected-roots`
-/// under `xdg_config_home`, or under `home/.config`. A relative
-/// `xdg_config_home` is ignored, as the XDG specification requires.
-pub fn protected_roots_file(
-    xdg_config_home: Option<&Path>,
-    home: Option<&Path>,
-) -> Result<PathBuf, SandboxError> {
-    let base = match (xdg_config_home, home) {
-        (Some(dir), _) if dir.is_absolute() => dir.to_path_buf(),
-        (_, Some(home)) if home.is_absolute() => home.join(".config"),
-        _ => {
-            return Err(SandboxError::Config(
-                "cannot locate the protected-roots file: set HOME or XDG_CONFIG_HOME to an absolute path".into(),
-            ));
-        }
-    };
-    Ok(base.join("rex-wave").join("protected-roots"))
-}
-
-/// Read a protected-roots file. A file that is missing, unreadable or
-/// malformed is an error and never an empty list: running with nothing
-/// protected takes an explicit, empty file.
-pub fn load_protected_roots_from(
-    file: &Path,
-    home: Option<&Path>,
-) -> Result<Protection, SandboxError> {
-    let text = fs::read_to_string(file).map_err(|e| {
-        let hint = if e.kind() == std::io::ErrorKind::NotFound {
-            " (create it; it may be empty if there is nothing to protect)"
-        } else {
-            ""
-        };
-        SandboxError::Config(format!("{}: {e}{hint}", file.display()))
-    })?;
-    parse_protected_roots(&text, home)
-        .map_err(|e| SandboxError::Config(format!("{}: {e}", file.display())))
-}
-
-/// Read this deployment's protected-roots file, located from the environment.
-pub fn load_protected_roots() -> Result<Protection, SandboxError> {
-    let env_path = |key: &str| {
-        std::env::var_os(key)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    let home = env_path("HOME");
-    let file = protected_roots_file(env_path("XDG_CONFIG_HOME").as_deref(), home.as_deref())?;
-    load_protected_roots_from(&file, home.as_deref())
-}
-
-fn check_not_production(
-    candidate: &Path,
-    reported: &Path,
-    policy: &Policy,
-) -> Result<(), SandboxError> {
-    let refused = || Err(SandboxError::Production(reported.to_path_buf()));
-    // The filesystem root and the home folder are never a sandbox.
-    if candidate.parent().is_none() || policy.homes.iter().any(|home| home.starts_with(candidate)) {
-        return refused();
-    }
-    if candidate.components().any(|c| {
-        policy
-            .names
-            .iter()
-            .any(|name| c.as_os_str() == name.as_str())
-    }) {
-        return refused();
-    }
-    for prod in &policy.roots {
-        if candidate.starts_with(prod) || prod.starts_with(candidate) {
-            return refused();
-        }
-    }
-    Ok(())
+    dir: ConfinedDir,
+    guard: ProtectedRootsGuard,
 }
 
 impl SandboxRoot {
@@ -436,185 +94,81 @@ impl SandboxRoot {
 
     /// Verify `path` against an explicit `Protection`.
     pub fn verify_with(path: &Path, protection: &Protection) -> Result<Self, SandboxError> {
-        let forbidden = Policy::resolve(protection)?;
-        let lex = lexical_normalize(path)?;
-        check_not_production(&lex, path, &forbidden)?;
-
-        // Judge a symlink by where it points, so the verdict is the same
-        // whether or not its target exists on this machine.
-        if let Ok(target) = fs::read_link(path) {
-            let base = lex.parent().unwrap_or(Path::new("/"));
-            let pointed = lexical_normalize(&base.join(target))?;
-            check_not_production(&pointed, path, &forbidden)?;
+        let guard = ProtectedRootsGuard::resolve(protection)?;
+        let canon = guard.verify_dir(path)?;
+        if rex_wave_fs::entry_kind(&canon.join(MARKER_FILE)).ok() != Some(EntryKind::File) {
+            return Err(SandboxError::Unmarked(canon));
         }
-
-        let mut ancestor = lex.as_path();
-        while let Some(parent) = ancestor.parent() {
-            if let Ok(canon_anc) = fs::canonicalize(ancestor) {
-                let resolved = match lex.strip_prefix(ancestor) {
-                    Ok(suffix) if !suffix.as_os_str().is_empty() => canon_anc.join(suffix),
-                    _ => canon_anc,
-                };
-                check_not_production(&resolved, path, &forbidden)?;
-                break;
-            }
-            ancestor = parent;
-        }
-
-        let canon = fs::canonicalize(path).map_err(|e| SandboxError::Io(e.to_string()))?;
-        check_not_production(&canon, path, &forbidden)?;
-
-        let meta = fs::metadata(&canon).map_err(|e| SandboxError::Io(e.to_string()))?;
-        if !meta.is_dir() {
-            return Err(SandboxError::Io(format!(
-                "{} is not a directory",
-                canon.display()
-            )));
-        }
-
-        let marker = canon.join(MARKER_FILE);
-        match fs::symlink_metadata(&marker) {
-            Ok(m) if m.file_type().is_file() => Ok(SandboxRoot {
-                root: canon,
-                policy: forbidden,
-            }),
-            _ => Err(SandboxError::Unmarked(canon)),
-        }
+        let dir = ConfinedDir::open(&canon).map_err(|e| SandboxError::Io(e.to_string()))?;
+        Ok(SandboxRoot { dir, guard })
     }
 
     pub fn path(&self) -> &Path {
-        &self.root
+        self.dir.path()
     }
 
     fn ensure_dir(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
-        let forbidden = &self.policy;
-        let mut cur = self.root.clone();
-        for &seg in segments {
-            if seg.is_empty()
-                || seg == "."
-                || seg == ".."
-                || seg.contains('/')
-                || seg.contains('\\')
-            {
-                return Err(ApiError::Invalid(InvalidId {
+        let names = segments
+            .iter()
+            .map(|seg| SafeName::parse(seg))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(RelPath::from_names)
+            .map_err(|e| {
+                ApiError::Invalid(InvalidId {
                     what: "sandbox directory".into(),
-                    reason: "invalid directory segment".into(),
-                }));
-            }
-            cur = cur.join(seg);
-            match fs::symlink_metadata(&cur) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(ApiError::Denied {
-                        principal: "mailbridge".into(),
-                        action: format!("write through symlink {}", cur.display()),
-                    });
-                }
-                Ok(m) if !m.file_type().is_dir() => {
-                    return Err(ApiError::conflict(format!(
-                        "{} exists and is not a directory",
-                        cur.display()
-                    )));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&cur).map_err(|ce| {
-                        ApiError::Internal(format!("mkdir {}: {ce}", cur.display()))
-                    })?;
-                }
-                Err(e) => return Err(ApiError::Internal(format!("stat {}: {e}", cur.display()))),
-            }
-            let canon = fs::canonicalize(&cur)
-                .map_err(|e| ApiError::Internal(format!("canonicalize {}: {e}", cur.display())))?;
-            if check_not_production(&canon, &cur, forbidden).is_err()
-                || !canon.starts_with(&self.root)
-            {
-                return Err(ApiError::Denied {
+                    reason: format!("invalid directory segment: {e}"),
+                })
+            })?;
+        let dir = self
+            .dir
+            .ensure_subdir(&names, SANDBOX_DIR_MODE)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidInput => ApiError::Denied {
                     principal: "mailbridge".into(),
-                    action: format!("escape sandbox via {}", cur.display()),
-                });
-            }
-            cur = canon;
+                    action: format!("write through symlink: {e}"),
+                },
+                std::io::ErrorKind::NotADirectory => ApiError::conflict(e.to_string()),
+                _ => ApiError::Internal(format!("mkdir {names}: {e}")),
+            })?;
+        if self.guard.check(&dir, &dir).is_err() {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("escape sandbox via {}", dir.display()),
+            });
         }
-        Ok(cur)
+        Ok(dir)
     }
 
     fn confine(&self, raw: &Path) -> Result<(PathBuf, String, bool), SandboxError> {
-        if raw.as_os_str().is_empty() || raw.components().any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(SandboxError::Io("invalid path outside sandbox".into()));
-        }
-        let forbidden = &self.policy;
-        let joined = if raw.is_absolute() {
-            raw.to_path_buf()
-        } else {
-            self.root.join(raw)
-        };
-        let lex = lexical_normalize(&joined)?;
-        check_not_production(&lex, raw, forbidden)?;
-        if !lex.starts_with(&self.root) || lex == self.root {
-            return Err(SandboxError::Production(raw.to_path_buf()));
-        }
+        self.guard.confine(self.dir.path(), raw)
+    }
 
-        let mut walk = self.root.clone();
-        if let Ok(rel_parts) = lex.strip_prefix(&self.root) {
-            for comp in rel_parts.components() {
-                walk.push(comp.as_os_str());
-                if let Ok(sm) = fs::symlink_metadata(&walk)
-                    && sm.file_type().is_symlink()
-                {
-                    return Err(SandboxError::Production(raw.to_path_buf()));
-                }
-            }
-        }
+    fn read_state_string(&self, rel: &str, max_bytes: u64) -> Option<String> {
+        let rel = RelPath::parse(rel).ok()?;
+        self.dir.read_string(&rel, max_bytes).ok()
+    }
 
-        match fs::canonicalize(&lex) {
-            Ok(canon) => {
-                check_not_production(&canon, raw, forbidden)?;
-                if !canon.starts_with(&self.root) || canon == self.root {
-                    return Err(SandboxError::Production(raw.to_path_buf()));
-                }
-                let rel = relative_slash(&self.root, &canon)?;
-                Ok((canon, rel, true))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = lex.parent()
-                    && let Ok(canon_parent) = fs::canonicalize(parent)
-                {
-                    if !canon_parent.starts_with(&self.root) {
-                        return Err(SandboxError::Production(raw.to_path_buf()));
-                    }
-                    if let Some(fname) = lex.file_name() {
-                        check_not_production(&canon_parent.join(fname), raw, forbidden)?;
-                    }
-                }
-                let rel = relative_slash(&self.root, &lex)?;
-                Ok((lex, rel, false))
-            }
-            Err(e) => Err(SandboxError::Io(e.to_string())),
-        }
+    fn read_bell_prompt(&self, digest16: &str) -> Option<String> {
+        let raw =
+            self.read_state_string(&format!("state/bells/{digest16}.json"), MAX_BELL_FILE_BYTES)?;
+        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        val.get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
     }
 }
 
-fn relative_slash(root: &Path, target: &Path) -> Result<String, SandboxError> {
-    let stripped = target
-        .strip_prefix(root)
-        .map_err(|_| SandboxError::Production(target.to_path_buf()))?;
-    let mut parts = Vec::new();
-    for comp in stripped.components() {
-        match comp {
-            Component::Normal(seg) => {
-                let s = seg
-                    .to_str()
-                    .ok_or_else(|| SandboxError::Io("non-utf8 path".into()))?;
-                parts.push(s);
+fn read_letter(path: &Path) -> Result<Vec<u8>, ApiError> {
+    rex_wave_fs::read_regular_bounded(path, MAX_LETTER_BYTES).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("read {}: {e}", path.display()),
             }
-            _ => return Err(SandboxError::Io("unexpected path component".into())),
+        } else {
+            ApiError::Internal(format!("read {}: {e}", path.display()))
         }
-    }
-    if parts.is_empty() {
-        return Err(SandboxError::Io("empty relative path".into()));
-    }
-    Ok(parts.join("/"))
+    })
 }
 
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> Sha256Hex {
@@ -636,27 +190,6 @@ pub fn wake_id(seat: &SeatName, mailbox: &str, file: &str, full_sha256: &Sha256H
     h.update(format!("wake/1\n{seat}\n{mailbox}/{file}\n{full_sha256}").as_bytes());
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     WakeId(hex[..16].to_owned())
-}
-
-pub(crate) fn unix_secs_to_iso8601_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    let second = rem % 60;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn is_valid_address_segment(seg: &str) -> bool {
@@ -1074,32 +607,130 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
     out
 }
 
+struct SandboxAckScan {
+    matched: bool,
+    needs_leading_newline: bool,
+}
+
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!buf.is_empty()).then_some(false));
+        }
+        if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(nl) > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("acks.jsonl line exceeds {max_bytes} bytes"),
+                ));
+            }
+            buf.extend_from_slice(&available[..nl]);
+            reader.consume(nl + 1);
+            return Ok(Some(true));
+        }
+        if buf.len().saturating_add(available.len()) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("acks.jsonl line exceeds {max_bytes} bytes"),
+            ));
+        }
+        buf.extend_from_slice(available);
+        let n = available.len();
+        reader.consume(n);
+    }
+}
+
+fn scan_sandbox_acks(
+    root: &SandboxRoot,
+    to_seat: &str,
+    rel_path: &str,
+    sha256: &Sha256Hex,
+    strict_lines: bool,
+) -> Result<SandboxAckScan, ApiError> {
+    let rel = RelPath::parse("state/acks.jsonl")
+        .map_err(|e| ApiError::Internal(format!("invalid acks relpath: {e}")))?;
+    let (file, _) = match root.dir.open_regular(&rel) {
+        Ok(pair) => pair,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SandboxAckScan {
+                matched: false,
+                needs_leading_newline: false,
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("read non-regular acks.jsonl: {e}"),
+            });
+        }
+        Err(e) => return Err(ApiError::Internal(format!("read acks.jsonl: {e}"))),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_buf = Vec::new();
+    let aliases = acks::AliasMap::empty();
+    let mut matched = false;
+    let mut any_bytes = false;
+    let mut last_had_newline = true;
+    let mut line_no = 0usize;
+    while let Some(had_nl) = read_bounded_line(&mut reader, &mut line_buf, MAX_ACK_LINE_BYTES)
+        .map_err(|e| ApiError::Internal(format!("read acks.jsonl: {e}")))?
+    {
+        line_no += 1;
+        any_bytes = true;
+        last_had_newline = had_nl;
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(s) => s,
+            Err(_) if !strict_lines => continue,
+            Err(_) => {
+                return Err(ApiError::Internal(format!(
+                    "corrupt non-UTF-8 row at state/acks.jsonl:{line_no}; repair or remove that line before appending new acks"
+                )));
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) if !strict_lines => continue,
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "corrupt JSON row at state/acks.jsonl:{line_no} ({e}); repair or remove that line before appending new acks"
+                )));
+            }
+        };
+        if !val.is_object() {
+            if !strict_lines {
+                continue;
+            }
+            return Err(ApiError::Internal(format!(
+                "corrupt non-object JSON row at state/acks.jsonl:{line_no}; repair or remove that line before appending new acks"
+            )));
+        }
+        if !matched && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases) {
+            matched = true;
+        }
+    }
+    Ok(SandboxAckScan {
+        matched,
+        needs_leading_newline: any_bytes && !last_had_newline,
+    })
+}
+
 fn is_acked_in_sandbox(
     root: &SandboxRoot,
     to_seat: &str,
     rel_path: &str,
     sha256: &Sha256Hex,
-) -> bool {
-    let Some(acks_path) = regular_file_without_symlinks(root.path(), &["state", "acks.jsonl"])
-    else {
-        return false;
-    };
-    let Ok(contents) = fs::read_to_string(&acks_path) else {
-        return false;
-    };
-    let aliases = acks::AliasMap::empty();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases)
-        {
-            return true;
-        }
-    }
-    false
+) -> Result<bool, ApiError> {
+    Ok(scan_sandbox_acks(root, to_seat, rel_path, sha256, false)?.matched)
 }
 
 fn ack_row_matches(
@@ -1163,12 +794,14 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         ("1970-01-01T00:00:00Z".to_owned(), "recorded".to_owned())
     } else {
         (
-            unix_secs_to_iso8601_utc(parsed_time.ts.0 / 1_000),
+            parsed_time.ts.to_rfc3339_sec(),
             parsed_time.basis.as_mailbox_ts_basis().to_owned(),
         )
     };
 
-    let state = if is_acked_in_sandbox(root, &to, &rel_path, &sha256) {
+    let acked = is_acked_in_sandbox(root, &to, &rel_path, &sha256)
+        .map_err(|e| SandboxError::Io(e.to_string()))?;
+    let state = if acked {
         "acked".to_owned()
     } else {
         "open".to_owned()
@@ -1206,83 +839,20 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
 }
 
 fn fsync_dir(dir: &Path) -> Result<(), String> {
-    let f = File::open(dir).map_err(|e| format!("open dir {}: {e}", dir.display()))?;
-    f.sync_all()
-        .map_err(|e| format!("fsync dir {}: {e}", dir.display()))
+    rex_wave_fs::sync_dir(dir).map_err(|e| format!("fsync dir {}: {e}", dir.display()))
 }
 
 fn atomic_write_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, ApiError> {
     let dest = dir.join(file_name);
-    match fs::symlink_metadata(&dest) {
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err(ApiError::Denied {
-                principal: "mailbridge".into(),
-                action: format!("write through symlink {}", dest.display()),
-            });
-        }
-        Ok(_) => {
-            let existing = fs::read(&dest)
-                .map_err(|e| ApiError::Internal(format!("read {}: {e}", dest.display())))?;
-            if existing == bytes {
-                return Ok(dest);
-            }
-            return Err(ApiError::conflict(format!(
-                "canon file {} already exists with different bytes (BoxMonotone)",
-                dest.display()
-            )));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(ApiError::Internal(format!("stat {}: {e}", dest.display()))),
+    let created = rex_wave_fs::write_atomic_if_absent_path(&dest, bytes, SANDBOX_FILE_MODE, true)
+        .map_err(|e| ApiError::Internal(format!("write {}: {e}", dest.display())))?;
+    if created || read_letter(&dest)? == bytes {
+        return Ok(dest);
     }
-
-    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".tmp.{}.{nonce}", std::process::id()));
-    let write_res = (|| -> Result<(), String> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| format!("create temp {}: {e}", tmp.display()))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("write temp {}: {e}", tmp.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("fsync temp {}: {e}", tmp.display()))?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp);
-        return Err(ApiError::Internal(e));
-    }
-
-    let link_res = fs::hard_link(&tmp, &dest);
-    let _ = fs::remove_file(&tmp);
-
-    match link_res {
-        Ok(()) => {
-            fsync_dir(dir).map_err(ApiError::Internal)?;
-            Ok(dest)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err(ApiError::Denied {
-                    principal: "mailbridge".into(),
-                    action: format!("write through symlink {}", dest.display()),
-                });
-            }
-            let existing = fs::read(&dest)
-                .map_err(|re| ApiError::Internal(format!("read {}: {re}", dest.display())))?;
-            if existing == bytes {
-                Ok(dest)
-            } else {
-                Err(ApiError::conflict(format!(
-                    "canon file {} already exists with different bytes (BoxMonotone)",
-                    dest.display()
-                )))
-            }
-        }
-        Err(e) => Err(ApiError::Internal(format!("link {}: {e}", dest.display()))),
-    }
+    Err(ApiError::conflict(format!(
+        "canon file {} already exists with different bytes (BoxMonotone)",
+        dest.display()
+    )))
 }
 
 fn canonical_bell_key(schedule_id: &str, mark: &str) -> String {
@@ -1343,7 +913,6 @@ impl MailBridge {
     /// Without a [`Hub`], committed `Mail` entries persist for replay and `Read` only;
     /// live daemons pass a [`Hub`] via [`MailBridge::with_hub`].
     pub fn new(root: SandboxRoot, reader: Journal, writer: StreamWriter) -> Self {
-        register_sandbox_root(root.path());
         let seen_wakes = collect_seen_wakes(&reader);
         MailBridge {
             root,
@@ -1354,7 +923,6 @@ impl MailBridge {
     }
 
     pub fn with_hub(root: SandboxRoot, reader: Journal, writer: StreamWriter, hub: Hub) -> Self {
-        register_sandbox_root(root.path());
         let seen_wakes = collect_seen_wakes(&reader);
         MailBridge {
             root,
@@ -1405,7 +973,7 @@ impl MailBridge {
         let room_stream = StreamId::Room {
             room: req.room.clone(),
         };
-        can_read(&ctx.by, &room_stream)?;
+        can_read(ctx.by(), &room_stream)?;
 
         let entries: Vec<Envelope> = self
             .reader
@@ -1432,7 +1000,16 @@ impl MailBridge {
             });
         }
 
-        let (file_name, bytes) = render_letter(&req, &ctx.by, &entries);
+        let (file_name, bytes) = render_letter(&req, ctx.by(), &entries);
+        if bytes.len() as u64 > MAX_LETTER_BYTES {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "range".into(),
+                reason: format!(
+                    "promoted letter is {} bytes, exceeding max {MAX_LETTER_BYTES} bytes",
+                    bytes.len()
+                ),
+            }));
+        }
         let sha256 = sha256_bytes(&bytes);
 
         let mut seen_seats = BTreeSet::new();
@@ -1483,7 +1060,7 @@ impl MailBridge {
         let mut st = self.state.lock().await;
         let appended = st
             .writer
-            .append(&ctx.by, ctx.at, Some(&idem), events)
+            .append(ctx.by(), ctx.at(), Some(&idem), events)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         for letter in &banked_letters {
             st.seen_wakes.insert(letter.wake_id.clone());
@@ -1500,7 +1077,7 @@ impl MailBridge {
     async fn ack(&self, req: MailAck, ctx: DecideCtx) -> Result<Ack, ApiError> {
         let (abs_path, rel_path, exists) = self.root.confine(&req.path).map_err(|e| match e {
             SandboxError::Production(_) => ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("ack path outside sandbox ({})", req.path.display()),
             },
             other => ApiError::Invalid(InvalidId {
@@ -1516,13 +1093,13 @@ impl MailBridge {
             .split_once('/')
             .and_then(|(first, _)| first.strip_prefix("to-"));
 
-        let acker_seat = match (&ctx.by, box_seat) {
+        let acker_seat = match (ctx.by(), box_seat) {
             (Principal::Seat { seat }, Some(target)) if seat.as_str() == target => {
                 seat.as_str().to_owned()
             }
             (Principal::Seat { .. } | Principal::Worker { .. }, Some(target)) => {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("ack letter in to-{target}"),
                 });
             }
@@ -1533,7 +1110,7 @@ impl MailBridge {
             }
             (Principal::Operator { .. }, Some(target)) => {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("ack letter in to-{target}"),
                 });
             }
@@ -1541,11 +1118,10 @@ impl MailBridge {
             (Principal::Operator { seat } | Principal::Seat { seat }, None) => {
                 seat.as_str().to_owned()
             }
-            _ => principal_mail_address(&ctx.by),
+            _ => principal_mail_address(ctx.by()),
         };
 
-        let bytes =
-            fs::read(&abs_path).map_err(|e| ApiError::Internal(format!("read {rel_path}: {e}")))?;
+        let bytes = read_letter(&abs_path)?;
         let on_disk_sha = sha256_bytes(&bytes);
         if on_disk_sha != req.sha256 {
             return Err(ApiError::conflict(format!(
@@ -1554,11 +1130,11 @@ impl MailBridge {
             )));
         }
 
-        let ts = unix_secs_to_iso8601_utc(ctx.at.0 / 1_000);
+        let ts = ctx.at().to_rfc3339_sec();
         let ack_json = serde_json::json!({
             "schema": 1,
             "seat": acker_seat,
-            "by": ctx.by.to_string(),
+            "by": ctx.by().to_string(),
             "path": rel_path,
             "sha256_full": req.sha256.as_str(),
             "sha256": &req.sha256.as_str()[..16],
@@ -1568,23 +1144,26 @@ impl MailBridge {
         let mut st = self.state.lock().await;
         let state_dir = self.root.ensure_dir(&["state"])?;
         let acks_file = state_dir.join("acks.jsonl");
-        if let Ok(sm) = fs::symlink_metadata(&acks_file)
-            && sm.file_type().is_symlink()
-        {
-            return Err(ApiError::Denied {
-                principal: "mailbridge".into(),
-                action: format!("write through symlink {}", acks_file.display()),
-            });
-        }
 
-        if !is_acked_in_sandbox(&self.root, &acker_seat, &rel_path, &req.sha256) {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&acks_file)
-                .map_err(|e| ApiError::Internal(format!("open acks.jsonl: {e}")))?;
-            let mut line =
-                serde_json::to_vec(&ack_json).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let scan = scan_sandbox_acks(&self.root, &acker_seat, &rel_path, &req.sha256, true)?;
+        if !scan.matched {
+            let (mut f, _) = rex_wave_fs::open_append_nofollow(&acks_file, SANDBOX_FILE_MODE)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::InvalidInput {
+                        ApiError::Denied {
+                            principal: "mailbridge".into(),
+                            action: format!("write through symlink {}", acks_file.display()),
+                        }
+                    } else {
+                        ApiError::Internal(format!("open acks.jsonl: {e}"))
+                    }
+                })?;
+            let mut line = Vec::new();
+            if scan.needs_leading_newline {
+                line.push(b'\n');
+            }
+            serde_json::to_writer(&mut line, &ack_json)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
             line.push(b'\n');
             f.write_all(&line)
                 .map_err(|e| ApiError::Internal(format!("append acks.jsonl: {e}")))?;
@@ -1598,8 +1177,8 @@ impl MailBridge {
         let appended = st
             .writer
             .append(
-                &ctx.by,
-                ctx.at,
+                ctx.by(),
+                ctx.at(),
                 Some(&idem),
                 vec![Event::Mail(MailEvent::Acked {
                     path: PathBuf::from(&rel_path),
@@ -1661,8 +1240,8 @@ impl MailBridge {
         let appended = st
             .writer
             .append(
-                &ctx.by,
-                ctx.at,
+                ctx.by(),
+                ctx.at(),
                 Some(&idem),
                 vec![Event::Mail(MailEvent::BellRang {
                     bell_id: canonical,
@@ -1721,7 +1300,7 @@ impl MailBridge {
             md_files.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (file_name, file_path) in md_files {
-                let bytes = fs::read(&file_path).map_err(|e| ApiError::Internal(e.to_string()))?;
+                let bytes = read_letter(&file_path)?;
                 let item = project(&self.root, &file_path, &bytes)
                     .map_err(|e| ApiError::Internal(e.to_string()))?;
                 let wid = wake_id(&seat, &box_name, &file_name, &item.reference.sha256);
@@ -1738,11 +1317,7 @@ impl MailBridge {
                     st.seen_wakes.insert(wid);
                     continue;
                 }
-                let at = UnixMs(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis() as u64),
-                );
+                let at = rex_wave_runtime::now();
                 let appended = st
                     .writer
                     .append(
@@ -1782,21 +1357,6 @@ impl Service<MailCommand> for MailBridge {
             }
         })
     }
-}
-
-fn is_loopback_host(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("[::1]") {
-        return rest.is_empty()
-            || rest
-                .strip_prefix(':')
-                .is_some_and(|p| p.parse::<u16>().is_ok());
-    }
-    let host = match trimmed.rsplit_once(':') {
-        Some((h, port)) if port.parse::<u16>().is_ok() => h,
-        _ => trimmed,
-    };
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
 }
 
 pub async fn serve_wake_bell_sink<C: Client + 'static>(
@@ -2007,14 +1567,17 @@ async fn write_http_json(
 
 async fn deliver_bell_dm(
     client: &LocalClient,
+    sandbox: &SandboxRoot,
     seat: SeatName,
     bell_id: String,
 ) -> Result<(), ApiError> {
     let digest16 = bell_digest16(&seat, &bell_id);
     let idem = IdemKey::parse(format!("bell:{digest16}"))?;
-    let prompt = read_bell_prompt_any_sandbox(&digest16).ok_or_else(|| ApiError::NotFound {
-        what: format!("banked wake bell {bell_id} for @{seat}"),
-    })?;
+    let prompt = sandbox
+        .read_bell_prompt(&digest16)
+        .ok_or_else(|| ApiError::NotFound {
+            what: format!("banked wake bell {bell_id} for @{seat}"),
+        })?;
     let body = room::Body::parse(prompt)?;
     client
         .call(room::RoomPost {
@@ -2030,7 +1593,17 @@ async fn deliver_bell_dm(
     Ok(())
 }
 
-pub struct BellCourier;
+/// Delivers each rung bell's banked prompt, read from the sandbox it was
+/// banked in, as a DM to its seat.
+pub struct BellCourier {
+    sandbox: SandboxRoot,
+}
+
+impl BellCourier {
+    pub fn new(sandbox: SandboxRoot) -> Self {
+        Self { sandbox }
+    }
+}
 
 impl Reactor for BellCourier {
     const NAME: &'static str = "bell-courier";
@@ -2047,12 +1620,13 @@ impl Reactor for BellCourier {
         client: &LocalClient,
     ) -> impl Future<Output = Result<(), ApiError>> + Send {
         let client = client.clone();
+        let sandbox = self.sandbox.clone();
         async move {
             match frame {
                 Frame::Committed(Envelope {
                     event: Event::Mail(MailEvent::BellRang { bell_id, seat }),
                     ..
-                }) => deliver_bell_dm(&client, seat, bell_id).await,
+                }) => deliver_bell_dm(&client, &sandbox, seat, bell_id).await,
                 _ => Ok(()),
             }
         }

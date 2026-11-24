@@ -339,7 +339,7 @@ impl World {
 
     fn is_member(&self, room: &RoomId, who: &Principal) -> bool {
         match room {
-            RoomId::Direct { pair } => pair.contains(who),
+            RoomId::Direct { pair } => pair.other_for_viewer(who).is_some(),
             RoomId::Channel { .. } => self
                 .rooms
                 .get(room)
@@ -355,10 +355,10 @@ impl World {
         let mut unread = 0u32;
         let mut mentions = 0u32;
         for p in &r.posts {
-            if p.seq > upto && &p.by != viewer {
+            if p.seq > upto && !viewer.same_actor(&p.by) {
                 unread += 1;
-                let system_to_operator = matches!(p.by, Principal::System { .. })
-                    && matches!(viewer, Principal::Operator { .. });
+                let system_to_operator =
+                    matches!(p.by, Principal::System { .. }) && viewer.is_operator();
                 if !system_to_operator
                     && (p.mentions.principals.contains(viewer) || (p.mentions.all && in_room))
                 {
@@ -496,7 +496,7 @@ impl World {
                         });
                 }
                 RoomId::Direct { pair } => {
-                    if let Some(other) = pair.other(viewer) {
+                    if let Some(other) = pair.other_for_viewer(viewer) {
                         direct_messages.push(DmLeaf {
                             room: room.clone(),
                             with: other.clone(),

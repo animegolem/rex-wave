@@ -1,0 +1,9 @@
+disallowed-methods = [
+  { path = "std::fs::symlink_metadata", reason = "use rex_wave_fs::open_regular_nofollow / ConfinedDir (fstat on O_NOFOLLOW handle)" },
+  { path = "std::fs::read_to_string", reason = "use rex_wave_fs::read_regular_string(path, max_bytes) or ConfinedDir::read_string" },
+  { path = "std::fs::read", reason = "use rex_wave_fs::read_regular_bounded(path, max_bytes) or ConfinedDir::read_regular" },
+  { path = "std::fs::rename", reason = "use rex_wave_fs::write_atomic_path or ConfinedDir::write_atomic" },
+  { path = "std::fs::hard_link", reason = "use rex_wave_fs::write_atomic_if_absent_path or ConfinedDir::write_atomic_if_absent" },
+  { path = "std::fs::canonicalize", reason = "use rex_wave_fs::ProtectedRootsGuard / OutsidePath instead of ad-hoc canonicalize" },
+  { path = "std::time::SystemTime::now", reason = "use rex_wave_runtime::now() (or rex_wave_api::UnixMs::now_wall() only where runtime is unavailable)" },
+]

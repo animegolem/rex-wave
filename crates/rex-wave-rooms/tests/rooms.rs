@@ -486,13 +486,13 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
     assert_eq!(history[1].reply_to, Some(first.seq));
 
     let raw = sam
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: room.resolve(sam.me()).unwrap(),
             },
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+            Seq::ORIGIN,
+            None,
+        ))
         .await
         .unwrap();
     assert!(
@@ -673,9 +673,8 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
         async move {
             verifier
                 .call(Wait {
-                    interest: Interest::Mentions,
-                    after,
                     timeout_ms: Some(2000),
+                    ..Wait::new(Interest::Mentions, after)
                 })
                 .await
                 .unwrap()
@@ -1723,10 +1722,7 @@ fn pure_clock_lease_expiry_and_readiness_evaluation() {
             }),
             ..RoomPost::new(room.clone(), Body::parse("clock body").unwrap())
         }),
-        &DecideCtx {
-            by: w1.clone(),
-            at: UnixMs(1_000),
-        },
+        &DecideCtx::for_test(w1.clone(), UnixMs(1_000)),
     )
     .unwrap();
     apply(&mut state, &mut seq, &w1, UnixMs(1_000), post_evs);
@@ -1742,10 +1738,7 @@ fn pure_clock_lease_expiry_and_readiness_evaluation() {
             force: false,
             idem: None,
         }),
-        &DecideCtx {
-            by: w1.clone(),
-            at: UnixMs(1_000),
-        },
+        &DecideCtx::for_test(w1.clone(), UnixMs(1_000)),
     )
     .unwrap();
     apply(&mut state, &mut seq, &w1, UnixMs(1_000), claim_evs);
@@ -1793,10 +1786,7 @@ fn pure_clock_lease_expiry_and_readiness_evaluation() {
             force: false,
             idem: None,
         }),
-        &DecideCtx {
-            by: w2.clone(),
-            at: UnixMs(1_499),
-        },
+        &DecideCtx::for_test(w2.clone(), UnixMs(1_499)),
     )
     .unwrap_err();
     assert!(matches!(
@@ -1817,10 +1807,7 @@ fn pure_clock_lease_expiry_and_readiness_evaluation() {
             force: false,
             idem: None,
         }),
-        &DecideCtx {
-            by: w2.clone(),
-            at: UnixMs(1_500),
-        },
+        &DecideCtx::for_test(w2.clone(), UnixMs(1_500)),
     )
     .unwrap();
     apply(&mut state, &mut seq, &w2, UnixMs(1_500), takeover_evs);
