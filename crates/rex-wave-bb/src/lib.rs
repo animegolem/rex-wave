@@ -3187,7 +3187,7 @@ fn parked_room_and_since(
         Interest::Room { room } | Interest::RoomFiltered { room, .. } => match room.resolve(worker)
         {
             Ok(id) => {
-                let since = w.after.at(&StreamId::Room { room: id.clone() });
+                let since = w.after.at_compatible(&StreamId::Room { room: id.clone() });
                 (Some(id), since)
             }
             Err(_) => (None, Seq::ORIGIN),

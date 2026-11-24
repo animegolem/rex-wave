@@ -145,6 +145,32 @@ impl Cursor {
     pub fn lists(&self, stream: &StreamId) -> bool {
         self.positions.iter().any(|(s, _)| s == stream)
     }
+    /// True when `stream` is listed directly or, for a canonical `(Seat, peer)`
+    /// DM, under a pre-PR-26 `(Operator, peer)` key for the same two actors.
+    pub fn lists_compatible(&self, stream: &StreamId) -> bool {
+        if self.lists(stream) {
+            return true;
+        }
+        let StreamId::Room {
+            room: RoomId::Direct { pair },
+        } = stream
+        else {
+            return false;
+        };
+        let (a, b): (Principal, Principal) = pair.clone().into();
+        if a.is_operator() || b.is_operator() {
+            return false;
+        }
+        self.positions.iter().any(|(s, _)| match s {
+            StreamId::Room {
+                room: RoomId::Direct { pair: other },
+            } => {
+                let (oa, ob): (Principal, Principal) = other.clone().into();
+                (oa.same_actor(&a) && ob.same_actor(&b)) || (oa.same_actor(&b) && ob.same_actor(&a))
+            }
+            _ => false,
+        })
+    }
     pub fn with(mut self, stream: StreamId, seq: Seq) -> Self {
         self.advance(&stream, seq);
         self
@@ -154,6 +180,42 @@ impl Cursor {
             .iter()
             .find(|(s, _)| s == stream)
             .map(|(_, q)| *q)
+            .unwrap_or(Seq::ORIGIN)
+    }
+    /// Position for `stream`, falling back to a pre-PR-26 `(Operator, peer)`
+    /// DM entry for the same two actors when `stream` is canonical and unlisted.
+    pub fn at_compatible(&self, stream: &StreamId) -> Seq {
+        if self.lists(stream) {
+            return self.at(stream);
+        }
+        let StreamId::Room {
+            room: RoomId::Direct { pair },
+        } = stream
+        else {
+            return Seq::ORIGIN;
+        };
+        let (a, b): (Principal, Principal) = pair.clone().into();
+        if a.is_operator() || b.is_operator() {
+            return Seq::ORIGIN;
+        }
+        self.positions
+            .iter()
+            .filter_map(|(s, q)| match s {
+                StreamId::Room {
+                    room: RoomId::Direct { pair: other },
+                } => {
+                    let (oa, ob): (Principal, Principal) = other.clone().into();
+                    if (oa.same_actor(&a) && ob.same_actor(&b))
+                        || (oa.same_actor(&b) && ob.same_actor(&a))
+                    {
+                        Some(*q)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .max()
             .unwrap_or(Seq::ORIGIN)
     }
     pub fn try_map_streams<F, E>(&self, mut f: F) -> Result<Cursor, E>

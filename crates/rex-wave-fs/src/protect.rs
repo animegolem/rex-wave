@@ -602,26 +602,14 @@ impl OutsidePath {
     }
 }
 
-/// Descriptor-relative startup open for `mail shadow --watch --out`:
-/// 1. Validates `out` against `protected_root` via [`OutsidePath::verify`].
-/// 2. Walks from `/` component-by-component with `openat(O_DIRECTORY | O_NOFOLLOW)`
-///    (following ancestor directory symlinks via `readlinkat` with a hop cap
-///    and creating missing parent directories via `mkdirat`), tracking the
-///    held directory descriptor's path and verifying at every step that the
-///    held directory's `(dev, ino)` is never `protected_root` (nor inside it).
-/// 3. Opens/creates the leaf directly inside the verified parent descriptor
-///    with `openat(O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK)` so
-///    concurrent ancestor renames cannot redirect file creation into
-///    `protected_root`.
-pub fn open_outside_rw_append_confined(
+fn walk_outside_parent_confined(
     out: &Path,
     protected_root: &Path,
-    mode: u32,
-) -> Result<(PathBuf, std::fs::File, std::fs::Metadata), OutsideError> {
+) -> Result<(rustix::fd::OwnedFd, PathBuf, std::ffi::OsString, PathBuf), OutsideError> {
     use rustix::fs::{Mode, OFlags, fstat, mkdirat, openat, readlinkat};
     use std::os::unix::fs::MetadataExt as _;
 
-    let verified = OutsidePath::verify(out, protected_root)?;
+    let _verified = OutsidePath::verify(out, protected_root)?;
     let abs = lexical_normalize(out).map_err(|e| OutsideError::Io(e.to_string()))?;
     let file_name = abs
         .file_name()
@@ -649,31 +637,50 @@ pub fn open_outside_rw_append_confined(
         let f = std::fs::File::open("/").map_err(|e| OutsideError::Io(e.to_string()))?;
         Ok(f.into())
     };
+    let check_dir = |fd: &rustix::fd::OwnedFd, path: &Path| -> Result<(), OutsideError> {
+        let st = fstat(fd).map_err(|e| OutsideError::Io(e.to_string()))?;
+        if Some((st.st_dev as u64, st.st_ino as u64)) == protected_dev_ino
+            || path.starts_with(&canon_protected)
+            || (ci && starts_with_ascii_ci(path, &canon_protected))
+        {
+            return Err(OutsideError::Inside(
+                out.to_path_buf(),
+                canon_protected.clone(),
+            ));
+        }
+        Ok(())
+    };
 
     let mut dir_fd = open_root()?;
     let mut cur_path = PathBuf::from("/");
-    let mut pending: Vec<std::ffi::OsString> = parent
+    let mut ancestors: Vec<(rustix::fd::OwnedFd, PathBuf)> = Vec::new();
+    let mut pending: Vec<(std::ffi::OsString, bool)> = parent
         .components()
         .rev()
-        .map(|c| c.as_os_str().to_owned())
+        .map(|c| (c.as_os_str().to_owned(), false))
         .collect();
     let mut hops = 0usize;
 
-    while let Some(seg) = pending.pop() {
+    while let Some((seg, from_symlink)) = pending.pop() {
         match Path::new(&seg).components().next() {
             Some(Component::Prefix(_) | Component::RootDir | Component::CurDir) | None => continue,
             Some(Component::ParentDir) => {
-                return Err(OutsideError::ParentDir(out.to_path_buf()));
+                if !from_symlink {
+                    return Err(OutsideError::ParentDir(out.to_path_buf()));
+                }
+                if let Some((prev_fd, prev_path)) = ancestors.pop() {
+                    dir_fd = prev_fd;
+                    cur_path = prev_path;
+                }
+                check_dir(&dir_fd, &cur_path)?;
+                continue;
             }
             Some(Component::Normal(_)) => {}
         }
 
         let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let next_fd = match openat(&dir_fd, &seg, dir_flags, Mode::empty()) {
-            Ok(fd) => {
-                cur_path.push(&seg);
-                fd
-            }
+            Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => {
                 let candidate_dir = cur_path.join(&seg);
                 if candidate_dir.starts_with(&canon_protected)
@@ -693,7 +700,7 @@ pub fn open_outside_rw_append_confined(
                         )));
                     }
                 }
-                let fd = openat(&dir_fd, &seg, dir_flags, Mode::empty()).map_err(|e| {
+                openat(&dir_fd, &seg, dir_flags, Mode::empty()).map_err(|e| {
                     if e == rustix::io::Errno::LOOP
                         || e == rustix::io::Errno::MLINK
                         || e == rustix::io::Errno::NOTDIR
@@ -702,9 +709,7 @@ pub fn open_outside_rw_append_confined(
                     } else {
                         OutsideError::Io(format!("open dir {}: {e}", candidate_dir.display()))
                     }
-                })?;
-                cur_path.push(&seg);
-                fd
+                })?
             }
             Err(e)
                 if e == rustix::io::Errno::LOOP
@@ -728,16 +733,12 @@ pub fn open_outside_rw_append_confined(
                     return Err(OutsideError::Io("too many symlinks".into()));
                 }
                 if target.is_absolute() {
+                    ancestors.clear();
                     dir_fd = open_root()?;
                     cur_path = PathBuf::from("/");
                 }
                 for comp in target.components().rev() {
-                    match comp {
-                        Component::ParentDir => {
-                            return Err(OutsideError::ParentDir(out.to_path_buf()));
-                        }
-                        _ => pending.push(comp.as_os_str().to_owned()),
-                    }
+                    pending.push((comp.as_os_str().to_owned(), true));
                 }
                 continue;
             }
@@ -749,26 +750,40 @@ pub fn open_outside_rw_append_confined(
             }
         };
 
-        let st = fstat(&next_fd).map_err(|e| OutsideError::Io(e.to_string()))?;
-        if Some((st.st_dev as u64, st.st_ino as u64)) == protected_dev_ino
-            || cur_path.starts_with(&canon_protected)
-            || (ci && starts_with_ascii_ci(&cur_path, &canon_protected))
-        {
-            return Err(OutsideError::Inside(
-                out.to_path_buf(),
-                canon_protected.clone(),
-            ));
-        }
-        dir_fd = next_fd;
+        let next_path = cur_path.join(&seg);
+        check_dir(&next_fd, &next_path)?;
+        let prev_fd = std::mem::replace(&mut dir_fd, next_fd);
+        let prev_path = std::mem::replace(&mut cur_path, next_path);
+        ancestors.push((prev_fd, prev_path));
     }
 
     let final_path = cur_path.join(&file_name);
     if final_path.starts_with(&canon_protected)
         || (ci && starts_with_ascii_ci(&final_path, &canon_protected))
     {
-        return Err(OutsideError::Inside(out.to_path_buf(), canon_protected));
+        return Err(OutsideError::Inside(
+            out.to_path_buf(),
+            canon_protected.clone(),
+        ));
     }
-    let _ = verified;
+    Ok((dir_fd, cur_path, file_name, final_path))
+}
+
+/// Descriptor-relative startup open for `mail shadow --watch --out`:
+/// walks from `/` component-by-component with `openat(O_DIRECTORY | O_NOFOLLOW)`,
+/// resolves directory symlinks (including `..` inside symlink targets against the
+/// held ancestor descriptor stack), creates missing directories via `mkdirat`,
+/// verifies at every step that the held directory is outside `protected_root`,
+/// and opens/creates the leaf via `openat(O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW)`.
+pub fn open_outside_rw_append_confined(
+    out: &Path,
+    protected_root: &Path,
+    mode: u32,
+) -> Result<(PathBuf, std::fs::File, std::fs::Metadata), OutsideError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let (dir_fd, _parent_path, file_name, final_path) =
+        walk_outside_parent_confined(out, protected_root)?;
 
     let leaf_flags = OFlags::RDWR
         | OFlags::APPEND
@@ -802,6 +817,24 @@ pub fn open_outside_rw_append_confined(
         )));
     }
     Ok((final_path, file, meta))
+}
+
+/// Descriptor-confined atomic snapshot write outside `protected_root`:
+/// creates any missing parent directories via `mkdirat` on verified descriptors
+/// and atomically writes `bytes` to the verified leaf path, re-checking
+/// `OutsidePath::verify` so an ancestor swap cannot land inside `protected_root`.
+pub fn write_outside_atomic_confined(
+    out: &Path,
+    protected_root: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<PathBuf, OutsideError> {
+    let (_dir_fd, _parent_path, _file_name, final_path) =
+        walk_outside_parent_confined(out, protected_root)?;
+    let recheck = OutsidePath::verify(&final_path, protected_root)?;
+    crate::file::write_atomic_path(recheck.path(), bytes, mode, false)
+        .map_err(|e| OutsideError::Io(format!("write {}: {e}", recheck.path().display())))?;
+    Ok(recheck.path().to_path_buf())
 }
 
 #[cfg(test)]
@@ -881,5 +914,46 @@ mod tests {
         assert!(guard.check(&base, &base).is_err());
         assert!(guard.check(&base.join("a/secret/b"), &base).is_err());
         assert!(guard.check(&base.join("sandbox"), &base).is_ok());
+    }
+
+    #[test]
+    fn confined_outside_open_allows_relative_parent_symlink_outside_and_refuses_into_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = real_path(dir.path()).unwrap();
+        let protected = base.join("interchange");
+        let ui = base.join("ui");
+        let logs = base.join("logs");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+
+        symlink("../logs", ui.join("logs")).unwrap();
+        let out_via_rel_link = ui.join("logs/sub/shadow.jsonl");
+        let (final_path, _f, meta) =
+            open_outside_rw_append_confined(&out_via_rel_link, &protected, 0o644).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(final_path, logs.join("sub/shadow.jsonl"));
+
+        let snap_path = write_outside_atomic_confined(
+            &ui.join("logs/sub/snap.jsonl"),
+            &protected,
+            b"{}\n",
+            0o644,
+        )
+        .unwrap();
+        assert_eq!(snap_path, logs.join("sub/snap.jsonl"));
+
+        symlink("../interchange", ui.join("escape")).unwrap();
+        let escape_err = open_outside_rw_append_confined(
+            &ui.join("escape/newdir/shadow.jsonl"),
+            &protected,
+            0o644,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(escape_err, OutsideError::Inside(..)),
+            "got {escape_err:?}"
+        );
+        assert!(!protected.join("newdir").exists());
     }
 }

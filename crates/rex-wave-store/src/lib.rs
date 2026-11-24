@@ -191,6 +191,34 @@ fn find_idem(
     )?))
 }
 
+/// Outcome of resolving a DM room for an idempotent command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DmIdemResolution {
+    Route(RoomId),
+    Ambiguous(Vec<RoomId>),
+}
+
+fn legacy_dm_candidates(a: &Principal, b: &Principal) -> Vec<RoomId> {
+    let mut pairs = Vec::new();
+    if let Principal::Seat { seat } = a {
+        pairs.push((Principal::Operator { seat: seat.clone() }, b.clone()));
+    }
+    if let Principal::Seat { seat } = b {
+        pairs.push((a.clone(), Principal::Operator { seat: seat.clone() }));
+    }
+    if let (Principal::Seat { seat: sa }, Principal::Seat { seat: sb }) = (a, b) {
+        pairs.push((
+            Principal::Operator { seat: sa.clone() },
+            Principal::Operator { seat: sb.clone() },
+        ));
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(la, lb)| PrincipalPair::new(la, lb).ok())
+        .map(|pair| RoomId::Direct { pair })
+        .collect()
+}
+
 impl Journal {
     /// Open (creating if needed) the journal at `path` in WAL mode.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -273,34 +301,84 @@ impl Journal {
         if head_of(&conn, &StreamId::Room { room: room.clone() })? > Seq::ORIGIN {
             return Ok(room);
         }
-        let mut candidates = Vec::new();
-        if let Principal::Seat { ref seat } = a {
-            candidates.push((Principal::Operator { seat: seat.clone() }, b.clone()));
-        }
-        if let Principal::Seat { ref seat } = b {
-            candidates.push((a.clone(), Principal::Operator { seat: seat.clone() }));
-        }
-        if let (Principal::Seat { seat: sa }, Principal::Seat { seat: sb }) = (&a, &b) {
-            candidates.push((
-                Principal::Operator { seat: sa.clone() },
-                Principal::Operator { seat: sb.clone() },
-            ));
-        }
-        for (la, lb) in candidates {
-            if let Ok(legacy_pair) = PrincipalPair::new(la, lb) {
-                let legacy_room = RoomId::Direct { pair: legacy_pair };
-                if head_of(
-                    &conn,
-                    &StreamId::Room {
-                        room: legacy_room.clone(),
-                    },
-                )? > Seq::ORIGIN
-                {
-                    return Ok(legacy_room);
-                }
+        for legacy_room in legacy_dm_candidates(&a, &b) {
+            if head_of(
+                &conn,
+                &StreamId::Room {
+                    room: legacy_room.clone(),
+                },
+            )? > Seq::ORIGIN
+            {
+                return Ok(legacy_room);
             }
         }
         Ok(room)
+    }
+
+    /// Resolve a canonical `(Seat, peer)` DM room for a command carrying an
+    /// optional idempotency key across both canonical and pre-PR-26
+    /// `(Operator, peer)` histories:
+    /// - Checks every existing history for `idem`;
+    /// - Routes to the unique stream where `by` (`same_actor`) committed `idem`;
+    /// - Returns [`DmIdemResolution::Ambiguous`] when `idem` exists on multiple
+    ///   histories for `by` or belongs to a different author.
+    pub fn resolve_dm_room_with_idem(
+        &self,
+        room: RoomId,
+        by: &Principal,
+        idem: Option<&IdemKey>,
+    ) -> Result<DmIdemResolution, StoreError> {
+        let RoomId::Direct { ref pair } = room else {
+            return Ok(DmIdemResolution::Route(room));
+        };
+        let (a, b): (Principal, Principal) = pair.clone().into();
+        if a.is_operator() || b.is_operator() {
+            return Ok(DmIdemResolution::Route(room));
+        }
+        let conn = self.inner.conn();
+        let canon_exists = head_of(&conn, &StreamId::Room { room: room.clone() })? > Seq::ORIGIN;
+        let mut legacy_existing = Vec::new();
+        for cand in legacy_dm_candidates(&a, &b) {
+            if head_of(&conn, &StreamId::Room { room: cand.clone() })? > Seq::ORIGIN {
+                legacy_existing.push(cand);
+            }
+        }
+        if legacy_existing.is_empty() {
+            return Ok(DmIdemResolution::Route(room));
+        }
+        if let Some(key) = idem {
+            let mut to_check = Vec::with_capacity(1 + legacy_existing.len());
+            if canon_exists {
+                to_check.push(room.clone());
+            }
+            to_check.extend(legacy_existing.iter().cloned());
+
+            let mut same_actor_rooms = Vec::new();
+            let mut other_actor_rooms = Vec::new();
+            for r in to_check {
+                if let Some(batch) = find_idem(&conn, &StreamId::Room { room: r.clone() }, key)? {
+                    if batch.first().is_some_and(|env| env.by.same_actor(by)) {
+                        same_actor_rooms.push(r);
+                    } else {
+                        other_actor_rooms.push(r);
+                    }
+                }
+            }
+            if same_actor_rooms.len() == 1 {
+                return Ok(DmIdemResolution::Route(same_actor_rooms.remove(0)));
+            }
+            if same_actor_rooms.len() > 1 {
+                return Ok(DmIdemResolution::Ambiguous(same_actor_rooms));
+            }
+            if !other_actor_rooms.is_empty() {
+                return Ok(DmIdemResolution::Ambiguous(other_actor_rooms));
+            }
+        }
+        if canon_exists {
+            Ok(DmIdemResolution::Route(room))
+        } else {
+            Ok(DmIdemResolution::Route(legacy_existing.remove(0)))
+        }
     }
 
     /// Every stream with at least one entry, with its head.
@@ -570,5 +648,29 @@ mod legacy_dm_tests {
                 .unwrap(),
             Seq(2)
         );
+        let same_idem = IdemKey::parse("same-idem").unwrap();
+        assert_eq!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, Some(&same_idem))
+                .unwrap(),
+            DmIdemResolution::Route(legacy_room.clone()),
+            "operator retry resolves to the operator's legacy batch even when peer used same key on canonical stream"
+        );
+        assert_eq!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &alice, Some(&same_idem))
+                .unwrap(),
+            DmIdemResolution::Route(canon_room.clone()),
+            "peer retry resolves to peer's canonical batch"
+        );
+        let bob = Principal::Seat {
+            seat: SeatName::parse("bob").unwrap(),
+        };
+        assert!(matches!(
+            split
+                .resolve_dm_room_with_idem(canon_room.clone(), &bob, Some(&same_idem))
+                .unwrap(),
+            DmIdemResolution::Ambiguous(_)
+        ));
     }
 }

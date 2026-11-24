@@ -433,45 +433,6 @@ fn mint_task_org_id(room_id: &RoomId, seq: Seq, existing: &BTreeMap<OrgId, Seq>)
     unreachable!("deterministic OrgId namespace exhausted")
 }
 
-fn fnv1a_128(bytes: &[u8]) -> u128 {
-    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for &b in bytes {
-        hash ^= u128::from(b);
-        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
-    }
-    hash
-}
-
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Namespace idempotency keys for Phase 3 room commands so reusing the same raw
-/// key across different command variants never collides in the per-stream journal
-/// lookup table, while keeping `RoomPost` keys raw for pre-upgrade compatibility.
-fn scoped_idem(prefix: &str, key: &IdemKey) -> IdemKey {
-    let raw = key.as_str();
-    let max_raw = 256 - prefix.len() - 2;
-    let encoded = if raw.len() <= max_raw {
-        format!("{prefix}r:{raw}")
-    } else {
-        let h_fwd = fnv1a_128(raw.as_bytes());
-        let rev_bytes: Vec<u8> = raw.as_bytes().iter().rev().copied().collect();
-        let h_rev = fnv1a_128(&rev_bytes) as u64;
-        let max_prefix = 256 - prefix.len() - 2 - 48 - 1;
-        let head = truncate_utf8(raw, max_prefix);
-        format!("{prefix}h:{h_fwd:032x}{h_rev:016x}:{head}")
-    };
-    IdemKey::parse(encoded).expect("scoped idempotency key is valid printable <= 256 bytes")
-}
-
 fn sanitize_handle_prefix(raw: &str, max_len: usize) -> String {
     let mut s: String = raw
         .bytes()
@@ -658,24 +619,7 @@ impl Decider for Rooms {
     }
 
     fn idem(cmd: &RoomCommand) -> Option<IdemKey> {
-        match cmd {
-            RoomCommand::RoomPost(c) => c.idem.as_ref().map(|k| {
-                if k.as_str().starts_with("__rw_") {
-                    scoped_idem("__rw_pst:", k)
-                } else {
-                    k.clone()
-                }
-            }),
-            RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_lbl:", k)),
-            RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_clm:", k)),
-            RoomCommand::TaskTransition(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_trn:", k)),
-            RoomCommand::TaskUpdate(c) => c.idem.as_ref().map(|k| scoped_idem("__rw_upd:", k)),
-            RoomCommand::RoomEnsure(_)
-            | RoomCommand::RoomJoin(_)
-            | RoomCommand::RoomLeave(_)
-            | RoomCommand::TaskHeartbeat(_)
-            | RoomCommand::RoomTasks(_) => None,
-        }
+        cmd.effective_idem()
     }
 
     fn decide(

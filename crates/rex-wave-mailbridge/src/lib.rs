@@ -677,18 +677,20 @@ fn scan_sandbox_acks(
     let mut matched = false;
     let mut any_bytes = false;
     let mut last_had_newline = true;
+    let mut line_no = 0usize;
     while let Some(had_nl) = read_bounded_line(&mut reader, &mut line_buf, MAX_ACK_LINE_BYTES)
         .map_err(|e| ApiError::Internal(format!("read acks.jsonl: {e}")))?
     {
+        line_no += 1;
         any_bytes = true;
         last_had_newline = had_nl;
         let line = match std::str::from_utf8(&line_buf) {
             Ok(s) => s,
             Err(_) if !strict_lines => continue,
             Err(_) => {
-                return Err(ApiError::Internal(
-                    "corrupt non-UTF-8 line in state/acks.jsonl".into(),
-                ));
+                return Err(ApiError::Internal(format!(
+                    "corrupt non-UTF-8 row at state/acks.jsonl:{line_no}; repair or remove that line before appending new acks"
+                )));
             }
         };
         let trimmed = line.trim();
@@ -700,7 +702,7 @@ fn scan_sandbox_acks(
             Err(_) if !strict_lines => continue,
             Err(e) => {
                 return Err(ApiError::Internal(format!(
-                    "corrupt JSON line in state/acks.jsonl: {e}"
+                    "corrupt JSON row at state/acks.jsonl:{line_no} ({e}); repair or remove that line before appending new acks"
                 )));
             }
         };
@@ -708,9 +710,9 @@ fn scan_sandbox_acks(
             if !strict_lines {
                 continue;
             }
-            return Err(ApiError::Internal(
-                "corrupt non-object JSON line in state/acks.jsonl".into(),
-            ));
+            return Err(ApiError::Internal(format!(
+                "corrupt non-object JSON row at state/acks.jsonl:{line_no}; repair or remove that line before appending new acks"
+            )));
         }
         if !matched && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases) {
             matched = true;

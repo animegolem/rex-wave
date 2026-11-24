@@ -288,7 +288,6 @@ select_open_re = re.compile(r"\bselect!\s*\{")
 select_read_re = re.compile(r"\b(read_frame|read_message|read_exact)\s*\(")
 for_test_re = re.compile(r"\bDecideCtx::for_test\s*\(")
 cfg_attr_open_re = re.compile(r"#\s*\[\s*cfg\s*\(")
-not_test_re = re.compile(r"\bnot\s*\(\s*test\s*\)")
 has_test_re = re.compile(r"\btest\b")
 MAX_MACRO_SCAN = 1 << 20
 
@@ -453,12 +452,72 @@ def select_branch_future_spans(text, body_start, body_end):
         i += 1
     return spans
 
+def eval_cfg_when_not_test(expr):
+    """Evaluate (can_be_true, can_be_false) for a Rust cfg(...) expression under test=False."""
+    n = len(expr)
+    pos = [0]
+
+    def skip_ws():
+        while pos[0] < n and expr[pos[0]].isspace():
+            pos[0] += 1
+
+    def parse_node():
+        skip_ws()
+        start = pos[0]
+        while pos[0] < n and (expr[pos[0]].isalnum() or expr[pos[0]] == "_"):
+            pos[0] += 1
+        ident = expr[start:pos[0]]
+        skip_ws()
+        if pos[0] < n and expr[pos[0]] == "(":
+            pos[0] += 1
+            args = []
+            while True:
+                skip_ws()
+                if pos[0] >= n:
+                    break
+                if expr[pos[0]] == ")":
+                    pos[0] += 1
+                    break
+                args.append(parse_node())
+                skip_ws()
+                if pos[0] < n and expr[pos[0]] == ",":
+                    pos[0] += 1
+            if ident == "not":
+                t, f = args[0] if len(args) == 1 else (True, True)
+                return (f, t)
+            if ident == "all":
+                return (
+                    all(t for t, _ in args),
+                    any(f for _, f in args),
+                )
+            if ident == "any":
+                return (
+                    any(t for t, _ in args),
+                    all(f for _, f in args),
+                )
+            return (True, True)
+        if pos[0] < n and expr[pos[0]] == "=":
+            pos[0] += 1
+            while pos[0] < n and expr[pos[0]] not in (",", ")"):
+                pos[0] += 1
+            return (True, True)
+        if not ident and pos[0] < n and expr[pos[0]] not in (",", ")"):
+            pos[0] += 1
+            return (True, True)
+        if ident == "test":
+            return (False, True)
+        return (True, True)
+
+    can_true, _ = parse_node()
+    return can_true
+
+
 def cfg_test_ranges(text):
     ranges = []
     for m in cfg_attr_open_re.finditer(text):
         cfg_end = balanced_end(text, m.end(), "(", ")")
         inner = text[m.end():cfg_end]
-        if not has_test_re.search(inner) or not_test_re.search(inner):
+        if not has_test_re.search(inner) or eval_cfg_when_not_test(inner):
             continue
         close_bracket = text.find("]", cfg_end)
         if close_bracket == -1:

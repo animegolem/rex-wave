@@ -2893,5 +2893,153 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
         .unwrap();
     assert_eq!(continued.room, legacy_room);
     assert_eq!(continued.seq, Seq(3));
+
+    // Paging a legacy-only DM via canonical stream + returned cursor advances cleanly [1] -> [2] -> [3].
+    let canon_room = RoomRef::Dm {
+        with: alice_p.clone(),
+    }
+    .resolve(&op_p)
+    .unwrap();
+    let canon_stream = StreamId::Room {
+        room: canon_room.clone(),
+    };
+    let p1 = zorro_op
+        .call(rex_wave_api::read::Read {
+            stream: canon_stream.clone(),
+            after: Seq::ORIGIN,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1.entries[0].seq, Seq(1));
+    let p2 = zorro_op
+        .call(rex_wave_api::read::Read {
+            stream: canon_stream.clone(),
+            after: p1.cursor.at_compatible(&canon_stream),
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(p2.entries[0].seq, Seq(2));
+    let p3 = zorro_op
+        .call(rex_wave_api::read::Read {
+            stream: canon_stream,
+            after: p2.cursor.at_compatible(&StreamId::Room {
+                room: canon_room.clone(),
+            }),
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(p3.entries[0].seq, Seq(3));
     herald_2.abort();
+
+    // Split DM journal: Operator retry with shared idem key returns Operator's legacy receipt, not Alice's canonical post.
+    let split_journal = Journal::in_memory().unwrap();
+    let shared_idem = IdemKey::parse("shared-retry-key").unwrap();
+    {
+        let mut w_canon = split_journal
+            .claim(StreamId::Room {
+                room: canon_room.clone(),
+            })
+            .unwrap();
+        w_canon
+            .append(
+                &alice_p,
+                UnixMs(1_000),
+                Some(&shared_idem),
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: canon_room.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice canonical #2").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: Some(shared_idem.clone()),
+                    }),
+                ],
+            )
+            .unwrap();
+        let mut w_leg = split_journal
+            .claim(StreamId::Room {
+                room: legacy_room.clone(),
+            })
+            .unwrap();
+        w_leg
+            .append(
+                &op_p,
+                UnixMs(2_000),
+                None,
+                vec![
+                    Event::Room(RoomEvent::Opened {
+                        id: legacy_room.clone(),
+                        origin: RoomOrigin::Manual,
+                        topic: None,
+                    }),
+                    Event::Room(RoomEvent::Posted {
+                        body: Body::parse("alice earlier").unwrap(),
+                        mentions: Mentions::default(),
+                        re: None,
+                        after: None,
+                        labels: Vec::new(),
+                        task: None,
+                        idem: None,
+                    }),
+                ],
+            )
+            .unwrap();
+        w_leg
+            .append(
+                &op_p,
+                UnixMs(2_500),
+                Some(&shared_idem),
+                vec![Event::Room(RoomEvent::Posted {
+                    body: Body::parse("operator legacy #3").unwrap(),
+                    mentions: Mentions::default(),
+                    re: None,
+                    after: None,
+                    labels: Vec::new(),
+                    task: None,
+                    idem: Some(shared_idem.clone()),
+                })],
+            )
+            .unwrap();
+    }
+    let split_hub = Hub::new(64);
+    let split_sidebar = SidebarProjection::spawn(split_journal.clone(), split_hub.clone());
+    let split_router = Arc::new(Router {
+        room: Registry::<Rooms>::new(split_journal.clone(), split_hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Registry::<Inbox>::new(split_journal.clone(), split_hub.clone()),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: split_journal,
+            hub: split_hub,
+            sidebar: split_sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let split_op = LocalClient::new(split_router.clone(), op_p);
+    let retried = split_op
+        .call(RoomPost {
+            room: RoomRef::Dm { with: alice_p },
+            body: Body::parse("operator legacy #3").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: Some(shared_idem),
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried.room, legacy_room);
+    assert_eq!(retried.seq, Seq(3));
 }

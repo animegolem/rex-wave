@@ -468,10 +468,23 @@ pub fn socket_owner_uid(path: &Path) -> io::Result<u32> {
     Ok(meta.uid())
 }
 
-/// Derive the current process's effective Unix uid from an anonymous kernel
-/// temporary file descriptor (`fstat`), independent of any replaceable path.
+/// Derive the current process's effective Unix uid directly via `geteuid()`,
+/// independent of any replaceable filesystem entry or `TMPDIR`.
 pub fn current_process_uid() -> io::Result<u32> {
-    Ok(tempfile::tempfile()?.metadata()?.uid())
+    Ok(rustix::process::geteuid().as_raw())
+}
+
+/// Create `path` (and any missing ancestors) with mode `0700` when `path` does
+/// not exist yet, without altering permissions of any pre-existing directory.
+pub fn create_missing_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    if entry_kind(path)? == EntryKind::Missing {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    Ok(())
 }
 
 /// Descriptor-pinned parent directory for safe Unix-domain socket setup.

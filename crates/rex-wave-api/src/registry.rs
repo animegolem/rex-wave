@@ -235,3 +235,66 @@ commands! {
         ThreadPage -> ThreadPageView      : "thread_page", Member, false, "One wave agent's BB thread events and context usage (BB-owned, proxied).";
     }
 }
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for &b in bytes {
+        hash ^= u128::from(b);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    hash
+}
+
+fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn scoped_room_idem(prefix: &str, key: &crate::id::IdemKey) -> crate::id::IdemKey {
+    let raw = key.as_str();
+    let max_raw = 256 - prefix.len() - 2;
+    let encoded = if raw.len() <= max_raw {
+        format!("{prefix}r:{raw}")
+    } else {
+        let h_fwd = fnv1a_128(raw.as_bytes());
+        let rev_bytes: Vec<u8> = raw.as_bytes().iter().rev().copied().collect();
+        let h_rev = fnv1a_128(&rev_bytes) as u64;
+        let max_prefix = 256 - prefix.len() - 2 - 48 - 1;
+        let head = truncate_utf8_prefix(raw, max_prefix);
+        format!("{prefix}h:{h_fwd:032x}{h_rev:016x}:{head}")
+    };
+    crate::id::IdemKey::parse(encoded)
+        .expect("scoped idempotency key is valid printable <= 256 bytes")
+}
+
+impl RoomCommand {
+    /// Journal-stored idempotency key for this room command, if any.
+    pub fn effective_idem(&self) -> Option<crate::id::IdemKey> {
+        match self {
+            RoomCommand::RoomPost(c) => c.idem.as_ref().map(|k| {
+                if k.as_str().starts_with("__rw_") {
+                    scoped_room_idem("__rw_pst:", k)
+                } else {
+                    k.clone()
+                }
+            }),
+            RoomCommand::RoomLabel(c) => c.idem.as_ref().map(|k| scoped_room_idem("__rw_lbl:", k)),
+            RoomCommand::TaskClaim(c) => c.idem.as_ref().map(|k| scoped_room_idem("__rw_clm:", k)),
+            RoomCommand::TaskTransition(c) => {
+                c.idem.as_ref().map(|k| scoped_room_idem("__rw_trn:", k))
+            }
+            RoomCommand::TaskUpdate(c) => c.idem.as_ref().map(|k| scoped_room_idem("__rw_upd:", k)),
+            RoomCommand::RoomEnsure(_)
+            | RoomCommand::RoomJoin(_)
+            | RoomCommand::RoomLeave(_)
+            | RoomCommand::TaskHeartbeat(_)
+            | RoomCommand::RoomTasks(_) => None,
+        }
+    }
+}

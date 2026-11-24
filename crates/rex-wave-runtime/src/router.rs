@@ -137,6 +137,8 @@ fn resolve_room_cmd(
     mut cmd: RoomCommand,
 ) -> Result<RoomCommand, ApiError> {
     use rex_wave_api::room::RoomRef;
+    use rex_wave_store::DmIdemResolution;
+    let idem = cmd.effective_idem();
     let slot = match &mut cmd {
         RoomCommand::RoomEnsure(c) => &mut c.room,
         RoomCommand::RoomPost(c) => &mut c.room,
@@ -149,9 +151,21 @@ fn resolve_room_cmd(
         RoomCommand::TaskUpdate(c) => &mut c.room,
         RoomCommand::RoomTasks(c) => &mut c.room,
     };
-    *slot = RoomRef::Id {
-        id: read.resolve_room_ref(slot, by)?,
+    let resolved = slot.resolve(by)?;
+    let target = match read
+        .journal
+        .resolve_dm_room_with_idem(resolved, by, idem.as_ref())
+        .map_err(crate::store_error)?
+    {
+        DmIdemResolution::Route(room) => room,
+        DmIdemResolution::Ambiguous(_) => {
+            return Err(ApiError::conflict(format!(
+                "ambiguous idempotency key {:?} across DM histories; specify an explicit RoomId or a fresh idem key",
+                idem.as_ref().map(IdemKey::as_str).unwrap_or_default()
+            )));
+        }
     };
+    *slot = RoomRef::Id { id: target };
     Ok(cmd)
 }
 

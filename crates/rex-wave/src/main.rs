@@ -1242,11 +1242,16 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
             let parsed_labels = parse_labels(labels)?;
             let start_seq = match (after, cursor) {
                 (Some(n), _) => Seq(*n),
-                (None, Some(c)) => parse_cursor_arg(c)?.at(&stream),
+                (None, Some(c)) => parse_cursor_arg(c)?.at_compatible(&stream),
                 (None, None) => Seq::ORIGIN,
             };
             if re.is_some() || !parsed_labels.is_empty() {
                 let mut wait = Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
+                if after.is_none()
+                    && let Some(c) = cursor
+                {
+                    wait.after = parse_cursor_arg(c)?;
+                }
                 wait.timeout_ms = Some(0);
                 Ok(WireCommand::Wait(wait))
             } else {
@@ -1284,10 +1289,17 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         let start_seq = if *since > 0 {
                             Seq(*since)
                         } else {
-                            base_cursor.as_ref().map_or(Seq::ORIGIN, |c| c.at(&stream))
+                            base_cursor
+                                .as_ref()
+                                .map_or(Seq::ORIGIN, |c| c.at_compatible(&stream))
                         };
                         let mut w =
                             Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
+                        if *since == 0
+                            && let Some(c) = base_cursor
+                        {
+                            w.after = c;
+                        }
                         w.timeout_ms = *timeout;
                         w
                     } else {
@@ -1299,7 +1311,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                             } else {
                                 c
                             };
-                            if *since > 0 || (mentions && !c.lists(&stream)) {
+                            if *since > 0 || (mentions && !c.lists_compatible(&stream)) {
                                 c.advance(&stream, Seq(*since));
                             }
                             w.after = c;
@@ -2963,44 +2975,40 @@ async fn execute_tasks_org_sync<C: Client>(
     }
 }
 
-/// Verify that the shadow output `out` lies outside the read-only
-/// interchange, creating its parent, and return its real location. `-`
-/// (stdout) needs no file.
-fn resolve_shadow_out_target(out: &Path, interchange_root: &Path) -> Result<PathBuf, CliError> {
-    let verify = || {
-        rex_wave_fs::OutsidePath::verify(out, interchange_root).map_err(|e| {
-            use rex_wave_fs::OutsideError;
-            CliError::Msg(match e {
-                OutsideError::Inside(..) => format!(
-                    "refusing to write shadow output {} inside read-only interchange {}",
-                    out.display(),
-                    interchange_root.display()
-                ),
-                OutsideError::Symlink(_) => format!(
-                    "refusing to write shadow output through symlink {}",
-                    out.display()
-                ),
-                OutsideError::ParentDir(_) => format!(
-                    "refusing shadow output {} containing '..' parent traversal",
-                    out.display()
-                ),
-                other => format!("shadow output {}: {other}", out.display()),
-            })
-        })
-    };
-    let target = verify()?.path().to_path_buf();
-    let parent = target.parent().expect("verified output path is absolute");
-    std::fs::create_dir_all(parent)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
-    // Creating the parent cannot move it, unless a link was planted meanwhile.
-    let after = verify()?.path().to_path_buf();
-    if after != target {
-        return Err(CliError::Msg(format!(
-            "refusing shadow output {}: its location changed while creating it",
+fn format_outside_shadow_err(
+    out: &Path,
+    interchange_root: &Path,
+    err: rex_wave_fs::OutsideError,
+) -> CliError {
+    use rex_wave_fs::OutsideError;
+    CliError::Msg(match err {
+        OutsideError::Inside(_, ref root) => format!(
+            "refusing to write shadow output {} inside read-only interchange {}",
+            out.display(),
+            if root.as_os_str().is_empty() {
+                interchange_root.display()
+            } else {
+                root.display()
+            }
+        ),
+        OutsideError::Symlink(_) => format!(
+            "refusing to write shadow output through symlink {}",
             out.display()
-        )));
-    }
-    Ok(target)
+        ),
+        OutsideError::ParentDir(_) => format!(
+            "refusing shadow output {} containing '..' parent traversal",
+            out.display()
+        ),
+        other => format!("shadow output {}: {other}", out.display()),
+    })
+}
+
+/// Read-only verification that shadow output `out` resolves outside
+/// `interchange_root` without creating or mutating any filesystem entries.
+fn verify_shadow_out_target(out: &Path, interchange_root: &Path) -> Result<PathBuf, CliError> {
+    rex_wave_fs::OutsidePath::verify(out, interchange_root)
+        .map(|p| p.path().to_path_buf())
+        .map_err(|e| format_outside_shadow_err(out, interchange_root, e))
 }
 
 fn write_file_atomic_outside(
@@ -3008,9 +3016,9 @@ fn write_file_atomic_outside(
     interchange_root: &Path,
     bytes: &[u8],
 ) -> Result<(), CliError> {
-    let final_target = resolve_shadow_out_target(target, interchange_root)?;
-    rex_wave_fs::write_atomic_path(&final_target, bytes, 0o644, false)
-        .map_err(|e| CliError::Msg(format!("write {}: {e}", final_target.display())))
+    rex_wave_fs::write_outside_atomic_confined(target, interchange_root, bytes, 0o644)
+        .map(|_| ())
+        .map_err(|e| format_outside_shadow_err(target, interchange_root, e))
 }
 
 struct ShadowWatchLogFile {
@@ -3020,17 +3028,16 @@ struct ShadowWatchLogFile {
 }
 
 /// Appends `bytes` to the retained `--watch` shadow log handle after
-/// re-verifying that `out_arg` still resolves outside `interchange_root` to the
-/// exact same regular file `(dev, ino)` opened at startup. Writing to the
-/// already-opened descriptor never traverses any pathname in the kernel, while
-/// the pre-flight check refuses a mid-run symlink or file swap.
+/// read-only verification that `out_arg` still resolves outside
+/// `interchange_root` to the exact same regular file `(dev, ino)` opened at
+/// startup.
 fn append_shadow_delta(
     log: &mut ShadowWatchLogFile,
     interchange_root: &Path,
     bytes: &[u8],
 ) -> Result<(), CliError> {
     assert!(!bytes.is_empty(), "callers skip empty deltas");
-    let cur_target = resolve_shadow_out_target(&log.out_arg, interchange_root)?;
+    let cur_target = verify_shadow_out_target(&log.out_arg, interchange_root)?;
     rex_wave_fs::verify_same_regular_nofollow(&cur_target, log.id).map_err(|e| {
         CliError::Msg(format!(
             "refusing to append shadow output to {}: {e}",
@@ -3179,7 +3186,7 @@ async fn execute_mail_shadow(
     let ro = ReadOnlyInterchange::open(interchange)
         .map_err(|e| CliError::Msg(format!("open read-only interchange: {e}")))?;
     if out != Path::new("-") {
-        resolve_shadow_out_target(out, ro.root())?;
+        verify_shadow_out_target(out, ro.root())?;
     }
     let policy = RingPolicy::default();
     let affinity = IncarnationAffinity::new();
