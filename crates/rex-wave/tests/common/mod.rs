@@ -2,6 +2,7 @@
 //! directories and subprocess environments isolated from the developer's live
 //! house (`~/.t3`, `~/.bb`, `~/.config/rex-wave`, ambient tokens).
 #![allow(dead_code)]
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

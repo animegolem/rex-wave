@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_mailbridge::{GATE1_CASE_IDS, current_process_start};
 use rex_wave_t3::transport::ws_accept;
 use serde_json::{Value, json};
@@ -2748,6 +2749,55 @@ fn decision_lines(path: &Path) -> Vec<Value> {
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .filter(|v| v.get("decision").is_some())
         .collect()
+}
+
+#[test]
+fn shadow_watch_refuses_a_log_swapped_for_a_symlink_mid_run() {
+    let dir = fresh_dir("watch-swap");
+    let interchange = dir.0.join("interchange");
+    std::fs::create_dir_all(interchange.join("mail")).unwrap();
+    std::fs::create_dir_all(interchange.join("state")).unwrap();
+    std::fs::write(interchange.join("state/acks.jsonl"), "").unwrap();
+    std::fs::write(
+        interchange.join("mail/1795000000001-to-alpha.md"),
+        "---\nfrom: ops\nto: alpha\nid: 1795000000001\nsubject: one\n---\none\n",
+    )
+    .unwrap();
+    let out = dir.0.join("shadow-watch.jsonl");
+    let victim = dir.0.join("victim.txt");
+    std::fs::write(&victim, "keep\n").unwrap();
+    let sock = dir.0.join("unused.sock");
+
+    let (mut guard, rx) = spawn_shadow_watch(&interchange, &out, &sock);
+    assert_eq!(next_appended(&rx), 1);
+    assert_eq!(next_appended(&rx), 0);
+
+    // Swap the log for a symlink between passes, then give the watcher a
+    // new transition to append: the O_NOFOLLOW open must refuse the link.
+    std::fs::remove_file(&out).unwrap();
+    std::os::unix::fs::symlink(&victim, &out).unwrap();
+    std::fs::write(
+        interchange.join("mail/1795000000002-to-beta.md"),
+        "---\nfrom: ops\nto: beta\nid: 1795000000002\nsubject: two\n---\ntwo\n",
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = guard.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watcher kept running after its log became a symlink"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "append through a symlink must fail");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "keep\n",
+        "the symlink target is never written"
+    );
 }
 
 #[test]

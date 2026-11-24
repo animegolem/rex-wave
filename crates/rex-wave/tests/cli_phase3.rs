@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::room::{Body, RoomMessageSummary};
 use rex_wave_api::wave::{
     Activity, AgentSpec, Observation, PermissionMode, WaveObserve, WaveSpec, WaveStart, WaveView,

@@ -6,7 +6,6 @@ use rex_wave_api::presence::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -213,23 +212,15 @@ pub fn load_claude_session_file_from(
         return Err(invalid("pid", "pid must be positive"));
     }
     let path = sessions_dir.join(format!("{pid}.json"));
-    let meta = fs::symlink_metadata(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ApiError::NotFound {
-                what: format!("claude session file {}", path.display()),
-            }
-        } else {
-            ApiError::Internal(format!("stat {}: {e}", path.display()))
-        }
+    let raw = read_text_nofollow(
+        &path,
+        MAX_SESSION_FILE_BYTES,
+        "claude_session",
+        "session file",
+    )?
+    .ok_or_else(|| ApiError::NotFound {
+        what: format!("claude session file {}", path.display()),
     })?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(ApiError::Denied {
-            principal: "presence".into(),
-            action: format!("read non-regular session file {}", path.display()),
-        });
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
     let parsed = parse_claude_session_json(&raw)?;
     if parsed.pid != pid {
         return Err(invalid(
@@ -352,32 +343,15 @@ pub fn house_profile_path_from(
 /// a symlink, non-regular file, oversized file, malformed JSON, unknown field,
 /// invalid seat name, or out-of-bounds list fails closed.
 pub fn load_house_profile_from(path: &Path) -> Result<HouseProfile, ApiError> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HouseProfile::default()),
-        Err(e) => {
-            return Err(ApiError::Internal(format!("stat {}: {e}", path.display())));
-        }
+    let Some(raw) = read_text_nofollow(
+        path,
+        HOUSE_PROFILE_MAX_BYTES,
+        "house_profile",
+        "house profile",
+    )?
+    else {
+        return Ok(HouseProfile::default());
     };
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() {
-        return Err(ApiError::Denied {
-            principal: "presence".into(),
-            action: format!("read non-regular house profile {}", path.display()),
-        });
-    }
-    if meta.len() > HOUSE_PROFILE_MAX_BYTES {
-        return Err(invalid(
-            "house_profile",
-            format!(
-                "{}: {} bytes exceeds limit {HOUSE_PROFILE_MAX_BYTES}",
-                path.display(),
-                meta.len()
-            ),
-        ));
-    }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
     let house: HouseProfile = serde_json::from_str(&raw)
         .map_err(|e| invalid("house_profile", format!("{}: {e}", path.display())))?;
     house
@@ -422,23 +396,34 @@ impl SeedInterchangePlan {
     }
 }
 
-fn read_regular_text_if_present(path: &Path) -> Result<Option<String>, ApiError> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(ApiError::Internal(format!("stat {}: {e}", path.display())));
-        }
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(ApiError::Denied {
+/// The largest Claude session file read.
+const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024;
+/// The largest interchange seed file read.
+const MAX_SEED_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a UTF-8 regular file of at most `max_bytes` through an `O_NOFOLLOW`
+/// handle. Missing is `None`; a symlink or non-regular file is `Denied`; an
+/// oversized or non-UTF-8 file is invalid `what`.
+fn read_text_nofollow(
+    path: &Path,
+    max_bytes: u64,
+    what: &str,
+    label: &str,
+) -> Result<Option<String>, ApiError> {
+    match rex_wave_fs::read_regular_string(path, max_bytes) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(ApiError::Denied {
             principal: "presence".into(),
-            action: format!("read non-regular seed file {}", path.display()),
-        });
+            action: format!("read non-regular {label} {}", path.display()),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(invalid(what, e.to_string())),
+        Err(e) => Err(ApiError::Internal(format!("read {}: {e}", path.display()))),
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
-    Ok(Some(raw))
+}
+
+fn read_regular_text_if_present(path: &Path) -> Result<Option<String>, ApiError> {
+    read_text_nofollow(path, MAX_SEED_FILE_BYTES, "seed_file", "seed file")
 }
 
 fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
@@ -456,13 +441,13 @@ fn read_regular_json_if_present(path: &Path) -> Result<Option<serde_json::Value>
 
 fn resolve_local_or_parent(canon_dir: &Path, rel: &str) -> Option<PathBuf> {
     let local = canon_dir.join(rel);
-    if fs::symlink_metadata(&local).is_ok() {
+    if rex_wave_fs::entry_exists(&local) {
         Some(local)
     } else {
         canon_dir
             .parent()
             .map(|p| p.join(rel))
-            .filter(|p| fs::symlink_metadata(p).is_ok())
+            .filter(|p| rex_wave_fs::entry_exists(p))
     }
 }
 
@@ -527,14 +512,9 @@ pub fn seed_records_from_interchange_with_options(
     seats_tsv: Option<&Path>,
     house: &HouseProfile,
 ) -> Result<SeedInterchangePlan, ApiError> {
-    let canon_dir = fs::canonicalize(interchange_dir)
+    let interchange = rex_wave_fs::ConfinedDir::open(interchange_dir)
         .map_err(|e| invalid("interchange", format!("{}: {e}", interchange_dir.display())))?;
-    if !canon_dir.is_dir() {
-        return Err(invalid(
-            "interchange",
-            format!("{} is not a directory", canon_dir.display()),
-        ));
-    }
+    let canon_dir = interchange.path().to_path_buf();
 
     let mut sources_read = Vec::new();
     let mut skipped_targets = BTreeSet::new();

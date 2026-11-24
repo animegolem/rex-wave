@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use futures_util::StreamExt;
 use rex_wave_api::read::{AgentEventKind, Read, ThreadPageView};
 use rex_wave_api::room::{Body, RoomEvent};

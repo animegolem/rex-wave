@@ -47,7 +47,6 @@ use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const EXIT_CONFLICT: u8 = 3;
@@ -1077,6 +1076,16 @@ fn parse_role_kv<'a>(raw: &'a str, flag: &str) -> Result<(RoleName, &'a str), Ap
     Ok((role, val))
 }
 
+/// The largest file the CLI reads as command input (bodies, briefs,
+/// manifests, shadow and acks logs).
+const MAX_CLI_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest `mail shadow --watch` log resumed.
+const MAX_SHADOW_LOG_BYTES: u64 = 256 * 1024 * 1024;
+
+fn read_cli_text(path: &Path) -> std::io::Result<String> {
+    rex_wave_fs::read_regular_string(path, MAX_CLI_INPUT_BYTES)
+}
+
 fn read_text_source(
     inline: Option<&String>,
     file: Option<&PathBuf>,
@@ -1084,7 +1093,7 @@ fn read_text_source(
 ) -> Result<String, ApiError> {
     match (inline, file) {
         (Some(s), _) => Ok(s.clone()),
-        (None, Some(path)) => std::fs::read_to_string(path)
+        (None, Some(path)) => read_cli_text(path)
             .map_err(|e| invalid(what, format!("failed reading {}: {e}", path.display()))),
         (None, None) => Err(invalid(what, format!("provide --{what} or --{what}-file"))),
     }
@@ -1158,23 +1167,18 @@ fn load_claude_session_endpoint(
             ));
         }
         let path = PathBuf::from(path_arg.trim());
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            invalid(
-                "from-claude-session",
-                format!("failed statting {}: {e}", path.display()),
-            )
-        })?;
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return Err(ApiError::Denied {
-                principal: "presence".into(),
-                action: format!("read non-regular session file {}", path.display()),
-            });
-        }
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            invalid(
-                "from-claude-session",
-                format!("failed reading {}: {e}", path.display()),
-            )
+        let raw = read_cli_text(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                ApiError::Denied {
+                    principal: "presence".into(),
+                    action: format!("read non-regular session file {}: {e}", path.display()),
+                }
+            } else {
+                invalid(
+                    "from-claude-session",
+                    format!("failed reading {}: {e}", path.display()),
+                )
+            }
         })?;
         parse_claude_session_json(&raw)?
     } else {
@@ -1473,7 +1477,7 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                 let brief_str = if let Some(dir) = brief_dir {
                     let candidate = dir.join(format!("{role_part}.md"));
                     if candidate.exists() {
-                        std::fs::read_to_string(&candidate).map_err(|e| {
+                        read_cli_text(&candidate).map_err(|e| {
                             invalid(
                                 "brief",
                                 format!("failed reading {}: {e}", candidate.display()),
@@ -2812,7 +2816,7 @@ async fn run_org_sync_step<C: Client>(
     let use_org_to_room = if !file.exists() {
         false
     } else if let Some(ref synced) = state.last_synced_bytes {
-        std::fs::read(file)
+        rex_wave_board::task_org::read_org_file(file)
             .map(|cur| cur != *synced)
             .unwrap_or(true)
     } else {
@@ -2953,7 +2957,7 @@ async fn execute_tasks_org_sync<C: Client>(
     let mut last_conflict_bytes: Option<Vec<u8>> = None;
     loop {
         let skip_same_conflict = if let Some(ref prev_conflict) = last_conflict_bytes {
-            match std::fs::read(file) {
+            match rex_wave_board::task_org::read_org_file(file) {
                 Ok(cur) if cur == *prev_conflict => true,
                 Ok(_) => {
                     last_conflict_bytes = None;
@@ -2971,7 +2975,7 @@ async fn execute_tasks_org_sync<C: Client>(
                     consecutive_errors = 0;
                     let (payload, summary, is_conflict) = format_org_sync_step(&step);
                     if is_conflict {
-                        last_conflict_bytes = std::fs::read(file).ok();
+                        last_conflict_bytes = rex_wave_board::task_org::read_org_file(file).ok();
                         if as_json {
                             eprintln!(
                                 "{}",
@@ -3015,131 +3019,44 @@ async fn execute_tasks_org_sync<C: Client>(
     }
 }
 
-fn canonicalize_deepest_existing_no_parent(path: &Path) -> PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon;
-    }
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cursor = path;
-    while let Some(name) = cursor.file_name() {
-        tail.push(name.to_os_string());
-        let Some(parent) = cursor.parent() else {
-            break;
-        };
-        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
-            let mut resolved = canon_parent;
-            for part in tail.into_iter().rev() {
-                resolved.push(part);
-            }
-            return resolved;
-        }
-        cursor = parent;
-    }
-    path.to_path_buf()
-}
-
-fn ensure_out_outside_interchange(out: &Path, interchange_root: &Path) -> Result<(), CliError> {
-    if out == Path::new("-") {
-        return Ok(());
-    }
-    if out
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(CliError::Msg(format!(
-            "refusing shadow output {} containing '..' parent traversal",
-            out.display()
-        )));
-    }
-    let abs = if out.is_absolute() {
-        out.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
-            .join(out)
+/// Verify that the shadow output `out` lies outside the read-only
+/// interchange, creating its parent, and return its real location. `-`
+/// (stdout) needs no file.
+fn resolve_shadow_out_target(out: &Path, interchange_root: &Path) -> Result<PathBuf, CliError> {
+    let verify = || {
+        rex_wave_fs::OutsidePath::verify(out, interchange_root).map_err(|e| {
+            use rex_wave_fs::OutsideError;
+            CliError::Msg(match e {
+                OutsideError::Inside(..) => format!(
+                    "refusing to write shadow output {} inside read-only interchange {}",
+                    out.display(),
+                    interchange_root.display()
+                ),
+                OutsideError::Symlink(_) => format!(
+                    "refusing to write shadow output through symlink {}",
+                    out.display()
+                ),
+                OutsideError::ParentDir(_) => format!(
+                    "refusing shadow output {} containing '..' parent traversal",
+                    out.display()
+                ),
+                other => format!("shadow output {}: {other}", out.display()),
+            })
+        })
     };
-    if let Ok(meta) = std::fs::symlink_metadata(&abs)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to write shadow output through symlink {}",
-            out.display()
-        )));
-    }
-    let candidate = canonicalize_deepest_existing_no_parent(&abs);
-    if candidate.starts_with(interchange_root) {
-        return Err(CliError::Msg(format!(
-            "refusing to write shadow output {} inside read-only interchange {}",
-            out.display(),
-            interchange_root.display()
-        )));
-    }
-    Ok(())
-}
-
-static SHADOW_OUT_NONCE: AtomicU64 = AtomicU64::new(1);
-
-/// Resolves a shadow `--out` file to `(canonical_parent, file_name, final_path)`,
-/// creating the parent and refusing any location inside `interchange_root` or a
-/// symlinked leaf.
-fn resolve_shadow_out_target(
-    target: &Path,
-    interchange_root: &Path,
-) -> Result<(PathBuf, std::ffi::OsString, PathBuf), CliError> {
-    ensure_out_outside_interchange(target, interchange_root)?;
-    let abs = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| CliError::Msg(format!("current_dir: {e}")))?
-            .join(target)
-    };
-    let file_name = abs
-        .file_name()
-        .ok_or_else(|| {
-            CliError::Msg(format!(
-                "shadow output {} has no file name",
-                target.display()
-            ))
-        })?
-        .to_os_string();
-    let parent = abs
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| {
-            CliError::Msg(format!(
-                "shadow output {} has no parent directory",
-                target.display()
-            ))
-        })?;
+    let target = verify()?.path().to_path_buf();
+    let parent = target.parent().expect("verified output path is absolute");
     std::fs::create_dir_all(parent)
         .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
-    let canon_parent = std::fs::canonicalize(parent)
-        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
-    if canon_parent.starts_with(interchange_root) {
+    // Creating the parent cannot move it, unless a link was planted meanwhile.
+    let after = verify()?.path().to_path_buf();
+    if after != target {
         return Err(CliError::Msg(format!(
-            "refusing to write shadow output {} inside read-only interchange {}",
-            target.display(),
-            interchange_root.display()
+            "refusing shadow output {}: its location changed while creating it",
+            out.display()
         )));
     }
-    let final_target = canon_parent.join(&file_name);
-    if final_target.starts_with(interchange_root) {
-        return Err(CliError::Msg(format!(
-            "refusing to write shadow output {} inside read-only interchange {}",
-            target.display(),
-            interchange_root.display()
-        )));
-    }
-    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to overwrite symlink {}",
-            final_target.display()
-        )));
-    }
-    Ok((canon_parent, file_name, final_target))
+    Ok(target)
 }
 
 fn write_file_atomic_outside(
@@ -3147,64 +3064,23 @@ fn write_file_atomic_outside(
     interchange_root: &Path,
     bytes: &[u8],
 ) -> Result<(), CliError> {
-    let (canon_parent, file_name, final_target) =
-        resolve_shadow_out_target(target, interchange_root)?;
-    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let mut tmp_name = file_name;
-    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
-    let tmp = canon_parent.join(tmp_name);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", tmp.display())))?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        drop(f);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &final_target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!(
-            "rename {}: {e}",
-            final_target.display()
-        )));
-    }
-    Ok(())
+    let final_target = resolve_shadow_out_target(target, interchange_root)?;
+    rex_wave_fs::write_atomic_path(&final_target, bytes, 0o644, false)
+        .map_err(|e| CliError::Msg(format!("write {}: {e}", final_target.display())))
 }
 
 /// Appends `bytes` to the `--watch` shadow log at `final_target` (already
-/// resolved by [`resolve_shadow_out_target`]) and syncs. Refuses a symlinked
-/// or non-regular leaf, re-checked on every append: the leaf is checked before
-/// open and the opened handle must be the same inode the path names.
+/// resolved by [`resolve_shadow_out_target`]) and syncs. The log is opened
+/// `O_NOFOLLOW` and judged by its handle on every append, so a symlink or
+/// non-regular file swapped in at the leaf is refused, never written through.
 fn append_shadow_delta(final_target: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    use std::os::unix::fs::MetadataExt as _;
     assert!(!bytes.is_empty(), "callers skip empty deltas");
-    if let Ok(meta) = std::fs::symlink_metadata(final_target)
-        && !meta.file_type().is_file()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to append shadow output to non-regular file {}",
+    let (mut f, _) = rex_wave_fs::open_append_nofollow(final_target, 0o644).map_err(|e| {
+        CliError::Msg(format!(
+            "refusing to append shadow output to {}: {e}",
             final_target.display()
-        )));
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(final_target)
-        .map_err(|e| CliError::Msg(format!("open {}: {e}", final_target.display())))?;
-    let opened = f
-        .metadata()
-        .map_err(|e| CliError::Msg(format!("stat {}: {e}", final_target.display())))?;
-    let named = std::fs::symlink_metadata(final_target)
-        .map_err(|e| CliError::Msg(format!("lstat {}: {e}", final_target.display())))?;
-    if !named.file_type().is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
-        return Err(CliError::Msg(format!(
-            "refusing to append shadow output: {} changed under us (symlink swap?)",
-            final_target.display()
-        )));
-    }
+        ))
+    })?;
     f.write_all(bytes)
         .and_then(|()| f.sync_data())
         .map_err(|e| CliError::Msg(format!("append {}: {e}", final_target.display())))
@@ -3219,20 +3095,13 @@ fn open_shadow_watch_log(
     out: &Path,
     interchange_root: &Path,
 ) -> Result<(PathBuf, ShadowWatchTracker, bool), CliError> {
-    let (_, _, final_target) = resolve_shadow_out_target(out, interchange_root)?;
-    let existing = match std::fs::symlink_metadata(&final_target) {
-        Ok(meta) if meta.file_type().is_file() => std::fs::read_to_string(&final_target)
-            .map_err(|e| CliError::Msg(format!("read {}: {e}", final_target.display())))?,
-        Ok(_) => {
-            return Err(CliError::Msg(format!(
-                "refusing shadow --watch output {}: not a regular file",
-                final_target.display()
-            )));
-        }
+    let final_target = resolve_shadow_out_target(out, interchange_root)?;
+    let existing = match rex_wave_fs::read_regular_string(&final_target, MAX_SHADOW_LOG_BYTES) {
+        Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
             return Err(CliError::Msg(format!(
-                "stat {}: {e}",
+                "refusing shadow --watch output {}: {e}",
                 final_target.display()
             )));
         }
@@ -3314,7 +3183,9 @@ async fn execute_mail_shadow(
 ) -> Result<ExitCode, CliError> {
     let ro = ReadOnlyInterchange::open(interchange)
         .map_err(|e| CliError::Msg(format!("open read-only interchange: {e}")))?;
-    ensure_out_outside_interchange(out, ro.root())?;
+    if out != Path::new("-") {
+        resolve_shadow_out_target(out, ro.root())?;
+    }
     let policy = RingPolicy::default();
     let affinity = IncarnationAffinity::new();
     let retry_state = RetryState::new();
@@ -3425,9 +3296,9 @@ fn execute_mail_score(
     mailwatch_seen_paths: &[PathBuf],
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let shadow_text = std::fs::read_to_string(shadow_path)
+    let shadow_text = read_cli_text(shadow_path)
         .map_err(|e| CliError::Msg(format!("read shadow {}: {e}", shadow_path.display())))?;
-    let acks_text = std::fs::read_to_string(acks_path)
+    let acks_text = read_cli_text(acks_path)
         .map_err(|e| CliError::Msg(format!("read acks {}: {e}", acks_path.display())))?;
     let aliases = extract_shadow_aliases(&shadow_text).map_err(CliError::Msg)?;
     let acks_report = parse_acks_jsonl(&acks_text, &aliases);
@@ -3438,7 +3309,7 @@ fn execute_mail_score(
         Some(path) => {
             let house = load_house_profile()
                 .map_err(|e| CliError::Msg(format!("load house profile: {e}")))?;
-            let raw = std::fs::read_to_string(path)
+            let raw = read_cli_text(path)
                 .map_err(|e| CliError::Msg(format!("read fixtures {}: {e}", path.display())))?;
             Some(check_gate1_fixtures_with_profile(&raw, &house).map_err(CliError::Msg)?)
         }
@@ -3450,7 +3321,7 @@ fn execute_mail_score(
     } else {
         let mut texts = Vec::with_capacity(mailwatch_seen_paths.len());
         for path in mailwatch_seen_paths {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
+            let raw = read_cli_text(path).map_err(|e| {
                 CliError::Msg(format!("read mailwatch seen {}: {e}", path.display()))
             })?;
             texts.push((path.display().to_string(), raw));
@@ -3681,52 +3552,12 @@ async fn execute_presence_hold(
 }
 
 fn write_file_atomic_plain(target: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .ok_or_else(|| {
-            CliError::Msg(format!("target path {} has no file name", target.display()))
-        })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
-    let canon_parent = std::fs::canonicalize(parent)
-        .map_err(|e| CliError::Msg(format!("canonicalize {}: {e}", parent.display())))?;
-    let final_target = canon_parent.join(&file_name);
-    if let Ok(meta) = std::fs::symlink_metadata(&final_target)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::Msg(format!(
-            "refusing to overwrite symlink {}",
-            final_target.display()
-        )));
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Msg(format!("create {}: {e}", parent.display())))?;
     }
-    let nonce = SHADOW_OUT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let mut tmp_name = file_name;
-    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
-    let tmp = canon_parent.join(tmp_name);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| CliError::Msg(format!("create {}: {e}", tmp.display())))?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        drop(f);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!("write {}: {e}", tmp.display())));
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &final_target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::Msg(format!(
-            "rename {}: {e}",
-            final_target.display()
-        )));
-    }
-    Ok(())
+    rex_wave_fs::write_atomic_path(target, bytes, 0o644, false)
+        .map_err(|e| CliError::Msg(format!("write {}: {e}", target.display())))
 }
 
 async fn execute_presence_seed_interchange(
@@ -3928,16 +3759,12 @@ async fn execute_presence_import_manifest(
     explicit_token: Option<&str>,
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| CliError::Msg(format!("stat {}: {e}", path.display())))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(CliError::Msg(format!(
-            "refusing to read non-regular manifest file {}",
+    let raw = rex_wave_fs::read_regular_string(path, MAX_CLI_INPUT_BYTES).map_err(|e| {
+        CliError::Msg(format!(
+            "refusing to read manifest file {}: {e}",
             path.display()
-        )));
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| CliError::Msg(format!("read {}: {e}", path.display())))?;
+        ))
+    })?;
     let manifest: ResidentManifest = serde_json::from_str(&raw)
         .map_err(|e| CliError::Msg(format!("parse manifest {}: {e}", path.display())))?;
     if manifest.schema != RESIDENT_MANIFEST_SCHEMA {

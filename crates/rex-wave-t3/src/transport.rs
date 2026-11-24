@@ -89,10 +89,12 @@ pub fn ws_accept(client_key: &str) -> String {
 
 fn next_entropy_block() -> [u8; 32] {
     let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(seq);
+        h.finish()
+    };
     let mut hasher = Sha256::new();
     hasher.update(seq.to_le_bytes());
     hasher.update(nanos.to_le_bytes());

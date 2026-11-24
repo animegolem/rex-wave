@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::mail::{LetterPriority, MailPromote};
 use rex_wave_api::presence::*;
 use rex_wave_api::room::{Body, RoomPost, RoomRef, RoomScope};

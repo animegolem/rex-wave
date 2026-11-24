@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_kanban::Priority;
 use rex_wave_api::notify::{InboxRaise, NotifyKind};
 use rex_wave_api::room::*;

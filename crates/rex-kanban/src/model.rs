@@ -7,7 +7,6 @@ use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[error("invalid {what}: {reason}")]
@@ -118,18 +117,12 @@ checked_str!(
 impl OrgId {
     pub fn mint() -> Self {
         let seq = ORG_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         let pid = std::process::id();
         let mut h1 = RandomState::new().build_hasher();
-        h1.write_u128(nanos);
         h1.write_u32(pid);
         h1.write_u64(seq);
         let mut h2 = RandomState::new().build_hasher();
         h2.write_u64(seq.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        h2.write_u128(nanos);
         let hi = mix64(h1.finish());
         let lo = mix64(h2.finish()) & 0xffff_ffff;
         Self(format!("rw-{hi:016x}{lo:08x}"))

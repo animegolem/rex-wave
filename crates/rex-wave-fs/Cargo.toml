@@ -1,0 +1,20 @@
+[package]
+name = "rex-wave-fs"
+description = "The one owner of std::fs primitives: validated names, O_NOFOLLOW handle reads, atomic writes, confined directories and protected-roots guards."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

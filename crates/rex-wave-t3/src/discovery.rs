@@ -137,9 +137,12 @@ pub struct ServerRuntimeInfo {
     pub owner_id: Option<String>,
 }
 
+/// The largest T3 runtime discovery file read.
+const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024;
+
 impl ServerRuntimeInfo {
     pub fn load(path: &Path) -> Result<Self, HostError> {
-        let raw = std::fs::read(path).map_err(|e| {
+        let raw = rex_wave_fs::read_regular_bounded(path, MAX_RUNTIME_FILE_BYTES).map_err(|e| {
             HostError::Unreachable(format!("read T3 runtime file {}: {e}", path.display()))
         })?;
         serde_json::from_slice(&raw).map_err(|e| {

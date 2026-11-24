@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::mail::*;
 use rex_wave_api::notify::*;
 use rex_wave_api::presence::*;

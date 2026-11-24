@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::board::{BoardId, BoardView, project_board};
 use rex_wave_api::mail::{LetterPriority, MailAck, MailPromote, MailSchemaV1};
 use rex_wave_api::notify::{InboxList, NotifyKind, NotifyState};

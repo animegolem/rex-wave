@@ -1,0 +1,598 @@
+use crate::name::{RelPath, SafeName};
+use std::fs::{self, File, Metadata, OpenOptions, Permissions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Flags for every handle this crate opens by name: never follow a symlink
+/// at the leaf, and never block on opening a FIFO a hostile peer planted.
+const NOFOLLOW: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+
+/// How many temp names one atomic write tries before giving up.
+const MAX_TEMP_ATTEMPTS: u32 = 64;
+
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// True when `err` is the refusal an `O_NOFOLLOW` open returns for a
+/// symlink leaf (`ELOOP`; `EMLINK` on some BSDs).
+fn is_symlink_refusal(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::EMLINK)
+}
+
+fn opened(path: &Path, err: io::Error) -> io::Error {
+    if is_symlink_refusal(&err) {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to follow symlink {}", path.display()),
+        )
+    } else {
+        err
+    }
+}
+
+fn not_regular(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not a regular file", path.display()),
+    )
+}
+
+/// Open `path` read-only without following a symlink at the leaf, then
+/// judge the opened handle (`fstat`), so nothing can swap the file between
+/// the check and the read.
+pub fn open_regular_nofollow(path: &Path) -> io::Result<(File, Metadata)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW)
+        .open(path)
+        .map_err(|e| opened(path, e))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(not_regular(path));
+    }
+    Ok((file, meta))
+}
+
+/// Read a regular file of at most `max_bytes` through an `O_NOFOLLOW`
+/// handle. A larger file is `InvalidData`, never a silent truncation.
+pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let (file, meta) = open_regular_nofollow(path)?;
+    read_open_bounded(path, file, &meta, max_bytes)
+}
+
+/// [`read_regular_bounded`] for a secret: also refuses (`PermissionDenied`)
+/// a file whose handle shows any group or other permission bit, or another
+/// owner than `expected_uid`.
+pub fn read_private_regular(
+    path: &Path,
+    expected_uid: Option<u32>,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    let (file, meta) = open_regular_nofollow(path)?;
+    if let Some(uid) = expected_uid
+        && meta.uid() != uid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is owned by another uid", path.display()),
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} must be mode 0600", path.display()),
+        ));
+    }
+    read_open_bounded(path, file, &meta, max_bytes)
+}
+
+fn read_open_bounded(
+    path: &Path,
+    file: File,
+    meta: &Metadata,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    let too_big = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is larger than {max_bytes} bytes", path.display()),
+        )
+    };
+    if meta.len() > max_bytes {
+        return Err(too_big());
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(too_big());
+    }
+    Ok(buf)
+}
+
+/// [`read_regular_bounded`], decoded as UTF-8 (`InvalidData` otherwise).
+pub fn read_regular_string(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let bytes = read_regular_bounded(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8", path.display()),
+        )
+    })
+}
+
+/// Open (creating with `mode` when absent) `path` for appending without
+/// following a symlink at the leaf, and refuse a handle that is not a
+/// regular file.
+pub fn open_append_nofollow(path: &Path, mode: u32) -> io::Result<(File, Metadata)> {
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(mode)
+        .custom_flags(NOFOLLOW)
+        .open(path)
+        .map_err(|e| opened(path, e))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(not_regular(path));
+    }
+    Ok((file, meta))
+}
+
+/// Create a fresh, exclusive temp file beside `path` (never following a
+/// symlink), fill it with `bytes` at `mode`, and sync it. Returns its path.
+fn write_temp_sibling(path: &Path, bytes: &[u8], mode: u32) -> io::Result<PathBuf> {
+    let parent = parent_of(path)?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        )
+    })?;
+    for _ in 0..MAX_TEMP_ATTEMPTS {
+        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
+        let tmp = parent.join(tmp_name);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(NOFOLLOW)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(opened(&tmp, e)),
+        };
+        let filled = file
+            .set_permissions(Permissions::from_mode(mode))
+            .and_then(|()| file.write_all(bytes))
+            .and_then(|()| file.sync_all());
+        if let Err(e) = filled {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(tmp);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "no free temp name beside {} after {MAX_TEMP_ATTEMPTS} tries",
+            path.display()
+        ),
+    ))
+}
+
+fn parent_of(path: &Path) -> io::Result<&Path> {
+    match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => Ok(Path::new(".")),
+        Some(p) => Ok(p),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )),
+    }
+}
+
+/// `fsync` a directory so a rename or link inside it survives a crash.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+fn refuse_symlink_leaf(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to replace symlink {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Replace `path` with `bytes` atomically: exclusive temp sibling, `mode`,
+/// `fsync`, `rename`, and (when `sync_dir`) `fsync` of the parent. Refuses a
+/// symlink at `path`. `rename` never writes through a link, so a link
+/// planted after that check is replaced, not followed.
+pub fn write_atomic_path(path: &Path, bytes: &[u8], mode: u32, sync_dir: bool) -> io::Result<()> {
+    refuse_symlink_leaf(path)?;
+    let tmp = write_temp_sibling(path, bytes, mode)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if sync_dir {
+        self::sync_dir(parent_of(path)?)?;
+    }
+    Ok(())
+}
+
+/// Create `path` holding `bytes` only if nothing is there: temp sibling,
+/// then `link`, which fails on any existing entry (a symlink included)
+/// instead of replacing it. Returns false when `path` already existed.
+pub fn write_atomic_if_absent_path(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    sync_dir: bool,
+) -> io::Result<bool> {
+    let tmp = write_temp_sibling(path, bytes, mode)?;
+    let linked = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            if sync_dir {
+                self::sync_dir(parent_of(path)?)?;
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// What sits at `path` itself, a symlink never followed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    Missing,
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// Classify the entry at `path` without following a symlink there. Use it
+/// for presence checks (lock files are dangling symlinks); never to decide
+/// whether a later open is safe — open the handle and judge that instead.
+pub fn entry_kind(path: &Path) -> io::Result<EntryKind> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            Ok(if ft.is_symlink() {
+                EntryKind::Symlink
+            } else if ft.is_file() {
+                EntryKind::File
+            } else if ft.is_dir() {
+                EntryKind::Dir
+            } else {
+                EntryKind::Other
+            })
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(EntryKind::Missing),
+        Err(e) => Err(e),
+    }
+}
+
+/// True when anything — a dangling symlink included — exists at `path`.
+pub fn entry_exists(path: &Path) -> bool {
+    !matches!(entry_kind(path), Ok(EntryKind::Missing) | Err(_))
+}
+
+/// Open the directory at `path` without following a symlink there and
+/// return its metadata from the handle: for permission and owner checks.
+pub fn dir_metadata_nofollow(path: &Path) -> io::Result<Metadata> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|e| opened(path, e))?;
+    let meta = dir.metadata()?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    Ok(meta)
+}
+
+/// The owner uid of the Unix socket at `path`, refusing anything else
+/// (sockets cannot be opened, so this is the one `lstat`-based judgment).
+pub fn socket_owner_uid(path: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a socket", path.display()),
+        ));
+    }
+    Ok(meta.uid())
+}
+
+/// The real, symlink-free absolute location of an existing `path`.
+pub(crate) fn real_path(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path)
+}
+
+/// A directory verified at open to be a real directory (not a symlink),
+/// held by its symlink-free absolute path. Every lookup beneath it takes
+/// validated [`SafeName`]/[`RelPath`] segments and refuses a symlink at
+/// every step.
+///
+/// What is and is not race-free: each leaf is opened `O_NOFOLLOW` and judged
+/// by its handle, so a swapped leaf is refused. Intermediate directories are
+/// checked with `lstat` before use; safe std has no `openat`, so a peer that
+/// can write inside the root could swap one between the check and the
+/// open. The root is assumed writable only by its owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfinedDir {
+    root: PathBuf,
+}
+
+impl ConfinedDir {
+    /// Hold an existing directory. `root` may be reached through symlinks;
+    /// the held path is its real location.
+    pub fn open(root: &Path) -> io::Result<Self> {
+        if entry_kind(root)? == EntryKind::Symlink {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to follow symlink {}", root.display()),
+            ));
+        }
+        let real = real_path(root)?;
+        dir_metadata_nofollow(&real)?;
+        Ok(Self { root: real })
+    }
+
+    /// Create `root` (and missing parents) with `mode`, then hold it.
+    pub fn create(root: &Path, mode: u32) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(mode)
+            .create(root)?;
+        Self::open(root)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Walk `segments` beneath the root, refusing a symlink or non-directory
+    /// at each step, creating missing ones with `create` when given.
+    fn walk(&self, segments: &[SafeName], create: Option<u32>) -> io::Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut cur = self.root.clone();
+        for seg in segments {
+            cur.push(seg.as_str());
+            match entry_kind(&cur)? {
+                EntryKind::Dir => {}
+                EntryKind::Missing if create.is_some() => {
+                    let mode = create.expect("checked by guard");
+                    match fs::DirBuilder::new().mode(mode).create(&cur) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                            dir_metadata_nofollow(&cur)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                EntryKind::Missing => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{} does not exist", cur.display()),
+                    ));
+                }
+                EntryKind::Symlink => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("refusing to follow symlink {}", cur.display()),
+                    ));
+                }
+                EntryKind::File | EntryKind::Other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        format!("{} is not a directory", cur.display()),
+                    ));
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    /// The path `rel` names beneath the root, with every parent checked.
+    pub fn resolve(&self, rel: &RelPath) -> io::Result<PathBuf> {
+        Ok(self
+            .walk(rel.parent_segments(), None)?
+            .join(rel.file_name().as_str()))
+    }
+
+    pub fn read_regular(&self, rel: &RelPath, max_bytes: u64) -> io::Result<Vec<u8>> {
+        read_regular_bounded(&self.resolve(rel)?, max_bytes)
+    }
+
+    pub fn read_string(&self, rel: &RelPath, max_bytes: u64) -> io::Result<String> {
+        read_regular_string(&self.resolve(rel)?, max_bytes)
+    }
+
+    pub fn write_atomic(
+        &self,
+        rel: &RelPath,
+        bytes: &[u8],
+        mode: u32,
+        sync_dir: bool,
+    ) -> io::Result<()> {
+        write_atomic_path(&self.resolve(rel)?, bytes, mode, sync_dir)
+    }
+
+    pub fn write_atomic_if_absent(
+        &self,
+        rel: &RelPath,
+        bytes: &[u8],
+        mode: u32,
+        sync_dir: bool,
+    ) -> io::Result<bool> {
+        write_atomic_if_absent_path(&self.resolve(rel)?, bytes, mode, sync_dir)
+    }
+
+    /// Ensure every directory in `rel` exists beneath the root (creating
+    /// missing ones with `mode`), refusing symlinks; returns its path.
+    pub fn ensure_subdir(&self, rel: &RelPath, mode: u32) -> io::Result<PathBuf> {
+        self.walk(rel.segments(), Some(mode))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn bounded_read_refuses_symlink_oversize_and_non_regular() {
+        let dir = tmp();
+        let file = dir.path().join("f");
+        fs::write(&file, b"hello").unwrap();
+        assert_eq!(read_regular_bounded(&file, 5).unwrap(), b"hello");
+        let big = read_regular_bounded(&file, 4).unwrap_err();
+        assert_eq!(big.kind(), io::ErrorKind::InvalidData);
+
+        let link = dir.path().join("l");
+        symlink(&file, &link).unwrap();
+        let err = read_regular_bounded(&link, 64).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        let err = read_regular_bounded(dir.path(), 64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        fs::write(&file, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_regular_string(&file, 64).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn fifo_is_refused_without_blocking() {
+        let dir = tmp();
+        let fifo = dir.path().join("p");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            read_regular_bounded(&fifo, 64).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn append_refuses_symlink_and_creates_with_mode() {
+        let dir = tmp();
+        let log = dir.path().join("log");
+        let (mut f, meta) = open_append_nofollow(&log, 0o600).unwrap();
+        f.write_all(b"a").unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        let link = dir.path().join("link");
+        symlink(&victim, &link).unwrap();
+        assert!(open_append_nofollow(&link, 0o600).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn atomic_writes_replace_or_refuse() {
+        let dir = tmp();
+        let target = dir.path().join("t.json");
+        write_atomic_path(&target, b"one", 0o600, true).unwrap();
+        write_atomic_path(&target, b"two", 0o600, true).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"two");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        assert!(!write_atomic_if_absent_path(&target, b"three", 0o644, true).unwrap());
+        assert_eq!(fs::read(&target).unwrap(), b"two");
+        let fresh = dir.path().join("fresh");
+        assert!(write_atomic_if_absent_path(&fresh, b"x", 0o644, true).unwrap());
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        let link = dir.path().join("link");
+        symlink(&victim, &link).unwrap();
+        assert!(write_atomic_path(&link, b"evil", 0o600, false).is_err());
+        assert!(!write_atomic_if_absent_path(&link, b"evil", 0o600, false).unwrap());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn confined_dir_refuses_symlinked_segments() {
+        let dir = tmp();
+        let outside = tmp();
+        let root = ConfinedDir::create(&dir.path().join("root"), 0o700).unwrap();
+        let rel = RelPath::parse("state/bells/a.json").unwrap();
+        root.ensure_subdir(&RelPath::parse("state/bells").unwrap(), 0o700)
+            .unwrap();
+        root.write_atomic(&rel, b"{}", 0o600, true).unwrap();
+        assert_eq!(root.read_string(&rel, 16).unwrap(), "{}");
+        assert!(
+            root.write_atomic_if_absent(&rel, b"x", 0o600, false)
+                .is_ok()
+        );
+
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        let through = RelPath::parse("escape/x").unwrap();
+        assert!(root.write_atomic(&through, b"x", 0o600, false).is_err());
+        assert!(root.ensure_subdir(&through, 0o700).is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+
+        let missing = RelPath::parse("nope/x").unwrap();
+        assert_eq!(
+            root.read_regular(&missing, 1).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn entry_kind_sees_dangling_symlinks() {
+        let dir = tmp();
+        let lock = dir.path().join(".#lock");
+        symlink("user@host.1:2", &lock).unwrap();
+        assert_eq!(entry_kind(&lock).unwrap(), EntryKind::Symlink);
+        assert!(entry_exists(&lock));
+        assert!(!entry_exists(&dir.path().join("none")));
+        assert!(dir_metadata_nofollow(dir.path()).is_ok());
+        let dlink = dir.path().join("dl");
+        symlink(dir.path(), &dlink).unwrap();
+        assert!(dir_metadata_nofollow(&dlink).is_err());
+    }
+}

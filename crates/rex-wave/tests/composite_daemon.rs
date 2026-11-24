@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_t3::transport::ws_accept;
 use serde_json::{Value, json};
 use std::collections::HashMap;

@@ -27,9 +27,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -302,8 +301,6 @@ impl Authenticator for TableAuthenticator {
     }
 }
 
-static WORKER_TOKEN_NONCE: AtomicU64 = AtomicU64::new(1);
-
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max_len = a.len().max(b.len());
     let mut diff = a.len() ^ b.len();
@@ -331,63 +328,64 @@ fn validate_token_principal(token: &str, principal: &Principal) -> Result<(), Ap
     Ok(())
 }
 
-fn verify_private_file(
+/// The largest token store or worker token file read.
+const MAX_TOKEN_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a private token file: a regular file (never through a symlink),
+/// mode `0600`, owned by `expected_uid` when given, judged by the opened
+/// handle. A missing file is `None`; any other refusal is `Denied`.
+pub fn read_private_file(
     path: &Path,
     expected_uid: Option<u32>,
     what: &str,
-) -> Result<bool, ApiError> {
-    let meta = match std::fs::symlink_metadata(path) {
+) -> Result<Option<Vec<u8>>, ApiError> {
+    match rex_wave_fs::read_private_regular(path, expected_uid, MAX_TOKEN_FILE_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(ApiError::Denied {
+                principal: "anonymous".into(),
+                action: format!("{what}: {e}"),
+            })
+        }
+        Err(e) => Err(ApiError::Internal(format!("{what}: {e}"))),
+    }
+}
+
+/// Refuse a directory of private files unless it is a real directory (not a
+/// symlink), owned by `expected_uid` when given, with no group/other bits.
+fn verify_private_dir(dir: &Path, expected_uid: Option<u32>) -> Result<bool, ApiError> {
+    let denied = |why: &str| ApiError::Denied {
+        principal: "anonymous".into(),
+        action: why.into(),
+    };
+    let meta = match rex_wave_fs::dir_metadata_nofollow(dir) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(ApiError::Internal(format!("{what} metadata: {e}"))),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            return Err(denied("worker-tokens path must be a real directory"));
+        }
+        Err(e) => return Err(ApiError::Internal(format!("worker-tokens metadata: {e}"))),
     };
-    if meta.file_type().is_symlink() {
-        return Err(ApiError::Denied {
-            principal: "anonymous".into(),
-            action: format!("{what} must not be a symlink"),
-        });
-    }
-    if !meta.file_type().is_file() {
-        return Err(ApiError::Denied {
-            principal: "anonymous".into(),
-            action: format!("{what} must be a regular file"),
-        });
-    }
     if let Some(uid) = expected_uid
         && meta.uid() != uid
     {
-        return Err(ApiError::Denied {
-            principal: "anonymous".into(),
-            action: format!("{what} owned by another uid"),
-        });
+        return Err(denied("worker-tokens directory owned by another uid"));
     }
     if meta.permissions().mode() & 0o077 != 0 {
-        return Err(ApiError::Denied {
-            principal: "anonymous".into(),
-            action: format!("{what} must be mode 0600"),
-        });
+        return Err(denied("worker-tokens directory must be mode 0700"));
     }
     Ok(true)
 }
 
-/// Verifies that `path` (if it exists) is a regular, non-symlink file owned by
-/// `expected_uid` (when supplied) with mode `0600`. Returns `Ok(false)` when missing.
-pub fn check_private_file(
-    path: &Path,
-    expected_uid: Option<u32>,
-    what: &str,
-) -> Result<bool, ApiError> {
-    verify_private_file(path, expected_uid, what)
-}
-
 /// Validates a single safe filename for `<state_dir>/worker-tokens/<id>`.
 pub fn is_safe_worker_token_id(id: &str) -> bool {
-    !id.is_empty()
-        && !id.starts_with('.')
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains("..")
-        && !id.chars().any(char::is_control)
+    rex_wave_fs::SafeName::parse_plain(id).is_ok()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -454,25 +452,14 @@ fn verify_legacy_worker_thread_token(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("worker-tokens");
-    let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
-        return false;
-    };
-    if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
-        return false;
-    }
-    if let Some(uid) = expected_uid
-        && dir_meta.uid() != uid
-    {
-        return false;
-    }
-    if dir_meta.permissions().mode() & 0o077 != 0 {
+    if !verify_private_dir(&dir, expected_uid).unwrap_or(false) {
         return false;
     }
     let file_path = dir.join(thread_id);
-    if !verify_private_file(&file_path, expected_uid, "legacy worker token").unwrap_or(false) {
+    let Ok(Some(bytes)) = read_private_file(&file_path, expected_uid, "legacy worker token") else {
         return false;
-    }
-    let Ok(raw) = std::fs::read_to_string(&file_path) else {
+    };
+    let Ok(raw) = String::from_utf8(bytes) else {
         return false;
     };
     let trimmed = raw.trim();
@@ -620,23 +607,7 @@ impl PrincipalTokenTable {
         }
         let encoded = serde_json::to_vec_pretty(&out)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let nonce = WORKER_TOKEN_NONCE.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            file.write_all(&encoded)?;
-            file.sync_all()?;
-        }
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
+        rex_wave_fs::write_atomic_path(path, &encoded, 0o600, false)?;
         Ok(())
     }
 
@@ -646,11 +617,9 @@ impl PrincipalTokenTable {
     /// Legacy worker entries carrying `thread_id` are accepted only while a
     /// matching private `<state_dir>/worker-tokens/<thread_id>` file exists.
     pub fn load_tokens_file(path: &Path, expected_uid: Option<u32>) -> Result<Self, ApiError> {
-        if !verify_private_file(path, expected_uid, "token store")? {
+        let Some(raw) = read_private_file(path, expected_uid, "token store")? else {
             return Ok(Self::new());
-        }
-        let raw =
-            std::fs::read(path).map_err(|e| ApiError::Internal(format!("read tokens: {e}")))?;
+        };
         let decoded: BTreeMap<String, TokenMapValue> = serde_json::from_slice(&raw)
             .map_err(|e| ApiError::Internal(format!("decode tokens: {e}")))?;
         let mut table = Self::new();
@@ -673,30 +642,8 @@ impl PrincipalTokenTable {
     /// Loads mode-`0600` per-worker token files from `<state_dir>/worker-tokens/`
     /// when present. Missing directory yields an empty table.
     pub fn load_worker_tokens_dir(dir: &Path, expected_uid: Option<u32>) -> Result<Self, ApiError> {
-        let dir_meta = match std::fs::symlink_metadata(dir) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::new()),
-            Err(e) => return Err(ApiError::Internal(format!("worker-tokens metadata: {e}"))),
-        };
-        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
-            return Err(ApiError::Denied {
-                principal: "anonymous".into(),
-                action: "worker-tokens path must be a real directory".into(),
-            });
-        }
-        if let Some(uid) = expected_uid
-            && dir_meta.uid() != uid
-        {
-            return Err(ApiError::Denied {
-                principal: "anonymous".into(),
-                action: "worker-tokens directory owned by another uid".into(),
-            });
-        }
-        if dir_meta.permissions().mode() & 0o077 != 0 {
-            return Err(ApiError::Denied {
-                principal: "anonymous".into(),
-                action: "worker-tokens directory must be mode 0700".into(),
-            });
+        if !verify_private_dir(dir, expected_uid)? {
+            return Ok(Self::new());
         }
         let entries = std::fs::read_dir(dir)
             .map_err(|e| ApiError::Internal(format!("read worker-tokens dir: {e}")))?;
@@ -715,18 +662,11 @@ impl PrincipalTokenTable {
         let mut table = Self::new();
         for path in paths {
             let label = format!("worker token {}", path.display());
-            match verify_private_file(&path, expected_uid, &label) {
-                Ok(true) => {}
-                Ok(false) => continue,
+            let raw = match read_private_file(&path, expected_uid, &label) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
                 Err(e) => {
                     daemon_log!("skipping {label}: {e}");
-                    continue;
-                }
-            }
-            let raw = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    daemon_log!("skipping {label}: read failed: {e}");
                     continue;
                 }
             };
@@ -804,21 +744,8 @@ pub fn write_worker_token_file(
     let encoded = serde_json::to_vec_pretty(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let nonce = WORKER_TOKEN_NONCE.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".tmp.{}.{nonce}", std::process::id()));
     let dest = dir.join(id);
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(&encoded)?;
-        f.sync_all()?;
-    }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, &dest)?;
+    rex_wave_fs::write_atomic_path(&dest, &encoded, 0o600, false)?;
     Ok(dest)
 }
 
@@ -1551,7 +1478,7 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let uid = std::fs::symlink_metadata(path)?.uid();
+    let uid = rex_wave_fs::socket_owner_uid(path)?;
     Ok((listener, uid))
 }
 

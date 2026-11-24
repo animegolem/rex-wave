@@ -414,6 +414,11 @@ pub const DEFAULT_DIGEST_THRESHOLD: usize = 3;
 /// never from attempt/pass count.
 pub const DEFAULT_RETRY_DEADLINE_MS: u64 = 3_600_000;
 
+/// The largest live `state/acks.jsonl` read.
+const MAX_ACKS_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest letter read while scanning.
+const MAX_LETTER_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Default reconnect grace window (`15 s`) matching `rex-wave-notify`.
 pub const DEFAULT_RECONNECT_GRACE_MS: u64 = 15_000;
 
@@ -427,15 +432,11 @@ pub struct ReadOnlyInterchange {
 
 impl ReadOnlyInterchange {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SandboxError> {
-        let canon = fs::canonicalize(root.as_ref()).map_err(|e| SandboxError::Io(e.to_string()))?;
-        let meta = fs::metadata(&canon).map_err(|e| SandboxError::Io(e.to_string()))?;
-        if !meta.is_dir() {
-            return Err(SandboxError::Io(format!(
-                "{} is not a directory",
-                canon.display()
-            )));
-        }
-        Ok(Self { root: canon })
+        let dir = rex_wave_fs::ConfinedDir::open(root.as_ref())
+            .map_err(|e| SandboxError::Io(format!("{}: {e}", root.as_ref().display())))?;
+        Ok(Self {
+            root: dir.path().to_path_buf(),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -446,20 +447,13 @@ impl ReadOnlyInterchange {
     /// or creating any file.
     pub fn read_acks(&self, aliases: &AliasMap) -> Result<AcksParseReport, SandboxError> {
         let acks_path = self.root.join("state").join("acks.jsonl");
-        let meta = match fs::symlink_metadata(&acks_path) {
-            Ok(m) => m,
+        let bytes = match rex_wave_fs::read_regular_bounded(&acks_path, MAX_ACKS_BYTES) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(AcksParseReport::default());
             }
             Err(e) => return Err(SandboxError::Io(e.to_string())),
         };
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return Err(SandboxError::Io(format!(
-                "{} is not a regular file",
-                acks_path.display()
-            )));
-        }
-        let bytes = fs::read(&acks_path).map_err(|e| SandboxError::Io(e.to_string()))?;
         let text = String::from_utf8_lossy(&bytes);
         Ok(parse_acks_jsonl(&text, aliases))
     }
@@ -771,7 +765,8 @@ fn read_scanned_letter(
     box_seat: Option<&SeatName>,
     aliases: &AliasMap,
 ) -> Result<ScannedLetter, SandboxError> {
-    let bytes = fs::read(path).map_err(|e| SandboxError::Io(e.to_string()))?;
+    let bytes = rex_wave_fs::read_regular_bounded(path, MAX_LETTER_BYTES)
+        .map_err(|e| SandboxError::Io(e.to_string()))?;
     let sha256 = sha256_bytes(&bytes);
     let sha16 = sha256.as_str()[..16].to_owned();
     let mtime_ms = fs::metadata(path)

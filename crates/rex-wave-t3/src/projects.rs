@@ -116,12 +116,15 @@ pub fn load_t3_project_names_from_sqlite(db_path: &Path) -> BTreeMap<BbProjectId
 
 /// Resolves a BB project ID (`proj_...`) to its local workspace root using
 /// `<bb_data_dir>/projects.json` and read-only `<bb_data_dir>/bb.db`.
+/// The largest BB `projects.json` cache read.
+const MAX_PROJECT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub fn lookup_bb_project_location(
     bb_data_dir: &Path,
     project_id: &str,
 ) -> Option<BbProjectLocation> {
     let json_path = bb_data_dir.join("projects.json");
-    if let Ok(raw) = std::fs::read(&json_path)
+    if let Ok(raw) = rex_wave_fs::read_regular_bounded(&json_path, MAX_PROJECT_CACHE_BYTES)
         && let Ok(val) = serde_json::from_slice::<Value>(&raw)
         && let Some(found) = lookup_bb_project_in_json(&val, project_id)
     {
@@ -243,8 +246,10 @@ fn lookup_bb_project_in_sqlite(db_path: &Path, project_id: &str) -> Option<BbPro
 
 fn normalize_path_key(raw: &str) -> String {
     let path = Path::new(raw);
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon.to_string_lossy().trim_end_matches('/').to_owned();
+    if path.is_absolute()
+        && let Ok(real) = rex_wave_fs::resolve_links(path)
+    {
+        return real.to_string_lossy().trim_end_matches('/').to_owned();
     }
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() && raw.starts_with('/') {

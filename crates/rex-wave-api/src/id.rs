@@ -264,6 +264,18 @@ impl LeaseEpoch {
 #[serde(transparent)]
 pub struct UnixMs(pub u64);
 
+impl UnixMs {
+    /// The wall clock. The workspace's one `SystemTime::now` call: deciders
+    /// take time from `DecideCtx::at`, and daemons from `rex_wave_runtime::now`.
+    #[allow(clippy::disallowed_methods)]
+    pub fn now_wall() -> Self {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        UnixMs(ms)
+    }
+}
+
 /// Inclusive range of seqs inside one stream (used by `promote_to_letter`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "(u64, u64)", into = "(u64, u64)")]

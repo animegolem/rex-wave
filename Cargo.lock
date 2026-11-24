@@ -1332,6 +1332,7 @@ dependencies = [
  "rex-wave-api",
  "rex-wave-bb",
  "rex-wave-board",
+ "rex-wave-fs",
  "rex-wave-mailbridge",
  "rex-wave-mcp",
  "rex-wave-notify",
@@ -1365,6 +1366,7 @@ name = "rex-wave-bb"
 version = "0.1.0"
 dependencies = [
  "rex-wave-api",
+ "rex-wave-fs",
  "rex-wave-runtime",
  "rex-wave-waves",
  "serde",
@@ -1379,6 +1381,7 @@ dependencies = [
  "futures-util",
  "rex-kanban",
  "rex-wave-api",
+ "rex-wave-fs",
  "rex-wave-runtime",
  "rex-wave-store",
  "tempfile",
@@ -1386,10 +1389,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-wave-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rex-wave-mailbridge"
 version = "0.1.0"
 dependencies = [
  "rex-wave-api",
+ "rex-wave-fs",
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
@@ -1472,6 +1485,7 @@ dependencies = [
  "futures-util",
  "rex-wave-api",
  "rex-wave-board",
+ "rex-wave-fs",
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
@@ -1492,6 +1506,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "rex-wave-api",
+ "rex-wave-fs",
  "rex-wave-runtime",
  "rex-wave-store",
  "serde",
@@ -1517,6 +1532,7 @@ name = "rex-wave-waves"
 version = "0.1.0"
 dependencies = [
  "rex-wave-api",
+ "rex-wave-fs",
  "rex-wave-runtime",
  "serde_json",
  "thiserror 2.0.21",

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use rex_wave_api::mail::*;
 use rex_wave_api::read::Read;
 use rex_wave_api::room::*;
@@ -746,7 +747,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let mail_service = Arc::new(MailBridge::with_hub(
-        sandbox,
+        sandbox.clone(),
         journal.clone(),
         journal.claim(StreamId::Mail).unwrap(),
         hub.clone(),
@@ -772,7 +773,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
             part: SystemPart::WakeBell,
         },
     );
-    let courier_task = spawn_reactor(BellCourier, bell_client.clone());
+    let courier_task = spawn_reactor(BellCourier::new(sandbox.clone()), bell_client.clone());
 
     let (sink_addr, sink_task) = loop {
         let candidate: SocketAddr = {
@@ -877,7 +878,7 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
         }
     })
     .await
-    .expect("BellCourier delivered live wake prompt even via 3-arg MailBridge::new");
+    .expect("BellCourier delivered live wake prompt from the sandbox it was handed");
 
     tokio::time::sleep(Duration::from_millis(40)).await;
     let after_retries = room_history(&sam, dm_with_bell.clone(), Seq::ORIGIN, Some(10))

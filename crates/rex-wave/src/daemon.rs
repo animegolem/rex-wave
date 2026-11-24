@@ -26,7 +26,7 @@ use rex_wave_t3::{
 };
 use rex_wave_transport::{
     Authenticator, ConnectionHooks, Endpoint, PrincipalTokenTable, StateDirAuthenticator,
-    WorkerTokenFile, bind_unix, check_private_file, is_safe_worker_token_id,
+    WorkerTokenFile, bind_unix, is_safe_worker_token_id, read_private_file,
     serve_listener_with_hooks, write_worker_token_file,
 };
 use rex_wave_waves::{WaveConductor, Waves};
@@ -264,8 +264,7 @@ pub fn mint_principal_token(
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let path = dir.join(tid);
-        if check_private_file(&path, None, "worker token file").unwrap_or(false)
-            && let Ok(raw) = std::fs::read(&path)
+        if let Ok(Some(raw)) = read_private_file(&path, None, "worker token file")
             && let Ok(existing) = serde_json::from_slice::<WorkerTokenFile>(&raw)
             && existing.principal == *principal
             && !existing.token.is_empty()
@@ -597,7 +596,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
-            sandbox,
+            sandbox.clone(),
             journal.clone(),
             mail_writer,
             hub.clone(),
@@ -632,7 +631,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let herald_client = system(SystemPart::Herald);
     let herald_task = spawn_reactor(herald, herald_client.clone());
     let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client);
-    let bell_task = spawn_reactor(BellCourier, system(SystemPart::WakeBell));
+    let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
     let sink_task = tokio::spawn(rex_wave_mailbridge::serve_wake_bell_sink(

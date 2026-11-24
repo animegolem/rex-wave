@@ -123,10 +123,12 @@ pub(crate) fn parse_ws_url(url: &str) -> Result<(String, String), HostError> {
 
 fn next_mask_bytes() -> [u8; 4] {
     let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let nanos = {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(seq);
+        h.finish()
+    };
     let mixed =
         seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ nanos.rotate_left(17) ^ 0xA5A5_5A5A_C3C3_3C3C;
     (mixed as u32).to_be_bytes()

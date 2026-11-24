@@ -103,11 +103,7 @@ pub trait Service<C>: Send + Sync + 'static {
 }
 
 pub fn now() -> UnixMs {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    UnixMs(ms)
+    UnixMs::now_wall()
 }
 
 fn store_error(e: rex_wave_store::StoreError) -> ApiError {

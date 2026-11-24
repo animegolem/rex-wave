@@ -1170,10 +1170,13 @@ fn parse_project_rows(val: &serde_json::Value, out: &mut BTreeMap<BbProjectId, S
     }
 }
 
+/// The largest BB `projects.json` cache read.
+const MAX_PROJECT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub fn load_bb_projects_from_dir(dir: &Path) -> BTreeMap<BbProjectId, String> {
     let mut map = BTreeMap::new();
     let json_cache = dir.join("projects.json");
-    if let Ok(raw) = std::fs::read(&json_cache)
+    if let Ok(raw) = rex_wave_fs::read_regular_bounded(&json_cache, MAX_PROJECT_CACHE_BYTES)
         && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw)
     {
         parse_project_rows(&val, &mut map);
@@ -3356,6 +3359,7 @@ impl AgentFeed for BbBridge {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use rex_wave_api::board::{BoardEnsure, BoardEvent, BoardId, BoardInfo};

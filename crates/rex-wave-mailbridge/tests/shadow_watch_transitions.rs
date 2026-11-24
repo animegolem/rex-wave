@@ -1,5 +1,6 @@
 //! `mail shadow --watch` append-only transitions, multi-pass scoring, ring
 //! watcher `seen.jsonl` formats, and T3 doorbell target seeding.
+#![allow(clippy::disallowed_methods)]
 
 use rex_wave_api::presence::*;
 use rex_wave_api::*;

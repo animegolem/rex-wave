@@ -20,10 +20,7 @@ use rex_wave_api::{
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CANONICAL_TODO_HEADER: &str = "#+TODO: IDEA TODO STRT WAIT BLKD | DONE CNCL";
 
@@ -31,7 +28,10 @@ const PROP_REX_SEQ: &str = "REX_SEQ";
 const PROP_REX_EPOCH: &str = "REX_EPOCH";
 const PROP_REX_LEASE: &str = "REX_LEASE";
 
-static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Mode of org files and conflict sidecars this module writes.
+const ORG_FILE_MODE: u32 = 0o644;
+/// The largest org file synced; a task board is far smaller.
+const MAX_ORG_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum OrgSyncError {
@@ -227,9 +227,9 @@ pub fn emacs_lock_path(target: &Path) -> Option<PathBuf> {
 }
 
 /// True when an Emacs `.#<filename>` lock exists for `target`.
-/// Uses `symlink_metadata` (`lstat`) because Emacs lock files are dangling symlinks.
+/// Judged without following links, because Emacs lock files are dangling symlinks.
 pub fn has_emacs_lock(target: &Path) -> bool {
-    emacs_lock_path(target).is_some_and(|lock| fs::symlink_metadata(&lock).is_ok())
+    emacs_lock_path(target).is_some_and(|lock| rex_wave_fs::entry_exists(&lock))
 }
 
 /// Path of the conflict sidecar `<filename>.rex-conflict` alongside `target`.
@@ -700,41 +700,17 @@ fn record_labels_in_baseline(
 }
 
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), OrgSyncError> {
-    let parent = match target.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let pid = std::process::id();
-    let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".rex-wave-org-{pid}-{seq}.tmp"));
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .map_err(|source| OrgSyncError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-
-    if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = fs::remove_file(&tmp_path);
-        return Err(OrgSyncError::Io {
-            path: tmp_path,
-            source,
-        });
-    }
-    drop(file);
-
-    if let Err(source) = fs::rename(&tmp_path, target) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(OrgSyncError::Io {
+    rex_wave_fs::write_atomic_path(target, bytes, ORG_FILE_MODE, false).map_err(|source| {
+        OrgSyncError::Io {
             path: target.to_path_buf(),
             source,
-        });
-    }
-    Ok(())
+        }
+    })
+}
+
+/// Read an org file (bounded, never through a symlink).
+pub fn read_org_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    rex_wave_fs::read_regular_bounded(path, MAX_ORG_FILE_BYTES)
 }
 
 fn write_conflict_sidecar(
@@ -957,12 +933,12 @@ pub async fn sync_org_to_room<C: Client>(
         return Ok(OrgToRoomOutcome::IgnoredEphemeral);
     }
     if let Some(lock_path) = emacs_lock_path(path)
-        && fs::symlink_metadata(&lock_path).is_ok()
+        && rex_wave_fs::entry_exists(&lock_path)
     {
         return Ok(OrgToRoomOutcome::DeferredLock { lock_path });
     }
 
-    let initial_bytes = fs::read(path).map_err(|source| OrgSyncError::Io {
+    let initial_bytes = read_org_file(path).map_err(|source| OrgSyncError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -1571,7 +1547,7 @@ pub async fn sync_org_to_room<C: Client>(
     let wrote_back = if projected != edoc {
         let rendered = render_emacs_document(&projected).into_bytes();
         let still_clean = !has_emacs_lock(path)
-            && fs::read(path)
+            && read_org_file(path)
                 .map(|cur| cur == initial_bytes)
                 .unwrap_or(false);
         if still_clean {
@@ -1615,12 +1591,12 @@ pub async fn sync_room_to_org<C: Client>(
         return Ok(RoomToOrgOutcome::IgnoredEphemeral);
     }
     if let Some(lock_path) = emacs_lock_path(path)
-        && fs::symlink_metadata(&lock_path).is_ok()
+        && rex_wave_fs::entry_exists(&lock_path)
     {
         return Ok(RoomToOrgOutcome::DeferredLock { lock_path });
     }
 
-    let (existing_bytes, existing_doc) = match fs::read(path) {
+    let (existing_bytes, existing_doc) = match read_org_file(path) {
         Ok(bytes) => {
             if state.last_synced_bytes.as_deref() != Some(bytes.as_slice()) {
                 return Ok(RoomToOrgOutcome::DeferredLocalEdits);
@@ -1657,12 +1633,12 @@ pub async fn sync_room_to_org<C: Client>(
     }
 
     if let Some(lock_path) = emacs_lock_path(path)
-        && fs::symlink_metadata(&lock_path).is_ok()
+        && rex_wave_fs::entry_exists(&lock_path)
     {
         return Ok(RoomToOrgOutcome::DeferredLock { lock_path });
     }
     if let Some(prev_bytes) = &existing_bytes {
-        let current = fs::read(path).map_err(|source| OrgSyncError::Io {
+        let current = read_org_file(path).map_err(|source| OrgSyncError::Io {
             path: path.to_path_buf(),
             source,
         })?;

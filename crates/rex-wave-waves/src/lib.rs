@@ -10,7 +10,7 @@ use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, LocalClient, Reactor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
     let name =
@@ -99,34 +99,12 @@ fn bounded_body(raw: String) -> Body {
 /// Normalize a wave/worker-owned lexical path (`output_dir` or `writes` entry).
 /// Rejects empty paths, `"."`-only paths, and any `..` parent traversal.
 pub fn normalize_owned_path(path: &Path, what: &str) -> Result<PathBuf, ApiError> {
-    if path.as_os_str().is_empty() {
-        return Err(ApiError::Invalid(InvalidId {
+    rex_wave_fs::normalize_no_parent(path).map_err(|e| {
+        ApiError::Invalid(InvalidId {
             what: what.into(),
-            reason: "path must not be empty".into(),
-        }));
-    }
-    let mut normalized = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::ParentDir => {
-                return Err(ApiError::Invalid(InvalidId {
-                    what: what.into(),
-                    reason: format!("path '{}' must not contain '..'", path.display()),
-                }));
-            }
-            Component::CurDir => {}
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                normalized.push(comp.as_os_str());
-            }
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return Err(ApiError::Invalid(InvalidId {
-            what: what.into(),
-            reason: format!("path '{}' must not be empty or '.'", path.display()),
-        }));
-    }
-    Ok(normalized)
+            reason: e.to_string(),
+        })
+    })
 }
 
 /// Resolve a worker's effective output directory: explicit `worker_output_dir`
