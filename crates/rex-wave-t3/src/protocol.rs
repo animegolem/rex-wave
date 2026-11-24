@@ -1655,7 +1655,7 @@ mod tests {
         );
         assert_eq!(run_acct.as_deref(), Some("work-acct@example.com"));
 
-        // S11: stale lastError on a later clean idle/completed shell must NOT trigger Refused.
+        // Stale lastError on a later clean idle/completed shell must NOT trigger Refused.
         let stale_idle = json!({
             "status": "idle",
             "lastError": "Request blocked by cyber_safeguard policy"

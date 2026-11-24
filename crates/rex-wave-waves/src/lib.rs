@@ -3165,7 +3165,7 @@ mod tests {
             Some("auth-v2:author:attempt-1:at-1000")
         );
 
-        // S2: a racing Activity::Errored must never overwrite Activity::Refused on the same attempt.
+        // A racing Activity::Errored must never overwrite Activity::Refused on the same attempt.
         let (dup_evs, _) = apply_cmd(
             &mut state,
             &mut seq,
@@ -3186,7 +3186,7 @@ mod tests {
             "Errored must not overwrite Refused on the same live attempt"
         );
 
-        // S5: a Live worker cannot bypass allow_incomplete or override paying account.
+        // A Live worker cannot bypass allow_incomplete or override paying account.
         let worker_caller = Principal::Worker {
             wave: spec.slug.clone(),
             role: verifier.clone(),
@@ -3469,12 +3469,12 @@ mod tests {
                 .as_str()
                 .contains("output_dir: runs/auth-v2/author (relative to workspace root)")
         );
-        // S14: return_schema appears after Assignment so a large schema never clips the brief.
+        // Return_schema appears after Assignment so a large schema never clips the brief.
         let assign_pos = author_req.prompt.as_str().find("Assignment:").unwrap();
         let schema_pos = author_req.prompt.as_str().find("return_schema:").unwrap();
         assert!(schema_pos > assign_pos);
 
-        // S3: unreachable check_live during reconcile must not fail or leave reconcile dirty.
+        // Unreachable check_live during reconcile must not fail or leave reconcile dirty.
         *host.unreachable_check_live.lock().unwrap() = true;
         let mut offline_restarted = WaveConductor::new(host.clone());
         let history = bus.lock().unwrap().history.clone();
@@ -3538,7 +3538,7 @@ mod tests {
             "reconcile must surface missing host thread instead of fake Live/Working: {author_phase:?}"
         );
 
-        // Lesson 4: doorbell_text marks truncation explicitly instead of silently clipping.
+        // Doorbell_text marks truncation explicitly instead of silently clipping.
         let huge = Body::parse("a".repeat(64 * 1024)).unwrap();
         let room = RoomId::Channel {
             scope: RoomScope::Global,

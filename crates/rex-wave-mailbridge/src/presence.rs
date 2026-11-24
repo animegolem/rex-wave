@@ -531,7 +531,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 1. Read `<interchange>/postmaster/state/roster.json` if present.
     let roster_path = canon_dir.join("postmaster/state/roster.json");
     if let Some(roster_val) = read_regular_json_if_present(&roster_path)? {
         sources_read.push(roster_path);
@@ -567,9 +566,8 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 2. Read `.watchers/mailwatch-routes.json` and the T3 doorbell's
-    //    `tooling/t3-doorbell/targets.json` under `<interchange>` or its parent
-    //    house root. Both map `<seat>` -> `{.., "aliases": [..]}`.
+    // `.watchers/mailwatch-routes.json` and the T3 doorbell's
+    // `tooling/t3-doorbell/targets.json` both map `<seat>` -> `{.., "aliases": [..]}`.
     for rel in [
         ".watchers/mailwatch-routes.json",
         "tooling/t3-doorbell/targets.json",
@@ -619,7 +617,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 3. Read `<interchange>/state/bb-knock-routes.tsv` if present.
     let bb_routes_path = canon_dir.join("state/bb-knock-routes.tsv");
     if let Some(raw) = read_regular_text_if_present(&bb_routes_path)? {
         sources_read.push(bb_routes_path);
@@ -653,7 +650,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 4. Read `<interchange>/state/codex-knock-routes.tsv` if present.
     let codex_routes_path = canon_dir.join("state/codex-knock-routes.tsv");
     if let Some(raw) = read_regular_text_if_present(&codex_routes_path)? {
         sources_read.push(codex_routes_path);
@@ -687,7 +683,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 5. Read `herdr-registry.tsv` under `<interchange>` or its parent house root.
     if let Some(herdr_path) = resolve_local_or_parent(&canon_dir, "herdr-registry.tsv")
         && let Some(raw) = read_regular_text_if_present(&herdr_path)?
     {
@@ -725,7 +720,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 6. Read `<interchange>/state/ledger.md` CLAIM rows if present.
     let ledger_path = canon_dir.join("state/ledger.md");
     if let Some(raw) = read_regular_text_if_present(&ledger_path)? {
         sources_read.push(ledger_path);
@@ -750,9 +744,8 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 7. Read optional external `seats.tsv` (`session_name\tseat\troom_path`).
-    //    When the caller explicitly supplies a path, surface `NotFound` rather
-    //    than silently dropping a mistyped `--seats-tsv` flag.
+    // An explicitly supplied `seats.tsv` surfaces `NotFound` rather than
+    // silently dropping a mistyped `--seats-tsv` flag.
     if let Some(seats_path) = seats_tsv {
         let Some(raw) = read_regular_text_if_present(seats_path)? else {
             return Err(ApiError::NotFound {
@@ -803,7 +796,6 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 8. Merge the house profile's canonical alias folds.
     for (canon, alias_list) in &house.aliases {
         let set = seat_aliases.entry(canon.clone()).or_default();
         for alias_slug in alias_list {
@@ -813,7 +805,7 @@ pub fn seed_records_from_interchange_with_options(
         }
     }
 
-    // 9. Remove any alias that collides with a canonical seat or an earlier seat's alias.
+    // An alias that collides with a canonical seat or an earlier seat's alias is dropped.
     let canonical_seats: BTreeSet<SeatName> = seat_aliases.keys().cloned().collect();
     let mut claimed_aliases: BTreeSet<SeatName> = BTreeSet::new();
     let witness = &house.witness_seat;
@@ -1450,14 +1442,13 @@ impl PresenceState {
         }
         let lane = normalize_lane(&query.lane)?;
 
-        // 1. Exact canonical seat name (works even when all bindings are offline).
+        // An exact canonical seat name resolves even when all bindings are offline.
         if let Ok(seat_name) = SeatName::parse(q.to_ascii_lowercase())
             && let Some(record) = self.seats.get(&seat_name)
         {
             return Ok(self.build_resolution(record, lane.as_deref(), now));
         }
 
-        // 2. Registered alias match across durable records.
         let alias_matches: Vec<&SeatRecord> = self
             .seats
             .values()
@@ -1478,7 +1469,7 @@ impl PresenceState {
             )));
         }
 
-        // 3. Project or role ownership match (non-retired first, then retired fallback).
+        // Project or role owners: non-retired first, then retired as a fallback.
         let matches_project_or_role = |rec: &SeatRecord| {
             rec.projects.iter().any(|p| p.value.eq_ignore_ascii_case(q))
                 || rec

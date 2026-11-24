@@ -5386,7 +5386,7 @@ mod tests {
 
     #[test]
     fn bb_refusal_stop_reasons_runtime_meta_and_spawn_provenance_work() {
-        // S1: BB-shaped failed turn (provider/error policy + turn/completed status=failed with nested error.message)
+        // BB-shaped failed turn (provider/error policy + turn/completed status=failed with nested error.message)
         // must resolve to Refused, never Idle.
         let bb_refused_turn = vec![
             serde_json::json!({ "seq": 1, "type": "turn/started", "data": {} }),
@@ -5415,7 +5415,7 @@ mod tests {
             Some("cyber_safeguard: blocked by policy")
         );
 
-        // S1: BB-shaped generic failed turn (non-refusal) resolves to Errored with nested error.message.
+        // BB-shaped generic failed turn (non-refusal) resolves to Errored with nested error.message.
         let bb_failed_turn = vec![
             serde_json::json!({ "seq": 1, "type": "turn/started", "data": {} }),
             serde_json::json!({
@@ -5431,7 +5431,7 @@ mod tests {
             })
         );
 
-        // S8: a retrying provider/error (willRetry: true) in a turn that completes normally stays Idle.
+        // A retrying provider/error (willRetry: true) in a turn that completes normally stays Idle.
         let retried_then_ok = vec![
             serde_json::json!({ "seq": 1, "type": "turn/started", "data": {} }),
             serde_json::json!({
@@ -5455,7 +5455,7 @@ mod tests {
         );
         assert_eq!(refusal_from_latest_turn(&retried_then_ok), None);
 
-        // S4: runtime model extraction reads actual BB runtime events (contextWindowUsage.snapshot.model
+        // Runtime model extraction reads actual BB runtime events (contextWindowUsage.snapshot.model
         // and provider/modelFallback), ignoring request echoes in client/turn/start.
         let runtime_rows = vec![
             serde_json::json!({
@@ -5481,7 +5481,7 @@ mod tests {
         );
         assert_eq!(account, None);
 
-        // S10: narrow missing-thread matching ignores unrelated "missing required field" errors.
+        // Narrow missing-thread matching ignores unrelated "missing required field" errors.
         assert_eq!(
             classify_missing_or_archived_thread("missing required field: threadId"),
             None
@@ -5493,7 +5493,7 @@ mod tests {
             }) if error.contains("missing after restart")
         ));
 
-        // S4: spawn_args keeps account in pluginMetadata.rexWave, not provider sessionOptions.
+        // Spawn_args keeps account in pluginMetadata.rexWave, not provider sessionOptions.
         let room = rex_wave_waves::wave_room(
             &WaveSlug::parse("w-prov").unwrap(),
             &BbProjectId::parse("proj_1").unwrap(),

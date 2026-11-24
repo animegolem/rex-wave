@@ -108,9 +108,6 @@ pub fn markdown_lines(body: &str, width: u16, p: &Palette) -> Vec<Line<'static>>
     out
 }
 
-// ---------------------------------------------------------------------------
-// Block-level helpers
-
 /// Strip `\r`, expand tabs to 4 spaces, drop other control characters.
 fn sanitize(raw: &str) -> String {
     let mut s = String::with_capacity(raw.len());
@@ -164,9 +161,6 @@ fn list_item(line: &str) -> Option<(String, &str)> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Inline parsing
-
 fn push_seg(segs: &mut Vec<(String, Style)>, s: &str, style: Style) {
     if s.is_empty() {
         return;
@@ -200,7 +194,6 @@ fn inline_into(
     let mut prev: Option<char> = None;
     while i < s.len() {
         let rest = &s[i..];
-        // `code`
         if let Some(after) = rest.strip_prefix('`')
             && let Some(end) = after.find('`')
             && end > 0
@@ -212,7 +205,6 @@ fn inline_into(
             prev = Some('`');
             continue;
         }
-        // **bold**
         if allow_bold
             && let Some(after) = rest.strip_prefix("**")
             && let Some(end) = after.find("**")
@@ -229,7 +221,6 @@ fn inline_into(
             continue;
         }
         let c = rest.chars().next().unwrap_or(' ');
-        // @mention at a word start
         if c == '@'
             && prev.is_none_or(|pc| pc.is_whitespace() || matches!(pc, '(' | '[' | '"' | '\''))
             && rest[1..].chars().next().is_some_and(char::is_alphanumeric)
@@ -252,9 +243,6 @@ fn inline_into(
     }
     push_seg(segs, &s[lit_start..], base);
 }
-
-// ---------------------------------------------------------------------------
-// Wrapping
 
 /// A base char plus any following zero-width chars (combining marks,
 /// variation selectors, ZWJ). Never split across lines.

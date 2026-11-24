@@ -983,6 +983,55 @@ pub enum DeferReason {
     TransportDown { transport: TransportKind },
 }
 
+/// Which [`DeferReason`] deferred a ring, without its per-pass details: the
+/// part of a deferral that counts as a `--watch` transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeferKind {
+    ReconnectGrace,
+    TargetBusy,
+    TransportDown,
+}
+
+impl DeferKind {
+    const ALL: [DeferKind; 3] = [
+        DeferKind::ReconnectGrace,
+        DeferKind::TargetBusy,
+        DeferKind::TransportDown,
+    ];
+
+    /// The `reason_kind` spelling in shadow JSONL.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeferKind::ReconnectGrace => "ReconnectGrace",
+            DeferKind::TargetBusy => "TargetBusy",
+            DeferKind::TransportDown => "TransportDown",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == raw)
+    }
+
+    /// The kind a logged `reason` names. Logs written before `reason_kind`
+    /// existed carry only `reason`, which begins with the kind's name.
+    fn from_logged_reason(reason: &str) -> Option<Self> {
+        let name_end = reason
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(reason.len());
+        Self::parse(&reason[..name_end])
+    }
+}
+
+impl DeferReason {
+    pub fn kind(&self) -> DeferKind {
+        match self {
+            DeferReason::ReconnectGrace { .. } => DeferKind::ReconnectGrace,
+            DeferReason::TargetBusy { .. } => DeferKind::TargetBusy,
+            DeferReason::TransportDown { .. } => DeferKind::TransportDown,
+        }
+    }
+}
+
 /// Pure output of the mail-ring decision engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RingDecision {
@@ -1206,6 +1255,7 @@ impl RingDecision {
                 "seat": seat.as_str(),
                 "referent": referent.to_json_value(),
                 "reason": format!("{reason:?}"),
+                "reason_kind": reason.kind().as_str(),
                 "deadline_at_ms": deadline_at.0,
                 "time_basis": time_basis.as_str(),
             }),
@@ -1664,7 +1714,7 @@ pub enum WatchDecisionState {
     SkipNonSeatTarget,
     FlagMutatedAfterAck { prior_ack_sha: String },
     Ring,
-    Defer { reason_kind: String },
+    Defer { reason_kind: DeferKind },
     RaiseUnrung,
 }
 
@@ -1762,18 +1812,11 @@ fn watch_line_facts(
         ),
         "ring" => single(referent_sha()?, WatchDecisionState::Ring),
         "defer" => {
-            // `reason` is `Debug` output such as `TargetBusy { pass_count: 2 }`;
-            // only the variant name is a transition.
-            let reason = watch_str(obj, "reason", line_no)?;
-            let reason_kind: String = reason
-                .chars()
-                .take_while(char::is_ascii_alphanumeric)
-                .collect();
-            if reason_kind.is_empty() {
-                return Err(format!(
-                    "shadow line {line_no}: defer `reason` '{reason}' has no kind"
-                ));
+            let reason_kind = match obj.get("reason_kind").and_then(|v| v.as_str()) {
+                Some(kind) => DeferKind::parse(kind),
+                None => DeferKind::from_logged_reason(watch_str(obj, "reason", line_no)?),
             }
+            .ok_or_else(|| format!("shadow line {line_no}: defer names no known reason kind"))?;
             single(referent_sha()?, WatchDecisionState::Defer { reason_kind })
         }
         "ring_digest" => multi(WatchDecisionState::Ring)?,

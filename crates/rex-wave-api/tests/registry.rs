@@ -727,7 +727,7 @@ fn wave_honesty_refusals_counts_serde_defaults_and_truncation_marker() {
     assert_eq!(counts.retired_refused, 1);
     assert_eq!(counts.retired_clean, 0);
 
-    // S9: substring safeguard/refusal stop reasons match across TS and Rust.
+    // Substring safeguard/refusal stop reasons match across TS and Rust.
     assert!(rex_wave_api::wave::is_refusal_stop_reason(
         "safeguard_block"
     ));

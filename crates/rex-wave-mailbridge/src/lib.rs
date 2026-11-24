@@ -31,11 +31,11 @@ pub use score::{
     parse_mailwatch_seen_sources, score_shadow_against_acks, score_shadow_jsonl,
 };
 pub use shadow::{
-    DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferReason,
-    LetterCandidate, ParsedLetterTime, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
-    RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowAction, ShadowPassReport,
-    ShadowWatchTracker, TimeBasis, WATCH_TRACKER_MAX_ENTRIES, WatchDecisionState, WatchDelta,
-    decide_mail_ring, decide_mail_rings_for_seat, extract_letter_timestamp,
+    DEFAULT_DIGEST_THRESHOLD, DEFAULT_RECONNECT_GRACE_MS, DEFAULT_RETRY_DEADLINE_MS, DeferKind,
+    DeferReason, LetterCandidate, ParsedLetterTime, ReadOnlyInterchange, RetryEntry, RetryState,
+    RingDecision, RingDeliveryChannel, RingPolicy, RingReferent, ScannedLetter, ShadowAction,
+    ShadowPassReport, ShadowWatchTracker, TimeBasis, WATCH_TRACKER_MAX_ENTRIES, WatchDecisionState,
+    WatchDelta, decide_mail_ring, decide_mail_rings_for_seat, extract_letter_timestamp,
     extract_letter_timestamp_detailed, parse_recorded_datetime_ms, run_shadow_pass,
 };
 

@@ -1019,7 +1019,6 @@ fn frame_stream(rx: mpsc::Receiver<Result<Frame, ApiError>>, guard: UnwatchGuard
             match rx.recv().await {
                 Some(item) => Some((item, (rx, guard))),
                 None => {
-                    // The watch already ended; no Unwatch needed.
                     guard.armed = false;
                     None
                 }
@@ -1763,7 +1762,6 @@ async fn handle_conn(
                         .send(wire::ServerFrame::WatchEnded { id, error: end_err })
                         .await;
                 });
-                // Replacing an entry aborts the watch it held.
                 watches.insert(id, AbortOnDrop(handle.abort_handle()));
             }
             wire::ClientFrame::Unwatch { id } => {
