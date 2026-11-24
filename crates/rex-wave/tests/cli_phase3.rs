@@ -758,11 +758,12 @@ async fn worker_credentials_fail_closed_and_legacy_tokens_do_not_rebind_across_p
     std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let sock = state_dir.join("daemon.sock");
 
-    // 1. Blank REX_WAVE_WORKER_THREAD_ID and malformed `t3:` T3CODE_THREAD_ID fail closed (never PeerUid).
+    // 1. Blank REX_WAVE_WORKER_THREAD_ID and malformed or Unicode-padded `t3:` T3CODE_THREAD_ID fail closed (never PeerUid).
     for (env_k, env_v) in [
         ("REX_WAVE_WORKER_THREAD_ID", "   ".to_owned()),
         ("T3CODE_THREAD_ID", format!("t3:{}", "x".repeat(300))),
         ("T3CODE_THREAD_ID", "t3:bad/slash".to_owned()),
+        ("T3CODE_THREAD_ID", "\u{00a0}t3:w1:target:a1".to_owned()),
     ] {
         let out = common::rex_wave_at(&sock)
             .arg("inbox")
@@ -778,8 +779,9 @@ async fn worker_credentials_fail_closed_and_legacy_tokens_do_not_rebind_across_p
         );
     }
 
-    // 2. Legacy plaintext worker token belonging to `@w/other` rotates instead of rebinding to `@w/target`,
-    //    while a verified legacy plaintext entry in `tokens.json` for `@w/target` upgrades in place.
+    // 2. Legacy plaintext worker token belonging to `@w/other` OR a principal-scoped token in
+    //    `tokens.json` without a thread binding rotates instead of rebinding/surviving retirement,
+    //    while a thread-bound legacy entry in `tokens.json` upgrades cleanly and revokes on unlink.
     let wave = WaveSlug::parse("w1").unwrap();
     let other_role = RoleName::parse("other").unwrap();
     let target_role = RoleName::parse("target").unwrap();
@@ -789,19 +791,29 @@ async fn worker_credentials_fail_closed_and_legacy_tokens_do_not_rebind_across_p
     std::fs::set_permissions(&wt_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let tokens_path = state_dir.join("tokens.json");
+    let wt_file = wt_dir.join(tid.as_str());
+    std::fs::write(&wt_file, "rw_w_verified_thread_bound\n").unwrap();
+    std::fs::set_permissions(&wt_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
     let mut table = PrincipalTokenTable::new();
     table
         .insert_worker("rw_w_other_secret", wave.clone(), other_role)
         .unwrap();
     table
-        .insert_worker("rw_w_verified_target", wave.clone(), target_role.clone())
+        .insert_worker("rw_w_principal_scoped", wave.clone(), target_role.clone())
+        .unwrap();
+    table
+        .insert_legacy_worker_thread(
+            "rw_w_verified_thread_bound",
+            wave.clone(),
+            target_role.clone(),
+            tid.as_str(),
+        )
         .unwrap();
     table.save_tokens_file(&tokens_path).unwrap();
 
-    let wt_file = wt_dir.join(tid.as_str());
     std::fs::write(&wt_file, "rw_w_other_secret\n").unwrap();
     std::fs::set_permissions(&wt_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-
     let rotated =
         provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
     assert!(
@@ -810,15 +822,56 @@ async fn worker_credentials_fail_closed_and_legacy_tokens_do_not_rebind_across_p
     );
     assert_ne!(rotated.token, "rw_w_other_secret");
 
-    std::fs::write(&wt_file, "rw_w_verified_target\n").unwrap();
+    std::fs::write(&wt_file, "rw_w_principal_scoped\n").unwrap();
+    std::fs::set_permissions(&wt_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let rotated_principal =
+        provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
+    assert!(
+        rotated_principal.created,
+        "principal-scoped tokens.json bearer must NOT be reused as a thread-scoped worker token"
+    );
+    assert_ne!(rotated_principal.token, "rw_w_principal_scoped");
+
+    std::fs::write(&wt_file, "rw_w_verified_thread_bound\n").unwrap();
     std::fs::set_permissions(&wt_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let upgraded =
         provision_worker_token_in_state_dir(&state_dir, &wave, &target_role, &tid).unwrap();
     assert!(
         !upgraded.created,
-        "verified legacy token for same principal upgrades cleanly"
+        "thread-bound legacy token for same principal and thread upgrades cleanly"
     );
-    assert_eq!(upgraded.token, "rw_w_verified_target");
+    assert_eq!(upgraded.token, "rw_w_verified_thread_bound");
+
+    let auth = rex_wave_transport::StateDirAuthenticator::from_state_dir(
+        SeatName::parse("owner").unwrap(),
+        None,
+        &state_dir,
+    );
+    use rex_wave_transport::Authenticator as _;
+    assert_eq!(
+        auth.authenticate(
+            None,
+            &rex_wave_transport::Credential::Token {
+                token: upgraded.token.clone()
+            },
+        )
+        .unwrap(),
+        Principal::Worker {
+            wave: wave.clone(),
+            role: target_role.clone()
+        }
+    );
+    rex_wave_transport::remove_worker_token_file(&state_dir, tid.as_str()).unwrap();
+    assert!(
+        auth.authenticate(
+            None,
+            &rex_wave_transport::Credential::Token {
+                token: upgraded.token
+            },
+        )
+        .is_err(),
+        "deleting the upgraded worker token file must revoke authentication immediately"
+    );
 
     // 3. Explicit canonical RoomRef::Id write + Read + RoomFiltered Wait on a legacy-only DM stay symmetric,
     //    while raw StreamId reads/subscriptions remain exact, and Seat/Operator cannot spoof MirroredTurn.

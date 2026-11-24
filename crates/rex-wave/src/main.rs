@@ -1087,12 +1087,6 @@ pub fn resolve_cli_credential(
         };
     }
     if let Some(raw_os) = std::env::var_os(rex_wave_transport::T3_WORKER_THREAD_ENV) {
-        let raw_bytes = raw_os.as_encoded_bytes();
-        let trimmed_bytes = raw_bytes
-            .iter()
-            .position(|b| !b.is_ascii_whitespace())
-            .map_or(&[][..], |idx| &raw_bytes[idx..]);
-        let has_worker_prefix = RunnerKind::from_thread_bytes(trimmed_bytes) != RunnerKind::Bb;
         let Some(raw_str) = raw_os.to_str() else {
             return Err(format!(
                 "{} contains non-UTF-8 bytes; refusing PeerUid fallback",
@@ -1101,6 +1095,7 @@ pub fn resolve_cli_credential(
         };
         let tid = raw_str.trim();
         if !tid.is_empty() {
+            let has_worker_prefix = RunnerKind::from_thread_str(tid) != RunnerKind::Bb;
             let state_dir = daemon::state_dir_for(sock_path);
             match rex_wave_transport::read_worker_token_file(&state_dir, tid) {
                 Ok(Some(token)) => return Ok(Credential::Token { token }),

@@ -83,16 +83,15 @@ impl FrontmatterDoc {
             } else {
                 bytes.len() + 1
             };
-            let line_no_cr = after_open[cursor..line_end].trim_end_matches('\r');
-            if line_no_cr.trim_end_matches([' ', '\t']) == "---" {
+            let (line_body, line_nl) = if line_end == bytes.len() {
+                (&after_open[cursor..line_end], "")
+            } else if line_end > cursor && bytes[line_end - 1] == b'\r' {
+                (&after_open[cursor..line_end - 1], "\r\n")
+            } else {
+                (&after_open[cursor..line_end], "\n")
+            };
+            if line_body.trim_end_matches([' ', '\t', '\r']) == "---" {
                 let raw_fm = after_open[..cursor].to_owned();
-                let close_newline = if line_end == bytes.len() {
-                    ""
-                } else if line_end > cursor && bytes[line_end - 1] == b'\r' {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
                 let body = if line_end < bytes.len() {
                     after_open[line_end + 1..].to_owned()
                 } else {
@@ -102,13 +101,14 @@ impl FrontmatterDoc {
                     has_frontmatter: true,
                     crlf,
                     open_newline,
-                    close_fence: line_no_cr.to_owned(),
-                    close_newline,
+                    close_fence: line_body.to_owned(),
+                    close_newline: line_nl,
                     entries,
                     raw_frontmatter: raw_fm,
                     body,
                 };
             }
+            let line_no_cr = line_body.trim_end_matches('\r');
             if let Some((k, v)) = line_no_cr.split_once(':') {
                 let key = k.trim().to_owned();
                 if !key.is_empty() {
@@ -467,6 +467,16 @@ mod tests {
         assert!(parsed_spaced.has_frontmatter);
         assert_eq!(parsed_spaced.get("from"), Some("alice"));
         assert_eq!(parsed_spaced.render_lossless(), spaced_close);
+
+        for cr_edge in [
+            "---\nfrom: alice\n---\r",
+            "---\nfrom: alice\n---\r\r\nBody\n",
+            "---\r\nfrom: alice\r\n---\r\r\r",
+        ] {
+            let doc = FrontmatterDoc::parse(cr_edge);
+            assert!(doc.has_frontmatter);
+            assert_eq!(doc.render_lossless(), cr_edge, "lost bytes on {cr_edge:?}");
+        }
     }
 
     #[test]

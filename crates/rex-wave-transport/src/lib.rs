@@ -530,6 +530,20 @@ impl PrincipalTokenTable {
         self.insert(token, Principal::Worker { wave, role })
     }
 
+    pub fn insert_legacy_worker_thread(
+        &mut self,
+        token: impl Into<String>,
+        wave: WaveSlug,
+        role: RoleName,
+        thread_id: impl Into<String>,
+    ) -> Result<(), ApiError> {
+        let token = token.into();
+        let tid = thread_id.into();
+        self.insert(token.clone(), Principal::Worker { wave, role })?;
+        self.legacy_thread_ids.insert(token, tid);
+        Ok(())
+    }
+
     pub fn insert_operator(
         &mut self,
         token: impl Into<String>,
@@ -560,6 +574,16 @@ impl PrincipalTokenTable {
         for (stored, principal) in &self.tokens {
             if constant_time_eq(stored.as_bytes(), candidate.as_bytes()) {
                 matched = Some(principal);
+            }
+        }
+        matched
+    }
+
+    pub fn legacy_thread_id(&self, candidate: &str) -> Option<&str> {
+        let mut matched: Option<&str> = None;
+        for (stored, tid) in &self.legacy_thread_ids {
+            if constant_time_eq(stored.as_bytes(), candidate.as_bytes()) {
+                matched = Some(tid.as_str());
             }
         }
         matched

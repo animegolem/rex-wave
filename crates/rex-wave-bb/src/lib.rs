@@ -1228,7 +1228,7 @@ struct TrackedWorker {
     pending_interaction: Option<PendingInteraction>,
     last_seq: Option<u64>,
     mirror_room_watermark: Seq,
-    mirrored_anchors: std::collections::HashSet<String>,
+    last_mirrored_anchor: Option<String>,
 }
 
 enum OwnerMsg {
@@ -1460,10 +1460,10 @@ impl BridgeOwner {
                             pending_interaction: None,
                             last_seq: None,
                             mirror_room_watermark: Seq::ORIGIN,
-                            mirrored_anchors: std::collections::HashSet::new(),
+                            last_mirrored_anchor: None,
                         });
                     if entry.thread.as_ref() != Some(&thread) {
-                        entry.mirrored_anchors.clear();
+                        entry.last_mirrored_anchor = None;
                     }
                     entry.attempt = attempt;
                     entry.thread = Some(thread);
@@ -1562,10 +1562,9 @@ impl BridgeOwner {
                         self.workers_by_role
                             .get(&(wave, role))
                             .map_or((Seq::ORIGIN, false), |w| {
-                                (
-                                    w.mirror_room_watermark,
-                                    w.mirrored_anchors.contains(&anchor),
-                                )
+                                let matched = !anchor.is_empty()
+                                    && w.last_mirrored_anchor.as_deref() == Some(anchor.as_str());
+                                (w.mirror_room_watermark, matched)
                             });
                     let _ = reply.send(state);
                 }
@@ -1580,7 +1579,7 @@ impl BridgeOwner {
                             rec.mirror_room_watermark = seq;
                         }
                         if let Some(a) = anchor {
-                            rec.mirrored_anchors.insert(a);
+                            rec.last_mirrored_anchor = Some(a);
                         }
                     }
                 }
@@ -1607,7 +1606,7 @@ impl BridgeOwner {
                         pending_interaction: None,
                         last_seq: None,
                         mirror_room_watermark: Seq::ORIGIN,
-                        mirrored_anchors: std::collections::HashSet::new(),
+                        last_mirrored_anchor: None,
                     },
                 );
             }
@@ -1622,7 +1621,7 @@ impl BridgeOwner {
                             rec.live = false;
                             rec.pending_interaction = None;
                             rec.last_seq = None;
-                            rec.mirrored_anchors.clear();
+                            rec.last_mirrored_anchor = None;
                         }
                         return;
                     }
@@ -1645,10 +1644,10 @@ impl BridgeOwner {
                             pending_interaction: None,
                             last_seq: None,
                             mirror_room_watermark: Seq::ORIGIN,
-                            mirrored_anchors: std::collections::HashSet::new(),
+                            last_mirrored_anchor: None,
                         });
                     if rec.thread.as_ref() != Some(&thread) {
-                        rec.mirrored_anchors.clear();
+                        rec.last_mirrored_anchor = None;
                     }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
@@ -2893,6 +2892,7 @@ impl BbBridge {
         };
         let legacy_truncated_idem =
             rex_wave_waves::legacy_truncated_mirror_idem_key(wave, role, thread, &completed.anchor);
+        let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
 
         let mut already_posted = false;
         let mut reached_end = false;
@@ -2914,14 +2914,29 @@ impl BbBridge {
             room_head = last.seq;
             let count = page.entries.len();
             for env in &page.entries {
-                if let Event::Room(RoomEvent::Posted { idem, .. }) = &env.event {
-                    if idem.as_ref() == Some(&idem_key)
-                        || (legacy_truncated_idem.is_some() && idem == &legacy_truncated_idem)
-                    {
+                if let Event::Room(RoomEvent::Posted {
+                    body, idem, origin, ..
+                }) = &env.event
+                {
+                    if idem.as_ref() == Some(&idem_key) {
                         already_posted = true;
                         break;
                     }
-                    if env.by == worker_principal
+                    let is_mirrored_row = *origin == rex_wave_api::room::PostOrigin::MirroredTurn
+                        || idem
+                            .as_ref()
+                            .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
+                    if is_mirrored_row {
+                        if legacy_truncated_idem.is_some()
+                            && idem == &legacy_truncated_idem
+                            && env.by == worker_principal
+                            && body.as_str() == trimmed
+                            && (completed.turn_start_at == 0 || env.at.0 >= completed.turn_start_at)
+                        {
+                            already_posted = true;
+                            break;
+                        }
+                    } else if env.by == worker_principal
                         && (completed.turn_start_at == 0 || env.at.0 >= completed.turn_start_at)
                     {
                         already_posted = true;
@@ -2948,7 +2963,6 @@ impl BbBridge {
             return;
         }
 
-        let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
         let Ok(body) = Body::parse(trimmed) else {
             return;
         };
@@ -3237,7 +3251,7 @@ impl BbBridge {
                                 pending_interaction,
                                 last_seq: None,
                                 mirror_room_watermark: Seq::ORIGIN,
-                                mirrored_anchors: std::collections::HashSet::new(),
+                                last_mirrored_anchor: None,
                             })
                         }
                         WorkerPhase::Retiring { thread, .. }
@@ -3252,7 +3266,7 @@ impl BbBridge {
                             pending_interaction: None,
                             last_seq: None,
                             mirror_room_watermark: Seq::ORIGIN,
-                            mirrored_anchors: std::collections::HashSet::new(),
+                            last_mirrored_anchor: None,
                         }),
                         _ => Err(ApiError::NotFound {
                             what: format!("live BB thread for @{wave}/{role}"),
@@ -6857,7 +6871,7 @@ mod tests {
                 after: None,
                 labels: Vec::new(),
                 task: None,
-                idem: Some(legacy_idem),
+                idem: Some(legacy_idem.clone()),
                 origin: rex_wave_api::room::PostOrigin::Direct,
             })
             .await
@@ -6866,25 +6880,25 @@ mod tests {
         let rows = vec![
             serde_json::json!({
                 "seq": 999_999_999u64,
-                "at": 500_000_000_000u64,
-                "method": "turn/started",
+                "createdAt": 900u64,
+                "type": "turn/started",
                 "data": {}
             }),
             serde_json::json!({
                 "seq": 1_000_000_000u64,
-                "at": 500_000_000_100u64,
-                "method": "item/completed",
+                "createdAt": 950u64,
+                "type": "item/completed",
                 "data": { "item": { "type": "agentMessage", "text": "pre-upgrade mirrored turn" } }
             }),
             serde_json::json!({
                 "seq": 1_000_000_001u64,
-                "at": 500_000_000_200u64,
-                "method": "turn/completed",
+                "createdAt": 990u64,
+                "type": "turn/completed",
                 "data": {}
             }),
         ];
+        assert!(extract_unposted_final_turn(&rows).is_some());
 
-        // Trigger two consecutive completion mirror passes for the same turn.
         bridge
             .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &rows)
             .await;
@@ -6893,7 +6907,11 @@ mod tests {
             .await;
 
         let page = owner
-            .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+            .call(Read::stream(
+                StreamId::Room { room: room.clone() },
+                Seq::ORIGIN,
+                Some(50),
+            ))
             .await
             .unwrap();
         let posts: Vec<_> = page
@@ -6905,6 +6923,118 @@ mod tests {
             posts.len(),
             1,
             "pre-upgrade truncated mirror post must not duplicate on consecutive retries"
+        );
+
+        let cold_bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let _ = cold_bridge.backend.set(Arc::new(harness.clone()));
+        cold_bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: long_tid.clone(),
+                },
+            },
+        );
+        assert_eq!(
+            rex_wave_waves::legacy_truncated_mirror_idem_key(
+                &wave,
+                &role,
+                &long_tid,
+                "s1000000002",
+            )
+            .as_ref(),
+            Some(&legacy_idem),
+            "both anchors collide under legacy 256-byte truncation"
+        );
+        let second_turn_rows = vec![
+            serde_json::json!({
+                "seq": 1_000_000_002u64,
+                "createdAt": 900u64,
+                "type": "turn/started",
+                "data": {}
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_003u64,
+                "createdAt": 950u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "post-upgrade second turn" } }
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_004u64,
+                "createdAt": 990u64,
+                "type": "turn/completed",
+                "data": {}
+            }),
+        ];
+        assert!(extract_unposted_final_turn(&second_turn_rows).is_some());
+        cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &second_turn_rows)
+            .await;
+
+        let third_cold_bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let _ = third_cold_bridge.backend.set(Arc::new(harness.clone()));
+        third_cold_bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: long_tid.clone(),
+                },
+            },
+        );
+        let third_turn_rows = vec![
+            serde_json::json!({
+                "seq": 1_000_000_005u64,
+                "createdAt": 5_000u64,
+                "type": "turn/started",
+                "data": {}
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_006u64,
+                "createdAt": 5_100u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "pre-upgrade mirrored turn" } }
+            }),
+            serde_json::json!({
+                "seq": 1_000_000_007u64,
+                "createdAt": 5_200u64,
+                "type": "turn/completed",
+                "data": {}
+            }),
+        ];
+        assert!(extract_unposted_final_turn(&third_turn_rows).is_some());
+        third_cold_bridge
+            .mirror_completed_turn_from_rows(&wave, &role, &long_tid, &third_turn_rows)
+            .await;
+
+        let page2 = owner
+            .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+            .await
+            .unwrap();
+        let posts2: Vec<_> = page2
+            .entries
+            .iter()
+            .filter(|e| matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
+            .collect();
+        assert_eq!(
+            posts2.len(),
+            3,
+            "cold bridge must mirror new turns even when legacy 256-byte truncation or body collides"
         );
     }
 }

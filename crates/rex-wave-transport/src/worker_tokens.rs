@@ -248,6 +248,7 @@ pub fn provision_worker_token_locked(
             let tokens_path = state_dir.join("tokens.json");
             if let Ok(table) = PrincipalTokenTable::load_tokens_file(&tokens_path, None)
                 && table.get(trimmed) == Some(&principal)
+                && table.legacy_thread_id(trimmed) == Some(thread.as_str())
             {
                 let upgraded =
                     write_worker_token_record(state_dir, thread.as_str(), trimmed, &principal)?;
