@@ -35,10 +35,10 @@ use rex_wave_board::task_org::{
 };
 use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
-    RingPolicy, ShadowWatchTracker, check_gate1_fixtures, compare_shadow_with_mailwatch_seen,
-    extract_shadow_aliases, load_claude_session_file, parse_acks_jsonl, parse_claude_session_json,
-    parse_mailwatch_seen_sources, run_shadow_pass, score_shadow_jsonl,
-    seed_records_from_interchange_with_options,
+    RingPolicy, ShadowWatchTracker, check_gate1_fixtures_with_profile,
+    compare_shadow_with_mailwatch_seen, extract_shadow_aliases, load_claude_session_file,
+    load_house_profile, parse_acks_jsonl, parse_claude_session_json, parse_mailwatch_seen_sources,
+    run_shadow_pass, score_shadow_jsonl, seed_records_from_interchange_with_options,
 };
 use rex_wave_mcp::McpServer;
 use rex_wave_runtime::{Decider, EntryMeta};
@@ -3436,9 +3436,11 @@ fn execute_mail_score(
 
     let fixtures = match fixtures_path {
         Some(path) => {
+            let house = load_house_profile()
+                .map_err(|e| CliError::Msg(format!("load house profile: {e}")))?;
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| CliError::Msg(format!("read fixtures {}: {e}", path.display())))?;
-            Some(check_gate1_fixtures(&raw).map_err(CliError::Msg)?)
+            Some(check_gate1_fixtures_with_profile(&raw, &house).map_err(CliError::Msg)?)
         }
         None => None,
     };

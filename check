@@ -155,11 +155,6 @@ run_stage1_fmt() {
 }
 
 run_stage1_hygiene() {
-	if [[ "${SKIP_REPO_HYGIENE:-0}" == "1" ]]; then
-		printf 'warning: SKIP_REPO_HYGIENE=1 set; skipping repo hygiene lints\n'
-		return 0
-	fi
-
 	local missing=0
 	for lic in LICENSE-MIT LICENSE-APACHE; do
 		if [[ ! -s "$ROOT/$lic" ]]; then
@@ -183,6 +178,7 @@ root = sys.argv[1]
 # Domain-separated SHA-256 prefixes keep the public repo check free of
 # environment-private path, project, or seat literals while enforcing exact matches.
 PRIVATE_PATH_DIGESTS = frozenset([
+    "1c2c793c35880b1d",
     "27c49b165113c1d3",
     "3a7f21d75b8e822a",
     "61344a74e88ac17a",
@@ -192,6 +188,13 @@ PRIVATE_PATH_DIGESTS = frozenset([
 ])
 
 PRIVATE_SEAT_DIGESTS = frozenset([
+    "66bd35893c2907a3",
+    "6f1115b1216d79e2",
+    "3d7666fcca7c37d1",
+    "aea5f85f6f787f8f",
+    "3cce485ba4d03f29",
+    "8593a03eb2de9b52",
+    "3d7d0921299d5915",
     "4027d6b1f298a1e6",
     "83a33bc203695b00",
     "88c5d7f9962c63d2",
@@ -230,9 +233,9 @@ def has_digest(ns, token, table):
         digest_cache[key] = h
     return h in table
 
-def git_ls_files(paths):
+def git_ls_files():
     out = subprocess.check_output(
-        ["git", "-C", root, "ls-files", "--"] + paths,
+        ["git", "-C", root, "ls-files"],
         text=True,
     )
     return [line for line in out.splitlines() if line]
@@ -243,8 +246,9 @@ sub_split_re = re.compile(r"([_:-])")
 seat_chunk_re = re.compile(r"[a-z0-9_-]+")
 
 def find_private_path_match(line_low):
-    if "/users/" in line_low:
-        return "/users/"
+    mac_home_prefix = "/" + "users" + "/"
+    if mac_home_prefix in line_low:
+        return mac_home_prefix
     cleaned = esc_re.sub(" ", line_low)
     for chunk in sub_chunk_re.findall(cleaned):
         parts = sub_split_re.split(chunk)
@@ -261,7 +265,8 @@ def find_private_path_match(line_low):
     return None
 
 def find_private_seat_match(line_low):
-    for chunk in seat_chunk_re.findall(line_low):
+    cleaned = esc_re.sub(" ", line_low)
+    for chunk in seat_chunk_re.findall(cleaned):
         parts = chunk.split("-")
         n = len(parts)
         for i, p in enumerate(parts):
@@ -287,7 +292,7 @@ path_hits = []
 seat_hits = []
 todo_hits = []
 
-hygiene_files = git_ls_files(["crates", "README.md", "ARCHITECTURE.md", ".agents"])
+hygiene_files = git_ls_files()
 for rel in hygiene_files:
     if "LICENSE" in os.path.basename(rel).upper():
         continue
@@ -304,8 +309,9 @@ for rel in hygiene_files:
             if m_seat is not None:
                 seat_hits.append((rel, lineno, m_seat))
 
-todo_files = git_ls_files(["crates", "scripts", "bb-plugin"])
-for rel in todo_files:
+for rel in hygiene_files:
+    if rel == "check":
+        continue
     full = os.path.join(root, rel)
     if not os.path.isfile(full):
         continue

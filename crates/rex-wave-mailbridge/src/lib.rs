@@ -27,7 +27,7 @@ pub use presence::{
 };
 pub use score::{
     FixtureCoverageReport, GATE1_CASE_IDS, GATE1_CASE_TESTS, MailwatchComparisonReport,
-    MailwatchSeenIndex, ShadowScoreReport, check_gate1_fixtures,
+    MailwatchSeenIndex, ShadowScoreReport, check_gate1_fixtures, check_gate1_fixtures_with_profile,
     compare_shadow_with_mailwatch_seen, extract_shadow_aliases, parse_mailwatch_seen_jsonl,
     parse_mailwatch_seen_sources, score_shadow_against_acks, score_shadow_jsonl,
 };

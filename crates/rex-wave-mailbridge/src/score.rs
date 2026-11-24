@@ -4,6 +4,7 @@
 
 use crate::acks::{AckIndex, AliasMap};
 use crate::shadow::{RingDecision, RingReferent};
+use rex_wave_api::presence::HouseProfile;
 use rex_wave_api::{SeatName, Sha256Hex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,6 +84,16 @@ impl FixtureCoverageReport {
 /// registration against [`GATE1_CASE_IDS`] (`missing_case_ids` and `unknown_case_ids`),
 /// attaching the exact verifying test function name per case ID.
 pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, String> {
+    check_gate1_fixtures_with_profile(cases_jsonl, &HouseProfile::default())
+}
+
+/// Like [`check_gate1_fixtures`], resolving any deployment-specific legacy
+/// fixture IDs through [`HouseProfile::fixture_id_aliases`] before matching
+/// [`GATE1_CASE_IDS`].
+pub fn check_gate1_fixtures_with_profile(
+    cases_jsonl: &str,
+    house: &HouseProfile,
+) -> Result<FixtureCoverageReport, String> {
     let expected: BTreeSet<&str> = GATE1_CASE_IDS.iter().copied().collect();
     let mut case_ids = Vec::new();
     let mut seen = BTreeSet::new();
@@ -95,16 +106,17 @@ pub fn check_gate1_fixtures(cases_jsonl: &str) -> Result<FixtureCoverageReport, 
         }
         let val: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| format!("fixtures line {}: invalid JSON: {e}", idx + 1))?;
-        let id = val
+        let raw_id = val
             .get("id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("fixtures line {}: missing non-empty `id`", idx + 1))?;
+        let id = house.resolve_fixture_id(raw_id);
         if seen.insert(id.to_owned()) {
             case_ids.push(id.to_owned());
             if !expected.contains(id) {
-                unknown_case_ids.push(id.to_owned());
+                unknown_case_ids.push(raw_id.to_owned());
             }
         }
     }
@@ -827,6 +839,22 @@ mod tests {
 
         assert!(check_gate1_fixtures("{not-json").is_err());
         assert!(check_gate1_fixtures(r#"{"id":"   "}"#).is_err());
+
+        let mut aliased_house = HouseProfile::default();
+        aliased_house.fixture_id_aliases.insert(
+            "legacy-case-01".to_owned(),
+            "seat-stale-six-days".to_owned(),
+        );
+        let aliased_jsonl = all_ten.replace("seat-stale-six-days", "legacy-case-01");
+        assert!(
+            !check_gate1_fixtures(&aliased_jsonl)
+                .unwrap()
+                .fixture_ids_registered()
+        );
+        let mapped = check_gate1_fixtures_with_profile(&aliased_jsonl, &aliased_house).unwrap();
+        assert!(mapped.fixture_ids_registered());
+        assert!(mapped.missing_case_ids.is_empty());
+        assert!(mapped.unknown_case_ids.is_empty());
     }
 
     #[test]

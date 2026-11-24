@@ -35,7 +35,7 @@ fn house_fixture() -> Value {
             "dave": ["dave_old", "dave-opus-5"],
             "heidi": ["heidi-old", "heidi-typo", "muse"],
             "ivan-supervisor": ["ivan", "ivan-sup"],
-            "loupe": ["loupe-rev"],
+            "lucas": ["lucas-rev"],
             "neon": []
         }
     })

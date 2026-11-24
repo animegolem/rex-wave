@@ -2313,7 +2313,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
 
     // 2. TransportDown suppresses per-seat MailUnrung and retains bindings created during outage (S4+S5).
     let mut td_view = HeraldView::default();
-    let loupe = SeatName::parse("loupe").unwrap();
+    let lucas = SeatName::parse("lucas").unwrap();
     td_view.observe(&Envelope {
         stream: StreamId::Presence,
         seq: Seq(1),
@@ -2332,12 +2332,12 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         seq: Seq(2),
         at: UnixMs(1_500),
         by: Principal::Seat {
-            seat: loupe.clone(),
+            seat: lucas.clone(),
         },
         event: Event::Presence(PresenceEvent::Bound {
             binding: SeatBinding {
-                seat: loupe.clone(),
-                incarnation_id: IncarnationId::parse("inc-loupe-1").unwrap(),
+                seat: lucas.clone(),
+                incarnation_id: IncarnationId::parse("inc-lucas-1").unwrap(),
                 epoch: 1,
                 lane: None,
                 endpoint: TransportEndpoint::BbThread {
@@ -2359,11 +2359,11 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         event: Event::Mail(MailEvent::Banked {
             from_room: room,
             range: (Seq(1), Seq(1)),
-            letter: letter_ref_for("loupe", "during-outage-r1.md", 'f'),
+            letter: letter_ref_for("lucas", "during-outage-r1.md", 'f'),
         }),
     });
     assert_eq!(
-        td_view.evaluate_mail_unrung(&loupe, UnixMs(2_000)),
+        td_view.evaluate_mail_unrung(&lucas, UnixMs(2_000)),
         MailUnrungEval::Suppress,
         "MailUnrung suppressed during provider TransportDown outage"
     );
@@ -2381,7 +2381,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
         }),
     });
     assert_eq!(
-        td_view.evaluate_mail_unrung(&loupe, UnixMs(3_000)),
+        td_view.evaluate_mail_unrung(&lucas, UnixMs(3_000)),
         MailUnrungEval::Suppress,
         "binding created during outage becomes live automatically on transport recovery"
     );
