@@ -5399,10 +5399,6 @@
               "description": "Streams not listed start at their head at subscribe time instead of origin.",
               "type": "boolean"
             },
-            "pinned": {
-              "description": "True once `Wait` has materialized all subscription-time visible stream\nheads into `positions` and cleared `from_head`, so subsequent CLI\nmentions waits keep `from_head: false` for streams created between waits.",
-              "type": "boolean"
-            },
             "positions": {
               "items": {
                 "maxItems": 2,
@@ -5418,6 +5414,17 @@
                 "type": "array"
               },
               "type": "array"
+            },
+            "snapshot": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SnapshotScope"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Scope of streams whose subscription-time heads were materialized into\n`positions` by `Wait`, allowing new streams inside that scope to start at\n`Seq::ORIGIN` while broader waits initialize newly included streams at head."
             }
           },
           "required": [
@@ -5661,6 +5668,52 @@
           "minimum": 0,
           "type": "integer"
         },
+        "SnapshotScope": {
+          "description": "Which stream universe a `from_head` `Wait` cursor has already snapshotted\ninto explicit `positions`.",
+          "oneOf": [
+            {
+              "properties": {
+                "scope": {
+                  "const": "mentions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "scope": {
+                  "const": "everything",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "StreamId": {
           "description": "The identity of one single-writer log. Also the actor address.",
           "oneOf": [
@@ -5835,10 +5888,6 @@
               "description": "Streams not listed start at their head at subscribe time instead of origin.",
               "type": "boolean"
             },
-            "pinned": {
-              "description": "True once `Wait` has materialized all subscription-time visible stream\nheads into `positions` and cleared `from_head`, so subsequent CLI\nmentions waits keep `from_head: false` for streams created between waits.",
-              "type": "boolean"
-            },
             "positions": {
               "items": {
                 "maxItems": 2,
@@ -5854,6 +5903,17 @@
                 "type": "array"
               },
               "type": "array"
+            },
+            "snapshot": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SnapshotScope"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Scope of streams whose subscription-time heads were materialized into\n`positions` by `Wait`, allowing new streams inside that scope to start at\n`Seq::ORIGIN` while broader waits initialize newly included streams at head."
             }
           },
           "required": [
@@ -6282,6 +6342,52 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "SnapshotScope": {
+          "description": "Which stream universe a `from_head` `Wait` cursor has already snapshotted\ninto explicit `positions`.",
+          "oneOf": [
+            {
+              "properties": {
+                "scope": {
+                  "const": "mentions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "project": {
+                  "description": "bb project id",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "scope": {
+                  "const": "everything",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "StageTarget": {
           "description": "What the focused sidebar node shows on the stage.",

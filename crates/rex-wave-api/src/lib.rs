@@ -44,7 +44,7 @@ pub use registry::{
     authorize, tool_catalog,
 };
 pub use stage::{FocusGeneration, StageTarget};
-pub use stream::{Cursor, Envelope, Event, Frame, Interest, StreamId};
+pub use stream::{Cursor, Envelope, Event, Frame, Interest, SnapshotScope, StreamId};
 
 /// Empty success reply for commands whose only result is "it is now true".
 #[derive(

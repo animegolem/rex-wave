@@ -495,11 +495,26 @@ pub struct PreparedUnixSocket {
     file_name: std::ffi::OsString,
     uid: u32,
     bound_id: std::sync::Mutex<Option<(u64, u64)>>,
+    cleanup_on_drop: bool,
+}
+
+impl Drop for PreparedUnixSocket {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = self.cleanup_bound();
+        }
+    }
 }
 
 impl PreparedUnixSocket {
     pub fn uid(&self) -> u32 {
         self.uid
+    }
+
+    /// Arm automatic inode-checked socket removal when this handle drops so
+    /// early startup errors after [`Self::bind`] never leave a socket behind.
+    pub fn arm_cleanup_on_drop(&mut self) {
+        self.cleanup_on_drop = true;
     }
 
     /// Verify via `statat(AT_SYMLINK_NOFOLLOW)` on the held parent directory
@@ -509,25 +524,15 @@ impl PreparedUnixSocket {
         chmod_socket_nofollow(&self.parent_dir, &self.file_name, self.uid, display_path)
     }
 
-    /// Unlink any stale socket, bind a new listening socket, tighten its mode
-    /// to `0600`, and publish it inside the held `parent_dir` without resolving
-    /// `display_path` on the filesystem.
+    /// Unlink any stale socket, stage a new listening socket inside a private
+    /// `0700` subdirectory on the destination filesystem, tighten its mode to
+    /// `0600` before publication, and link it into `self.parent_dir`.
     pub fn bind(&self, display_path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
         use rustix::fs::{AtFlags, FileType, linkat, statat};
 
         self.unlink_stale(display_path)?;
 
-        #[cfg(target_os = "linux")]
-        if let Some(fd_target) = proc_fd_socket_path(&self.parent_dir, &self.file_name) {
-            let listener = std::os::unix::net::UnixListener::bind(&fd_target)?;
-            chmod_socket_nofollow(&self.parent_dir, &self.file_name, self.uid, display_path)?;
-            let st = statat(&self.parent_dir, &self.file_name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(io::Error::from)?;
-            *self.bound_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(stat_file_id(&st));
-            return Ok(listener);
-        }
-
-        let stage = StageDir::create(self.uid, display_path)?;
+        let stage = StageDir::create(&self.parent_dir, self.uid, display_path)?;
         let listener = std::os::unix::net::UnixListener::bind(&stage.sock_path)?;
         chmod_socket_nofollow(
             stage.dir(),
@@ -679,50 +684,75 @@ fn chmod_socket_nofollow(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn proc_fd_socket_path(parent_dir: &File, file_name: &std::ffi::OsStr) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd as _;
+fn next_stage_token() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher as _, Hasher as _};
+
+    let n = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut h = RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.write_u64(n);
+    h.finish()
+}
+
+fn resolve_stage_sock_path(stage_dir: &File, display_path: &Path) -> io::Result<Option<PathBuf>> {
     use std::os::unix::net::SocketAddr;
 
-    let fd_dir = PathBuf::from(format!("/proc/self/fd/{}", parent_dir.as_raw_fd()));
-    let (Ok(parent_meta), Ok(fd_meta)) = (parent_dir.metadata(), fs::metadata(&fd_dir)) else {
-        return None;
-    };
-    if (parent_meta.dev(), parent_meta.ino()) != (fd_meta.dev(), fd_meta.ino()) {
-        return None;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let fd_dir = PathBuf::from(format!("/proc/self/fd/{}", stage_dir.as_raw_fd()));
+        if let (Ok(stage_meta), Ok(fd_meta)) = (stage_dir.metadata(), fs::metadata(&fd_dir))
+            && (stage_meta.dev(), stage_meta.ino()) == (fd_meta.dev(), fd_meta.ino())
+        {
+            let target = fd_dir.join("s");
+            if SocketAddr::from_pathname(&target).is_ok() {
+                return Ok(Some(target));
+            }
+        }
     }
-    let target = fd_dir.join(file_name);
-    SocketAddr::from_pathname(&target).ok()?;
-    Some(target)
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let cpath = rustix::fs::getpath(stage_dir).map_err(io::Error::from)?;
+        let target = PathBuf::from(std::ffi::OsStr::from_bytes(cpath.as_bytes())).join("s");
+        let _ = display_path;
+        Ok(SocketAddr::from_pathname(&target).ok().map(|_| target))
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    )))]
+    {
+        let _ = (stage_dir, display_path);
+        Ok(None)
+    }
 }
 
 struct StageDir {
-    tmp_dir: File,
+    host_dir: File,
     stage_name: String,
     stage_dir: Option<File>,
     sock_path: PathBuf,
 }
 
 impl StageDir {
-    fn create(uid: u32, display_path: &Path) -> io::Result<Self> {
-        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+    fn create_in_host(host_dir: File, uid: u32) -> io::Result<(Self, File)> {
+        use rustix::fs::{Mode, OFlags, fchmod, mkdirat, openat};
 
-        let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "socket {}: cannot anchor staging root ({e})",
-                    display_path.display()
-                ),
-            )
-        })?;
-
-        let pid = std::process::id();
         let mut created_stage: Option<String> = None;
         for _ in 0..MAX_TEMP_ATTEMPTS {
-            let n = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = format!(".rw-sp-{pid}-{n:x}");
-            match mkdirat(&tmp_dir, &candidate, Mode::from_raw_mode(0o700)) {
+            let candidate = format!(".s{:08x}", next_stage_token() as u32);
+            match mkdirat(&host_dir, &candidate, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
                     created_stage = Some(candidate);
                     break;
@@ -737,22 +767,22 @@ impl StageDir {
                 "exhausted temporary socket staging names",
             )
         })?;
-        let sock_path = tmp_path.join(&stage_name).join("s");
-        let mut out = Self {
-            tmp_dir,
+        let out = Self {
+            host_dir,
             stage_name: stage_name.clone(),
             stage_dir: None,
-            sock_path,
+            sock_path: PathBuf::new(),
         };
 
         let stage_fd = openat(
-            &out.tmp_dir,
+            &out.host_dir,
             &stage_name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(io::Error::from)?;
         let stage_dir = File::from(stage_fd);
+        fchmod(&stage_dir, Mode::from_raw_mode(0o700)).map_err(io::Error::from)?;
         let stage_meta = stage_dir.metadata()?;
         if !stage_meta.is_dir()
             || stage_meta.uid() != uid
@@ -763,8 +793,44 @@ impl StageDir {
                 "socket staging directory failed ownership or 0700 mode check",
             ));
         }
-        out.stage_dir = Some(stage_dir);
-        Ok(out)
+        Ok((out, stage_dir))
+    }
+
+    fn create(parent_dir: &File, uid: u32, display_path: &Path) -> io::Result<Self> {
+        let parent_clone = parent_dir.try_clone()?;
+        let (mut stage, stage_dir) = Self::create_in_host(parent_clone, uid)?;
+        if let Some(sock_path) = resolve_stage_sock_path(&stage_dir, display_path)? {
+            stage.sock_path = sock_path;
+            stage.stage_dir = Some(stage_dir);
+            return Ok(stage);
+        }
+        drop(stage_dir);
+        drop(stage);
+
+        let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "socket {}: cannot anchor fallback staging root ({e})",
+                    display_path.display()
+                ),
+            )
+        })?;
+        if tmp_dir.metadata()?.dev() != parent_dir.metadata()?.dev() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "socket {}: staging path in parent directory exceeds SUN_LEN and /tmp is on a different filesystem",
+                    display_path.display()
+                ),
+            ));
+        }
+        let (mut tmp_stage, tmp_stage_dir) = Self::create_in_host(tmp_dir, uid)?;
+        let sock_path = tmp_path.join(&tmp_stage.stage_name).join("s");
+        std::os::unix::net::SocketAddr::from_pathname(&sock_path)?;
+        tmp_stage.sock_path = sock_path;
+        tmp_stage.stage_dir = Some(tmp_stage_dir);
+        Ok(tmp_stage)
     }
 
     fn dir(&self) -> &File {
@@ -778,7 +844,7 @@ impl Drop for StageDir {
             let _ = rustix::fs::unlinkat(sd, "s", rustix::fs::AtFlags::empty());
         }
         let _ = rustix::fs::unlinkat(
-            &self.tmp_dir,
+            &self.host_dir,
             &self.stage_name,
             rustix::fs::AtFlags::REMOVEDIR,
         );
@@ -868,28 +934,7 @@ fn connect_held_socket(
 ) -> io::Result<HeldProbeOutcome> {
     use rustix::fs::{AtFlags, linkat, statat};
 
-    #[cfg(target_os = "linux")]
-    if let Some(target) = proc_fd_socket_path(parent_dir, file_name) {
-        return match std::os::unix::net::UnixStream::connect(&target) {
-            Ok(_) => Ok(HeldProbeOutcome::Listening),
-            Err(e)
-                if e.kind() == io::ErrorKind::ConnectionRefused
-                    || e.raw_os_error() == Some(libc::ECONNREFUSED) =>
-            {
-                Ok(HeldProbeOutcome::Stale)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HeldProbeOutcome::Gone),
-            Err(e) => Err(io::Error::new(
-                e.kind(),
-                format!(
-                    "refusing to unlink socket {} after inconclusive liveness probe: {e}",
-                    display_path.display()
-                ),
-            )),
-        };
-    }
-
-    let stage = StageDir::create(uid, display_path)?;
+    let stage = StageDir::create(parent_dir, uid, display_path)?;
     match linkat(parent_dir, file_name, stage.dir(), "s", AtFlags::empty()) {
         Ok(()) => {}
         Err(rustix::io::Errno::NOENT) => return Ok(HeldProbeOutcome::Gone),
@@ -923,6 +968,13 @@ fn connect_held_socket(
         {
             Ok(HeldProbeOutcome::Stale)
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to unlink socket {}: staging path diverged during probe",
+                display_path.display()
+            ),
+        )),
         Err(e) => Err(io::Error::new(
             e.kind(),
             format!(
@@ -1025,6 +1077,7 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
             )
         })?
         .to_os_string();
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
     let parent = parent_of(path)?;
     if entry_kind(parent)? == EntryKind::Missing {
         fs::DirBuilder::new()
@@ -1146,6 +1199,7 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
         file_name,
         uid,
         bound_id: std::sync::Mutex::new(None),
+        cleanup_on_drop: false,
     })
 }
 
@@ -1534,5 +1588,23 @@ mod tests {
         drop(rebound);
         prepared_moved.cleanup_bound().unwrap();
         assert_eq!(entry_kind(&moved_sock_path).unwrap(), EntryKind::Missing);
+
+        // Overlong caller-visible socket path (> SUN_LEN) is rejected up front.
+        let overlong = dir.path().join("x".repeat(130)).join("daemon.sock");
+        assert!(validate_unix_socket_target(&overlong).is_err());
+
+        // Armed drop guard removes bound socket on early startup failure.
+        let drop_sock = held_dir.join("early-fail.sock");
+        {
+            let mut armed = validate_unix_socket_target(&drop_sock).unwrap();
+            armed.arm_cleanup_on_drop();
+            let _l = armed.bind(&drop_sock).unwrap();
+            assert_eq!(entry_kind(&drop_sock).unwrap(), EntryKind::Other);
+        }
+        assert_eq!(
+            entry_kind(&drop_sock).unwrap(),
+            EntryKind::Missing,
+            "armed PreparedUnixSocket must unlink bound socket when dropped"
+        );
     }
 }

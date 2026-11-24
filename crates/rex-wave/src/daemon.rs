@@ -567,10 +567,11 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         .unwrap_or_else(|| sock_path.with_file_name("journal.sqlite3"));
     let sandbox =
         SandboxRoot::verify(&args.mail_sandbox).map_err(|e| format!("mail sandbox: {e}"))?;
+    let mut prepared_sock = rex_wave_fs::validate_unix_socket_target(&sock_path)
+        .map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
+    prepared_sock.arm_cleanup_on_drop();
     rex_wave_fs::create_missing_private_dir(&state_dir)
         .map_err(|e| format!("create socket dir {}: {e}", state_dir.display()))?;
-    let prepared_sock = rex_wave_fs::validate_unix_socket_target(&sock_path)
-        .map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
     if let Some(parent) = journal_path.parent()
         && parent != state_dir.as_path()
     {

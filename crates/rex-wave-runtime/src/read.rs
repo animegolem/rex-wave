@@ -334,6 +334,41 @@ impl ReadSide {
         Ok(self.watch_journal_with_baseline(viewer, interest, from)?.0)
     }
 
+    fn sanitize_and_remap_cursor(
+        &self,
+        viewer: &Principal,
+        from: &Cursor,
+        remap_dm_cursor: bool,
+    ) -> Result<Cursor, ApiError> {
+        let mut store_err: Option<ApiError> = None;
+        let out = from.filter_map_streams(|s| {
+            if can_read(viewer, s).is_err() {
+                return None;
+            }
+            let mapped = if remap_dm_cursor {
+                match self.resolve_stream(s.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        if store_err.is_none() {
+                            store_err = Some(e);
+                        }
+                        return None;
+                    }
+                }
+            } else {
+                s.clone()
+            };
+            if can_read(viewer, &mapped).is_err() {
+                return None;
+            }
+            Some(mapped)
+        });
+        if let Some(e) = store_err {
+            return Err(e);
+        }
+        Ok(out)
+    }
+
     fn watch_journal_with_baseline(
         &self,
         viewer: Principal,
@@ -349,11 +384,7 @@ impl ReadSide {
                 ..
             } | Interest::Mentions
         );
-        let from = if remap_dm_cursor {
-            from.try_map_streams(|s| self.resolve_stream(s))?
-        } else {
-            from
-        };
+        let from = self.sanitize_and_remap_cursor(&viewer, &from, remap_dm_cursor)?;
         let mut filter = Filter::build(&viewer, interest, &self.journal, self.sidebar.clone())?;
         let mut tap = self.hub.tap();
         let initial: BTreeMap<StreamId, Seq> = self
@@ -362,6 +393,27 @@ impl ReadSide {
             .map_err(store_error)?
             .into_iter()
             .collect();
+
+        let snap_project_waves = match from.snapshot() {
+            Some(SnapshotScope::Project { project }) => {
+                let mut waves = BTreeSet::new();
+                for s in initial.keys() {
+                    if let StreamId::Wave { wave } = s
+                        && let Ok(first) = self.journal.read(s, Seq::ORIGIN, 1)
+                    {
+                        for env in &first {
+                            if let Event::Wave(WaveEvent::Started { spec, .. }) = &env.event
+                                && &spec.project == project
+                            {
+                                waves.insert(wave.clone());
+                            }
+                        }
+                    }
+                }
+                waves
+            }
+            _ => BTreeSet::new(),
+        };
 
         let raw_candidates: Vec<StreamId> = match &filter {
             Filter::Exact(set) => set.iter().cloned().collect(),
@@ -373,21 +425,41 @@ impl ReadSide {
             if can_read(&viewer, &s).is_err() {
                 continue;
             }
-            let start = start_seq(&from, &initial, &s);
+            let start = start_seq_scoped(&from, &initial, &snap_project_waves, &s);
             filter.seed_stream(&self.journal, &s, start);
             if !filter.considers_stream(&viewer, &s) {
                 continue;
             }
             candidates.push((s, start));
         }
+
+        let target_scope = match &filter {
+            Filter::Mentions { .. } => Some(SnapshotScope::Mentions),
+            Filter::Project { project, .. } => Some(SnapshotScope::Project {
+                project: project.clone(),
+            }),
+            Filter::Everything => Some(SnapshotScope::Everything),
+            Filter::Exact(_) | Filter::RoomFiltered { .. } => None,
+        };
+
         let mut baseline = from.clone();
-        if from.from_head() {
+        if from.from_head() || from.snapshot().is_some() {
             for (s, start) in &candidates {
-                if !baseline.lists(s) {
+                if !baseline.lists(s) && unlisted_starts_at_head(&from, &snap_project_waves, s) {
                     baseline.advance(s, *start);
                 }
             }
-            baseline = baseline.pin_head_snapshot();
+            if from.from_head() {
+                baseline = match target_scope {
+                    Some(scope) => baseline.with_snapshot(scope),
+                    None => baseline.with_from_head(false),
+                };
+            } else if let Some(scope) = target_scope
+                && from.snapshot() != Some(&scope)
+                && !matches!(from.snapshot(), Some(SnapshotScope::Everything))
+            {
+                baseline = baseline.with_snapshot(scope);
+            }
         }
 
         let journal = self.journal.clone();
@@ -400,7 +472,7 @@ impl ReadSide {
             for (s, start) in candidates {
                 seen.insert(s.clone(), start);
                 cursor.advance(&s, start);
-                if from.from_head() && !from.lists(&s) {
+                if !from.lists(&s) && unlisted_starts_at_head(&from, &snap_project_waves, &s) {
                     continue;
                 }
                 if !replay_stream(
@@ -441,7 +513,7 @@ impl ReadSide {
                             if !filter.considers_stream(&viewer, &env.stream) {
                                 continue;
                             }
-                            let cur = *seen.entry(env.stream.clone()).or_insert_with(|| start_seq(&from, &initial, &env.stream));
+                            let cur = *seen.entry(env.stream.clone()).or_insert_with(|| start_seq_scoped(&from, &initial, &snap_project_waves, &env.stream));
                             if env.seq <= cur {
                                 continue;
                             }
@@ -461,7 +533,7 @@ impl ReadSide {
                                 if can_read(&viewer, &s).is_err() {
                                     continue;
                                 }
-                                let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq(&from, &initial, &s));
+                                let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq_scoped(&from, &initial, &snap_project_waves, &s));
                                 filter.seed_stream(&journal, &s, cur);
                                 if !filter.considers_stream(&viewer, &s) {
                                     continue;
@@ -491,8 +563,10 @@ impl ReadSide {
             None => None,
         };
         if let Some(ref c) = req.cursor {
-            let mut out = c.clone();
-            if let Some(ref target) = target_stream {
+            let mut out = self.sanitize_and_remap_cursor(viewer, c, false)?;
+            if let Some(ref target) = target_stream
+                && can_read(viewer, target).is_ok()
+            {
                 if let Some(since) = req.since {
                     out.advance(target, since);
                 } else if matches!(req.interest, Interest::Mentions) && !out.lists(target) {
@@ -507,9 +581,12 @@ impl ReadSide {
             } else {
                 Cursor::default()
             };
-            return Ok(base.with(target, since));
+            if can_read(viewer, &target).is_ok() {
+                return Ok(base.with(target, since));
+            }
+            return Ok(base);
         }
-        Ok(req.after.clone())
+        self.sanitize_and_remap_cursor(viewer, &req.after, false)
     }
 
     pub fn parked_room_and_since(
@@ -521,25 +598,35 @@ impl ReadSide {
             Ok(c) => c,
             Err(_) => return (None, Seq::ORIGIN),
         };
+        let resolve_since = |cursor: &Cursor, stream: &StreamId| -> Seq {
+            if cursor.lists(stream) {
+                cursor.at(stream)
+            } else if unlisted_starts_at_head(cursor, &BTreeSet::new(), stream) {
+                self.journal.head(stream).unwrap_or(Seq::ORIGIN)
+            } else {
+                Seq::ORIGIN
+            }
+        };
         match &wait.interest {
             Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
                 match self.resolve_room_ref(room, worker) {
                     Ok(id) => {
                         let mapped = if matches!(room, rex_wave_api::room::RoomRef::Dm { .. }) {
-                            effective
-                                .try_map_streams(|s| self.resolve_stream(s))
+                            self.sanitize_and_remap_cursor(worker, &effective, true)
                                 .unwrap_or(effective)
                         } else {
                             effective
                         };
-                        let since = mapped.at(&StreamId::Room { room: id.clone() });
-                        (Some(id), since)
+                        let stream = StreamId::Room { room: id.clone() };
+                        (Some(id), resolve_since(&mapped, &stream))
                     }
                     Err(_) => (None, Seq::ORIGIN),
                 }
             }
             Interest::Streams { streams } if streams.len() == 1 => match &streams[0] {
-                StreamId::Room { room } => (Some(room.clone()), effective.at(&streams[0])),
+                StreamId::Room { room } => {
+                    (Some(room.clone()), resolve_since(&effective, &streams[0]))
+                }
                 _ => (None, Seq::ORIGIN),
             },
             _ => (None, Seq::ORIGIN),
@@ -677,10 +764,44 @@ impl ReadSide {
     }
 }
 
-fn start_seq(from: &Cursor, initial: &BTreeMap<StreamId, Seq>, stream: &StreamId) -> Seq {
+fn unlisted_starts_at_head(
+    from: &Cursor,
+    snap_project_waves: &BTreeSet<WaveSlug>,
+    stream: &StreamId,
+) -> bool {
+    if from.from_head() {
+        return true;
+    }
+    match from.snapshot() {
+        None | Some(SnapshotScope::Everything) => false,
+        Some(SnapshotScope::Mentions) => !matches!(stream, StreamId::Room { .. }),
+        Some(SnapshotScope::Project { project }) => {
+            let in_project = match stream {
+                StreamId::Room {
+                    room:
+                        RoomId::Channel {
+                            scope: RoomScope::Project { project: p },
+                            ..
+                        },
+                } => p == project,
+                StreamId::Board { board } => board == &project_board(project),
+                StreamId::Wave { wave } => snap_project_waves.contains(wave),
+                _ => false,
+            };
+            !in_project
+        }
+    }
+}
+
+fn start_seq_scoped(
+    from: &Cursor,
+    initial: &BTreeMap<StreamId, Seq>,
+    snap_project_waves: &BTreeSet<WaveSlug>,
+    stream: &StreamId,
+) -> Seq {
     if from.lists(stream) {
         from.at(stream)
-    } else if from.from_head() {
+    } else if unlisted_starts_at_head(from, snap_project_waves, stream) {
         initial.get(stream).copied().unwrap_or(Seq::ORIGIN)
     } else {
         Seq::ORIGIN

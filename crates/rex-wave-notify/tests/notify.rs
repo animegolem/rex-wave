@@ -3482,30 +3482,95 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
     .await
     .unwrap();
 
+    // Seed a legacy `(Operator("owner"), Seat("bob"))` DM and verify `alice` supplying
+    // `Direct(Seat("bob"), Seat("owner"))` in `Wait.after` cannot probe or retain it.
+    let legacy_owner_bob = RoomId::Direct {
+        pair: PrincipalPair::new(
+            Principal::Operator {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+            bob_p.clone(),
+        )
+        .unwrap(),
+    };
+    {
+        let mut w_ob = router
+            .read
+            .journal
+            .claim(StreamId::Room {
+                room: legacy_owner_bob.clone(),
+            })
+            .unwrap();
+        w_ob.append(
+            op.me(),
+            UnixMs(900),
+            None,
+            vec![Event::Room(RoomEvent::Opened {
+                id: legacy_owner_bob,
+                origin: RoomOrigin::Manual,
+                topic: None,
+            })],
+        )
+        .unwrap();
+    }
+    let canon_owner_bob = RoomId::Direct {
+        pair: PrincipalPair::new(
+            Principal::Seat {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+            bob_p.clone(),
+        )
+        .unwrap(),
+    };
+
     let p1 = alice
         .call(rex_wave_api::read::Wait {
             timeout_ms: Some(0),
             limit: Some(1),
             ..rex_wave_api::read::Wait::new(
                 Interest::Mentions,
-                Cursor::live().with(
-                    StreamId::Room {
-                        room: general.resolve(&alice_p).unwrap(),
-                    },
-                    Seq::ORIGIN,
-                ),
+                Cursor::live()
+                    .with(
+                        StreamId::Room {
+                            room: general.resolve(&alice_p).unwrap(),
+                        },
+                        Seq::ORIGIN,
+                    )
+                    .with(
+                        StreamId::Room {
+                            room: canon_owner_bob,
+                        },
+                        Seq::ORIGIN,
+                    ),
             )
         })
         .await
         .unwrap();
     assert_eq!(p1.entries.len(), 1);
-    assert!(p1.cursor.is_pinned());
+    assert_eq!(p1.cursor.snapshot(), Some(&SnapshotScope::Mentions));
     assert!(!p1.cursor.from_head());
     let cursor_json = serde_json::to_string(&p1.cursor).unwrap();
     assert!(
-        !cursor_json.contains("carol"),
-        "wait cursor must never disclose unrelated private DM participants: {cursor_json}"
+        !cursor_json.contains("carol") && !cursor_json.contains("bob"),
+        "wait cursor must never disclose unrelated private or legacy DM streams: {cursor_json}"
     );
+
+    // A one-room live wait cursor leaves `snapshot: None` so broadening to Mentions starts
+    // other rooms at their current heads instead of replaying old DM posts.
+    let one_room_wait = alice
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Room {
+                    room: general.clone(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(one_room_wait.cursor.snapshot(), None);
+    assert!(!one_room_wait.cursor.from_head());
 
     let wave_slug = WaveSlug::parse("w-park").unwrap();
     let role_name = RoleName::parse("coder").unwrap();
@@ -3560,17 +3625,17 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
     let worker = LocalClient::new(router.clone(), worker_p.clone());
 
     let general_id = general.resolve(&worker_p).unwrap();
-    let mut w =
-        rex_wave_api::read::Wait::room_ref(general.clone(), &worker_p, Seq::ORIGIN, false).unwrap();
-    w.since = None;
-    w.cursor = Some(Cursor::default().with(
-        StreamId::Room {
-            room: general_id.clone(),
-        },
-        Seq(5),
-    ));
-    w.timeout_ms = Some(200);
-    let wait_handle = tokio::spawn(async move { worker.call(w).await.unwrap() });
+    let w_live = rex_wave_api::read::Wait {
+        timeout_ms: Some(200),
+        ..rex_wave_api::read::Wait::new(
+            Interest::Room {
+                room: general.clone(),
+            },
+            Cursor::live(),
+        )
+    };
+    let worker_live = worker.clone();
+    let wait_handle = tokio::spawn(async move { worker_live.call(w_live).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(40)).await;
     let snap = op
         .call(WaveView {
@@ -3591,6 +3656,6 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
                 ..
             } if r == &general_id
         ),
-        "worker Activity::Parked must record resolved cursor offset Seq(5), got {phase:?}"
+        "live worker Wait must record subscription head Seq(5) in Activity::Parked, got {phase:?}"
     );
 }

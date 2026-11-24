@@ -890,7 +890,12 @@ fn parse_cursor_arg(raw: &str) -> Result<Cursor, ApiError> {
 }
 
 fn ensure_cursor_from_head(cursor: Cursor) -> Cursor {
-    if cursor.from_head() || cursor.is_pinned() {
+    if cursor.from_head()
+        || matches!(
+            cursor.snapshot(),
+            Some(SnapshotScope::Mentions | SnapshotScope::Everything)
+        )
+    {
         return cursor;
     }
     cursor.with_from_head(true)
