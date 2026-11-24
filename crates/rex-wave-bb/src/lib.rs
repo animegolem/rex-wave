@@ -3741,10 +3741,7 @@ mod tests {
                 match cmd.route() {
                     Routed::Wave(wc) => {
                         let mut g = harness.inner.lock().await;
-                        let ctx = DecideCtx {
-                            by: me.clone(),
-                            at: UnixMs(1_000),
-                        };
+                        let ctx = DecideCtx::for_test(me.clone(), UnixMs(1_000));
                         let stream = Waves::address(&wc, &ctx)?;
                         let StreamId::Wave { wave } = &stream else {
                             unreachable!()

@@ -42,7 +42,7 @@ impl Decider for ToyRooms {
             RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
-            room: r.resolve(&ctx.by)?,
+            room: r.resolve(ctx.by())?,
         })
     }
 
@@ -61,7 +61,7 @@ impl Decider for ToyRooms {
     ) -> Result<Vec<RoomEvent>, ApiError> {
         match cmd {
             RoomCommand::RoomEnsure(c) => {
-                let id = c.room.resolve(&ctx.by)?;
+                let id = c.room.resolve(ctx.by())?;
                 if state.head == Seq::ORIGIN {
                     Ok(vec![RoomEvent::Opened {
                         id,
@@ -73,7 +73,7 @@ impl Decider for ToyRooms {
                 }
             }
             RoomCommand::RoomJoin(c) => {
-                let who = c.member.clone().unwrap_or_else(|| ctx.by.clone());
+                let who = c.member.clone().unwrap_or_else(|| ctx.by().clone());
                 let handle = match &c.handle {
                     Some(h) => h.clone(),
                     None => Handle::parse(who.to_string().trim_start_matches('@'))?,
@@ -84,7 +84,7 @@ impl Decider for ToyRooms {
                 }])
             }
             RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft {
-                member: ctx.by.clone(),
+                member: ctx.by().clone(),
             }]),
             RoomCommand::RoomPost(c) => {
                 let mut principals = Vec::new();
@@ -267,7 +267,7 @@ impl Decider for ToyInbox {
     fn address(cmd: &InboxCommand, ctx: &DecideCtx) -> Result<StreamId, ApiError> {
         let owner = match cmd {
             InboxCommand::InboxRaise(c) => c.to.clone(),
-            _ => ctx.by.clone(),
+            _ => ctx.by().clone(),
         };
         Ok(StreamId::Inbox { owner })
     }

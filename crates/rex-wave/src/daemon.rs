@@ -228,10 +228,7 @@ pub fn mint_principal_token(
     principal: &Principal,
     thread_id: Option<&str>,
 ) -> io::Result<String> {
-    if matches!(
-        principal,
-        Principal::System { .. } | Principal::Operator { .. }
-    ) {
+    if principal.is_operator_or_system() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "cannot mint bearer token for Operator or System principals",

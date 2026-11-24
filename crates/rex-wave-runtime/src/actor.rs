@@ -339,7 +339,7 @@ impl<D: Decider> StreamActor<D> {
         let events = events.into_iter().map(D::wrap).collect();
         let appended = self
             .writer
-            .append(&ctx.by, ctx.at, idem.as_ref(), events)
+            .append(ctx.by(), ctx.at(), idem.as_ref(), events)
             .map_err(|e| {
                 self.stale = matches!(e, rex_wave_store::StoreError::HeadMoved { .. });
                 store_error(e)

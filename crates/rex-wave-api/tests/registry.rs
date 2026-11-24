@@ -767,3 +767,40 @@ fn wave_honesty_refusals_counts_serde_defaults_and_truncation_marker() {
     assert!(truncated.contains("[truncated: "));
     assert!(truncated.contains(" of 200 bytes shown]"));
 }
+
+#[test]
+fn audience_admits_exactly_its_principals() {
+    let operator = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let seat = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let worker = Principal::Worker {
+        wave: WaveSlug::parse("auth-v2").unwrap(),
+        role: RoleName::parse("author").unwrap(),
+    };
+    let system = Principal::System {
+        part: SystemPart::Herald,
+    };
+    for p in [&operator, &seat, &worker, &system] {
+        assert!(authorize(Audience::Member, p).is_ok(), "{p}");
+    }
+    assert!(authorize(Audience::Operator, &operator).is_ok());
+    for p in [&seat, &worker, &system] {
+        assert!(authorize(Audience::Operator, p).is_err(), "{p}");
+    }
+    assert!(authorize(Audience::System, &system).is_ok());
+    for p in [&operator, &seat, &worker] {
+        assert!(authorize(Audience::System, p).is_err(), "{p}");
+    }
+    for name in ["wave_start", "wave_resolve"] {
+        let meta = TOOLS.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(
+            meta.audience,
+            Audience::Operator,
+            "{name} relies on the router's audience check; the decider no longer re-checks"
+        );
+        assert!(authorize(meta.audience, &seat).is_err());
+    }
+}

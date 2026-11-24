@@ -56,7 +56,7 @@ fn seat(name: &str) -> SeatName {
 
 fn apply(state: &mut PresenceState, seq: &mut u64, by: Principal, cmd: PresenceCommand) {
     let at = UnixMs(1_000);
-    let ctx = DecideCtx { by: by.clone(), at };
+    let ctx = DecideCtx::for_test(by.clone(), at);
     let events = Presence::decide_with_probe(state, &cmd, &ctx, |_, _| true).unwrap();
     for ev in events {
         *seq += 1;

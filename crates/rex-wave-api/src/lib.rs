@@ -41,7 +41,7 @@ pub use read::{ArchiveTarget, SetArchived};
 pub use registry::{
     Audience, BoardCommand, Command, Family, InboxCommand, MailCommand, PresenceCommand,
     ReadCommand, RoomCommand, Routed, TOOLS, ToolMeta, WaveCommand, WireCommand, WireReply,
-    tool_catalog,
+    authorize, tool_catalog,
 };
 pub use stage::{FocusGeneration, StageTarget};
 pub use stream::{Cursor, Envelope, Event, Frame, Interest, StreamId};

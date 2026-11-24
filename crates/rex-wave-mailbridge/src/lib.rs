@@ -869,7 +869,7 @@ impl MailBridge {
         let room_stream = StreamId::Room {
             room: req.room.clone(),
         };
-        can_read(&ctx.by, &room_stream)?;
+        can_read(ctx.by(), &room_stream)?;
 
         let entries: Vec<Envelope> = self
             .reader
@@ -896,7 +896,7 @@ impl MailBridge {
             });
         }
 
-        let (file_name, bytes) = render_letter(&req, &ctx.by, &entries);
+        let (file_name, bytes) = render_letter(&req, ctx.by(), &entries);
         let sha256 = sha256_bytes(&bytes);
 
         let mut seen_seats = BTreeSet::new();
@@ -947,7 +947,7 @@ impl MailBridge {
         let mut st = self.state.lock().await;
         let appended = st
             .writer
-            .append(&ctx.by, ctx.at, Some(&idem), events)
+            .append(ctx.by(), ctx.at(), Some(&idem), events)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         for letter in &banked_letters {
             st.seen_wakes.insert(letter.wake_id.clone());
@@ -964,7 +964,7 @@ impl MailBridge {
     async fn ack(&self, req: MailAck, ctx: DecideCtx) -> Result<Ack, ApiError> {
         let (abs_path, rel_path, exists) = self.root.confine(&req.path).map_err(|e| match e {
             SandboxError::Production(_) => ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("ack path outside sandbox ({})", req.path.display()),
             },
             other => ApiError::Invalid(InvalidId {
@@ -980,13 +980,13 @@ impl MailBridge {
             .split_once('/')
             .and_then(|(first, _)| first.strip_prefix("to-"));
 
-        let acker_seat = match (&ctx.by, box_seat) {
+        let acker_seat = match (ctx.by(), box_seat) {
             (Principal::Seat { seat }, Some(target)) if seat.as_str() == target => {
                 seat.as_str().to_owned()
             }
             (Principal::Seat { .. } | Principal::Worker { .. }, Some(target)) => {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("ack letter in to-{target}"),
                 });
             }
@@ -997,7 +997,7 @@ impl MailBridge {
             }
             (Principal::Operator { .. }, Some(target)) => {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("ack letter in to-{target}"),
                 });
             }
@@ -1005,7 +1005,7 @@ impl MailBridge {
             (Principal::Operator { seat } | Principal::Seat { seat }, None) => {
                 seat.as_str().to_owned()
             }
-            _ => principal_mail_address(&ctx.by),
+            _ => principal_mail_address(ctx.by()),
         };
 
         let bytes = read_letter(&abs_path)?;
@@ -1017,11 +1017,11 @@ impl MailBridge {
             )));
         }
 
-        let ts = ctx.at.to_rfc3339_sec();
+        let ts = ctx.at().to_rfc3339_sec();
         let ack_json = serde_json::json!({
             "schema": 1,
             "seat": acker_seat,
-            "by": ctx.by.to_string(),
+            "by": ctx.by().to_string(),
             "path": rel_path,
             "sha256_full": req.sha256.as_str(),
             "sha256": &req.sha256.as_str()[..16],
@@ -1059,8 +1059,8 @@ impl MailBridge {
         let appended = st
             .writer
             .append(
-                &ctx.by,
-                ctx.at,
+                ctx.by(),
+                ctx.at(),
                 Some(&idem),
                 vec![Event::Mail(MailEvent::Acked {
                     path: PathBuf::from(&rel_path),
@@ -1122,8 +1122,8 @@ impl MailBridge {
         let appended = st
             .writer
             .append(
-                &ctx.by,
-                ctx.at,
+                ctx.by(),
+                ctx.at(),
                 Some(&idem),
                 vec![Event::Mail(MailEvent::BellRang {
                     bell_id: canonical,

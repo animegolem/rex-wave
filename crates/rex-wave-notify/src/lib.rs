@@ -456,7 +456,7 @@ impl HeraldView {
             }
             (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
                 wave::WaveEvent::Started { .. } => {
-                    if matches!(entry.by, Principal::Operator { .. }) {
+                    if entry.by.is_operator() {
                         self.wave_owners.insert(wave.clone(), entry.by.clone());
                     }
                 }
@@ -1258,7 +1258,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     recipients.retain(|p| {
                         p != &entry.by
                             && !matches!(p, Principal::System { .. })
-                            && !(is_system_post && matches!(p, Principal::Operator { .. }))
+                            && !(is_system_post && p.is_operator())
                     });
                     for recipient in recipients {
                         out.push((
@@ -1640,7 +1640,7 @@ impl Decider for Inbox {
     fn address(cmd: &InboxCommand, ctx: &DecideCtx) -> Result<StreamId, ApiError> {
         let owner = match cmd {
             InboxCommand::InboxRaise(c) => c.to.clone(),
-            _ => ctx.by.clone(),
+            _ => ctx.by().clone(),
         };
         Ok(StreamId::Inbox { owner })
     }

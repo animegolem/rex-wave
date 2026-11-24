@@ -1413,7 +1413,7 @@ fn parse_sse_interest_and_cursor(
                 ));
             }
         }
-    } else if matches!(principal, Principal::Operator { .. }) {
+    } else if principal.is_operator() {
         Interest::Everything
     } else {
         Interest::MyInbox

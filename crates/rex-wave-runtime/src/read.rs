@@ -78,10 +78,7 @@ impl AgentFeed for NoAgentFeed {
 /// Stream-level read privacy: a principal's inbox is theirs alone, and a DM is
 /// only for its two members.
 pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
-    if matches!(
-        viewer,
-        Principal::Operator { .. } | Principal::System { .. }
-    ) {
+    if viewer.is_operator_or_system() {
         return Ok(());
     }
     let allowed = match stream {
@@ -609,10 +606,7 @@ impl Filter {
                 })
             }
             Interest::Everything => {
-                if !matches!(
-                    viewer,
-                    Principal::Operator { .. } | Principal::System { .. }
-                ) {
+                if !viewer.is_operator_or_system() {
                     return Err(ApiError::Denied {
                         principal: viewer.to_string(),
                         action: "watch everything".into(),
@@ -877,7 +871,7 @@ impl Service<ReadCommand> for ReadSide {
         Box::pin(async move {
             match cmd {
                 ReadCommand::Read(r) => {
-                    can_read(&ctx.by, &r.stream)?;
+                    can_read(ctx.by(), &r.stream)?;
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
                     let entries = self
                         .journal
@@ -897,8 +891,10 @@ impl Service<ReadCommand> for ReadSide {
                         truncated,
                     }))
                 }
-                ReadCommand::Wait(w) => Ok(WireReply::Wait(self.wait_for(ctx.by, w).await?)),
-                ReadCommand::Sidebar(_) => Ok(WireReply::Sidebar(self.snapshot_sidebar(&ctx.by))),
+                ReadCommand::Wait(w) => {
+                    Ok(WireReply::Wait(self.wait_for(ctx.by().clone(), w).await?))
+                }
+                ReadCommand::Sidebar(_) => Ok(WireReply::Sidebar(self.snapshot_sidebar(ctx.by()))),
                 ReadCommand::ThreadPage(t) => {
                     let limit = t.limit.unwrap_or(100).clamp(1, 500);
                     Ok(WireReply::ThreadPage(

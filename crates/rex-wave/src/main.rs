@@ -3547,7 +3547,7 @@ async fn execute_presence_seed_interchange(
 
     let cred = resolve_cli_credential(sock_path, explicit_token)?;
     let client = RemoteClient::connect(endpoint, cred, "presence-seed").await?;
-    if !matches!(client.me(), Principal::Operator { .. }) {
+    if !client.me().is_operator() {
         return Err(CliError::Api(ApiError::Denied {
             principal: client.me().to_string(),
             action: "presence seed-interchange".to_owned(),
@@ -3753,7 +3753,7 @@ async fn execute_presence_import_manifest(
 
     let cred = resolve_cli_credential(sock_path, explicit_token)?;
     let client = RemoteClient::connect(endpoint, cred, "presence-import-manifest").await?;
-    if !matches!(client.me(), Principal::Operator { .. }) {
+    if !client.me().is_operator() {
         return Err(CliError::Api(ApiError::Denied {
             principal: client.me().to_string(),
             action: "presence import-manifest".to_owned(),

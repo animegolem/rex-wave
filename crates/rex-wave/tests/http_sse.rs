@@ -508,14 +508,14 @@ impl Service<RoomCommand> for StubPhase3Rooms {
                 needs: vec![],
                 labels: vec![Label::parse("area=http").unwrap()],
                 lease: Some(TaskLease {
-                    holder: ctx.by.clone(),
+                    holder: ctx.by().clone(),
                     epoch: LeaseEpoch(1),
                     claimed_at: UnixMs(100),
                     expires_at: UnixMs(60_100),
                 }),
                 ready: false,
                 lease_expired: false,
-                created_by: ctx.by.clone(),
+                created_by: ctx.by().clone(),
                 created_at: UnixMs(50),
                 updated_at: UnixMs(100),
             };
@@ -532,7 +532,7 @@ impl Service<RoomCommand> for StubPhase3Rooms {
                                 newer_message: Box::new(RoomMessageSummary {
                                     seq: Seq(5),
                                     at: UnixMs(999),
-                                    by: ctx.by.clone(),
+                                    by: ctx.by().clone(),
                                     body: Body::parse("concurrent post").unwrap(),
                                     re: p.re,
                                     labels: vec![],
@@ -612,7 +612,7 @@ impl Service<PresenceCommand> for StubPresence {
                 start_cmd: None,
                 resume_cmd: None,
                 rex_target: None,
-                claimed_by: ctx.by,
+                claimed_by: ctx.by().clone(),
                 claimed_at: UnixMs(10),
             };
             let binding = SeatBinding {

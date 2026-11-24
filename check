@@ -262,6 +262,65 @@ TODO_MSG = (
 
 digest_cache = {}
 
+# Structural lints over crates/*/src/**/*.rs. Each names the replacement.
+OPERATOR_MATCH_MSG = (
+    "use Principal::is_operator() / is_operator_or_system() or an Audience::Operator command"
+)
+CALENDAR_MSG = "use rex_wave_api::UnixMs civil-calendar / RFC 3339 methods"
+HTTP_GUARD_MSG = (
+    "use the shared loopback HTTP guard module (rex_wave_api::http_guard)"
+)
+SELECT_READ_MSG = (
+    "cancel-unsafe frame read in select!: read frames in a spawned reader task "
+    "and select on its channel Receiver"
+)
+HTTP_GUARD_OWNER = "crates/rex-wave-api/src/http_guard.rs"
+src_rs_re = re.compile(r"^crates/[^/]+/src/.+\.rs$")
+operator_pat_re = re.compile(r"Principal::Operator\s*\{\s*\.\.\s*\}")
+matches_open_re = re.compile(r"\bmatches!\s*\(")
+calendar_re = re.compile(r"\b(719_468|146_097)\b")
+http_guard_fn_re = re.compile(r"\bfn\s+(is_loopback_host|strip_bearer)\b")
+select_open_re = re.compile(r"\bselect!\s*\{")
+select_read_re = re.compile(r"\b(read_frame|read_message|read_exact)\s*\(")
+MAX_MACRO_SCAN = 1 << 20
+
+def balanced_end(text, start, open_ch, close_ch):
+    depth = 1
+    i = start
+    limit = min(len(text), start + MAX_MACRO_SCAN)
+    while i < limit:
+        c = text[i]
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return limit
+
+def line_of(text, offset):
+    return text.count("\n", 0, offset) + 1
+
+def structural_hits(rel, text):
+    hits = []
+    in_api = rel.startswith("crates/rex-wave-api/")
+    if not in_api:
+        for m in matches_open_re.finditer(text):
+            end = balanced_end(text, m.end(), "(", ")")
+            if operator_pat_re.search(text, m.end(), end):
+                hits.append((rel, line_of(text, m.start()), "matches!(.., Principal::Operator { .. })", OPERATOR_MATCH_MSG))
+        for m in calendar_re.finditer(text):
+            hits.append((rel, line_of(text, m.start()), m.group(1), CALENDAR_MSG))
+    if rel != HTTP_GUARD_OWNER:
+        for m in http_guard_fn_re.finditer(text):
+            hits.append((rel, line_of(text, m.start()), "fn " + m.group(1), HTTP_GUARD_MSG))
+    for m in select_open_re.finditer(text):
+        end = balanced_end(text, m.end(), "{", "}")
+        for r in select_read_re.finditer(text, m.end(), end):
+            hits.append((rel, line_of(text, r.start()), r.group(1) + "(", SELECT_READ_MSG))
+    return hits
+
 def has_digest(ns, token, table):
     key = (ns, token)
     h = digest_cache.get(key)
@@ -482,6 +541,7 @@ def iter_entries():
 path_hits = []
 seat_hits = []
 todo_hits = []
+struct_hits = []
 licenses_nonempty = {"LICENSE-MIT": False, "LICENSE-APACHE": False}
 
 for rel, data in iter_entries():
@@ -498,6 +558,8 @@ for rel, data in iter_entries():
     check_seats = rel not in LOCKFILES_SKIP_SEAT_WORDS
     check_todos = rel != "check"
     text = data.decode("utf-8", errors="replace")
+    if src_rs_re.match(rel):
+        struct_hits.extend(structural_hits(rel, text))
     for lineno, line in enumerate(text.splitlines(), 1):
         m_path = find_private_path_match(line)
         if m_path is not None:
@@ -515,7 +577,7 @@ if missing_lic:
         sys.stderr.write("error: {} is missing or empty\n".format(lic))
     sys.exit(1)
 
-total = len(path_hits) + len(seat_hits) + len(todo_hits)
+total = len(path_hits) + len(seat_hits) + len(todo_hits) + len(struct_hits)
 if total == 0:
     sys.exit(0)
 
@@ -535,9 +597,15 @@ def report(label, hits, msg):
 report("private path/ID literals", path_hits, PATH_MSG)
 report("private seat literals", seat_hits, SEAT_MSG)
 report("stale PR TODOs", todo_hits, TODO_MSG)
+if struct_hits:
+    sys.stderr.write("\n[hygiene] structural lints ({} violation(s)):\n".format(len(struct_hits)))
+    for rel, lineno, detail, msg in struct_hits[:MAX_PER_CAT]:
+        sys.stderr.write("  {}:{} ({}): {}\n".format(rel, lineno, detail, msg))
+    if len(struct_hits) > MAX_PER_CAT:
+        sys.stderr.write("  ... and {} more structural violation(s)\n".format(len(struct_hits) - MAX_PER_CAT))
 sys.stderr.write(
-    "\nhygiene failed: {} violation(s) total ({} path/ID, {} seat, {} TODO).\n".format(
-        total, len(path_hits), len(seat_hits), len(todo_hits)
+    "\nhygiene failed: {} violation(s) total ({} path/ID, {} seat, {} TODO, {} structural).\n".format(
+        total, len(path_hits), len(seat_hits), len(todo_hits), len(struct_hits)
     )
 )
 sys.exit(1)

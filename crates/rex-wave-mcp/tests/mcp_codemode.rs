@@ -54,7 +54,7 @@ impl Decider for TestRooms {
             RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
-            room: room_ref.resolve(&ctx.by)?,
+            room: room_ref.resolve(ctx.by())?,
         })
     }
 
@@ -79,22 +79,22 @@ impl Decider for TestRooms {
                 if state.id.is_some() {
                     return Ok(Vec::new());
                 }
-                let id = room.resolve(&ctx.by)?;
+                let id = room.resolve(ctx.by())?;
                 let mut events = vec![RoomEvent::Opened {
                     id,
                     origin: origin.clone().unwrap_or(RoomOrigin::Manual),
                     topic: topic.clone(),
                 }];
-                if let Some(h) = default_handle(&ctx.by) {
+                if let Some(h) = default_handle(ctx.by()) {
                     events.push(RoomEvent::MemberJoined {
-                        member: ctx.by.clone(),
+                        member: ctx.by().clone(),
                         handle: h,
                     });
                 }
                 Ok(events)
             }
             RoomCommand::RoomJoin(j) => {
-                let who = j.member.clone().unwrap_or_else(|| ctx.by.clone());
+                let who = j.member.clone().unwrap_or_else(|| ctx.by().clone());
                 if state.members.iter().any(|(_, p)| p == &who) {
                     return Ok(Vec::new());
                 }
@@ -109,7 +109,7 @@ impl Decider for TestRooms {
                 }])
             }
             RoomCommand::RoomLeave(_) => Ok(vec![RoomEvent::MemberLeft {
-                member: ctx.by.clone(),
+                member: ctx.by().clone(),
             }]),
             RoomCommand::RoomPost(RoomPost {
                 room,
@@ -122,7 +122,7 @@ impl Decider for TestRooms {
             }) => {
                 let mut events = Vec::new();
                 if state.id.is_none() {
-                    let id = room.resolve(&ctx.by)?;
+                    let id = room.resolve(ctx.by())?;
                     events.push(RoomEvent::Opened {
                         id,
                         origin: RoomOrigin::Manual,

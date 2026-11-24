@@ -357,8 +357,8 @@ impl World {
         for p in &r.posts {
             if p.seq > upto && &p.by != viewer {
                 unread += 1;
-                let system_to_operator = matches!(p.by, Principal::System { .. })
-                    && matches!(viewer, Principal::Operator { .. });
+                let system_to_operator =
+                    matches!(p.by, Principal::System { .. }) && viewer.is_operator();
                 if !system_to_operator
                     && (p.mentions.principals.contains(viewer) || (p.mentions.all && in_room))
                 {

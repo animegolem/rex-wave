@@ -62,7 +62,7 @@ impl Decider for ToyRooms {
             RoomCommand::RoomTasks(c) => &c.room,
         };
         Ok(StreamId::Room {
-            room: r.resolve(&ctx.by)?,
+            room: r.resolve(ctx.by())?,
         })
     }
 
@@ -816,7 +816,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
                     lane: bind.lane,
                     endpoint: bind.endpoint,
                     liveness: bind.liveness,
-                    bound_at: ctx.at,
+                    bound_at: ctx.at(),
                     expires_at: None,
                     status: BindingStatus::Live,
                 }))

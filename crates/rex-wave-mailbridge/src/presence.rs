@@ -1624,7 +1624,7 @@ impl Presence {
             PresenceCommand::PresenceTransportHealth(c) => Self::decide_transport_health(state, c),
             PresenceCommand::PresenceList(_) => Ok(vec![]),
             PresenceCommand::PresenceResolve(q) => {
-                state.resolve_at(q, ctx.at)?;
+                state.resolve_at(q, ctx.at())?;
                 Ok(vec![])
             }
         }
@@ -1650,7 +1650,7 @@ impl Presence {
         let house = &state.house;
         if house.is_operator_seat(c.seat.as_str()) && status == SeatStatus::Active {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "claim operator surface seat '{}' as active (the operator surface cannot become an active seat)",
                     c.seat
@@ -1662,7 +1662,7 @@ impl Presence {
             .any(|alias| house.is_operator_seat(alias.as_str()))
         {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "claim reserved operator surface '{}' as an alias of '{}'",
                     house.operator_seat, c.seat
@@ -1672,11 +1672,9 @@ impl Presence {
 
         // `start_cmd` and `resume_cmd` are operator-only command fields: no
         // seat, worker, or system principal may set or mutate them.
-        if !matches!(ctx.by, Principal::Operator { .. })
-            && (c.start_cmd.is_some() || c.resume_cmd.is_some())
-        {
+        if !ctx.by().is_operator() && (c.start_cmd.is_some() || c.resume_cmd.is_some()) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "set start_cmd/resume_cmd on seat '{}' (operator-only)",
                     c.seat
@@ -1690,19 +1688,19 @@ impl Presence {
                     what: format!("seat '{old_seat}' to replace"),
                 });
             };
-            if !can_manage_seat(&ctx.by, old_seat, Some(old_rec)) {
+            if !can_manage_seat(ctx.by(), old_seat, Some(old_rec)) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("replace seat '{old_seat}'"),
                 });
             }
         }
 
         if let Some(rec) = existing {
-            if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+            if !can_manage_seat(ctx.by(), &c.seat, Some(rec)) {
                 if replacing_self {
                     return Err(ApiError::Denied {
-                        principal: ctx.by.to_string(),
+                        principal: ctx.by().to_string(),
                         action: format!("replace seat '{}'", c.seat),
                     });
                 }
@@ -1712,11 +1710,11 @@ impl Presence {
                 )));
             }
             if replacing_self
-                && !matches!(ctx.by, Principal::Operator { .. })
+                && !ctx.by().is_operator()
                 && (rec.start_cmd.is_some() || rec.resume_cmd.is_some())
             {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!(
                         "clear start_cmd/resume_cmd on seat '{}' via replace (operator-only)",
                         c.seat
@@ -1724,9 +1722,9 @@ impl Presence {
                 });
             }
         } else {
-            if !can_manage_seat(&ctx.by, &c.seat, None) {
+            if !can_manage_seat(ctx.by(), &c.seat, None) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("claim seat '{}'", c.seat),
                 });
             }
@@ -1753,7 +1751,7 @@ impl Presence {
             }
         }
 
-        let prov = make_provenance(&ctx.by, &c.seat, c.verified_how.clone(), ctx.at);
+        let prov = make_provenance(ctx.by(), &c.seat, c.verified_how.clone(), ctx.at());
         let mut events = Vec::new();
 
         if let Some(old_seat) = replacing_other
@@ -1852,7 +1850,7 @@ impl Presence {
         };
 
         let retired_at = if status == SeatStatus::Retired {
-            existing.and_then(|r| r.retired_at).or(Some(ctx.at))
+            existing.and_then(|r| r.retired_at).or(Some(ctx.at()))
         } else {
             None
         };
@@ -1893,15 +1891,12 @@ impl Presence {
             None => existing.and_then(|r| r.rex_target.clone()),
         };
 
-        let can_reassign_owner = matches!(
-            ctx.by,
-            Principal::Operator { .. } | Principal::System { .. }
-        );
+        let can_reassign_owner = ctx.by().is_operator_or_system();
         let (claimed_by, claimed_at) = match existing {
             Some(rec) if !(replacing_self && can_reassign_owner) => {
                 (rec.claimed_by.clone(), rec.claimed_at)
             }
-            _ => (ctx.by.clone(), ctx.at),
+            _ => (ctx.by().clone(), ctx.at()),
         };
 
         let record = SeatRecord {
@@ -1934,7 +1929,7 @@ impl Presence {
     ) -> Result<Vec<PresenceEvent>, ApiError> {
         if state.house.is_operator_seat(c.seat.as_str()) && c.status == SeatStatus::Active {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "set operator surface seat '{}' to active (the operator surface cannot become an active seat)",
                     c.seat
@@ -1946,13 +1941,13 @@ impl Presence {
                 what: format!("seat '{}'", c.seat),
             });
         };
-        if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+        if !can_manage_seat(ctx.by(), &c.seat, Some(rec)) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("set status for seat '{}'", c.seat),
             });
         }
-        let provenance = make_provenance(&ctx.by, &c.seat, c.verified_how.clone(), ctx.at);
+        let provenance = make_provenance(ctx.by(), &c.seat, c.verified_how.clone(), ctx.at());
         let mut events = vec![PresenceEvent::SeatStatusSet {
             seat: c.seat.clone(),
             status: c.status,
@@ -1989,7 +1984,7 @@ impl Presence {
         // bound as an active seat by any hook or principal.
         if state.house.is_operator_seat(c.seat.as_str()) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!(
                     "bind operator surface seat '{}' (the operator surface cannot be bound as an active seat)",
                     c.seat
@@ -2004,9 +1999,9 @@ impl Presence {
 
         let existing_seat = state.seats.get(&c.seat);
         if let Some(rec) = existing_seat {
-            if !can_manage_seat(&ctx.by, &c.seat, Some(rec)) {
+            if !can_manage_seat(ctx.by(), &c.seat, Some(rec)) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("bind seat '{}'", c.seat),
                 });
             }
@@ -2017,9 +2012,9 @@ impl Presence {
                 )));
             }
         } else {
-            if !can_manage_seat(&ctx.by, &c.seat, None) {
+            if !can_manage_seat(ctx.by(), &c.seat, None) {
                 return Err(ApiError::Denied {
-                    principal: ctx.by.to_string(),
+                    principal: ctx.by().to_string(),
                     action: format!("bind seat '{}'", c.seat),
                 });
             }
@@ -2033,11 +2028,11 @@ impl Presence {
 
         let expires_at = match c.liveness {
             LivenessMode::SocketLifetime => {
-                c.ttl_ms.map(|ttl| UnixMs(ctx.at.0.saturating_add(ttl)))
+                c.ttl_ms.map(|ttl| UnixMs(ctx.at().0.saturating_add(ttl)))
             }
             LivenessMode::ProcessAndLease | LivenessMode::LeaseOnly => {
                 let ttl = c.ttl_ms.unwrap_or(DEFAULT_LEASE_TTL_MS);
-                Some(UnixMs(ctx.at.0.saturating_add(ttl)))
+                Some(UnixMs(ctx.at().0.saturating_add(ttl)))
             }
         };
 
@@ -2054,7 +2049,7 @@ impl Presence {
                 }
 
                 // Lease already elapsed -> dead, auto-superseded.
-                if b.expires_at.is_some_and(|exp| exp <= ctx.at) {
+                if b.expires_at.is_some_and(|exp| exp <= ctx.at()) {
                     superseded.push(b.incarnation_id.clone());
                     continue;
                 }
@@ -2124,7 +2119,7 @@ impl Presence {
         let effective_horizon = c
             .mail_horizon_at
             .or_else(|| existing_seat.and_then(|r| r.mail_horizon_at))
-            .or(Some(ctx.at));
+            .or(Some(ctx.at()));
 
         let mut events = Vec::new();
         if let Some(rec) = existing_seat {
@@ -2134,7 +2129,7 @@ impl Presence {
                 events.push(PresenceEvent::SeatClaimed { record: updated });
             }
         } else {
-            let prov = make_provenance(&ctx.by, &c.seat, None, ctx.at);
+            let prov = make_provenance(ctx.by(), &c.seat, None, ctx.at());
             events.push(PresenceEvent::SeatClaimed {
                 record: SeatRecord {
                     seat: c.seat.clone(),
@@ -2152,8 +2147,8 @@ impl Presence {
                     start_cmd: None,
                     resume_cmd: None,
                     rex_target: None,
-                    claimed_by: ctx.by.clone(),
-                    claimed_at: ctx.at,
+                    claimed_by: ctx.by().clone(),
+                    claimed_at: ctx.at(),
                 },
             });
         }
@@ -2165,7 +2160,7 @@ impl Presence {
             lane,
             endpoint: c.endpoint.clone(),
             liveness: c.liveness,
-            bound_at: ctx.at,
+            bound_at: ctx.at(),
             expires_at,
             status,
         };
@@ -2185,9 +2180,9 @@ impl Presence {
             return Err(invalid("ttl_ms", "ttl_ms must be positive"));
         }
         let existing_seat = state.seats.get(&c.seat);
-        if !can_manage_seat(&ctx.by, &c.seat, existing_seat) {
+        if !can_manage_seat(ctx.by(), &c.seat, existing_seat) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("heartbeat seat '{}'", c.seat),
             });
         }
@@ -2209,7 +2204,7 @@ impl Presence {
                 c.seat, c.incarnation_id, binding.status
             )));
         }
-        if binding.expires_at.is_some_and(|exp| exp <= ctx.at) {
+        if binding.expires_at.is_some_and(|exp| exp <= ctx.at()) {
             return Err(ApiError::conflict(format!(
                 "binding '{}/{}' lease already expired; rebind",
                 c.seat, c.incarnation_id
@@ -2218,11 +2213,11 @@ impl Presence {
         let expires_at = match binding.liveness {
             LivenessMode::SocketLifetime => c
                 .ttl_ms
-                .map(|ttl| UnixMs(ctx.at.0.saturating_add(ttl)))
+                .map(|ttl| UnixMs(ctx.at().0.saturating_add(ttl)))
                 .or(binding.expires_at),
             LivenessMode::ProcessAndLease | LivenessMode::LeaseOnly => {
                 let ttl = c.ttl_ms.unwrap_or(DEFAULT_LEASE_TTL_MS);
-                Some(UnixMs(ctx.at.0.saturating_add(ttl)))
+                Some(UnixMs(ctx.at().0.saturating_add(ttl)))
             }
         };
         Ok(vec![PresenceEvent::Heartbeated {
@@ -2238,9 +2233,9 @@ impl Presence {
         ctx: &DecideCtx,
     ) -> Result<Vec<PresenceEvent>, ApiError> {
         let existing_seat = state.seats.get(&c.seat);
-        if !can_manage_seat(&ctx.by, &c.seat, existing_seat) {
+        if !can_manage_seat(ctx.by(), &c.seat, existing_seat) {
             return Err(ApiError::Denied {
-                principal: ctx.by.to_string(),
+                principal: ctx.by().to_string(),
                 action: format!("unbind seat '{}'", c.seat),
             });
         }

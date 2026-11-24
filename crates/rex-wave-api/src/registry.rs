@@ -19,7 +19,7 @@ use crate::presence::*;
 use crate::read::*;
 use crate::room::*;
 use crate::wave::*;
-use crate::{Ack, ApiError};
+use crate::{Ack, ApiError, Principal};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -27,14 +27,39 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Audience {
-    /// Any authenticated non-system principal (operator, seat, worker).
-    /// Finer, per-resource policy (room membership, wave roster) lives in the
-    /// owning decider.
+    /// Any authenticated principal: operator, seat, worker, and the daemon's
+    /// own parts (reactors post to rooms, unbind presence and raise
+    /// notifications as `System`). Finer, per-resource policy (room
+    /// membership, wave roster) lives in the owning decider.
     Member,
     /// Only the human operator (approvals, wave launch).
     Operator,
     /// Only daemon-internal parts (`Principal::System`).
     System,
+}
+
+impl Audience {
+    /// Whether `by` may issue a command of this audience.
+    pub fn allows(self, by: &Principal) -> bool {
+        match self {
+            Audience::Member => true,
+            Audience::Operator => by.is_operator(),
+            Audience::System => matches!(by, Principal::System { .. }),
+        }
+    }
+}
+
+/// The audience check the router runs once per command. Finer policy
+/// belongs to deciders.
+pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
+    if audience.allows(by) {
+        Ok(())
+    } else {
+        Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("{audience:?} command"),
+        })
+    }
 }
 
 /// Catalog entry for MCP `tools/list`, BB `registerTool`, and `rex.*` in Code Mode.

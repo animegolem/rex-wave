@@ -52,22 +52,7 @@ pub struct Router {
     pub read: Arc<ReadSide>,
 }
 
-/// Pure audience check. Finer policy belongs to deciders.
-pub fn authorize(audience: Audience, by: &Principal) -> Result<(), ApiError> {
-    let ok = match (audience, by) {
-        (Audience::System, by) => matches!(by, Principal::System { .. }),
-        (Audience::Operator, by) => matches!(by, Principal::Operator { .. }),
-        (Audience::Member, _) => true,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::Denied {
-            principal: by.to_string(),
-            action: format!("{audience:?} command"),
-        })
-    }
-}
+pub use rex_wave_api::authorize;
 
 type ActiveWaitKey = (usize, WaveSlug, RoleName);
 
@@ -133,12 +118,12 @@ fn parked_room_and_since(
 }
 
 fn system_ctx() -> DecideCtx {
-    DecideCtx {
-        by: Principal::System {
+    DecideCtx::new(
+        Principal::System {
             part: SystemPart::WaveConductor,
         },
-        at: now(),
-    }
+        now(),
+    )
 }
 
 async fn restore_worker_working(
@@ -240,10 +225,7 @@ impl Drop for WorkerWaitGuard {
 impl Router {
     pub async fn dispatch(&self, by: &Principal, cmd: WireCommand) -> Result<WireReply, ApiError> {
         authorize(cmd.meta().audience, by)?;
-        let ctx = DecideCtx {
-            by: by.clone(),
-            at: now(),
-        };
+        let ctx = DecideCtx::new(by.clone(), now());
         match cmd.route() {
             Routed::Room(c) => self.room.dispatch(c, ctx).await,
             Routed::Wave(c) => self.wave.dispatch(c, ctx).await,
@@ -311,7 +293,7 @@ impl<C: Send + 'static> Service<C> for Unavailable {
 
 /// Forwards a family to another process (e.g. a split-out Kanban app) through
 /// the same `Client` trait. The remote authorizes the forwarding daemon's own
-/// session principal; carrying `ctx.by` across is an open question (see
+/// session principal; carrying `ctx.by()` across is an open question (see
 /// ARCHITECTURE.md).
 pub struct Remote<C: Client> {
     pub client: C,
