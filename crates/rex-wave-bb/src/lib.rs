@@ -23,7 +23,7 @@ use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1736,14 +1736,15 @@ impl Reactor for BridgeWaveWatcher {
 }
 
 struct WaitFlightGuard {
-    active: Arc<AtomicUsize>,
+    bridge: Arc<BbBridge>,
+    key: (WaveSlug, RoleName),
     aborted: Arc<AtomicBool>,
     completed: bool,
 }
 
 impl Drop for WaitFlightGuard {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::Relaxed);
+        self.bridge.decrement_fallback_wait(&self.key);
         if !self.completed {
             self.aborted.store(true, Ordering::Relaxed);
         }
@@ -1757,7 +1758,6 @@ pub struct WorkerToolClient {
     me: Principal,
     wave: WaveSlug,
     role: RoleName,
-    active_waits: Arc<AtomicUsize>,
     aborted_wait: Arc<AtomicBool>,
 }
 
@@ -1775,7 +1775,6 @@ impl Client for WorkerToolClient {
         let me = self.me.clone();
         let wave = self.wave.clone();
         let role = self.role.clone();
-        let active_waits = self.active_waits.clone();
         let aborted_wait = self.aborted_wait.clone();
         async move {
             let is_blocking_wait = matches!(&cmd, WireCommand::Wait(w) if w.timeout_ms != Some(0));
@@ -1787,33 +1786,33 @@ impl Client for WorkerToolClient {
                 _ => None,
             };
             let mut wait_guard = None;
-            if is_blocking_wait && (router_handles_park || manual_parked_scope.is_some()) {
-                active_waits.fetch_add(1, Ordering::Relaxed);
+            if let Some((room, since)) = manual_parked_scope {
+                let key = (wave.clone(), role.clone());
+                bridge.increment_fallback_wait(&key);
                 wait_guard = Some(WaitFlightGuard {
-                    active: active_waits.clone(),
+                    bridge: bridge.clone(),
+                    key,
                     aborted: aborted_wait,
                     completed: false,
                 });
-                if let Some((room, since)) = manual_parked_scope {
-                    bridge
-                        .call_wave_observe(
-                            wave.clone(),
-                            role.clone(),
-                            Observation::Activity {
-                                activity: Activity::Parked { room, since },
-                            },
-                        )
-                        .await;
-                }
+                bridge
+                    .call_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Activity {
+                            activity: Activity::Parked { room, since },
+                        },
+                    )
+                    .await;
             }
 
             let outcome = backend.call_as(me, cmd).await;
 
             if let Some(mut guard) = wait_guard {
+                let key = guard.key.clone();
                 guard.completed = true;
                 drop(guard);
-                if !router_handles_park
-                    && active_waits.load(Ordering::Relaxed) == 0
+                if !bridge.has_fallback_wait(&key)
                     && let Ok(rec) = bridge.lookup_worker(&wave, &role).await
                     && matches!(rec.activity, Activity::Parked { .. })
                 {
@@ -1851,6 +1850,7 @@ pub struct BbBridge {
     owner: mpsc::UnboundedSender<OwnerMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     code_runner: Option<CodeRunner>,
+    fallback_active_waits: std::sync::Mutex<HashMap<(WaveSlug, RoleName), usize>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -1881,11 +1881,40 @@ impl BbBridge {
             owner: BridgeOwner::spawn(),
             backend: OnceLock::new(),
             code_runner,
+            fallback_active_waits: std::sync::Mutex::new(HashMap::new()),
             project_names_tx,
             project_names_rx,
         });
         bridge.refresh_local_project_names();
         bridge
+    }
+
+    fn increment_fallback_wait(&self, key: &(WaveSlug, RoleName)) {
+        let mut map = self
+            .fallback_active_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *map.entry(key.clone()).or_insert(0) += 1;
+    }
+
+    fn decrement_fallback_wait(&self, key: &(WaveSlug, RoleName)) {
+        let mut map = self
+            .fallback_active_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(key);
+            }
+        }
+    }
+
+    fn has_fallback_wait(&self, key: &(WaveSlug, RoleName)) -> bool {
+        self.fallback_active_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 
     fn refresh_local_project_names(&self) {
@@ -2467,7 +2496,7 @@ impl BbBridge {
             return;
         };
 
-        let active_waits = Arc::new(AtomicUsize::new(0));
+        let router_handles_park = backend.handles_worker_wait_parking();
         let aborted_wait = Arc::new(AtomicBool::new(false));
         let worker_client = WorkerToolClient {
             bridge: self.clone(),
@@ -2478,7 +2507,6 @@ impl BbBridge {
             },
             wave: wave.clone(),
             role: role.clone(),
-            active_waits: active_waits.clone(),
             aborted_wait: aborted_wait.clone(),
         };
 
@@ -2488,8 +2516,10 @@ impl BbBridge {
                 return;
             };
             let res = (runner)(worker_client, args).await;
-            if aborted_wait.load(Ordering::Relaxed)
-                && active_waits.load(Ordering::Relaxed) == 0
+            let key = (wave.clone(), role.clone());
+            if !router_handles_park
+                && aborted_wait.load(Ordering::Relaxed)
+                && !self.has_fallback_wait(&key)
                 && let Ok(rec) = self.lookup_worker(&wave, &role).await
                 && matches!(rec.activity, Activity::Parked { .. })
             {
@@ -5793,5 +5823,257 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = bridge_runner.await;
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_code_wait_does_not_mark_still_waiting_worker_working() {
+        #[derive(Clone)]
+        struct RouterModeHarness(LoopbackHarness);
+        impl BridgeBackend for RouterModeHarness {
+            type C = HarnessClient;
+            fn client(&self, me: Principal) -> HarnessClient {
+                self.0.client(me)
+            }
+            fn handles_worker_wait_parking(&self) -> bool {
+                true
+            }
+        }
+
+        for router_owns_parking in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let ws_srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ws = ws::WsConn::accept(tcp, "tok").await.unwrap();
+                let (mut rd, mut wr) = ws.into_split();
+                wr.send_text(
+                    &serde_json::to_string(&protocol::Up::Hello {
+                        plugin_version: "0.1.0".into(),
+                        sdk_version: "0.6.132".into(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                while let Ok(Some(_)) = rd.recv().await {}
+            });
+
+            let room_slot: Arc<std::sync::OnceLock<RoomId>> = Arc::new(std::sync::OnceLock::new());
+            let runner_room = room_slot.clone();
+            let runner: CodeRunner = Arc::new(move |client, args| {
+                let room = runner_room.get().unwrap().clone();
+                Box::pin(async move {
+                    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("hold");
+                    let room_stream = StreamId::Room { room: room.clone() };
+                    let w = rex_wave_api::read::Wait {
+                        timeout_ms: Some(5_000),
+                        ..rex_wave_api::read::Wait::new(
+                            Interest::Room {
+                                room: RoomRef::Id { id: room },
+                            },
+                            Cursor::default().with(room_stream, Seq(1)),
+                        )
+                    };
+                    if mode == "abort" {
+                        let fut = client.call(w);
+                        let _ = tokio::time::timeout(Duration::from_millis(30), fut).await;
+                        Err("script cancelled wait".into())
+                    } else {
+                        let _ = client.call(w).await;
+                        Ok("done".into())
+                    }
+                })
+            });
+
+            let bridge = BbBridge::with_options(
+                BridgeConfig {
+                    url: format!("ws://{addr}/bridge"),
+                    token: "tok".into(),
+                },
+                None,
+                Some(runner),
+            );
+            let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let bridge_runner = if router_owns_parking {
+                let b = bridge.clone();
+                let h = RouterModeHarness(harness.clone());
+                tokio::spawn(async move { b.run_until(h, shutdown_rx).await })
+            } else {
+                let b = bridge.clone();
+                let h = harness.clone();
+                tokio::spawn(async move { b.run_until(h, shutdown_rx).await })
+            };
+
+            let op = harness.client(Principal::Operator {
+                seat: SeatName::parse("owner").unwrap(),
+            });
+            let sys = harness.client(Principal::System {
+                part: SystemPart::BbBridge,
+            });
+            let wave = WaveSlug::parse("w-cancel").unwrap();
+            let role = RoleName::parse("coder").unwrap();
+            let started = op
+                .call(rex_wave_api::wave::WaveStart {
+                    spec: rex_wave_api::wave::WaveSpec {
+                        slug: wave.clone(),
+                        project: BbProjectId::parse("proj_cancel").unwrap(),
+                        goal: Body::parse("cancel guard").unwrap(),
+                        output_dir: None,
+                        defaults: rex_wave_api::wave::AgentSpec {
+                            provider: ProviderId::parse("claude").unwrap(),
+                            model: None,
+                            account: None,
+                            reasoning: None,
+                            service_tier: None,
+                            permission: PermissionMode::Full,
+                            workspace: Workspace::ProjectDefault,
+                        },
+                        workers: vec![rex_wave_api::wave::WorkerSpec {
+                            role: role.clone(),
+                            brief: Body::parse("test").unwrap(),
+                            agent: None,
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
+                        }],
+                    },
+                    idem: None,
+                })
+                .await
+                .unwrap();
+            let _ = room_slot.set(started.room.clone());
+
+            let thread = BbThreadId::parse("th_cancel_1").unwrap();
+            sys.call(WaveObserve {
+                wave: wave.clone(),
+                role: role.clone(),
+                observation: Observation::Spawned {
+                    attempt: 1,
+                    thread: thread.clone(),
+                },
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role: role.clone(),
+                    observation: Observation::Spawned {
+                        attempt: 1,
+                        thread: thread.clone(),
+                    },
+                },
+            );
+
+            if router_owns_parking {
+                let park_ev = Observation::Activity {
+                    activity: Activity::Parked {
+                        room: Some(started.room.clone()),
+                        since: Seq::ORIGIN,
+                    },
+                };
+                sys.call(WaveObserve {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    observation: park_ev.clone(),
+                })
+                .await
+                .unwrap();
+                bridge.observe_wave_event(
+                    wave.clone(),
+                    WaveEvent::WorkerObserved {
+                        role: role.clone(),
+                        observation: park_ev,
+                    },
+                );
+            }
+
+            let b1 = bridge.clone();
+            let hold_handle = tokio::spawn(async move {
+                b1.on_tool_call(
+                    "call_hold".into(),
+                    "th_cancel_1".into(),
+                    None,
+                    "run_code".into(),
+                    serde_json::json!({ "mode": "hold" }),
+                )
+                .await;
+            });
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let s = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+                    if matches!(
+                        &s.workers[0].2,
+                        WorkerPhase::Live {
+                            activity: Activity::Parked { .. },
+                            ..
+                        }
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("hold call parked worker");
+
+            bridge
+                .on_tool_call(
+                    "call_abort".into(),
+                    "th_cancel_1".into(),
+                    None,
+                    "run_code".into(),
+                    serde_json::json!({ "mode": "abort" }),
+                )
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mid_snap = op.call(WaveView { wave: wave.clone() }).await.unwrap();
+            assert!(
+                matches!(
+                    &mid_snap.workers[0].2,
+                    WorkerPhase::Live {
+                        activity: Activity::Parked { .. },
+                        ..
+                    }
+                ),
+                "cancelling one run_code wait (router_owns_parking={router_owns_parking}) must not overwrite sibling parked wait: {:?}",
+                mid_snap.workers[0].2
+            );
+
+            op.call(RoomPost {
+                room: RoomRef::Id {
+                    id: started.room.clone(),
+                },
+                body: Body::parse("wake hold wait").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: None,
+            })
+            .await
+            .unwrap();
+            hold_handle.await.unwrap();
+            if !router_owns_parking {
+                let end_snap = op.call(WaveView { wave }).await.unwrap();
+                assert!(
+                    matches!(
+                        &end_snap.workers[0].2,
+                        WorkerPhase::Live {
+                            activity: Activity::Working,
+                            ..
+                        }
+                    ),
+                    "finishing final fallback wait restores Working: {:?}",
+                    end_snap.workers[0].2
+                );
+            }
+            let _ = shutdown_tx.send(true);
+            let _ = bridge_runner.await;
+            ws_srv.abort();
+        }
     }
 }

@@ -1438,7 +1438,9 @@ dependencies = [
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
+ "rusqlite",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

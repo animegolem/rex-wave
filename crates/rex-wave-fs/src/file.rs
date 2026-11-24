@@ -761,7 +761,6 @@ impl Drop for OwnedSubdir {
     fn drop(&mut self) {
         if let Some(ref sd) = self.dir {
             let _ = rustix::fs::unlinkat(sd, "s", rustix::fs::AtFlags::empty());
-            let _ = rustix::fs::unlinkat(sd, "d", rustix::fs::AtFlags::empty());
         }
         let _ = rustix::fs::unlinkat(&self.host_dir, &self.name, rustix::fs::AtFlags::REMOVEDIR);
     }
@@ -784,83 +783,69 @@ fn proc_fd_stage_sock_path(stage_dir: &File) -> Option<PathBuf> {
     Some(target)
 }
 
-/// Stages a new socket on the destination filesystem (`parent_dir`) while
-/// addressing it via a short path independent of `parent_dir`'s path length
-/// (`/proc/self/fd/<fd>/s` on Linux; a symlink trampoline inside verified
-/// `/tmp` on macOS and fallback targets).
+fn ensure_same_device_as_verified_tmp(
+    dir_meta: &fs::Metadata,
+    uid: u32,
+    display_path: &Path,
+) -> io::Result<(File, PathBuf)> {
+    let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "socket {}: cannot anchor verified /tmp root ({e})",
+                display_path.display()
+            ),
+        )
+    })?;
+    let tmp_meta = tmp_dir.metadata()?;
+    if dir_meta.dev() != tmp_meta.dev() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "refusing to bind Unix socket {}: cross-filesystem socket staging cannot be anchored without /proc/self/fd",
+                display_path.display()
+            ),
+        ));
+    }
+    Ok((tmp_dir, tmp_path))
+}
+
+/// Stages a new socket via a path anchored to a verified directory descriptor
+/// (`/proc/self/fd/<fd>/s` on Linux; a `0700` directory inside root-verified
+/// sticky `/tmp` on the same filesystem otherwise, declining cross-filesystem
+/// binds before creating any socket through an unanchored pathname).
 struct BindStage {
-    dest_stage: OwnedSubdir,
-    _tramp_stage: Option<OwnedSubdir>,
+    stage: OwnedSubdir,
     bind_addr: PathBuf,
 }
 
 impl BindStage {
     fn create(parent_dir: &File, uid: u32, display_path: &Path) -> io::Result<Self> {
-        let dest_stage = OwnedSubdir::create(parent_dir.try_clone()?, ".s", 16, uid)?;
-
         #[cfg(target_os = "linux")]
-        if let Some(fd_sock) = proc_fd_stage_sock_path(dest_stage.dir()) {
-            return Ok(Self {
-                dest_stage,
-                _tramp_stage: None,
-                bind_addr: fd_sock,
-            });
+        {
+            let dest_stage = OwnedSubdir::create(parent_dir.try_clone()?, ".s", 16, uid)?;
+            if let Some(fd_sock) = proc_fd_stage_sock_path(dest_stage.dir()) {
+                return Ok(Self {
+                    stage: dest_stage,
+                    bind_addr: fd_sock,
+                });
+            }
         }
 
-        let dest_dir_path = stage_dir_abs_path(dest_stage.dir(), &dest_stage.name, display_path)?;
-        let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "socket {}: cannot anchor trampoline root ({e})",
-                    display_path.display()
-                ),
-            )
-        })?;
-        let tramp_stage = OwnedSubdir::create(tmp_dir, ".t", 16, uid)?;
-        rustix::fs::symlinkat(&dest_dir_path, tramp_stage.dir(), "d").map_err(io::Error::from)?;
-        let bind_addr = tmp_path.join(&tramp_stage.name).join("d").join("s");
+        let parent_meta = parent_dir.metadata()?;
+        let (tmp_dir, tmp_path) =
+            ensure_same_device_as_verified_tmp(&parent_meta, uid, display_path)?;
+        let tmp_stage = OwnedSubdir::create(tmp_dir, ".b", 32, uid)?;
+        let bind_addr = tmp_path.join(&tmp_stage.name).join("s");
         std::os::unix::net::SocketAddr::from_pathname(&bind_addr)?;
         Ok(Self {
-            dest_stage,
-            _tramp_stage: Some(tramp_stage),
+            stage: tmp_stage,
             bind_addr,
         })
     }
 
     fn dir(&self) -> &File {
-        self.dest_stage.dir()
-    }
-}
-
-fn stage_dir_abs_path(
-    stage_dir: &File,
-    stage_name: &str,
-    display_path: &Path,
-) -> io::Result<PathBuf> {
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos"
-    ))]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        let _ = (stage_name, display_path);
-        let cpath = rustix::fs::getpath(stage_dir).map_err(io::Error::from)?;
-        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(cpath.as_bytes())))
-    }
-
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos"
-    )))]
-    {
-        let _ = stage_dir;
-        let parent = parent_of(display_path)?;
-        Ok(fs::canonicalize(parent)?.join(stage_name))
+        self.stage.dir()
     }
 }
 
@@ -1151,6 +1136,21 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
         .to_os_string();
     std::os::unix::net::SocketAddr::from_pathname(path)?;
     let parent = parent_of(path)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut anc = parent;
+        while entry_kind(anc)? == EntryKind::Missing {
+            match anc.parent() {
+                Some(p) if !p.as_os_str().is_empty() => anc = p,
+                _ => {
+                    anc = Path::new(".");
+                    break;
+                }
+            }
+        }
+        let anc_meta = fs::metadata(anc)?;
+        ensure_same_device_as_verified_tmp(&anc_meta, uid, path)?;
+    }
     if entry_kind(parent)? == EntryKind::Missing {
         fs::DirBuilder::new()
             .recursive(true)
@@ -1202,6 +1202,8 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
             ),
         ));
     }
+    #[cfg(not(target_os = "linux"))]
+    ensure_same_device_as_verified_tmp(&parent_meta, uid, path)?;
 
     let mut lock_name = file_name.clone();
     lock_name.push(".lock");
@@ -1641,11 +1643,19 @@ mod tests {
         );
 
         fs::remove_file(&orig_sock_path).unwrap();
+        fs::remove_dir(&outer_sub).unwrap();
+        fs::remove_dir(&outer).unwrap();
+        let victim_bind_dir = dir.path().join("victim_bind_dir");
+        ensure_private_dir(&victim_bind_dir).unwrap();
+        let victim_sub = victim_bind_dir.join("sub");
+        ensure_private_dir(&victim_sub).unwrap();
+        std::os::unix::fs::symlink(&victim_bind_dir, &outer).unwrap();
+
         let rebound = prepared_moved.bind(&orig_sock_path).unwrap();
         assert_eq!(
-            entry_kind(&orig_sock_path).unwrap(),
-            EntryKind::Missing,
-            "bind must publish into held directory rather than diverged pathname"
+            fs::read_dir(&victim_sub).unwrap().count(),
+            0,
+            "bind must never create or stage sockets along a diverged pathname"
         );
         assert_eq!(entry_kind(&moved_sock_path).unwrap(), EntryKind::Other);
         assert_eq!(

@@ -3815,7 +3815,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         presence: router.presence.clone(),
         read: router.read.clone(),
     });
-    let race_worker = LocalClient::new(race_router, worker_p);
+    let race_worker = LocalClient::new(race_router.clone(), worker_p.clone());
     let race_page = race_worker
         .call(rex_wave_api::read::Wait {
             timeout_ms: Some(150),
@@ -3831,5 +3831,218 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
     assert!(
         !race_page.timed_out && race_page.entries.len() == 1,
         "worker Wait must deliver post committed while WaveObserve(Parked) was in flight, got {race_page:?}"
+    );
+
+    // Worker waiting on its own wave or project must NOT wake on its own Parked/Working bookkeeping.
+    let self_wave_slug = WaveSlug::parse("w-park").unwrap();
+    let self_wave_wait_1 = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(60),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![StreamId::Wave {
+                        wave: self_wave_slug.clone(),
+                    }],
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        self_wave_wait_1.timed_out && self_wave_wait_1.entries.is_empty(),
+        "live worker wait on own wave must not wake on its own Parked event: {self_wave_wait_1:?}"
+    );
+
+    let self_wave_wait_2 = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(60),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Streams {
+                    streams: vec![StreamId::Wave {
+                        wave: self_wave_slug,
+                    }],
+                },
+                self_wave_wait_1.cursor,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        self_wave_wait_2.timed_out && self_wave_wait_2.entries.is_empty(),
+        "resuming worker wait from previous timeout cursor must not wake on Working/Parked bookkeeping: {self_wave_wait_2:?}"
+    );
+
+    let self_proj_wait = worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(60),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_park").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        self_proj_wait.timed_out && self_proj_wait.entries.is_empty(),
+        "live worker wait on own project must not wake on its own Parked event: {self_proj_wait:?}"
+    );
+
+    // Project wait with intervening project-room post during Parked delivers ONLY the room post.
+    let proj_room_id = RoomId::Channel {
+        scope: RoomScope::Project {
+            project: BbProjectId::parse("proj_park").unwrap(),
+        },
+        name: ChannelName::parse("alerts").unwrap(),
+    };
+    let proj_race_router = Arc::new(Router {
+        room: router.room.clone(),
+        wave: Arc::new(PostDuringParkWave {
+            inner: router.wave.clone(),
+            poster: alice.clone(),
+            room: proj_room_id,
+        }),
+        board: router.board.clone(),
+        inbox: router.inbox.clone(),
+        mail: router.mail.clone(),
+        presence: router.presence.clone(),
+        read: router.read.clone(),
+    });
+    let proj_race_worker = LocalClient::new(proj_race_router, worker_p);
+    let proj_race_page = proj_race_worker
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(150),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_park").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        !proj_race_page.timed_out
+            && !proj_race_page.entries.is_empty()
+            && proj_race_page
+                .entries
+                .iter()
+                .all(|e| matches!(e.stream, StreamId::Room { .. })),
+        "project worker wait must deliver intervening room post without Parked bookkeeping: {proj_race_page:?}"
+    );
+
+    // Project-scoped single-wave Read inspects that wave's header directly (unaffected by
+    // unrelated unrecognized stream rows) and propagates errors if that wave's header is corrupt.
+    let tmp = tempfile::Builder::new()
+        .prefix("rw_proj_wave_")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let db_path = tmp.path().join("journal.sqlite3");
+    let disk_journal = Journal::open(&db_path).unwrap();
+    let disk_hub = Hub::new(64);
+    let disk_sidebar = SidebarProjection::spawn(disk_journal.clone(), disk_hub.clone());
+    let disk_router = Arc::new(Router {
+        room: Registry::<Rooms>::new(disk_journal.clone(), disk_hub.clone()),
+        wave: Registry::<TestWaves>::new(disk_journal.clone(), disk_hub.clone()),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: Arc::new(Unavailable(Family::Mail)),
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: disk_journal.clone(),
+            hub: disk_hub,
+            sidebar: disk_sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let disk_op = LocalClient::new(
+        disk_router,
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let saved_proj = disk_op
+        .call(rex_wave_api::read::Wait {
+            timeout_ms: Some(0),
+            ..rex_wave_api::read::Wait::new(
+                Interest::Project {
+                    project: BbProjectId::parse("proj_disk").unwrap(),
+                },
+                Cursor::live(),
+            )
+        })
+        .await
+        .unwrap()
+        .cursor;
+    let w_disk = WaveSlug::parse("w-disk").unwrap();
+    disk_op
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_disk.clone(),
+                project: BbProjectId::parse("proj_disk").unwrap(),
+                goal: Body::parse("disk wave").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                workers: vec![WorkerSpec {
+                    role: RoleName::parse("coder").unwrap(),
+                    agent: None,
+                    brief: Body::parse("check").unwrap(),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+                output_dir: None,
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+    raw_conn
+        .execute(
+            "INSERT INTO entries(stream, seq, at, by, idem, batch, event) VALUES (?1, 1, 1, '\"operator\"', NULL, 1, '{}')",
+            ["{\"stream\":\"future_unknown\"}"],
+        )
+        .unwrap();
+    assert!(
+        disk_journal.streams().is_err(),
+        "unrecognized stream row makes full stream listing fail"
+    );
+
+    let mut wave_read = rex_wave_api::read::Read::stream(
+        StreamId::Wave {
+            wave: w_disk.clone(),
+        },
+        Seq::ORIGIN,
+        None,
+    );
+    wave_read.cursor = Some(saved_proj.clone());
+    let ok_page = disk_op.call(wave_read.clone()).await.unwrap();
+    assert_eq!(
+        ok_page.entries.len(),
+        2,
+        "single-wave project Read must still return all wave entries despite unrelated unknown stream"
+    );
+
+    raw_conn
+        .execute(
+            "UPDATE entries SET event = '{corrupt' WHERE seq = 1 AND stream LIKE '%w-disk%'",
+            [],
+        )
+        .unwrap();
+    let err_res = disk_op.call(wave_read).await;
+    assert!(
+        err_res.is_err(),
+        "corrupt wave header must return an error instead of advancing cursor over skipped history"
     );
 }
