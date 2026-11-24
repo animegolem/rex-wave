@@ -80,11 +80,13 @@ enum StateMsg {
     MirrorWatermark {
         wave: WaveSlug,
         role: RoleName,
+        thread: BbThreadId,
         reply: oneshot::Sender<Seq>,
     },
     AdvanceMirrorWatermark {
         wave: WaveSlug,
         role: RoleName,
+        thread: BbThreadId,
         seq: Seq,
     },
 }
@@ -127,6 +129,9 @@ impl StateOwner {
                             pending_interaction: None,
                             mirror_room_watermark: Seq::ORIGIN,
                         });
+                    if rec.thread.as_ref() != Some(&thread) {
+                        rec.mirror_room_watermark = Seq::ORIGIN;
+                    }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
                     rec.live = true;
@@ -156,15 +161,26 @@ impl StateOwner {
                     }
                     let _ = reply.send(out);
                 }
-                StateMsg::MirrorWatermark { wave, role, reply } => {
-                    let wm = self
-                        .workers_by_role
-                        .get(&(wave, role))
-                        .map_or(Seq::ORIGIN, |r| r.mirror_room_watermark);
+                StateMsg::MirrorWatermark {
+                    wave,
+                    role,
+                    thread,
+                    reply,
+                } => {
+                    let wm = match self.workers_by_role.get(&(wave, role)) {
+                        Some(r) if r.thread.as_ref() == Some(&thread) => r.mirror_room_watermark,
+                        _ => Seq::ORIGIN,
+                    };
                     let _ = reply.send(wm);
                 }
-                StateMsg::AdvanceMirrorWatermark { wave, role, seq } => {
+                StateMsg::AdvanceMirrorWatermark {
+                    wave,
+                    role,
+                    thread,
+                    seq,
+                } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
                         && rec.mirror_room_watermark < seq
                     {
                         rec.mirror_room_watermark = seq;
@@ -205,6 +221,7 @@ impl StateOwner {
                             rec.thread = None;
                             rec.live = false;
                             rec.pending_interaction = None;
+                            rec.mirror_room_watermark = Seq::ORIGIN;
                         }
                         return;
                     }
@@ -227,6 +244,9 @@ impl StateOwner {
                             pending_interaction: None,
                             mirror_room_watermark: Seq::ORIGIN,
                         });
+                    if rec.thread.as_ref() != Some(&thread) {
+                        rec.mirror_room_watermark = Seq::ORIGIN;
+                    }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
                     rec.live = true;
@@ -1072,6 +1092,7 @@ impl T3Bridge {
         let _ = self.state.send(StateMsg::MirrorWatermark {
             wave: wave.clone(),
             role: role.clone(),
+            thread: thread.clone(),
             reply: wm_tx,
         });
         let watermark = wm_rx.await.unwrap_or(Seq::ORIGIN);
@@ -1111,6 +1132,7 @@ impl T3Bridge {
                     let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                         wave: wave.clone(),
                         role: role.clone(),
+                        thread: thread.clone(),
                         seq: room_head,
                     });
                 }
@@ -1177,6 +1199,7 @@ impl T3Bridge {
             let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                 wave: wave.clone(),
                 role: role.clone(),
+                thread: thread.clone(),
                 seq: room_head,
             });
             return;
@@ -1224,6 +1247,7 @@ impl T3Bridge {
             let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                 wave: wave.clone(),
                 role: role.clone(),
+                thread: thread.clone(),
                 seq: posted.seq,
             });
         }

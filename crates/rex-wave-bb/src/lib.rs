@@ -1005,6 +1005,14 @@ fn is_failed_completion_status(status: Option<&str>) -> bool {
     )
 }
 
+fn is_nonmirrorable_completion_row(row: &serde_json::Value) -> bool {
+    let status = row
+        .get("data")
+        .and_then(|d| d.get("status"))
+        .and_then(|v| v.as_str());
+    is_failed_completion_status(status) || extract_refusal_from_row(row).is_some()
+}
+
 fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
     if rows.is_empty() {
         return None;
@@ -1013,11 +1021,7 @@ fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
     let end_idx = ordered
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
-    let status = ordered[end_idx]
-        .get("data")
-        .and_then(|d| d.get("status"))
-        .and_then(|v| v.as_str());
-    if is_failed_completion_status(status) {
+    if is_nonmirrorable_completion_row(ordered[end_idx]) {
         return None;
     }
     Some(
@@ -1028,6 +1032,44 @@ fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
     )
 }
 
+fn nonfailed_turn_completions_in_order(rows: &[serde_json::Value]) -> Vec<(u64, Option<u64>)> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let ordered = sort_and_dedup_thread_rows(rows);
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    for (idx, row) in ordered.iter().enumerate() {
+        if row.get("type").and_then(|v| v.as_str()) == Some("turn/completed") {
+            segments.push((seg_start, idx));
+            seg_start = idx + 1;
+        }
+    }
+    let trailing_start_at = ordered[seg_start..]
+        .iter()
+        .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
+        .find(|&at| at > 0);
+    let mut out = Vec::new();
+    for (seg_idx, &(_, end_idx)) in segments.iter().enumerate() {
+        let end_row = ordered[end_idx];
+        if is_nonmirrorable_completion_row(end_row) {
+            continue;
+        }
+        let end_seq = end_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        let next_start_at = segments
+            .get(seg_idx + 1)
+            .and_then(|&(ns, ne)| {
+                ordered[ns..=ne]
+                    .iter()
+                    .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
+                    .find(|&at| at > 0)
+            })
+            .or(trailing_start_at);
+        out.push((end_seq, next_start_at));
+    }
+    out
+}
+
 fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> Option<u64> {
     if rows.is_empty() {
         return None;
@@ -1036,11 +1078,7 @@ fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> O
     let end_idx = ordered
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
-    let status = ordered[end_idx]
-        .get("data")
-        .and_then(|d| d.get("status"))
-        .and_then(|v| v.as_str());
-    if is_failed_completion_status(status) {
+    if is_nonmirrorable_completion_row(ordered[end_idx]) {
         return None;
     }
     let prev_end_idx = ordered[..end_idx]
@@ -1068,11 +1106,7 @@ fn inspect_turn_window(turn_window: &[&serde_json::Value]) -> TurnMirrorCheck {
     let Some(&end_row) = turn_window.last() else {
         return TurnMirrorCheck::Ignore;
     };
-    let status = end_row
-        .get("data")
-        .and_then(|d| d.get("status"))
-        .and_then(|v| v.as_str());
-    if is_failed_completion_status(status) {
+    if is_nonmirrorable_completion_row(end_row) {
         return TurnMirrorCheck::Ignore;
     }
     let turn_end_seq = end_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1446,7 +1480,7 @@ struct TrackedWorker {
     pending_interaction: Option<PendingInteraction>,
     last_seq: Option<u64>,
     feed_seq: Option<u64>,
-    pending_turn_mirror: bool,
+    pending_mirror_since: Option<u64>,
     mirror_room_watermark: Seq,
     last_mirrored_end_seq: u64,
     last_mirrored_anchor: Option<String>,
@@ -1501,7 +1535,23 @@ enum OwnerMsg {
         reply: oneshot::Sender<Option<TrackedWorker>>,
     },
     ListLiveWorkers {
-        reply: oneshot::Sender<Vec<(WaveSlug, RoleName, BbThreadId, Activity, Option<u64>, bool)>>,
+        reply: oneshot::Sender<
+            Vec<(
+                WaveSlug,
+                RoleName,
+                BbThreadId,
+                Activity,
+                Option<u64>,
+                Option<u64>,
+                u64,
+            )>,
+        >,
+    },
+    WorkerMirrorCursor {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        reply: oneshot::Sender<(Option<u64>, Option<u64>, u64, bool)>,
     },
     AdvanceSeq {
         thread: BbThreadId,
@@ -1514,7 +1564,9 @@ enum OwnerMsg {
     SetPendingMirror {
         wave: WaveSlug,
         role: RoleName,
-        pending: bool,
+        thread: BbThreadId,
+        since_end_seq: Option<u64>,
+        mark_unknown_dirty: bool,
     },
     ThreadEvents {
         thread: BbThreadId,
@@ -1532,6 +1584,7 @@ enum OwnerMsg {
     MirrorState {
         wave: WaveSlug,
         role: RoleName,
+        thread: BbThreadId,
         end_seq: u64,
         anchor: String,
         reply: oneshot::Sender<(Seq, bool, bool)>,
@@ -1539,9 +1592,11 @@ enum OwnerMsg {
     AdvanceMirrorWatermark {
         wave: WaveSlug,
         role: RoleName,
+        thread: BbThreadId,
         seq: Seq,
         end_seq: Option<u64>,
         anchor: Option<String>,
+        clear_pending: bool,
     },
 }
 
@@ -1692,7 +1747,7 @@ impl BridgeOwner {
                             pending_interaction: None,
                             last_seq: None,
                             feed_seq: None,
-                            pending_turn_mirror: false,
+                            pending_mirror_since: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             last_mirrored_end_seq: 0,
                             last_mirrored_anchor: None,
@@ -1700,7 +1755,8 @@ impl BridgeOwner {
                     if entry.thread.as_ref() != Some(&thread) {
                         entry.last_seq = None;
                         entry.feed_seq = None;
-                        entry.pending_turn_mirror = false;
+                        entry.pending_mirror_since = None;
+                        entry.mirror_room_watermark = Seq::ORIGIN;
                         entry.last_mirrored_end_seq = 0;
                         entry.last_mirrored_anchor = None;
                     }
@@ -1714,7 +1770,8 @@ impl BridgeOwner {
                 OwnerMsg::LookupByThread { thread, reply } => {
                     let out = self.role_by_thread.get(&thread).and_then(|(w, r)| {
                         let rec = self.workers_by_role.get(&(w.clone(), r.clone()))?;
-                        rec.live.then(|| (w.clone(), r.clone(), rec.attempt))
+                        (rec.live && rec.thread.as_ref() == Some(&thread))
+                            .then(|| (w.clone(), r.clone(), rec.attempt))
                     });
                     let _ = reply.send(out);
                 }
@@ -1734,15 +1791,35 @@ impl BridgeOwner {
                                 th.clone(),
                                 rec.activity.clone(),
                                 rec.last_seq,
-                                rec.pending_turn_mirror,
+                                rec.pending_mirror_since,
+                                rec.last_mirrored_end_seq,
                             ));
                         }
                     }
                     let _ = reply.send(list);
                 }
+                OwnerMsg::WorkerMirrorCursor {
+                    wave,
+                    role,
+                    thread,
+                    reply,
+                } => {
+                    let ever_connected = self.conn_id > 0;
+                    let cur = match self.workers_by_role.get(&(wave, role)) {
+                        Some(rec) if rec.thread.as_ref() == Some(&thread) => (
+                            rec.last_seq,
+                            rec.pending_mirror_since,
+                            rec.last_mirrored_end_seq,
+                            ever_connected,
+                        ),
+                        _ => (None, None, 0, ever_connected),
+                    };
+                    let _ = reply.send(cur);
+                }
                 OwnerMsg::AdvanceSeq { thread, seq } => {
                     if let Some(key) = self.role_by_thread.get(&thread)
                         && let Some(rec) = self.workers_by_role.get_mut(key)
+                        && rec.thread.as_ref() == Some(&thread)
                     {
                         rec.last_seq = Some(rec.last_seq.map_or(seq, |prev| prev.max(seq)));
                     }
@@ -1750,6 +1827,7 @@ impl BridgeOwner {
                 OwnerMsg::AdvanceFeedSeq { thread, seq } => {
                     if let Some(key) = self.role_by_thread.get(&thread)
                         && let Some(rec) = self.workers_by_role.get_mut(key)
+                        && rec.thread.as_ref() == Some(&thread)
                     {
                         rec.feed_seq = Some(rec.feed_seq.map_or(seq, |prev| prev.max(seq)));
                     }
@@ -1757,10 +1835,27 @@ impl BridgeOwner {
                 OwnerMsg::SetPendingMirror {
                     wave,
                     role,
-                    pending,
+                    thread,
+                    since_end_seq,
+                    mark_unknown_dirty,
                 } => {
-                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
-                        rec.pending_turn_mirror = pending;
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
+                        if mark_unknown_dirty {
+                            let fallback = rec.last_mirrored_end_seq.saturating_add(1);
+                            rec.pending_mirror_since = Some(
+                                rec.pending_mirror_since
+                                    .map_or(fallback, |prev| prev.min(fallback)),
+                            );
+                        } else if let Some(new_s) = since_end_seq {
+                            rec.pending_mirror_since = Some(
+                                rec.pending_mirror_since
+                                    .map_or(new_s, |prev| prev.min(new_s)),
+                            );
+                        } else {
+                            rec.pending_mirror_since = None;
+                        }
                     }
                 }
                 OwnerMsg::ThreadEvents { thread, sequence } => {
@@ -1811,42 +1906,58 @@ impl BridgeOwner {
                 OwnerMsg::MirrorState {
                     wave,
                     role,
+                    thread,
                     end_seq,
                     anchor,
                     reply,
                 } => {
                     let ever_connected = self.conn_id > 0;
-                    let state = self.workers_by_role.get(&(wave, role)).map_or(
-                        (Seq::ORIGIN, false, ever_connected),
-                        |w| {
+                    let state = match self.workers_by_role.get(&(wave, role)) {
+                        Some(w) if w.thread.as_ref() == Some(&thread) => {
                             let matched = (end_seq > 0 && w.last_mirrored_end_seq >= end_seq)
                                 || (!anchor.is_empty()
                                     && w.last_mirrored_anchor.as_deref() == Some(anchor.as_str()));
                             (w.mirror_room_watermark, matched, ever_connected)
-                        },
-                    );
+                        }
+                        _ => (Seq::ORIGIN, false, ever_connected),
+                    };
                     let _ = reply.send(state);
                 }
                 OwnerMsg::AdvanceMirrorWatermark {
                     wave,
                     role,
+                    thread,
                     seq,
                     end_seq,
                     anchor,
+                    clear_pending,
                 } => {
-                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
                         if rec.mirror_room_watermark < seq {
                             rec.mirror_room_watermark = seq;
                         }
-                        if let Some(es) = end_seq
-                            && es > rec.last_mirrored_end_seq
-                        {
-                            rec.last_mirrored_end_seq = es;
+                        if let Some(es) = end_seq {
+                            if es > rec.last_mirrored_end_seq {
+                                rec.last_mirrored_end_seq = es;
+                            }
+                            if let Some(pend) = rec.pending_mirror_since
+                                && pend <= es
+                            {
+                                rec.pending_mirror_since = if clear_pending {
+                                    None
+                                } else {
+                                    Some(es.saturating_add(1))
+                                };
+                            }
                         }
                         if let Some(a) = anchor {
                             rec.last_mirrored_anchor = Some(a);
                         }
-                        rec.pending_turn_mirror = false;
+                        if clear_pending {
+                            rec.pending_mirror_since = None;
+                        }
                     }
                 }
             }
@@ -1872,7 +1983,7 @@ impl BridgeOwner {
                         pending_interaction: None,
                         last_seq: None,
                         feed_seq: None,
-                        pending_turn_mirror: false,
+                        pending_mirror_since: None,
                         mirror_room_watermark: Seq::ORIGIN,
                         last_mirrored_end_seq: 0,
                         last_mirrored_anchor: None,
@@ -1891,7 +2002,8 @@ impl BridgeOwner {
                             rec.pending_interaction = None;
                             rec.last_seq = None;
                             rec.feed_seq = None;
-                            rec.pending_turn_mirror = false;
+                            rec.pending_mirror_since = None;
+                            rec.mirror_room_watermark = Seq::ORIGIN;
                             rec.last_mirrored_end_seq = 0;
                             rec.last_mirrored_anchor = None;
                         }
@@ -1916,7 +2028,7 @@ impl BridgeOwner {
                             pending_interaction: None,
                             last_seq: None,
                             feed_seq: None,
-                            pending_turn_mirror: false,
+                            pending_mirror_since: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             last_mirrored_end_seq: 0,
                             last_mirrored_anchor: None,
@@ -1924,7 +2036,8 @@ impl BridgeOwner {
                     if rec.thread.as_ref() != Some(&thread) {
                         rec.last_seq = None;
                         rec.feed_seq = None;
-                        rec.pending_turn_mirror = false;
+                        rec.pending_mirror_since = None;
+                        rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.last_mirrored_end_seq = 0;
                         rec.last_mirrored_anchor = None;
                     }
@@ -1951,7 +2064,7 @@ impl BridgeOwner {
                 Observation::Archived => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
                         rec.live = false;
-                        rec.pending_turn_mirror = false;
+                        rec.pending_mirror_since = None;
                         rec.pending_interaction = None;
                         if let Some(th) = &rec.thread {
                             self.role_by_thread.remove(th);
@@ -1961,7 +2074,7 @@ impl BridgeOwner {
                 Observation::SpawnFailed { .. } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
                         rec.live = false;
-                        rec.pending_turn_mirror = false;
+                        rec.pending_mirror_since = None;
                     }
                 }
                 Observation::RuntimeMeta { .. } => {}
@@ -1969,14 +2082,14 @@ impl BridgeOwner {
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
                     rec.live = false;
-                    rec.pending_turn_mirror = false;
+                    rec.pending_mirror_since = None;
                 }
             }
             WaveEvent::Finished { .. } => {
                 for ((w, _), rec) in &mut self.workers_by_role {
                     if w == &wave {
                         rec.live = false;
-                        rec.pending_turn_mirror = false;
+                        rec.pending_mirror_since = None;
                     }
                 }
             }
@@ -2838,7 +2951,9 @@ impl BbBridge {
                             let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                                 wave,
                                 role,
-                                pending: true,
+                                thread,
+                                since_end_seq: None,
+                                mark_unknown_dirty: true,
                             });
                             return;
                         };
@@ -2859,19 +2974,24 @@ impl BbBridge {
                             let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                                 wave: wave.clone(),
                                 role: role.clone(),
-                                pending: false,
+                                thread: thread.clone(),
+                                since_end_seq: None,
+                                mark_unknown_dirty: false,
                             });
-                            self.call_wave_observe(
-                                wave,
-                                role,
-                                Observation::Activity {
-                                    activity: Activity::Refused { reason },
-                                },
-                            )
-                            .await;
+                            if self.is_current_live_thread(&wave, &role, &thread).await {
+                                self.call_wave_observe(
+                                    wave,
+                                    role,
+                                    Observation::Activity {
+                                        activity: Activity::Refused { reason },
+                                    },
+                                )
+                                .await;
+                            }
                         } else if self
-                            .mirror_completed_turn_from_rows(&wave, &role, &thread, &rows)
+                            .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &rows)
                             .await
+                            && self.is_current_live_thread(&wave, &role, &thread).await
                         {
                             self.call_wave_observe(
                                 wave,
@@ -3245,6 +3365,159 @@ impl BbBridge {
         (combined, !reached_origin)
     }
 
+    async fn is_current_live_thread(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+    ) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .owner
+            .send(OwnerMsg::LookupByRole {
+                wave: wave.clone(),
+                role: role.clone(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        match rx.await {
+            Ok(Some(rec)) => rec.live && rec.thread.as_ref() == Some(thread),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    async fn mirror_outstanding_turns_from_tail(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        rows: &[serde_json::Value],
+    ) -> bool {
+        let (cur_tx, cur_rx) = oneshot::channel();
+        let _ = self.owner.send(OwnerMsg::WorkerMirrorCursor {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            reply: cur_tx,
+        });
+        let (_cursor_seq, pending_mirror_since, last_mirrored_end_seq, ever_connected) =
+            cur_rx.await.unwrap_or((None, None, 0, false));
+        let floor_opt = match (pending_mirror_since, last_mirrored_end_seq) {
+            (Some(pend), last_m) if last_m > 0 => Some(last_m.min(pend.saturating_sub(1))),
+            (Some(pend), _) => Some(pend.saturating_sub(1)),
+            (None, last_m) if last_m > 0 => Some(last_m),
+            (None, _) => None,
+        };
+
+        let mut working = rows.to_vec();
+        if let Some(floor) = floor_opt
+            && ever_connected
+        {
+            let mut before_seq = working
+                .iter()
+                .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                .min();
+            for _ in 0..MAX_TURN_BACKSCAN_PAGES {
+                let Some(cur_before) = before_seq else {
+                    break;
+                };
+                if cur_before <= floor.saturating_add(1) || cur_before <= 1 {
+                    break;
+                }
+                let Ok(rows_val) = self
+                    .rpc(protocol::Down::EventsPage {
+                        req_id: 0,
+                        thread_id: thread.to_string(),
+                        after_seq: None,
+                        before_seq: Some(cur_before),
+                        limit: 200,
+                        order: Some(protocol::EventsOrder::Desc),
+                    })
+                    .await
+                else {
+                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        thread: thread.clone(),
+                        since_end_seq: Some(floor.saturating_add(1)),
+                        mark_unknown_dirty: false,
+                    });
+                    return false;
+                };
+                let Some(page) = rows_val.as_array() else {
+                    break;
+                };
+                if page.is_empty() {
+                    break;
+                }
+                let count = page.len();
+                let mut next_before = cur_before;
+                for row in page {
+                    if let Some(s) = row.get("seq").and_then(|v| v.as_u64())
+                        && s < next_before
+                    {
+                        next_before = s;
+                    }
+                    working.push(row.clone());
+                }
+                if count < 200 || next_before == cur_before {
+                    break;
+                }
+                before_seq = Some(next_before);
+            }
+        }
+
+        let completions: Vec<(u64, Option<u64>)> = nonfailed_turn_completions_in_order(&working)
+            .into_iter()
+            .filter(|&(end_seq, _)| floor_opt.is_none_or(|fl| end_seq > fl))
+            .collect();
+        if completions.is_empty() {
+            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+                since_end_seq: None,
+                mark_unknown_dirty: false,
+            });
+            return true;
+        }
+
+        let total = completions.len();
+        for (idx, (target_end_seq, next_start_at)) in completions.into_iter().enumerate() {
+            let is_last = idx + 1 == total;
+            let prefix_rows: Vec<serde_json::Value> = if target_end_seq > 0 {
+                working
+                    .iter()
+                    .filter(|r| {
+                        r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) <= target_end_seq
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                working.clone()
+            };
+            if !self
+                .mirror_completed_turn_from_rows_inner(
+                    wave,
+                    role,
+                    thread,
+                    &prefix_rows,
+                    next_start_at,
+                    is_last,
+                )
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
     async fn mirror_completed_turn_from_rows(
         &self,
         wave: &WaveSlug,
@@ -3252,27 +3525,55 @@ impl BbBridge {
         thread: &BbThreadId,
         rows: &[serde_json::Value],
     ) -> bool {
+        self.mirror_completed_turn_from_rows_inner(wave, role, thread, rows, None, true)
+            .await
+    }
+
+    async fn mirror_completed_turn_from_rows_inner(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        rows: &[serde_json::Value],
+        next_turn_start_at: Option<u64>,
+        clear_pending_on_settle: bool,
+    ) -> bool {
         let _mirror_guard = self.mirror_lock.lock().await;
+        let Some(end_seq_hint) = latest_nonfailed_turn_end_seq(rows) else {
+            if clear_pending_on_settle {
+                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    since_end_seq: None,
+                    mark_unknown_dirty: false,
+                });
+            }
+            return true;
+        };
         let mark_pending = || {
             let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                 wave: wave.clone(),
                 role: role.clone(),
-                pending: true,
+                thread: thread.clone(),
+                since_end_seq: Some(end_seq_hint.max(1)),
+                mark_unknown_dirty: false,
             });
             false
         };
-        let clear_pending = || {
-            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+        let settle_without_post = |seq: Seq, end_seq: Option<u64>, anchor: Option<String>| {
+            let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
                 wave: wave.clone(),
                 role: role.clone(),
-                pending: false,
+                thread: thread.clone(),
+                seq,
+                end_seq,
+                anchor,
+                clear_pending: clear_pending_on_settle,
             });
             true
         };
 
-        let Some(end_seq_hint) = latest_nonfailed_turn_end_seq(rows) else {
-            return clear_pending();
-        };
         let Some(backend) = self.backend.get() else {
             return mark_pending();
         };
@@ -3284,7 +3585,9 @@ impl BbBridge {
             .await
         {
             Ok(WireReply::WaveView(snap)) => snap,
-            Err(ApiError::NotFound { .. }) => return clear_pending(),
+            Err(ApiError::NotFound { .. }) => {
+                return settle_without_post(Seq::ORIGIN, None, None);
+            }
             _ => return mark_pending(),
         };
         let room = rex_wave_waves::wave_room(wave, &snap.spec.project);
@@ -3302,6 +3605,7 @@ impl BbBridge {
         let _ = self.owner.send(OwnerMsg::MirrorState {
             wave: wave.clone(),
             role: role.clone(),
+            thread: thread.clone(),
             end_seq: end_seq_hint,
             anchor: anchor_hint.clone(),
             reply: wm_tx,
@@ -3309,7 +3613,11 @@ impl BbBridge {
         let (watermark, already_mirrored, ever_connected) =
             wm_rx.await.unwrap_or((Seq::ORIGIN, false, false));
         if already_mirrored {
-            return clear_pending();
+            return settle_without_post(
+                watermark,
+                (end_seq_hint > 0).then_some(end_seq_hint),
+                (!anchor_hint.is_empty()).then_some(anchor_hint),
+            );
         }
 
         let (working_rows, history_incomplete, reached_origin) = self
@@ -3325,14 +3633,11 @@ impl BbBridge {
         let mut room_head = watermark;
         let completed = match check {
             TurnMirrorCheck::Ignore => {
-                let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
-                    wave: wave.clone(),
-                    role: role.clone(),
-                    seq: watermark,
-                    end_seq: (end_seq_hint > 0).then_some(end_seq_hint),
-                    anchor: (!anchor_hint.is_empty()).then_some(anchor_hint),
-                });
-                return true;
+                return settle_without_post(
+                    watermark,
+                    (end_seq_hint > 0).then_some(end_seq_hint),
+                    (!anchor_hint.is_empty()).then_some(anchor_hint),
+                );
             }
             TurnMirrorCheck::PostedViaTool => {
                 let mut tool_reached_end = false;
@@ -3363,21 +3668,22 @@ impl BbBridge {
                 if !tool_reached_end {
                     return mark_pending();
                 }
-                let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
-                    wave: wave.clone(),
-                    role: role.clone(),
-                    seq: room_head,
-                    end_seq: (end_seq_hint > 0).then_some(end_seq_hint),
-                    anchor: (!anchor_hint.is_empty()).then_some(anchor_hint),
-                });
-                return true;
+                return settle_without_post(
+                    room_head,
+                    (end_seq_hint > 0).then_some(end_seq_hint),
+                    (!anchor_hint.is_empty()).then_some(anchor_hint),
+                );
             }
             TurnMirrorCheck::Unposted(c) => c,
         };
 
         let Ok(idem_key) = rex_wave_waves::mirror_idem_key(wave, role, thread, &completed.anchor)
         else {
-            return clear_pending();
+            return settle_without_post(
+                watermark,
+                (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
+                Some(completed.anchor),
+            );
         };
         let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
 
@@ -3446,6 +3752,7 @@ impl BbBridge {
                         }
                     } else if env.by == worker_principal
                         && (completed.turn_start_at == 0 || env.at.0 >= completed.turn_start_at)
+                        && next_turn_start_at.is_none_or(|ns| env.at.0 < ns)
                     {
                         already_posted = true;
                         break;
@@ -3543,18 +3850,19 @@ impl BbBridge {
         }
 
         if already_posted {
-            let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
-                wave: wave.clone(),
-                role: role.clone(),
-                seq: room_head,
-                end_seq: (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
-                anchor: Some(completed.anchor),
-            });
-            return true;
+            return settle_without_post(
+                room_head,
+                (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
+                Some(completed.anchor),
+            );
         }
 
         let Ok(body) = Body::parse(trimmed) else {
-            return clear_pending();
+            return settle_without_post(
+                room_head,
+                (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
+                Some(completed.anchor),
+            );
         };
         let post_cmd = RoomPost::mirrored_turn(RoomRef::Id { id: room.clone() }, body, idem_key);
         let first_try = backend
@@ -3591,14 +3899,11 @@ impl BbBridge {
             other => other,
         };
         if let Ok(WireReply::RoomPost(posted)) = post_res {
-            let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
-                wave: wave.clone(),
-                role: role.clone(),
-                seq: posted.seq.max(room_head),
-                end_seq: (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
-                anchor: Some(completed.anchor),
-            });
-            return true;
+            return settle_without_post(
+                posted.seq.max(room_head),
+                (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
+                Some(completed.anchor),
+            );
         }
         mark_pending()
     }
@@ -3614,71 +3919,23 @@ impl BbBridge {
             return;
         }
         let Ok(workers) = rx.await else { return };
-        for (wave, role, thread, tracked_activity, mut cursor_seq, pending_turn_mirror) in workers {
-            let had_prev_cursor = cursor_seq.is_some();
+        'workers: for (
+            wave,
+            role,
+            thread,
+            tracked_activity,
+            mut cursor_seq,
+            pending_mirror_since,
+            last_mirrored_end_seq,
+        ) in workers
+        {
+            let initial_cursor = cursor_seq;
+            let had_prev_cursor = initial_cursor.is_some();
             let mut collected_rows: Vec<serde_json::Value> = Vec::new();
             let mut thread_gone: Option<Observation> = None;
             let mut saw_new_turn_start = false;
             let mut fetch_complete = true;
-            if cursor_seq.is_none() {
-                let mut before_seq: Option<u64> = None;
-                let mut pages = 0usize;
-                'desc: loop {
-                    match self
-                        .rpc(protocol::Down::EventsPage {
-                            req_id: 0,
-                            thread_id: thread.to_string(),
-                            after_seq: None,
-                            before_seq,
-                            limit: 200,
-                            order: Some(protocol::EventsOrder::Desc),
-                        })
-                        .await
-                    {
-                        Ok(rows_val) => {
-                            let Some(rows) = rows_val.as_array() else {
-                                break;
-                            };
-                            if rows.is_empty() {
-                                break;
-                            }
-                            pages += 1;
-                            let count = rows.len();
-                            let prev_before = before_seq;
-                            let mut reached_turn_start = false;
-                            for row in rows {
-                                if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
-                                    cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
-                                    before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
-                                }
-                                collected_rows.push(row.clone());
-                                if matches!(
-                                    row.get("type").and_then(|v| v.as_str()),
-                                    Some("turn/started" | "client/turn/start")
-                                ) {
-                                    reached_turn_start = true;
-                                }
-                            }
-                            if reached_turn_start
-                                || count < 200
-                                || before_seq == prev_before
-                                || pages >= 4
-                            {
-                                break 'desc;
-                            }
-                        }
-                        Err(HostError::Rejected(msg)) => {
-                            thread_gone = classify_missing_or_archived_thread(&msg);
-                            fetch_complete = false;
-                            break;
-                        }
-                        Err(HostError::Unreachable(_)) => {
-                            fetch_complete = false;
-                            break;
-                        }
-                    }
-                }
-            } else {
+            if let Some(init_cur) = initial_cursor {
                 loop {
                     match self
                         .rpc(protocol::Down::EventsPage {
@@ -3727,6 +3984,119 @@ impl BbBridge {
                         }
                     }
                 }
+                if fetch_complete
+                    && let Some(pend) = pending_mirror_since
+                    && pend <= init_cur
+                {
+                    let mut before_seq = Some(init_cur.saturating_add(1));
+                    for _ in 0..MAX_TURN_BACKSCAN_PAGES {
+                        match self
+                            .rpc(protocol::Down::EventsPage {
+                                req_id: 0,
+                                thread_id: thread.to_string(),
+                                after_seq: None,
+                                before_seq,
+                                limit: 200,
+                                order: Some(protocol::EventsOrder::Desc),
+                            })
+                            .await
+                        {
+                            Ok(rows_val) => {
+                                let Some(rows) = rows_val.as_array() else {
+                                    break;
+                                };
+                                if rows.is_empty() {
+                                    break;
+                                };
+                                let count = rows.len();
+                                let prev_before = before_seq;
+                                for row in rows {
+                                    if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                                        cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                                        before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
+                                    }
+                                    collected_rows.push(row.clone());
+                                }
+                                let covered_pending = before_seq.is_some_and(|b| b <= pend);
+                                if covered_pending || count < 200 || before_seq == prev_before {
+                                    break;
+                                }
+                            }
+                            Err(HostError::Rejected(msg)) => {
+                                thread_gone = classify_missing_or_archived_thread(&msg);
+                                fetch_complete = false;
+                                break;
+                            }
+                            Err(HostError::Unreachable(_)) => {
+                                fetch_complete = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let mut before_seq: Option<u64> = None;
+                let mut pages = 0usize;
+                'desc: loop {
+                    match self
+                        .rpc(protocol::Down::EventsPage {
+                            req_id: 0,
+                            thread_id: thread.to_string(),
+                            after_seq: None,
+                            before_seq,
+                            limit: 200,
+                            order: Some(protocol::EventsOrder::Desc),
+                        })
+                        .await
+                    {
+                        Ok(rows_val) => {
+                            let Some(rows) = rows_val.as_array() else {
+                                break;
+                            };
+                            if rows.is_empty() {
+                                break;
+                            }
+                            pages += 1;
+                            let count = rows.len();
+                            let prev_before = before_seq;
+                            let mut reached_turn_start = false;
+                            for row in rows {
+                                if let Some(s) = row.get("seq").and_then(|v| v.as_u64()) {
+                                    cursor_seq = Some(cursor_seq.map_or(s, |cur| cur.max(s)));
+                                    before_seq = Some(before_seq.map_or(s, |cur| cur.min(s)));
+                                }
+                                collected_rows.push(row.clone());
+                                if matches!(
+                                    row.get("type").and_then(|v| v.as_str()),
+                                    Some("turn/started" | "client/turn/start")
+                                ) {
+                                    reached_turn_start = true;
+                                }
+                            }
+                            let covered_pending = pending_mirror_since
+                                .is_none_or(|pend| before_seq.is_some_and(|b| b <= pend));
+                            if (reached_turn_start && covered_pending)
+                                || count < 200
+                                || before_seq == prev_before
+                                || (pages >= 4 && pending_mirror_since.is_none())
+                            {
+                                break 'desc;
+                            }
+                        }
+                        Err(HostError::Rejected(msg)) => {
+                            thread_gone = classify_missing_or_archived_thread(&msg);
+                            fetch_complete = false;
+                            break;
+                        }
+                        Err(HostError::Unreachable(_)) => {
+                            fetch_complete = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !self.is_current_live_thread(&wave, &role, &thread).await {
+                continue;
             }
             let current_activity = self
                 .authoritative_activity(&wave, &role)
@@ -3748,6 +4118,10 @@ impl BbBridge {
             let (row_model, row_account) = extract_runtime_meta_from_rows(&collected_rows);
             self.observe_runtime_meta_if_present(&wave, &role, row_model, row_account)
                 .await;
+            let suppress_historical_completions = matches!(
+                current_activity,
+                Activity::Refused { .. } | Activity::Errored { .. }
+            ) && !(had_prev_cursor && saw_new_turn_start);
             let mut derived_activity = derive_latest_turn_activity(&collected_rows);
             if matches!(
                 current_activity,
@@ -3756,75 +4130,90 @@ impl BbBridge {
             {
                 derived_activity = None;
             }
-            if matches!(
-                current_activity,
-                Activity::Refused { .. } | Activity::Errored { .. }
-            ) && matches!(derived_activity, Some(Activity::Idle))
-                && !(had_prev_cursor && saw_new_turn_start)
-            {
+            if suppress_historical_completions && matches!(derived_activity, Some(Activity::Idle)) {
                 derived_activity = None;
             }
-            if let Some(activity) = derived_activity {
-                if matches!(activity, Activity::Idle)
-                    && !self
-                        .mirror_completed_turn_from_rows(&wave, &role, &thread, &collected_rows)
-                        .await
-                {
-                    continue;
-                }
-                self.call_wave_observe(wave, role, Observation::Activity { activity })
-                    .await;
-            } else if pending_turn_mirror {
-                let Ok(recent_rows) = self.fetch_recent_thread_rows_checked(&thread).await else {
-                    continue;
+
+            if !suppress_historical_completions {
+                let floor = match (pending_mirror_since, initial_cursor, last_mirrored_end_seq) {
+                    (Some(pend), Some(cur), _) => cur.min(pend.saturating_sub(1)),
+                    (Some(pend), None, last_m) => {
+                        if last_m > 0 {
+                            last_m.min(pend.saturating_sub(1))
+                        } else {
+                            pend.saturating_sub(1)
+                        }
+                    }
+                    (None, Some(cur), last_m) => {
+                        if last_m > 0 {
+                            cur.min(last_m)
+                        } else {
+                            cur
+                        }
+                    }
+                    (None, None, last_m) => last_m,
                 };
-                let (rm, ra) = extract_runtime_meta_from_rows(&recent_rows);
-                self.observe_runtime_meta_if_present(&wave, &role, rm, ra)
-                    .await;
-                if let Some(reason) = refusal_from_latest_turn(&recent_rows) {
-                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                        wave: wave.clone(),
-                        role: role.clone(),
-                        pending: false,
-                    });
-                    self.call_wave_observe(
-                        wave,
-                        role,
-                        Observation::Activity {
-                            activity: Activity::Refused { reason },
-                        },
-                    )
-                    .await;
-                } else if matches!(
-                    derive_latest_turn_activity(&recent_rows),
-                    Some(Activity::Idle)
-                ) {
+                let completions: Vec<(u64, Option<u64>)> = if had_prev_cursor
+                    || pending_mirror_since.is_some()
+                    || matches!(derived_activity, Some(Activity::Idle))
+                {
+                    nonfailed_turn_completions_in_order(&collected_rows)
+                        .into_iter()
+                        .filter(|&(end_seq, _)| end_seq > floor)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let total = completions.len();
+                for (idx, (target_end_seq, next_start_at)) in completions.into_iter().enumerate() {
+                    let is_last = idx + 1 == total;
+                    let prefix_rows: Vec<serde_json::Value> = if target_end_seq > 0 {
+                        collected_rows
+                            .iter()
+                            .filter(|r| {
+                                r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) <= target_end_seq
+                            })
+                            .cloned()
+                            .collect()
+                    } else {
+                        collected_rows.clone()
+                    };
                     if !self
-                        .mirror_completed_turn_from_rows(&wave, &role, &thread, &recent_rows)
+                        .mirror_completed_turn_from_rows_inner(
+                            &wave,
+                            &role,
+                            &thread,
+                            &prefix_rows,
+                            next_start_at,
+                            is_last,
+                        )
                         .await
                     {
-                        continue;
+                        continue 'workers;
                     }
-                    if !matches!(
-                        current_activity,
-                        Activity::Refused { .. } | Activity::Errored { .. }
-                    ) {
-                        self.call_wave_observe(
-                            wave,
-                            role,
-                            Observation::Activity {
-                                activity: Activity::Idle,
-                            },
-                        )
-                        .await;
+                    if target_end_seq > 0 {
+                        let _ = self.owner.send(OwnerMsg::AdvanceSeq {
+                            thread: thread.clone(),
+                            seq: target_end_seq,
+                        });
                     }
-                } else {
+                }
+                if total == 0 && pending_mirror_since.is_some() {
                     let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                         wave: wave.clone(),
                         role: role.clone(),
-                        pending: false,
+                        thread: thread.clone(),
+                        since_end_seq: None,
+                        mark_unknown_dirty: false,
                     });
                 }
+            }
+
+            if let Some(activity) = derived_activity
+                && self.is_current_live_thread(&wave, &role, &thread).await
+            {
+                self.call_wave_observe(wave, role, Observation::Activity { activity })
+                    .await;
             }
             if let Some(seq) = cursor_seq {
                 let _ = self.owner.send(OwnerMsg::AdvanceSeq {
@@ -3911,7 +4300,7 @@ impl BbBridge {
                                 pending_interaction,
                                 last_seq: None,
                                 feed_seq: None,
-                                pending_turn_mirror: false,
+                                pending_mirror_since: None,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 last_mirrored_end_seq: 0,
                                 last_mirrored_anchor: None,
@@ -3929,7 +4318,7 @@ impl BbBridge {
                             pending_interaction: None,
                             last_seq: None,
                             feed_seq: None,
-                            pending_turn_mirror: false,
+                            pending_mirror_since: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             last_mirrored_end_seq: 0,
                             last_mirrored_anchor: None,
@@ -8386,8 +8775,8 @@ mod tests {
             }));
             events
         };
-        let events_f = build_long_turn_events();
-        let events_g = build_long_turn_events();
+        let mut events_f = build_long_turn_events();
+        let mut events_g = build_long_turn_events();
 
         let server_task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
@@ -8419,12 +8808,57 @@ mod tests {
                                 && before_seq.is_some()
                                 && drop_srv_f.swap(false, Ordering::SeqCst)
                             {
+                                events_f.extend([
+                                    serde_json::json!({
+                                        "seq": 1127u64,
+                                        "createdAt": 1_300u64,
+                                        "type": "turn/started",
+                                        "data": {}
+                                    }),
+                                    serde_json::json!({
+                                        "seq": 1128u64,
+                                        "createdAt": 1_301u64,
+                                        "type": "item/agentMessage/delta",
+                                        "data": { "delta": "second reply" }
+                                    }),
+                                    serde_json::json!({
+                                        "seq": 1129u64,
+                                        "createdAt": 1_302u64,
+                                        "type": "turn/completed",
+                                        "data": { "status": "completed" }
+                                    }),
+                                ]);
                                 break;
                             }
                             if thread_id == "th_reconnect_g"
                                 && before_seq.is_some()
                                 && drop_srv_g.swap(false, Ordering::SeqCst)
                             {
+                                events_g.extend([
+                                    serde_json::json!({
+                                        "seq": 1127u64,
+                                        "createdAt": 1_300u64,
+                                        "type": "turn/started",
+                                        "data": {}
+                                    }),
+                                    serde_json::json!({
+                                        "seq": 1128u64,
+                                        "createdAt": 1_301u64,
+                                        "type": "item/completed",
+                                        "data": {
+                                            "item": {
+                                                "type": "agentMessage",
+                                                "text": "second reply"
+                                            }
+                                        }
+                                    }),
+                                    serde_json::json!({
+                                        "seq": 1129u64,
+                                        "createdAt": 1_302u64,
+                                        "type": "turn/completed",
+                                        "data": { "status": "completed" }
+                                    }),
+                                ]);
                                 break;
                             }
                             let source = if thread_id == "th_reconnect_f" {
@@ -8763,14 +9197,205 @@ mod tests {
                 .collect();
             assert_eq!(
                 bodies,
-                vec![full_delta_body],
-                "{label}: reconnect must publish the full recovered turn exactly once"
+                vec![full_delta_body, "second reply"],
+                "{label}: reconnect must publish all completed turns in sequence order"
             );
         }
 
         let _ = shutdown_tx2.send(true);
         let _ = bridge_runner2.await;
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn late_mirror_from_replaced_thread_never_suppresses_replacement_replies() {
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let _ = bridge.backend.set(Arc::new(harness.clone()));
+        let sys = harness.client(Principal::System {
+            part: SystemPart::WaveConductor,
+        });
+        let owner = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+        let wave = WaveSlug::parse("replaced-thread-mirror").unwrap();
+        let proj = BbProjectId::parse("proj_replaced").unwrap();
+        let role_a = RoleName::parse("writer").unwrap();
+        let role_b = RoleName::parse("same-text").unwrap();
+        let old_tid_a = BbThreadId::parse(format!("th_old_a_{}", "x".repeat(230))).unwrap();
+        let new_tid_a = BbThreadId::parse("th_new_a").unwrap();
+        let old_tid_b = BbThreadId::parse("th_old_b").unwrap();
+        let new_tid_b = BbThreadId::parse("th_new_b").unwrap();
+
+        owner
+            .call(WaveStart {
+                spec: WaveSpec {
+                    slug: wave.clone(),
+                    project: proj.clone(),
+                    goal: Body::parse("test replacement thread mirror isolation").unwrap(),
+                    output_dir: None,
+                    defaults: AgentSpec {
+                        provider: ProviderId::parse("pi").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::Full,
+                        workspace: Workspace::ProjectDefault,
+                    },
+                    workers: [&role_a, &role_b]
+                        .into_iter()
+                        .map(|r| WorkerSpec {
+                            role: r.clone(),
+                            agent: None,
+                            brief: Body::parse("write").unwrap(),
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
+                        })
+                        .collect(),
+                },
+                idem: None,
+            })
+            .await
+            .unwrap();
+
+        let room = rex_wave_waves::wave_room(&wave, &proj);
+        sys.call(RoomEnsure {
+            room: RoomRef::Id { id: room.clone() },
+            topic: None,
+            origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
+        })
+        .await
+        .unwrap();
+
+        for (role, old_tid, new_tid) in [
+            (&role_a, &old_tid_a, &new_tid_a),
+            (&role_b, &old_tid_b, &new_tid_b),
+        ] {
+            let spawned1 = Observation::Spawned {
+                attempt: 1,
+                thread: old_tid.clone(),
+            };
+            sys.call(WaveObserve {
+                wave: wave.clone(),
+                role: role.clone(),
+                observation: spawned1.clone(),
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role: role.clone(),
+                    observation: spawned1,
+                },
+            );
+            sys.call(RoomJoin {
+                room: RoomRef::Id { id: room.clone() },
+                member: Some(Principal::Worker {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                }),
+                handle: Handle::parse(role.as_str()).ok(),
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role: role.clone(),
+                    observation: Observation::Spawned {
+                        attempt: 2,
+                        thread: new_tid.clone(),
+                    },
+                },
+            );
+        }
+
+        for (tid, start, body) in [
+            (&old_tid_a, 701u64, "old reply"),
+            (&new_tid_a, 1u64, "replacement reply"),
+        ] {
+            let rows = [
+                serde_json::json!({ "seq": start, "type": "turn/started", "createdAt": 1_000 }),
+                serde_json::json!({
+                    "seq": start + 1,
+                    "type": "item/completed",
+                    "createdAt": 1_001,
+                    "data": { "item": { "type": "agentMessage", "text": body } }
+                }),
+                serde_json::json!({
+                    "seq": start + 2,
+                    "type": "turn/completed",
+                    "createdAt": 1_002,
+                    "data": {}
+                }),
+            ];
+            assert!(
+                bridge
+                    .mirror_completed_turn_from_rows(&wave, &role_a, tid, &rows)
+                    .await
+            );
+        }
+
+        for (tid, start) in [(&old_tid_b, 901u64), (&new_tid_b, 1u64)] {
+            let rows = [
+                serde_json::json!({ "seq": start, "type": "turn/started", "createdAt": 2_000 }),
+                serde_json::json!({
+                    "seq": start + 1,
+                    "type": "item/completed",
+                    "createdAt": 2_001,
+                    "data": { "item": { "type": "agentMessage", "text": "Done." } }
+                }),
+                serde_json::json!({
+                    "seq": start + 2,
+                    "type": "turn/completed",
+                    "createdAt": 2_002,
+                    "data": {}
+                }),
+            ];
+            assert!(
+                bridge
+                    .mirror_completed_turn_from_rows(&wave, &role_b, tid, &rows)
+                    .await
+            );
+        }
+
+        let locked = harness.inner.lock().await;
+        let entries = &locked.entries[&StreamId::Room { room }];
+        let pa = Principal::Worker {
+            wave: wave.clone(),
+            role: role_a.clone(),
+        };
+        let pb = Principal::Worker {
+            wave: wave.clone(),
+            role: role_b.clone(),
+        };
+        let bodies_a: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.by == pa)
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
+        let bodies_b: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.by == pb)
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies_a, vec!["old reply", "replacement reply"]);
+        assert_eq!(bodies_b, vec!["Done.", "Done."]);
     }
 
     #[tokio::test]
