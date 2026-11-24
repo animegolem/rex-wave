@@ -88,10 +88,10 @@ pub fn is_legacy_mirror_idem_key(idem: &IdemKey) -> bool {
 
 /// Classifies whether `idem` matches an existing pre-upgrade BB turn-mirror row for
 /// `(wave, role, thread)`. Returns `Some(true)` for an exact full start-anchor match
-/// (`s<turn_start_seq>`), `Some(false)` for a 256-byte-truncated key that must
-/// additionally match worker principal, body, and timestamp floor, or `None` when
-/// `idem` does not belong to this completed turn. Start-anchored keys (`s<N>`) never
-/// match without a recovered `turn_start_seq`.
+/// (`s<turn_start_seq>`), `Some(false)` for a 256-byte-truncated start or end key that
+/// requires chronological turn-to-post reconciliation, or `None` when `idem` cannot
+/// belong to this completed turn. Start-anchored keys (`s<N>`) never match without a
+/// recovered `turn_start_seq`.
 pub fn classify_legacy_bb_mirror_idem(
     idem: &IdemKey,
     wave: &WaveSlug,
@@ -114,7 +114,6 @@ pub fn classify_legacy_bb_mirror_idem(
         {
             return Some(false);
         }
-        return None;
     }
 
     let end_anchor = format!("e{turn_end_seq}");
@@ -122,34 +121,6 @@ pub fn classify_legacy_bb_mirror_idem(
         return Some(false);
     }
     None
-}
-
-/// True when `idem` is a pre-upgrade `s<N>` (`N < turn_end_seq`) mirror key for
-/// `(wave, role, thread)` whose membership in the current turn cannot be decided
-/// while BB history backfill is transiently unreachable.
-pub fn is_ambiguous_legacy_bb_start_idem(
-    idem: &IdemKey,
-    wave: &WaveSlug,
-    role: &RoleName,
-    thread: &HostThreadId,
-    turn_end_seq: u64,
-) -> bool {
-    let s_prefix = format!("wave:{wave}:turn:{role}:{thread}:s");
-    let raw_idem = idem.as_str();
-    if raw_idem.len() < 256 {
-        return raw_idem.strip_prefix(&s_prefix).is_some_and(|digits| {
-            !digits.is_empty() && digits.parse::<u64>().is_ok_and(|s| s < turn_end_seq)
-        });
-    }
-    if raw_idem.len() == 256 {
-        let mut shared = s_prefix.len().min(256);
-        while !s_prefix.is_char_boundary(shared) {
-            shared -= 1;
-        }
-        return raw_idem.starts_with(&s_prefix[..shared])
-            && raw_idem[shared..].bytes().all(|b| b.is_ascii_digit());
-    }
-    false
 }
 
 pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase, String> {

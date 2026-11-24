@@ -986,15 +986,32 @@ enum TurnMirrorCheck {
 }
 
 const MAX_MIRROR_SCAN_PAGES: usize = 16;
+const MAX_RECONCILE_ROOM_PAGES: usize = 1_024;
 const MAX_TURN_BACKSCAN_PAGES: usize = 512;
 
-fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> Option<u64> {
+fn sort_and_dedup_thread_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0));
+    ordered.dedup_by(|a, b| {
+        let sa = a.get("seq").and_then(|v| v.as_u64());
+        let sb = b.get("seq").and_then(|v| v.as_u64());
+        sa.is_some() && sa == sb
+    });
+    ordered
+}
+
+fn is_failed_completion_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("failed" | "cancelled" | "canceled" | "interrupted" | "aborted")
+    )
+}
+
+fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
     if rows.is_empty() {
         return None;
     }
-    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
-    ordered.sort_by_key(|r| r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0));
-
+    let ordered = sort_and_dedup_thread_rows(rows);
     let end_idx = ordered
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
@@ -1002,10 +1019,30 @@ fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> O
         .get("data")
         .and_then(|d| d.get("status"))
         .and_then(|v| v.as_str());
-    if matches!(
-        status,
-        Some("failed" | "cancelled" | "canceled" | "interrupted" | "aborted")
-    ) {
+    if is_failed_completion_status(status) {
+        return None;
+    }
+    Some(
+        ordered[end_idx]
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    )
+}
+
+fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> Option<u64> {
+    if rows.is_empty() {
+        return None;
+    }
+    let ordered = sort_and_dedup_thread_rows(rows);
+    let end_idx = ordered
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
+    let status = ordered[end_idx]
+        .get("data")
+        .and_then(|d| d.get("status"))
+        .and_then(|v| v.as_str());
+    if is_failed_completion_status(status) {
         return None;
     }
     let prev_end_idx = ordered[..end_idx]
@@ -1029,38 +1066,18 @@ fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> O
         .filter(|&s| s > 1)
 }
 
-fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck {
-    if rows.is_empty() {
-        return TurnMirrorCheck::Ignore;
-    }
-    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
-    ordered.sort_by_key(|r| r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0));
-
-    let Some(end_idx) = ordered
-        .iter()
-        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
-    else {
+fn inspect_turn_window(turn_window: &[&serde_json::Value]) -> TurnMirrorCheck {
+    let Some(&end_row) = turn_window.last() else {
         return TurnMirrorCheck::Ignore;
     };
-    let status = ordered[end_idx]
+    let status = end_row
         .get("data")
         .and_then(|d| d.get("status"))
         .and_then(|v| v.as_str());
-    if matches!(
-        status,
-        Some("failed" | "cancelled" | "canceled" | "interrupted" | "aborted")
-    ) {
+    if is_failed_completion_status(status) {
         return TurnMirrorCheck::Ignore;
     }
-    let turn_end_seq = ordered[end_idx]
-        .get("seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let turn_floor_idx = ordered[..end_idx]
-        .iter()
-        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
-        .map_or(0, |idx| idx + 1);
-    let turn_window = &ordered[turn_floor_idx..=end_idx];
+    let turn_end_seq = end_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let start_idx = turn_window.iter().rposition(|r| {
         matches!(
@@ -1164,7 +1181,7 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
     } else {
         "e0".to_owned()
     };
-    let turn_end_at = ordered[end_idx]
+    let turn_end_at = end_row
         .get("createdAt")
         .and_then(|v| v.as_u64())
         .filter(|&at| at > 0)
@@ -1184,6 +1201,143 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
         turn_end_at,
         text,
     })
+}
+
+fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck {
+    if rows.is_empty() {
+        return TurnMirrorCheck::Ignore;
+    }
+    let ordered = sort_and_dedup_thread_rows(rows);
+    let Some(end_idx) = ordered
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+    else {
+        return TurnMirrorCheck::Ignore;
+    };
+    let turn_floor_idx = ordered[..end_idx]
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+        .map_or(0, |idx| idx + 1);
+    inspect_turn_window(&ordered[turn_floor_idx..=end_idx])
+}
+
+fn inspect_all_unposted_completed_turns(
+    rows: &[serde_json::Value],
+    through_end_seq: u64,
+) -> Vec<(CompletedTurn, Option<u64>)> {
+    let ordered = sort_and_dedup_thread_rows(rows);
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    for (idx, row) in ordered.iter().enumerate() {
+        if row.get("type").and_then(|v| v.as_str()) == Some("turn/completed") {
+            let seq = row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+            if through_end_seq > 0 && seq > through_end_seq {
+                break;
+            }
+            segments.push((seg_start, idx));
+            seg_start = idx + 1;
+        }
+    }
+    let mut out = Vec::new();
+    for (seg_idx, &(s, e)) in segments.iter().enumerate() {
+        if let TurnMirrorCheck::Unposted(turn) = inspect_turn_window(&ordered[s..=e]) {
+            let next_seg_start_at = segments.get(seg_idx + 1).and_then(|&(ns, ne)| {
+                ordered[ns..=ne]
+                    .iter()
+                    .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
+                    .find(|&at| at > 0)
+            });
+            out.push((turn, next_seg_start_at));
+        }
+    }
+    out
+}
+
+struct WorkerRoomPost {
+    at: UnixMs,
+    body: String,
+    idem: Option<IdemKey>,
+    is_mirrored: bool,
+}
+
+fn reconcile_shared_legacy_mirror(
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &BbThreadId,
+    turns: &[(CompletedTurn, Option<u64>)],
+    posts: &[WorkerRoomPost],
+    target_end_seq: u64,
+) -> bool {
+    let Some(target_idx) = turns
+        .iter()
+        .rposition(|(t, _)| t.turn_end_seq == target_end_seq)
+    else {
+        return false;
+    };
+    let mut turn_matched = vec![false; turns.len()];
+    let mut post_used = vec![false; posts.len()];
+
+    for (ti, (turn, next_start_at)) in turns.iter().enumerate() {
+        let exact_end = rex_wave_waves::mirror_idem_key(wave, role, thread, &turn.anchor).ok();
+        let exact_start = turn.turn_start_seq.and_then(|s| {
+            rex_wave_waves::mirror_idem_key(wave, role, thread, &format!("s{s}")).ok()
+        });
+        for (pi, post) in posts.iter().enumerate() {
+            if post_used[pi] {
+                continue;
+            }
+            let exact_idem_hit = post.idem.is_some()
+                && (post.idem == exact_end || (exact_start.is_some() && post.idem == exact_start));
+            let direct_hit = !post.is_mirrored
+                && (turn.turn_start_at == 0
+                    || (post.at.0 >= turn.turn_start_at
+                        && next_start_at.is_none_or(|ns| post.at.0 < ns)));
+            if exact_idem_hit || direct_hit {
+                turn_matched[ti] = true;
+                post_used[pi] = true;
+                break;
+            }
+        }
+    }
+    if turn_matched[target_idx] {
+        return true;
+    }
+
+    for (ti, (turn, _)) in turns.iter().enumerate() {
+        if turn_matched[ti] {
+            continue;
+        }
+        let trimmed = truncate_with_notice(&turn.text, 64 * 1024);
+        let min_at = if turn.turn_start_at > 0 {
+            turn.turn_start_at
+        } else {
+            turn.turn_end_at
+        };
+        for (pi, post) in posts.iter().enumerate() {
+            if post_used[pi] || !post.is_mirrored {
+                continue;
+            }
+            let Some(ref existing_idem) = post.idem else {
+                continue;
+            };
+            if rex_wave_waves::classify_legacy_bb_mirror_idem(
+                existing_idem,
+                wave,
+                role,
+                thread,
+                turn.turn_start_seq,
+                turn.turn_end_seq,
+            ) == Some(false)
+                && post.body == trimmed
+                && (min_at == 0 || post.at.0 >= min_at)
+            {
+                turn_matched[ti] = true;
+                post_used[pi] = true;
+                break;
+            }
+        }
+    }
+    turn_matched[target_idx]
 }
 
 #[cfg(test)]
@@ -2875,15 +3029,21 @@ impl BbBridge {
         thread: &BbThreadId,
         initial_rows: &[serde_json::Value],
         ever_connected: bool,
-    ) -> (Vec<serde_json::Value>, bool) {
+    ) -> (Vec<serde_json::Value>, bool, bool) {
         let Some(mut before_seq) = latest_completed_turn_missing_start_boundary(initial_rows)
         else {
-            return (initial_rows.to_vec(), false);
+            let reached_origin = initial_rows
+                .iter()
+                .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                .min()
+                .is_some_and(|s| s <= 1);
+            return (initial_rows.to_vec(), false, reached_origin);
         };
         let mut combined = initial_rows.to_vec();
-        let mut failed_transiently = false;
+        let mut complete = false;
+        let mut reached_origin = false;
         for _ in 0..MAX_TURN_BACKSCAN_PAGES {
-            let rows_val = match self
+            let Ok(rows_val) = self
                 .rpc(protocol::Down::EventsPage {
                     req_id: 0,
                     thread_id: thread.to_string(),
@@ -2893,18 +3053,15 @@ impl BbBridge {
                     order: Some(protocol::EventsOrder::Desc),
                 })
                 .await
-            {
-                Ok(val) => val,
-                Err(HostError::Unreachable(_)) => {
-                    failed_transiently = ever_connected;
-                    break;
-                }
-                Err(HostError::Rejected(_)) => break,
+            else {
+                break;
             };
             let Some(page) = rows_val.as_array() else {
                 break;
             };
             if page.is_empty() {
+                complete = true;
+                reached_origin = true;
                 break;
             }
             let count = page.len();
@@ -2924,11 +3081,83 @@ impl BbBridge {
                 }
                 combined.push(row.clone());
             }
-            if found_boundary || count < 200 || before_seq == prev_before || before_seq <= 1 {
+            if count < 200 || before_seq <= 1 {
+                complete = true;
+                reached_origin = true;
+                break;
+            }
+            if found_boundary {
+                complete = true;
+                break;
+            }
+            if before_seq == prev_before {
                 break;
             }
         }
-        (combined, failed_transiently)
+        let history_incomplete = ever_connected && !complete;
+        (combined, history_incomplete, reached_origin)
+    }
+
+    async fn fetch_all_thread_rows_through(
+        &self,
+        thread: &BbThreadId,
+        working_rows: &[serde_json::Value],
+        already_reached_origin: bool,
+        ever_connected: bool,
+    ) -> (Vec<serde_json::Value>, bool) {
+        if !ever_connected || already_reached_origin {
+            return (working_rows.to_vec(), false);
+        }
+        let Some(mut before_seq) = working_rows
+            .iter()
+            .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+            .min()
+            .filter(|&s| s > 1)
+        else {
+            return (working_rows.to_vec(), false);
+        };
+        let mut combined = working_rows.to_vec();
+        let mut reached_origin = false;
+        for _ in 0..MAX_TURN_BACKSCAN_PAGES {
+            let Ok(rows_val) = self
+                .rpc(protocol::Down::EventsPage {
+                    req_id: 0,
+                    thread_id: thread.to_string(),
+                    after_seq: None,
+                    before_seq: Some(before_seq),
+                    limit: 200,
+                    order: Some(protocol::EventsOrder::Desc),
+                })
+                .await
+            else {
+                break;
+            };
+            let Some(page) = rows_val.as_array() else {
+                break;
+            };
+            if page.is_empty() {
+                reached_origin = true;
+                break;
+            }
+            let count = page.len();
+            let prev_before = before_seq;
+            for row in page {
+                if let Some(s) = row.get("seq").and_then(|v| v.as_u64())
+                    && s < before_seq
+                {
+                    before_seq = s;
+                }
+                combined.push(row.clone());
+            }
+            if count < 200 || before_seq <= 1 {
+                reached_origin = true;
+                break;
+            }
+            if before_seq == prev_before {
+                break;
+            }
+        }
+        (combined, !reached_origin)
     }
 
     async fn mirror_completed_turn_from_rows(
@@ -2938,16 +3167,9 @@ impl BbBridge {
         thread: &BbThreadId,
         rows: &[serde_json::Value],
     ) {
-        fn completed_turn_anchor_hint(check: &TurnMirrorCheck) -> String {
-            match check {
-                TurnMirrorCheck::Unposted(c) => c.anchor.clone(),
-                TurnMirrorCheck::Ignore | TurnMirrorCheck::PostedViaTool => String::new(),
-            }
-        }
-        let initial_check = inspect_latest_completed_turn(rows);
-        if matches!(initial_check, TurnMirrorCheck::Ignore) {
+        let Some(end_seq_hint) = latest_nonfailed_turn_end_seq(rows) else {
             return;
-        }
+        };
         let Some(backend) = self.backend.get() else {
             return;
         };
@@ -2966,11 +3188,16 @@ impl BbBridge {
             role: role.clone(),
         };
 
+        let anchor_hint = if end_seq_hint > 0 {
+            format!("e{end_seq_hint}")
+        } else {
+            String::new()
+        };
         let (wm_tx, wm_rx) = oneshot::channel();
         let _ = self.owner.send(OwnerMsg::MirrorState {
             wave: wave.clone(),
             role: role.clone(),
-            anchor: completed_turn_anchor_hint(&initial_check),
+            anchor: anchor_hint,
             reply: wm_tx,
         });
         let (watermark, already_mirrored, ever_connected) =
@@ -2979,15 +3206,13 @@ impl BbBridge {
             return;
         }
 
-        let (check, backfill_failed_transiently) =
-            if latest_completed_turn_missing_start_boundary(rows).is_some() {
-                let (full_rows, failed) = self
-                    .backfill_latest_turn_rows(thread, rows, ever_connected)
-                    .await;
-                (inspect_latest_completed_turn(&full_rows), failed)
-            } else {
-                (initial_check, false)
-            };
+        let (working_rows, history_incomplete, reached_origin) = self
+            .backfill_latest_turn_rows(thread, rows, ever_connected)
+            .await;
+        if history_incomplete {
+            return;
+        }
+        let check = inspect_latest_completed_turn(&working_rows);
 
         let stream = StreamId::Room { room: room.clone() };
         let mut cursor = watermark;
@@ -3032,6 +3257,7 @@ impl BbBridge {
         let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
 
         let mut already_posted = false;
+        let mut needs_shared_legacy_reconcile = false;
         let mut reached_end = false;
         for _ in 0..MAX_MIRROR_SCAN_PAGES {
             let Ok(WireReply::Read(page)) = backend
@@ -3071,33 +3297,23 @@ impl BbBridge {
                         };
                         if env.by == worker_principal
                             && let Some(existing_idem) = idem.as_ref()
-                        {
-                            if let Some(exact) = rex_wave_waves::classify_legacy_bb_mirror_idem(
+                            && let Some(exact) = rex_wave_waves::classify_legacy_bb_mirror_idem(
                                 existing_idem,
                                 wave,
                                 role,
                                 thread,
                                 completed.turn_start_seq,
                                 completed.turn_end_seq,
-                            ) && (exact
-                                || (body.as_str() == trimmed
-                                    && (legacy_min_at == 0 || env.at.0 >= legacy_min_at)))
-                            {
+                            )
+                        {
+                            if exact {
                                 already_posted = true;
                                 break;
                             }
-                            if backfill_failed_transiently
-                                && completed.turn_start_seq.is_none()
-                                && body.as_str() == trimmed
-                                && rex_wave_waves::is_ambiguous_legacy_bb_start_idem(
-                                    existing_idem,
-                                    wave,
-                                    role,
-                                    thread,
-                                    completed.turn_end_seq,
-                                )
+                            if body.as_str() == trimmed
+                                && (legacy_min_at == 0 || env.at.0 >= legacy_min_at)
                             {
-                                return;
+                                needs_shared_legacy_reconcile = true;
                             }
                         }
                     } else if env.by == worker_principal
@@ -3115,6 +3331,77 @@ impl BbBridge {
                 reached_end = true;
                 break;
             }
+        }
+
+        if !already_posted && reached_end && needs_shared_legacy_reconcile {
+            let (full_thread_rows, full_incomplete) = self
+                .fetch_all_thread_rows_through(
+                    thread,
+                    &working_rows,
+                    reached_origin,
+                    ever_connected,
+                )
+                .await;
+            if full_incomplete {
+                return;
+            }
+            let mut all_worker_posts = Vec::new();
+            let mut full_cursor = Seq::ORIGIN;
+            let mut full_room_end = false;
+            for _ in 0..MAX_RECONCILE_ROOM_PAGES {
+                let Ok(WireReply::Read(page)) = backend
+                    .call_as(
+                        sys.clone(),
+                        Read::stream(stream.clone(), full_cursor, Some(500)).into_wire(),
+                    )
+                    .await
+                else {
+                    return;
+                };
+                let Some(last) = page.entries.last() else {
+                    full_room_end = true;
+                    break;
+                };
+                full_cursor = last.seq;
+                let count = page.entries.len();
+                for env in &page.entries {
+                    if env.by != worker_principal {
+                        continue;
+                    }
+                    if let Event::Room(RoomEvent::Posted {
+                        body, idem, origin, ..
+                    }) = &env.event
+                    {
+                        let is_mirrored = *origin == rex_wave_api::room::PostOrigin::MirroredTurn
+                            || idem
+                                .as_ref()
+                                .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
+                        all_worker_posts.push(WorkerRoomPost {
+                            at: env.at,
+                            body: body.as_str().to_owned(),
+                            idem: idem.clone(),
+                            is_mirrored,
+                        });
+                    }
+                }
+                if count < 500 {
+                    full_room_end = true;
+                    break;
+                }
+            }
+            if !full_room_end {
+                return;
+            }
+            let all_turns =
+                inspect_all_unposted_completed_turns(&full_thread_rows, completed.turn_end_seq);
+            already_posted = reconcile_shared_legacy_mirror(
+                wave,
+                role,
+                thread,
+                &all_turns,
+                &all_worker_posts,
+                completed.turn_end_seq,
+            );
         }
 
         if already_posted || !reached_end {
@@ -7397,56 +7684,168 @@ mod tests {
             "data": { "status": "completed" }
         }));
 
-        let server_task = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let ws = ws::WsConn::accept(tcp, token).await.unwrap();
-            let (mut ws_reader, mut ws_writer) = ws.into_split();
-            ws_writer
-                .send_text(
-                    &serde_json::to_string(&protocol::Up::Hello {
-                        plugin_version: "0.1.0".into(),
-                        sdk_version: "0.6.132".into(),
-                    })
-                    .unwrap(),
-                )
-                .await
+        let mut early_msg_events = vec![
+            serde_json::json!({ "seq": 600u64, "createdAt": 100u64, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 601u64,
+                "createdAt": 110u64,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "Early message before tool output." } }
+            }),
+        ];
+        for s in 602u64..807u64 {
+            early_msg_events.push(serde_json::json!({
+                "seq": s,
+                "createdAt": 110u64 + (s - 601),
+                "type": "item/commandExecution/outputDelta",
+                "data": { "delta": "log line\n" }
+            }));
+        }
+        early_msg_events.push(serde_json::json!({
+            "seq": 807u64,
+            "createdAt": 999u64,
+            "type": "turn/completed",
+            "data": { "status": "completed" }
+        }));
+
+        let mut delta_disconnect_events = vec![
+            serde_json::json!({ "seq": 900u64, "createdAt": 100u64, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 901u64,
+                "createdAt": 101u64,
+                "type": "item/agentMessage/delta",
+                "data": { "delta": "Prefix " }
+            }),
+        ];
+        let mut full_delta_body = String::from("Prefix ");
+        for s in 902u64..1125u64 {
+            delta_disconnect_events.push(serde_json::json!({
+                "seq": s,
+                "createdAt": 101u64 + (s - 901),
+                "type": "item/agentMessage/delta",
+                "data": { "delta": "x" }
+            }));
+            full_delta_body.push('x');
+        }
+        delta_disconnect_events.push(serde_json::json!({
+            "seq": 1125u64,
+            "createdAt": 990u64,
+            "type": "item/agentMessage/delta",
+            "data": { "delta": " suffix" }
+        }));
+        full_delta_body.push_str(" suffix");
+        delta_disconnect_events.push(serde_json::json!({
+            "seq": 1126u64,
+            "createdAt": 999u64,
+            "type": "turn/completed",
+            "data": { "status": "completed" }
+        }));
+
+        let wave = WaveSlug::parse("ws-backfill").unwrap();
+        let proj = BbProjectId::parse("proj_backfill").unwrap();
+        let role_a = RoleName::parse("delayed-turn2").unwrap();
+        let role_b = RoleName::parse("same-turn1").unwrap();
+        let role_c = RoleName::parse("shared-s").unwrap();
+        let role_d = RoleName::parse("end-trunc").unwrap();
+        let role_e = RoleName::parse("early-msg").unwrap();
+        let role_f = RoleName::parse("disc-delta").unwrap();
+
+        let prefix_c_len = format!("wave:{wave}:turn:{role_c}:").len();
+        let tid_c_fill = 256 - prefix_c_len - 2 - "th_c_".len();
+        let tid_c = BbThreadId::parse(format!("th_c_{}", "z".repeat(tid_c_fill))).unwrap();
+        let trunc_c_s10 =
+            rex_wave_waves::legacy_truncated_mirror_idem_key(&wave, &role_c, &tid_c, "s10")
                 .unwrap();
-            while let Ok(Some(ws::WsInbound::Text(raw))) = ws_reader.recv().await {
-                let down: protocol::Down = serde_json::from_str(&raw).unwrap();
-                if let protocol::Down::EventsPage {
-                    req_id,
-                    thread_id,
-                    before_seq,
-                    limit,
-                    order,
-                    ..
-                } = down
-                {
-                    let source = if thread_id == "th_backfill_delayed" {
-                        &turn2_events
-                    } else {
-                        &single_long_turn_events
-                    };
-                    let mut filtered: Vec<serde_json::Value> = source
-                        .iter()
-                        .filter(|r| {
-                            let seq = r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-                            before_seq.is_none_or(|b| seq < b)
+        let trunc_c_s20 =
+            rex_wave_waves::legacy_truncated_mirror_idem_key(&wave, &role_c, &tid_c, "s20")
+                .unwrap();
+        assert_eq!(trunc_c_s10, trunc_c_s20);
+        assert!(trunc_c_s10.as_str().ends_with(":s"));
+
+        let prefix_d_len = format!("wave:{wave}:turn:{role_d}:").len();
+        let tid_d_fill = 256 - prefix_d_len - 3 - "th_d_".len();
+        let tid_d = BbThreadId::parse(format!("th_d_{}", "y".repeat(tid_d_fill))).unwrap();
+        let trunc_d_e525 =
+            rex_wave_waves::legacy_truncated_mirror_idem_key(&wave, &role_d, &tid_d, "e525")
+                .unwrap();
+        assert!(trunc_d_e525.as_str().ends_with(":e5"));
+
+        let tid_a = BbThreadId::parse("th_backfill_delayed").unwrap();
+        let tid_b = BbThreadId::parse("th_backfill_same").unwrap();
+        let tid_e = BbThreadId::parse("th_backfill_early_msg").unwrap();
+        let tid_f = BbThreadId::parse("th_backfill_disc_delta").unwrap();
+
+        let tid_c_srv = tid_c.to_string();
+        let tid_d_srv = tid_d.to_string();
+        let drop_next_backfill = Arc::new(AtomicBool::new(false));
+        let drop_srv = drop_next_backfill.clone();
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let ws = ws::WsConn::accept(tcp, token).await.unwrap();
+                let (mut ws_reader, mut ws_writer) = ws.into_split();
+                ws_writer
+                    .send_text(
+                        &serde_json::to_string(&protocol::Up::Hello {
+                            plugin_version: "0.1.0".into(),
+                            sdk_version: "0.6.132".into(),
                         })
-                        .cloned()
-                        .collect();
-                    if order == Some(protocol::EventsOrder::Desc) {
-                        filtered.reverse();
-                    }
-                    filtered.truncate(limit as usize);
-                    let reply = protocol::Up::Result {
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(ws::WsInbound::Text(raw))) = ws_reader.recv().await {
+                    let down: protocol::Down = serde_json::from_str(&raw).unwrap();
+                    if let protocol::Down::EventsPage {
                         req_id,
-                        ok: true,
-                        value: serde_json::Value::Array(filtered),
-                    };
-                    let _ = ws_writer
-                        .send_text(&serde_json::to_string(&reply).unwrap())
-                        .await;
+                        thread_id,
+                        before_seq,
+                        limit,
+                        order,
+                        ..
+                    } = down
+                    {
+                        if thread_id == "th_backfill_disc_delta"
+                            && before_seq.is_some()
+                            && drop_srv.swap(false, Ordering::SeqCst)
+                        {
+                            break;
+                        }
+                        let source = if thread_id == "th_backfill_delayed" || thread_id == tid_c_srv
+                        {
+                            &turn2_events
+                        } else if thread_id == "th_backfill_early_msg" {
+                            &early_msg_events
+                        } else if thread_id == "th_backfill_disc_delta" {
+                            &delta_disconnect_events
+                        } else {
+                            let _ = &tid_d_srv;
+                            &single_long_turn_events
+                        };
+                        let mut filtered: Vec<serde_json::Value> = source
+                            .iter()
+                            .filter(|r| {
+                                let seq = r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                                before_seq.is_none_or(|b| seq < b)
+                            })
+                            .cloned()
+                            .collect();
+                        if order == Some(protocol::EventsOrder::Desc) {
+                            filtered.reverse();
+                        }
+                        filtered.truncate(limit as usize);
+                        let reply = protocol::Up::Result {
+                            req_id,
+                            ok: true,
+                            value: serde_json::Value::Array(filtered),
+                        };
+                        let _ = ws_writer
+                            .send_text(&serde_json::to_string(&reply).unwrap())
+                            .await;
+                    }
                 }
             }
         });
@@ -7478,10 +7877,6 @@ mod tests {
         let owner = harness.client(Principal::Operator {
             seat: SeatName::parse("owner").unwrap(),
         });
-        let wave = WaveSlug::parse("ws-backfill").unwrap();
-        let proj = BbProjectId::parse("proj_backfill").unwrap();
-        let role_a = RoleName::parse("delayed-turn2").unwrap();
-        let role_b = RoleName::parse("same-turn1").unwrap();
 
         owner
             .call(WaveStart {
@@ -7499,24 +7894,17 @@ mod tests {
                         permission: PermissionMode::Full,
                         workspace: Workspace::ProjectDefault,
                     },
-                    workers: vec![
-                        WorkerSpec {
-                            role: role_a.clone(),
+                    workers: [&role_a, &role_b, &role_c, &role_d, &role_e, &role_f]
+                        .into_iter()
+                        .map(|r| WorkerSpec {
+                            role: r.clone(),
                             agent: None,
-                            brief: Body::parse("a").unwrap(),
+                            brief: Body::parse("work").unwrap(),
                             output_dir: None,
                             writes: Vec::new(),
                             return_schema: None,
-                        },
-                        WorkerSpec {
-                            role: role_b.clone(),
-                            agent: None,
-                            brief: Body::parse("b").unwrap(),
-                            output_dir: None,
-                            writes: Vec::new(),
-                            return_schema: None,
-                        },
-                    ],
+                        })
+                        .collect(),
                 },
                 idem: None,
             })
@@ -7532,9 +7920,14 @@ mod tests {
         .await
         .unwrap();
 
-        let tid_a = BbThreadId::parse("th_backfill_delayed").unwrap();
-        let tid_b = BbThreadId::parse("th_backfill_same").unwrap();
-        for (role, tid) in [(&role_a, &tid_a), (&role_b, &tid_b)] {
+        for (role, tid) in [
+            (&role_a, &tid_a),
+            (&role_b, &tid_b),
+            (&role_c, &tid_c),
+            (&role_d, &tid_d),
+            (&role_e, &tid_e),
+            (&role_f, &tid_f),
+        ] {
             let obs = Observation::Spawned {
                 attempt: 1,
                 thread: tid.clone(),
@@ -7565,17 +7958,13 @@ mod tests {
             .unwrap();
         }
 
-        let worker_a_p = Principal::Worker {
+        let worker_p = |r: &RoleName| Principal::Worker {
             wave: wave.clone(),
-            role: role_a.clone(),
-        };
-        let worker_b_p = Principal::Worker {
-            wave: wave.clone(),
-            role: role_b.clone(),
+            role: r.clone(),
         };
 
         harness
-            .client(worker_a_p.clone())
+            .client(worker_p(&role_a))
             .call(RoomPost {
                 room: RoomRef::Id { id: room.clone() },
                 body: Body::parse("Identical verdict.").unwrap(),
@@ -7590,7 +7979,7 @@ mod tests {
             .unwrap();
 
         harness
-            .client(worker_b_p.clone())
+            .client(worker_p(&role_b))
             .call(RoomPost {
                 room: RoomRef::Id { id: room.clone() },
                 body: Body::parse("Long single turn.").unwrap(),
@@ -7606,47 +7995,128 @@ mod tests {
             .await
             .unwrap();
 
-        let page1_a = bridge.fetch_recent_thread_rows(&tid_a).await;
-        assert_eq!(page1_a.len(), 200);
-        assert!(latest_completed_turn_missing_start_boundary(&page1_a).is_some());
+        harness
+            .client(worker_p(&role_c))
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("Identical verdict.").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: Some(trunc_c_s10),
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+
+        harness
+            .client(worker_p(&role_d))
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("Long single turn.").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: Some(trunc_d_e525),
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+
+        harness
+            .client(worker_p(&role_f))
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse(full_delta_body).unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: Some(
+                    rex_wave_waves::mirror_idem_key(&wave, &role_f, &tid_f, "s900").unwrap(),
+                ),
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+
+        for (role, tid) in [
+            (&role_a, &tid_a),
+            (&role_b, &tid_b),
+            (&role_c, &tid_c),
+            (&role_d, &tid_d),
+            (&role_e, &tid_e),
+        ] {
+            let page1 = bridge.fetch_recent_thread_rows(tid).await;
+            assert_eq!(page1.len(), 200);
+            bridge
+                .mirror_completed_turn_from_rows(&wave, role, tid, &page1)
+                .await;
+            bridge
+                .mirror_completed_turn_from_rows(&wave, role, tid, &page1)
+                .await;
+        }
+
+        let page1_f = bridge.fetch_recent_thread_rows(&tid_f).await;
+        assert_eq!(page1_f.len(), 200);
+        drop_next_backfill.store(true, Ordering::SeqCst);
         bridge
-            .mirror_completed_turn_from_rows(&wave, &role_a, &tid_a, &page1_a)
+            .mirror_completed_turn_from_rows(&wave, &role_f, &tid_f, &page1_f)
             .await;
 
-        let page1_b = bridge.fetch_recent_thread_rows(&tid_b).await;
-        assert_eq!(page1_b.len(), 200);
-        assert!(latest_completed_turn_missing_start_boundary(&page1_b).is_some());
+        let (wc_tx2, wc_rx2) = oneshot::channel();
         bridge
-            .mirror_completed_turn_from_rows(&wave, &role_b, &tid_b, &page1_b)
+            .owner
+            .send(OwnerMsg::WaitConnected { reply: wc_tx2 })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wc_rx2)
+            .await
+            .unwrap()
+            .unwrap();
+        bridge
+            .mirror_completed_turn_from_rows(&wave, &role_f, &tid_f, &page1_f)
             .await;
 
         let read_page = owner
-            .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+            .call(Read::stream(
+                StreamId::Room { room },
+                Seq::ORIGIN,
+                Some(100),
+            ))
             .await
             .unwrap();
-        let posts_a: Vec<_> = read_page
-            .entries
-            .iter()
-            .filter(|e| {
-                e.by == worker_a_p && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
-            })
-            .collect();
-        let posts_b: Vec<_> = read_page
-            .entries
-            .iter()
-            .filter(|e| {
-                e.by == worker_b_p && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
-            })
-            .collect();
+        let count_for = |r: &RoleName| -> usize {
+            let p = worker_p(r);
+            read_page
+                .entries
+                .iter()
+                .filter(|e| e.by == p && matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
+                .count()
+        };
+
+        assert_eq!(count_for(&role_a), 2, "untruncated s10 vs backfilled s20");
+        assert_eq!(count_for(&role_b), 1, "untruncated s300 deduped");
         assert_eq!(
-            posts_a.len(),
+            count_for(&role_c),
             2,
-            "delayed s10 legacy mirror (journaled at 1000, 1ms after e241 at 999) must not suppress s20..e241 once s20 is backfilled from BB history"
+            "shared 256-byte ':s' truncation reconciled across T1 and T2"
         );
         assert_eq!(
-            posts_b.len(),
+            count_for(&role_d),
             1,
-            "pre-upgrade s300 legacy mirror on 225-event turn must deduplicate once s300 is backfilled from BB history"
+            "identifiable ':e5' legacy end-key still matches after s300 backfill"
+        );
+        assert_eq!(
+            count_for(&role_e),
+            1,
+            "final agentMessage outside newest 200 events backfills before Ignore"
+        );
+        assert_eq!(
+            count_for(&role_f),
+            1,
+            "disconnect during older-page backfill never publishes partial delta suffix"
         );
 
         let _ = shutdown_tx.send(true);
