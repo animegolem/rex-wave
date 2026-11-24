@@ -1100,9 +1100,11 @@ impl T3Bridge {
         let stream = StreamId::Room { room: room.clone() };
         let mut cursor = watermark;
         let mut room_head = watermark;
+        let mut safe_watermark = watermark;
+        let mut watermark_pinned = false;
         let completed = match check {
             TurnMirrorCheck::Ignore => return,
-            TurnMirrorCheck::PostedViaTool => {
+            TurnMirrorCheck::PostedViaTool { run_end_at } => {
                 let mut tool_reached_end = false;
                 loop {
                     let Ok(WireReply::Read(page)) = backend
@@ -1122,7 +1124,19 @@ impl T3Bridge {
                         break;
                     }
                     cursor = last.seq;
-                    room_head = last.seq;
+                    for env in &page.entries {
+                        if env.by == worker_principal
+                            && let Event::Room(RoomEvent::Posted { origin, .. }) = &env.event
+                            && *origin != rex_wave_api::room::PostOrigin::MirroredTurn
+                            && run_end_at > 0
+                            && env.at.0 > run_end_at
+                        {
+                            watermark_pinned = true;
+                        }
+                        if !watermark_pinned {
+                            safe_watermark = env.seq;
+                        }
+                    }
                     if page.entries.len() < 500 {
                         tool_reached_end = true;
                         break;
@@ -1133,7 +1147,7 @@ impl T3Bridge {
                         wave: wave.clone(),
                         role: role.clone(),
                         thread: thread.clone(),
-                        seq: room_head,
+                        seq: safe_watermark,
                     });
                 }
                 return;
@@ -1169,17 +1183,31 @@ impl T3Bridge {
             room_head = last.seq;
             let count = page.entries.len();
             for env in &page.entries {
-                if let Event::Room(RoomEvent::Posted { idem, .. }) = &env.event {
+                if let Event::Room(RoomEvent::Posted { idem, origin, .. }) = &env.event {
                     if idem.as_ref() == Some(&idem_key) {
+                        if !watermark_pinned {
+                            safe_watermark = env.seq;
+                        }
                         already_posted = true;
                         break;
                     }
-                    if env.by == worker_principal
+                    if *origin != rex_wave_api::room::PostOrigin::MirroredTurn
+                        && env.by == worker_principal
                         && (completed.run_start_at == 0 || env.at.0 >= completed.run_start_at)
                     {
-                        already_posted = true;
-                        break;
+                        if completed.run_end_at > 0 && env.at.0 > completed.run_end_at {
+                            watermark_pinned = true;
+                        } else {
+                            if !watermark_pinned {
+                                safe_watermark = env.seq;
+                            }
+                            already_posted = true;
+                            break;
+                        }
                     }
+                }
+                if !watermark_pinned {
+                    safe_watermark = env.seq;
                 }
             }
             if already_posted {
@@ -1200,7 +1228,7 @@ impl T3Bridge {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
-                seq: room_head,
+                seq: safe_watermark,
             });
             return;
         }
@@ -1244,10 +1272,11 @@ impl T3Bridge {
             other => other,
         };
         if let Ok(WireReply::RoomPost(posted)) = post_res {
-            let posted_head = if posted.seq.0 == room_head.0.saturating_add(1) {
+            let posted_head = if !watermark_pinned && posted.seq.0 == room_head.0.saturating_add(1)
+            {
                 posted.seq
             } else {
-                room_head
+                safe_watermark
             };
             let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                 wave: wave.clone(),

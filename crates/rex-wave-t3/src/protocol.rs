@@ -1021,13 +1021,14 @@ pub fn parse_provider_turns_usage(projection: &Value) -> Option<ThreadContextUsa
 pub struct CompletedTurn {
     pub anchor: String,
     pub run_start_at: u64,
+    pub run_end_at: u64,
     pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnMirrorCheck {
     Ignore,
-    PostedViaTool,
+    PostedViaTool { run_end_at: u64 },
     Unposted(CompletedTurn),
 }
 
@@ -1046,7 +1047,7 @@ pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
             .max_by_key(|r| r.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0))
     });
 
-    let (target_run_id, run_start_at) = if let Some(run) = latest_run {
+    let (target_run_id, run_start_at, run_end_at) = if let Some(run) = latest_run {
         let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status != "completed" {
             return TurnMirrorCheck::Ignore;
@@ -1057,9 +1058,15 @@ pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
             .or_else(|| run.get("createdAt"))
             .map(parse_timestamp_ms)
             .map_or(0, |u| u.0);
-        (id, started)
+        let ended = run
+            .get("completedAt")
+            .or_else(|| run.get("endedAt"))
+            .or_else(|| run.get("updatedAt"))
+            .map(parse_timestamp_ms)
+            .map_or(0, |u| u.0);
+        (id, started, ended)
     } else {
-        (None, 0)
+        (None, 0, 0)
     };
 
     let mut ordered: Vec<&Value> = items.iter().collect();
@@ -1104,7 +1111,7 @@ pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
                 .and_then(|v| v.as_str())
                 == Some("dm");
             if !is_dm {
-                return TurnMirrorCheck::PostedViaTool;
+                return TurnMirrorCheck::PostedViaTool { run_end_at };
             }
         }
     }
@@ -1153,6 +1160,7 @@ pub fn inspect_latest_completed_turn(projection: &Value) -> TurnMirrorCheck {
     TurnMirrorCheck::Unposted(CompletedTurn {
         anchor,
         run_start_at,
+        run_end_at,
         text,
     })
 }
