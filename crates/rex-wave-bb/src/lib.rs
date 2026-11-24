@@ -1013,6 +1013,69 @@ fn is_nonmirrorable_completion_row(row: &serde_json::Value) -> bool {
     is_failed_completion_status(status) || extract_refusal_from_row(row).is_some()
 }
 
+fn is_nonmirrorable_turn_window(turn_window: &[&serde_json::Value]) -> bool {
+    let Some(&end_row) = turn_window.last() else {
+        return true;
+    };
+    if is_nonmirrorable_completion_row(end_row) {
+        return true;
+    }
+    let start_idx = turn_window
+        .iter()
+        .rposition(|r| {
+            matches!(
+                r.get("type").and_then(|v| v.as_str()),
+                Some("turn/started" | "client/turn/start")
+            )
+        })
+        .unwrap_or(0);
+    turn_window[start_idx..]
+        .iter()
+        .any(|r| !is_retrying_provider_error(r) && extract_refusal_from_row(r).is_some())
+}
+
+fn rows_before_terminal_turn(rows: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let ordered = sort_and_dedup_thread_rows(rows);
+    if ordered.is_empty() {
+        return Vec::new();
+    }
+    let last_completed = ordered
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
+    let cut_idx = match last_completed {
+        Some(end_idx) if end_idx + 1 == ordered.len() => {
+            let prev_end = ordered[..end_idx]
+                .iter()
+                .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
+            let search_from = prev_end.map_or(0, |i| i + 1);
+            ordered[search_from..=end_idx]
+                .iter()
+                .rposition(|r| {
+                    matches!(
+                        r.get("type").and_then(|v| v.as_str()),
+                        Some("turn/started" | "client/turn/start")
+                    )
+                })
+                .map_or(search_from, |rel| search_from + rel)
+        }
+        Some(end_idx) => end_idx + 1,
+        None => 0,
+    };
+    let end_exclusive = if cut_idx < ordered.len()
+        && matches!(
+            ordered[cut_idx].get("type").and_then(|v| v.as_str()),
+            Some("turn/started" | "client/turn/start")
+        ) {
+        cut_idx + 1
+    } else {
+        cut_idx
+    };
+    ordered[..end_exclusive]
+        .iter()
+        .map(|r| (*r).clone())
+        .collect()
+}
+
 fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
     if rows.is_empty() {
         return None;
@@ -1021,7 +1084,11 @@ fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
     let end_idx = ordered
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
-    if is_nonmirrorable_completion_row(ordered[end_idx]) {
+    let turn_floor_idx = ordered[..end_idx]
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+        .map_or(0, |idx| idx + 1);
+    if is_nonmirrorable_turn_window(&ordered[turn_floor_idx..=end_idx]) {
         return None;
     }
     Some(
@@ -1050,11 +1117,11 @@ fn nonfailed_turn_completions_in_order(rows: &[serde_json::Value]) -> Vec<(u64, 
         .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
         .find(|&at| at > 0);
     let mut out = Vec::new();
-    for (seg_idx, &(_, end_idx)) in segments.iter().enumerate() {
-        let end_row = ordered[end_idx];
-        if is_nonmirrorable_completion_row(end_row) {
+    for (seg_idx, &(s_idx, end_idx)) in segments.iter().enumerate() {
+        if is_nonmirrorable_turn_window(&ordered[s_idx..=end_idx]) {
             continue;
         }
+        let end_row = ordered[end_idx];
         let end_seq = end_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
         let next_start_at = segments
             .get(seg_idx + 1)
@@ -1078,13 +1145,13 @@ fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> O
     let end_idx = ordered
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))?;
-    if is_nonmirrorable_completion_row(ordered[end_idx]) {
-        return None;
-    }
     let prev_end_idx = ordered[..end_idx]
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"));
     if prev_end_idx.is_some() {
+        return None;
+    }
+    if is_nonmirrorable_turn_window(&ordered[..=end_idx]) {
         return None;
     }
     let has_start = ordered[..=end_idx].iter().any(|r| {
@@ -1106,7 +1173,7 @@ fn inspect_turn_window(turn_window: &[&serde_json::Value]) -> TurnMirrorCheck {
     let Some(&end_row) = turn_window.last() else {
         return TurnMirrorCheck::Ignore;
     };
-    if is_nonmirrorable_completion_row(end_row) {
+    if is_nonmirrorable_turn_window(turn_window) {
         return TurnMirrorCheck::Ignore;
     }
     let turn_end_seq = end_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2971,13 +3038,15 @@ impl BbBridge {
                             .map(str::to_owned)
                             .or_else(|| refusal_from_latest_turn(&rows));
                         if let Some(reason) = refusal_reason {
-                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                wave: wave.clone(),
-                                role: role.clone(),
-                                thread: thread.clone(),
-                                since_end_seq: None,
-                                mark_unknown_dirty: false,
-                            });
+                            let prior_rows = rows_before_terminal_turn(&rows);
+                            let _ = self
+                                .mirror_outstanding_turns_from_tail(
+                                    &wave,
+                                    &role,
+                                    &thread,
+                                    &prior_rows,
+                                )
+                                .await;
                             if self.is_current_live_thread(&wave, &role, &thread).await {
                                 self.call_wave_observe(
                                     wave,
@@ -3020,14 +3089,37 @@ impl BbBridge {
                             .as_deref()
                             .is_some_and(rex_wave_api::wave::is_refusal_stop_reason)
                             || rex_wave_api::wave::is_refusal_error_text(&msg);
-                        let row_refusal = if !is_direct_refusal {
-                            let rows = self.fetch_recent_thread_rows(&thread).await;
-                            let (rm, ra) = extract_runtime_meta_from_rows(&rows);
-                            final_model = final_model.or(rm);
-                            final_account = final_account.or(ra);
-                            refusal_from_latest_turn(&rows)
-                        } else {
-                            None
+                        let row_refusal = match self.fetch_recent_thread_rows_checked(&thread).await
+                        {
+                            Ok(rows) => {
+                                let (rm, ra) = extract_runtime_meta_from_rows(&rows);
+                                final_model = final_model.or(rm);
+                                final_account = final_account.or(ra);
+                                let prior_rows = rows_before_terminal_turn(&rows);
+                                let _ = self
+                                    .mirror_outstanding_turns_from_tail(
+                                        &wave,
+                                        &role,
+                                        &thread,
+                                        &prior_rows,
+                                    )
+                                    .await;
+                                if is_direct_refusal {
+                                    None
+                                } else {
+                                    refusal_from_latest_turn(&rows)
+                                }
+                            }
+                            Err(_) => {
+                                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                    wave: wave.clone(),
+                                    role: role.clone(),
+                                    thread: thread.clone(),
+                                    since_end_seq: None,
+                                    mark_unknown_dirty: true,
+                                });
+                                None
+                            }
                         };
                         self.observe_runtime_meta_if_present(
                             &wave,
@@ -3223,6 +3315,7 @@ impl BbBridge {
         Ok(rows_val.as_array().cloned().unwrap_or_default())
     }
 
+    #[cfg(test)]
     async fn fetch_recent_thread_rows(&self, thread: &BbThreadId) -> Vec<serde_json::Value> {
         self.fetch_recent_thread_rows_checked(thread)
             .await
@@ -3551,6 +3644,7 @@ impl BbBridge {
             }
             return true;
         };
+        let allow_watermark_advance = clear_pending_on_settle && next_turn_start_at.is_none();
         let mark_pending = || {
             let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                 wave: wave.clone(),
@@ -3561,18 +3655,24 @@ impl BbBridge {
             });
             false
         };
-        let settle_without_post = |seq: Seq, end_seq: Option<u64>, anchor: Option<String>| {
-            let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-                seq,
-                end_seq,
-                anchor,
-                clear_pending: clear_pending_on_settle,
-            });
-            true
-        };
+        let settle_without_post =
+            |seq: Seq, watermark_floor: Seq, end_seq: Option<u64>, anchor: Option<String>| {
+                let next_seq = if allow_watermark_advance {
+                    seq
+                } else {
+                    watermark_floor
+                };
+                let _ = self.owner.send(OwnerMsg::AdvanceMirrorWatermark {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    seq: next_seq,
+                    end_seq,
+                    anchor,
+                    clear_pending: clear_pending_on_settle,
+                });
+                true
+            };
 
         let Some(backend) = self.backend.get() else {
             return mark_pending();
@@ -3586,7 +3686,7 @@ impl BbBridge {
         {
             Ok(WireReply::WaveView(snap)) => snap,
             Err(ApiError::NotFound { .. }) => {
-                return settle_without_post(Seq::ORIGIN, None, None);
+                return settle_without_post(Seq::ORIGIN, Seq::ORIGIN, None, None);
             }
             _ => return mark_pending(),
         };
@@ -3615,6 +3715,7 @@ impl BbBridge {
         if already_mirrored {
             return settle_without_post(
                 watermark,
+                watermark,
                 (end_seq_hint > 0).then_some(end_seq_hint),
                 (!anchor_hint.is_empty()).then_some(anchor_hint),
             );
@@ -3634,6 +3735,7 @@ impl BbBridge {
         let completed = match check {
             TurnMirrorCheck::Ignore => {
                 return settle_without_post(
+                    watermark,
                     watermark,
                     (end_seq_hint > 0).then_some(end_seq_hint),
                     (!anchor_hint.is_empty()).then_some(anchor_hint),
@@ -3670,6 +3772,7 @@ impl BbBridge {
                 }
                 return settle_without_post(
                     room_head,
+                    watermark,
                     (end_seq_hint > 0).then_some(end_seq_hint),
                     (!anchor_hint.is_empty()).then_some(anchor_hint),
                 );
@@ -3680,6 +3783,7 @@ impl BbBridge {
         let Ok(idem_key) = rex_wave_waves::mirror_idem_key(wave, role, thread, &completed.anchor)
         else {
             return settle_without_post(
+                watermark,
                 watermark,
                 (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
                 Some(completed.anchor),
@@ -3852,6 +3956,7 @@ impl BbBridge {
         if already_posted {
             return settle_without_post(
                 room_head,
+                watermark,
                 (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
                 Some(completed.anchor),
             );
@@ -3860,6 +3965,7 @@ impl BbBridge {
         let Ok(body) = Body::parse(trimmed) else {
             return settle_without_post(
                 room_head,
+                watermark,
                 (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
                 Some(completed.anchor),
             );
@@ -3899,8 +4005,14 @@ impl BbBridge {
             other => other,
         };
         if let Ok(WireReply::RoomPost(posted)) = post_res {
+            let posted_head = if posted.seq.0 == room_head.0.saturating_add(1) {
+                posted.seq
+            } else {
+                room_head
+            };
             return settle_without_post(
-                posted.seq.max(room_head),
+                posted_head,
+                watermark,
                 (completed.turn_end_seq > 0).then_some(completed.turn_end_seq),
                 Some(completed.anchor),
             );
@@ -4073,9 +4185,18 @@ impl BbBridge {
                                     reached_turn_start = true;
                                 }
                             }
+                            let latest_failed = matches!(
+                                derive_latest_turn_activity(&collected_rows),
+                                Some(Activity::Errored { .. } | Activity::Refused { .. })
+                            );
+                            let saw_nonfailed_completion =
+                                !nonfailed_turn_completions_in_order(&collected_rows).is_empty();
                             let covered_pending = pending_mirror_since
                                 .is_none_or(|pend| before_seq.is_some_and(|b| b <= pend));
-                            if (reached_turn_start && covered_pending)
+                            let ready_to_stop = reached_turn_start
+                                && covered_pending
+                                && (!latest_failed || saw_nonfailed_completion);
+                            if ready_to_stop
                                 || count < 200
                                 || before_seq == prev_before
                                 || (pages >= 4 && pending_mirror_since.is_none())
@@ -4134,79 +4255,71 @@ impl BbBridge {
                 derived_activity = None;
             }
 
-            if !suppress_historical_completions {
-                let floor = match (pending_mirror_since, initial_cursor, last_mirrored_end_seq) {
-                    (Some(pend), Some(cur), _) => cur.min(pend.saturating_sub(1)),
-                    (Some(pend), None, last_m) => {
-                        if last_m > 0 {
-                            last_m.min(pend.saturating_sub(1))
-                        } else {
-                            pend.saturating_sub(1)
-                        }
+            let floor = match (pending_mirror_since, initial_cursor, last_mirrored_end_seq) {
+                (Some(pend), Some(cur), _) => cur.min(pend.saturating_sub(1)),
+                (Some(pend), None, last_m) => {
+                    if last_m > 0 {
+                        last_m.min(pend.saturating_sub(1))
+                    } else {
+                        pend.saturating_sub(1)
                     }
-                    (None, Some(cur), last_m) => {
-                        if last_m > 0 {
-                            cur.min(last_m)
-                        } else {
-                            cur
-                        }
+                }
+                (None, Some(cur), last_m) => {
+                    if last_m > 0 {
+                        cur.min(last_m)
+                    } else {
+                        cur
                     }
-                    (None, None, last_m) => last_m,
-                };
-                let completions: Vec<(u64, Option<u64>)> = if had_prev_cursor
-                    || pending_mirror_since.is_some()
-                    || matches!(derived_activity, Some(Activity::Idle))
-                {
-                    nonfailed_turn_completions_in_order(&collected_rows)
-                        .into_iter()
-                        .filter(|&(end_seq, _)| end_seq > floor)
+                }
+                (None, None, last_m) => last_m,
+            };
+            let completions: Vec<(u64, Option<u64>)> =
+                nonfailed_turn_completions_in_order(&collected_rows)
+                    .into_iter()
+                    .filter(|&(end_seq, _)| end_seq > floor)
+                    .collect();
+            let total = completions.len();
+            for (idx, (target_end_seq, next_start_at)) in completions.into_iter().enumerate() {
+                let is_last = idx + 1 == total;
+                let prefix_rows: Vec<serde_json::Value> = if target_end_seq > 0 {
+                    collected_rows
+                        .iter()
+                        .filter(|r| {
+                            r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) <= target_end_seq
+                        })
+                        .cloned()
                         .collect()
                 } else {
-                    Vec::new()
+                    collected_rows.clone()
                 };
-                let total = completions.len();
-                for (idx, (target_end_seq, next_start_at)) in completions.into_iter().enumerate() {
-                    let is_last = idx + 1 == total;
-                    let prefix_rows: Vec<serde_json::Value> = if target_end_seq > 0 {
-                        collected_rows
-                            .iter()
-                            .filter(|r| {
-                                r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) <= target_end_seq
-                            })
-                            .cloned()
-                            .collect()
-                    } else {
-                        collected_rows.clone()
-                    };
-                    if !self
-                        .mirror_completed_turn_from_rows_inner(
-                            &wave,
-                            &role,
-                            &thread,
-                            &prefix_rows,
-                            next_start_at,
-                            is_last,
-                        )
-                        .await
-                    {
-                        continue 'workers;
-                    }
-                    if target_end_seq > 0 {
-                        let _ = self.owner.send(OwnerMsg::AdvanceSeq {
-                            thread: thread.clone(),
-                            seq: target_end_seq,
-                        });
-                    }
+                if !self
+                    .mirror_completed_turn_from_rows_inner(
+                        &wave,
+                        &role,
+                        &thread,
+                        &prefix_rows,
+                        next_start_at,
+                        is_last,
+                    )
+                    .await
+                {
+                    continue 'workers;
                 }
-                if total == 0 && pending_mirror_since.is_some() {
-                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                        wave: wave.clone(),
-                        role: role.clone(),
+                if target_end_seq > 0 {
+                    let _ = self.owner.send(OwnerMsg::AdvanceSeq {
                         thread: thread.clone(),
-                        since_end_seq: None,
-                        mark_unknown_dirty: false,
+                        seq: target_end_seq,
                     });
                 }
+            }
+            if total == 0 && pending_mirror_since.is_some() {
+                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    since_end_seq: None,
+                    mark_unknown_dirty: false,
+                });
             }
 
             if let Some(activity) = derived_activity
@@ -9623,5 +9736,612 @@ mod tests {
             2,
             "distinct second turn with identical text must still publish once past 8,001 room posts"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_final_turn_still_mirrors_earlier_successful_reply_on_restart() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "tok_failed_tail_restart";
+
+        let mut short_fail_events = vec![
+            serde_json::json!({ "seq": 905u64, "createdAt": 100u64, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 906u64,
+                "createdAt": 101u64,
+                "type": "item/agentMessage/delta",
+                "data": { "delta": "Prefix " }
+            }),
+        ];
+        let mut full_delta_body = String::from("Prefix ");
+        for s in 907u64..1125u64 {
+            short_fail_events.push(serde_json::json!({
+                "seq": s,
+                "createdAt": 101u64 + (s - 906),
+                "type": "item/agentMessage/delta",
+                "data": { "delta": "x" }
+            }));
+            full_delta_body.push('x');
+        }
+        short_fail_events.push(serde_json::json!({
+            "seq": 1125u64,
+            "createdAt": 990u64,
+            "type": "item/agentMessage/delta",
+            "data": { "delta": " suffix" }
+        }));
+        full_delta_body.push_str(" suffix");
+        short_fail_events.push(serde_json::json!({
+            "seq": 1126u64,
+            "createdAt": 999u64,
+            "type": "turn/completed",
+            "data": { "status": "completed" }
+        }));
+        let mut long_fail_events = short_fail_events.clone();
+        let live_fail_events = {
+            let mut v = short_fail_events.clone();
+            v.push(serde_json::json!({
+                "seq": 1127u64,
+                "createdAt": 1_010u64,
+                "type": "turn/started",
+                "data": {}
+            }));
+            v.push(serde_json::json!({
+                "seq": 1128u64,
+                "createdAt": 1_012u64,
+                "type": "turn/completed",
+                "data": { "status": "failed", "error": { "message": "upstream timeout" } }
+            }));
+            v
+        };
+        short_fail_events.push(serde_json::json!({
+            "seq": 1127u64,
+            "createdAt": 1_010u64,
+            "type": "turn/started",
+            "data": {}
+        }));
+        short_fail_events.push(serde_json::json!({
+            "seq": 1128u64,
+            "createdAt": 1_012u64,
+            "type": "turn/completed",
+            "data": { "status": "failed", "error": { "message": "upstream timeout" } }
+        }));
+
+        long_fail_events.push(serde_json::json!({
+            "seq": 1127u64,
+            "createdAt": 1_010u64,
+            "type": "turn/started",
+            "data": {}
+        }));
+        for s in 1128u64..1330u64 {
+            long_fail_events.push(serde_json::json!({
+                "seq": s,
+                "createdAt": 1_010u64 + (s - 1127),
+                "type": "item/commandExecution/outputDelta",
+                "data": { "delta": "stderr\n" }
+            }));
+        }
+        long_fail_events.push(serde_json::json!({
+            "seq": 1330u64,
+            "createdAt": 1_300u64,
+            "type": "turn/completed",
+            "data": { "status": "failed", "error": { "message": "long turn crashed" } }
+        }));
+
+        let wave = WaveSlug::parse("failed-tail-restart").unwrap();
+        let proj = BbProjectId::parse("proj_failed_tail").unwrap();
+        let role_short = RoleName::parse("short-fail").unwrap();
+        let role_long = RoleName::parse("long-fail").unwrap();
+        let role_live = RoleName::parse("live-fail").unwrap();
+        let tid_short = BbThreadId::parse("th_short_fail").unwrap();
+        let tid_long = BbThreadId::parse("th_long_fail").unwrap();
+        let tid_live = BbThreadId::parse("th_live_fail").unwrap();
+
+        let mut events_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        events_map.insert(tid_short.to_string(), short_fail_events);
+        events_map.insert(tid_long.to_string(), long_fail_events);
+        events_map.insert(tid_live.to_string(), live_fail_events);
+        let events_map = Arc::new(events_map);
+
+        let server_task = tokio::spawn({
+            let events_map = events_map.clone();
+            async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let Ok(ws) = ws::WsConn::accept(tcp, token).await else {
+                        continue;
+                    };
+                    let (mut ws_reader, mut ws_writer) = ws.into_split();
+                    let hello = protocol::Up::Hello {
+                        plugin_version: "0.1.0".into(),
+                        sdk_version: "0.6.132".into(),
+                    };
+                    let _ = ws_writer
+                        .send_text(&serde_json::to_string(&hello).unwrap())
+                        .await;
+                    while let Ok(Some(ws::WsInbound::Text(raw))) = ws_reader.recv().await {
+                        let Ok(down) = serde_json::from_str::<protocol::Down>(&raw) else {
+                            continue;
+                        };
+                        if let protocol::Down::EventsPage {
+                            req_id,
+                            thread_id,
+                            after_seq,
+                            before_seq,
+                            limit,
+                            order,
+                        } = down
+                        {
+                            let mut rows: Vec<serde_json::Value> = events_map
+                                .get(&thread_id)
+                                .cloned()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|r| {
+                                    let s = r["seq"].as_u64().unwrap_or(0);
+                                    after_seq.is_none_or(|a| s > a)
+                                        && before_seq.is_none_or(|b| s < b)
+                                })
+                                .collect();
+                            if matches!(order, Some(protocol::EventsOrder::Desc)) {
+                                rows.reverse();
+                            }
+                            rows.truncate(limit as usize);
+                            let reply = protocol::Up::Result {
+                                req_id,
+                                ok: true,
+                                value: serde_json::Value::Array(rows),
+                            };
+                            let _ = ws_writer
+                                .send_text(&serde_json::to_string(&reply).unwrap())
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: format!("ws://{addr}/bridge"),
+                token: token.into(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let sys = harness.client(Principal::System {
+            part: SystemPart::WaveConductor,
+        });
+        let owner = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+
+        owner
+            .call(WaveStart {
+                spec: WaveSpec {
+                    slug: wave.clone(),
+                    project: proj.clone(),
+                    goal: Body::parse("settle earlier reply before failed final turn").unwrap(),
+                    output_dir: None,
+                    defaults: AgentSpec {
+                        provider: ProviderId::parse("pi").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::Full,
+                        workspace: Workspace::ProjectDefault,
+                    },
+                    workers: [&role_short, &role_long, &role_live]
+                        .into_iter()
+                        .map(|r| WorkerSpec {
+                            role: r.clone(),
+                            agent: None,
+                            brief: Body::parse("reply").unwrap(),
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
+                        })
+                        .collect(),
+                },
+                idem: None,
+            })
+            .await
+            .unwrap();
+
+        let room = rex_wave_waves::wave_room(&wave, &proj);
+        sys.call(RoomEnsure {
+            room: RoomRef::Id { id: room.clone() },
+            topic: None,
+            origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
+        })
+        .await
+        .unwrap();
+
+        for (role, tid) in [(&role_short, &tid_short), (&role_long, &tid_long)] {
+            let spawned = Observation::Spawned {
+                attempt: 1,
+                thread: tid.clone(),
+            };
+            sys.call(WaveObserve {
+                wave: wave.clone(),
+                role: role.clone(),
+                observation: spawned.clone(),
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role: role.clone(),
+                    observation: spawned,
+                },
+            );
+            sys.call(RoomJoin {
+                room: RoomRef::Id { id: room.clone() },
+                member: Some(Principal::Worker {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                }),
+                handle: Handle::parse(role.as_str()).ok(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bridge_runner = tokio::spawn({
+            let bridge = bridge.clone();
+            let harness = harness.clone();
+            async move { bridge.run_until(harness, shutdown_rx).await }
+        });
+        let (wc_tx, wc_rx) = oneshot::channel();
+        bridge
+            .owner
+            .send(OwnerMsg::WaitConnected { reply: wc_tx })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wc_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        bridge.reconcile_live_workers().await;
+        bridge.reconcile_live_workers().await;
+
+        let spawned_live = Observation::Spawned {
+            attempt: 1,
+            thread: tid_live.clone(),
+        };
+        sys.call(WaveObserve {
+            wave: wave.clone(),
+            role: role_live.clone(),
+            observation: spawned_live.clone(),
+        })
+        .await
+        .unwrap();
+        bridge.observe_wave_event(
+            wave.clone(),
+            WaveEvent::WorkerObserved {
+                role: role_live.clone(),
+                observation: spawned_live,
+            },
+        );
+        sys.call(RoomJoin {
+            room: RoomRef::Id { id: room.clone() },
+            member: Some(Principal::Worker {
+                wave: wave.clone(),
+                role: role_live.clone(),
+            }),
+            handle: Handle::parse(role_live.as_str()).ok(),
+        })
+        .await
+        .unwrap();
+        bridge
+            .on_thread_signal(protocol::Up::Thread {
+                signal: protocol::ThreadSignal::Failed,
+                thread_id: tid_live.to_string(),
+                project_id: proj.to_string(),
+                meta: None,
+                error: Some("upstream timeout".into()),
+                stop_reason: None,
+                model: None,
+                account: None,
+            })
+            .await;
+
+        let read_page = owner
+            .call(Read::stream(
+                StreamId::Room { room },
+                Seq::ORIGIN,
+                Some(100),
+            ))
+            .await
+            .unwrap();
+        let snap = owner.call(WaveView { wave: wave.clone() }).await.unwrap();
+        for (label, role) in [
+            ("short-fail", &role_short),
+            ("long-fail", &role_long),
+            ("live-fail", &role_live),
+        ] {
+            let p = Principal::Worker {
+                wave: wave.clone(),
+                role: role.clone(),
+            };
+            let bodies: Vec<&str> = read_page
+                .entries
+                .iter()
+                .filter(|e| e.by == p)
+                .filter_map(|e| match &e.event {
+                    Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                bodies,
+                vec![full_delta_body.as_str()],
+                "{label}: earlier completed reply must publish once even when final turn failed"
+            );
+            let errored = snap
+                .workers
+                .iter()
+                .find(|(r, _, _)| r == role)
+                .is_some_and(|(_, _, phase)| phase.error().is_some());
+            assert!(
+                errored,
+                "{label}: worker must report Errored for failed final turn"
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = bridge_runner.await;
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_post_during_second_turn_does_not_duplicate_when_first_turn_mirrors() {
+        let bridge = BbBridge::with_data_dir(
+            BridgeConfig {
+                url: "ws://127.0.0.1:9/unused".into(),
+                token: String::new(),
+            },
+            None,
+        );
+        let (harness, _frame_rx) = LoopbackHarness::new(bridge.clone());
+        let _ = bridge.backend.set(Arc::new(harness.clone()));
+        let sys = harness.client(Principal::System {
+            part: SystemPart::WaveConductor,
+        });
+        let owner = harness.client(Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        });
+        let wave = WaveSlug::parse("direct-second-turn").unwrap();
+        let proj = BbProjectId::parse("proj_direct_second").unwrap();
+        let role_batch = RoleName::parse("batch-w").unwrap();
+        let role_stream = RoleName::parse("stream-w").unwrap();
+        let tid_batch = BbThreadId::parse("th_batch_w").unwrap();
+        let tid_stream = BbThreadId::parse("th_stream_w").unwrap();
+
+        owner
+            .call(WaveStart {
+                spec: WaveSpec {
+                    slug: wave.clone(),
+                    project: proj.clone(),
+                    goal: Body::parse(
+                        "preserve room watermark until all outstanding turns check direct posts",
+                    )
+                    .unwrap(),
+                    output_dir: None,
+                    defaults: AgentSpec {
+                        provider: ProviderId::parse("pi").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::Full,
+                        workspace: Workspace::ProjectDefault,
+                    },
+                    workers: [&role_batch, &role_stream]
+                        .into_iter()
+                        .map(|r| WorkerSpec {
+                            role: r.clone(),
+                            agent: None,
+                            brief: Body::parse("work").unwrap(),
+                            output_dir: None,
+                            writes: Vec::new(),
+                            return_schema: None,
+                        })
+                        .collect(),
+                },
+                idem: None,
+            })
+            .await
+            .unwrap();
+
+        let room = rex_wave_waves::wave_room(&wave, &proj);
+        sys.call(RoomEnsure {
+            room: RoomRef::Id { id: room.clone() },
+            topic: None,
+            origin: Some(RoomOrigin::Wave { wave: wave.clone() }),
+        })
+        .await
+        .unwrap();
+
+        for (role, tid) in [(&role_batch, &tid_batch), (&role_stream, &tid_stream)] {
+            let spawned = Observation::Spawned {
+                attempt: 1,
+                thread: tid.clone(),
+            };
+            sys.call(WaveObserve {
+                wave: wave.clone(),
+                role: role.clone(),
+                observation: spawned.clone(),
+            })
+            .await
+            .unwrap();
+            bridge.observe_wave_event(
+                wave.clone(),
+                WaveEvent::WorkerObserved {
+                    role: role.clone(),
+                    observation: spawned,
+                },
+            );
+            sys.call(RoomJoin {
+                room: RoomRef::Id { id: room.clone() },
+                member: Some(Principal::Worker {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                }),
+                handle: Handle::parse(role.as_str()).ok(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let p_batch = Principal::Worker {
+            wave: wave.clone(),
+            role: role_batch.clone(),
+        };
+        let direct_batch = harness
+            .client(p_batch.clone())
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("already sent via CLI").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: None,
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+        let start2_batch = {
+            let locked = harness.inner.lock().await;
+            locked.entries[&StreamId::Room { room: room.clone() }]
+                .iter()
+                .find(|e| e.seq == direct_batch.seq)
+                .unwrap()
+                .at
+                .0
+        };
+        let batch_rows = vec![
+            serde_json::json!({ "seq": 1u64, "createdAt": start2_batch - 5, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 2u64,
+                "createdAt": start2_batch - 4,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "first" } }
+            }),
+            serde_json::json!({
+                "seq": 3u64,
+                "createdAt": start2_batch - 3,
+                "type": "turn/completed",
+                "data": { "status": "completed" }
+            }),
+            serde_json::json!({ "seq": 4u64, "createdAt": start2_batch, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 5u64,
+                "createdAt": start2_batch + 1,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "second" } }
+            }),
+            serde_json::json!({
+                "seq": 6u64,
+                "createdAt": start2_batch + 2,
+                "type": "turn/completed",
+                "data": { "status": "completed" }
+            }),
+        ];
+        assert!(
+            bridge
+                .mirror_outstanding_turns_from_tail(&wave, &role_batch, &tid_batch, &batch_rows)
+                .await
+        );
+
+        let p_stream = Principal::Worker {
+            wave: wave.clone(),
+            role: role_stream.clone(),
+        };
+        let direct_stream = harness
+            .client(p_stream.clone())
+            .call(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
+                body: Body::parse("already sent via CLI").unwrap(),
+                re: None,
+                after: None,
+                labels: Vec::new(),
+                task: None,
+                idem: None,
+                origin: rex_wave_api::room::PostOrigin::Direct,
+            })
+            .await
+            .unwrap();
+        let start2_stream = {
+            let locked = harness.inner.lock().await;
+            locked.entries[&StreamId::Room { room: room.clone() }]
+                .iter()
+                .find(|e| e.seq == direct_stream.seq)
+                .unwrap()
+                .at
+                .0
+        };
+        let stream_pass1 = vec![
+            serde_json::json!({ "seq": 1u64, "createdAt": start2_stream - 5, "type": "turn/started", "data": {} }),
+            serde_json::json!({
+                "seq": 2u64,
+                "createdAt": start2_stream - 4,
+                "type": "item/completed",
+                "data": { "item": { "type": "agentMessage", "text": "first" } }
+            }),
+            serde_json::json!({
+                "seq": 3u64,
+                "createdAt": start2_stream - 3,
+                "type": "turn/completed",
+                "data": { "status": "completed" }
+            }),
+            serde_json::json!({ "seq": 4u64, "createdAt": start2_stream, "type": "turn/started", "data": {} }),
+        ];
+        assert!(
+            bridge
+                .mirror_outstanding_turns_from_tail(&wave, &role_stream, &tid_stream, &stream_pass1)
+                .await
+        );
+        let mut stream_pass2 = stream_pass1;
+        stream_pass2.push(serde_json::json!({
+            "seq": 5u64,
+            "createdAt": start2_stream + 1,
+            "type": "item/completed",
+            "data": { "item": { "type": "agentMessage", "text": "second" } }
+        }));
+        stream_pass2.push(serde_json::json!({
+            "seq": 6u64,
+            "createdAt": start2_stream + 2,
+            "type": "turn/completed",
+            "data": { "status": "completed" }
+        }));
+        assert!(
+            bridge
+                .mirror_outstanding_turns_from_tail(&wave, &role_stream, &tid_stream, &stream_pass2)
+                .await
+        );
+
+        let locked = harness.inner.lock().await;
+        let entries = &locked.entries[&StreamId::Room { room }];
+        for (label, p) in [("batch", &p_batch), ("stream", &p_stream)] {
+            let bodies: Vec<&str> = entries
+                .iter()
+                .filter(|e| &e.by == p)
+                .filter_map(|e| match &e.event {
+                    Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                bodies,
+                vec!["already sent via CLI", "first"],
+                "{label}: turn 2 direct post must suppress turn 2 mirror even after turn 1 mirrors"
+            );
+        }
     }
 }

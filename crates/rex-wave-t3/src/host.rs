@@ -1244,11 +1244,16 @@ impl T3Bridge {
             other => other,
         };
         if let Ok(WireReply::RoomPost(posted)) = post_res {
+            let posted_head = if posted.seq.0 == room_head.0.saturating_add(1) {
+                posted.seq
+            } else {
+                room_head
+            };
             let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
-                seq: posted.seq,
+                seq: posted_head,
             });
         }
     }
