@@ -869,6 +869,13 @@ mod tests {
             "owner"
         );
         drop(live_listener);
+
+        let held_prepare = rex_wave_fs::validate_unix_socket_target(&sock).unwrap();
+        let concurrent_err = rex_wave_fs::validate_unix_socket_target(&sock)
+            .err()
+            .expect("concurrent startup lock must reject second caller");
+        assert_eq!(concurrent_err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(held_prepare);
     }
 
     #[tokio::test]

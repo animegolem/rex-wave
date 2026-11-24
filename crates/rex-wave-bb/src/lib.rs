@@ -2578,12 +2578,7 @@ impl BbBridge {
                     let Ok(WireReply::Read(page)) = backend
                         .call_as(
                             sys.clone(),
-                            Read {
-                                stream: stream.clone(),
-                                after: cursor,
-                                limit: Some(500),
-                            }
-                            .into_wire(),
+                            Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
                         )
                         .await
                     else {
@@ -2620,12 +2615,7 @@ impl BbBridge {
             let Ok(WireReply::Read(page)) = backend
                 .call_as(
                     sys.clone(),
-                    Read {
-                        stream: stream.clone(),
-                        after: cursor,
-                        limit: Some(500),
-                    }
-                    .into_wire(),
+                    Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
                 )
                 .await
             else {
@@ -5243,13 +5233,13 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let page = op
-                    .call(Read {
-                        stream: StreamId::Room {
+                    .call(Read::stream(
+                        StreamId::Room {
                             room: started.room.clone(),
                         },
-                        after: Seq::ORIGIN,
-                        limit: Some(50),
-                    })
+                        Seq::ORIGIN,
+                        Some(50),
+                    ))
                     .await
                     .unwrap();
                 if page.entries.iter().any(|e| e.by == worker_p) {
@@ -5334,13 +5324,13 @@ mod tests {
         let t3_posts = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let page = op
-                    .call(Read {
-                        stream: StreamId::Room {
+                    .call(Read::stream(
+                        StreamId::Room {
                             room: started.room.clone(),
                         },
-                        after: Seq::ORIGIN,
-                        limit: Some(50),
-                    })
+                        Seq::ORIGIN,
+                        Some(50),
+                    ))
                     .await
                     .unwrap();
                 let posts: Vec<String> = page

@@ -1064,12 +1064,7 @@ impl T3Bridge {
                     let Ok(WireReply::Read(page)) = backend
                         .call_as(
                             sys.clone(),
-                            Read {
-                                stream: stream.clone(),
-                                after: cursor,
-                                limit: Some(500),
-                            }
-                            .into_wire(),
+                            Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
                         )
                         .await
                     else {
@@ -1105,12 +1100,7 @@ impl T3Bridge {
             let Ok(WireReply::Read(page)) = backend
                 .call_as(
                     sys.clone(),
-                    Read {
-                        stream: stream.clone(),
-                        after: cursor,
-                        limit: Some(500),
-                    }
-                    .into_wire(),
+                    Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
                 )
                 .await
             else {

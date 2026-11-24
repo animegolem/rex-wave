@@ -275,6 +275,25 @@ struct StreamActor<D: Decider> {
     stale: bool,
 }
 
+fn ensure_dm_idem_author(
+    stream: &StreamId,
+    by: &rex_wave_api::Principal,
+    prior: &[Envelope],
+) -> Result<(), ApiError> {
+    if matches!(
+        stream,
+        StreamId::Room {
+            room: rex_wave_api::room::RoomId::Direct { .. }
+        }
+    ) && prior.first().is_some_and(|env| !env.by.same_actor(by))
+    {
+        return Err(ApiError::conflict(
+            "idempotency key in this DM was already used by another participant",
+        ));
+    }
+    Ok(())
+}
+
 impl<D: Decider> StreamActor<D> {
     fn rehydrate(
         journal: &Journal,
@@ -330,6 +349,7 @@ impl<D: Decider> StreamActor<D> {
         if let Some(key) = &idem
             && let Some(prior) = self.writer.lookup(key).map_err(store_error)?
         {
+            ensure_dm_idem_author(self.writer.stream(), ctx.by(), &prior)?;
             return Ok(D::reply(&self.state, cmd, &prior));
         }
         let events = D::decide(&self.state, &cmd, ctx)?;
@@ -352,7 +372,10 @@ impl<D: Decider> StreamActor<D> {
                 self.hub.publish(&committed);
                 Ok(D::reply(&self.state, cmd, &committed))
             }
-            Appended::Replayed(prior) => Ok(D::reply(&self.state, cmd, &prior)),
+            Appended::Replayed(prior) => {
+                ensure_dm_idem_author(self.writer.stream(), ctx.by(), &prior)?;
+                Ok(D::reply(&self.state, cmd, &prior))
+            }
         }
     }
 }

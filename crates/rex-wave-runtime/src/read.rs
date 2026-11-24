@@ -152,7 +152,12 @@ impl ReadSide {
         viewer: &Principal,
     ) -> Result<RoomId, ApiError> {
         let resolved = room.resolve(viewer)?;
-        self.journal.resolve_dm_room(resolved).map_err(store_error)
+        match room {
+            rex_wave_api::room::RoomRef::Dm { .. } => {
+                self.journal.resolve_dm_room(resolved).map_err(store_error)
+            }
+            _ => Ok(resolved),
+        }
     }
 
     pub fn resolve_stream(&self, stream: StreamId) -> Result<StreamId, ApiError> {
@@ -326,7 +331,20 @@ impl ReadSide {
         interest: Interest,
         from: Cursor,
     ) -> Result<FrameStream, ApiError> {
-        let from = from.try_map_streams(|s| self.resolve_stream(s))?;
+        let remap_dm_cursor = matches!(
+            &interest,
+            Interest::Room {
+                room: rex_wave_api::room::RoomRef::Dm { .. }
+            } | Interest::RoomFiltered {
+                room: rex_wave_api::room::RoomRef::Dm { .. },
+                ..
+            } | Interest::Mentions
+        );
+        let from = if remap_dm_cursor {
+            from.try_map_streams(|s| self.resolve_stream(s))?
+        } else {
+            from
+        };
         let mut filter = Filter::build(&viewer, interest, &self.journal, self.sidebar.clone())?;
         let mut tap = self.hub.tap();
         let initial: BTreeMap<StreamId, Seq> = self
@@ -588,22 +606,19 @@ impl Filter {
     ) -> Result<Self, ApiError> {
         let resolve_ref = |room: &rex_wave_api::room::RoomRef| -> Result<RoomId, ApiError> {
             let resolved = room.resolve(viewer)?;
-            journal.resolve_dm_room(resolved).map_err(store_error)
+            match room {
+                rex_wave_api::room::RoomRef::Dm { .. } => {
+                    journal.resolve_dm_room(resolved).map_err(store_error)
+                }
+                _ => Ok(resolved),
+            }
         };
         match interest {
             Interest::Streams { streams } => {
-                let mut resolved_streams = BTreeSet::new();
-                for s in streams {
-                    let s = match s {
-                        StreamId::Room { room } => StreamId::Room {
-                            room: journal.resolve_dm_room(room).map_err(store_error)?,
-                        },
-                        other => other,
-                    };
-                    can_read(viewer, &s)?;
-                    resolved_streams.insert(s);
+                for s in &streams {
+                    can_read(viewer, s)?;
                 }
-                Ok(Filter::Exact(resolved_streams))
+                Ok(Filter::Exact(streams.into_iter().collect()))
             }
             Interest::Room { room } => {
                 let s = StreamId::Room {
@@ -907,23 +922,30 @@ impl Service<ReadCommand> for ReadSide {
         Box::pin(async move {
             match cmd {
                 ReadCommand::Read(r) => {
-                    let requested_stream = r.stream;
-                    let target_stream = self.resolve_stream(requested_stream.clone())?;
+                    let target_stream = match &r.room {
+                        Some(room_ref) => StreamId::Room {
+                            room: self.resolve_room_ref(room_ref, ctx.by())?,
+                        },
+                        None => r.stream,
+                    };
                     can_read(ctx.by(), &target_stream)?;
+                    let after = if r.after > Seq::ORIGIN {
+                        r.after
+                    } else if let Some(ref c) = r.cursor {
+                        c.at(&target_stream)
+                    } else {
+                        Seq::ORIGIN
+                    };
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
                     let entries = self
                         .journal
-                        .read(&target_stream, r.after, limit)
+                        .read(&target_stream, after, limit)
                         .map_err(store_error)?;
                     let head = self.journal.head(&target_stream).map_err(store_error)?;
-                    let total_count =
-                        (head.0.saturating_sub(r.after.0) as usize).max(entries.len());
+                    let total_count = (head.0.saturating_sub(after.0) as usize).max(entries.len());
                     let truncated = entries.len() < total_count;
-                    let last = entries.last().map_or(r.after, |e| e.seq);
-                    let mut cursor = Cursor::default().with(target_stream.clone(), last);
-                    if requested_stream != target_stream {
-                        cursor = cursor.with(requested_stream, last);
-                    }
+                    let last = entries.last().map_or(after, |e| e.seq);
+                    let cursor = Cursor::default().with(target_stream, last);
                     Ok(WireReply::Read(Page {
                         entries,
                         cursor,

@@ -244,9 +244,7 @@ pub async fn room_history<C: Client>(
     after: Seq,
     limit: Option<u32>,
 ) -> Result<Vec<RoomMessage>, ApiError> {
-    let id = room.resolve(client.me())?;
     let want = limit.unwrap_or(200).clamp(1, 1000) as usize;
-    let stream = StreamId::Room { room: id };
     let mut cursor = after;
     let mut messages = Vec::new();
 
@@ -257,11 +255,13 @@ pub async fn room_history<C: Client>(
         }
         let batch = remaining.clamp(64, 1000) as u32;
         let page = client
-            .call(Read {
-                stream: stream.clone(),
-                after: cursor,
-                limit: Some(batch),
-            })
+            .call(Read::room_ref(
+                room.clone(),
+                client.me(),
+                cursor,
+                None,
+                Some(batch),
+            )?)
             .await?;
         let Some(last) = page.entries.last() else {
             break;

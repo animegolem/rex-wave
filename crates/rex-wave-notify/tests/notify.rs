@@ -2894,44 +2894,99 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     assert_eq!(continued.room, legacy_room);
     assert_eq!(continued.seq, Seq(3));
 
-    // Paging a legacy-only DM via canonical stream + returned cursor advances cleanly [1] -> [2] -> [3].
+    // Paging a legacy-only DM via RoomRef::Dm + returned cursor advances cleanly [1] -> [2] -> [3],
+    // while explicit canonical RoomId / Wait return 0 entries until the canonical stream is opened.
     let canon_room = RoomRef::Dm {
         with: alice_p.clone(),
     }
     .resolve(&op_p)
     .unwrap();
-    let canon_stream = StreamId::Room {
-        room: canon_room.clone(),
+    let dm_ref = RoomRef::Dm {
+        with: alice_p.clone(),
     };
-    let p1 = zorro_op
-        .call(rex_wave_api::read::Read {
-            stream: canon_stream.clone(),
-            after: Seq::ORIGIN,
-            limit: Some(1),
+    let explicit_canon_wait = zorro_op
+        .call(rex_wave_api::read::Wait {
+            interest: Interest::Room {
+                room: RoomRef::Id {
+                    id: canon_room.clone(),
+                },
+            },
+            after: Cursor::default(),
+            timeout_ms: Some(0),
         })
         .await
         .unwrap();
+    assert!(
+        explicit_canon_wait.entries.is_empty(),
+        "explicit canonical RoomRef::Id wait must not return legacy entries"
+    );
+
+    let p1 = zorro_op
+        .call(
+            rex_wave_api::read::Read::room_ref(dm_ref.clone(), &op_p, Seq::ORIGIN, None, Some(1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(p1.entries[0].seq, Seq(1));
+    assert!(!p1.cursor.lists(&StreamId::Room {
+        room: canon_room.clone()
+    }));
     let p2 = zorro_op
-        .call(rex_wave_api::read::Read {
-            stream: canon_stream.clone(),
-            after: p1.cursor.at(&canon_stream),
-            limit: Some(1),
-        })
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                dm_ref.clone(),
+                &op_p,
+                Seq::ORIGIN,
+                Some(p1.cursor),
+                Some(1),
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(p2.entries[0].seq, Seq(2));
     let p3 = zorro_op
-        .call(rex_wave_api::read::Read {
-            stream: canon_stream,
-            after: p2.cursor.at(&StreamId::Room {
-                room: canon_room.clone(),
-            }),
-            limit: Some(1),
-        })
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                dm_ref.clone(),
+                &op_p,
+                Seq::ORIGIN,
+                Some(p2.cursor),
+                Some(1),
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(p3.entries[0].seq, Seq(3));
+
+    // Opening the canonical stream via explicit RoomRef::Id and resuming with p3.cursor does NOT skip canonical entries!
+    zorro_op
+        .call(RoomPost {
+            room: RoomRef::Id {
+                id: canon_room.clone(),
+            },
+            body: Body::parse("first canonical post").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let resumed_after_canon_open = zorro_op
+        .call(
+            rex_wave_api::read::Read::room_ref(dm_ref, &op_p, Seq::ORIGIN, Some(p3.cursor), None)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !resumed_after_canon_open.entries.is_empty(),
+        "legacy-stream cursor must not skip newly opened canonical DM entries"
+    );
     herald_2.abort();
 
     // Split DM journal: Operator retry with shared idem key returns Operator's legacy receipt, not Alice's canonical post.

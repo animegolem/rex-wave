@@ -588,11 +588,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     );
 
     let mail_page = owner
-        .call(Read {
-            stream: StreamId::Mail,
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+        .call(Read::stream(StreamId::Mail, Seq::ORIGIN, None))
         .await
         .unwrap();
     assert_eq!(

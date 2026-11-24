@@ -254,8 +254,7 @@ pub(crate) async fn read_resource<C: Client>(
             let room_ref = other_target
                 .into_room_ref(client.me())
                 .map_err(ApiError::from)?;
-            let room = room_ref.resolve(client.me()).map_err(ApiError::from)?;
-            let page = read_room_tail(client, StreamId::Room { room }).await?;
+            let page = read_room_tail(client, room_ref).await?;
             serde_json::to_string(&page).map_err(|e| ApiError::Internal(e.to_string()))?
         }
     };
@@ -337,19 +336,23 @@ pub(crate) async fn subscribe_resource<C: Client>(
     }
 }
 
-async fn read_room_tail<C: Client>(client: &C, stream: StreamId) -> Result<read::Page, ApiError> {
+async fn read_room_tail<C: Client>(client: &C, room_ref: RoomRef) -> Result<read::Page, ApiError> {
     let mut after = Seq::ORIGIN;
     let mut tail = VecDeque::with_capacity(DEFAULT_ROOM_READ_LIMIT);
     let mut cursor;
+    let mut head_total = 0usize;
 
     loop {
-        let page = client
-            .call(read::Read {
-                stream: stream.clone(),
-                after,
-                limit: Some(ROOM_SCAN_BATCH),
-            })
-            .await?;
+        let req = read::Read::room_ref(
+            room_ref.clone(),
+            client.me(),
+            after,
+            None,
+            Some(ROOM_SCAN_BATCH),
+        )
+        .map_err(ApiError::from)?;
+        let page = client.call(req).await?;
+        head_total = head_total.max((after.0 as usize).saturating_add(page.total_count));
         cursor = page.cursor;
         let count = page.entries.len();
         let last_seq = page.entries.last().map_or(after, |e| e.seq);
@@ -366,7 +369,7 @@ async fn read_room_tail<C: Client>(client: &C, stream: StreamId) -> Result<read:
     }
 
     let entries: Vec<_> = tail.into_iter().collect();
-    let total_count = (cursor.at(&stream).0 as usize).max(entries.len());
+    let total_count = head_total.max(entries.len());
     let truncated = entries.len() < total_count;
     Ok(read::Page {
         entries,

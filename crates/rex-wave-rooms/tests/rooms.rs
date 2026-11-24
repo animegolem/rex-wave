@@ -486,13 +486,13 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
     assert_eq!(history[1].reply_to, Some(first.seq));
 
     let raw = sam
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: room.resolve(sam.me()).unwrap(),
             },
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+            Seq::ORIGIN,
+            None,
+        ))
         .await
         .unwrap();
     assert!(

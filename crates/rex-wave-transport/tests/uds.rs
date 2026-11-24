@@ -324,13 +324,13 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         name: ChannelName::parse("general").unwrap(),
     };
     let page = sam
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: general_id.clone(),
             },
-            after: Seq(8),
-            limit: None,
-        })
+            Seq(8),
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(page.entries.len(), 2);

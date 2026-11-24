@@ -16,10 +16,49 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Read {
     pub stream: StreamId,
+    /// Optional room reference (`#channel`, `@seat`); when present, resolved
+    /// server-side (`RoomRef::Dm` falls back to an existing pre-PR-26
+    /// `(Operator, peer)` stream when canonical `head == 0`, while
+    /// `RoomRef::Id` stays pinned to its exact stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomRef>,
     #[serde(default)]
     pub after: Seq,
+    /// Optional resume cursor; when present and `after == Seq::ORIGIN`, the
+    /// server looks up `cursor.at(&target_stream)` after resolving `room`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Cursor>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+impl Read {
+    pub fn stream(stream: StreamId, after: Seq, limit: Option<u32>) -> Self {
+        Read {
+            stream,
+            room: None,
+            after,
+            cursor: None,
+            limit,
+        }
+    }
+
+    pub fn room_ref(
+        room: RoomRef,
+        viewer: &Principal,
+        after: Seq,
+        cursor: Option<Cursor>,
+        limit: Option<u32>,
+    ) -> Result<Self, crate::id::InvalidId> {
+        let fallback_id = room.resolve(viewer)?;
+        Ok(Read {
+            stream: StreamId::Room { room: fallback_id },
+            room: Some(room),
+            after,
+            cursor,
+            limit,
+        })
+    }
 }
 
 /// `channel_wait`. Returns as soon as `interest` matches anything after
@@ -55,6 +94,29 @@ impl Wait {
         }
     }
 
+    pub fn room_ref(
+        room: RoomRef,
+        me: &Principal,
+        since: Seq,
+        mentions_only: bool,
+    ) -> Result<Self, crate::id::InvalidId> {
+        let id = room.resolve(me)?;
+        let stream = StreamId::Room { room: id };
+        if mentions_only {
+            Ok(Wait {
+                interest: Interest::Mentions,
+                after: Cursor::live().with(stream, since),
+                timeout_ms: None,
+            })
+        } else {
+            Ok(Wait {
+                interest: Interest::Room { room },
+                after: Cursor::default().with(stream, since),
+                timeout_ms: None,
+            })
+        }
+    }
+
     pub fn room_filtered(room: RoomId, since: Seq, re: Option<Seq>, labels: Vec<Label>) -> Self {
         let stream = StreamId::Room { room: room.clone() };
         Wait {
@@ -66,6 +128,22 @@ impl Wait {
             after: Cursor::default().with(stream, since),
             timeout_ms: None,
         }
+    }
+
+    pub fn room_ref_filtered(
+        room: RoomRef,
+        me: &Principal,
+        since: Seq,
+        re: Option<Seq>,
+        labels: Vec<Label>,
+    ) -> Result<Self, crate::id::InvalidId> {
+        let id = room.resolve(me)?;
+        let stream = StreamId::Room { room: id };
+        Ok(Wait {
+            interest: Interest::RoomFiltered { room, re, labels },
+            after: Cursor::default().with(stream, since),
+            timeout_ms: None,
+        })
     }
 }
 

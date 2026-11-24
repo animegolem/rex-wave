@@ -487,9 +487,11 @@ pub fn create_missing_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Descriptor-pinned parent directory for safe Unix-domain socket setup.
+/// Descriptor-pinned parent directory and exclusive startup lock for safe
+/// Unix-domain socket setup.
 pub struct PreparedUnixSocket {
     parent_dir: File,
+    _lock_file: File,
     file_name: std::ffi::OsString,
     uid: u32,
 }
@@ -565,15 +567,7 @@ impl PreparedUnixSocket {
                         ),
                     ));
                 }
-                if std::os::unix::net::UnixStream::connect(display_path).is_ok() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        format!(
-                            "another daemon is already listening on {}",
-                            display_path.display()
-                        ),
-                    ));
-                }
+                probe_socket_is_stale(display_path)?;
                 unlinkat(&self.parent_dir, &self.file_name, AtFlags::empty())
                     .map_err(io::Error::from)?;
             }
@@ -584,16 +578,42 @@ impl PreparedUnixSocket {
     }
 }
 
+fn probe_socket_is_stale(path: &Path) -> io::Result<()> {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("another daemon is already listening on {}", path.display()),
+        )),
+        Err(e)
+            if e.kind() == io::ErrorKind::ConnectionRefused
+                || e.raw_os_error() == Some(libc::ECONNREFUSED)
+                || e.kind() == io::ErrorKind::NotFound =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "refusing to unlink socket {} after inconclusive liveness probe: {e}",
+                path.display()
+            ),
+        )),
+    }
+}
+
 /// Validate `path` and its parent directory for a Unix-domain socket without
 /// unlinking or binding yet:
 /// 1. Derives the process UID via `geteuid()`.
 /// 2. Creates missing parent directories with mode `0700`, opens the parent
 ///    directory with `O_DIRECTORY | O_NOFOLLOW`, and requires it to be owned
 ///    by this UID and not writable by group or others (`mode & 0o022 == 0`).
-/// 3. Refuses non-socket entries, foreign-UID sockets, and live listening
-///    endpoints (`AddrInUse`) at `path`.
+/// 3. Acquires a non-blocking exclusive flock on `<socket>.lock` inside the
+///    verified parent directory, held inside [`PreparedUnixSocket`] through
+///    probe, unlink, and `bind` so concurrent starts cannot race.
+/// 4. Refuses non-socket entries, foreign-UID sockets, live listening
+///    endpoints (`AddrInUse`), and inconclusive liveness probes.
 pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket> {
-    use rustix::fs::{AtFlags, FileType, statat};
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
     use std::os::unix::fs::DirBuilderExt as _;
 
     let uid = current_process_uid()?;
@@ -659,6 +679,45 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
         ));
     }
 
+    let mut lock_name = file_name.clone();
+    lock_name.push(".lock");
+    let lock_fd = openat(
+        &parent_dir,
+        &lock_name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::MLINK {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing symlinked socket lock in {}", parent.display()),
+            )
+        } else {
+            io::Error::from(e)
+        }
+    })?;
+    let lock_file = File::from(lock_fd);
+    if !lock_file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket lock in {} is not a regular file", parent.display()),
+        ));
+    }
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "another daemon is starting or listening on {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(e),
+    }
+
     match statat(&parent_dir, &file_name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => {
             if FileType::from_raw_mode(st.st_mode) != FileType::Socket {
@@ -676,12 +735,7 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
                     ),
                 ));
             }
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("another daemon is already listening on {}", path.display()),
-                ));
-            }
+            probe_socket_is_stale(path)?;
         }
         Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(io::Error::from(e)),
@@ -689,6 +743,7 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
 
     Ok(PreparedUnixSocket {
         parent_dir,
+        _lock_file: lock_file,
         file_name,
         uid,
     })

@@ -1226,11 +1226,11 @@ fn handle_reply(
                     let room_stream = StreamId::Room {
                         room: r.room.clone(),
                     };
-                    Some(WireCommand::Read(read::Read {
-                        after: r.cursor.at(&room_stream),
-                        stream: room_stream,
-                        limit: Some(ROOM_PAGE_LIMIT),
-                    }))
+                    Some(WireCommand::Read(read::Read::stream(
+                        room_stream.clone(),
+                        r.cursor.at(&room_stream),
+                        Some(ROOM_PAGE_LIMIT),
+                    )))
                 }
                 _ => plan_for(&model.active_target, &model.sidebar_snapshot, &model.me).initial,
             };
@@ -1720,11 +1720,11 @@ async fn load_stage_target_with_guard<C: Client, F: Fn() -> bool>(
                 return (None, Ok(None));
             }
             let res = client
-                .call_wire(WireCommand::Read(read::Read {
-                    stream: stream_id.clone(),
+                .call_wire(WireCommand::Read(read::Read::stream(
+                    stream_id.clone(),
                     after,
-                    limit: Some(ROOM_PAGE_LIMIT),
-                }))
+                    Some(ROOM_PAGE_LIMIT),
+                )))
                 .await;
             match res {
                 Ok(WireReply::Read(page)) => {

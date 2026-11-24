@@ -1237,42 +1237,29 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
         } => {
             let room_ref = parse_room_ref(room)?;
             let parsed_labels = parse_labels(labels)?;
-            if after.is_none()
-                && let Some(c) = cursor
-            {
-                let parsed_cursor = parse_cursor_arg(c)?;
-                let interest = if re.is_some() || !parsed_labels.is_empty() {
-                    Interest::RoomFiltered {
-                        room: room_ref,
-                        re: re.map(Seq),
-                        labels: parsed_labels,
-                    }
-                } else {
-                    Interest::Room { room: room_ref }
-                };
-                Ok(WireCommand::Wait(Wait {
-                    interest,
-                    after: parsed_cursor,
-                    timeout_ms: Some(0),
-                }))
-            } else {
-                let room_id = room_ref.resolve(me)?;
-                let stream = StreamId::Room {
-                    room: room_id.clone(),
-                };
-                let start_seq = after.map_or(Seq::ORIGIN, Seq);
-                if re.is_some() || !parsed_labels.is_empty() {
-                    let mut wait =
-                        Wait::room_filtered(room_id, start_seq, re.map(Seq), parsed_labels);
-                    wait.timeout_ms = Some(0);
-                    Ok(WireCommand::Wait(wait))
-                } else {
-                    Ok(WireCommand::Read(Read {
-                        stream,
-                        after: start_seq,
-                        limit: *limit,
-                    }))
+            let parsed_cursor = match cursor {
+                Some(c) => Some(parse_cursor_arg(c)?),
+                None => None,
+            };
+            let start_seq = after.map_or(Seq::ORIGIN, Seq);
+            if re.is_some() || !parsed_labels.is_empty() {
+                let mut wait =
+                    Wait::room_ref_filtered(room_ref, me, start_seq, re.map(Seq), parsed_labels)?;
+                if after.is_none()
+                    && let Some(c) = parsed_cursor
+                {
+                    wait.after = c;
                 }
+                wait.timeout_ms = Some(0);
+                Ok(WireCommand::Wait(wait))
+            } else {
+                Ok(WireCommand::Read(Read::room_ref(
+                    room_ref,
+                    me,
+                    start_seq,
+                    if after.is_some() { None } else { parsed_cursor },
+                    *limit,
+                )?))
             }
         }
         Cmd::Wait {
@@ -1313,18 +1300,19 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                                 timeout_ms: *timeout,
                             }
                         } else {
-                            let mut w = Wait::room_filtered(
-                                room_id,
+                            let mut w = Wait::room_ref_filtered(
+                                room_ref,
+                                me,
                                 Seq(*since),
                                 re.map(Seq),
                                 parsed_labels,
-                            );
+                            )?;
                             w.timeout_ms = *timeout;
                             w
                         }
                     } else {
                         let mentions = !*all;
-                        let mut w = Wait::room(room_id, Seq(*since), mentions);
+                        let mut w = Wait::room_ref(room_ref, me, Seq(*since), mentions)?;
                         if let Some(c) = base_cursor {
                             let mut c = if mentions {
                                 ensure_cursor_from_head(c)
@@ -3168,11 +3156,7 @@ async fn load_live_presence_state(
     let mut after = Seq::ORIGIN;
     loop {
         let page = client
-            .call(Read {
-                stream: StreamId::Presence,
-                after,
-                limit: Some(1000),
-            })
+            .call(Read::stream(StreamId::Presence, after, Some(1000)))
             .await?;
         if page.entries.is_empty() {
             break;
@@ -3902,13 +3886,11 @@ async fn execute_remote<C: Client>(
     {
         page.timed_out = false;
         let total_count = page.entries.len();
-        if let Some(lim) = limit {
-            let cap = (*lim).clamp(1, 1000) as usize;
-            if page.entries.len() > cap {
-                page.entries.truncate(cap);
-                if let Some(last) = page.entries.last() {
-                    page.cursor = Cursor::default().with(last.stream.clone(), last.seq);
-                }
+        let cap = limit.unwrap_or(200).clamp(1, 1000) as usize;
+        if page.entries.len() > cap {
+            page.entries.truncate(cap);
+            if let Some(last) = page.entries.last() {
+                page.cursor = Cursor::default().with(last.stream.clone(), last.seq);
             }
         }
         page.total_count = total_count;

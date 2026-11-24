@@ -5391,6 +5391,36 @@
     "description": "Page one stream after a seq.",
     "inputSchema": {
       "$defs": {
+        "Cursor": {
+          "description": "A multi-stream resume position. Missing streams mean `Seq::ORIGIN`.",
+          "properties": {
+            "from_head": {
+              "default": false,
+              "description": "Streams not listed start at their head at subscribe time instead of origin.",
+              "type": "boolean"
+            },
+            "positions": {
+              "items": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "$ref": "#/$defs/StreamId"
+                  },
+                  {
+                    "$ref": "#/$defs/Seq"
+                  }
+                ],
+                "type": "array"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "positions"
+          ],
+          "type": "object"
+        },
         "Principal": {
           "description": "Who did something. Bound at session open by the transport. Command\narguments may name only a member (`Seat` or `Worker`, see\n`Principal::parse_member_ref`), never an `Operator` or `System`.",
           "oneOf": [
@@ -5522,6 +5552,64 @@
               "required": [
                 "room",
                 "pair"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RoomRef": {
+          "description": "How a caller *names* a room. Resolved to a [`RoomId`] server-side using the\nsession principal (a DM ref needs \"me\"). Parsed from `#general`,\n`#proj:p_123/wave-auth-v2`, or `@sam` at the CLI/MCP boundary.",
+          "oneOf": [
+            {
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/RoomId"
+                },
+                "ref": {
+                  "const": "id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref",
+                "id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "name": {
+                  "description": "channel",
+                  "type": "string"
+                },
+                "ref": {
+                  "const": "channel",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/RoomScope"
+                }
+              },
+              "required": [
+                "ref",
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "ref": {
+                  "const": "dm",
+                  "type": "string"
+                },
+                "with": {
+                  "$ref": "#/$defs/Principal"
+                }
+              },
+              "required": [
+                "ref",
+                "with"
               ],
               "type": "object"
             }
@@ -5687,6 +5775,17 @@
           "$ref": "#/$defs/Seq",
           "default": 0
         },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional resume cursor; when present and `after == Seq::ORIGIN`, the\nserver looks up `cursor.at(&target_stream)` after resolving `room`."
+        },
         "limit": {
           "default": null,
           "format": "uint32",
@@ -5695,6 +5794,17 @@
             "integer",
             "null"
           ]
+        },
+        "room": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoomRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional room reference (`#channel`, `@seat`); when present, resolved\nserver-side (`RoomRef::Dm` falls back to an existing pre-PR-26\n`(Operator, peer)` stream when canonical `head == 0`, while\n`RoomRef::Id` stays pinned to its exact stream)."
         },
         "stream": {
           "$ref": "#/$defs/StreamId"

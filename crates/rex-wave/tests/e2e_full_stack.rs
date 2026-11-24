@@ -635,13 +635,13 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
                     .iter()
                     .all(|(_, _, p)| matches!(p, WorkerPhase::Live { .. }));
             let page = operator
-                .call(Read {
-                    stream: StreamId::Room {
+                .call(Read::stream(
+                    StreamId::Room {
                         room: wave_room.clone(),
                     },
-                    after: Seq::ORIGIN,
-                    limit: Some(50),
-                })
+                    Seq::ORIGIN,
+                    Some(50),
+                ))
                 .await
                 .unwrap();
             let posted_count = page
@@ -676,13 +676,13 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     assert_eq!(board_initial.board, expected_board);
     assert!(
         operator
-            .call(Read {
-                stream: StreamId::Room {
+            .call(Read::stream(
+                StreamId::Room {
                     room: wave_room.clone(),
                 },
-                after: Seq::ORIGIN,
-                limit: Some(5),
-            })
+                Seq::ORIGIN,
+                Some(5),
+            ))
             .await
             .unwrap()
             .entries
@@ -730,13 +730,13 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
         .expect("operator invited @sam to wave room");
     let _ = join_reply;
     let room_after_invite = operator
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: wave_room.clone(),
             },
-            after: Seq::ORIGIN,
-            limit: Some(50),
-        })
+            Seq::ORIGIN,
+            Some(50),
+        ))
         .await
         .unwrap()
         .entries
@@ -1287,13 +1287,13 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let page = sam_client
-                .call(Read {
-                    stream: StreamId::Room {
+                .call(Read::stream(
+                    StreamId::Room {
                         room: dm_room.clone(),
                     },
-                    after: Seq::ORIGIN,
-                    limit: Some(20),
-                })
+                    Seq::ORIGIN,
+                    Some(20),
+                ))
                 .await
                 .unwrap();
             let posts: Vec<_> = page
@@ -1312,11 +1312,11 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let dm_after_settle = sam_client
-        .call(Read {
-            stream: StreamId::Room { room: dm_room },
-            after: Seq::ORIGIN,
-            limit: Some(20),
-        })
+        .call(Read::stream(
+            StreamId::Room { room: dm_room },
+            Seq::ORIGIN,
+            Some(20),
+        ))
         .await
         .unwrap();
     let dm_bodies: Vec<&str> = dm_after_settle

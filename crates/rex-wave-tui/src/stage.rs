@@ -126,11 +126,11 @@ pub fn plan_for(target: &StageTarget, overview: &SidebarTreeSnapshot, me: &Princ
             }
         }
         StageTarget::Room { room } => Plan {
-            initial: Some(WireCommand::Read(read::Read {
-                stream: StreamId::Room { room: room.clone() },
-                after: Seq::ORIGIN,
-                limit: Some(200),
-            })),
+            initial: Some(WireCommand::Read(read::Read::stream(
+                StreamId::Room { room: room.clone() },
+                Seq::ORIGIN,
+                Some(200),
+            ))),
             watch: Some((
                 Interest::Stage {
                     target: rex_wave_api::StageTarget::Room {

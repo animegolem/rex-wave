@@ -490,16 +490,16 @@ async fn decider_rehydrates_after_passivation_and_dedupes_idem() {
     );
 
     let page = sam
-        .call(Read {
-            stream: StreamId::Room {
+        .call(Read::stream(
+            StreamId::Room {
                 room: RoomId::Channel {
                     scope: RoomScope::Global,
                     name: ChannelName::parse("general").unwrap(),
                 },
             },
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+            Seq::ORIGIN,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -560,11 +560,7 @@ async fn audience_and_privacy_boundaries_hold() {
         .unwrap();
     let dm = RoomRef::Dm { with: alice }.resolve(&sam).unwrap();
     let denied = nora_c
-        .call(Read {
-            stream: StreamId::Room { room: dm },
-            after: Seq::ORIGIN,
-            limit: None,
-        })
+        .call(Read::stream(StreamId::Room { room: dm }, Seq::ORIGIN, None))
         .await
         .unwrap_err();
     assert!(

@@ -1020,11 +1020,7 @@ async fn dispatch_json_route(
                         None => Seq::ORIGIN,
                     };
                     let page = client
-                        .call(Read {
-                            stream: StreamId::Inbox { owner },
-                            after,
-                            limit,
-                        })
+                        .call(Read::stream(StreamId::Inbox { owner }, after, limit))
                         .await
                         .map_err(|e| mask_err(e, "inbox"))?;
                     return Ok(("200 OK", to_json_value(&page)?));
@@ -1116,7 +1112,8 @@ async fn dispatch_json_route(
                 .map_err(|e| HttpError::from_api(e.into()))?;
 
             let mut page: Page = if re.is_some() || !labels.is_empty() {
-                let mut wait = Wait::room_filtered(room_id.clone(), after, re, labels);
+                let mut wait = Wait::room_ref_filtered(room_ref, &principal, after, re, labels)
+                    .map_err(|e| HttpError::from_api(e.into()))?;
                 wait.timeout_ms = Some(0);
                 let mut p = client
                     .call(wait)
@@ -1142,12 +1139,10 @@ async fn dispatch_json_route(
                 p.truncated = p.entries.len() < total_count;
                 p
             } else {
+                let read_cmd = Read::room_ref(room_ref, &principal, after, None, limit)
+                    .map_err(|e| HttpError::from_api(e.into()))?;
                 client
-                    .call(Read {
-                        stream: StreamId::Room { room: room_id },
-                        after,
-                        limit,
-                    })
+                    .call(read_cmd)
                     .await
                     .map_err(|e| mask_err(e, &format!("room {room}")))?
             };
@@ -1329,10 +1324,15 @@ async fn dispatch_json_route(
                 )
             })?;
             if let WireCommand::Read(ref r) = cmd {
-                let target_stream = router
-                    .read
-                    .resolve_stream(r.stream.clone())
-                    .map_err(HttpError::from_api)?;
+                let target_stream = match &r.room {
+                    Some(room_ref) => StreamId::Room {
+                        room: router
+                            .read
+                            .resolve_room_ref(room_ref, &principal)
+                            .map_err(HttpError::from_api)?,
+                    },
+                    None => r.stream.clone(),
+                };
                 can_read_visible(&principal, &target_stream, &tool).map_err(HttpError::from_api)?;
             }
             if let WireCommand::PresenceBind(ref b) = cmd
