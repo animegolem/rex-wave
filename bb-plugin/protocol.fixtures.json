@@ -9,12 +9,12 @@
       "t": "thread",
       "signal": "created",
       "thread_id": "th_01",
-      "project_id": "proj_3vs7nkyeum",
+      "project_id": "proj_demo_main",
       "meta": {
         "waveId": "auth-v2",
         "role": "verifier",
         "attempt": 1,
-        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+        "roomId": "#proj_demo_main/wave-auth-v2"
       },
       "error": null
     },
@@ -25,7 +25,7 @@
         "waveId": "auth-v2",
         "role": "verifier",
         "attempt": 1,
-        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+        "roomId": "#proj_demo_main/wave-auth-v2"
       },
       "interaction": {
         "id": "int_01",
@@ -44,12 +44,12 @@
       "t": "tool_call",
       "call_id": "call_99",
       "thread_id": "th_01",
-      "project_id": "proj_3vs7nkyeum",
+      "project_id": "proj_demo_main",
       "meta": {
         "waveId": "auth-v2",
         "role": "verifier",
         "attempt": 1,
-        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+        "roomId": "#proj_demo_main/wave-auth-v2"
       },
       "tool": "room_post",
       "args": {
@@ -70,7 +70,7 @@
       "t": "spawn",
       "req_id": 1,
       "args": {
-        "projectId": "proj_3vs7nkyeum",
+        "projectId": "proj_demo_main",
         "environment": {
           "type": "provider",
           "environmentProviderId": "git-worktree",
@@ -90,7 +90,7 @@
             "waveId": "auth-v2",
             "role": "verifier",
             "attempt": 1,
-            "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+            "roomId": "#proj_demo_main/wave-auth-v2"
           }
         }
       }
@@ -102,7 +102,7 @@
         "waveId": "auth-v2",
         "role": "verifier",
         "attempt": 1,
-        "roomId": "#proj_3vs7nkyeum/wave-auth-v2"
+        "roomId": "#proj_demo_main/wave-auth-v2"
       }
     },
     {

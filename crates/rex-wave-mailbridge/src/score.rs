@@ -898,7 +898,7 @@ mod tests {
         let sha_seeded = Sha256Hex::parse(format!("{}06", "f".repeat(62))).unwrap();
         let sha_absent = Sha256Hex::parse(format!("{}07", "1".repeat(62))).unwrap();
 
-        let aliases = AliasMap::from_pairs([("muse", "heidi"), ("carol_old", "carol")]);
+        let aliases = AliasMap::from_pairs([("maya", "heidi"), ("carol_old", "carol")]);
         let ch = RingDeliveryChannel::ClaudeMessagingSocket {
             socket: PathBuf::from("/tmp/cc.sock"),
             pid: 99,
@@ -919,7 +919,7 @@ mod tests {
                     seat: SeatName::parse("heidi").unwrap(),
                     incarnation_id: inc.clone(),
                     channel: ch.clone(),
-                    referent: RingReferent::new("to-muse/02.md", sha_unknown.clone()).unwrap(),
+                    referent: RingReferent::new("to-maya/02.md", sha_unknown.clone()).unwrap(),
                     time_basis: TimeBasis::LetterIdMs,
                 },
                 RingDecision::Ring {
@@ -955,9 +955,9 @@ mod tests {
                 r#"{{"key":"shared-carol_old:{}","outcome":"rung","attempts":2,"ts":"2026-11-21T19:02:00Z"}}"#,
                 &sha_rung.as_str()[..16]
             ),
-            // Legacy box/file:sha16 format with alias `to-muse` + outcome `unknown` (counts as rung)
+            // Legacy box/file:sha16 format with alias `to-maya` + outcome `unknown` (counts as rung)
             format!(
-                r#"{{"key":"to-muse/legacy-file.md:{}","outcome":"unknown","attempts":1,"ts":"2026-11-21T19:05:00Z"}}"#,
+                r#"{{"key":"to-maya/legacy-file.md:{}","outcome":"unknown","attempts":1,"ts":"2026-11-21T19:05:00Z"}}"#,
                 &sha_unknown.as_str()[..16]
             ),
             // own-knocker

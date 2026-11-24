@@ -40,7 +40,7 @@ async fn board_decider_cas_idem_moves_links_and_wal_passivation_rehydration() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("board-wal.sqlite3");
 
-    let board = project_board(&BbProjectId::parse("proj_3vs7nkyeum").unwrap());
+    let board = project_board(&BbProjectId::parse("proj_demo_main").unwrap());
     let sam_principal = Principal::Operator {
         seat: SeatName::parse("sam").unwrap(),
     };

@@ -480,7 +480,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(WaveStart {
             spec: WaveSpec {
                 slug: wave_slug.clone(),
-                project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+                project: BbProjectId::parse("proj_demo_main").unwrap(),
                 goal: Body::parse("Ship OAuth").unwrap(),
                 defaults: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
@@ -2341,7 +2341,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 epoch: 1,
                 lane: None,
                 endpoint: TransportEndpoint::BbThread {
-                    thread_id: BbThreadId::parse("th_loupe").unwrap(),
+                    thread_id: BbThreadId::parse("th_lucas").unwrap(),
                 },
                 liveness: LivenessMode::SocketLifetime,
                 bound_at: UnixMs(1_500),
@@ -2594,7 +2594,7 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
         .call(WaveStart {
             spec: WaveSpec {
                 slug: wave.clone(),
-                project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+                project: BbProjectId::parse("proj_demo_main").unwrap(),
                 goal: Body::parse("Audit safety").unwrap(),
                 defaults: AgentSpec {
                     provider: ProviderId::parse("claude-code").unwrap(),

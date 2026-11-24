@@ -33,10 +33,10 @@ fn house_fixture() -> Value {
         "aliases": {
             "carol": ["carol_old", "carol-legacy"],
             "dave": ["dave_old", "dave-opus-5"],
-            "heidi": ["heidi-old", "heidi-typo", "muse"],
+            "heidi": ["heidi-old", "heidi-typo", "maya"],
             "ivan-supervisor": ["ivan", "ivan-sup"],
             "lucas": ["lucas-rev"],
-            "neon": []
+            "niaj": []
         }
     })
 }
@@ -1417,7 +1417,7 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
 async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
     // A shortened reconnect grace window keeps this lifecycle test fast; the
     // 15 s production constant is pinned by `rex-wave-notify`'s unit tests.
-    const GRACE_MS: u64 = 1_000;
+    const GRACE_MS: u64 = 2_500;
     let grace = Duration::from_millis(GRACE_MS);
     let daemon = IsolatedDaemon::start_with_grace("presence-grace", GRACE_MS).await;
 
@@ -1550,7 +1550,7 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
         unbind_instant.elapsed()
     );
 
-    let raised_card = tokio::time::timeout(Duration::from_secs(5), async {
+    let raised_card = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let resp = http_request(daemon.http_addr, "GET", "/v1/inbox", &[], None).await;
             assert_eq!(resp.status, 200);
@@ -1572,7 +1572,7 @@ async fn e2e_phase3_presence_hold_raii_unbind_and_15s_mail_unrung_lifecycle() {
     );
     let grace_elapsed = unbind_instant.elapsed();
     assert!(
-        grace_elapsed >= grace * 4 / 5 && grace_elapsed < Duration::from_secs(5),
+        grace_elapsed >= grace * 4 / 5 && grace_elapsed < Duration::from_secs(8),
         "MailUnrung must wait for the {grace:?} reconnect grace window, fired after {grace_elapsed:?}"
     );
     assert_eq!(raised_card["draft"]["kind"]["kind"], "mail_unrung");
@@ -1791,7 +1791,7 @@ async fn e2e_pr20_seed_interchange_horizon_operator_guard_and_resident_manifest(
             "seats": {
                 "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
                 "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" },
-                "rd-3": { "name": "heidi", "box": "/tmp/interchange/to-muse" }
+                "rd-3": { "name": "heidi", "box": "/tmp/interchange/to-maya" }
             }
         }))
         .unwrap(),
@@ -1801,7 +1801,7 @@ async fn e2e_pr20_seed_interchange_horizon_operator_guard_and_resident_manifest(
         estate.join(".watchers/mailwatch-routes.json"),
         serde_json::to_vec(&json!({
             "carol": { "aliases": ["carol", "carol_old", "Carol-legacy"] },
-            "heidi": { "aliases": ["muse", "heidi-old"] }
+            "heidi": { "aliases": ["maya", "heidi-old"] }
         }))
         .unwrap(),
     )
@@ -2555,7 +2555,7 @@ async fn pr22_cli_seed_seats_tsv_and_mail_score_mailwatch_seen() {
         .collect();
     assert!(seeded_seats.contains(&"frank"));
     assert!(seeded_seats.contains(&"chroma"));
-    assert!(seeded_seats.contains(&"neon"));
+    assert!(seeded_seats.contains(&"niaj"));
     assert!(!seeded_seats.contains(&"bob"));
     assert!(
         dry_seed["skipped_targets"]

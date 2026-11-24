@@ -30,5 +30,8 @@ serde.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

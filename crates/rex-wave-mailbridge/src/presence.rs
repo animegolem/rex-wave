@@ -508,20 +508,10 @@ fn register_seed_seat<'a>(
 /// `.watchers/mailwatch-routes.json`, `tooling/t3-doorbell/targets.json`,
 /// `state/bb-knock-routes.tsv`,
 /// `state/codex-knock-routes.tsv`, `herdr-registry.tsv` (in `<dir>` or its
-/// parent house root), `state/ledger.md`, and the house profile's canonical
-/// alias folds ([`load_house_profile`]).
+/// parent house root), `state/ledger.md`, and `house`'s canonical alias folds.
 ///
 /// Never writes to disk and never emits `Active` claims for the house's
 /// operator surface seat or non-seat pseudo-targets (`cc`, `desk`, etc.).
-pub fn seed_records_from_interchange(
-    interchange_dir: &Path,
-) -> Result<SeedInterchangePlan, ApiError> {
-    let house = load_house_profile()?;
-    seed_records_from_interchange_with_profile(interchange_dir, &house)
-}
-
-/// [`seed_records_from_interchange`] with an explicit [`HouseProfile`] instead
-/// of the environment-resolved one.
 pub fn seed_records_from_interchange_with_profile(
     interchange_dir: &Path,
     house: &HouseProfile,

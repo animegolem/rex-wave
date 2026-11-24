@@ -57,10 +57,28 @@ impl AliasMap {
         }
     }
 
-    /// Builds an alias map from every durable `SeatRecord`'s canonical name and
-    /// aliases in `PresenceState`, carrying the state's operator surface seat.
+    /// Builds an alias map from the house profile's configured alias folds and
+    /// every durable `SeatRecord` in `PresenceState`, carrying the state's
+    /// operator surface seat. Durable `SeatRecord` claims take precedence over
+    /// static profile folds when present.
     pub fn from_presence(presence: &PresenceState) -> Self {
         let mut map = Self::empty().with_operator_seat(presence.house().operator_seat.clone());
+        for (canon_seat, alias_list) in &presence.house().aliases {
+            if presence
+                .seats()
+                .values()
+                .any(|rec| rec.aliases.iter().any(|a| &a.value == canon_seat))
+            {
+                continue;
+            }
+            let canon = canon_seat.as_str();
+            map.insert(canon, canon);
+            for alias in alias_list {
+                if !presence.seats().contains_key(alias) {
+                    map.insert(alias.as_str(), canon);
+                }
+            }
+        }
         for (seat, rec) in presence.seats() {
             let canon = seat.as_str();
             map.insert(canon, canon);

@@ -4,9 +4,17 @@
 
 For the crate dependency graph, actor ownership rules, and protocol invariants, read [the architecture document](./ARCHITECTURE.md). For agent bash usage, read [the CLI skill](./.agents/skills/rex-wave-cli/SKILL.md).
 
-## Build and verify offline
+## Build and verify
 
-Build the binary and run the full workspace test suite offline:
+Run the hermetic verification gate (`cargo fmt`, repo hygiene, `bb-plugin` typecheck and tests, `cargo clippy -D warnings`, parallel workspace tests, `tui --self-test`, and `schema --bb` diff), enable the `pre-push` hook once per clone, and install a release binary atomically:
+
+```sh
+git config core.hooksPath .githooks
+./check
+./scripts/install-local.sh
+```
+
+To build and test completely offline once dependencies are cached:
 
 ```sh
 cargo build --release --offline

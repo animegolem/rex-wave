@@ -4297,7 +4297,7 @@ mod tests {
         let role = RoleName::parse("verifier").unwrap();
         let spec = WaveSpec {
             slug: wave.clone(),
-            project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+            project: BbProjectId::parse("proj_demo_main").unwrap(),
             goal: Body::parse("Verify OAuth refresh").unwrap(),
             defaults: AgentSpec {
                 provider: ProviderId::parse("codex").unwrap(),
@@ -4354,7 +4354,7 @@ mod tests {
                 wave: wave.clone(),
                 role: role.clone(),
                 attempt: 1,
-                project: BbProjectId::parse("proj_3vs7nkyeum").unwrap(),
+                project: BbProjectId::parse("proj_demo_main").unwrap(),
                 agent: AgentSpec {
                     provider: ProviderId::parse("codex").unwrap(),
                     model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
@@ -4441,7 +4441,7 @@ mod tests {
             .send(protocol::Up::ToolCall {
                 call_id: "call_wait_1".into(),
                 thread_id: "th_auth_verifier".into(),
-                project_id: "proj_3vs7nkyeum".into(),
+                project_id: "proj_demo_main".into(),
                 meta: None,
                 tool: "wait".into(),
                 args: serde_json::to_value(Wait::room(started.room.clone(), Seq(4), false))

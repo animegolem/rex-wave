@@ -71,10 +71,10 @@ fn test_house() -> HouseProfile {
         aliases: [
             fold("carol", &["carol_old", "carol-legacy"]),
             fold("dave", &["dave_old", "dave-opus-5"]),
-            fold("heidi", &["heidi-old", "heidi-typo", "muse"]),
+            fold("heidi", &["heidi-old", "heidi-typo", "maya"]),
             fold("ivan-supervisor", &["ivan", "ivan-sup"]),
             fold("lucas", &["lucas-rev"]),
-            fold("neon", &[]),
+            fold("niaj", &[]),
         ]
         .into_iter()
         .collect(),
@@ -721,26 +721,21 @@ fn gate1_all_10_mail_routing_cases_verified() {
         );
     }
 
-    // When running on the estate Mac where Carol's fixture file exists, verify our
-    // 10-case matrix covers 100% of the case IDs in `cases.jsonl`.
+    // When running with an opt-in live interchange directory, verify our 10-case
+    // matrix covers 100% of `cases.jsonl` after applying any configured
+    // `HouseProfile::fixture_id_aliases`.
     if let Some(root) = opt_in_interchange_dir() {
         let fixture_path = root.join("fixtures/mail-routing/cases.jsonl");
         if fixture_path.is_file() {
             let raw = fs::read_to_string(fixture_path).unwrap();
-            let disk_ids: BTreeSet<String> = raw
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    let v: serde_json::Value = serde_json::from_str(l).unwrap();
-                    v["id"].as_str().unwrap().to_owned()
-                })
-                .collect();
-            let expected_owned: BTreeSet<String> =
-                expected_ids.iter().map(|s| (*s).to_owned()).collect();
+            let house = rex_wave_mailbridge::load_house_profile().unwrap();
+            let report =
+                rex_wave_mailbridge::check_gate1_fixtures_with_profile(&raw, &house).unwrap();
             assert!(
-                expected_owned.is_subset(&disk_ids),
-                "expected Gate 1 case IDs missing from cases.jsonl: {:?}",
-                expected_owned.difference(&disk_ids).collect::<Vec<_>>()
+                report.fixture_ids_registered(),
+                "expected Gate 1 case IDs to match cases.jsonl (missing={:?}, unknown={:?})",
+                report.missing_case_ids,
+                report.unknown_case_ids
             );
         }
     }
@@ -1160,7 +1155,7 @@ fn gate1_case_06_a_transport_dies() {
         let mut seq = 0;
         let quire = SeatName::parse("quire").unwrap();
         let trent = SeatName::parse("trent").unwrap();
-        for (seat, tid) in [(&quire, "th_quire"), (&trent, "th_tangle")] {
+        for (seat, tid) in [(&quire, "th_quire"), (&trent, "th_trent")] {
             apply_presence_with_probe(
                 &mut st,
                 &mut seq,
@@ -1261,13 +1256,13 @@ fn gate1_case_07_two_seats_one_name() {
         let mut st = PresenceState::default();
         let mut seq = 0;
         let peggy = SeatName::parse("peggy").unwrap();
-        let plumb_p = Principal::Seat {
+        let peggy_p = Principal::Seat {
             seat: peggy.clone(),
         };
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            plumb_p.clone(),
+            peggy_p.clone(),
             UnixMs(1_000),
             PresenceCommand::PresenceClaim(PresenceClaim {
                 seat: peggy.clone(),
@@ -1293,7 +1288,7 @@ fn gate1_case_07_two_seats_one_name() {
         apply_presence_with_probe(
             &mut st,
             &mut seq,
-            plumb_p,
+            peggy_p,
             UnixMs(1_500),
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: peggy.clone(),
@@ -2443,7 +2438,7 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
             "seats": {
                 "rd-1": { "name": "carol", "box": "/tmp/interchange/to-carol" },
                 "rd-2": { "name": "operator", "box": "/tmp/interchange/to-operator" },
-                "rd-3": { "name": "heidi", "box": "/tmp/interchange/to-muse" },
+                "rd-3": { "name": "heidi", "box": "/tmp/interchange/to-maya" },
                 "rd-4": { "name": "dave", "box": "/tmp/interchange/to-dave" }
             }
         }))
@@ -2455,7 +2450,7 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
         serde_json::to_vec(&serde_json::json!({
             "carol": { "aliases": ["carol", "carol_old", "Carol-legacy", "carol desk"] },
             "dave": { "aliases": ["dave", "dave_old", "users-c7"] },
-            "heidi": { "aliases": ["muse", "heidi", "heidi-old"] },
+            "heidi": { "aliases": ["maya", "heidi", "heidi-old"] },
             "cc": { "aliases": ["cc"] }
         }))
         .unwrap(),
@@ -2523,7 +2518,7 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
     assert_eq!(aliases.canonicalize("dave_old"), "dave");
     assert_eq!(aliases.canonicalize("heidi-old"), "heidi");
     assert_eq!(aliases.canonicalize("heidi-typo"), "heidi");
-    assert_eq!(aliases.canonicalize("muse"), "heidi");
+    assert_eq!(aliases.canonicalize("maya"), "heidi");
 
     let resolved = st
         .resolve_at(
@@ -3465,7 +3460,7 @@ fn pr22_seed_records_ingests_all_doorbells_ledger_and_seats_tsv() {
         })
     );
     assert_eq!(
-        by_seat(&base_plan, "neon").unwrap().verified_how,
+        by_seat(&base_plan, "niaj").unwrap().verified_how,
         Some(VerificationKind::WitnessedBy { seat: carol_seat })
     );
     assert!(by_seat(&base_plan, "chroma").is_none());
@@ -3793,6 +3788,11 @@ fn house_profile_loader_defaults_when_absent_and_applies_custom_profile_when_pre
         h
     });
     assert!(house.is_operator_seat("@BOB") && !house.is_operator_seat("operator"));
+    // Offline PresenceState (zero claimed SeatRecords) still folds house.json aliases.
+    let offline_aliases =
+        AliasMap::from_presence(&PresenceState::with_house_profile(house.clone()));
+    assert_eq!(offline_aliases.canonicalize("carol_old"), "carol");
+    assert!(offline_aliases.is_operator_surface("@bob"));
 
     // The loaded profile drives seeding: operator skipped, alias folded,
     // excluded pane dropped, unconfirmed claims witnessed by the profile's seat.
@@ -3841,12 +3841,16 @@ fn house_profile_loader_defaults_when_absent_and_applies_custom_profile_when_pre
     ));
     assert!(Presence::decide(&st, &claim("operator"), &ctx).is_ok());
 
-    // Fail closed: malformed JSON, unknown field, invalid seat name.
+    // Fail closed: malformed JSON, unknown field, invalid seat name, self-alias,
+    // canonical-seat collision, or duplicate alias across two canonical seats.
     for bad in [
         &b"{ not json"[..],
         br#"{ "operator_seat": "bob", "surprise": 1 }"#,
         br#"{ "operator_seat": "Not A Seat" }"#,
         br#"{ "aliases": { "carol": ["bob"] }, "operator_seat": "bob" }"#,
+        br#"{ "aliases": { "carol": ["carol"] } }"#,
+        br#"{ "aliases": { "carol": ["dave"], "dave": [] } }"#,
+        br#"{ "aliases": { "carol": ["shared_alias"], "dave": ["shared_alias"] } }"#,
     ] {
         fs::write(&path, bad).unwrap();
         let err = load_house_profile_from(&path).unwrap_err();

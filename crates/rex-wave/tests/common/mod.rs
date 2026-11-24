@@ -5,9 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NONCE: AtomicU64 = AtomicU64::new(1);
+use tempfile::{Builder, TempDir};
 
 /// macOS `sockaddr_un.sun_path` holds 104 bytes; keep every test directory
 /// short enough that `<dir>/<name>.sock` always fits, whatever `TMPDIR` says.
@@ -23,34 +21,37 @@ pub const SCRUBBED_ENV: &[&str] = &[
     "REX_WAVE_T3_TOKEN",
     "REX_WAVE_BB_TOKEN",
     "REX_WAVE_INTERCHANGE_DIR",
+    "REX_WAVE_LIVE_INTERCHANGE_TEST_DIR",
     "CLAUDE_PID",
 ];
 
-/// A fresh directory under `/tmp/rw-...` (never `$TMPDIR`), removed on drop.
-pub struct DirGuard(pub PathBuf);
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+/// A private `O_EXCL` (`0700`) temporary directory short enough for Unix
+/// domain sockets on macOS, removed on drop via [`TempDir`].
+pub struct DirGuard(pub PathBuf, TempDir);
 
 pub fn fresh_dir(label: &str) -> DirGuard {
-    let n = NONCE.fetch_add(1, Ordering::Relaxed);
     let short: String = label
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(12)
+        .take(10)
         .collect();
-    let p = PathBuf::from(format!("/tmp/rw-{short}-{}-{n}", std::process::id()));
+    let ambient = std::env::temp_dir();
+    let base = if ambient.as_os_str().len() < 36 && ambient.is_dir() {
+        ambient
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let guard = Builder::new()
+        .prefix(&format!("rw-{short}-"))
+        .tempdir_in(&base)
+        .expect("create private short test temp dir");
+    let p = guard.path().to_path_buf();
     assert!(
         p.as_os_str().len() < MAX_TEST_DIR_LEN,
         "test dir {} must stay under {MAX_TEST_DIR_LEN} bytes",
         p.display()
     );
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    DirGuard(p)
+    DirGuard(p, guard)
 }
 
 /// `<root>/config`, holding an empty `rex-wave/protected-roots` (the daemon

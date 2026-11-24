@@ -83,10 +83,10 @@ pub fn load_t3_project_names_from_sqlite(db_path: &Path) -> BTreeMap<BbProjectId
     let Ok(conn) = Connection::open_with_flags(db_path, flags) else {
         return map;
     };
-    // T3 writes this database live; wait briefly on its write lock instead of
-    // failing the read with SQLITE_BUSY.
+    // Pin a 5 s busy timeout explicitly so concurrent T3 WAL writes wait rather
+    // than returning SQLITE_BUSY even if rusqlite's default changes.
     if conn
-        .busy_timeout(std::time::Duration::from_millis(1_000))
+        .busy_timeout(std::time::Duration::from_millis(5_000))
         .is_err()
     {
         return map;

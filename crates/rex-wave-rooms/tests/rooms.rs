@@ -93,7 +93,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
     );
     assert_eq!(g2.topic.as_deref(), Some("Town hall"));
 
-    let proj = BbProjectId::parse("proj_3vs7nkyeum").unwrap();
+    let proj = BbProjectId::parse("proj_demo_main").unwrap();
     let proj_chan = RoomRef::Channel {
         scope: RoomScope::Project {
             project: proj.clone(),

@@ -135,6 +135,8 @@ impl HouseProfile {
                 }
             }
         }
+        let mut seen_aliases: std::collections::BTreeMap<&SeatName, &SeatName> =
+            std::collections::BTreeMap::new();
         for (canon, list) in &self.aliases {
             if list.len() > HOUSE_PROFILE_MAX_ALIASES_PER_SEAT {
                 return Err(format!(
@@ -149,6 +151,25 @@ impl HouseProfile {
                     "aliases.{canon}: the operator surface seat '{}' may not be a canonical seat or alias",
                     self.operator_seat
                 ));
+            }
+            for alias in list {
+                if alias == canon {
+                    return Err(format!(
+                        "aliases.{canon}: self-alias '{alias}' is redundant"
+                    ));
+                }
+                if self.aliases.contains_key(alias) {
+                    return Err(format!(
+                        "aliases.{canon}: alias '{alias}' collides with canonical seat '{alias}'"
+                    ));
+                }
+                if let Some(prev_canon) = seen_aliases.insert(alias, canon)
+                    && prev_canon != canon
+                {
+                    return Err(format!(
+                        "aliases.{canon}: alias '{alias}' is already claimed by '{prev_canon}'"
+                    ));
+                }
             }
         }
         Ok(())
