@@ -274,7 +274,11 @@ SELECT_READ_MSG = (
     "cancel-unsafe frame read in select!: read frames in a spawned reader task "
     "and select on its channel Receiver"
 )
+FOR_TEST_MSG = (
+    "DecideCtx::for_test is test-only: route production commands through Router"
+)
 HTTP_GUARD_OWNER = "crates/rex-wave-api/src/http_guard.rs"
+RUNTIME_DECIDE_CTX_OWNER = "crates/rex-wave-runtime/src/lib.rs"
 src_rs_re = re.compile(r"^crates/[^/]+/src/.+\.rs$")
 operator_pat_re = re.compile(r"Principal::Operator\s*\{\s*\.\.\s*\}")
 matches_open_re = re.compile(r"\bmatches!\s*\(")
@@ -282,6 +286,8 @@ calendar_re = re.compile(r"\b(719_468|146_097)\b")
 http_guard_fn_re = re.compile(r"\bfn\s+(is_loopback_host|strip_bearer)\b")
 select_open_re = re.compile(r"\bselect!\s*\{")
 select_read_re = re.compile(r"\b(read_frame|read_message|read_exact)\s*\(")
+for_test_re = re.compile(r"\bDecideCtx::for_test\s*\(")
+cfg_test_mod_re = re.compile(r"#\s*\[\s*cfg\s*\([^]]*\btest\b[^]]*\)\s*\]")
 MAX_MACRO_SCAN = 1 << 20
 
 def scrub_rust_noncode(text):
@@ -388,6 +394,60 @@ def balanced_end(text, start, open_ch, close_ch):
 def line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
+def select_branch_future_spans(text, body_start, body_end):
+    """Yield (start, end) slices for each top-level select! branch future (before `=>`),
+    skipping handler expressions that run after a branch is selected."""
+    spans = []
+    i = body_start
+    arm_start = body_start
+    depth_brace = 0
+    depth_paren = 0
+    depth_bracket = 0
+    in_handler = False
+    while i < body_end:
+        c = text[i]
+        if c == "{":
+            depth_brace += 1
+        elif c == "}":
+            if depth_brace > 0:
+                depth_brace -= 1
+                if in_handler and depth_brace == 0 and depth_paren == 0 and depth_bracket == 0:
+                    in_handler = False
+                    j = i + 1
+                    while j < body_end and text[j] in (" ", "\t", "\r", "\n", ","):
+                        j += 1
+                    arm_start = j
+                    i = j
+                    continue
+        elif c == "(":
+            depth_paren += 1
+        elif c == ")" and depth_paren > 0:
+            depth_paren -= 1
+        elif c == "[":
+            depth_bracket += 1
+        elif c == "]" and depth_bracket > 0:
+            depth_bracket -= 1
+        elif depth_brace == 0 and depth_paren == 0 and depth_bracket == 0:
+            if not in_handler and c == "=" and i + 1 < body_end and text[i + 1] == ">":
+                spans.append((arm_start, i))
+                in_handler = True
+                i += 2
+                continue
+            if in_handler and c == ",":
+                in_handler = False
+                arm_start = i + 1
+        i += 1
+    return spans
+
+def cfg_test_ranges(text):
+    ranges = []
+    for m in cfg_test_mod_re.finditer(text):
+        brace = text.find("{", m.end())
+        if brace != -1:
+            end = balanced_end(text, brace + 1, "{", "}")
+            ranges.append((m.start(), end))
+    return ranges
+
 def structural_hits(rel, raw_text):
     text = scrub_rust_noncode(raw_text)
     hits = []
@@ -402,10 +462,19 @@ def structural_hits(rel, raw_text):
     if rel != HTTP_GUARD_OWNER:
         for m in http_guard_fn_re.finditer(text):
             hits.append((rel, line_of(text, m.start()), "fn " + m.group(1), HTTP_GUARD_MSG))
+    if rel != RUNTIME_DECIDE_CTX_OWNER:
+        test_ranges = None
+        for m in for_test_re.finditer(text):
+            if test_ranges is None:
+                test_ranges = cfg_test_ranges(text)
+            pos = m.start()
+            if not any(lo <= pos <= hi for lo, hi in test_ranges):
+                hits.append((rel, line_of(text, pos), "DecideCtx::for_test(", FOR_TEST_MSG))
     for m in select_open_re.finditer(text):
         end = balanced_end(text, m.end(), "{", "}")
-        for r in select_read_re.finditer(text, m.end(), end):
-            hits.append((rel, line_of(text, r.start()), r.group(1) + "(", SELECT_READ_MSG))
+        for fut_start, fut_end in select_branch_future_spans(text, m.end(), end):
+            for r in select_read_re.finditer(text, fut_start, fut_end):
+                hits.append((rel, line_of(text, r.start()), r.group(1) + "(", SELECT_READ_MSG))
     return hits
 
 def has_digest(ns, token, table):

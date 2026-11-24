@@ -443,12 +443,97 @@ pub enum OutsideError {
     Io(String),
 }
 
+/// Canonicalize the deepest existing prefix of `path` (resolving both
+/// symlinks and filesystem case on case-insensitive volumes such as macOS
+/// APFS), then re-attach any not-yet-existing trailing components.
+pub fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, SandboxError> {
+    let lex = lexical_normalize(path)?;
+    let resolved = resolve_links(&lex)?;
+    for base in [&resolved, &lex] {
+        let mut anc = base.as_path();
+        loop {
+            if let Ok(canon_anc) = real_path(anc) {
+                return Ok(match base.strip_prefix(anc) {
+                    Ok(suffix) if !suffix.as_os_str().is_empty() => canon_anc.join(suffix),
+                    _ => canon_anc,
+                });
+            }
+            let Some(parent) = anc.parent() else {
+                break;
+            };
+            anc = parent;
+        }
+    }
+    Ok(resolved)
+}
+
+fn flip_ascii_case_first(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut flipped = false;
+    for ch in s.chars() {
+        if !flipped && ch.is_ascii_alphabetic() {
+            out.push(if ch.is_ascii_lowercase() {
+                ch.to_ascii_uppercase()
+            } else {
+                ch.to_ascii_lowercase()
+            });
+            flipped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    flipped.then_some(out)
+}
+
+/// Probe whether `existing_dir` resides on a case-insensitive filesystem by
+/// toggling the ASCII case of one existing path component and checking whether
+/// it resolves to the same `(dev, ino)` inode.
+fn is_case_insensitive_volume(existing_dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(orig) = std::fs::metadata(existing_dir) else {
+        return false;
+    };
+    let mut cur = existing_dir;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name().and_then(|n| n.to_str())
+            && let Some(toggled_name) = flip_ascii_case_first(name)
+        {
+            let suffix = existing_dir.strip_prefix(cur).unwrap_or(Path::new(""));
+            let mut probe = parent.join(toggled_name);
+            if !suffix.as_os_str().is_empty() {
+                probe = probe.join(suffix);
+            }
+            return std::fs::metadata(&probe)
+                .is_ok_and(|m| (m.dev(), m.ino()) == (orig.dev(), orig.ino()));
+        }
+        cur = parent;
+    }
+    false
+}
+
+fn starts_with_ascii_ci(path: &Path, root: &Path) -> bool {
+    let mut p_comps = path.components();
+    for r in root.components() {
+        let Some(p) = p_comps.next() else {
+            return false;
+        };
+        let eq = match (p.as_os_str().to_str(), r.as_os_str().to_str()) {
+            (Some(ps), Some(rs)) => ps.eq_ignore_ascii_case(rs),
+            _ => p.as_os_str() == r.as_os_str(),
+        };
+        if !eq {
+            return false;
+        }
+    }
+    true
+}
+
 impl OutsidePath {
     /// Verify that `out` (absolute, or relative to the current directory)
-    /// names a file outside `protected_root`, judged by spelling and by its
-    /// real location with every symlink on the way resolved, including
-    /// links whose targets do not exist yet. A symlink at `out` itself is
-    /// refused. The verified path keeps `out`'s real parent and file name.
+    /// names a file outside `protected_root`, judged by spelling, symlink
+    /// resolution, and `canonicalize` of the deepest existing ancestor (which
+    /// normalizes case on case-insensitive volumes such as macOS APFS). A
+    /// symlink at `out` itself is refused.
     pub fn verify(out: &Path, protected_root: &Path) -> Result<Self, OutsideError> {
         if out.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(OutsideError::ParentDir(out.to_path_buf()));
@@ -461,19 +546,41 @@ impl OutsidePath {
         if matches!(entry_kind(&abs), Ok(EntryKind::Symlink)) {
             return Err(OutsideError::Symlink(out.to_path_buf()));
         }
-        let protected = [
-            lexical_normalize(protected_root).map_err(|e| OutsideError::Io(e.to_string()))?,
-            resolve_links(protected_root).map_err(|e| OutsideError::Io(e.to_string()))?,
-        ];
         let parent = abs.parent().unwrap_or(Path::new("/"));
         let real_parent = resolve_links(parent).map_err(|e| OutsideError::Io(e.to_string()))?;
         let real = real_parent.join(&file_name);
-        for root in &protected {
-            if abs.starts_with(root) || real.starts_with(root) {
-                return Err(OutsideError::Inside(out.to_path_buf(), root.clone()));
+        if matches!(entry_kind(&real), Ok(EntryKind::Symlink)) {
+            return Err(OutsideError::Symlink(out.to_path_buf()));
+        }
+        let canon =
+            canonicalize_existing_prefix(&abs).map_err(|e| OutsideError::Io(e.to_string()))?;
+        if matches!(entry_kind(&canon), Ok(EntryKind::Symlink)) {
+            return Err(OutsideError::Symlink(out.to_path_buf()));
+        }
+
+        let protected = [
+            lexical_normalize(protected_root).map_err(|e| OutsideError::Io(e.to_string()))?,
+            resolve_links(protected_root).map_err(|e| OutsideError::Io(e.to_string()))?,
+            canonicalize_existing_prefix(protected_root)
+                .map_err(|e| OutsideError::Io(e.to_string()))?,
+        ];
+        let mut deepest_existing = canon.as_path();
+        while !deepest_existing.exists() {
+            let Some(p) = deepest_existing.parent() else {
+                break;
+            };
+            deepest_existing = p;
+        }
+        let ci = is_case_insensitive_volume(deepest_existing);
+
+        for cand in [&abs, &real, &canon] {
+            for root in &protected {
+                if cand.starts_with(root) || (ci && starts_with_ascii_ci(cand, root)) {
+                    return Err(OutsideError::Inside(out.to_path_buf(), root.clone()));
+                }
             }
         }
-        Ok(Self { path: real })
+        Ok(Self { path: canon })
     }
 
     pub fn path(&self) -> &Path {
@@ -521,6 +628,26 @@ mod tests {
             OutsidePath::verify(&leaf, &protected),
             Err(OutsideError::Symlink(_))
         ));
+
+        if is_case_insensitive_volume(&base) {
+            let house = base.join("House");
+            let inter = house.join("interchange");
+            std::fs::create_dir_all(&inter).unwrap();
+            let upper_direct = base.join("HOUSE").join("INTERCHANGE").join("shadow.jsonl");
+            assert!(matches!(
+                OutsidePath::verify(&upper_direct, &inter),
+                Err(OutsideError::Inside(..))
+            ));
+            let upper_sub = base
+                .join("HOUSE")
+                .join("INTERCHANGE")
+                .join("not-yet")
+                .join("shadow.jsonl");
+            assert!(matches!(
+                OutsidePath::verify(&upper_sub, &inter),
+                Err(OutsideError::Inside(..))
+            ));
+        }
     }
 
     #[test]

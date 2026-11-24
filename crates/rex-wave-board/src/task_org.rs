@@ -708,9 +708,9 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), OrgSyncError> {
     })
 }
 
-/// Read an org file (bounded, never through a symlink).
+/// Read an org file (bounded, following user symlinks).
 pub fn read_org_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    rex_wave_fs::read_regular_bounded(path, MAX_ORG_FILE_BYTES)
+    rex_wave_fs::read_input_bounded(path, MAX_ORG_FILE_BYTES)
 }
 
 fn write_conflict_sidecar(

@@ -33,7 +33,6 @@ use rex_wave_waves::{WaveConductor, Waves};
 use std::collections::HashSet;
 use std::io::{self, Read as _};
 use std::net::SocketAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -191,13 +190,7 @@ fn lock_token_store(tokens_path: &Path) -> io::Result<TokenStoreGuard> {
         std::fs::create_dir_all(parent)?;
     }
     let lock_path = tokens_path.with_extension("json.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)?;
+    let lock_file = rex_wave_fs::open_lock_nofollow(&lock_path)?;
     lock_file.lock()?;
     Ok(TokenStoreGuard {
         _in_proc: in_proc,

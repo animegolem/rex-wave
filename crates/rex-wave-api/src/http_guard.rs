@@ -35,9 +35,10 @@ pub fn is_loopback_host(authority: &str) -> bool {
 /// fragment or userinfo.
 fn origin_authority(origin: &str) -> Option<&str> {
     let trimmed = origin.trim();
-    let authority = if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
+    let bytes = trimmed.as_bytes();
+    let authority = if bytes.len() > 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
         &trimmed[7..]
-    } else if trimmed.len() > 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
+    } else if bytes.len() > 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
         &trimmed[8..]
     } else {
         return None;
@@ -123,6 +124,19 @@ mod tests {
         assert!(is_loopback_origin("http://[::1]:9"));
         assert!(!is_loopback_origin("http://127.0.0.1/path"));
         assert!(!is_loopback_origin("http://user@127.0.0.1"));
+        for multibyte in [
+            "abcdef\u{e9}",
+            "abcdefg\u{e9}",
+            "123456\u{1f600}",
+            "http://\u{e9}",
+            "https://\u{e9}:7782",
+        ] {
+            assert!(!is_loopback_origin(multibyte), "{multibyte:?}");
+            assert!(
+                !is_matching_loopback_origin(multibyte, "127.0.0.1:7782"),
+                "{multibyte:?}"
+            );
+        }
     }
 
     #[test]

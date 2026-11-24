@@ -71,7 +71,7 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
         }
         [kind, sub, seat] if kind == "dm" && sub == "operator" => {
             return Ok(ResourceTarget::Room(RoomRef::Dm {
-                with: Principal::Operator {
+                with: Principal::Seat {
                     seat: SeatName::parse(seat).map_err(api)?,
                 },
             }));
@@ -81,7 +81,13 @@ pub(crate) fn parse_uri(uri: &str) -> Result<ResourceTarget, ResourceError> {
             one_name(role).map(|()| format!("@{wave}/{role}"))?
         }
         [kind, project, name] if kind == "project" => {
-            one_name(name).map(|()| format!("#{project}/{name}"))?
+            one_name(name)?;
+            return Ok(ResourceTarget::Room(RoomRef::Channel {
+                scope: RoomScope::Project {
+                    project: BbProjectId::parse(project.clone()).map_err(api)?,
+                },
+                name: ChannelName::parse(name.clone()).map_err(api)?,
+            }));
         }
         [project, name] if project != "project" => {
             one_name(name).map(|()| format!("#{project}/{name}"))?
@@ -110,10 +116,10 @@ pub(crate) fn room_uri(room: &RoomId, viewer: &Principal) -> Option<(String, Str
             ))
         }
         RoomId::Direct { pair } => {
-            let other = pair.other(viewer)?;
+            let other = pair.other_for_viewer(viewer)?;
             let uri = match other {
                 Principal::Seat { seat } => format!("rex://room/dm/seat/{seat}"),
-                Principal::Operator { seat } => format!("rex://room/dm/operator/{seat}"),
+                Principal::Operator { seat } => format!("rex://room/dm/seat/{seat}"),
                 Principal::Worker { wave, role } => format!("rex://room/dm/worker/{wave}/{role}"),
                 Principal::System { .. } => return None,
             };
@@ -383,5 +389,46 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rex_wave_api::room::PrincipalPair;
+
+    #[test]
+    fn room_uri_and_parse_uri_preserve_proj_prefixed_ids_and_operator_dms() {
+        let operator = Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        };
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        };
+        let dm = RoomId::Direct {
+            pair: PrincipalPair::new(operator.as_dm_member(), alice.clone()).unwrap(),
+        };
+        let (dm_uri, _) = room_uri(&dm, &operator).expect("operator must see seat-keyed DM uri");
+        assert_eq!(dm_uri, "rex://room/dm/seat/alice");
+        assert_eq!(
+            parse_uri(&dm_uri).unwrap(),
+            ResourceTarget::Room(RoomRef::Dm { with: alice })
+        );
+
+        let proj = BbProjectId::parse("proj:alpha/sub").unwrap();
+        let chan = RoomId::Channel {
+            scope: RoomScope::Project {
+                project: proj.clone(),
+            },
+            name: ChannelName::parse("general").unwrap(),
+        };
+        let (chan_uri, _) = room_uri(&chan, &operator).unwrap();
+        assert_eq!(
+            parse_uri(&chan_uri).unwrap(),
+            ResourceTarget::Room(RoomRef::Channel {
+                scope: RoomScope::Project { project: proj },
+                name: ChannelName::parse("general").unwrap(),
+            })
+        );
     }
 }

@@ -20,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rex-wave-rooms.workspace = true
+rex-wave-runtime = { path = "../rex-wave-runtime", features = ["test-support"] }
 
 [lints]
 workspace = true

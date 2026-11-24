@@ -71,8 +71,8 @@ const MAX_SINK_CONNS: usize = 32;
 
 /// The largest banked wake-bell record read.
 const MAX_BELL_FILE_BYTES: u64 = 1024 * 1024;
-/// The largest sandbox `state/acks.jsonl` read.
-const MAX_ACKS_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest single JSONL line inside `state/acks.jsonl`.
+const MAX_ACK_LINE_BYTES: usize = 1024 * 1024;
 /// The largest letter read for projection or acknowledgement.
 const MAX_LETTER_BYTES: u64 = 16 * 1024 * 1024;
 /// Mode of letters, bells and acks written into the sandbox.
@@ -607,17 +607,68 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
     out
 }
 
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+        if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(nl) > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("acks.jsonl line exceeds {max_bytes} bytes"),
+                ));
+            }
+            buf.extend_from_slice(&available[..nl]);
+            reader.consume(nl + 1);
+            return Ok(true);
+        }
+        if buf.len().saturating_add(available.len()) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("acks.jsonl line exceeds {max_bytes} bytes"),
+            ));
+        }
+        buf.extend_from_slice(available);
+        let n = available.len();
+        reader.consume(n);
+    }
+}
+
 fn is_acked_in_sandbox(
     root: &SandboxRoot,
     to_seat: &str,
     rel_path: &str,
     sha256: &Sha256Hex,
-) -> bool {
-    let Some(contents) = root.read_state_string("state/acks.jsonl", MAX_ACKS_BYTES) else {
-        return false;
+) -> Result<bool, ApiError> {
+    let rel = RelPath::parse("state/acks.jsonl")
+        .map_err(|e| ApiError::Internal(format!("invalid acks relpath: {e}")))?;
+    let (file, _) = match root.dir.open_regular(&rel) {
+        Ok(pair) => pair,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("read non-regular acks.jsonl: {e}"),
+            });
+        }
+        Err(e) => return Err(ApiError::Internal(format!("read acks.jsonl: {e}"))),
     };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_buf = Vec::new();
     let aliases = acks::AliasMap::empty();
-    for line in contents.lines() {
+    while read_bounded_line(&mut reader, &mut line_buf, MAX_ACK_LINE_BYTES)
+        .map_err(|e| ApiError::Internal(format!("read acks.jsonl: {e}")))?
+    {
+        let Ok(line) = std::str::from_utf8(&line_buf) else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -625,10 +676,10 @@ fn is_acked_in_sandbox(
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
             && ack_row_matches(&val, to_seat, rel_path, sha256, &aliases)
         {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn ack_row_matches(
@@ -697,7 +748,9 @@ pub fn project(root: &SandboxRoot, path: &Path, bytes: &[u8]) -> Result<MailboxI
         )
     };
 
-    let state = if is_acked_in_sandbox(root, &to, &rel_path, &sha256) {
+    let acked = is_acked_in_sandbox(root, &to, &rel_path, &sha256)
+        .map_err(|e| SandboxError::Io(e.to_string()))?;
+    let state = if acked {
         "acked".to_owned()
     } else {
         "open".to_owned()
@@ -897,6 +950,15 @@ impl MailBridge {
         }
 
         let (file_name, bytes) = render_letter(&req, ctx.by(), &entries);
+        if bytes.len() as u64 > MAX_LETTER_BYTES {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "range".into(),
+                reason: format!(
+                    "promoted letter is {} bytes, exceeding max {MAX_LETTER_BYTES} bytes",
+                    bytes.len()
+                ),
+            }));
+        }
         let sha256 = sha256_bytes(&bytes);
 
         let mut seen_seats = BTreeSet::new();
@@ -1032,7 +1094,7 @@ impl MailBridge {
         let state_dir = self.root.ensure_dir(&["state"])?;
         let acks_file = state_dir.join("acks.jsonl");
 
-        if !is_acked_in_sandbox(&self.root, &acker_seat, &rel_path, &req.sha256) {
+        if !is_acked_in_sandbox(&self.root, &acker_seat, &rel_path, &req.sha256)? {
             let (mut f, _) = rex_wave_fs::open_append_nofollow(&acks_file, SANDBOX_FILE_MODE)
                 .map_err(|e| {
                     if e.kind() == std::io::ErrorKind::InvalidInput {

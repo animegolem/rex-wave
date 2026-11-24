@@ -245,17 +245,27 @@ fn lookup_bb_project_in_sqlite(db_path: &Path, project_id: &str) -> Option<BbPro
 }
 
 fn normalize_path_key(raw: &str) -> String {
-    let path = Path::new(raw);
-    if path.is_absolute()
-        && let Ok(real) = rex_wave_fs::resolve_links(path)
-    {
-        return real.to_string_lossy().trim_end_matches('/').to_owned();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
     }
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() && raw.starts_with('/') {
+    if looks_like_path(trimmed) || Path::new(trimmed).is_absolute() {
+        let expanded = expand_tilde(trimmed);
+        if let Ok(real) = rex_wave_fs::canonicalize_existing_prefix(&expanded) {
+            let s = real.to_string_lossy();
+            let stripped = s.trim_end_matches('/');
+            return if stripped.is_empty() {
+                "/".to_owned()
+            } else {
+                stripped.to_owned()
+            };
+        }
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    if stripped.is_empty() && raw.starts_with('/') {
         "/".to_owned()
     } else {
-        trimmed.to_owned()
+        stripped.to_owned()
     }
 }
 
@@ -326,8 +336,9 @@ pub async fn resolve_or_ensure_t3_project(
 
     let (target_root, desired_title) = if looks_like_path(raw) {
         let expanded = expand_tilde(raw);
-        let root_str = expanded.to_string_lossy().into_owned();
-        let title = expanded
+        let resolved = rex_wave_fs::canonicalize_existing_prefix(&expanded).unwrap_or(expanded);
+        let root_str = resolved.to_string_lossy().into_owned();
+        let title = resolved
             .file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
@@ -474,5 +485,37 @@ mod tests {
         let loc = lookup_bb_project_location(&bb_dir, "proj_alpha").unwrap();
         assert_eq!(loc.name.as_deref(), Some("alpha-repo"));
         assert_eq!(loc.workspace_root, PathBuf::from("/tmp/alpha-main"));
+
+        let repo_dir = tmp.path().join("SampleRepo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let abs_key = normalize_path_key(&repo_dir.to_string_lossy());
+        let cwd = std::env::current_dir().unwrap();
+        if let Ok(rel_from_cwd) = strip_or_rel(&cwd, &repo_dir) {
+            assert_eq!(normalize_path_key(&rel_from_cwd), abs_key);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let upper = tmp.path().join("SAMPLEREPO");
+            assert_eq!(normalize_path_key(&upper.to_string_lossy()), abs_key);
+        }
+    }
+
+    fn strip_or_rel(cwd: &Path, target: &Path) -> Result<String, ()> {
+        let mut ups = Vec::new();
+        let mut anc = cwd;
+        while !target.starts_with(anc) {
+            ups.push("..");
+            anc = anc.parent().ok_or(())?;
+        }
+        let tail = target.strip_prefix(anc).map_err(|_| ())?;
+        let mut out = if ups.is_empty() {
+            PathBuf::from(".")
+        } else {
+            ups.into_iter().collect::<PathBuf>()
+        };
+        if !tail.as_os_str().is_empty() {
+            out.push(tail);
+        }
+        Ok(out.to_string_lossy().into_owned())
     }
 }

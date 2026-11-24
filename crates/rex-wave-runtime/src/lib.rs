@@ -55,7 +55,7 @@ use std::pin::Pin;
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Context the router stamps on every command. Never caller-supplied:
-/// only the router (and `for_test`) can build one.
+/// only the router (and `test-support` in tests) can build one.
 #[derive(Clone, Debug)]
 pub struct DecideCtx {
     by: Principal,
@@ -67,8 +67,9 @@ impl DecideCtx {
         Self { by, at }
     }
 
-    /// A context for driving a decider directly in a test. Production
-    /// commands get theirs from the router.
+    /// A context for driving a decider directly in a test. Compiled out of
+    /// non-test builds unless the `test-support` dev feature is enabled.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(by: Principal, at: UnixMs) -> Self {
         Self { by, at }
     }

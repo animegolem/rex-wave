@@ -1027,7 +1027,7 @@ const MAX_CLI_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SHADOW_LOG_BYTES: u64 = 256 * 1024 * 1024;
 
 fn read_cli_text(path: &Path) -> std::io::Result<String> {
-    rex_wave_fs::read_regular_string(path, MAX_CLI_INPUT_BYTES)
+    rex_wave_fs::read_input_string(path, MAX_CLI_INPUT_BYTES)
 }
 
 fn read_text_source(
@@ -3013,43 +3013,71 @@ fn write_file_atomic_outside(
         .map_err(|e| CliError::Msg(format!("write {}: {e}", final_target.display())))
 }
 
-/// Appends `bytes` to the `--watch` shadow log at `final_target` (already
-/// resolved by [`resolve_shadow_out_target`]) and syncs. The log is opened
-/// `O_NOFOLLOW` and judged by its handle on every append, so a symlink or
-/// non-regular file swapped in at the leaf is refused, never written through.
-fn append_shadow_delta(final_target: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    assert!(!bytes.is_empty(), "callers skip empty deltas");
-    let (mut f, _) = rex_wave_fs::open_append_nofollow(final_target, 0o644).map_err(|e| {
-        CliError::Msg(format!(
-            "refusing to append shadow output to {}: {e}",
-            final_target.display()
-        ))
-    })?;
-    f.write_all(bytes)
-        .and_then(|()| f.sync_data())
-        .map_err(|e| CliError::Msg(format!("append {}: {e}", final_target.display())))
+struct ShadowWatchLogFile {
+    out_arg: PathBuf,
+    file: std::fs::File,
+    id: rex_wave_fs::FileId,
 }
 
-/// Opens the `--watch` append log: resolves and validates `out`, then hydrates
-/// a [`ShadowWatchTracker`] from it when it already exists so a restarted
-/// watcher appends only new transitions. Returns `(final_path, tracker,
-/// needs_leading_newline)`; the last flag is set when the existing log does
-/// not end in `\n` (a torn final write that still parsed).
+/// Appends `bytes` to the retained `--watch` shadow log handle after
+/// re-verifying that `out_arg` still resolves outside `interchange_root` to the
+/// exact same regular file `(dev, ino)` opened at startup. Writing to the
+/// already-opened descriptor never traverses any pathname in the kernel, while
+/// the pre-flight check refuses a mid-run symlink or file swap.
+fn append_shadow_delta(
+    log: &mut ShadowWatchLogFile,
+    interchange_root: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    assert!(!bytes.is_empty(), "callers skip empty deltas");
+    let cur_target = resolve_shadow_out_target(&log.out_arg, interchange_root)?;
+    rex_wave_fs::verify_same_regular_nofollow(&cur_target, log.id).map_err(|e| {
+        CliError::Msg(format!(
+            "refusing to append shadow output to {}: {e}",
+            cur_target.display()
+        ))
+    })?;
+    log.file
+        .write_all(bytes)
+        .and_then(|()| log.file.sync_data())
+        .map_err(|e| CliError::Msg(format!("append {}: {e}", cur_target.display())))
+}
+
+/// Opens and retains the `--watch` append log handle (`O_NOFOLLOW`), hydrating
+/// a [`ShadowWatchTracker`] from any existing bytes on that exact handle so a
+/// restarted watcher appends only new transitions.
 fn open_shadow_watch_log(
     out: &Path,
     interchange_root: &Path,
-) -> Result<(PathBuf, ShadowWatchTracker, bool), CliError> {
+) -> Result<(ShadowWatchLogFile, ShadowWatchTracker, bool), CliError> {
     let final_target = resolve_shadow_out_target(out, interchange_root)?;
-    let existing = match rex_wave_fs::read_regular_string(&final_target, MAX_SHADOW_LOG_BYTES) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(CliError::Msg(format!(
-                "refusing shadow --watch output {}: {e}",
-                final_target.display()
-            )));
-        }
-    };
+    let (file, meta) = rex_wave_fs::open_rw_append_nofollow(&final_target, 0o644).map_err(|e| {
+        CliError::Msg(format!(
+            "refusing shadow --watch output {}: {e}",
+            final_target.display()
+        ))
+    })?;
+    let id = rex_wave_fs::file_id(&meta);
+    let reader_copy = file.try_clone().map_err(|e| {
+        CliError::Msg(format!(
+            "clone shadow --watch output handle {}: {e}",
+            final_target.display()
+        ))
+    })?;
+    let raw_bytes =
+        rex_wave_fs::read_open_bounded(&final_target, reader_copy, &meta, MAX_SHADOW_LOG_BYTES)
+            .map_err(|e| {
+                CliError::Msg(format!(
+                    "refusing shadow --watch output {}: {e}",
+                    final_target.display()
+                ))
+            })?;
+    let existing = String::from_utf8(raw_bytes).map_err(|_| {
+        CliError::Msg(format!(
+            "refusing shadow --watch output {}: not UTF-8",
+            final_target.display()
+        ))
+    })?;
     let tracker = ShadowWatchTracker::from_existing_jsonl(&existing).map_err(|e| {
         CliError::Msg(format!(
             "cannot resume shadow --watch log {}: {e}; move it aside or repair it",
@@ -3057,7 +3085,15 @@ fn open_shadow_watch_log(
         ))
     })?;
     let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
-    Ok((final_target, tracker, needs_newline))
+    Ok((
+        ShadowWatchLogFile {
+            out_arg: out.to_path_buf(),
+            file,
+            id,
+        },
+        tracker,
+        needs_newline,
+    ))
 }
 
 async fn load_live_presence_state(
@@ -3137,13 +3173,13 @@ async fn execute_mail_shadow(
     let to_stdout = out == Path::new("-");
     // `--watch` appends transitions (a fresh tracker for stdout); `--once`
     // keeps the atomic snapshot overwrite.
-    let mut watch_log: Option<(Option<PathBuf>, ShadowWatchTracker, bool)> =
+    let mut watch_log: Option<(Option<ShadowWatchLogFile>, ShadowWatchTracker, bool)> =
         match (watch, to_stdout) {
             (false, _) => None,
             (true, true) => Some((None, ShadowWatchTracker::new(), false)),
             (true, false) => {
-                let (path, tracker, needs_newline) = open_shadow_watch_log(out, ro.root())?;
-                Some((Some(path), tracker, needs_newline))
+                let (log_file, tracker, needs_newline) = open_shadow_watch_log(out, ro.root())?;
+                Some((Some(log_file), tracker, needs_newline))
             }
         };
 
@@ -3163,23 +3199,23 @@ async fn execute_mail_shadow(
         )
         .map_err(|e| CliError::Msg(format!("shadow pass: {e}")))?;
         let mut appended_decisions: Option<usize> = None;
-        if let Some((path, tracker, needs_newline)) = watch_log.as_mut() {
+        if let Some((log_file, tracker, needs_newline)) = watch_log.as_mut() {
             let delta = tracker
                 .observe_pass(&report.decisions, &aliases, now)
                 .map_err(|e| CliError::Msg(format!("shadow watch: {e}")))?;
             appended_decisions = Some(delta.decision_lines);
-            match path {
+            match log_file {
                 None => {
                     print!("{}", delta.jsonl);
                     let _ = std::io::stdout().flush();
                 }
-                Some(path) if !delta.jsonl.is_empty() => {
+                Some(log_file) if !delta.jsonl.is_empty() => {
                     let mut bytes = Vec::with_capacity(delta.jsonl.len() + 1);
                     if *needs_newline {
                         bytes.push(b'\n');
                     }
                     bytes.extend_from_slice(delta.jsonl.as_bytes());
-                    append_shadow_delta(path, &bytes)?;
+                    append_shadow_delta(log_file, ro.root(), &bytes)?;
                     *needs_newline = false;
                 }
                 Some(_) => {}

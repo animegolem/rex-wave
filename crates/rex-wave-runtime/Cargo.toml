@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 rex-wave-api.workspace = true
 rex-wave-store.workspace = true

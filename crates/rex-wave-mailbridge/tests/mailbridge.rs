@@ -927,3 +927,98 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
     courier_task.abort();
     sink_task.abort();
 }
+
+#[tokio::test]
+async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_read_errors() {
+    let (_guard, sandbox) = TempSandbox::marked();
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let mail_service = Arc::new(MailBridge::with_hub(
+        sandbox.clone(),
+        journal.clone(),
+        journal.claim(StreamId::Mail).unwrap(),
+        hub.clone(),
+    ));
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Arc::new(Unavailable(Family::Wave)),
+        board: Arc::new(Unavailable(Family::Board)),
+        inbox: Arc::new(Unavailable(Family::Inbox)),
+        mail: mail_service,
+        presence: Arc::new(Unavailable(Family::Presence)),
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub,
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }),
+    });
+    let sam = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: SeatName::parse("sam").unwrap(),
+        },
+    );
+    let alice = LocalClient::new(
+        router,
+        Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        },
+    );
+    let chan = RoomRef::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("bulk").unwrap(),
+    };
+    let big_body = Body::parse("x".repeat(64 * 1024)).unwrap();
+    let mut first_seq = None;
+    let mut last_seq = Seq::ORIGIN;
+    for _ in 0..260 {
+        let posted = sam
+            .call(RoomPost::new(chan.clone(), big_body.clone()))
+            .await
+            .unwrap();
+        first_seq.get_or_insert(posted.seq);
+        last_seq = posted.seq;
+    }
+    let room_id = chan.resolve(sam.me()).unwrap();
+    let err = sam
+        .call(MailPromote {
+            room: room_id.clone(),
+            range: SeqRange::new(first_seq.unwrap(), last_seq).unwrap(),
+            to: vec![SeatName::parse("alice").unwrap()],
+            subject: "Too large to read back".into(),
+            topic: "too-large".into(),
+            priority: LetterPriority::Low,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Invalid(_)), "got {err:?}");
+    assert!(!sandbox.path().join("to-alice").exists());
+
+    let ok_ref = sam
+        .call(MailPromote {
+            room: room_id,
+            range: SeqRange::new(first_seq.unwrap(), first_seq.unwrap()).unwrap(),
+            to: vec![SeatName::parse("alice").unwrap()],
+            subject: "Small letter".into(),
+            topic: "small".into(),
+            priority: LetterPriority::Normal,
+        })
+        .await
+        .unwrap();
+
+    fs::create_dir_all(sandbox.path().join("state")).unwrap();
+    // Corrupt single line without newline exceeding per-line bound must fail closed, never duplicate-append.
+    let acks_path = sandbox.path().join("state/acks.jsonl");
+    fs::write(&acks_path, vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let ack_err = alice
+        .call(MailAck {
+            path: ok_ref.path.clone(),
+            sha256: ok_ref.sha256.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(ack_err, ApiError::Internal(_)), "got {ack_err:?}");
+    assert_eq!(fs::metadata(&acks_path).unwrap().len(), 2 * 1024 * 1024);
+}

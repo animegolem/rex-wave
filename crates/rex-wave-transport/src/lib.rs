@@ -772,7 +772,13 @@ impl Authenticator for PrincipalAuthenticator {
                 }),
             },
             Credential::Token { token } => match self.tokens.get(token) {
-                Some(principal) if !matches!(principal, Principal::System { .. }) => {
+                Some(principal)
+                    if !matches!(principal, Principal::System { .. })
+                        && !matches!(
+                            principal,
+                            Principal::Seat { seat } if seat == &self.operator
+                        ) =>
+                {
                     Ok(principal.clone())
                 }
                 _ => Err(ApiError::Denied {
@@ -1471,12 +1477,24 @@ pub fn bind_unix(path: &std::path::Path) -> io::Result<(UnixListener, u32)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
+    match rex_wave_fs::entry_kind(path)? {
+        rex_wave_fs::EntryKind::Missing => {}
+        rex_wave_fs::EntryKind::Other => {
+            rex_wave_fs::socket_owner_uid(path)?;
+            let _ = std::fs::remove_file(path);
+        }
+        rex_wave_fs::EntryKind::Symlink
+        | rex_wave_fs::EntryKind::File
+        | rex_wave_fs::EntryKind::Dir => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to unlink non-socket entry at {}", path.display()),
+            ));
+        }
     }
     let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let uid = rex_wave_fs::socket_owner_uid(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok((listener, uid))
 }
 

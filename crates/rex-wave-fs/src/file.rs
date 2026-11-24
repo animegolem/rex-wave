@@ -87,9 +87,17 @@ pub fn read_private_regular(
     read_open_bounded(path, file, &meta, max_bytes)
 }
 
-fn read_open_bounded(
+/// `(dev, ino)` identity of an opened file handle.
+pub type FileId = (u64, u64);
+
+pub fn file_id(meta: &Metadata) -> FileId {
+    (meta.dev(), meta.ino())
+}
+
+/// Read at most `max_bytes` from an already-opened handle.
+pub fn read_open_bounded(
     path: &Path,
-    file: File,
+    mut file: File,
     meta: &Metadata,
     max_bytes: u64,
 ) -> io::Result<Vec<u8>> {
@@ -99,13 +107,22 @@ fn read_open_bounded(
             format!("{} is larger than {max_bytes} bytes", path.display()),
         )
     };
-    if meta.len() > max_bytes {
+    if meta.is_file() && meta.len() > max_bytes {
         return Err(too_big());
     }
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    file.take(max_bytes + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > max_bytes {
-        return Err(too_big());
+    let cap = if meta.is_file() {
+        usize::try_from(meta.len().min(max_bytes)).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut buf = Vec::with_capacity(cap);
+    if max_bytes == u64::MAX {
+        file.read_to_end(&mut buf)?;
+    } else {
+        file.take(max_bytes + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > max_bytes {
+            return Err(too_big());
+        }
     }
     Ok(buf)
 }
@@ -113,6 +130,32 @@ fn read_open_bounded(
 /// [`read_regular_bounded`], decoded as UTF-8 (`InvalidData` otherwise).
 pub fn read_regular_string(path: &Path, max_bytes: u64) -> io::Result<String> {
     let bytes = read_regular_bounded(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8", path.display()),
+        )
+    })
+}
+
+/// Bounded read for an operator-chosen CLI input path: follows symlinks and
+/// accepts pipes, process substitution, and `/dev/stdin`, while refusing
+/// directories and inputs larger than `max_bytes`.
+pub fn read_input_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a directory", path.display()),
+        ));
+    }
+    read_open_bounded(path, file, &meta, max_bytes)
+}
+
+/// [`read_input_bounded`], decoded as UTF-8 (`InvalidData` otherwise).
+pub fn read_input_string(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let bytes = read_input_bounded(path, max_bytes)?;
     String::from_utf8(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -137,6 +180,57 @@ pub fn open_append_nofollow(path: &Path, mode: u32) -> io::Result<(File, Metadat
         return Err(not_regular(path));
     }
     Ok((file, meta))
+}
+
+/// Open (creating with `mode` when absent) `path` for both initial bounded
+/// reading and subsequent appending without following a symlink at the leaf.
+pub fn open_rw_append_nofollow(path: &Path, mode: u32) -> io::Result<(File, Metadata)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .mode(mode)
+        .custom_flags(NOFOLLOW)
+        .open(path)
+        .map_err(|e| opened(path, e))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(not_regular(path));
+    }
+    Ok((file, meta))
+}
+
+/// Verify that `path` still names the exact regular file `expected` without
+/// following a symlink at `path`.
+pub fn verify_same_regular_nofollow(path: &Path, expected: FileId) -> io::Result<()> {
+    let (_file, meta) = open_regular_nofollow(path)?;
+    if file_id(&meta) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} was replaced underneath watcher", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Open (creating if absent) a private `0600` advisory lock file without
+/// following a symlink at `path`.
+pub fn open_lock_nofollow(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(NOFOLLOW)
+        .open(path)
+        .map_err(|e| opened(path, e))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(not_regular(path));
+    }
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// Create a fresh, exclusive temp file beside `path` (never following a
@@ -398,12 +492,6 @@ impl ConfinedDir {
     /// Hold an existing directory. `root` may be reached through symlinks;
     /// the held path is its real location.
     pub fn open(root: &Path) -> io::Result<Self> {
-        if entry_kind(root)? == EntryKind::Symlink {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("refusing to follow symlink {}", root.display()),
-            ));
-        }
         let real = real_path(root)?;
         dir_metadata_nofollow(&real)?;
         Ok(Self { root: real })
@@ -470,6 +558,10 @@ impl ConfinedDir {
         Ok(self
             .walk(rel.parent_segments(), None)?
             .join(rel.file_name().as_str()))
+    }
+
+    pub fn open_regular(&self, rel: &RelPath) -> io::Result<(File, Metadata)> {
+        open_regular_nofollow(&self.resolve(rel)?)
     }
 
     pub fn read_regular(&self, rel: &RelPath, max_bytes: u64) -> io::Result<Vec<u8>> {
