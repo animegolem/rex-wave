@@ -567,9 +567,10 @@ impl PreparedUnixSocket {
                         ),
                     ));
                 }
-                probe_socket_is_stale(display_path)?;
-                unlinkat(&self.parent_dir, &self.file_name, AtFlags::empty())
-                    .map_err(io::Error::from)?;
+                if probe_socket_is_stale(&self.parent_dir, &self.file_name, display_path)? {
+                    unlinkat(&self.parent_dir, &self.file_name, AtFlags::empty())
+                        .map_err(io::Error::from)?;
+                }
             }
             Err(rustix::io::Errno::NOENT) => {}
             Err(e) => return Err(io::Error::from(e)),
@@ -578,7 +579,16 @@ impl PreparedUnixSocket {
     }
 }
 
-fn probe_socket_is_stale(path: &Path) -> io::Result<()> {
+/// Returns `Ok(true)` when a dead stale socket still sits at `(parent_dir, file_name)`,
+/// `Ok(false)` when the entry disappeared concurrently (`NOENT` in `parent_dir`),
+/// or `Err` when a live daemon is listening or the probe path diverged / failed.
+fn probe_socket_is_stale(
+    parent_dir: &File,
+    file_name: &std::ffi::OsStr,
+    path: &Path,
+) -> io::Result<bool> {
+    use rustix::fs::{AtFlags, statat};
+
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
@@ -586,10 +596,22 @@ fn probe_socket_is_stale(path: &Path) -> io::Result<()> {
         )),
         Err(e)
             if e.kind() == io::ErrorKind::ConnectionRefused
-                || e.raw_os_error() == Some(libc::ECONNREFUSED)
-                || e.kind() == io::ErrorKind::NotFound =>
+                || e.raw_os_error() == Some(libc::ECONNREFUSED) =>
         {
-            Ok(())
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match statat(parent_dir, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(rustix::io::Errno::NOENT) => Ok(false),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to unlink socket {}: probe path diverged from held directory",
+                        path.display()
+                    ),
+                )),
+                Err(se) => Err(io::Error::from(se)),
+            }
         }
         Err(e) => Err(io::Error::new(
             e.kind(),
@@ -735,7 +757,7 @@ pub fn validate_unix_socket_target(path: &Path) -> io::Result<PreparedUnixSocket
                     ),
                 ));
             }
-            probe_socket_is_stale(path)?;
+            probe_socket_is_stale(&parent_dir, &file_name, path)?;
         }
         Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(io::Error::from(e)),

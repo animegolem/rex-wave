@@ -2913,6 +2913,7 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
             },
             after: Cursor::default(),
             timeout_ms: Some(0),
+            limit: None,
         })
         .await
         .unwrap();
@@ -3127,14 +3128,40 @@ async fn pre_pr26_legacy_operator_dm_journal_replays_zero_duplicate_notification
     let split_wait_page = split_op
         .call(rex_wave_api::read::Wait {
             interest: Interest::Room {
-                room: RoomRef::Dm { with: alice_p },
+                room: RoomRef::Dm {
+                    with: alice_p.clone(),
+                },
             },
             after: legacy_cursor,
             timeout_ms: Some(0),
+            limit: Some(1),
         })
         .await
         .unwrap();
-    assert_eq!(split_wait_page.entries.len(), 2);
+    assert_eq!(split_wait_page.entries.len(), 1);
+    assert_eq!(split_wait_page.total_count, 2);
+    assert!(split_wait_page.truncated);
     assert_eq!(split_wait_page.entries[0].seq, Seq(1));
-    assert_eq!(split_wait_page.entries[1].seq, Seq(2));
+
+    // Live cursor (`from_head: true`) omitting target stream starts at head on `Read` (matching `Wait`).
+    let live_read = split_op
+        .call(
+            rex_wave_api::read::Read::room_ref(
+                RoomRef::Dm { with: alice_p },
+                &Principal::Operator {
+                    seat: SeatName::parse("zorro").unwrap(),
+                },
+                Seq::ORIGIN,
+                Some(Cursor::live()),
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(live_read.entries.is_empty());
+    assert_eq!(
+        live_read.cursor.at(&StreamId::Room { room: canon_room }),
+        Seq(2)
+    );
 }

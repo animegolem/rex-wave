@@ -651,6 +651,7 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
             interest: Interest::Mentions,
             after: Cursor::live(),
             timeout_ms: Some(15),
+            limit: None,
         })
         .await
         .unwrap();
@@ -665,6 +666,7 @@ async fn watch_and_wait_never_sleep_through_concurrent_commits() {
                     interest: Interest::Mentions,
                     after: wake_cursor,
                     timeout_ms: Some(2000),
+                    limit: None,
                 })
                 .await
                 .unwrap()
@@ -922,6 +924,7 @@ async fn operator_sidebar_lists_dms_addressed_to_its_seat() {
             interest: Interest::Mentions,
             after: Cursor::default(),
             timeout_ms: Some(1_000),
+            limit: None,
         })
         .await
         .expect("operator Interest::Mentions wakes on DM addressed to its seat");
@@ -1477,6 +1480,7 @@ async fn worker_wait_emits_parked_and_working_and_restores_on_cancel() {
                 Seq(0),
             ),
             timeout_ms: Some(0),
+            limit: None,
         })
         .await
         .unwrap();

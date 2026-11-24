@@ -1085,7 +1085,7 @@ async fn dispatch_json_route(
         }
         Route::RoomMessagesGet { room } => {
             let room_ref = parse_http_room_ref(&room).map_err(HttpError::from_api)?;
-            let room_id = check_room_visible(&router, &principal, &room_ref, &room)?;
+            let _ = check_room_visible(&router, &principal, &room_ref, &room)?;
             let after = match req.query_param("after") {
                 Some(raw) => Seq(raw.parse::<u64>().map_err(|_| {
                     HttpError::new("400 Bad Request", "invalid", "invalid after seq")
@@ -1115,28 +1115,12 @@ async fn dispatch_json_route(
                 let mut wait = Wait::room_ref_filtered(room_ref, &principal, after, re, labels)
                     .map_err(|e| HttpError::from_api(e.into()))?;
                 wait.timeout_ms = Some(0);
+                wait.limit = Some(limit.unwrap_or(200).clamp(1, 1000));
                 let mut p = client
                     .call(wait)
                     .await
                     .map_err(|e| mask_err(e, &format!("room {room}")))?;
                 p.timed_out = false;
-                let total_count = p.entries.len();
-                if let Some(lim) = limit {
-                    let cap = lim.clamp(1, 1000) as usize;
-                    if p.entries.len() > cap {
-                        p.entries.truncate(cap);
-                        if let Some(last) = p.entries.last() {
-                            p.cursor = Cursor::default().with(
-                                StreamId::Room {
-                                    room: room_id.clone(),
-                                },
-                                last.seq,
-                            );
-                        }
-                    }
-                }
-                p.total_count = total_count;
-                p.truncated = p.entries.len() < total_count;
                 p
             } else {
                 let read_cmd = Read::room_ref(room_ref, &principal, after, None, limit)
@@ -1389,10 +1373,6 @@ fn parse_sse_interest_and_cursor(
         }
     } else if let Some(stream_raw) = req.query_param("stream") {
         let stream = parse_sse_stream_param(stream_raw).map_err(HttpError::from_api)?;
-        let stream = router
-            .read
-            .resolve_stream(stream)
-            .map_err(HttpError::from_api)?;
         can_read_visible(principal, &stream, "stream").map_err(HttpError::from_api)?;
         single_stream = Some(stream.clone());
         Interest::Streams {

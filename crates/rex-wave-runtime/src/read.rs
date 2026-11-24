@@ -445,12 +445,30 @@ impl ReadSide {
 
     async fn wait_for(&self, viewer: Principal, req: read::Wait) -> Result<Page, ApiError> {
         let mut stream = self.watch_journal(viewer, req.interest, req.after.clone())?;
+        let cap = req.limit.map(|n| n.clamp(1, 1000) as usize);
         let mut entries = Vec::new();
+        let mut total_matched = 0usize;
         let mut cursor = req.after;
         let mut caught_up = false;
         let deadline = req
             .timeout_ms
             .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+
+        let finalize_page =
+            |entries: Vec<Envelope>, mut cursor: Cursor, total_matched: usize, timed_out: bool| {
+                let total_count = total_matched.max(entries.len());
+                let truncated = entries.len() < total_count;
+                if truncated && let Some(last) = entries.last() {
+                    cursor = Cursor::default().with(last.stream.clone(), last.seq);
+                }
+                Page {
+                    entries,
+                    cursor,
+                    timed_out,
+                    total_count,
+                    truncated,
+                }
+            };
 
         loop {
             let next = match deadline {
@@ -458,14 +476,7 @@ impl ReadSide {
                     match tokio::time::timeout_at(until, stream.next()).await {
                         Ok(item) => item,
                         Err(_) => {
-                            let total_count = entries.len();
-                            return Ok(Page {
-                                entries,
-                                cursor,
-                                timed_out: true,
-                                total_count,
-                                truncated: false,
-                            });
+                            return Ok(finalize_page(entries, cursor, total_matched, true));
                         }
                     }
                 }
@@ -474,37 +485,29 @@ impl ReadSide {
             match next {
                 Some(Ok(Frame::Committed(env))) => {
                     cursor.advance(&env.stream, env.seq);
-                    entries.push(env);
+                    total_matched += 1;
+                    if cap.is_none_or(|c| entries.len() < c) {
+                        entries.push(env);
+                    }
                     if caught_up {
                         tokio::task::yield_now().await;
                         while let Ok(Some(Ok(Frame::Committed(extra)))) =
                             tokio::time::timeout(Duration::ZERO, stream.next()).await
                         {
                             cursor.advance(&extra.stream, extra.seq);
-                            entries.push(extra);
+                            total_matched += 1;
+                            if cap.is_none_or(|c| entries.len() < c) {
+                                entries.push(extra);
+                            }
                         }
-                        let total_count = entries.len();
-                        return Ok(Page {
-                            entries,
-                            cursor,
-                            timed_out: false,
-                            total_count,
-                            truncated: false,
-                        });
+                        return Ok(finalize_page(entries, cursor, total_matched, false));
                     }
                 }
                 Some(Ok(Frame::CaughtUp { cursor: c })) => {
                     cursor = c;
                     caught_up = true;
-                    if !entries.is_empty() {
-                        let total_count = entries.len();
-                        return Ok(Page {
-                            entries,
-                            cursor,
-                            timed_out: false,
-                            total_count,
-                            truncated: false,
-                        });
+                    if total_matched > 0 {
+                        return Ok(finalize_page(entries, cursor, total_matched, false));
                     }
                     if req.timeout_ms == Some(0) {
                         return Ok(Page {
@@ -519,14 +522,7 @@ impl ReadSide {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e),
                 None => {
-                    let total_count = entries.len();
-                    return Ok(Page {
-                        entries,
-                        cursor,
-                        timed_out: false,
-                        total_count,
-                        truncated: false,
-                    });
+                    return Ok(finalize_page(entries, cursor, total_matched, false));
                 }
             }
         }
@@ -929,19 +925,23 @@ impl Service<ReadCommand> for ReadSide {
                         None => r.stream,
                     };
                     can_read(ctx.by(), &target_stream)?;
-                    let after = if r.after > Seq::ORIGIN {
-                        r.after
-                    } else if let Some(ref c) = r.cursor {
-                        c.at(&target_stream)
+                    let head = self.journal.head(&target_stream).map_err(store_error)?;
+                    let after = if let Some(ref c) = r.cursor {
+                        if c.lists(&target_stream) {
+                            c.at(&target_stream)
+                        } else if c.from_head() {
+                            head
+                        } else {
+                            Seq::ORIGIN
+                        }
                     } else {
-                        Seq::ORIGIN
+                        r.after
                     };
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
                     let entries = self
                         .journal
                         .read(&target_stream, after, limit)
                         .map_err(store_error)?;
-                    let head = self.journal.head(&target_stream).map_err(store_error)?;
                     let total_count = (head.0.saturating_sub(after.0) as usize).max(entries.len());
                     let truncated = entries.len() < total_count;
                     let last = entries.last().map_or(after, |e| e.seq);

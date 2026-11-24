@@ -6470,6 +6470,14 @@
         "interest": {
           "$ref": "#/$defs/Interest"
         },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "timeout_ms": {
           "default": null,
           "format": "uint64",

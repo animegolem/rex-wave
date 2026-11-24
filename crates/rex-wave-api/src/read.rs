@@ -50,11 +50,31 @@ impl Read {
         cursor: Option<Cursor>,
         limit: Option<u32>,
     ) -> Result<Self, crate::id::InvalidId> {
-        let fallback_id = room.resolve(viewer)?;
+        let fallback_id = match (&room, viewer) {
+            (RoomRef::Dm { with }, Principal::Operator { .. }) => {
+                let peer = with.as_dm_member();
+                if viewer.same_actor(&peer) {
+                    room.resolve(viewer)?
+                } else {
+                    RoomId::Direct {
+                        pair: crate::room::PrincipalPair::new(viewer.clone(), peer)?,
+                    }
+                }
+            }
+            _ => room.resolve(viewer)?,
+        };
+        let fallback_stream = StreamId::Room { room: fallback_id };
+        let wire_after = if after > Seq::ORIGIN {
+            after
+        } else if let Some(ref c) = cursor {
+            c.at(&fallback_stream)
+        } else {
+            Seq::ORIGIN
+        };
         Ok(Read {
-            stream: StreamId::Room { room: fallback_id },
+            stream: fallback_stream,
             room: Some(room),
-            after,
+            after: wire_after,
             cursor,
             limit,
         })
@@ -70,6 +90,8 @@ pub struct Wait {
     pub after: Cursor,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 impl Wait {
@@ -82,6 +104,7 @@ impl Wait {
                 interest: Interest::Mentions,
                 after: Cursor::live().with(stream, since),
                 timeout_ms: None,
+                limit: None,
             }
         } else {
             Wait {
@@ -90,6 +113,7 @@ impl Wait {
                 },
                 after: Cursor::default().with(stream, since),
                 timeout_ms: None,
+                limit: None,
             }
         }
     }
@@ -107,12 +131,14 @@ impl Wait {
                 interest: Interest::Mentions,
                 after: Cursor::live().with(stream, since),
                 timeout_ms: None,
+                limit: None,
             })
         } else {
             Ok(Wait {
                 interest: Interest::Room { room },
                 after: Cursor::default().with(stream, since),
                 timeout_ms: None,
+                limit: None,
             })
         }
     }
@@ -127,6 +153,7 @@ impl Wait {
             },
             after: Cursor::default().with(stream, since),
             timeout_ms: None,
+            limit: None,
         }
     }
 
@@ -143,6 +170,7 @@ impl Wait {
             interest: Interest::RoomFiltered { room, re, labels },
             after: Cursor::default().with(stream, since),
             timeout_ms: None,
+            limit: None,
         })
     }
 }

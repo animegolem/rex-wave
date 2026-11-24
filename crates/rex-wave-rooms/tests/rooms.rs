@@ -676,6 +676,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
                     interest: Interest::Mentions,
                     after,
                     timeout_ms: Some(2000),
+                    limit: None,
                 })
                 .await
                 .unwrap()

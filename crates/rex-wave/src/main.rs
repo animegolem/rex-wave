@@ -1251,6 +1251,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                     wait.after = c;
                 }
                 wait.timeout_ms = Some(0);
+                wait.limit = Some(limit.unwrap_or(200).clamp(1, 1000));
                 Ok(WireCommand::Wait(wait))
             } else {
                 Ok(WireCommand::Read(Read::room_ref(
@@ -1298,6 +1299,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                                 },
                                 after: c,
                                 timeout_ms: *timeout,
+                                limit: None,
                             }
                         } else {
                             let mut w = Wait::room_ref_filtered(
@@ -1348,6 +1350,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                         },
                         after,
                         timeout_ms: *timeout,
+                        limit: None,
                     }
                 }
             };
@@ -3881,20 +3884,10 @@ async fn execute_remote<C: Client>(
     let wire = to_command_for(cmd, client.me())?;
     let mut reply = client.call_wire(wire).await?;
 
-    if let Cmd::Read { limit, .. } = cmd
+    if matches!(cmd, Cmd::Read { .. })
         && let WireReply::Wait(mut page) = reply
     {
         page.timed_out = false;
-        let total_count = page.entries.len();
-        let cap = limit.unwrap_or(200).clamp(1, 1000) as usize;
-        if page.entries.len() > cap {
-            page.entries.truncate(cap);
-            if let Some(last) = page.entries.last() {
-                page.cursor = Cursor::default().with(last.stream.clone(), last.seq);
-            }
-        }
-        page.total_count = total_count;
-        page.truncated = page.entries.len() < total_count;
         reply = WireReply::Read(page);
     }
 
