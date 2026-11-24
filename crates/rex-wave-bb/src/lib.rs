@@ -23,7 +23,7 @@ use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1735,6 +1735,12 @@ impl Reactor for BridgeWaveWatcher {
     }
 }
 
+#[derive(Default)]
+struct FallbackWaitTable {
+    next_epoch: u64,
+    entries: HashMap<(WaveSlug, RoleName), FallbackWaitEntry>,
+}
+
 struct FallbackWaitEntry {
     active: usize,
     epoch: u64,
@@ -1898,8 +1904,7 @@ pub struct BbBridge {
     owner: mpsc::UnboundedSender<OwnerMsg>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     code_runner: Option<CodeRunner>,
-    fallback_epoch_seq: AtomicU64,
-    fallback_active_waits: std::sync::Mutex<HashMap<(WaveSlug, RoleName), FallbackWaitEntry>>,
+    fallback_active_waits: std::sync::Mutex<FallbackWaitTable>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -1930,8 +1935,7 @@ impl BbBridge {
             owner: BridgeOwner::spawn(),
             backend: OnceLock::new(),
             code_runner,
-            fallback_epoch_seq: AtomicU64::new(0),
-            fallback_active_waits: std::sync::Mutex::new(HashMap::new()),
+            fallback_active_waits: std::sync::Mutex::new(FallbackWaitTable::default()),
             project_names_tx,
             project_names_rx,
         });
@@ -1943,30 +1947,31 @@ impl BbBridge {
         &self,
         key: &(WaveSlug, RoleName),
     ) -> (u64, Arc<tokio::sync::Mutex<()>>) {
-        let next_epoch = self
-            .fallback_epoch_seq
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let mut map = self
+        let mut table = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let entry = map.entry(key.clone()).or_insert_with(|| FallbackWaitEntry {
-            active: 0,
-            epoch: 0,
-            gate: Arc::new(tokio::sync::Mutex::new(())),
-        });
+        table.next_epoch = table.next_epoch.wrapping_add(1);
+        let assigned_epoch = table.next_epoch;
+        let entry = table
+            .entries
+            .entry(key.clone())
+            .or_insert_with(|| FallbackWaitEntry {
+                active: 0,
+                epoch: 0,
+                gate: Arc::new(tokio::sync::Mutex::new(())),
+            });
         entry.active += 1;
-        entry.epoch = next_epoch;
+        entry.epoch = assigned_epoch;
         (entry.epoch, entry.gate.clone())
     }
 
     fn decrement_fallback_wait(&self, key: &(WaveSlug, RoleName)) -> usize {
-        let mut map = self
+        let mut table = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = map.get_mut(key) else {
+        let Some(entry) = table.entries.get_mut(key) else {
             return 0;
         };
         entry.active = entry.active.saturating_sub(1);
@@ -1979,11 +1984,11 @@ impl BbBridge {
         expected_epoch: u64,
         gate: &Arc<tokio::sync::Mutex<()>>,
     ) -> bool {
-        let map = self
+        let table = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.get(key).is_some_and(|e| {
+        table.entries.get(key).is_some_and(|e| {
             e.active > 0 && e.epoch >= expected_epoch && Arc::ptr_eq(&e.gate, gate)
         })
     }
@@ -1992,11 +1997,11 @@ impl BbBridge {
         &self,
         key: &(WaveSlug, RoleName),
     ) -> Option<(u64, Arc<tokio::sync::Mutex<()>>)> {
-        let map = self
+        let table = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let entry = map.get(key)?;
+        let entry = table.entries.get(key)?;
         if entry.active > 0 {
             return None;
         }
@@ -2009,11 +2014,13 @@ impl BbBridge {
         idle_epoch: u64,
         gate: &Arc<tokio::sync::Mutex<()>>,
     ) -> bool {
-        let map = self
+        let table = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.get(key)
+        table
+            .entries
+            .get(key)
             .is_some_and(|e| e.active == 0 && e.epoch == idle_epoch && Arc::ptr_eq(&e.gate, gate))
     }
 
@@ -2023,15 +2030,16 @@ impl BbBridge {
         idle_epoch: u64,
         gate: &Arc<tokio::sync::Mutex<()>>,
     ) {
-        let mut map = self
+        let mut table = self
             .fallback_active_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if map
+        if table
+            .entries
             .get(key)
             .is_some_and(|e| e.active == 0 && e.epoch == idle_epoch && Arc::ptr_eq(&e.gate, gate))
         {
-            map.remove(key);
+            table.entries.remove(key);
         }
     }
 
@@ -6278,7 +6286,12 @@ mod tests {
                 .unwrap();
                 race_handle.await.unwrap();
                 assert!(
-                    bridge.fallback_active_waits.lock().unwrap().is_empty(),
+                    bridge
+                        .fallback_active_waits
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty(),
                     "completed fallback waits must reclaim per-worker gate entries"
                 );
 
@@ -6338,7 +6351,14 @@ mod tests {
                 .await
                 .unwrap();
                 hold2.await.unwrap();
-                assert!(bridge.fallback_active_waits.lock().unwrap().is_empty());
+                assert!(
+                    bridge
+                        .fallback_active_waits
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
 
                 // Cancelling a fallback wait after `Wait` returned while `Working` restoration is
                 // in flight still completes `Working` and reclaims the map entry.
@@ -6449,9 +6469,45 @@ mod tests {
                     restored_snap.workers[0].2
                 );
                 assert!(
-                    bridge_slow.fallback_active_waits.lock().unwrap().is_empty(),
+                    bridge_slow
+                        .fallback_active_waits
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty(),
                     "detached restoration must reclaim fallback map entry"
                 );
+
+                // 16 concurrent OS-thread registrations where 15 cancel must always leave the
+                // sole survivor live (`fallback_wait_is_live == true`) with monotonic epochs.
+                for survivor_idx in 0..16usize {
+                    let barrier = std::sync::Barrier::new(16);
+                    let regs: Vec<(u64, Arc<tokio::sync::Mutex<()>>)> = std::thread::scope(|s| {
+                        let mut handles = Vec::with_capacity(16);
+                        for _ in 0..16 {
+                            let b_ref = &bridge_slow;
+                            let k_ref = &key;
+                            let bar_ref = &barrier;
+                            handles.push(s.spawn(move || {
+                                bar_ref.wait();
+                                b_ref.increment_fallback_wait(k_ref)
+                            }));
+                        }
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    for i in 0..16 {
+                        if i != survivor_idx {
+                            bridge_slow.decrement_fallback_wait(&key);
+                        }
+                    }
+                    let (surv_epoch, surv_gate) = &regs[survivor_idx];
+                    assert!(
+                        bridge_slow.fallback_wait_is_live(&key, *surv_epoch, surv_gate),
+                        "survivor {survivor_idx} (epoch={surv_epoch}) must remain live after 15 sibling cancellations"
+                    );
+                    assert_eq!(bridge_slow.decrement_fallback_wait(&key), 0);
+                    bridge_slow.restore_fallback_working_if_idle(&key).await;
+                }
             }
             let _ = shutdown_tx.send(true);
             let _ = bridge_runner.await;
