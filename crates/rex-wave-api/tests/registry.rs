@@ -711,7 +711,7 @@ fn wave_honesty_refusals_counts_serde_defaults_and_truncation_marker() {
 
     let retiring = live_refused.retiring();
     assert_eq!(retiring.refusal(), Some("cyber_safeguard"));
-    let retired = retiring.observe(&Observation::Archived);
+    let retired = retiring.observe(&Observation::archived());
     assert_eq!(
         retired,
         WorkerPhase::Retired {

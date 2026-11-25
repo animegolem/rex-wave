@@ -1421,7 +1421,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 wave::Observation::Spawned { .. }
                 | wave::Observation::Activity { .. }
                 | wave::Observation::RuntimeMeta { .. }
-                | wave::Observation::Archived => {}
+                | wave::Observation::Archived { .. } => {}
             },
             wave::WaveEvent::Finished { outcome } => {
                 let detail = match outcome {

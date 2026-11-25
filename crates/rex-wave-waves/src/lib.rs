@@ -174,9 +174,22 @@ pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase
             activity: activity.clone(),
         }),
         (
-            WorkerPhase::Live { .. } | WorkerPhase::Retiring { .. } | WorkerPhase::Requested { .. },
-            Observation::Archived,
-        ) => Ok(phase.observe(obs)),
+            WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread, .. },
+            Observation::Archived {
+                thread: obs_thread, ..
+            },
+        ) if obs_thread.as_ref().is_none_or(|t| t == thread) => Ok(phase.observe(obs)),
+        (
+            WorkerPhase::Requested { attempt },
+            Observation::Archived {
+                thread: obs_thread,
+                attempt: obs_attempt,
+            },
+        ) if obs_attempt.is_none_or(|a| a == *attempt)
+            && (obs_thread.is_none() || obs_attempt.is_some()) =>
+        {
+            Ok(phase.observe(obs))
+        }
         _ => Err(format!(
             "observation {obs:?} does not apply in phase {phase:?}"
         )),
@@ -739,6 +752,20 @@ impl Decider for Waves {
                         },
                     }]);
                 }
+                if let WorkerPhase::Requested { .. } = &rec.phase
+                    && let Observation::Archived {
+                        thread: Some(obs_th),
+                        ..
+                    } = &c.observation
+                {
+                    let is_t3 = obs_th.as_str().starts_with("t3:");
+                    let prov = rec.agent.provider.as_str();
+                    if (is_t3 && matches!(prov, "pi" | "cursor"))
+                        || (!is_t3 && prov == "antigravity")
+                    {
+                        return Ok(vec![]);
+                    }
+                }
                 let Ok(next) = worker_step(&rec.phase, &c.observation) else {
                     return Ok(vec![]);
                 };
@@ -1210,7 +1237,7 @@ impl<H: AgentHost> WaveConductor<H> {
             (StreamId::Wave { wave }, Event::Wave(ev)) => {
                 if let WaveEvent::WorkerObserved {
                     role,
-                    observation: Observation::Archived,
+                    observation: Observation::Archived { .. },
                 } = ev
                     && let Some(
                         WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread, .. },
@@ -1760,7 +1787,7 @@ impl<H: AgentHost> WaveConductor<H> {
             .call(WaveObserve {
                 wave: wave.clone(),
                 role: role.clone(),
-                observation: Observation::Archived,
+                observation: Observation::archived_for(thread.clone(), None),
             })
             .await?;
         Ok(())
@@ -2325,8 +2352,8 @@ mod tests {
         );
         assert_eq!(retiring["verifier"].error(), None);
 
-        observe(&mut state, &mut seq, &author, Observation::Archived);
-        observe(&mut state, &mut seq, &verifier, Observation::Archived);
+        observe(&mut state, &mut seq, &author, Observation::archived());
+        observe(&mut state, &mut seq, &verifier, Observation::archived());
         let retired = phases(&mut state, &mut seq);
         assert_eq!(
             retired["author"],
@@ -3614,7 +3641,7 @@ mod tests {
                 WaveCommand::WaveObserve(WaveObserve {
                     wave: spec.slug.clone(),
                     role: role.clone(),
-                    observation: Observation::Archived,
+                    observation: Observation::archived(),
                 }),
             )
             .unwrap();

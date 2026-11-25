@@ -211,30 +211,45 @@ impl WorkerPhase {
                 },
                 _ => self.clone(),
             },
-            (WorkerPhase::Live { thread, activity }, Observation::Archived) => {
-                WorkerPhase::Retired {
-                    thread: Some(thread.clone()),
-                    errored: activity.error().map(str::to_owned),
-                    refused: activity.refusal().map(str::to_owned),
-                }
-            }
+            (
+                WorkerPhase::Live { thread, activity },
+                Observation::Archived {
+                    thread: obs_thread, ..
+                },
+            ) if obs_thread.as_ref().is_none_or(|t| t == thread) => WorkerPhase::Retired {
+                thread: Some(thread.clone()),
+                errored: activity.error().map(str::to_owned),
+                refused: activity.refusal().map(str::to_owned),
+            },
             (
                 WorkerPhase::Retiring {
                     thread,
                     errored,
                     refused,
                 },
-                Observation::Archived,
-            ) => WorkerPhase::Retired {
+                Observation::Archived {
+                    thread: obs_thread, ..
+                },
+            ) if obs_thread.as_ref().is_none_or(|t| t == thread) => WorkerPhase::Retired {
                 thread: Some(thread.clone()),
                 errored: errored.clone(),
                 refused: refused.clone(),
             },
-            (WorkerPhase::Requested { .. }, Observation::Archived) => WorkerPhase::Retired {
-                thread: None,
-                errored: None,
-                refused: None,
-            },
+            (
+                WorkerPhase::Requested { attempt },
+                Observation::Archived {
+                    thread: obs_thread,
+                    attempt: obs_attempt,
+                },
+            ) if obs_attempt.is_none_or(|a| a == *attempt)
+                && (obs_thread.is_none() || obs_attempt.is_some()) =>
+            {
+                WorkerPhase::Retired {
+                    thread: None,
+                    errored: None,
+                    refused: None,
+                }
+            }
             (phase, _) => phase.clone(),
         }
     }
@@ -451,7 +466,7 @@ impl UnsettledFailure {
                     }
                 }
             }
-            Observation::RuntimeMeta { .. } | Observation::Archived => {}
+            Observation::RuntimeMeta { .. } | Observation::Archived { .. } => {}
         }
         let mut next = phase.observe(obs);
         if let WorkerPhase::Live {
@@ -467,7 +482,7 @@ impl UnsettledFailure {
                 },
             };
         }
-        if matches!(obs, Observation::Archived)
+        if matches!(obs, Observation::Archived { .. })
             && let WorkerPhase::Retired {
                 ref mut errored,
                 ref mut refused,
@@ -710,10 +725,29 @@ pub enum Observation {
         #[serde(default)]
         keys: Vec<String>,
     },
-    Archived,
+    Archived {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<BbThreadId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+    },
 }
 
 impl Observation {
+    pub fn archived() -> Self {
+        Observation::Archived {
+            thread: None,
+            attempt: None,
+        }
+    }
+
+    pub fn archived_for(thread: BbThreadId, attempt: Option<u32>) -> Self {
+        Observation::Archived {
+            thread: Some(thread),
+            attempt,
+        }
+    }
+
     pub fn activity(activity: Activity) -> Self {
         Observation::Activity {
             activity,
