@@ -1841,10 +1841,48 @@ fn parse_bb_ticket_resolved_key(key: &str) -> Option<(u64, u64)> {
     Some((id, seq))
 }
 
+fn format_bb_failure_outcome_key(tag: &str, act: &Activity) -> Option<String> {
+    match act {
+        Activity::Refused { reason } => {
+            let clean: String = reason.chars().take(512).collect();
+            Some(format!("fp:{tag}:{clean}"))
+        }
+        Activity::Errored { error } => {
+            let clean: String = error.chars().take(512).collect();
+            Some(format!("fe:{tag}:{clean}"))
+        }
+        _ => None,
+    }
+}
+
+fn parse_bb_failure_outcome_key(key: &str) -> Option<(&str, Activity)> {
+    if let Some(rest) = key.strip_prefix("fp:") {
+        let (tag, reason) = rest.split_once(':')?;
+        return Some((
+            tag,
+            Activity::Refused {
+                reason: reason.to_owned(),
+            },
+        ));
+    }
+    if let Some(rest) = key.strip_prefix("fe:") {
+        let (tag, error) = rest.split_once(':')?;
+        return Some((
+            tag,
+            Activity::Errored {
+                error: error.to_owned(),
+            },
+        ));
+    }
+    None
+}
+
 fn format_bb_segment_keys(
     start_seqs: &[u64],
     end_seq: Option<u64>,
     floor_seq: Option<u64>,
+    failure: Option<&Activity>,
+    consume_turn_started: bool,
 ) -> Vec<String> {
     let mut keys = Vec::new();
     for &s in start_seqs {
@@ -1858,6 +1896,15 @@ fn format_bb_segment_keys(
     if let Some(f) = floor_seq {
         keys.push(format!("f{f}"));
     }
+    let tag_seq = floor_seq.or(end_seq).unwrap_or(0);
+    if consume_turn_started {
+        keys.push(format!("fa:s:{tag_seq}"));
+    }
+    if let Some(act) = failure
+        && let Some(fk) = format_bb_failure_outcome_key(&format!("s{tag_seq}"), act)
+    {
+        keys.push(fk);
+    }
     keys
 }
 
@@ -1869,6 +1916,10 @@ struct HydratedSuppressionData {
     max_mirrored_end: u64,
     max_settled_seq: u64,
     turn_started_since_anchor: bool,
+    idle_seen_since_anchor: bool,
+    consumed_anchor_seqs: BTreeSet<u64>,
+    last_consumed_anchor_seq: u64,
+    unsaved_failure: Option<(Activity, Option<u64>)>,
     max_ticket_id: u64,
     resolved_ticket_ids: BTreeSet<u64>,
     open_tickets: Vec<BbFailureTicket>,
@@ -1904,10 +1955,13 @@ struct TrackedWorker {
     unsaved_suppressed_starts: BTreeSet<u64>,
     unsaved_suppressed_ends: BTreeSet<u64>,
     unsaved_floor: Option<u64>,
+    unsaved_idle_anchor: Option<u64>,
     unsaved_failure: Option<(Activity, Option<u64>)>,
     anchored_failure_floor: Option<u64>,
     turn_started_since_anchor: bool,
     idle_seen_since_anchor: bool,
+    consumed_anchor_seqs: BTreeSet<u64>,
+    last_consumed_anchor_seq: u64,
     next_ticket_id: u64,
     resolved_ticket_ids: BTreeSet<u64>,
     open_tickets: Vec<BbFailureTicket>,
@@ -1939,10 +1993,13 @@ impl TrackedWorker {
             unsaved_suppressed_starts: BTreeSet::new(),
             unsaved_suppressed_ends: BTreeSet::new(),
             unsaved_floor: None,
+            unsaved_idle_anchor: None,
             unsaved_failure: None,
             anchored_failure_floor: None,
             turn_started_since_anchor: false,
             idle_seen_since_anchor: false,
+            consumed_anchor_seqs: BTreeSet::new(),
+            last_consumed_anchor_seq: 0,
             next_ticket_id: 1,
             resolved_ticket_ids: BTreeSet::new(),
             open_tickets: Vec::new(),
@@ -1964,10 +2021,13 @@ impl TrackedWorker {
         self.unsaved_suppressed_starts.clear();
         self.unsaved_suppressed_ends.clear();
         self.unsaved_floor = None;
+        self.unsaved_idle_anchor = None;
         self.unsaved_failure = None;
         self.anchored_failure_floor = None;
         self.turn_started_since_anchor = false;
         self.idle_seen_since_anchor = false;
+        self.consumed_anchor_seqs.clear();
+        self.last_consumed_anchor_seq = 0;
         self.next_ticket_id = 1;
         self.resolved_ticket_ids.clear();
         self.open_tickets.clear();
@@ -1991,38 +2051,8 @@ impl TrackedWorker {
     }
 
     fn fold_suppression_keys(&mut self, keys: &[String]) {
-        let prev_floor_opt = self.anchored_failure_floor;
-        let prev_floor = prev_floor_opt.unwrap_or(0);
-        let mut consumes_started_turn = false;
         for k in keys {
-            if let Some((id, _)) = parse_bb_ticket_key(k) {
-                if !self.resolved_ticket_ids.contains(&id)
-                    && !self.open_tickets.iter().any(|t| t.id == id)
-                {
-                    consumes_started_turn = true;
-                }
-            } else if let Some(s) = k
-                .strip_prefix('s')
-                .and_then(|n| n.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-            {
-                if s > prev_floor {
-                    consumes_started_turn = true;
-                }
-            } else if prev_floor_opt.is_none()
-                && (k
-                    .strip_prefix('f')
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .is_some()
-                    || parse_bb_ticket_resolved_key(k).is_some())
-            {
-                consumes_started_turn = true;
-            }
             self.fold_suppression_key(k);
-        }
-        if consumes_started_turn {
-            self.turn_started_since_anchor = false;
-            self.idle_seen_since_anchor = false;
         }
     }
 
@@ -2036,6 +2066,9 @@ impl TrackedWorker {
                     existing.saved_in_journal = true;
                     existing.baseline_seq = existing.baseline_seq.max(base);
                 } else {
+                    self.turn_started_since_anchor = false;
+                    self.idle_seen_since_anchor = false;
+                    self.unsaved_idle_anchor = None;
                     self.open_tickets.push(BbFailureTicket {
                         id,
                         baseline_seq: base,
@@ -2060,6 +2093,47 @@ impl TrackedWorker {
             for rem in &mut self.open_tickets {
                 if rem.id > id {
                     rem.baseline_seq = rem.baseline_seq.max(res_seq);
+                }
+            }
+        } else if let Some(seq) = k.strip_prefix("fa:s:").and_then(|n| n.parse::<u64>().ok()) {
+            if self.consumed_anchor_seqs.insert(seq) {
+                self.last_consumed_anchor_seq = self.last_consumed_anchor_seq.max(seq);
+                self.turn_started_since_anchor = false;
+                self.idle_seen_since_anchor = false;
+                self.unsaved_idle_anchor = None;
+            }
+        } else if let Some(seq) = k.strip_prefix("fi:").and_then(|n| n.parse::<u64>().ok()) {
+            if seq >= self.last_consumed_anchor_seq {
+                self.idle_seen_since_anchor = true;
+            }
+            if self.unsaved_idle_anchor.is_some_and(|u| u <= seq) {
+                self.unsaved_idle_anchor = None;
+            }
+        } else if let Some((tag, act)) = parse_bb_failure_outcome_key(k) {
+            if let Some(tid) = tag
+                .strip_prefix('t')
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+            {
+                if let Some(existing) = self.open_tickets.iter_mut().find(|t| t.id == tid) {
+                    let preserve_refusal =
+                        matches!(existing.activity, Some(Activity::Refused { .. }))
+                            && matches!(act, Activity::Errored { .. });
+                    if !preserve_refusal {
+                        existing.activity = Some(act);
+                    }
+                    existing.needs_activity_commit = true;
+                }
+            } else {
+                let fseq = tag
+                    .strip_prefix('s')
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .or(self.anchored_failure_floor);
+                let preserve_refusal =
+                    matches!(self.unsaved_failure, Some((Activity::Refused { .. }, _)))
+                        && matches!(act, Activity::Errored { .. });
+                if !preserve_refusal {
+                    self.unsaved_failure = Some((act, fseq));
                 }
             }
         } else if let Some(f) = k.strip_prefix('f').and_then(|n| n.parse::<u64>().ok()) {
@@ -2092,6 +2166,7 @@ impl TrackedWorker {
     ) -> (u64, u64, bool) {
         self.turn_started_since_anchor = false;
         self.idle_seen_since_anchor = false;
+        self.unsaved_idle_anchor = None;
         let computed_base =
             baseline_override.unwrap_or_else(|| self.settled_seq_floor().unwrap_or(0));
         if let Some(last) = self.open_tickets.last_mut()
@@ -2135,6 +2210,7 @@ type MirrorStateReply = (Seq, bool, bool, BTreeSet<Seq>);
 type PendingUnsavedReply = (
     BTreeSet<u64>,
     BTreeSet<u64>,
+    Option<u64>,
     Option<u64>,
     Option<(Activity, Option<u64>)>,
     Option<u64>,
@@ -2285,6 +2361,8 @@ enum OwnerMsg {
         wave: WaveSlug,
         role: RoleName,
         thread: BbThreadId,
+        floor_seq: u64,
+        saved: bool,
     },
     LookupFailureBaseline {
         wave: WaveSlug,
@@ -2604,8 +2682,13 @@ impl BridgeOwner {
                                 Some(rec.anchored_failure_floor.map_or(f, |a| a.max(f)));
                         }
                         if consume_turn_started {
+                            let tag_seq = floor_seq.or(end_seq).unwrap_or(0);
+                            rec.consumed_anchor_seqs.insert(tag_seq);
+                            rec.last_consumed_anchor_seq =
+                                rec.last_consumed_anchor_seq.max(tag_seq);
                             rec.turn_started_since_anchor = false;
                             rec.idle_seen_since_anchor = false;
+                            rec.unsaved_idle_anchor = None;
                         }
                     }
                 }
@@ -2678,8 +2761,13 @@ impl BridgeOwner {
                             }
                         }
                         if consume_turn_started {
+                            let tag_seq = floor_seq.or(end_seq).unwrap_or(0);
+                            rec.consumed_anchor_seqs.insert(tag_seq);
+                            rec.last_consumed_anchor_seq =
+                                rec.last_consumed_anchor_seq.max(tag_seq);
                             rec.turn_started_since_anchor = false;
                             rec.idle_seen_since_anchor = false;
+                            rec.unsaved_idle_anchor = None;
                         }
                         let fallback = rec.last_mirrored_end_seq.saturating_add(1);
                         rec.pending_mirror_since = Some(
@@ -2699,6 +2787,7 @@ impl BridgeOwner {
                             rec.unsaved_suppressed_starts.clone(),
                             rec.unsaved_suppressed_ends.clone(),
                             rec.unsaved_floor,
+                            rec.unsaved_idle_anchor,
                             rec.unsaved_failure.clone(),
                             rec.anchored_failure_floor,
                             rec.turn_started_since_anchor || rec.idle_seen_since_anchor,
@@ -2707,6 +2796,7 @@ impl BridgeOwner {
                         _ => (
                             BTreeSet::new(),
                             BTreeSet::new(),
+                            None,
                             None,
                             None,
                             None,
@@ -2782,9 +2872,6 @@ impl BridgeOwner {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
                     {
-                        let prev_floor = rec.anchored_failure_floor.unwrap_or(0);
-                        let started_after_prev = start_seqs.iter().any(|&s| s > prev_floor)
-                            || rec.anchored_failure_floor.is_none();
                         for s in start_seqs {
                             if s > 0 {
                                 rec.unsaved_suppressed_starts.remove(&s);
@@ -2801,9 +2888,6 @@ impl BridgeOwner {
                             rec.anchored_failure_floor
                                 .map_or(resolved_max_seq, |a| a.max(resolved_max_seq)),
                         );
-                        if started_after_prev && rec.open_tickets.is_empty() {
-                            rec.turn_started_since_anchor = false;
-                        }
                         for rem in &mut rec.open_tickets {
                             if rem.id > id {
                                 rem.baseline_seq = rem.baseline_seq.max(resolved_max_seq);
@@ -2844,16 +2928,33 @@ impl BridgeOwner {
                     {
                         rec.turn_started_since_anchor = true;
                         rec.idle_seen_since_anchor = false;
+                        rec.unsaved_idle_anchor = None;
                         for u in &mut rec.open_tickets {
                             u.turns_started_after = u.turns_started_after.saturating_add(1);
                         }
                     }
                 }
-                OwnerMsg::NoteIdleWhileAnchored { wave, role, thread } => {
+                OwnerMsg::NoteIdleWhileAnchored {
+                    wave,
+                    role,
+                    thread,
+                    floor_seq,
+                    saved,
+                } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
                     {
                         rec.idle_seen_since_anchor = true;
+                        if saved {
+                            if rec.unsaved_idle_anchor.is_some_and(|u| u <= floor_seq) {
+                                rec.unsaved_idle_anchor = None;
+                            }
+                        } else {
+                            rec.unsaved_idle_anchor = Some(
+                                rec.unsaved_idle_anchor
+                                    .map_or(floor_seq, |u| u.max(floor_seq)),
+                            );
+                        }
                     }
                 }
                 OwnerMsg::LookupFailureBaseline {
@@ -2960,7 +3061,22 @@ impl BridgeOwner {
                             rec.anchored_failure_floor =
                                 Some(rec.anchored_failure_floor.map_or(f, |a| a.max(f)));
                         }
+                        rec.consumed_anchor_seqs
+                            .extend(hydrated.consumed_anchor_seqs);
+                        rec.last_consumed_anchor_seq = rec
+                            .last_consumed_anchor_seq
+                            .max(hydrated.last_consumed_anchor_seq);
                         rec.turn_started_since_anchor |= hydrated.turn_started_since_anchor;
+                        rec.idle_seen_since_anchor |= hydrated.idle_seen_since_anchor;
+                        if let Some((h_act, h_seq)) = hydrated.unsaved_failure
+                            && rec.unsaved_failure.is_none()
+                            && !matches!(
+                                rec.activity,
+                                Activity::Refused { .. } | Activity::Errored { .. }
+                            )
+                        {
+                            rec.unsaved_failure = Some((h_act, h_seq));
+                        }
                         if hydrated.max_ticket_id >= rec.next_ticket_id {
                             rec.next_ticket_id = hydrated.max_ticket_id + 1;
                         }
@@ -2979,6 +3095,10 @@ impl BridgeOwner {
                                 existing.baseline_seq = existing.baseline_seq.max(ht.baseline_seq);
                                 existing.turns_started_after =
                                     existing.turns_started_after.max(ht.turns_started_after);
+                                if existing.activity.is_none() && ht.activity.is_some() {
+                                    existing.activity = ht.activity;
+                                    existing.needs_activity_commit |= ht.needs_activity_commit;
+                                }
                             } else {
                                 if ht.id >= rec.next_ticket_id {
                                     rec.next_ticket_id = ht.id + 1;
@@ -4262,7 +4382,13 @@ impl BbBridge {
         consume_turn_started: bool,
     ) -> bool {
         let (start_seqs, end_seq, floor_seq) = bounds;
-        let keys = format_bb_segment_keys(&start_seqs, end_seq, floor_seq);
+        let keys = format_bb_segment_keys(
+            &start_seqs,
+            end_seq,
+            floor_seq,
+            failure.as_ref().map(|(a, _)| a),
+            consume_turn_started,
+        );
         if !self
             .commit_bb_suppression_keys(wave, role, thread, keys)
             .await
@@ -4313,11 +4439,14 @@ impl BbBridge {
         let Ok((id, base, already_saved)) = rx.await else {
             return;
         };
-        let key = format_bb_ticket_key(id, base);
+        let mut ticket_keys = vec![format_bb_ticket_key(id, base)];
+        if let Some(fk) = format_bb_failure_outcome_key(&format!("t{id}"), &activity) {
+            ticket_keys.push(fk);
+        }
         let mut ticket_saved = already_saved;
         if !ticket_saved
             && self
-                .commit_bb_suppression_keys(wave, role, thread, vec![key.clone()])
+                .commit_bb_suppression_keys(wave, role, thread, ticket_keys.clone())
                 .await
         {
             ticket_saved = true;
@@ -4331,7 +4460,11 @@ impl BbBridge {
         let can_observe_act =
             !check_live_before_activity || self.is_current_live_thread(wave, role, thread).await;
         if can_observe_act {
-            let carry_keys = if ticket_saved { Vec::new() } else { vec![key] };
+            let carry_keys = if ticket_saved {
+                Vec::new()
+            } else {
+                ticket_keys
+            };
             if self
                 .try_wave_observe(
                     wave.clone(),
@@ -4382,6 +4515,7 @@ impl BbBridge {
             unsaved_starts,
             unsaved_ends,
             unsaved_floor,
+            unsaved_idle_anchor,
             unsaved_failure,
             mut anchored_failure_floor,
             turn_started_since_anchor,
@@ -4400,11 +4534,24 @@ impl BbBridge {
         }
         if let Some(f) = unsaved_floor {
             keys.push(format!("f{f}"));
+            if let Some((ref act, _)) = unsaved_failure
+                && let Some(fk) = format_bb_failure_outcome_key(&format!("s{f}"), act)
+            {
+                keys.push(fk);
+            }
+        }
+        if let Some(idle_f) = unsaved_idle_anchor {
+            keys.push(format!("fi:{idle_f}"));
         }
         let mut unsaved_ticket_ids = Vec::new();
         for t in &open_tickets {
             if !t.saved_in_journal {
                 keys.push(format_bb_ticket_key(t.id, t.baseline_seq));
+                if let Some(ref act) = t.activity
+                    && let Some(fk) = format_bb_failure_outcome_key(&format!("t{}", t.id), act)
+                {
+                    keys.push(fk);
+                }
                 unsaved_ticket_ids.push(t.id);
             }
         }
@@ -4447,6 +4594,15 @@ impl BbBridge {
                     end_seq: None,
                     floor_seq: unsaved_floor,
                     consume_turn_started: false,
+                });
+            }
+            if let Some(idle_f) = unsaved_idle_anchor {
+                let _ = self.owner.send(OwnerMsg::NoteIdleWhileAnchored {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    floor_seq: idle_f,
+                    saved: true,
                 });
             }
             if let Some(f) = unsaved_floor {
@@ -4575,17 +4731,11 @@ impl BbBridge {
                     flushed.unsaved_failure = Some((act.clone(), merged_seq));
                 }
             }
-            let prev_floor = flushed.anchored_failure_floor.unwrap_or(0);
-            let started_after_prev = seg_starts.iter().any(|&s| s > prev_floor)
-                || flushed.anchored_failure_floor.is_none();
             flushed.anchored_failure_floor = Some(
                 flushed
                     .anchored_failure_floor
                     .map_or(resolved_seq, |a| a.max(resolved_seq)),
             );
-            if started_after_prev && idx + 1 == total {
-                flushed.turn_started_since_anchor = false;
-            }
             running_base = flushed.anchored_failure_floor;
             let _ = self.owner.send(OwnerMsg::ResolveTicket {
                 wave: wave.clone(),
@@ -4715,11 +4865,14 @@ impl BbBridge {
                                 }
                             }
                             if matches!(activity, Activity::Idle) {
+                                scratch.unsaved_failure = None;
                                 scratch.anchored_failure_floor = None;
                                 scratch.turn_started_since_anchor = false;
+                                scratch.idle_seen_since_anchor = false;
                                 orphan_failures.clear();
                             } else if matches!(activity, Activity::Working) {
                                 if !matches!(auth_activity, Activity::Working) {
+                                    scratch.idle_seen_since_anchor = false;
                                     if scratch.anchored_failure_floor.is_some()
                                         || matches!(
                                             auth_activity,
@@ -4736,35 +4889,46 @@ impl BbBridge {
                                         o.1 = o.1.saturating_add(1);
                                     }
                                 }
-                            } else if suppress_keys.is_empty()
-                                && matches!(
-                                    activity,
-                                    Activity::Errored { .. } | Activity::Refused { .. }
-                                )
-                            {
-                                let covered_by_open_ticket = scratch
-                                    .open_tickets
-                                    .last()
-                                    .is_some_and(|t| t.turns_started_after == 0);
-                                if !covered_by_open_ticket {
-                                    if let Some(last_orph) =
-                                        orphan_failures.last_mut().filter(|o| o.1 == 0)
+                            } else if matches!(
+                                activity,
+                                Activity::Errored { .. } | Activity::Refused { .. }
+                            ) {
+                                scratch.unsaved_failure = None;
+                                for u in &mut scratch.open_tickets {
+                                    if u.activity.as_ref() == Some(activity)
+                                        || (matches!(activity, Activity::Refused { .. })
+                                            && matches!(u.activity, Some(Activity::Errored { .. })))
                                     {
-                                        let base = scratch.settled_seq_floor().unwrap_or(0);
-                                        last_orph.0 = last_orph.0.max(base);
-                                        let preserve_refusal =
-                                            matches!(last_orph.2, Activity::Refused { .. })
-                                                && matches!(activity, Activity::Errored { .. });
-                                        if !preserve_refusal {
-                                            last_orph.2 = activity.clone();
+                                        u.needs_activity_commit = false;
+                                    }
+                                }
+                                if suppress_keys.is_empty() {
+                                    let covered_by_open_ticket = scratch
+                                        .open_tickets
+                                        .last()
+                                        .is_some_and(|t| t.turns_started_after == 0);
+                                    if !covered_by_open_ticket {
+                                        if let Some(last_orph) =
+                                            orphan_failures.last_mut().filter(|o| o.1 == 0)
+                                        {
+                                            let base = scratch.settled_seq_floor().unwrap_or(0);
+                                            last_orph.0 = last_orph.0.max(base);
+                                            let preserve_refusal =
+                                                matches!(last_orph.2, Activity::Refused { .. })
+                                                    && matches!(activity, Activity::Errored { .. });
+                                            if !preserve_refusal {
+                                                last_orph.2 = activity.clone();
+                                            }
+                                        } else if scratch.anchored_failure_floor.is_none()
+                                            || scratch.turn_started_since_anchor
+                                            || scratch.idle_seen_since_anchor
+                                            || !scratch.open_tickets.is_empty()
+                                        {
+                                            let base = scratch.settled_seq_floor().unwrap_or(0);
+                                            orphan_failures.push((base, 0, activity.clone()));
+                                            scratch.turn_started_since_anchor = false;
+                                            scratch.idle_seen_since_anchor = false;
                                         }
-                                    } else if scratch.anchored_failure_floor.is_none()
-                                        || scratch.turn_started_since_anchor
-                                        || !scratch.open_tickets.is_empty()
-                                    {
-                                        let base = scratch.settled_seq_floor().unwrap_or(0);
-                                        orphan_failures.push((base, 0, activity.clone()));
-                                        scratch.turn_started_since_anchor = false;
                                     }
                                 }
                             }
@@ -4813,6 +4977,10 @@ impl BbBridge {
                 max_mirrored_end: 0,
                 max_settled_seq: scratch.last_settled_turn_seq,
                 turn_started_since_anchor: scratch.turn_started_since_anchor,
+                idle_seen_since_anchor: scratch.idle_seen_since_anchor,
+                consumed_anchor_seqs: scratch.consumed_anchor_seqs,
+                last_consumed_anchor_seq: scratch.last_consumed_anchor_seq,
+                unsaved_failure: scratch.unsaved_failure,
                 max_ticket_id: scratch.next_ticket_id.saturating_sub(1),
                 resolved_ticket_ids: scratch.resolved_ticket_ids,
                 open_tickets: scratch.open_tickets,
@@ -4935,155 +5103,84 @@ impl BbBridge {
         .await;
     }
 
-    async fn handle_terminal_failure_signal(
+    fn handle_terminal_failure_signal(
         &self,
         target: (WaveSlug, RoleName, u32, BbThreadId),
         activity: Activity,
         rows_res: Result<Vec<serde_json::Value>, HostError>,
         runtime_meta: (Option<ModelId>, Option<String>),
         check_live_before_activity: bool,
-    ) {
-        let (wave, role, attempt, thread) = target;
-        let (parsed_model, parsed_account) = runtime_meta;
-        let (b_tx, b_rx) = oneshot::channel();
-        let _ = self.owner.send(OwnerMsg::LookupFailureBaseline {
-            wave: wave.clone(),
-            role: role.clone(),
-            thread: thread.clone(),
-            reply: b_tx,
-        });
-        let (owner_settled, owner_anchored, owner_tickets_empty, owner_turn_started_since_anchor) =
-            b_rx.await.unwrap_or((None, None, true, false));
-
-        if !self
-            .try_wave_observe(
-                wave.clone(),
-                role.clone(),
-                Observation::Spawned {
-                    attempt,
-                    thread: thread.clone(),
-                },
-            )
-            .await
-        {
-            if let Ok(ref rows) = rows_res
-                && owner_tickets_empty
-            {
-                let segments = extract_bb_turn_segments(rows);
-                let settled_num = owner_settled.unwrap_or(0);
-                if let Some(seg) = segments.iter().rfind(|s| s.first_seq > settled_num) {
-                    let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
-                        wave,
-                        role,
-                        thread,
-                        start_seqs: seg.start_seqs.clone(),
-                        end_seq: seg.end_seq,
-                        floor_seq: Some(seg.max_seq),
-                        failure: Some((activity, Some(seg.max_seq))),
-                        consume_turn_started: true,
-                    });
-                    return;
-                }
-                let max_row_seq = rows
-                    .iter()
-                    .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
-                    .max()
-                    .unwrap_or(0);
-                if !owner_turn_started_since_anchor
-                    && let Some(af) = owner_anchored.filter(|&af| max_row_seq <= af)
-                {
-                    let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
-                        wave,
-                        role,
-                        thread,
-                        start_seqs: Vec::new(),
-                        end_seq: None,
-                        floor_seq: Some(af),
-                        failure: Some((activity, Some(af))),
-                        consume_turn_started: false,
-                    });
-                    return;
-                }
-            } else if rows_res.is_err()
-                && !owner_turn_started_since_anchor
-                && owner_tickets_empty
-                && let Some(af) = owner_anchored
-            {
-                let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
-                    wave,
-                    role,
-                    thread,
-                    start_seqs: Vec::new(),
-                    end_seq: None,
-                    floor_seq: Some(af),
-                    failure: Some((activity, Some(af))),
-                    consume_turn_started: false,
-                });
-                return;
-            }
-            let (tx, rx) = oneshot::channel();
-            let _ = self.owner.send(OwnerMsg::AllocateOrMergeTicket {
-                wave,
-                role,
-                thread,
-                baseline_override: Some(owner_settled.unwrap_or(0)),
-                activity,
-                needs_activity_commit: true,
-                reply: tx,
-            });
-            let _ = rx.await;
-            return;
-        }
-
-        let (row_model, row_account) = rows_res
-            .as_ref()
-            .ok()
-            .map(|r| extract_runtime_meta_from_rows(r))
-            .unwrap_or((None, None));
-        self.observe_runtime_meta_if_present(
-            &wave,
-            &role,
-            parsed_model.or(row_model),
-            parsed_account.or(row_account),
-        )
-        .await;
-
-        let Ok(mut rows) = rows_res else {
-            let _ = self
-                .ensure_bb_journal_suppressions_hydrated(&wave, &role, &thread)
-                .await;
-            let (hb_tx, hb_rx) = oneshot::channel();
+    ) -> BoxFut<'_, ()> {
+        Box::pin(async move {
+            let (wave, role, attempt, thread) = target;
+            let (parsed_model, parsed_account) = runtime_meta;
+            let (b_tx, b_rx) = oneshot::channel();
             let _ = self.owner.send(OwnerMsg::LookupFailureBaseline {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
-                reply: hb_tx,
+                reply: b_tx,
             });
-            let (settled_h, anchored_h, tickets_empty_h, started_h) = hb_rx.await.unwrap_or((
+            let (
                 owner_settled,
                 owner_anchored,
                 owner_tickets_empty,
                 owner_turn_started_since_anchor,
-            ));
-            if !started_h
-                && tickets_empty_h
-                && let Some(af) = anchored_h
+            ) = b_rx.await.unwrap_or((None, None, true, false));
+
+            if !self
+                .try_wave_observe(
+                    wave.clone(),
+                    role.clone(),
+                    Observation::Spawned {
+                        attempt,
+                        thread: thread.clone(),
+                    },
+                )
+                .await
             {
-                let can_observe_act = !check_live_before_activity
-                    || self.is_current_live_thread(&wave, &role, &thread).await;
-                if can_observe_act
-                    && !self
-                        .try_wave_observe(
-                            wave.clone(),
-                            role.clone(),
-                            Observation::activity_with_bounds(
-                                activity.clone(),
-                                thread.clone(),
-                                settled_h,
-                                vec![format!("f{af}")],
-                            ),
-                        )
-                        .await
+                if let Ok(ref rows) = rows_res
+                    && owner_tickets_empty
+                {
+                    let segments = extract_bb_turn_segments(rows);
+                    let settled_num = owner_settled.unwrap_or(0);
+                    if let Some(seg) = segments.iter().rfind(|s| s.first_seq > settled_num) {
+                        let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                            wave,
+                            role,
+                            thread,
+                            start_seqs: seg.start_seqs.clone(),
+                            end_seq: seg.end_seq,
+                            floor_seq: Some(seg.max_seq),
+                            failure: Some((activity, Some(seg.max_seq))),
+                            consume_turn_started: true,
+                        });
+                        return;
+                    }
+                    let max_row_seq = rows
+                        .iter()
+                        .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                        .max()
+                        .unwrap_or(0);
+                    if !owner_turn_started_since_anchor
+                        && let Some(af) = owner_anchored.filter(|&af| max_row_seq <= af)
+                    {
+                        let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                            wave,
+                            role,
+                            thread,
+                            start_seqs: Vec::new(),
+                            end_seq: None,
+                            floor_seq: Some(af),
+                            failure: Some((activity, Some(af))),
+                            consume_turn_started: false,
+                        });
+                        return;
+                    }
+                } else if rows_res.is_err()
+                    && !owner_turn_started_since_anchor
+                    && owner_tickets_empty
+                    && let Some(af) = owner_anchored
                 {
                     let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
                         wave,
@@ -5095,41 +5192,8 @@ impl BbBridge {
                         failure: Some((activity, Some(af))),
                         consume_turn_started: false,
                     });
+                    return;
                 }
-                return;
-            }
-            self.commit_bb_failure_ticket(
-                &wave,
-                &role,
-                &thread,
-                settled_h,
-                activity,
-                check_live_before_activity,
-            )
-            .await;
-            return;
-        };
-
-        let Some(mut flushed) = self
-            .flush_and_hydrate_bb_suppressions(&wave, &role, &thread)
-            .await
-        else {
-            let segments = extract_bb_turn_segments(&rows);
-            let settled_num = owner_settled.unwrap_or(0);
-            if owner_tickets_empty
-                && let Some(seg) = segments.iter().rfind(|s| s.first_seq > settled_num)
-            {
-                let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
-                    wave,
-                    role,
-                    thread,
-                    start_seqs: seg.start_seqs.clone(),
-                    end_seq: seg.end_seq,
-                    floor_seq: Some(seg.max_seq),
-                    failure: Some((activity, Some(seg.max_seq))),
-                    consume_turn_started: true,
-                });
-            } else {
                 let (tx, rx) = oneshot::channel();
                 let _ = self.owner.send(OwnerMsg::AllocateOrMergeTicket {
                     wave,
@@ -5141,142 +5205,43 @@ impl BbBridge {
                     reply: tx,
                 });
                 let _ = rx.await;
-            }
-            return;
-        };
-
-        let mut new_turn_started_for_this_failure =
-            owner_turn_started_since_anchor || flushed.turn_started_since_anchor;
-
-        let min_row_seq = rows
-            .iter()
-            .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
-            .min()
-            .unwrap_or(0);
-        let min_needed = flushed
-            .open_tickets
-            .iter()
-            .map(|t| t.baseline_seq)
-            .min()
-            .unwrap_or_else(|| owner_settled.unwrap_or(0));
-        let last_seg_missing_start = extract_bb_turn_segments(&rows)
-            .last()
-            .is_some_and(|s| s.start_seqs.is_empty() && min_row_seq > 1);
-        if !rows.is_empty()
-            && ((!flushed.open_tickets.is_empty() && min_row_seq > min_needed.saturating_add(1))
-                || rows.len() >= 200
-                || last_seg_missing_start)
-        {
-            let (full_rows, incomplete) = self
-                .fetch_all_thread_rows_through(&thread, &rows, false, true)
-                .await;
-            if incomplete {
-                if !new_turn_started_for_this_failure
-                    && flushed.open_tickets.is_empty()
-                    && let Some(af) = flushed.anchored_failure_floor
-                {
-                    let can_observe_act = !check_live_before_activity
-                        || self.is_current_live_thread(&wave, &role, &thread).await;
-                    if can_observe_act {
-                        let _ = self
-                            .try_wave_observe(
-                                wave,
-                                role,
-                                Observation::activity_with_bounds(
-                                    activity,
-                                    thread,
-                                    owner_settled,
-                                    vec![format!("f{af}")],
-                                ),
-                            )
-                            .await;
-                    }
-                    return;
-                }
-                self.commit_bb_failure_ticket(
-                    &wave,
-                    &role,
-                    &thread,
-                    None,
-                    activity,
-                    check_live_before_activity,
-                )
-                .await;
                 return;
             }
-            rows = full_rows;
-        }
 
-        if !flushed.open_tickets.is_empty() {
-            let tail_turns_after = flushed
-                .open_tickets
-                .last()
-                .map_or(0, |t| t.turns_started_after);
-            let strict_prior = strict_rows_before_terminal_turn(&rows);
-            let Some((_, _, still_open_in_prior)) = self
-                .resolve_unanchored_failures_in_rows(
-                    &wave,
-                    &role,
-                    &thread,
-                    &strict_prior,
-                    &mut flushed,
-                )
-                .await
-            else {
-                self.commit_bb_failure_ticket(
-                    &wave,
-                    &role,
-                    &thread,
-                    None,
-                    activity,
-                    check_live_before_activity,
-                )
-                .await;
-                return;
-            };
-            if still_open_in_prior {
-                let Some((_, _, still_open_in_full)) = self
-                    .resolve_unanchored_failures_in_rows(&wave, &role, &thread, &rows, &mut flushed)
-                    .await
-                else {
-                    let can_observe_act = !check_live_before_activity
-                        || self.is_current_live_thread(&wave, &role, &thread).await;
-                    if can_observe_act {
-                        let _ = self
-                            .try_wave_observe(
-                                wave,
-                                role,
-                                Observation::activity_with_bounds(
-                                    activity,
-                                    thread,
-                                    owner_settled,
-                                    Vec::new(),
-                                ),
-                            )
-                            .await;
-                    }
-                    return;
-                };
-                if still_open_in_full {
-                    self.commit_bb_failure_ticket(
-                        &wave,
-                        &role,
-                        &thread,
-                        None,
-                        activity,
-                        check_live_before_activity,
-                    )
+            let (row_model, row_account) = rows_res
+                .as_ref()
+                .ok()
+                .map(|r| extract_runtime_meta_from_rows(r))
+                .unwrap_or((None, None));
+            self.observe_runtime_meta_if_present(
+                &wave,
+                &role,
+                parsed_model.or(row_model),
+                parsed_account.or(row_account),
+            )
+            .await;
+
+            let Ok(mut rows) = rows_res else {
+                let _ = self
+                    .ensure_bb_journal_suppressions_hydrated(&wave, &role, &thread)
                     .await;
-                    return;
-                }
-                if tail_turns_after == 0 {
-                    let prior_rows = rows_before_terminal_turn(&rows);
-                    let prior_settled =
-                        latest_completed_turn_end_seq(&strict_prior).or(owner_settled);
-                    let mirrored_ok = self
-                        .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &prior_rows)
-                        .await;
-                    let fseq_now = flushed.anchored_failure_floor.unwrap_or(0);
+                let (hb_tx, hb_rx) = oneshot::channel();
+                let _ = self.owner.send(OwnerMsg::LookupFailureBaseline {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    reply: hb_tx,
+                });
+                let (settled_h, anchored_h, tickets_empty_h, started_h) = hb_rx.await.unwrap_or((
+                    owner_settled,
+                    owner_anchored,
+                    owner_tickets_empty,
+                    owner_turn_started_since_anchor,
+                ));
+                if !started_h
+                    && tickets_empty_h
+                    && let Some(af) = anchored_h
+                {
                     let can_observe_act = !check_live_before_activity
                         || self.is_current_live_thread(&wave, &role, &thread).await;
                     if can_observe_act
@@ -5287,8 +5252,8 @@ impl BbBridge {
                                 Observation::activity_with_bounds(
                                     activity.clone(),
                                     thread.clone(),
-                                    prior_settled,
-                                    Vec::new(),
+                                    settled_h,
+                                    vec![format!("f{af}")],
                                 ),
                             )
                             .await
@@ -5299,175 +5264,378 @@ impl BbBridge {
                             thread,
                             start_seqs: Vec::new(),
                             end_seq: None,
-                            floor_seq: Some(fseq_now),
-                            failure: Some((activity, Some(fseq_now))),
+                            floor_seq: Some(af),
+                            failure: Some((activity, Some(af))),
                             consume_turn_started: false,
-                        });
-                    } else if !mirrored_ok {
-                        let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                            wave,
-                            role,
-                            thread,
-                            since_end_seq: None,
-                            mark_unknown_dirty: true,
                         });
                     }
                     return;
                 }
-                new_turn_started_for_this_failure = true;
-            }
-        }
-
-        let (b2_tx, b2_rx) = oneshot::channel();
-        let _ = self.owner.send(OwnerMsg::LookupFailureBaseline {
-            wave: wave.clone(),
-            role: role.clone(),
-            thread: thread.clone(),
-            reply: b2_tx,
-        });
-        let (owner_settled_now, _, _, _) =
-            b2_rx.await.unwrap_or((owner_settled, None, true, false));
-        let settled_floor = [
-            owner_settled_now.unwrap_or(0),
-            flushed.anchored_failure_floor.unwrap_or(0),
-            flushed.starts.last().copied().unwrap_or(0),
-            flushed.ends.last().copied().unwrap_or(0),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-
-        let segments = extract_bb_turn_segments(&rows);
-        if let Some(seg) = segments
-            .iter()
-            .rfind(|seg| {
-                seg.first_seq > settled_floor
-                    && !is_segment_already_suppressed(seg, &flushed.starts, &flushed.ends)
-            })
-            .cloned()
-        {
-            let strict_prior = strict_rows_before_terminal_turn(&rows);
-            let prior_settled = latest_completed_turn_end_seq(&strict_prior).or(owner_settled_now);
-            let seg_keys = format_bb_segment_keys(&seg.start_seqs, seg.end_seq, Some(seg.max_seq));
-            let failure = Some((activity.clone(), Some(seg.max_seq)));
-            if !self
-                .record_suppressed_bb_segment(
+                self.commit_bb_failure_ticket(
                     &wave,
                     &role,
                     &thread,
-                    (seg.start_seqs.clone(), seg.end_seq, Some(seg.max_seq)),
-                    failure.clone(),
-                    true,
+                    settled_h,
+                    activity,
+                    check_live_before_activity,
                 )
+                .await;
+                return;
+            };
+
+            let Some(mut flushed) = self
+                .flush_and_hydrate_bb_suppressions(&wave, &role, &thread)
                 .await
-            {
-                let can_observe_act = !check_live_before_activity
-                    || self.is_current_live_thread(&wave, &role, &thread).await;
-                if can_observe_act
-                    && self
-                        .try_wave_observe(
-                            wave.clone(),
-                            role.clone(),
-                            Observation::activity_with_bounds(
-                                activity,
-                                thread.clone(),
-                                prior_settled,
-                                seg_keys,
-                            ),
-                        )
-                        .await
+            else {
+                let segments = extract_bb_turn_segments(&rows);
+                let settled_num = owner_settled.unwrap_or(0);
+                if owner_tickets_empty
+                    && let Some(seg) = segments.iter().rfind(|s| s.first_seq > settled_num)
                 {
-                    let _ = self.owner.send(OwnerMsg::SuppressTurn {
+                    let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
                         wave,
                         role,
                         thread,
-                        start_seqs: seg.start_seqs,
+                        start_seqs: seg.start_seqs.clone(),
                         end_seq: seg.end_seq,
                         floor_seq: Some(seg.max_seq),
+                        failure: Some((activity, Some(seg.max_seq))),
                         consume_turn_started: true,
                     });
+                } else {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = self.owner.send(OwnerMsg::AllocateOrMergeTicket {
+                        wave,
+                        role,
+                        thread,
+                        baseline_override: Some(owner_settled.unwrap_or(0)),
+                        activity,
+                        needs_activity_commit: true,
+                        reply: tx,
+                    });
+                    let _ = rx.await;
                 }
                 return;
-            }
-            let prior_rows = rows_before_terminal_turn(&rows);
-            let mirrored_ok = self
-                .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &prior_rows)
-                .await;
-            let can_observe_act = !check_live_before_activity
-                || self.is_current_live_thread(&wave, &role, &thread).await;
-            if can_observe_act
-                && !self
-                    .try_wave_observe(
-                        wave.clone(),
-                        role.clone(),
-                        Observation::activity_with_bounds(
-                            activity.clone(),
-                            thread.clone(),
-                            prior_settled,
-                            Vec::new(),
-                        ),
-                    )
-                    .await
-            {
-                let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
-                    wave,
-                    role,
-                    thread,
-                    start_seqs: Vec::new(),
-                    end_seq: None,
-                    floor_seq: Some(seg.max_seq),
-                    failure,
-                    consume_turn_started: true,
-                });
-            } else if !mirrored_ok {
-                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                    wave,
-                    role,
-                    thread,
-                    since_end_seq: None,
-                    mark_unknown_dirty: true,
-                });
-            }
-            return;
-        }
+            };
 
-        let max_row_seq = rows
-            .iter()
-            .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+            let mut new_turn_started_for_this_failure =
+                owner_turn_started_since_anchor || flushed.turn_started_since_anchor;
+
+            let min_row_seq = rows
+                .iter()
+                .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                .min()
+                .unwrap_or(0);
+            let min_needed = flushed
+                .open_tickets
+                .iter()
+                .map(|t| t.baseline_seq)
+                .min()
+                .unwrap_or_else(|| owner_settled.unwrap_or(0));
+            let last_seg_missing_start = extract_bb_turn_segments(&rows)
+                .last()
+                .is_some_and(|s| s.start_seqs.is_empty() && min_row_seq > 1);
+            let pre_settled_floor = [
+                owner_settled.unwrap_or(0),
+                flushed.anchored_failure_floor.unwrap_or(0),
+                flushed.starts.last().copied().unwrap_or(0),
+                flushed.ends.last().copied().unwrap_or(0),
+            ]
+            .into_iter()
             .max()
             .unwrap_or(0);
-        let suppressed_last_seg = segments
-            .last()
-            .filter(|ls| is_segment_already_suppressed(ls, &flushed.starts, &flushed.ends))
-            .cloned();
-        let is_duplicate_of_anchored_failure = !new_turn_started_for_this_failure
-            && (flushed
-                .anchored_failure_floor
-                .is_some_and(|af| max_row_seq <= af)
-                || suppressed_last_seg.is_some());
-        if is_duplicate_of_anchored_failure {
-            let strict_prior = strict_rows_before_terminal_turn(&rows);
-            let prior_settled = latest_completed_turn_end_seq(&strict_prior).or(owner_settled_now);
-            let new_floor = flushed.anchored_failure_floor.unwrap_or(0).max(
-                suppressed_last_seg
-                    .as_ref()
-                    .map_or(max_row_seq, |ls| ls.max_seq),
-            );
-            if let Some(last_seg) = suppressed_last_seg {
-                let dup_keys =
-                    format_bb_segment_keys(&last_seg.start_seqs, last_seg.end_seq, Some(new_floor));
+            if !rows.is_empty()
+                && ((!flushed.open_tickets.is_empty()
+                    && min_row_seq > min_needed.saturating_add(1))
+                    || rows.len() >= 200
+                    || last_seg_missing_start)
+            {
+                let (full_rows, incomplete) = self
+                    .fetch_all_thread_rows_through(&thread, &rows, false, true)
+                    .await;
+                if incomplete {
+                    let partial_max_seq = full_rows
+                        .iter()
+                        .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                        .max()
+                        .unwrap_or(0);
+                    if !new_turn_started_for_this_failure
+                        && flushed.open_tickets.is_empty()
+                        && let Some(af) = flushed
+                            .anchored_failure_floor
+                            .filter(|&af| partial_max_seq <= af)
+                    {
+                        let can_observe_act = !check_live_before_activity
+                            || self.is_current_live_thread(&wave, &role, &thread).await;
+                        if can_observe_act {
+                            let _ = self
+                                .try_wave_observe(
+                                    wave,
+                                    role,
+                                    Observation::activity_with_bounds(
+                                        activity,
+                                        thread,
+                                        owner_settled,
+                                        vec![format!("f{af}")],
+                                    ),
+                                )
+                                .await;
+                        }
+                        return;
+                    }
+                    if flushed.open_tickets.is_empty()
+                        && let Some(seg) =
+                            extract_bb_turn_segments(&full_rows)
+                                .into_iter()
+                                .rfind(|seg| {
+                                    !seg.start_seqs.is_empty()
+                                        && seg.first_seq > pre_settled_floor
+                                        && !is_segment_already_suppressed(
+                                            seg,
+                                            &flushed.starts,
+                                            &flushed.ends,
+                                        )
+                                })
+                    {
+                        let seg_keys = format_bb_segment_keys(
+                            &seg.start_seqs,
+                            seg.end_seq,
+                            Some(seg.max_seq),
+                            Some(&activity),
+                            true,
+                        );
+                        let failure = Some((activity.clone(), Some(seg.max_seq)));
+                        let saved = self
+                            .record_suppressed_bb_segment(
+                                &wave,
+                                &role,
+                                &thread,
+                                (seg.start_seqs.clone(), seg.end_seq, Some(seg.max_seq)),
+                                failure.clone(),
+                                true,
+                            )
+                            .await;
+                        let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                            wave: wave.clone(),
+                            role: role.clone(),
+                            thread: thread.clone(),
+                            since_end_seq: None,
+                            mark_unknown_dirty: true,
+                        });
+                        let can_observe_act = !check_live_before_activity
+                            || self.is_current_live_thread(&wave, &role, &thread).await;
+                        if can_observe_act {
+                            let carry = if saved { Vec::new() } else { seg_keys };
+                            if self
+                                .try_wave_observe(
+                                    wave.clone(),
+                                    role.clone(),
+                                    Observation::activity_with_bounds(
+                                        activity,
+                                        thread.clone(),
+                                        owner_settled,
+                                        carry,
+                                    ),
+                                )
+                                .await
+                            {
+                                if !saved {
+                                    let _ = self.owner.send(OwnerMsg::SuppressTurn {
+                                        wave,
+                                        role,
+                                        thread,
+                                        start_seqs: seg.start_seqs,
+                                        end_seq: seg.end_seq,
+                                        floor_seq: Some(seg.max_seq),
+                                        consume_turn_started: true,
+                                    });
+                                }
+                            } else if saved {
+                                let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                                    wave,
+                                    role,
+                                    thread,
+                                    start_seqs: Vec::new(),
+                                    end_seq: None,
+                                    floor_seq: Some(seg.max_seq),
+                                    failure,
+                                    consume_turn_started: true,
+                                });
+                            }
+                        }
+                        return;
+                    }
+                    self.commit_bb_failure_ticket(
+                        &wave,
+                        &role,
+                        &thread,
+                        Some(pre_settled_floor),
+                        activity,
+                        check_live_before_activity,
+                    )
+                    .await;
+                    return;
+                }
+                rows = full_rows;
+            }
+
+            if !flushed.open_tickets.is_empty() {
+                let tail_turns_after = flushed
+                    .open_tickets
+                    .last()
+                    .map_or(0, |t| t.turns_started_after);
+                let strict_prior = strict_rows_before_terminal_turn(&rows);
+                let Some((_, _, still_open_in_prior)) = self
+                    .resolve_unanchored_failures_in_rows(
+                        &wave,
+                        &role,
+                        &thread,
+                        &strict_prior,
+                        &mut flushed,
+                    )
+                    .await
+                else {
+                    self.commit_bb_failure_ticket(
+                        &wave,
+                        &role,
+                        &thread,
+                        None,
+                        activity,
+                        check_live_before_activity,
+                    )
+                    .await;
+                    return;
+                };
+                if still_open_in_prior {
+                    let Some((_, _, still_open_in_full)) = self
+                        .resolve_unanchored_failures_in_rows(
+                            &wave,
+                            &role,
+                            &thread,
+                            &rows,
+                            &mut flushed,
+                        )
+                        .await
+                    else {
+                        self.commit_bb_failure_ticket(
+                            &wave,
+                            &role,
+                            &thread,
+                            None,
+                            activity,
+                            check_live_before_activity,
+                        )
+                        .await;
+                        return;
+                    };
+                    if still_open_in_full {
+                        self.commit_bb_failure_ticket(
+                            &wave,
+                            &role,
+                            &thread,
+                            None,
+                            activity,
+                            check_live_before_activity,
+                        )
+                        .await;
+                        return;
+                    }
+                    if tail_turns_after == 0 {
+                        let prior_rows = rows_before_terminal_turn(&rows);
+                        let prior_settled =
+                            latest_completed_turn_end_seq(&strict_prior).or(owner_settled);
+                        let mirrored_ok = self
+                            .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &prior_rows)
+                            .await;
+                        let fseq_now = flushed.anchored_failure_floor.unwrap_or(0);
+                        let can_observe_act = !check_live_before_activity
+                            || self.is_current_live_thread(&wave, &role, &thread).await;
+                        if can_observe_act
+                            && !self
+                                .try_wave_observe(
+                                    wave.clone(),
+                                    role.clone(),
+                                    Observation::activity_with_bounds(
+                                        activity.clone(),
+                                        thread.clone(),
+                                        prior_settled,
+                                        Vec::new(),
+                                    ),
+                                )
+                                .await
+                        {
+                            let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                                wave,
+                                role,
+                                thread,
+                                start_seqs: Vec::new(),
+                                end_seq: None,
+                                floor_seq: Some(fseq_now),
+                                failure: Some((activity, Some(fseq_now))),
+                                consume_turn_started: false,
+                            });
+                        } else if !mirrored_ok {
+                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                wave,
+                                role,
+                                thread,
+                                since_end_seq: None,
+                                mark_unknown_dirty: true,
+                            });
+                        }
+                        return;
+                    }
+                    new_turn_started_for_this_failure = true;
+                }
+            }
+
+            let (b2_tx, b2_rx) = oneshot::channel();
+            let _ = self.owner.send(OwnerMsg::LookupFailureBaseline {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+                reply: b2_tx,
+            });
+            let (owner_settled_now, _, _, _) =
+                b2_rx.await.unwrap_or((owner_settled, None, true, false));
+            let settled_floor = [
+                owner_settled_now.unwrap_or(0),
+                flushed.anchored_failure_floor.unwrap_or(0),
+                flushed.starts.last().copied().unwrap_or(0),
+                flushed.ends.last().copied().unwrap_or(0),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+
+            let segments = extract_bb_turn_segments(&rows);
+            if let Some(seg) = segments
+                .iter()
+                .rfind(|seg| {
+                    seg.first_seq > settled_floor
+                        && !is_segment_already_suppressed(seg, &flushed.starts, &flushed.ends)
+                })
+                .cloned()
+            {
+                let strict_prior = strict_rows_before_terminal_turn(&rows);
+                let prior_settled =
+                    latest_completed_turn_end_seq(&strict_prior).or(owner_settled_now);
+                let seg_keys = format_bb_segment_keys(
+                    &seg.start_seqs,
+                    seg.end_seq,
+                    Some(seg.max_seq),
+                    Some(&activity),
+                    true,
+                );
+                let failure = Some((activity.clone(), Some(seg.max_seq)));
                 if !self
                     .record_suppressed_bb_segment(
                         &wave,
                         &role,
                         &thread,
-                        (
-                            last_seg.start_seqs.clone(),
-                            last_seg.end_seq,
-                            Some(new_floor),
-                        ),
-                        Some((activity.clone(), Some(new_floor))),
-                        false,
+                        (seg.start_seqs.clone(), seg.end_seq, Some(seg.max_seq)),
+                        failure.clone(),
+                        true,
                     )
                     .await
                 {
@@ -5482,7 +5650,7 @@ impl BbBridge {
                                     activity,
                                     thread.clone(),
                                     prior_settled,
-                                    dup_keys,
+                                    seg_keys,
                                 ),
                             )
                             .await
@@ -5491,58 +5659,175 @@ impl BbBridge {
                             wave,
                             role,
                             thread,
-                            start_seqs: last_seg.start_seqs,
-                            end_seq: last_seg.end_seq,
-                            floor_seq: Some(new_floor),
-                            consume_turn_started: false,
+                            start_seqs: seg.start_seqs,
+                            end_seq: seg.end_seq,
+                            floor_seq: Some(seg.max_seq),
+                            consume_turn_started: true,
                         });
                     }
                     return;
                 }
+                let prior_rows = rows_before_terminal_turn(&rows);
+                let mirrored_ok = self
+                    .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &prior_rows)
+                    .await;
+                let can_observe_act = !check_live_before_activity
+                    || self.is_current_live_thread(&wave, &role, &thread).await;
+                if can_observe_act
+                    && !self
+                        .try_wave_observe(
+                            wave.clone(),
+                            role.clone(),
+                            Observation::activity_with_bounds(
+                                activity.clone(),
+                                thread.clone(),
+                                prior_settled,
+                                Vec::new(),
+                            ),
+                        )
+                        .await
+                {
+                    let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                        wave,
+                        role,
+                        thread,
+                        start_seqs: Vec::new(),
+                        end_seq: None,
+                        floor_seq: Some(seg.max_seq),
+                        failure,
+                        consume_turn_started: true,
+                    });
+                } else if !mirrored_ok {
+                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                        wave,
+                        role,
+                        thread,
+                        since_end_seq: None,
+                        mark_unknown_dirty: true,
+                    });
+                }
+                return;
             }
-            let prior_rows = rows_before_terminal_turn(&rows);
-            let _ = self
-                .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &prior_rows)
-                .await;
-            let can_observe_act = !check_live_before_activity
-                || self.is_current_live_thread(&wave, &role, &thread).await;
-            if can_observe_act
-                && !self
-                    .try_wave_observe(
-                        wave.clone(),
-                        role.clone(),
-                        Observation::activity_with_bounds(
-                            activity.clone(),
-                            thread.clone(),
-                            prior_settled,
-                            Vec::new(),
-                        ),
-                    )
-                    .await
-            {
-                let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
-                    wave,
-                    role,
-                    thread,
-                    start_seqs: Vec::new(),
-                    end_seq: None,
-                    floor_seq: Some(new_floor),
-                    failure: Some((activity, Some(new_floor))),
-                    consume_turn_started: false,
-                });
-            }
-            return;
-        }
 
-        self.commit_bb_failure_ticket(
-            &wave,
-            &role,
-            &thread,
-            Some(settled_floor),
-            activity,
-            check_live_before_activity,
-        )
-        .await;
+            let max_row_seq = rows
+                .iter()
+                .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                .max()
+                .unwrap_or(0);
+            let suppressed_last_seg = segments
+                .last()
+                .filter(|ls| is_segment_already_suppressed(ls, &flushed.starts, &flushed.ends))
+                .cloned();
+            let is_duplicate_of_anchored_failure = !new_turn_started_for_this_failure
+                && (flushed
+                    .anchored_failure_floor
+                    .is_some_and(|af| max_row_seq <= af)
+                    || suppressed_last_seg.is_some());
+            if is_duplicate_of_anchored_failure {
+                let strict_prior = strict_rows_before_terminal_turn(&rows);
+                let prior_settled =
+                    latest_completed_turn_end_seq(&strict_prior).or(owner_settled_now);
+                let new_floor = flushed.anchored_failure_floor.unwrap_or(0).max(
+                    suppressed_last_seg
+                        .as_ref()
+                        .map_or(max_row_seq, |ls| ls.max_seq),
+                );
+                if let Some(last_seg) = suppressed_last_seg {
+                    let dup_keys = format_bb_segment_keys(
+                        &last_seg.start_seqs,
+                        last_seg.end_seq,
+                        Some(new_floor),
+                        Some(&activity),
+                        false,
+                    );
+                    if !self
+                        .record_suppressed_bb_segment(
+                            &wave,
+                            &role,
+                            &thread,
+                            (
+                                last_seg.start_seqs.clone(),
+                                last_seg.end_seq,
+                                Some(new_floor),
+                            ),
+                            Some((activity.clone(), Some(new_floor))),
+                            false,
+                        )
+                        .await
+                    {
+                        let can_observe_act = !check_live_before_activity
+                            || self.is_current_live_thread(&wave, &role, &thread).await;
+                        if can_observe_act
+                            && self
+                                .try_wave_observe(
+                                    wave.clone(),
+                                    role.clone(),
+                                    Observation::activity_with_bounds(
+                                        activity,
+                                        thread.clone(),
+                                        prior_settled,
+                                        dup_keys,
+                                    ),
+                                )
+                                .await
+                        {
+                            let _ = self.owner.send(OwnerMsg::SuppressTurn {
+                                wave,
+                                role,
+                                thread,
+                                start_seqs: last_seg.start_seqs,
+                                end_seq: last_seg.end_seq,
+                                floor_seq: Some(new_floor),
+                                consume_turn_started: false,
+                            });
+                        }
+                        return;
+                    }
+                }
+                let prior_rows = rows_before_terminal_turn(&rows);
+                let _ = self
+                    .mirror_outstanding_turns_from_tail(&wave, &role, &thread, &prior_rows)
+                    .await;
+                let can_observe_act = !check_live_before_activity
+                    || self.is_current_live_thread(&wave, &role, &thread).await;
+                if can_observe_act
+                    && !self
+                        .try_wave_observe(
+                            wave.clone(),
+                            role.clone(),
+                            Observation::activity_with_bounds(
+                                activity.clone(),
+                                thread.clone(),
+                                prior_settled,
+                                Vec::new(),
+                            ),
+                        )
+                        .await
+                {
+                    let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                        wave,
+                        role,
+                        thread,
+                        start_seqs: Vec::new(),
+                        end_seq: None,
+                        floor_seq: Some(new_floor),
+                        failure: Some((activity, Some(new_floor))),
+                        consume_turn_started: false,
+                    });
+                }
+                return;
+            }
+
+            self.commit_bb_failure_ticket(
+                &wave,
+                &role,
+                &thread,
+                Some(settled_floor),
+                activity,
+                check_live_before_activity,
+            )
+            .await;
+        })
     }
 
     #[cfg(test)]
@@ -5551,323 +5836,273 @@ impl BbBridge {
         self.on_thread_signal_with_guard(up, guard).await;
     }
 
-    async fn on_thread_signal_with_guard(
+    fn on_thread_signal_with_guard(
         &self,
         up: protocol::Up,
         queued_guard: Option<QueuedTerminalSignalGuard>,
-    ) {
-        let _reconcile_guard = self.reconcile_lock.lock().await;
-        drop(queued_guard);
-        match up {
-            protocol::Up::Thread {
-                signal,
-                thread_id,
-                meta,
-                error,
-                stop_reason,
-                model,
-                account,
-                ..
-            } => {
-                let Ok(thread) = BbThreadId::parse(thread_id) else {
-                    return;
-                };
-                let Some((wave, role, attempt, retiring)) =
-                    self.resolve_worker_identity(&thread, meta.as_ref()).await
-                else {
-                    return;
-                };
-                if retiring {
-                    if matches!(signal, protocol::ThreadSignal::Archived) {
-                        self.call_wave_observe(wave, role, Observation::Archived)
-                            .await;
-                    }
-                    return;
-                }
-                let parsed_model = model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|m| ModelId::parse(m).ok());
-                let parsed_account = account
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
-                match signal {
-                    protocol::ThreadSignal::Created => {
-                        self.call_wave_observe(
-                            wave.clone(),
-                            role.clone(),
-                            Observation::Spawned { attempt, thread },
-                        )
-                        .await;
-                        self.observe_runtime_meta_if_present(
-                            &wave,
-                            &role,
-                            parsed_model,
-                            parsed_account,
-                        )
-                        .await;
-                    }
-                    protocol::ThreadSignal::Active => {
-                        let _ = self.owner.send(OwnerMsg::NoteTurnStartedAfterFailure {
-                            wave: wave.clone(),
-                            role: role.clone(),
-                            thread: thread.clone(),
-                        });
-                        self.call_wave_observe(
-                            wave.clone(),
-                            role.clone(),
-                            Observation::Spawned { attempt, thread },
-                        )
-                        .await;
-                        self.observe_runtime_meta_if_present(
-                            &wave,
-                            &role,
-                            parsed_model,
-                            parsed_account,
-                        )
-                        .await;
-                        self.call_wave_observe(
-                            wave,
-                            role,
-                            Observation::activity(Activity::Working),
-                        )
-                        .await;
-                    }
-                    protocol::ThreadSignal::Idle => {
-                        let direct_refusal = stop_reason
-                            .as_deref()
-                            .filter(|sr| rex_wave_api::wave::is_refusal_stop_reason(sr))
-                            .map(str::to_owned);
-                        if direct_refusal.is_none() && self.has_queued_terminal_signal(&thread) {
-                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                wave,
-                                role,
-                                thread,
-                                since_end_seq: None,
-                                mark_unknown_dirty: true,
-                            });
-                            return;
+    ) -> BoxFut<'_, ()> {
+        Box::pin(async move {
+            let _reconcile_guard = self.reconcile_lock.lock().await;
+            drop(queued_guard);
+            match up {
+                protocol::Up::Thread {
+                    signal,
+                    thread_id,
+                    meta,
+                    error,
+                    stop_reason,
+                    model,
+                    account,
+                    ..
+                } => {
+                    let Ok(thread) = BbThreadId::parse(thread_id) else {
+                        return;
+                    };
+                    let Some((wave, role, attempt, retiring)) =
+                        self.resolve_worker_identity(&thread, meta.as_ref()).await
+                    else {
+                        return;
+                    };
+                    if retiring {
+                        if matches!(signal, protocol::ThreadSignal::Archived) {
+                            self.call_wave_observe(wave, role, Observation::Archived)
+                                .await;
                         }
-                        let rows_res = self.fetch_recent_terminal_turn_rows_checked(&thread).await;
-                        let row_refusal = if direct_refusal.is_some() {
-                            None
-                        } else {
-                            rows_res
-                                .as_ref()
-                                .ok()
-                                .and_then(|rows| refusal_from_latest_turn(rows))
-                        };
-                        if let Some(reason) = direct_refusal.or(row_refusal) {
-                            self.handle_terminal_failure_signal(
-                                (wave, role, attempt, thread),
-                                Activity::Refused { reason },
-                                rows_res,
-                                (parsed_model, parsed_account),
-                                true,
-                            )
-                            .await;
-                            return;
-                        }
-                        if self.has_queued_terminal_signal(&thread) {
-                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                wave,
-                                role,
-                                thread,
-                                since_end_seq: None,
-                                mark_unknown_dirty: true,
-                            });
-                            return;
-                        }
-                        if !self
-                            .try_wave_observe(
+                        return;
+                    }
+                    let parsed_model = model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .and_then(|m| ModelId::parse(m).ok());
+                    let parsed_account = account
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    match signal {
+                        protocol::ThreadSignal::Created => {
+                            self.call_wave_observe(
                                 wave.clone(),
                                 role.clone(),
-                                Observation::Spawned {
-                                    attempt,
-                                    thread: thread.clone(),
-                                },
+                                Observation::Spawned { attempt, thread },
                             )
-                            .await
-                        {
-                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                wave,
-                                role,
-                                thread,
-                                since_end_seq: None,
-                                mark_unknown_dirty: true,
-                            });
-                            return;
+                            .await;
+                            self.observe_runtime_meta_if_present(
+                                &wave,
+                                &role,
+                                parsed_model,
+                                parsed_account,
+                            )
+                            .await;
                         }
-                        let Ok(rows) = rows_res else {
-                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                        protocol::ThreadSignal::Active => {
+                            let _ = self.owner.send(OwnerMsg::NoteTurnStartedAfterFailure {
+                                wave: wave.clone(),
+                                role: role.clone(),
+                                thread: thread.clone(),
+                            });
+                            self.call_wave_observe(
+                                wave.clone(),
+                                role.clone(),
+                                Observation::Spawned { attempt, thread },
+                            )
+                            .await;
+                            self.observe_runtime_meta_if_present(
+                                &wave,
+                                &role,
+                                parsed_model,
+                                parsed_account,
+                            )
+                            .await;
+                            self.call_wave_observe(
                                 wave,
                                 role,
-                                thread,
-                                since_end_seq: None,
-                                mark_unknown_dirty: true,
-                            });
-                            return;
-                        };
-                        let max_row_seq = rows
-                            .iter()
-                            .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
-                            .max();
-                        let fseq_now = max_row_seq.unwrap_or(0);
-                        let (row_model, row_account) = extract_runtime_meta_from_rows(&rows);
-                        self.observe_runtime_meta_if_present(
-                            &wave,
-                            &role,
-                            parsed_model.or(row_model),
-                            parsed_account.or(row_account),
-                        )
-                        .await;
-                        let Some(mut flushed) = self
-                            .flush_and_hydrate_bb_suppressions(&wave, &role, &thread)
-                            .await
-                        else {
-                            return;
-                        };
-                        let mut working_rows = rows;
-                        if !flushed.open_tickets.is_empty() {
-                            let min_base = flushed
-                                .open_tickets
-                                .iter()
-                                .map(|u| u.baseline_seq)
-                                .min()
-                                .unwrap_or(0);
-                            let min_row_seq = working_rows
+                                Observation::activity(Activity::Working),
+                            )
+                            .await;
+                        }
+                        protocol::ThreadSignal::Idle => {
+                            let direct_refusal = stop_reason
+                                .as_deref()
+                                .filter(|sr| rex_wave_api::wave::is_refusal_stop_reason(sr))
+                                .map(str::to_owned);
+                            if direct_refusal.is_none() && self.has_queued_terminal_signal(&thread)
+                            {
+                                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                    wave,
+                                    role,
+                                    thread,
+                                    since_end_seq: None,
+                                    mark_unknown_dirty: true,
+                                });
+                                return;
+                            }
+                            let rows_res =
+                                self.fetch_recent_terminal_turn_rows_checked(&thread).await;
+                            let row_refusal = if direct_refusal.is_some() {
+                                None
+                            } else {
+                                rows_res
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|rows| refusal_from_latest_turn(rows))
+                            };
+                            if let Some(reason) = direct_refusal.or(row_refusal) {
+                                self.handle_terminal_failure_signal(
+                                    (wave, role, attempt, thread),
+                                    Activity::Refused { reason },
+                                    rows_res,
+                                    (parsed_model, parsed_account),
+                                    true,
+                                )
+                                .await;
+                                return;
+                            }
+                            if self.has_queued_terminal_signal(&thread) {
+                                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                    wave,
+                                    role,
+                                    thread,
+                                    since_end_seq: None,
+                                    mark_unknown_dirty: true,
+                                });
+                                return;
+                            }
+                            if !self
+                                .try_wave_observe(
+                                    wave.clone(),
+                                    role.clone(),
+                                    Observation::Spawned {
+                                        attempt,
+                                        thread: thread.clone(),
+                                    },
+                                )
+                                .await
+                            {
+                                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                    wave,
+                                    role,
+                                    thread,
+                                    since_end_seq: None,
+                                    mark_unknown_dirty: true,
+                                });
+                                return;
+                            }
+                            let Ok(rows) = rows_res else {
+                                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                    wave,
+                                    role,
+                                    thread,
+                                    since_end_seq: None,
+                                    mark_unknown_dirty: true,
+                                });
+                                return;
+                            };
+                            let max_row_seq = rows
                                 .iter()
                                 .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
-                                .min()
-                                .unwrap_or(0);
-                            if min_row_seq > min_base.saturating_add(1) {
-                                let (full_rows, incomplete) = self
-                                    .fetch_all_thread_rows_through(
-                                        &thread,
-                                        &working_rows,
-                                        false,
-                                        true,
-                                    )
-                                    .await;
-                                if incomplete {
-                                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                        wave,
-                                        role,
-                                        thread,
-                                        since_end_seq: None,
-                                        mark_unknown_dirty: true,
-                                    });
-                                    return;
-                                }
-                                working_rows = full_rows;
-                            }
-                            let Some((unresolved_act, unresolved_base, has_unresolved)) = self
-                                .resolve_unanchored_failures_in_rows(
-                                    &wave,
-                                    &role,
-                                    &thread,
-                                    &working_rows,
-                                    &mut flushed,
-                                )
+                                .max();
+                            let fseq_now = max_row_seq.unwrap_or(0);
+                            let (row_model, row_account) = extract_runtime_meta_from_rows(&rows);
+                            self.observe_runtime_meta_if_present(
+                                &wave,
+                                &role,
+                                parsed_model.or(row_model),
+                                parsed_account.or(row_account),
+                            )
+                            .await;
+                            let Some(mut flushed) = self
+                                .flush_and_hydrate_bb_suppressions(&wave, &role, &thread)
                                 .await
                             else {
                                 return;
                             };
-                            if has_unresolved {
-                                if let Some(safe_max) = unresolved_base.filter(|&b| b > 0) {
-                                    let safe_rows: Vec<serde_json::Value> = working_rows
-                                        .iter()
-                                        .filter(|r| {
-                                            r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0)
-                                                <= safe_max
-                                        })
-                                        .cloned()
-                                        .collect();
-                                    let _ = self
-                                        .mirror_outstanding_turns_from_tail(
-                                            &wave, &role, &thread, &safe_rows,
+                            let mut working_rows = rows;
+                            if !flushed.open_tickets.is_empty() {
+                                let min_base = flushed
+                                    .open_tickets
+                                    .iter()
+                                    .map(|u| u.baseline_seq)
+                                    .min()
+                                    .unwrap_or(0);
+                                let min_row_seq = working_rows
+                                    .iter()
+                                    .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                                    .min()
+                                    .unwrap_or(0);
+                                if min_row_seq > min_base.saturating_add(1) {
+                                    let (full_rows, incomplete) = self
+                                        .fetch_all_thread_rows_through(
+                                            &thread,
+                                            &working_rows,
+                                            false,
+                                            true,
                                         )
                                         .await;
-                                }
-                                if let Some(act) = unresolved_act
-                                    && self.is_current_live_thread(&wave, &role, &thread).await
-                                    && self
-                                        .try_wave_observe(
-                                            wave.clone(),
-                                            role.clone(),
-                                            Observation::activity_with_bounds(
-                                                act,
-                                                thread.clone(),
-                                                unresolved_base,
-                                                Vec::new(),
-                                            ),
-                                        )
-                                        .await
-                                {
-                                    let _ =
-                                        self.owner.send(OwnerMsg::MarkTicketActivityCommitted {
-                                            wave: wave.clone(),
-                                            role: role.clone(),
-                                            thread: thread.clone(),
+                                    if incomplete {
+                                        let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                            wave,
+                                            role,
+                                            thread,
+                                            since_end_seq: None,
+                                            mark_unknown_dirty: true,
                                         });
+                                        return;
+                                    }
+                                    working_rows = full_rows;
                                 }
-                                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                    wave,
-                                    role,
-                                    thread,
-                                    since_end_seq: None,
-                                    mark_unknown_dirty: true,
-                                });
-                                return;
-                            }
-                        }
-                        let auth_activity = self.authoritative_activity(&wave, &role).await;
-                        let auth_terminal_failure = matches!(
-                            auth_activity,
-                            Some(Activity::Refused { .. } | Activity::Errored { .. })
-                        );
-                        let has_active_failure = flushed.anchored_failure_floor.is_some()
-                            || flushed.unsaved_failure.is_some()
-                            || auth_terminal_failure;
-                        if has_active_failure {
-                            let max_sup_seq = flushed
-                                .starts
-                                .last()
-                                .copied()
-                                .into_iter()
-                                .chain(flushed.ends.last().copied())
-                                .max();
-                            let effective_floor = flushed
-                                .anchored_failure_floor
-                                .or_else(|| flushed.unsaved_failure.as_ref().and_then(|(_, s)| *s))
-                                .or(max_sup_seq);
-                            let mut recovered = has_unsuppressed_turn_after(
-                                &working_rows,
-                                &flushed.starts,
-                                &flushed.ends,
-                                effective_floor,
-                            );
-                            let needs_backfill = effective_floor.is_some_and(|fseq| {
-                                working_rows.len() >= 200
-                                    || working_rows
-                                        .iter()
-                                        .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
-                                        .min()
-                                        .is_some_and(|min_s| min_s > fseq)
-                            });
-                            if needs_backfill && let Some(fseq) = effective_floor {
-                                let (full_rows, incomplete) = self
-                                    .fetch_all_thread_rows_through(
+                                let Some((unresolved_act, unresolved_base, has_unresolved)) = self
+                                    .resolve_unanchored_failures_in_rows(
+                                        &wave,
+                                        &role,
                                         &thread,
                                         &working_rows,
-                                        false,
-                                        true,
+                                        &mut flushed,
                                     )
-                                    .await;
-                                if incomplete {
+                                    .await
+                                else {
+                                    return;
+                                };
+                                if has_unresolved {
+                                    if let Some(safe_max) = unresolved_base.filter(|&b| b > 0) {
+                                        let safe_rows: Vec<serde_json::Value> = working_rows
+                                            .iter()
+                                            .filter(|r| {
+                                                r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0)
+                                                    <= safe_max
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        let _ = self
+                                            .mirror_outstanding_turns_from_tail(
+                                                &wave, &role, &thread, &safe_rows,
+                                            )
+                                            .await;
+                                    }
+                                    if let Some(act) = unresolved_act
+                                        && self.is_current_live_thread(&wave, &role, &thread).await
+                                        && self
+                                            .try_wave_observe(
+                                                wave.clone(),
+                                                role.clone(),
+                                                Observation::activity_with_bounds(
+                                                    act,
+                                                    thread.clone(),
+                                                    unresolved_base,
+                                                    Vec::new(),
+                                                ),
+                                            )
+                                            .await
+                                    {
+                                        let _ = self.owner.send(
+                                            OwnerMsg::MarkTicketActivityCommitted {
+                                                wave: wave.clone(),
+                                                role: role.clone(),
+                                                thread: thread.clone(),
+                                            },
+                                        );
+                                    }
                                     let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                                         wave,
                                         role,
@@ -5877,176 +6112,227 @@ impl BbBridge {
                                     });
                                     return;
                                 }
-                                working_rows = full_rows;
-                                recovered = has_unsuppressed_turn_after(
+                            }
+                            let auth_activity = self.authoritative_activity(&wave, &role).await;
+                            let auth_terminal_failure = matches!(
+                                auth_activity,
+                                Some(Activity::Refused { .. } | Activity::Errored { .. })
+                            );
+                            let has_active_failure = flushed.anchored_failure_floor.is_some()
+                                || flushed.unsaved_failure.is_some()
+                                || auth_terminal_failure;
+                            if has_active_failure {
+                                let max_sup_seq = flushed
+                                    .starts
+                                    .last()
+                                    .copied()
+                                    .into_iter()
+                                    .chain(flushed.ends.last().copied())
+                                    .max();
+                                let effective_floor = flushed
+                                    .anchored_failure_floor
+                                    .or_else(|| {
+                                        flushed.unsaved_failure.as_ref().and_then(|(_, s)| *s)
+                                    })
+                                    .or(max_sup_seq);
+                                let mut recovered = has_unsuppressed_turn_after(
                                     &working_rows,
                                     &flushed.starts,
                                     &flushed.ends,
-                                    Some(fseq),
+                                    effective_floor,
                                 );
-                            }
-                            if !recovered {
-                                let segments = extract_bb_turn_segments(&working_rows);
-                                let tail_ok = if effective_floor.is_none() {
-                                    let (sup_starts, sup_end, sup_max) = match segments.last() {
-                                        Some(seg) => {
-                                            (seg.start_seqs.clone(), seg.end_seq, seg.max_seq)
-                                        }
-                                        None => (Vec::new(), None, fseq_now),
-                                    };
-                                    if !self
-                                        .record_suppressed_bb_segment(
-                                            &wave,
-                                            &role,
+                                let needs_backfill = effective_floor.is_some_and(|fseq| {
+                                    working_rows.len() >= 200
+                                        || working_rows
+                                            .iter()
+                                            .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+                                            .min()
+                                            .is_some_and(|min_s| min_s > fseq)
+                                });
+                                if needs_backfill && let Some(fseq) = effective_floor {
+                                    let (full_rows, incomplete) = self
+                                        .fetch_all_thread_rows_through(
                                             &thread,
-                                            (sup_starts, sup_end, Some(sup_max)),
-                                            flushed.unsaved_failure.clone(),
+                                            &working_rows,
                                             false,
+                                            true,
                                         )
-                                        .await
-                                    {
+                                        .await;
+                                    if incomplete {
+                                        let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                            wave,
+                                            role,
+                                            thread,
+                                            since_end_seq: None,
+                                            mark_unknown_dirty: true,
+                                        });
                                         return;
                                     }
-                                    let prior_rows = rows_before_terminal_turn(&working_rows);
-                                    self.mirror_outstanding_turns_from_tail(
-                                        &wave,
-                                        &role,
-                                        &thread,
-                                        &prior_rows,
-                                    )
-                                    .await
-                                } else {
-                                    if let Some(last_seg) = segments.last() {
-                                        let already_fully_recorded = last_seg
-                                            .start_seqs
-                                            .iter()
-                                            .all(|s| *s == 0 || flushed.starts.contains(s))
-                                            && last_seg.end_seq.is_none_or(|e| {
-                                                e == 0 || flushed.ends.contains(&e)
-                                            })
-                                            && flushed
-                                                .anchored_failure_floor
-                                                .is_some_and(|af| af >= last_seg.max_seq);
-                                        if is_segment_already_suppressed(
-                                            last_seg,
-                                            &flushed.starts,
-                                            &flushed.ends,
-                                        ) && !already_fully_recorded
-                                            && !self
-                                                .record_suppressed_bb_segment(
-                                                    &wave,
-                                                    &role,
-                                                    &thread,
-                                                    (
-                                                        last_seg.start_seqs.clone(),
-                                                        last_seg.end_seq,
-                                                        Some(last_seg.max_seq),
-                                                    ),
-                                                    flushed.unsaved_failure.clone(),
-                                                    false,
-                                                )
-                                                .await
+                                    working_rows = full_rows;
+                                    recovered = has_unsuppressed_turn_after(
+                                        &working_rows,
+                                        &flushed.starts,
+                                        &flushed.ends,
+                                        Some(fseq),
+                                    );
+                                }
+                                if !recovered {
+                                    let segments = extract_bb_turn_segments(&working_rows);
+                                    let tail_ok = if effective_floor.is_none() {
+                                        let (sup_starts, sup_end, sup_max) = match segments.last() {
+                                            Some(seg) => {
+                                                (seg.start_seqs.clone(), seg.end_seq, seg.max_seq)
+                                            }
+                                            None => (Vec::new(), None, fseq_now),
+                                        };
+                                        if !self
+                                            .record_suppressed_bb_segment(
+                                                &wave,
+                                                &role,
+                                                &thread,
+                                                (sup_starts, sup_end, Some(sup_max)),
+                                                flushed.unsaved_failure.clone(),
+                                                false,
+                                            )
+                                            .await
                                         {
                                             return;
                                         }
-                                    }
-                                    self.mirror_outstanding_turns_from_tail(
-                                        &wave,
-                                        &role,
-                                        &thread,
-                                        &working_rows,
-                                    )
-                                    .await
-                                };
-                                if let Some((fail_act, _)) = flushed.unsaved_failure
-                                    && self.is_current_live_thread(&wave, &role, &thread).await
-                                    && !self
-                                        .try_wave_observe(
-                                            wave.clone(),
-                                            role.clone(),
-                                            Observation::activity_with_bounds(
-                                                fail_act.clone(),
-                                                thread.clone(),
-                                                None,
-                                                Vec::new(),
-                                            ),
+                                        let prior_rows = rows_before_terminal_turn(&working_rows);
+                                        self.mirror_outstanding_turns_from_tail(
+                                            &wave,
+                                            &role,
+                                            &thread,
+                                            &prior_rows,
                                         )
                                         .await
-                                {
-                                    let _ = self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                                    } else {
+                                        if let Some(last_seg) = segments.last() {
+                                            let already_fully_recorded = last_seg
+                                                .start_seqs
+                                                .iter()
+                                                .all(|s| *s == 0 || flushed.starts.contains(s))
+                                                && last_seg.end_seq.is_none_or(|e| {
+                                                    e == 0 || flushed.ends.contains(&e)
+                                                })
+                                                && flushed
+                                                    .anchored_failure_floor
+                                                    .is_some_and(|af| af >= last_seg.max_seq);
+                                            if is_segment_already_suppressed(
+                                                last_seg,
+                                                &flushed.starts,
+                                                &flushed.ends,
+                                            ) && !already_fully_recorded
+                                                && !self
+                                                    .record_suppressed_bb_segment(
+                                                        &wave,
+                                                        &role,
+                                                        &thread,
+                                                        (
+                                                            last_seg.start_seqs.clone(),
+                                                            last_seg.end_seq,
+                                                            Some(last_seg.max_seq),
+                                                        ),
+                                                        flushed.unsaved_failure.clone(),
+                                                        false,
+                                                    )
+                                                    .await
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        self.mirror_outstanding_turns_from_tail(
+                                            &wave,
+                                            &role,
+                                            &thread,
+                                            &working_rows,
+                                        )
+                                        .await
+                                    };
+                                    if let Some((fail_act, _)) = flushed.unsaved_failure
+                                        && self.is_current_live_thread(&wave, &role, &thread).await
+                                        && !self
+                                            .try_wave_observe(
+                                                wave.clone(),
+                                                role.clone(),
+                                                Observation::activity_with_bounds(
+                                                    fail_act.clone(),
+                                                    thread.clone(),
+                                                    None,
+                                                    Vec::new(),
+                                                ),
+                                            )
+                                            .await
+                                    {
+                                        let _ =
+                                            self.owner.send(OwnerMsg::QueueUnsavedSuppressions {
+                                                wave,
+                                                role,
+                                                thread,
+                                                start_seqs: Vec::new(),
+                                                end_seq: None,
+                                                floor_seq: Some(
+                                                    effective_floor.unwrap_or(fseq_now),
+                                                ),
+                                                failure: Some((
+                                                    fail_act,
+                                                    Some(effective_floor.unwrap_or(fseq_now)),
+                                                )),
+                                                consume_turn_started: false,
+                                            });
+                                        return;
+                                    }
+                                    if !tail_ok {
+                                        let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                            wave: wave.clone(),
+                                            role: role.clone(),
+                                            thread: thread.clone(),
+                                            since_end_seq: None,
+                                            mark_unknown_dirty: true,
+                                        });
+                                    }
+                                    let idle_floor = effective_floor.unwrap_or(fseq_now);
+                                    let fi_key = format!("fi:{idle_floor}");
+                                    let mut fi_saved = self
+                                        .commit_bb_suppression_keys(
+                                            &wave,
+                                            &role,
+                                            &thread,
+                                            vec![fi_key.clone()],
+                                        )
+                                        .await;
+                                    if !fi_saved
+                                        && let Some(ref act) = auth_activity
+                                        && matches!(
+                                            act,
+                                            Activity::Refused { .. } | Activity::Errored { .. }
+                                        )
+                                        && self.is_current_live_thread(&wave, &role, &thread).await
+                                    {
+                                        fi_saved = self
+                                            .try_wave_observe(
+                                                wave.clone(),
+                                                role.clone(),
+                                                Observation::activity_with_bounds(
+                                                    act.clone(),
+                                                    thread.clone(),
+                                                    None,
+                                                    vec![fi_key],
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                    let _ = self.owner.send(OwnerMsg::NoteIdleWhileAnchored {
                                         wave,
                                         role,
                                         thread,
-                                        start_seqs: Vec::new(),
-                                        end_seq: None,
-                                        floor_seq: Some(effective_floor.unwrap_or(fseq_now)),
-                                        failure: Some((
-                                            fail_act,
-                                            Some(effective_floor.unwrap_or(fseq_now)),
-                                        )),
-                                        consume_turn_started: false,
+                                        floor_seq: idle_floor,
+                                        saved: fi_saved,
                                     });
                                     return;
                                 }
-                                if !tail_ok {
-                                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                        wave: wave.clone(),
-                                        role: role.clone(),
-                                        thread: thread.clone(),
-                                        since_end_seq: None,
-                                        mark_unknown_dirty: true,
-                                    });
-                                }
-                                let _ = self.owner.send(OwnerMsg::NoteIdleWhileAnchored {
-                                    wave,
-                                    role,
-                                    thread,
-                                });
-                                return;
                             }
-                        }
-                        if self.has_queued_terminal_signal(&thread) {
-                            let _ = self.owner.send(OwnerMsg::SetPendingMirror {
-                                wave,
-                                role,
-                                thread,
-                                since_end_seq: None,
-                                mark_unknown_dirty: true,
-                            });
-                            return;
-                        }
-                        if self
-                            .mirror_outstanding_turns_from_tail(
-                                &wave,
-                                &role,
-                                &thread,
-                                &working_rows,
-                            )
-                            .await
-                            && !self.has_queued_terminal_signal(&thread)
-                            && self.is_current_live_thread(&wave, &role, &thread).await
-                        {
-                            let settled_seq = latest_completed_turn_end_seq(&working_rows);
-                            if self
-                                .try_wave_observe(
-                                    wave.clone(),
-                                    role.clone(),
-                                    Observation::activity_with_bounds(
-                                        Activity::Idle,
-                                        thread.clone(),
-                                        settled_seq,
-                                        Vec::new(),
-                                    ),
-                                )
-                                .await
-                            {
-                                let _ = self.owner.send(OwnerMsg::ClearUnsavedFailure {
-                                    wave,
-                                    role,
-                                    thread,
-                                    settled_seq,
-                                });
-                            } else {
+                            if self.has_queued_terminal_signal(&thread) {
                                 let _ = self.owner.send(OwnerMsg::SetPendingMirror {
                                     wave,
                                     role,
@@ -6054,97 +6340,140 @@ impl BbBridge {
                                     since_end_seq: None,
                                     mark_unknown_dirty: true,
                                 });
+                                return;
+                            }
+                            if self
+                                .mirror_outstanding_turns_from_tail(
+                                    &wave,
+                                    &role,
+                                    &thread,
+                                    &working_rows,
+                                )
+                                .await
+                                && !self.has_queued_terminal_signal(&thread)
+                                && self.is_current_live_thread(&wave, &role, &thread).await
+                            {
+                                let settled_seq = latest_completed_turn_end_seq(&working_rows);
+                                if self
+                                    .try_wave_observe(
+                                        wave.clone(),
+                                        role.clone(),
+                                        Observation::activity_with_bounds(
+                                            Activity::Idle,
+                                            thread.clone(),
+                                            settled_seq,
+                                            Vec::new(),
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    let _ = self.owner.send(OwnerMsg::ClearUnsavedFailure {
+                                        wave,
+                                        role,
+                                        thread,
+                                        settled_seq,
+                                    });
+                                } else {
+                                    let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                                        wave,
+                                        role,
+                                        thread,
+                                        since_end_seq: None,
+                                        mark_unknown_dirty: true,
+                                    });
+                                }
                             }
                         }
-                    }
-                    protocol::ThreadSignal::Failed => {
-                        let msg = error.unwrap_or_else(|| "BB thread failed".into());
-                        let is_direct_refusal = stop_reason
-                            .as_deref()
-                            .is_some_and(rex_wave_api::wave::is_refusal_stop_reason)
-                            || rex_wave_api::wave::is_refusal_error_text(&msg);
-                        let direct_failure_activity = || {
-                            if is_direct_refusal {
-                                let reason = match stop_reason.as_deref() {
-                                    Some(sr)
-                                        if !msg
-                                            .to_ascii_lowercase()
-                                            .contains(&sr.to_ascii_lowercase()) =>
-                                    {
-                                        format!("{sr}: {msg}")
-                                    }
-                                    _ => msg.clone(),
-                                };
+                        protocol::ThreadSignal::Failed => {
+                            let msg = error.unwrap_or_else(|| "BB thread failed".into());
+                            let is_direct_refusal = stop_reason
+                                .as_deref()
+                                .is_some_and(rex_wave_api::wave::is_refusal_stop_reason)
+                                || rex_wave_api::wave::is_refusal_error_text(&msg);
+                            let direct_failure_activity = || {
+                                if is_direct_refusal {
+                                    let reason = match stop_reason.as_deref() {
+                                        Some(sr)
+                                            if !msg
+                                                .to_ascii_lowercase()
+                                                .contains(&sr.to_ascii_lowercase()) =>
+                                        {
+                                            format!("{sr}: {msg}")
+                                        }
+                                        _ => msg.clone(),
+                                    };
+                                    Activity::Refused { reason }
+                                } else {
+                                    Activity::Errored { error: msg.clone() }
+                                }
+                            };
+                            let rows_res =
+                                self.fetch_recent_terminal_turn_rows_checked(&thread).await;
+                            let row_refusal = if is_direct_refusal {
+                                None
+                            } else {
+                                rows_res
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|rows| refusal_from_latest_turn(rows))
+                            };
+                            let activity = if let Some(reason) = row_refusal {
                                 Activity::Refused { reason }
                             } else {
-                                Activity::Errored { error: msg.clone() }
-                            }
-                        };
-                        let rows_res = self.fetch_recent_terminal_turn_rows_checked(&thread).await;
-                        let row_refusal = if is_direct_refusal {
-                            None
-                        } else {
-                            rows_res
-                                .as_ref()
-                                .ok()
-                                .and_then(|rows| refusal_from_latest_turn(rows))
-                        };
-                        let activity = if let Some(reason) = row_refusal {
-                            Activity::Refused { reason }
-                        } else {
-                            direct_failure_activity()
-                        };
-                        self.handle_terminal_failure_signal(
-                            (wave, role, attempt, thread),
-                            activity,
-                            rows_res,
-                            (parsed_model, parsed_account),
-                            false,
-                        )
-                        .await;
-                    }
-                    protocol::ThreadSignal::Archived => {
-                        self.call_wave_observe(wave, role, Observation::Archived)
+                                direct_failure_activity()
+                            };
+                            self.handle_terminal_failure_signal(
+                                (wave, role, attempt, thread),
+                                activity,
+                                rows_res,
+                                (parsed_model, parsed_account),
+                                false,
+                            )
                             .await;
+                        }
+                        protocol::ThreadSignal::Archived => {
+                            self.call_wave_observe(wave, role, Observation::Archived)
+                                .await;
+                        }
                     }
                 }
-            }
-            protocol::Up::Interaction {
-                thread_id,
-                meta,
-                interaction,
-            } => {
-                let Ok(thread) = BbThreadId::parse(thread_id) else {
-                    return;
-                };
-                let Some(pending) = parse_pending_interaction(&interaction) else {
-                    return;
-                };
-                let Some((wave, role, attempt, retiring)) =
-                    self.resolve_worker_identity(&thread, meta.as_ref()).await
-                else {
-                    return;
-                };
-                if retiring {
-                    return;
+                protocol::Up::Interaction {
+                    thread_id,
+                    meta,
+                    interaction,
+                } => {
+                    let Ok(thread) = BbThreadId::parse(thread_id) else {
+                        return;
+                    };
+                    let Some(pending) = parse_pending_interaction(&interaction) else {
+                        return;
+                    };
+                    let Some((wave, role, attempt, retiring)) =
+                        self.resolve_worker_identity(&thread, meta.as_ref()).await
+                    else {
+                        return;
+                    };
+                    if retiring {
+                        return;
+                    }
+                    self.call_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Spawned { attempt, thread },
+                    )
+                    .await;
+                    self.call_wave_observe(
+                        wave,
+                        role,
+                        Observation::activity(Activity::Blocked {
+                            interaction: pending,
+                        }),
+                    )
+                    .await;
                 }
-                self.call_wave_observe(
-                    wave.clone(),
-                    role.clone(),
-                    Observation::Spawned { attempt, thread },
-                )
-                .await;
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::activity(Activity::Blocked {
-                        interaction: pending,
-                    }),
-                )
-                .await;
+                _ => {}
             }
-            _ => {}
-        }
+        })
     }
 
     async fn on_tool_call(
@@ -8677,6 +9006,7 @@ mod tests {
         boards: BTreeSet<BoardId>,
         entries: BTreeMap<StreamId, Vec<Envelope>>,
         waiters: Vec<mpsc::UnboundedSender<Envelope>>,
+        fail_next_error_activity: bool,
         fail_next_turns_suppressed: usize,
         fail_next_spawned_observe: usize,
         fail_next_wave_reads: usize,
@@ -8700,6 +9030,7 @@ mod tests {
                 boards: BTreeSet::new(),
                 entries: BTreeMap::new(),
                 waiters: Vec::new(),
+                fail_next_error_activity: false,
                 fail_next_turns_suppressed: 0,
                 fail_next_spawned_observe: 0,
                 fail_next_wave_reads: 0,
@@ -8796,6 +9127,23 @@ mod tests {
                             g.fail_next_spawned_observe -= 1;
                             return Err(ApiError::Internal(
                                 "injected Spawned write failure".into(),
+                            ));
+                        }
+                        if g.fail_next_error_activity
+                            && matches!(
+                                &wc,
+                                rex_wave_api::WaveCommand::WaveObserve(WaveObserve {
+                                    observation: Observation::Activity {
+                                        activity: Activity::Errored { .. },
+                                        ..
+                                    },
+                                    ..
+                                })
+                            )
+                        {
+                            g.fail_next_error_activity = false;
+                            return Err(ApiError::Internal(
+                                "injected Activity write failure".into(),
                             ));
                         }
                         let ctx = DecideCtx::for_test(me.clone(), UnixMs(1_000));
@@ -14168,6 +14516,29 @@ mod tests {
     }
 
     async fn run_bb_suppression_fault_matrix_case(scenario: &str) {
+        let scenario_owned = scenario.to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::thread::Builder::new()
+                .name(format!("bb-fault-{scenario_owned}"))
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .thread_stack_size(16 * 1024 * 1024)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(run_bb_suppression_fault_matrix_case_inner(&scenario_owned));
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn run_bb_suppression_fault_matrix_case_inner(scenario: &str) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let token = "tok_bb_faults";
@@ -14246,6 +14617,8 @@ mod tests {
         let server_rows: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let fail_events_page_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_backscan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_backscan_srv = fail_backscan.clone();
         let first_rpc = Arc::new(tokio::sync::Notify::new());
         let server_first_rpc = first_rpc.clone();
         let server_rows_srv = server_rows.clone();
@@ -14278,7 +14651,11 @@ mod tests {
                     } = down
                     {
                         server_first_rpc.notify_one();
-                        if fail_ep_srv.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        if fail_ep_srv.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            || (before_seq.is_some()
+                                && fail_backscan_srv
+                                    .swap(false, std::sync::atomic::Ordering::SeqCst))
+                        {
                             let err_reply = protocol::Up::Result {
                                 req_id,
                                 ok: false,
@@ -14611,6 +14988,85 @@ mod tests {
                     publish(&three);
                     bridge.on_thread_signal(idle()).await;
                 }
+                "r28_r31_failed_resolution" | "r28_r31_failed_resolution_control" => {
+                    fail_page();
+                    bridge.on_thread_signal(failed("second turn failed")).await;
+                    bridge.on_thread_signal(active()).await;
+                    if scenario == "r28_r31_failed_resolution" {
+                        harness.inner.lock().await.fail_next_turns_suppressed = 2;
+                    }
+                    bridge.on_thread_signal(failed("third turn failed")).await;
+                    assert_eq!(harness.inner.lock().await.fail_next_turns_suppressed, 0);
+                    publish(&three);
+                    bridge.on_thread_signal(idle()).await;
+                }
+                "r28_r31_extended_anchor" | "r28_r31_extended_anchor_control" => {
+                    let mut start = live_rows[3].clone();
+                    start["type"] = serde_json::json!("client/turn/start");
+                    let mut rows = live_rows[..3].to_vec();
+                    rows.push(start);
+                    publish(&rows);
+                    bridge.on_thread_signal(failed("second turn failed")).await;
+                    bridge.on_thread_signal(active()).await;
+                    for mut row in three[3..].iter().cloned() {
+                        row["seq"] = serde_json::json!(row["seq"].as_u64().unwrap() + 1);
+                        rows.push(row);
+                    }
+                    publish(&rows[..7]);
+                    if scenario == "r28_r31_extended_anchor" {
+                        bridge.reconcile_live_workers().await;
+                    }
+                    fail_page();
+                    bridge.on_thread_signal(failed("third turn failed")).await;
+                    publish(&rows);
+                    bridge.on_thread_signal(idle()).await;
+                }
+                "r28_r31_idle_restart_control" => {
+                    bridge.on_thread_signal(failed("second turn failed")).await;
+                    bridge.on_thread_signal(idle()).await;
+                    fail_page();
+                    bridge.on_thread_signal(failed("third turn failed")).await;
+                    publish(&three);
+                    bridge.on_thread_signal(idle()).await;
+                }
+                "r28_r31_ticket_resolve_between" | "r28_r31_ticket_resolve_between_control" => {
+                    fail_page();
+                    bridge.on_thread_signal(failed("second turn failed")).await;
+                    bridge.on_thread_signal(active()).await;
+                    if scenario == "r28_r31_ticket_resolve_between" {
+                        bridge.reconcile_live_workers().await;
+                    }
+                    fail_page();
+                    bridge.on_thread_signal(failed("third turn failed")).await;
+                    publish(&three);
+                    bridge.on_thread_signal(idle()).await;
+                }
+                "r28_r31_partial_backscan" | "r28_r31_partial_backscan_control" => {
+                    bridge.on_thread_signal(failed("second turn failed")).await;
+                    let mut rows = live_rows.clone();
+                    for seq in 7u64..=208 {
+                        rows.push(serde_json::json!({
+                            "seq": seq,
+                            "createdAt": seq + 120,
+                            "type": "thread/contextWindowUsage/updated",
+                            "data": {}
+                        }));
+                    }
+                    for (i, row) in three[6..].iter().enumerate() {
+                        let mut row = row.clone();
+                        row["seq"] = serde_json::json!(209 + i);
+                        row["createdAt"] = serde_json::json!(329 + i);
+                        rows.push(row);
+                    }
+                    publish(&rows);
+                    fail_backscan.store(
+                        scenario == "r28_r31_partial_backscan",
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    bridge.on_thread_signal(failed("third turn failed")).await;
+                    assert!(!fail_backscan.load(std::sync::atomic::Ordering::SeqCst));
+                    bridge.on_thread_signal(idle()).await;
+                }
                 "r28_probe_new_failure_stale" => {
                     bridge.on_thread_signal(failed("second turn failed")).await;
                     bridge.on_thread_signal(active()).await;
@@ -14727,6 +15183,9 @@ mod tests {
                 "r28_restart"
                 | "r28_restart_write_fault"
                 | "r28_probe_historical_restart"
+                | "r28_r31_ticket_activity_crash"
+                | "r28_r31_ticket_activity_crash_control"
+                | "r28_r31_idle_restart"
                 | "r28_r30_empty_restart"
                 | "r28_r30_long_id_restart"
                 | "r28_r30_anchor_write_restart"
@@ -14743,7 +15202,13 @@ mod tests {
                     ) {
                         harness.inner.lock().await.fail_next_turns_suppressed = 2;
                     }
-                    if scenario != "r28_r30_anchor_write_restart" {
+                    if scenario == "r28_r31_ticket_activity_crash" {
+                        harness.inner.lock().await.fail_next_error_activity = true;
+                    }
+                    if !matches!(
+                        scenario,
+                        "r28_r30_anchor_write_restart" | "r28_r31_idle_restart"
+                    ) {
                         fail_page();
                     }
                     bridge.on_thread_signal(failed("second turn failed")).await;
@@ -14753,9 +15218,19 @@ mod tests {
                         fail_page();
                         bridge.on_thread_signal(failed("third turn failed")).await;
                     }
+                    if scenario == "r28_r31_idle_restart" {
+                        bridge.on_thread_signal(idle()).await;
+                    }
                     let _ = shutdown_tx.send(true);
                     let _ = bridge_runner.await;
-                    publish(&three);
+                    if !matches!(
+                        scenario,
+                        "r28_r31_idle_restart"
+                            | "r28_r31_ticket_activity_crash"
+                            | "r28_r31_ticket_activity_crash_control"
+                    ) {
+                        publish(&three);
+                    }
                     let cold = BbBridge::with_data_dir(
                         BridgeConfig {
                             url: format!("ws://{addr}/bridge"),
@@ -14787,6 +15262,12 @@ mod tests {
                         .unwrap();
                     cold.reconcile_live_workers().await;
                     cold.flush_signal_queue().await;
+                    if scenario == "r28_r31_idle_restart" {
+                        fail_page();
+                        cold.on_thread_signal(failed("third turn failed")).await;
+                        publish(&three);
+                        cold.on_thread_signal(idle()).await;
+                    }
                     let _ = stop.send(true);
                     let _ = running.await;
                     server_task.abort();
@@ -14820,14 +15301,45 @@ mod tests {
                             "r28_probe_first_restart" | "r28_r30_empty_restart"
                         ) {
                             vec!["third reply"]
-                        } else if scenario == "r28_r30_second_ticket_lost" {
+                        } else if matches!(
+                            scenario,
+                            "r28_r31_ticket_activity_crash_control"
+                                | "r28_r31_ticket_activity_crash"
+                                | "r28_r31_idle_restart"
+                                | "r28_r30_second_ticket_lost"
+                        ) {
                             vec!["Earlier completed reply"]
                         } else {
                             vec!["Earlier completed reply", "third reply"]
                         },
                         "{scenario}"
                     );
-                    if scenario == "r28_r30_second_ticket_lost" {
+                    if matches!(
+                        scenario,
+                        "r28_r31_ticket_activity_crash_control" | "r28_r31_ticket_activity_crash"
+                    ) {
+                        assert!(!harness.inner.lock().await.fail_next_error_activity);
+                        let finish = owner
+                            .call(rex_wave_api::wave::WaveFinish {
+                                wave: wave.clone(),
+                                outcome: rex_wave_api::wave::WaveOutcome::Completed {
+                                    summary: Body::parse("done").unwrap(),
+                                },
+                                allow_incomplete: false,
+                            })
+                            .await;
+                        assert!(
+                            finish.is_err(),
+                            "wave accepted Completed after failed turn: {finish:?}; phase {phase:?}"
+                        );
+                    }
+                    if matches!(
+                        scenario,
+                        "r28_r31_ticket_activity_crash_control"
+                            | "r28_r31_ticket_activity_crash"
+                            | "r28_r31_idle_restart"
+                            | "r28_r30_second_ticket_lost"
+                    ) {
                         assert!(phase.error().is_some(), "{scenario}: {phase:?}");
                     } else {
                         assert!(
@@ -15314,6 +15826,18 @@ mod tests {
             "r28_r30_empty_restart",
             "r28_r30_second_ticket_lost",
             "r28_r30_anchor_write_restart",
+            "r28_r31_ticket_resolve_between",
+            "r28_r31_ticket_resolve_between_control",
+            "r28_r31_partial_backscan",
+            "r28_r31_partial_backscan_control",
+            "r28_r31_idle_restart",
+            "r28_r31_idle_restart_control",
+            "r28_r31_extended_anchor",
+            "r28_r31_extended_anchor_control",
+            "r28_r31_failed_resolution",
+            "r28_r31_failed_resolution_control",
+            "r28_r31_ticket_activity_crash",
+            "r28_r31_ticket_activity_crash_control",
         ] {
             run_bb_suppression_fault_matrix_case(scenario).await;
         }

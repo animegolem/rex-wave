@@ -297,6 +297,33 @@ struct WorkerRecord {
     suppressed_thread: Option<BbThreadId>,
     suppressed_turns: BTreeSet<String>,
     settled_turn_seq: u64,
+    unsettled_failure: Option<Activity>,
+}
+
+fn fold_unsettled_failure_keys(rec: &mut WorkerRecord, keys: &[String]) {
+    for key in keys {
+        if let Some(rest) = key.strip_prefix("fp:")
+            && let Some((_, reason)) = rest.split_once(':')
+        {
+            rec.unsettled_failure = Some(Activity::Refused {
+                reason: reason.to_owned(),
+            });
+        } else if let Some(rest) = key.strip_prefix("fe:")
+            && let Some((_, error)) = rest.split_once(':')
+        {
+            if !matches!(rec.unsettled_failure, Some(Activity::Refused { .. })) {
+                rec.unsettled_failure = Some(Activity::Errored {
+                    error: error.to_owned(),
+                });
+            }
+        } else if (key.starts_with("ft:") || key.starts_with("fail_ticket:"))
+            && rec.unsettled_failure.is_none()
+        {
+            rec.unsettled_failure = Some(Activity::Errored {
+                error: "turn failed".into(),
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -608,9 +635,13 @@ impl Decider for Waves {
                     let mut refused = Vec::new();
                     let mut errored = Vec::new();
                     for (role, rec) in &state.workers {
-                        if rec.phase.refusal().is_some() {
+                        if rec.phase.refusal().is_some()
+                            || matches!(rec.unsettled_failure, Some(Activity::Refused { .. }))
+                        {
                             refused.push(format!("@{role}"));
-                        } else if rec.phase.error().is_some() {
+                        } else if rec.phase.error().is_some()
+                            || matches!(rec.unsettled_failure, Some(Activity::Errored { .. }))
+                        {
                             errored.push(format!("@{role}"));
                         }
                     }
@@ -845,6 +876,7 @@ impl Decider for Waves {
                         suppressed_thread: None,
                         suppressed_turns: BTreeSet::new(),
                         settled_turn_seq: 0,
+                        unsettled_failure: None,
                     },
                 );
             }
@@ -867,12 +899,14 @@ impl Decider for Waves {
                                 rec.suppressed_thread = Some(thread.clone());
                                 rec.suppressed_turns.clear();
                                 rec.settled_turn_seq = 0;
+                                rec.unsettled_failure = None;
                             }
                             for key in keys {
                                 if !key.is_empty() {
                                     rec.suppressed_turns.insert(key.clone());
                                 }
                             }
+                            fold_unsettled_failure_keys(rec, keys);
                         }
                         other => {
                             if let Observation::Spawned { thread, .. } = other
@@ -881,18 +915,22 @@ impl Decider for Waves {
                                 rec.suppressed_thread = Some(thread.clone());
                                 rec.suppressed_turns.clear();
                                 rec.settled_turn_seq = 0;
+                                rec.unsettled_failure = None;
                             }
                             if let Observation::Activity {
-                                thread: Some(th),
+                                activity,
+                                thread,
                                 settled_seq,
                                 suppress_keys,
-                                ..
                             } = other
                             {
-                                if rec.suppressed_thread.as_ref() != Some(th) {
+                                if let Some(th) = thread
+                                    && rec.suppressed_thread.as_ref() != Some(th)
+                                {
                                     rec.suppressed_thread = Some(th.clone());
                                     rec.suppressed_turns.clear();
                                     rec.settled_turn_seq = 0;
+                                    rec.unsettled_failure = None;
                                 }
                                 if let Some(s) = settled_seq {
                                     rec.settled_turn_seq = rec.settled_turn_seq.max(*s);
@@ -902,6 +940,29 @@ impl Decider for Waves {
                                         rec.suppressed_turns.insert(key.clone());
                                     }
                                 }
+                                fold_unsettled_failure_keys(rec, suppress_keys);
+                                match activity {
+                                    Activity::Idle => {
+                                        rec.unsettled_failure = None;
+                                    }
+                                    Activity::Refused { .. } => {
+                                        rec.unsettled_failure = Some(activity.clone());
+                                    }
+                                    Activity::Errored { .. } => {
+                                        if !matches!(
+                                            rec.unsettled_failure,
+                                            Some(Activity::Refused { .. })
+                                        ) {
+                                            rec.unsettled_failure = Some(activity.clone());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if matches!(
+                                other,
+                                Observation::Archived | Observation::SpawnFailed { .. }
+                            ) {
+                                rec.unsettled_failure = None;
                             }
                             rec.phase = rec.phase.observe(other);
                             rec.resolved_interaction = None;
