@@ -1368,6 +1368,7 @@ dependencies = [
  "rex-wave-api",
  "rex-wave-fs",
  "rex-wave-runtime",
+ "rex-wave-store",
  "rex-wave-waves",
  "serde",
  "serde_json",

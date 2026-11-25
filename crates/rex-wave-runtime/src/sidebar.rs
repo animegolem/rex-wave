@@ -4,7 +4,7 @@ use rex_wave_api::notify::{InboxEvent, NotificationId, NotifyKind, NotifyState};
 use rex_wave_api::read::*;
 use rex_wave_api::room::{Mentions, RoomEvent, RoomId, RoomOrigin, RoomScope};
 use rex_wave_api::stage::derive_osc7501_status;
-use rex_wave_api::wave::{AgentSpec, WaveEvent, WaveOutcome, WorkerPhase};
+use rex_wave_api::wave::{AgentSpec, UnsettledFailure, WaveEvent, WaveOutcome, WorkerPhase};
 use rex_wave_api::{
     BbProjectId, Cursor, Envelope, Event, Principal, RoleName, Seq, StreamId, WaveSlug,
 };
@@ -152,7 +152,7 @@ struct WaveEntry {
     project: BbProjectId,
     room: RoomId,
     finished: Option<WaveOutcome>,
-    workers: BTreeMap<RoleName, (AgentSpec, WorkerPhase)>,
+    workers: BTreeMap<RoleName, (AgentSpec, WorkerPhase, UnsettledFailure)>,
 }
 
 #[derive(Clone, Default)]
@@ -225,30 +225,34 @@ impl World {
                     if let Some(w) = self.waves.get_mut(wave) {
                         Arc::make_mut(w).workers.insert(
                             role.clone(),
-                            (agent.clone(), WorkerPhase::Requested { attempt: *attempt }),
+                            (
+                                agent.clone(),
+                                WorkerPhase::Requested { attempt: *attempt },
+                                UnsettledFailure::default(),
+                            ),
                         );
                     }
                 }
                 WaveEvent::WorkerObserved { role, observation } => {
                     if let Some(w) = self.waves.get_mut(wave)
-                        && let Some((_, phase)) = Arc::make_mut(w).workers.get_mut(role)
+                        && let Some((_, phase, unsettled)) = Arc::make_mut(w).workers.get_mut(role)
                     {
-                        *phase = phase.observe(observation);
+                        *phase = unsettled.observe(phase, observation);
                     }
                 }
                 WaveEvent::WorkerRetiring { role, .. } => {
                     if let Some(w) = self.waves.get_mut(wave)
-                        && let Some((_, phase)) = Arc::make_mut(w).workers.get_mut(role)
+                        && let Some((_, phase, unsettled)) = Arc::make_mut(w).workers.get_mut(role)
                     {
-                        *phase = phase.retiring();
+                        *phase = unsettled.retiring(phase);
                     }
                 }
                 WaveEvent::Finished { outcome } => {
                     if let Some(w) = self.waves.get_mut(wave) {
                         let w = Arc::make_mut(w);
                         w.finished = Some(outcome.clone());
-                        for (_, phase) in w.workers.values_mut() {
-                            *phase = phase.retiring();
+                        for (_, phase, unsettled) in w.workers.values_mut() {
+                            *phase = unsettled.retiring(phase);
                         }
                     }
                 }
@@ -447,7 +451,7 @@ impl World {
             let workers = w
                 .workers
                 .iter()
-                .map(|(role, (spec, phase))| WaveWorkerLeaf {
+                .map(|(role, (spec, phase, _))| WaveWorkerLeaf {
                     role: role.clone(),
                     provider: spec.provider.clone(),
                     model: spec.model.clone(),
@@ -533,7 +537,7 @@ impl World {
         let all_phases = self
             .waves
             .values()
-            .flat_map(|w| w.workers.values().map(|(_, p)| p));
+            .flat_map(|w| w.workers.values().map(|(_, p, _)| p));
         let osc7501 = derive_osc7501_status(&inbox, all_phases);
         SidebarTreeSnapshot {
             inbox,

@@ -150,8 +150,12 @@ impl WorkerPhase {
                     thread,
                     activity: cur_activity,
                 },
-                Observation::Activity { activity, .. },
-            ) => {
+                Observation::Activity {
+                    activity,
+                    thread: obs_thread,
+                    ..
+                },
+            ) if obs_thread.as_ref().is_none_or(|t| t == thread) => {
                 let next_activity = match (cur_activity, activity) {
                     (Activity::Refused { reason }, Activity::Errored { .. }) => Activity::Refused {
                         reason: reason.clone(),
@@ -341,6 +345,170 @@ pub fn failure_activity_from_suppression_keys(keys: &[String]) -> Option<Activit
         }
     }
     out
+}
+
+/// Shared per-worker unsettled terminal failure/refusal tracker used by both
+/// `Waves` and `SidebarProjection` so live, retiring, and archived phases stay
+/// identical even when an intermediate `Working` turn precedes retirement or archive.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnsettledFailure {
+    thread: Option<BbThreadId>,
+    failure: Option<Activity>,
+}
+
+impl UnsettledFailure {
+    pub fn activity(&self) -> Option<&Activity> {
+        self.failure.as_ref()
+    }
+
+    fn fold_keys(&mut self, keys: &[String]) {
+        for key in keys {
+            if let Some(rest) = key.strip_prefix("fp:")
+                && let Some((_, reason)) = rest.split_once(':')
+            {
+                self.failure = Some(Activity::Refused {
+                    reason: reason.to_owned(),
+                });
+            } else if let Some(rest) = key.strip_prefix("fe:")
+                && let Some((_, error)) = rest.split_once(':')
+            {
+                if !matches!(self.failure, Some(Activity::Refused { .. })) {
+                    self.failure = Some(Activity::Errored {
+                        error: error.to_owned(),
+                    });
+                }
+            } else if (key.starts_with("ft:") || key.starts_with("fail_ticket:"))
+                && self.failure.is_none()
+            {
+                self.failure = Some(Activity::Errored {
+                    error: "turn failed".into(),
+                });
+            }
+        }
+    }
+
+    pub fn observe(&mut self, phase: &WorkerPhase, obs: &Observation) -> WorkerPhase {
+        match obs {
+            Observation::Spawned { attempt, thread } => {
+                if matches!(phase, WorkerPhase::Requested { attempt: a } if a == attempt)
+                    && self.thread.as_ref() != Some(thread)
+                {
+                    self.thread = Some(thread.clone());
+                    self.failure = None;
+                }
+            }
+            Observation::SpawnFailed { attempt, .. } => {
+                if matches!(phase, WorkerPhase::Requested { attempt: a } if a == attempt) {
+                    self.failure = None;
+                }
+            }
+            Observation::TurnsSuppressed { thread, keys } => {
+                let matches_thread = match phase {
+                    WorkerPhase::Live { thread: t, .. }
+                    | WorkerPhase::Retiring { thread: t, .. } => t == thread,
+                    WorkerPhase::Requested { .. } => true,
+                    WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
+                };
+                if matches_thread {
+                    if self.thread.as_ref() != Some(thread) {
+                        self.thread = Some(thread.clone());
+                        self.failure = None;
+                    }
+                    self.fold_keys(keys);
+                }
+            }
+            Observation::Activity {
+                activity,
+                thread,
+                suppress_keys,
+                ..
+            } => {
+                if let WorkerPhase::Live {
+                    thread: live_th, ..
+                } = phase
+                {
+                    if thread.as_ref().is_some_and(|t| t != live_th) {
+                        return phase.clone();
+                    }
+                    if self.thread.as_ref() != Some(live_th) {
+                        self.thread = Some(live_th.clone());
+                        self.failure = None;
+                    }
+                    self.fold_keys(suppress_keys);
+                    match activity {
+                        Activity::Idle => {
+                            self.failure = None;
+                        }
+                        Activity::Refused { .. } => {
+                            self.failure = Some(activity.clone());
+                        }
+                        Activity::Errored { .. } => {
+                            if !matches!(self.failure, Some(Activity::Refused { .. })) {
+                                self.failure = Some(activity.clone());
+                            }
+                        }
+                        Activity::Working | Activity::Parked { .. } | Activity::Blocked { .. } => {}
+                    }
+                }
+            }
+            Observation::RuntimeMeta { .. } | Observation::Archived => {}
+        }
+        let mut next = phase.observe(obs);
+        if let WorkerPhase::Live {
+            ref thread,
+            activity: Activity::Errored { .. },
+        } = next
+            && let Some(Activity::Refused { ref reason }) = self.failure
+        {
+            next = WorkerPhase::Live {
+                thread: thread.clone(),
+                activity: Activity::Refused {
+                    reason: reason.clone(),
+                },
+            };
+        }
+        if matches!(obs, Observation::Archived)
+            && let WorkerPhase::Retired {
+                ref mut errored,
+                ref mut refused,
+                ..
+            } = next
+        {
+            match &self.failure {
+                Some(Activity::Refused { reason }) if refused.is_none() => {
+                    *refused = Some(reason.clone());
+                    *errored = None;
+                }
+                Some(Activity::Errored { error }) if refused.is_none() && errored.is_none() => {
+                    *errored = Some(error.clone());
+                }
+                _ => {}
+            }
+        }
+        next
+    }
+
+    pub fn retiring(&self, phase: &WorkerPhase) -> WorkerPhase {
+        let mut next = phase.retiring();
+        if let WorkerPhase::Retiring {
+            ref mut errored,
+            ref mut refused,
+            ..
+        } = next
+        {
+            match &self.failure {
+                Some(Activity::Refused { reason }) if refused.is_none() => {
+                    *refused = Some(reason.clone());
+                    *errored = None;
+                }
+                Some(Activity::Errored { error }) if refused.is_none() && errored.is_none() => {
+                    *errored = Some(error.clone());
+                }
+                _ => {}
+            }
+        }
+        next
+    }
 }
 
 /// True when a provider stop/finish reason or status names a safety / policy refusal.
