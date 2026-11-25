@@ -2464,6 +2464,204 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
 }
 
 #[tokio::test]
+async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_item_only".into(),
+        projects: vec![json!({
+            "id": "uuid-item-only",
+            "title": "item-only-repo",
+            "workspaceRoot": "/tmp/item-only"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_item_only").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    let conductor_task = spawn_reactor(
+        WaveConductor::new(T3Host(bridge.clone())),
+        LocalClient::new(
+            router.clone(),
+            Principal::System {
+                part: SystemPart::WaveConductor,
+            },
+        ),
+    );
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("item-only-v1").unwrap();
+    let role = RoleName::parse("writer").unwrap();
+    let project = BbProjectId::parse("uuid-item-only").unwrap();
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse("Attribute direct post to first item-only turn only").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("Post in turn 1, reply directly in turn 2").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let expected_tid = BbThreadId::parse("t3:item-only-v1:writer:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let expected_tid = expected_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            snap.workers.iter().any(|(_, _, phase)| {
+                matches!(phase, WorkerPhase::Live { thread, .. } if thread == &expected_tid)
+            })
+        }
+    })
+    .await;
+
+    let room = wave_room(&wave, &project);
+    let worker_client = LocalClient::new(
+        router.clone(),
+        Principal::Worker {
+            wave: wave.clone(),
+            role: role.clone(),
+        },
+    );
+    worker_client
+        .call(rex_wave_api::room::RoomPost {
+            room: rex_wave_api::room::RoomRef::Id { id: room.clone() },
+            body: Body::parse("Posted directly via rex-wave CLI").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: None,
+            origin: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    {
+        let mut st = server.state.lock().await;
+        let proj = st
+            .thread_projections
+            .get_mut(expected_tid.as_str())
+            .unwrap();
+        let base = rex_wave_runtime::now().0;
+        proj["runs"] = json!([]);
+        proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "createdAt": base.saturating_sub(1_000) },
+            { "ordinal": 1, "type": "assistant_message", "id": "final1", "text": "First wrap-up", "createdAt": base },
+            { "ordinal": 2, "type": "user_message", "createdAt": base + 10 },
+            { "ordinal": 3, "type": "assistant_message", "id": "final2", "text": "Second reply", "createdAt": base + 20 }
+        ]);
+    }
+    for seq in [30u64, 31u64] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": expected_tid.as_str(),
+                    "status": "completed",
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let role = role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            page.entries
+                .iter()
+                .filter(|e| {
+                    e.by == Principal::Worker {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                    } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                })
+                .count()
+                == 2
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let room_page = operator
+        .call(Read::stream(
+            StreamId::Room { room: room.clone() },
+            Seq::ORIGIN,
+            Some(50),
+        ))
+        .await
+        .unwrap();
+    let bodies: Vec<&str> = room_page
+        .entries
+        .iter()
+        .filter(|e| {
+            e.by == Principal::Worker {
+                wave: wave.clone(),
+                role: role.clone(),
+            }
+        })
+        .filter_map(|e| match &e.event {
+            Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        bodies,
+        vec!["Posted directly via rex-wave CLI", "Second reply"]
+    );
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
+    bridge_task.abort();
+}
+
+#[tokio::test]
 async fn t3_bridge_respects_bb_default_runner_on_requested_and_ignores_retiring_working_updates() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockT3Server::start(MockT3State {

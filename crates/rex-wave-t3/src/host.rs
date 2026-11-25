@@ -53,7 +53,10 @@ struct TrackedWorker {
     pending_interaction: Option<PendingInteraction>,
     mirror_room_watermark: Seq,
     settled_turn_keys: BTreeSet<String>,
+    claimed_direct_posts: BTreeSet<Seq>,
 }
+
+type MirrorStateSnapshot = (Seq, bool, BTreeSet<Seq>);
 
 enum StateMsg {
     BindThread {
@@ -83,7 +86,7 @@ enum StateMsg {
         role: RoleName,
         thread: BbThreadId,
         turn_keys: Vec<String>,
-        reply: oneshot::Sender<(Seq, bool)>,
+        reply: oneshot::Sender<MirrorStateSnapshot>,
     },
     AdvanceMirrorWatermark {
         wave: WaveSlug,
@@ -91,6 +94,7 @@ enum StateMsg {
         thread: BbThreadId,
         seq: Seq,
         turn_keys: Vec<String>,
+        claimed_seqs: Vec<Seq>,
     },
 }
 
@@ -132,10 +136,12 @@ impl StateOwner {
                             pending_interaction: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
+                            claimed_direct_posts: BTreeSet::new(),
                         });
                     if rec.thread.as_ref() != Some(&thread) {
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
+                        rec.claimed_direct_posts.clear();
                     }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
@@ -178,9 +184,13 @@ impl StateOwner {
                             let settled = turn_keys
                                 .iter()
                                 .any(|k| !k.is_empty() && r.settled_turn_keys.contains(k));
-                            (r.mirror_room_watermark, settled)
+                            (
+                                r.mirror_room_watermark,
+                                settled,
+                                r.claimed_direct_posts.clone(),
+                            )
                         }
-                        _ => (Seq::ORIGIN, false),
+                        _ => (Seq::ORIGIN, false, BTreeSet::new()),
                     };
                     let _ = reply.send(st);
                 }
@@ -190,6 +200,7 @@ impl StateOwner {
                     thread,
                     seq,
                     turn_keys,
+                    claimed_seqs,
                 } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
@@ -201,6 +212,9 @@ impl StateOwner {
                             if !k.is_empty() {
                                 rec.settled_turn_keys.insert(k);
                             }
+                        }
+                        for s in claimed_seqs {
+                            rec.claimed_direct_posts.insert(s);
                         }
                     }
                 }
@@ -227,6 +241,7 @@ impl StateOwner {
                         pending_interaction: None,
                         mirror_room_watermark: Seq::ORIGIN,
                         settled_turn_keys: BTreeSet::new(),
+                        claimed_direct_posts: BTreeSet::new(),
                     },
                 );
             }
@@ -242,6 +257,7 @@ impl StateOwner {
                             rec.pending_interaction = None;
                             rec.mirror_room_watermark = Seq::ORIGIN;
                             rec.settled_turn_keys.clear();
+                            rec.claimed_direct_posts.clear();
                         }
                         return;
                     }
@@ -264,10 +280,12 @@ impl StateOwner {
                             pending_interaction: None,
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
+                            claimed_direct_posts: BTreeSet::new(),
                         });
                     if rec.thread.as_ref() != Some(&thread) {
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
+                        rec.claimed_direct_posts.clear();
                     }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
@@ -1137,7 +1155,8 @@ impl T3Bridge {
                 turn_keys: turn_keys.clone(),
                 reply: wm_tx,
             });
-            let (watermark, already_settled) = wm_rx.await.unwrap_or((Seq::ORIGIN, false));
+            let (watermark, already_settled, claimed_direct_posts) =
+                wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
             if already_settled {
                 continue;
             }
@@ -1147,7 +1166,7 @@ impl T3Bridge {
             let mut safe_watermark = watermark;
             let mut watermark_pinned = !allow_watermark_advance;
 
-            let settle_turn = |target_seq: Seq, keys: Vec<String>| {
+            let settle_turn = |target_seq: Seq, keys: Vec<String>, claimed_seqs: Vec<Seq>| {
                 let next_seq = if allow_watermark_advance {
                     target_seq
                 } else {
@@ -1159,6 +1178,7 @@ impl T3Bridge {
                     thread: thread.clone(),
                     seq: next_seq,
                     turn_keys: keys,
+                    claimed_seqs,
                 });
             };
 
@@ -1166,6 +1186,7 @@ impl T3Bridge {
                 TurnMirrorCheck::Ignore => continue,
                 TurnMirrorCheck::PostedViaTool { run_end_at, .. } => {
                     let mut tool_reached_end = false;
+                    let mut tool_claimed = Vec::new();
                     loop {
                         let Ok(WireReply::Read(page)) = backend
                             .call_as(
@@ -1188,10 +1209,18 @@ impl T3Bridge {
                             if env.by == worker_principal
                                 && let Event::Room(RoomEvent::Posted { origin, .. }) = &env.event
                                 && *origin != rex_wave_api::room::PostOrigin::MirroredTurn
-                                && ((run_end_at > 0 && env.at.0 > run_end_at)
-                                    || next_run_start_at.is_some_and(|ns| env.at.0 >= ns))
                             {
-                                watermark_pinned = true;
+                                let post_after = (run_end_at > 0 && env.at.0 > run_end_at)
+                                    || next_run_start_at.is_some_and(|ns| env.at.0 >= ns);
+                                if post_after {
+                                    watermark_pinned = true;
+                                } else if !claimed_direct_posts.contains(&env.seq)
+                                    && (run_end_at > 0
+                                        || next_run_start_at.is_some()
+                                        || tool_claimed.is_empty())
+                                {
+                                    tool_claimed.push(env.seq);
+                                }
                             }
                             if !watermark_pinned {
                                 safe_watermark = env.seq;
@@ -1203,7 +1232,7 @@ impl T3Bridge {
                         }
                     }
                     if tool_reached_end {
-                        settle_turn(safe_watermark, turn_keys);
+                        settle_turn(safe_watermark, turn_keys, tool_claimed);
                     }
                     continue;
                 }
@@ -1212,12 +1241,14 @@ impl T3Bridge {
 
             // `WaveConductor` skips peer wakeups when idem starts with `wave:` and contains `:turn:`.
             let Ok(idem_key) = mirror_idem_key(wave, role, thread, &completed.anchor) else {
-                settle_turn(watermark, turn_keys);
+                settle_turn(watermark, turn_keys, Vec::new());
                 continue;
             };
 
             let mut already_posted = false;
             let mut reached_end = false;
+            let mut claimed_seqs = Vec::new();
+            let bounded_window = completed.run_end_at > 0 || next_run_start_at.is_some();
             loop {
                 let Ok(WireReply::Read(page)) = backend
                     .call_as(
@@ -1249,6 +1280,7 @@ impl T3Bridge {
                         }
                         if *origin != rex_wave_api::room::PostOrigin::MirroredTurn
                             && env.by == worker_principal
+                            && !claimed_direct_posts.contains(&env.seq)
                             && (completed.run_start_at == 0 || env.at.0 >= completed.run_start_at)
                         {
                             let post_after_run = (completed.run_end_at > 0
@@ -1260,8 +1292,11 @@ impl T3Bridge {
                                 if !watermark_pinned {
                                     safe_watermark = env.seq;
                                 }
+                                claimed_seqs.push(env.seq);
                                 already_posted = true;
-                                break;
+                                if !bounded_window {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1269,7 +1304,7 @@ impl T3Bridge {
                         safe_watermark = env.seq;
                     }
                 }
-                if already_posted {
+                if already_posted && !bounded_window {
                     break;
                 }
                 if count < 500 {
@@ -1283,13 +1318,13 @@ impl T3Bridge {
             }
 
             if already_posted {
-                settle_turn(safe_watermark, turn_keys);
+                settle_turn(safe_watermark, turn_keys, claimed_seqs);
                 continue;
             }
 
             let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
             let Ok(body) = Body::parse(trimmed) else {
-                settle_turn(safe_watermark, turn_keys);
+                settle_turn(safe_watermark, turn_keys, Vec::new());
                 continue;
             };
             let post_cmd =
@@ -1334,7 +1369,7 @@ impl T3Bridge {
                     } else {
                         safe_watermark
                     };
-                settle_turn(posted_head, turn_keys);
+                settle_turn(posted_head, turn_keys, Vec::new());
             } else {
                 return;
             }
@@ -1700,6 +1735,7 @@ impl T3Bridge {
                                 pending_interaction,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
+                                claimed_direct_posts: BTreeSet::new(),
                             })
                         }
                         WorkerPhase::Retiring { thread, .. }
@@ -1717,6 +1753,7 @@ impl T3Bridge {
                                 pending_interaction: None,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
+                                claimed_direct_posts: BTreeSet::new(),
                             })
                         }
                         _ => Err(ApiError::NotFound {

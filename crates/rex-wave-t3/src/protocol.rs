@@ -1235,9 +1235,51 @@ pub fn inspect_completed_turns_in_order(projection: &Value) -> Vec<(TurnMirrorCh
         if seg.is_empty() {
             continue;
         }
-        let check = inspect_turn_slice(seg, None, None, format!("seg:{seg_idx}"), 0, 0);
+        let seg_start_at = seg
+            .iter()
+            .filter_map(|it| {
+                it.get("startedAt")
+                    .or_else(|| it.get("createdAt"))
+                    .map(parse_timestamp_ms)
+                    .map(|u| u.0)
+                    .filter(|&ts| ts > 0)
+            })
+            .next()
+            .unwrap_or(0);
+        let seg_end_at = seg
+            .iter()
+            .filter_map(|it| {
+                it.get("completedAt")
+                    .or_else(|| it.get("endedAt"))
+                    .or_else(|| it.get("createdAt"))
+                    .map(parse_timestamp_ms)
+                    .map(|u| u.0)
+                    .filter(|&ts| ts > 0)
+            })
+            .max()
+            .unwrap_or(0);
+        let next_seg_start_at = ordered[end..]
+            .iter()
+            .filter_map(|it| {
+                it.get("startedAt")
+                    .or_else(|| it.get("createdAt"))
+                    .or_else(|| it.get("completedAt"))
+                    .or_else(|| it.get("endedAt"))
+                    .map(parse_timestamp_ms)
+                    .map(|u| u.0)
+                    .filter(|&ts| ts > 0)
+            })
+            .next();
+        let check = inspect_turn_slice(
+            seg,
+            None,
+            None,
+            format!("seg:{seg_idx}"),
+            seg_start_at,
+            seg_end_at,
+        );
         if !matches!(check, TurnMirrorCheck::Ignore) {
-            out.push((check, None));
+            out.push((check, next_seg_start_at));
         }
     }
     out
