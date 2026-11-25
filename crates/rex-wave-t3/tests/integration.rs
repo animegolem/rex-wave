@@ -2502,6 +2502,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
     );
     let wave = WaveSlug::parse("item-only-v1").unwrap();
     let role = RoleName::parse("writer").unwrap();
+    let upgrade_role = RoleName::parse("upgrader").unwrap();
     let project = BbProjectId::parse("uuid-item-only").unwrap();
     operator
         .call(WaveStart {
@@ -2519,14 +2520,25 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                     workspace: Workspace::ProjectDefault,
                 },
                 output_dir: None,
-                workers: vec![WorkerSpec {
-                    role: role.clone(),
-                    brief: Body::parse("Post in turn 1, reply directly in turn 2").unwrap(),
-                    agent: None,
-                    output_dir: None,
-                    writes: Vec::new(),
-                    return_schema: None,
-                }],
+                workers: vec![
+                    WorkerSpec {
+                        role: role.clone(),
+                        brief: Body::parse("Post in turn 1, reply directly in turn 2").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: upgrade_role.clone(),
+                        brief: Body::parse("Preserve turn 1 across pre-upgrade turn 2 mirror")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
             },
             idem: None,
         })
@@ -2534,17 +2546,23 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         .unwrap();
 
     let expected_tid = BbThreadId::parse("t3:item-only-v1:writer:a1").unwrap();
+    let upgrade_tid = BbThreadId::parse("t3:item-only-v1:upgrader:a1").unwrap();
     wait_until(Duration::from_secs(3), || {
         let operator = operator.clone();
         let wave = wave.clone();
         let expected_tid = expected_tid.clone();
+        let upgrade_tid = upgrade_tid.clone();
         async move {
             let Ok(snap) = operator.call(WaveView { wave }).await else {
                 return false;
             };
-            snap.workers.iter().any(|(_, _, phase)| {
+            let w1 = snap.workers.iter().any(|(_, _, phase)| {
                 matches!(phase, WorkerPhase::Live { thread, .. } if thread == &expected_tid)
-            })
+            });
+            let w2 = snap.workers.iter().any(|(_, _, phase)| {
+                matches!(phase, WorkerPhase::Live { thread, .. } if thread == &upgrade_tid)
+            });
+            w1 && w2
         }
     })
     .await;
@@ -2571,29 +2589,67 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         .await
         .unwrap();
 
+    let upgrade_client = LocalClient::new(
+        router.clone(),
+        Principal::Worker {
+            wave: wave.clone(),
+            role: upgrade_role.clone(),
+        },
+    );
+    let legacy_t2_key =
+        rex_wave_waves::mirror_idem_key(&wave, &upgrade_role, &upgrade_tid, "final2").unwrap();
+    upgrade_client
+        .call(rex_wave_api::room::RoomPost {
+            room: rex_wave_api::room::RoomRef::Id { id: room.clone() },
+            body: Body::parse("Pre-upgrade turn 2").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: Some(legacy_t2_key),
+            origin: Default::default(),
+        })
+        .await
+        .unwrap();
+
     {
         let mut st = server.state.lock().await;
+        let base = rex_wave_runtime::now().0;
         let proj = st
             .thread_projections
             .get_mut(expected_tid.as_str())
             .unwrap();
-        let base = rex_wave_runtime::now().0;
         proj["runs"] = json!([]);
         proj["turnItems"] = json!([
             { "ordinal": 0, "type": "user_message", "createdAt": base.saturating_sub(1_000) },
-            { "ordinal": 1, "type": "assistant_message", "id": "final1", "text": "First wrap-up", "createdAt": base },
+            { "ordinal": 1, "type": "assistant_message", "id": "final1", "text": "First wrap-up" },
             { "ordinal": 2, "type": "user_message", "createdAt": base + 10 },
             { "ordinal": 3, "type": "assistant_message", "id": "final2", "text": "Second reply", "createdAt": base + 20 }
         ]);
+        let u_proj = st.thread_projections.get_mut(upgrade_tid.as_str()).unwrap();
+        u_proj["runs"] = json!([]);
+        u_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "final1", "text": "Turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "final2", "text": "Pre-upgrade turn 2" },
+            { "ordinal": 4, "type": "user_message", "text": "u3" },
+            { "ordinal": 5, "type": "assistant_message", "id": "final3", "text": "Turn 3" }
+        ]);
     }
-    for seq in [30u64, 31u64] {
+    for (seq, tid) in [
+        (30u64, expected_tid.as_str()),
+        (31u64, expected_tid.as_str()),
+        (32u64, upgrade_tid.as_str()),
+        (33u64, upgrade_tid.as_str()),
+    ] {
         server
             .push_shell_item(json!({
                 "kind": "thread.updated",
                 "sequence": seq,
                 "location": "active",
                 "thread": {
-                    "id": expected_tid.as_str(),
+                    "id": tid,
                     "status": "completed",
                     "pendingRuntimeRequest": null,
                     "archivedAt": null
@@ -2607,6 +2663,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         let room = room.clone();
         let wave = wave.clone();
         let role = role.clone();
+        let upgrade_role = upgrade_role.clone();
         async move {
             let Ok(page) = operator
                 .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
@@ -2614,7 +2671,8 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
             else {
                 return false;
             };
-            page.entries
+            let c1 = page
+                .entries
                 .iter()
                 .filter(|e| {
                     e.by == Principal::Worker {
@@ -2622,8 +2680,18 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                         role: role.clone(),
                     } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
                 })
-                .count()
-                == 2
+                .count();
+            let c2 = page
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.by == Principal::Worker {
+                        wave: wave.clone(),
+                        role: upgrade_role.clone(),
+                    } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                })
+                .count();
+            c1 == 2 && c2 == 3
         }
     })
     .await;
@@ -2654,6 +2722,24 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
     assert_eq!(
         bodies,
         vec!["Posted directly via rex-wave CLI", "Second reply"]
+    );
+    let upgrade_bodies: Vec<&str> = room_page
+        .entries
+        .iter()
+        .filter(|e| {
+            e.by == Principal::Worker {
+                wave: wave.clone(),
+                role: upgrade_role.clone(),
+            }
+        })
+        .filter_map(|e| match &e.event {
+            Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        upgrade_bodies,
+        vec!["Pre-upgrade turn 2", "Turn 1", "Turn 3"]
     );
 
     let _ = shutdown_tx.send(true);

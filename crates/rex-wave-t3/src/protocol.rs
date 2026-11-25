@@ -1247,8 +1247,9 @@ pub fn inspect_completed_turns_in_order(projection: &Value) -> Vec<(TurnMirrorCh
             .next()
             .unwrap_or(0);
         let seg_end_at = seg
-            .iter()
-            .filter_map(|it| {
+            .last()
+            .filter(|it| it.get("type").and_then(|v| v.as_str()) != Some("user_message"))
+            .and_then(|it| {
                 it.get("completedAt")
                     .or_else(|| it.get("endedAt"))
                     .or_else(|| it.get("createdAt"))
@@ -1256,7 +1257,6 @@ pub fn inspect_completed_turns_in_order(projection: &Value) -> Vec<(TurnMirrorCh
                     .map(|u| u.0)
                     .filter(|&ts| ts > 0)
             })
-            .max()
             .unwrap_or(0);
         let next_seg_start_at = ordered[end..]
             .iter()

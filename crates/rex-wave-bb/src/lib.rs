@@ -1017,14 +1017,29 @@ fn is_nonmirrorable_completion_row(row: &serde_json::Value) -> bool {
     is_failed_completion_status(status) || extract_refusal_from_row(row).is_some()
 }
 
+fn turn_tail_end_exclusive(ordered: &[&serde_json::Value], end_idx: usize) -> usize {
+    ordered[end_idx + 1..]
+        .iter()
+        .position(|r| {
+            matches!(
+                r.get("type").and_then(|v| v.as_str()),
+                Some("turn/started" | "client/turn/start" | "turn/completed")
+            )
+        })
+        .map_or(ordered.len(), |rel| end_idx + 1 + rel)
+}
+
 fn is_nonmirrorable_turn_window(turn_window: &[&serde_json::Value]) -> bool {
-    let Some(&end_row) = turn_window.last() else {
+    let Some(end_idx) = turn_window
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+    else {
         return true;
     };
-    if is_nonmirrorable_completion_row(end_row) {
+    if is_nonmirrorable_completion_row(turn_window[end_idx]) {
         return true;
     }
-    let start_idx = turn_window
+    let start_idx = turn_window[..=end_idx]
         .iter()
         .rposition(|r| {
             matches!(
@@ -1046,13 +1061,18 @@ fn is_turn_window_suppressed(
     if is_nonmirrorable_turn_window(turn_window) {
         return true;
     }
-    if let Some(&end_row) = turn_window.last()
-        && let Some(end_seq) = end_row.get("seq").and_then(|v| v.as_u64())
+    let Some(end_idx) = turn_window
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+    else {
+        return true;
+    };
+    if let Some(end_seq) = turn_window[end_idx].get("seq").and_then(|v| v.as_u64())
         && suppressed_ends.contains(&end_seq)
     {
         return true;
     }
-    if let Some(start_idx) = turn_window.iter().rposition(|r| {
+    if let Some(start_idx) = turn_window[..=end_idx].iter().rposition(|r| {
         matches!(
             r.get("type").and_then(|v| v.as_str()),
             Some("turn/started" | "client/turn/start")
@@ -1190,7 +1210,8 @@ fn latest_nonfailed_turn_end_seq(rows: &[serde_json::Value]) -> Option<u64> {
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
         .map_or(0, |idx| idx + 1);
-    if is_nonmirrorable_turn_window(&ordered[turn_floor_idx..=end_idx]) {
+    let tail_excl = turn_tail_end_exclusive(&ordered, end_idx);
+    if is_nonmirrorable_turn_window(&ordered[turn_floor_idx..tail_excl]) {
         return None;
     }
     Some(
@@ -1234,8 +1255,9 @@ fn mirrorable_turn_completions_in_order(
         });
     let mut out = Vec::new();
     for (seg_idx, &(s_idx, end_idx)) in segments.iter().enumerate() {
+        let tail_excl = turn_tail_end_exclusive(&ordered, end_idx);
         if is_turn_window_suppressed(
-            &ordered[s_idx..=end_idx],
+            &ordered[s_idx..tail_excl],
             suppressed_starts,
             suppressed_ends,
         ) {
@@ -1280,7 +1302,8 @@ fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> O
     if prev_end_idx.is_some() {
         return None;
     }
-    if is_nonmirrorable_turn_window(&ordered[..=end_idx]) {
+    let tail_excl = turn_tail_end_exclusive(&ordered, end_idx);
+    if is_nonmirrorable_turn_window(&ordered[..tail_excl]) {
         return None;
     }
     let has_start = ordered[..=end_idx].iter().any(|r| {
@@ -1299,15 +1322,20 @@ fn latest_completed_turn_missing_start_boundary(rows: &[serde_json::Value]) -> O
 }
 
 fn inspect_turn_window(turn_window: &[&serde_json::Value]) -> TurnMirrorCheck {
-    let Some(&end_row) = turn_window.last() else {
+    let Some(end_idx) = turn_window
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
+    else {
         return TurnMirrorCheck::Ignore;
     };
     if is_nonmirrorable_turn_window(turn_window) {
         return TurnMirrorCheck::Ignore;
     }
+    let end_row = turn_window[end_idx];
+    let body_window = &turn_window[..=end_idx];
     let turn_end_seq = end_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let start_idx = turn_window.iter().rposition(|r| {
+    let start_idx = body_window.iter().rposition(|r| {
         matches!(
             r.get("type").and_then(|v| v.as_str()),
             Some("turn/started" | "client/turn/start")
@@ -1315,30 +1343,23 @@ fn inspect_turn_window(turn_window: &[&serde_json::Value]) -> TurnMirrorCheck {
     });
     let (turn_start_seq, turn_start_at, slice) = match start_idx {
         Some(idx) => {
-            let seq = turn_window[idx]
+            let seq = body_window[idx]
                 .get("seq")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let at = turn_window[idx]
+            let at = body_window[idx]
                 .get("createdAt")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            (Some(seq), at, &turn_window[idx..])
+            (Some(seq), at, &body_window[idx..])
         }
-        None => (None, 0, turn_window),
+        None => (None, 0, body_window),
     };
 
     let turn_end_at = end_row
         .get("createdAt")
         .and_then(|v| v.as_u64())
-        .filter(|&at| at > 0)
-        .unwrap_or_else(|| {
-            slice
-                .iter()
-                .filter_map(|r| r.get("createdAt").and_then(|v| v.as_u64()))
-                .max()
-                .unwrap_or(0)
-        });
+        .unwrap_or(0);
 
     for row in slice {
         if row.get("type").and_then(|v| v.as_str()) != Some("item/completed") {
@@ -1451,7 +1472,8 @@ fn inspect_latest_completed_turn(rows: &[serde_json::Value]) -> TurnMirrorCheck 
         .iter()
         .rposition(|r| r.get("type").and_then(|v| v.as_str()) == Some("turn/completed"))
         .map_or(0, |idx| idx + 1);
-    inspect_turn_window(&ordered[turn_floor_idx..=end_idx])
+    let tail_excl = turn_tail_end_exclusive(&ordered, end_idx);
+    inspect_turn_window(&ordered[turn_floor_idx..tail_excl])
 }
 
 fn inspect_all_unposted_completed_turns(
@@ -1473,7 +1495,8 @@ fn inspect_all_unposted_completed_turns(
     }
     let mut out = Vec::new();
     for (seg_idx, &(s, e)) in segments.iter().enumerate() {
-        if let TurnMirrorCheck::Unposted(turn) = inspect_turn_window(&ordered[s..=e]) {
+        let tail_excl = turn_tail_end_exclusive(&ordered, e);
+        if let TurnMirrorCheck::Unposted(turn) = inspect_turn_window(&ordered[s..tail_excl]) {
             let next_seg_start_at = segments.get(seg_idx + 1).and_then(|&(ns, ne)| {
                 ordered[ns..=ne]
                     .iter()
@@ -10402,12 +10425,8 @@ mod tests {
         refused_page_events.push(serde_json::json!({
             "seq": 1975u64,
             "createdAt": 1_999u64,
-            "type": "provider/error",
-            "data": {
-                "willRetry": false,
-                "message": "blocked by policy",
-                "errorInfo": { "category": "policy" }
-            }
+            "type": "item/agentMessage/delta",
+            "data": { "delta": "refused draft that must never publish" }
         }));
         refused_page_events.push(serde_json::json!({
             "seq": 1976u64,
@@ -10415,10 +10434,20 @@ mod tests {
             "type": "turn/completed",
             "data": { "status": "completed" }
         }));
-        for s in 1977u64..2827u64 {
+        refused_page_events.push(serde_json::json!({
+            "seq": 1977u64,
+            "createdAt": 2_001u64,
+            "type": "provider/error",
+            "data": {
+                "willRetry": false,
+                "message": "blocked by policy",
+                "errorInfo": { "category": "policy" }
+            }
+        }));
+        for s in 1978u64..2828u64 {
             refused_page_events.push(serde_json::json!({
                 "seq": s,
-                "createdAt": 2_000u64 + (s - 1976),
+                "createdAt": 2_001u64 + (s - 1977),
                 "type": "thread/contextWindowUsage/updated",
                 "data": {}
             }));

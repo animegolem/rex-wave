@@ -51,11 +51,13 @@ struct TrackedWorker {
     live: bool,
     activity: Activity,
     pending_interaction: Option<PendingInteraction>,
+    shell_epoch: u64,
     mirror_room_watermark: Seq,
     settled_turn_keys: BTreeSet<String>,
     claimed_direct_posts: BTreeSet<Seq>,
 }
 
+type LiveWorkerRow = (WaveSlug, RoleName, BbThreadId, Activity, u64);
 type MirrorStateSnapshot = (Seq, bool, BTreeSet<Seq>);
 
 enum StateMsg {
@@ -79,7 +81,12 @@ enum StateMsg {
         reply: oneshot::Sender<Option<TrackedWorker>>,
     },
     ListLiveWorkers {
-        reply: oneshot::Sender<Vec<(WaveSlug, RoleName, BbThreadId, Activity)>>,
+        reply: oneshot::Sender<Vec<LiveWorkerRow>>,
+    },
+    BumpShellEpoch {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
     },
     MirrorState {
         wave: WaveSlug,
@@ -134,11 +141,13 @@ impl StateOwner {
                             live: true,
                             activity: Activity::Working,
                             pending_interaction: None,
+                            shell_epoch: 0,
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
                             claimed_direct_posts: BTreeSet::new(),
                         });
                     if rec.thread.as_ref() != Some(&thread) {
+                        rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
                         rec.claimed_direct_posts.clear();
@@ -167,10 +176,23 @@ impl StateOwner {
                             && let Some(th) = &rec.thread
                             && is_t3_thread_id(th)
                         {
-                            out.push((w.clone(), r.clone(), th.clone(), rec.activity.clone()));
+                            out.push((
+                                w.clone(),
+                                r.clone(),
+                                th.clone(),
+                                rec.activity.clone(),
+                                rec.shell_epoch,
+                            ));
                         }
                     }
                     let _ = reply.send(out);
+                }
+                StateMsg::BumpShellEpoch { wave, role, thread } => {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
+                        rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
+                    }
                 }
                 StateMsg::MirrorState {
                     wave,
@@ -239,6 +261,7 @@ impl StateOwner {
                         live: false,
                         activity: Activity::Working,
                         pending_interaction: None,
+                        shell_epoch: 0,
                         mirror_room_watermark: Seq::ORIGIN,
                         settled_turn_keys: BTreeSet::new(),
                         claimed_direct_posts: BTreeSet::new(),
@@ -255,6 +278,7 @@ impl StateOwner {
                             rec.thread = None;
                             rec.live = false;
                             rec.pending_interaction = None;
+                            rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
                             rec.mirror_room_watermark = Seq::ORIGIN;
                             rec.settled_turn_keys.clear();
                             rec.claimed_direct_posts.clear();
@@ -278,11 +302,13 @@ impl StateOwner {
                             live: true,
                             activity: Activity::Working,
                             pending_interaction: None,
+                            shell_epoch: 0,
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
                             claimed_direct_posts: BTreeSet::new(),
                         });
                     if rec.thread.as_ref() != Some(&thread) {
+                        rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
                         rec.claimed_direct_posts.clear();
@@ -878,9 +904,32 @@ impl T3Bridge {
     async fn process_thread_removed(&self, thread: &BbThreadId) {
         self.unlink_worker_token(thread);
         if let Some((wave, role, _, _)) = self.resolve_worker_identity(thread).await {
+            let _ = self.state.send(StateMsg::BumpShellEpoch {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+            });
             self.call_wave_observe(wave, role, Observation::Archived)
                 .await;
         }
+    }
+
+    async fn current_shell_epoch(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+    ) -> Option<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.state
+            .send(StateMsg::LookupByRole {
+                wave: wave.clone(),
+                role: role.clone(),
+                reply: tx,
+            })
+            .ok()?;
+        let rec = rx.await.ok()??;
+        (rec.live && rec.thread.as_ref() == Some(thread)).then_some(rec.shell_epoch)
     }
 
     async fn observe_runtime_meta_if_present(
@@ -917,6 +966,11 @@ impl T3Bridge {
         else {
             return false;
         };
+        let _ = self.state.send(StateMsg::BumpShellEpoch {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+        });
         if retiring {
             if matches!(obs, ShellObservation::Archived) {
                 self.unlink_worker_token(thread);
@@ -1207,19 +1261,26 @@ impl T3Bridge {
                         cursor = last.seq;
                         for env in &page.entries {
                             if env.by == worker_principal
-                                && let Event::Room(RoomEvent::Posted { origin, .. }) = &env.event
-                                && *origin != rex_wave_api::room::PostOrigin::MirroredTurn
+                                && let Event::Room(RoomEvent::Posted { idem, origin, .. }) =
+                                    &env.event
                             {
-                                let post_after = (run_end_at > 0 && env.at.0 > run_end_at)
-                                    || next_run_start_at.is_some_and(|ns| env.at.0 >= ns);
-                                if post_after {
-                                    watermark_pinned = true;
-                                } else if !claimed_direct_posts.contains(&env.seq)
-                                    && (run_end_at > 0
-                                        || next_run_start_at.is_some()
-                                        || tool_claimed.is_empty())
-                                {
-                                    tool_claimed.push(env.seq);
+                                let is_mirrored_row = *origin
+                                    == rex_wave_api::room::PostOrigin::MirroredTurn
+                                    || idem
+                                        .as_ref()
+                                        .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
+                                if !is_mirrored_row {
+                                    let post_after = (run_end_at > 0 && env.at.0 > run_end_at)
+                                        || next_run_start_at.is_some_and(|ns| env.at.0 >= ns);
+                                    if post_after {
+                                        watermark_pinned = true;
+                                    } else if !claimed_direct_posts.contains(&env.seq)
+                                        && (run_end_at > 0
+                                            || next_run_start_at.is_some()
+                                            || tool_claimed.is_empty())
+                                    {
+                                        tool_claimed.push(env.seq);
+                                    }
                                 }
                             }
                             if !watermark_pinned {
@@ -1245,6 +1306,13 @@ impl T3Bridge {
                 continue;
             };
 
+            let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
+            let legacy_trunc_key = rex_wave_waves::legacy_truncated_mirror_idem_key(
+                wave,
+                role,
+                thread,
+                &completed.anchor,
+            );
             let mut already_posted = false;
             let mut reached_end = false;
             let mut claimed_seqs = Vec::new();
@@ -1270,7 +1338,10 @@ impl T3Bridge {
                 room_head = last.seq;
                 let count = page.entries.len();
                 for env in &page.entries {
-                    if let Event::Room(RoomEvent::Posted { idem, origin, .. }) = &env.event {
+                    if let Event::Room(RoomEvent::Posted {
+                        body, idem, origin, ..
+                    }) = &env.event
+                    {
                         if idem.as_ref() == Some(&idem_key) {
                             if !watermark_pinned {
                                 safe_watermark = env.seq;
@@ -1278,8 +1349,26 @@ impl T3Bridge {
                             already_posted = true;
                             break;
                         }
-                        if *origin != rex_wave_api::room::PostOrigin::MirroredTurn
-                            && env.by == worker_principal
+                        let is_mirrored_row = *origin
+                            == rex_wave_api::room::PostOrigin::MirroredTurn
+                            || idem
+                                .as_ref()
+                                .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
+                        if is_mirrored_row {
+                            if env.by == worker_principal
+                                && legacy_trunc_key.is_some()
+                                && idem == &legacy_trunc_key
+                                && body.as_str() == trimmed
+                                && !claimed_direct_posts.contains(&env.seq)
+                            {
+                                if !watermark_pinned {
+                                    safe_watermark = env.seq;
+                                }
+                                claimed_seqs.push(env.seq);
+                                already_posted = true;
+                                break;
+                            }
+                        } else if env.by == worker_principal
                             && !claimed_direct_posts.contains(&env.seq)
                             && (completed.run_start_at == 0 || env.at.0 >= completed.run_start_at)
                         {
@@ -1322,7 +1411,6 @@ impl T3Bridge {
                 continue;
             }
 
-            let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
             let Ok(body) = Body::parse(trimmed) else {
                 settle_turn(safe_watermark, turn_keys, Vec::new());
                 continue;
@@ -1386,7 +1474,7 @@ impl T3Bridge {
             return;
         }
         let Ok(workers) = rx.await else { return };
-        for (wave, role, thread, tracked_activity) in workers {
+        for (wave, role, thread, tracked_activity, shell_epoch) in workers {
             let raw_proj = match self.fetch_thread_projection(&thread).await {
                 Ok(v) => v,
                 Err(HostError::Rejected(msg)) => {
@@ -1399,7 +1487,12 @@ impl T3Bridge {
                             if matches!(obs, Observation::Archived) {
                                 self.unlink_worker_token(&thread);
                             }
-                            self.call_wave_observe(wave, role, obs).await;
+                            if matches!(obs, Observation::Archived)
+                                || self.current_shell_epoch(&wave, &role, &thread).await
+                                    == Some(shell_epoch)
+                            {
+                                self.call_wave_observe(wave, role, obs).await;
+                            }
                         }
                     }
                     continue;
@@ -1419,16 +1512,18 @@ impl T3Bridge {
             }
 
             if let Some(pending) = active_pending_interaction(proj) {
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Blocked {
-                            interaction: pending,
+                if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
+                    self.call_wave_observe(
+                        wave,
+                        role,
+                        Observation::Activity {
+                            activity: Activity::Blocked {
+                                interaction: pending,
+                            },
                         },
-                    },
-                )
-                .await;
+                    )
+                    .await;
+                }
                 continue;
             }
 
@@ -1452,8 +1547,10 @@ impl T3Bridge {
                     self.mirror_completed_turn_from_projection(&wave, &role, &thread, proj)
                         .await;
                 }
-                self.call_wave_observe(wave, role, Observation::Activity { activity })
-                    .await;
+                if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
+                    self.call_wave_observe(wave, role, Observation::Activity { activity })
+                        .await;
+                }
             }
         }
     }
@@ -1733,6 +1830,7 @@ impl T3Bridge {
                                 live: true,
                                 activity,
                                 pending_interaction,
+                                shell_epoch: 0,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
                                 claimed_direct_posts: BTreeSet::new(),
@@ -1751,6 +1849,7 @@ impl T3Bridge {
                                 live: false,
                                 activity: Activity::Idle,
                                 pending_interaction: None,
+                                shell_epoch: 0,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
                                 claimed_direct_posts: BTreeSet::new(),
