@@ -907,6 +907,11 @@ impl Decider for Waves {
                                 }
                             }
                             fold_unsettled_failure_keys(rec, keys);
+                            let next_phase = rec.phase.observe(observation);
+                            if next_phase != rec.phase {
+                                rec.phase = next_phase;
+                                rec.resolved_interaction = None;
+                            }
                         }
                         other => {
                             if let Observation::Spawned { thread, .. } = other
@@ -958,13 +963,24 @@ impl Decider for Waves {
                                     }
                                     _ => {}
                                 }
-                            } else if matches!(
-                                other,
-                                Observation::Archived | Observation::SpawnFailed { .. }
-                            ) {
+                            } else if matches!(other, Observation::SpawnFailed { .. }) {
                                 rec.unsettled_failure = None;
                             }
-                            rec.phase = rec.phase.observe(other);
+                            let mut next_phase = rec.phase.observe(other);
+                            if matches!(other, Observation::Archived)
+                                && let WorkerPhase::Retired {
+                                    ref mut errored,
+                                    ref mut refused,
+                                    ..
+                                } = next_phase
+                                && refused.is_none()
+                                && errored.is_none()
+                                && let Some(ref uf) = rec.unsettled_failure
+                            {
+                                *refused = uf.refusal().map(str::to_owned);
+                                *errored = uf.error().map(str::to_owned);
+                            }
+                            rec.phase = next_phase;
                             rec.resolved_interaction = None;
                         }
                     }

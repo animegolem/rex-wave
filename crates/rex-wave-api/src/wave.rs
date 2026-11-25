@@ -145,12 +145,68 @@ impl WorkerPhase {
             ) if a == attempt => WorkerPhase::Failed {
                 error: error.clone(),
             },
-            (WorkerPhase::Live { thread, .. }, Observation::Activity { activity, .. }) => {
+            (
+                WorkerPhase::Live {
+                    thread,
+                    activity: cur_activity,
+                },
+                Observation::Activity { activity, .. },
+            ) => {
+                let next_activity = match (cur_activity, activity) {
+                    (Activity::Refused { reason }, Activity::Errored { .. }) => Activity::Refused {
+                        reason: reason.clone(),
+                    },
+                    (_, act) => act.clone(),
+                };
                 WorkerPhase::Live {
                     thread: thread.clone(),
-                    activity: activity.clone(),
+                    activity: next_activity,
                 }
             }
+            (
+                WorkerPhase::Live {
+                    thread: live_thread,
+                    activity: cur_activity,
+                },
+                Observation::TurnsSuppressed { thread, keys },
+            ) if live_thread == thread => {
+                if let Some(outcome) = failure_activity_from_suppression_keys(keys) {
+                    let next_activity = match (cur_activity, outcome) {
+                        (Activity::Refused { reason }, Activity::Errored { .. }) => {
+                            Activity::Refused {
+                                reason: reason.clone(),
+                            }
+                        }
+                        (_, act) => act,
+                    };
+                    WorkerPhase::Live {
+                        thread: live_thread.clone(),
+                        activity: next_activity,
+                    }
+                } else {
+                    self.clone()
+                }
+            }
+            (
+                WorkerPhase::Retiring {
+                    thread: live_thread,
+                    errored,
+                    refused,
+                },
+                Observation::TurnsSuppressed { thread, keys },
+            ) if live_thread == thread => match failure_activity_from_suppression_keys(keys) {
+                Some(Activity::Refused { reason }) => WorkerPhase::Retiring {
+                    thread: live_thread.clone(),
+                    errored: errored.clone(),
+                    refused: Some(reason),
+                },
+                Some(Activity::Errored { error }) if refused.is_none() => WorkerPhase::Retiring {
+                    thread: live_thread.clone(),
+                    errored: Some(error),
+                    refused: None,
+                },
+                _ => self.clone(),
+            },
             (WorkerPhase::Live { thread, activity }, Observation::Archived) => {
                 WorkerPhase::Retired {
                     thread: Some(thread.clone()),
@@ -261,6 +317,30 @@ impl Activity {
             _ => None,
         }
     }
+}
+
+/// Extracts the highest-precedence terminal failure or refusal [`Activity`]
+/// encoded in `Observation::TurnsSuppressed` / `suppress_keys` (`fp:<tag>:<reason>`
+/// or `fe:<tag>:<error>`), preserving safety refusals over generic errors.
+pub fn failure_activity_from_suppression_keys(keys: &[String]) -> Option<Activity> {
+    let mut out: Option<Activity> = None;
+    for key in keys {
+        if let Some(rest) = key.strip_prefix("fp:")
+            && let Some((_, reason)) = rest.split_once(':')
+        {
+            out = Some(Activity::Refused {
+                reason: reason.to_owned(),
+            });
+        } else if let Some(rest) = key.strip_prefix("fe:")
+            && let Some((_, error)) = rest.split_once(':')
+            && !matches!(out, Some(Activity::Refused { .. }))
+        {
+            out = Some(Activity::Errored {
+                error: error.to_owned(),
+            });
+        }
+    }
+    out
 }
 
 /// True when a provider stop/finish reason or status names a safety / policy refusal.
