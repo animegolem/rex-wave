@@ -2504,6 +2504,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
     let role = RoleName::parse("writer").unwrap();
     let upgrade_role = RoleName::parse("upgrader").unwrap();
     let refused_role = RoleName::parse("refuser").unwrap();
+    let lagged_role = RoleName::parse("lagged").unwrap();
     let project = BbProjectId::parse("uuid-item-only").unwrap();
     operator
         .call(WaveStart {
@@ -2541,7 +2542,16 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                     },
                     WorkerSpec {
                         role: refused_role.clone(),
-                        brief: Body::parse("Suppress refused draft across later replay").unwrap(),
+                        brief: Body::parse("Suppress refused draft across bridge restart").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: lagged_role.clone(),
+                        brief: Body::parse("Suppress refused draft on lagged notification")
+                            .unwrap(),
                         agent: None,
                         output_dir: None,
                         writes: Vec::new(),
@@ -2557,12 +2567,14 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
     let expected_tid = BbThreadId::parse("t3:item-only-v1:writer:a1").unwrap();
     let upgrade_tid = BbThreadId::parse("t3:item-only-v1:upgrader:a1").unwrap();
     let refused_tid = BbThreadId::parse("t3:item-only-v1:refuser:a1").unwrap();
+    let lagged_tid = BbThreadId::parse("t3:item-only-v1:lagged:a1").unwrap();
     wait_until(Duration::from_secs(3), || {
         let operator = operator.clone();
         let wave = wave.clone();
         let expected_tid = expected_tid.clone();
         let upgrade_tid = upgrade_tid.clone();
         let refused_tid = refused_tid.clone();
+        let lagged_tid = lagged_tid.clone();
         async move {
             let Ok(snap) = operator.call(WaveView { wave }).await else {
                 return false;
@@ -2576,7 +2588,10 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
             let w3 = snap.workers.iter().any(|(_, _, phase)| {
                 matches!(phase, WorkerPhase::Live { thread, .. } if thread == &refused_tid)
             });
-            w1 && w2 && w3
+            let w4 = snap.workers.iter().any(|(_, _, phase)| {
+                matches!(phase, WorkerPhase::Live { thread, .. } if thread == &lagged_tid)
+            });
+            w1 && w2 && w3 && w4
         }
     })
     .await;
@@ -2636,28 +2651,42 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         ]);
         r_proj["thread"]["status"] = json!("completed");
         r_proj["thread"]["stopReason"] = json!("safety");
+
+        let l_proj = st.thread_projections.get_mut(lagged_tid.as_str()).unwrap();
+        l_proj["runs"] = json!([]);
+        l_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "lagged_refused_draft", "text": "Lagged refused draft turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "lagged_recovered_final", "text": "Lagged recovered reply turn 2" }
+        ]);
+        l_proj["thread"]["status"] = json!("completed");
+        l_proj["thread"]["stopReason"] = Value::Null;
     }
-    server
-        .push_shell_item(json!({
-            "kind": "thread.updated",
-            "sequence": 29,
-            "location": "active",
-            "thread": {
-                "id": refused_tid.as_str(),
-                "status": "completed",
-                "stopReason": "safety"
-            }
-        }))
-        .await;
+    for (seq, tid) in [(28u64, refused_tid.as_str()), (29u64, lagged_tid.as_str())] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety"
+                }
+            }))
+            .await;
+    }
     wait_until(Duration::from_secs(3), || {
         let operator = operator.clone();
         let wave = wave.clone();
         let refused_role = refused_role.clone();
+        let lagged_role = lagged_role.clone();
         async move {
             let Ok(snap) = operator.call(WaveView { wave }).await else {
                 return false;
             };
-            snap.workers.iter().any(|(r, _, phase)| {
+            let r_ok = snap.workers.iter().any(|(r, _, phase)| {
                 r == &refused_role
                     && matches!(
                         phase,
@@ -2666,7 +2695,18 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                             ..
                         }
                     )
-            })
+            });
+            let l_ok = snap.workers.iter().any(|(r, _, phase)| {
+                r == &lagged_role
+                    && matches!(
+                        phase,
+                        WorkerPhase::Live {
+                            activity: Activity::Refused { .. },
+                            ..
+                        }
+                    )
+            });
+            r_ok && l_ok
         }
     })
     .await;
@@ -2705,6 +2745,16 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
             { "ordinal": 3, "type": "assistant_message", "id": "recovered_final", "text": "Recovered reply turn 2" }
         ]);
     }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_item_only").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
     for (seq, tid) in [
         (30u64, expected_tid.as_str()),
         (31u64, expected_tid.as_str()),
@@ -2712,6 +2762,8 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         (33u64, upgrade_tid.as_str()),
         (34u64, refused_tid.as_str()),
         (35u64, refused_tid.as_str()),
+        (36u64, lagged_tid.as_str()),
+        (37u64, lagged_tid.as_str()),
     ] {
         server
             .push_shell_item(json!({
@@ -2735,6 +2787,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         let role = role.clone();
         let upgrade_role = upgrade_role.clone();
         let refused_role = refused_role.clone();
+        let lagged_role = lagged_role.clone();
         async move {
             let Ok(page) = operator
                 .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
@@ -2772,7 +2825,17 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                     } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
                 })
                 .count();
-            c1 == 2 && c2 == 3 && c3 == 1
+            let c4 = page
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.by == Principal::Worker {
+                        wave: wave.clone(),
+                        role: lagged_role.clone(),
+                    } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                })
+                .count();
+            c1 == 2 && c2 == 3 && c3 == 1 && c4 == 1
         }
     })
     .await;
@@ -2837,6 +2900,21 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         })
         .collect();
     assert_eq!(refused_bodies, vec!["Recovered reply turn 2"]);
+    let lagged_bodies: Vec<&str> = room_page
+        .entries
+        .iter()
+        .filter(|e| {
+            e.by == Principal::Worker {
+                wave: wave.clone(),
+                role: lagged_role.clone(),
+            }
+        })
+        .filter_map(|e| match &e.event {
+            Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lagged_bodies, vec!["Lagged recovered reply turn 2"]);
 
     let _ = shutdown_tx.send(true);
     conductor_task.abort();

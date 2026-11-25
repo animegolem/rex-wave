@@ -478,7 +478,8 @@ impl HeraldView {
                         self.blocked
                             .insert(key, (interaction.id.clone(), interaction.summary.clone()));
                     }
-                    wave::Observation::RuntimeMeta { .. } => {}
+                    wave::Observation::RuntimeMeta { .. }
+                    | wave::Observation::TurnsSuppressed { .. } => {}
                     _ => {
                         if let Some((old_id, old_summary)) =
                             self.blocked.remove(&(wave.clone(), role.clone()))
@@ -1361,6 +1362,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 wave::Observation::Spawned { .. }
                 | wave::Observation::Activity { .. }
                 | wave::Observation::RuntimeMeta { .. }
+                | wave::Observation::TurnsSuppressed { .. }
                 | wave::Observation::Archived => {}
             },
             wave::WaveEvent::Finished { outcome } => {

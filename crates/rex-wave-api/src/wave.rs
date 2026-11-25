@@ -451,6 +451,11 @@ pub enum Observation {
         #[serde(default)]
         actual_account: Option<String>,
     },
+    TurnsSuppressed {
+        thread: BbThreadId,
+        #[serde(default)]
+        keys: Vec<String>,
+    },
     Archived,
 }
 

@@ -293,6 +293,8 @@ struct WorkerRecord {
     writes: Vec<PathBuf>,
     return_schema: Option<serde_json::Value>,
     meta: WorkerRuntimeMeta,
+    suppressed_thread: Option<BbThreadId>,
+    suppressed_turns: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -684,6 +686,40 @@ impl Decider for Waves {
                         observation: c.observation.clone(),
                     }]);
                 }
+                if let Observation::TurnsSuppressed { thread, keys } = &c.observation {
+                    let matches_thread = match &rec.phase {
+                        WorkerPhase::Live { thread: t, .. }
+                        | WorkerPhase::Retiring { thread: t, .. } => t == thread,
+                        WorkerPhase::Requested { .. } => true,
+                        WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
+                    };
+                    if !matches_thread {
+                        return Ok(vec![]);
+                    }
+                    let thread_matches_existing = rec.suppressed_thread.as_ref() == Some(thread);
+                    let mut clean: Vec<String> = Vec::new();
+                    for key in keys {
+                        let trimmed = key.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let already_recorded =
+                            thread_matches_existing && rec.suppressed_turns.contains(trimmed);
+                        if !already_recorded && !clean.iter().any(|existing| existing == trimmed) {
+                            clean.push(trimmed.to_owned());
+                        }
+                    }
+                    if clean.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    return Ok(vec![WaveEvent::WorkerObserved {
+                        role: c.role.clone(),
+                        observation: Observation::TurnsSuppressed {
+                            thread: thread.clone(),
+                            keys: clean,
+                        },
+                    }]);
+                }
                 let Ok(next) = worker_step(&rec.phase, &c.observation) else {
                     return Ok(vec![]);
                 };
@@ -757,6 +793,8 @@ impl Decider for Waves {
                             actual_account: None,
                             run_stamp: Some(run_stamp),
                         },
+                        suppressed_thread: None,
+                        suppressed_turns: BTreeSet::new(),
                     },
                 );
             }
@@ -774,7 +812,24 @@ impl Decider for Waves {
                                 rec.meta.actual_account = Some(account.clone());
                             }
                         }
+                        Observation::TurnsSuppressed { thread, keys } => {
+                            if rec.suppressed_thread.as_ref() != Some(thread) {
+                                rec.suppressed_thread = Some(thread.clone());
+                                rec.suppressed_turns.clear();
+                            }
+                            for key in keys {
+                                if !key.is_empty() {
+                                    rec.suppressed_turns.insert(key.clone());
+                                }
+                            }
+                        }
                         other => {
+                            if let Observation::Spawned { thread, .. } = other
+                                && rec.suppressed_thread.as_ref() != Some(thread)
+                            {
+                                rec.suppressed_thread = Some(thread.clone());
+                                rec.suppressed_turns.clear();
+                            }
                             rec.phase = rec.phase.observe(other);
                             rec.resolved_interaction = None;
                         }

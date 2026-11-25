@@ -1711,6 +1711,7 @@ struct TrackedWorker {
     claimed_direct_posts: BTreeSet<Seq>,
     suppressed_start_seqs: BTreeSet<u64>,
     suppressed_end_seqs: BTreeSet<u64>,
+    hydrated_suppressions: bool,
 }
 
 type MirrorStateReply = (Seq, bool, bool, BTreeSet<Seq>);
@@ -1799,6 +1800,19 @@ enum OwnerMsg {
         thread: BbThreadId,
         start_seq: Option<u64>,
         end_seq: Option<u64>,
+    },
+    HydrationStatus {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        reply: oneshot::Sender<bool>,
+    },
+    ApplyHydratedSuppressions {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        start_seqs: BTreeSet<u64>,
+        end_seqs: BTreeSet<u64>,
     },
     AdvanceSeq {
         thread: BbThreadId,
@@ -2002,6 +2016,7 @@ impl BridgeOwner {
                             claimed_direct_posts: BTreeSet::new(),
                             suppressed_start_seqs: BTreeSet::new(),
                             suppressed_end_seqs: BTreeSet::new(),
+                            hydrated_suppressions: false,
                         });
                     if entry.thread.as_ref() != Some(&thread) {
                         entry.last_seq = None;
@@ -2013,6 +2028,7 @@ impl BridgeOwner {
                         entry.claimed_direct_posts.clear();
                         entry.suppressed_start_seqs.clear();
                         entry.suppressed_end_seqs.clear();
+                        entry.hydrated_suppressions = false;
                     }
                     entry.attempt = attempt;
                     entry.thread = Some(thread);
@@ -2097,6 +2113,32 @@ impl BridgeOwner {
                         if let Some(e) = end_seq.filter(|&e| e > 0) {
                             rec.suppressed_end_seqs.insert(e);
                         }
+                    }
+                }
+                OwnerMsg::HydrationStatus {
+                    wave,
+                    role,
+                    thread,
+                    reply,
+                } => {
+                    let hydrated = self.workers_by_role.get(&(wave, role)).is_some_and(|rec| {
+                        rec.thread.as_ref() == Some(&thread) && rec.hydrated_suppressions
+                    });
+                    let _ = reply.send(hydrated);
+                }
+                OwnerMsg::ApplyHydratedSuppressions {
+                    wave,
+                    role,
+                    thread,
+                    start_seqs,
+                    end_seqs,
+                } => {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
+                        rec.suppressed_start_seqs.extend(start_seqs);
+                        rec.suppressed_end_seqs.extend(end_seqs);
+                        rec.hydrated_suppressions = true;
                     }
                 }
                 OwnerMsg::AdvanceSeq { thread, seq } => {
@@ -2282,6 +2324,7 @@ impl BridgeOwner {
                         claimed_direct_posts: BTreeSet::new(),
                         suppressed_start_seqs: BTreeSet::new(),
                         suppressed_end_seqs: BTreeSet::new(),
+                        hydrated_suppressions: false,
                     },
                 );
             }
@@ -2304,6 +2347,7 @@ impl BridgeOwner {
                             rec.claimed_direct_posts.clear();
                             rec.suppressed_start_seqs.clear();
                             rec.suppressed_end_seqs.clear();
+                            rec.hydrated_suppressions = false;
                         }
                         return;
                     }
@@ -2333,6 +2377,7 @@ impl BridgeOwner {
                             claimed_direct_posts: BTreeSet::new(),
                             suppressed_start_seqs: BTreeSet::new(),
                             suppressed_end_seqs: BTreeSet::new(),
+                            hydrated_suppressions: false,
                         });
                     if rec.thread.as_ref() != Some(&thread) {
                         rec.last_seq = None;
@@ -2344,6 +2389,7 @@ impl BridgeOwner {
                         rec.claimed_direct_posts.clear();
                         rec.suppressed_start_seqs.clear();
                         rec.suppressed_end_seqs.clear();
+                        rec.hydrated_suppressions = false;
                     }
                     rec.attempt = attempt;
                     rec.thread = Some(thread);
@@ -2382,6 +2428,27 @@ impl BridgeOwner {
                     }
                 }
                 Observation::RuntimeMeta { .. } => {}
+                Observation::TurnsSuppressed { thread, keys } => {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
+                        for k in keys {
+                            if let Some(s) = k
+                                .strip_prefix('s')
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .filter(|&n| n > 0)
+                            {
+                                rec.suppressed_start_seqs.insert(s);
+                            } else if let Some(e) = k
+                                .strip_prefix('e')
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .filter(|&n| n > 0)
+                            {
+                                rec.suppressed_end_seqs.insert(e);
+                            }
+                        }
+                    }
+                }
             },
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
@@ -3144,6 +3211,166 @@ impl BbBridge {
         }
     }
 
+    async fn record_suppressed_bb_turn(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        start_seq: Option<u64>,
+        end_seq: Option<u64>,
+    ) {
+        let _ = self.owner.send(OwnerMsg::SuppressTurn {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            start_seq,
+            end_seq,
+        });
+        let mut keys = Vec::new();
+        if let Some(s) = start_seq.filter(|&s| s > 0) {
+            keys.push(format!("s{s}"));
+        }
+        if let Some(e) = end_seq.filter(|&e| e > 0) {
+            keys.push(format!("e{e}"));
+        }
+        if !keys.is_empty() {
+            self.call_wave_observe(
+                wave.clone(),
+                role.clone(),
+                Observation::TurnsSuppressed {
+                    thread: thread.clone(),
+                    keys,
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn ensure_bb_journal_suppressions_hydrated(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+    ) -> (BTreeSet<u64>, BTreeSet<u64>) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.owner.send(OwnerMsg::HydrationStatus {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            reply: tx,
+        });
+        if rx.await.unwrap_or(false) {
+            return (BTreeSet::new(), BTreeSet::new());
+        }
+        let Some(backend) = self.backend.get() else {
+            return (BTreeSet::new(), BTreeSet::new());
+        };
+        let sys = Principal::System {
+            part: SystemPart::BbBridge,
+        };
+        let mut cursor = Seq::ORIGIN;
+        let mut active_thread: Option<BbThreadId> = None;
+        let mut start_seqs = BTreeSet::new();
+        let mut end_seqs = BTreeSet::new();
+        let mut reached_end = false;
+        loop {
+            let Ok(WireReply::Read(page)) = backend
+                .call_as(
+                    sys.clone(),
+                    rex_wave_api::read::Read::stream(
+                        StreamId::Wave { wave: wave.clone() },
+                        cursor,
+                        Some(500),
+                    )
+                    .into_wire(),
+                )
+                .await
+            else {
+                break;
+            };
+            let Some(last) = page.entries.last() else {
+                reached_end = true;
+                break;
+            };
+            if last.seq <= cursor {
+                break;
+            }
+            cursor = last.seq;
+            let count = page.entries.len();
+            for env in &page.entries {
+                if let Event::Wave(ev) = &env.event {
+                    match ev {
+                        WaveEvent::WorkerRequested { role: r, .. } if r == role => {
+                            active_thread = None;
+                            start_seqs.clear();
+                            end_seqs.clear();
+                        }
+                        WaveEvent::WorkerObserved {
+                            role: r,
+                            observation: Observation::Spawned { thread: th, .. },
+                        } if r == role => {
+                            if active_thread.as_ref() != Some(th) {
+                                active_thread = Some(th.clone());
+                                start_seqs.clear();
+                                end_seqs.clear();
+                            }
+                        }
+                        WaveEvent::WorkerObserved {
+                            role: r,
+                            observation:
+                                Observation::TurnsSuppressed {
+                                    thread: th,
+                                    keys: ks,
+                                },
+                        } if r == role => {
+                            if active_thread.as_ref() != Some(th) {
+                                active_thread = Some(th.clone());
+                                start_seqs.clear();
+                                end_seqs.clear();
+                            }
+                            for k in ks {
+                                if let Some(s) = k
+                                    .strip_prefix('s')
+                                    .and_then(|n| n.parse::<u64>().ok())
+                                    .filter(|&n| n > 0)
+                                {
+                                    start_seqs.insert(s);
+                                } else if let Some(e) = k
+                                    .strip_prefix('e')
+                                    .and_then(|n| n.parse::<u64>().ok())
+                                    .filter(|&n| n > 0)
+                                {
+                                    end_seqs.insert(e);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if count < 500 {
+                reached_end = true;
+                break;
+            }
+        }
+        if !reached_end {
+            return (BTreeSet::new(), BTreeSet::new());
+        }
+        let (final_starts, final_ends) = if active_thread.as_ref() == Some(thread) {
+            (start_seqs, end_seqs)
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
+        let _ = self.owner.send(OwnerMsg::ApplyHydratedSuppressions {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            start_seqs: final_starts.clone(),
+            end_seqs: final_ends.clone(),
+        });
+        (final_starts, final_ends)
+    }
+
     async fn observe_runtime_meta_if_present(
         &self,
         wave: &WaveSlug,
@@ -3277,13 +3504,10 @@ impl BbBridge {
                             .or_else(|| refusal_from_latest_turn(&rows));
                         if let Some(reason) = refusal_reason {
                             let (sup_start, sup_end) = terminal_turn_bounds(&rows);
-                            let _ = self.owner.send(OwnerMsg::SuppressTurn {
-                                wave: wave.clone(),
-                                role: role.clone(),
-                                thread: thread.clone(),
-                                start_seq: sup_start,
-                                end_seq: sup_end,
-                            });
+                            self.record_suppressed_bb_turn(
+                                &wave, &role, &thread, sup_start, sup_end,
+                            )
+                            .await;
                             let prior_rows = rows_before_terminal_turn(&rows);
                             let _ = self
                                 .mirror_outstanding_turns_from_tail(
@@ -3342,13 +3566,10 @@ impl BbBridge {
                                     final_model = final_model.or(rm);
                                     final_account = final_account.or(ra);
                                     let (sup_start, sup_end) = terminal_turn_bounds(&rows);
-                                    let _ = self.owner.send(OwnerMsg::SuppressTurn {
-                                        wave: wave.clone(),
-                                        role: role.clone(),
-                                        thread: thread.clone(),
-                                        start_seq: sup_start,
-                                        end_seq: sup_end,
-                                    });
+                                    self.record_suppressed_bb_turn(
+                                        &wave, &role, &thread, sup_start, sup_end,
+                                    )
+                                    .await;
                                     let prior_rows = rows_before_terminal_turn(&rows);
                                     let _ = self
                                         .mirror_outstanding_turns_from_tail(
@@ -3810,6 +4031,9 @@ impl BbBridge {
         thread: &BbThreadId,
         rows: &[serde_json::Value],
     ) -> bool {
+        let _ = self
+            .ensure_bb_journal_suppressions_hydrated(wave, role, thread)
+            .await;
         let (cur_tx, cur_rx) = oneshot::channel();
         let _ = self.owner.send(OwnerMsg::WorkerMirrorCursor {
             wave: wave.clone(),
@@ -4530,6 +4754,11 @@ impl BbBridge {
             mut suppressed_end_seqs,
         ) in workers
         {
+            let (hyd_starts, hyd_ends) = self
+                .ensure_bb_journal_suppressions_hydrated(&wave, &role, &thread)
+                .await;
+            suppressed_start_seqs.extend(hyd_starts);
+            suppressed_end_seqs.extend(hyd_ends);
             let initial_cursor = cursor_seq;
             let had_prev_cursor = initial_cursor.is_some();
             let mut forward_rows: Vec<serde_json::Value> = Vec::new();
@@ -4780,13 +5009,8 @@ impl BbBridge {
                     if let Some(e) = sup_end {
                         suppressed_end_seqs.insert(e);
                     }
-                    let _ = self.owner.send(OwnerMsg::SuppressTurn {
-                        wave: wave.clone(),
-                        role: role.clone(),
-                        thread: thread.clone(),
-                        start_seq: sup_start,
-                        end_seq: sup_end,
-                    });
+                    self.record_suppressed_bb_turn(&wave, &role, &thread, sup_start, sup_end)
+                        .await;
                     std::borrow::Cow::Owned(rows_before_terminal_turn(&collected_rows))
                 } else {
                     std::borrow::Cow::Borrowed(&collected_rows)
@@ -4960,6 +5184,7 @@ impl BbBridge {
                                 claimed_direct_posts: BTreeSet::new(),
                                 suppressed_start_seqs: BTreeSet::new(),
                                 suppressed_end_seqs: BTreeSet::new(),
+                                hydrated_suppressions: false,
                             })
                         }
                         WorkerPhase::Retiring { thread, .. }
@@ -4981,6 +5206,7 @@ impl BbBridge {
                             claimed_direct_posts: BTreeSet::new(),
                             suppressed_start_seqs: BTreeSet::new(),
                             suppressed_end_seqs: BTreeSet::new(),
+                            hydrated_suppressions: false,
                         }),
                         _ => Err(ApiError::NotFound {
                             what: format!("live BB thread for @{wave}/{role}"),
