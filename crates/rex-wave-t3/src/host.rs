@@ -6,14 +6,14 @@ use crate::projects::{
     project_names_map, resolve_or_ensure_t3_project,
 };
 use crate::protocol::{
-    LiveSeqTracker, ShellObservation, TurnMirrorCheck, active_pending_interaction,
-    default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
-    extract_explicit_stop_refusal, extract_refusal_reason, extract_runtime_meta_from_value,
-    force_stop_thread_payload, inspect_completed_turns_in_order, is_t3_thread_id,
-    launch_thread_payload, message_dispatch_payload, mirror_idem_key, normalize_turn_item,
-    parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
-    runtime_request_respond_payload, strip_t3_provider_prefix, thread_archive_payload,
-    thread_stop_payload, unwrap_projection,
+    LiveSeqTracker, ShellObservation, TerminalTurnState, TurnMirrorCheck,
+    active_pending_interaction, default_model_from_server_config, derive_shell_observation,
+    deterministic_thread_id, extract_explicit_stop_refusal, extract_refusal_reason,
+    extract_runtime_meta_from_value, force_stop_thread_payload, inspect_turns_in_order,
+    is_t3_thread_id, launch_thread_payload, message_dispatch_payload, mirror_idem_key,
+    normalize_turn_item, parse_pending_interaction_from_projection, parse_provider_turns_usage,
+    parse_t3_thread_id, runtime_request_respond_payload, strip_t3_provider_prefix,
+    thread_archive_payload, thread_stop_payload, unwrap_projection,
 };
 use crate::rpc::{StreamEvent, T3RpcClient};
 use crate::worker_tokens::{WorkerTokenMinter, provision_worker_token, remove_worker_token_file};
@@ -1022,8 +1022,27 @@ impl T3Bridge {
                     },
                 )
                 .await;
-                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                let (proj_model, proj_account) = projection
+                    .as_ref()
+                    .map(extract_runtime_meta_from_value)
+                    .unwrap_or((None, None));
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    proj_model.or(shell_model),
+                    proj_account.or(shell_account),
+                )
+                .await;
+                if let Some(proj) = projection.as_ref() {
+                    self.mirror_turns_from_projection(
+                        &wave,
+                        &role,
+                        thread,
+                        proj,
+                        TerminalTurnState::InProgress,
+                    )
                     .await;
+                }
                 self.call_wave_observe(
                     wave,
                     role,
@@ -1066,8 +1085,28 @@ impl T3Bridge {
                     },
                 )
                 .await;
-                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                let fetched_proj = self.fetch_thread_projection(thread).await.ok();
+                let (proj_model, proj_account) = fetched_proj
+                    .as_ref()
+                    .map(extract_runtime_meta_from_value)
+                    .unwrap_or((None, None));
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    proj_model.or(shell_model),
+                    proj_account.or(shell_account),
+                )
+                .await;
+                if let Some(proj) = fetched_proj.as_ref() {
+                    self.mirror_turns_from_projection(
+                        &wave,
+                        &role,
+                        thread,
+                        proj,
+                        TerminalTurnState::Suppressed,
+                    )
                     .await;
+                }
                 self.call_wave_observe(
                     wave,
                     role,
@@ -1088,8 +1127,28 @@ impl T3Bridge {
                     },
                 )
                 .await;
-                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                let fetched_proj = self.fetch_thread_projection(thread).await.ok();
+                let (proj_model, proj_account) = fetched_proj
+                    .as_ref()
+                    .map(extract_runtime_meta_from_value)
+                    .unwrap_or((None, None));
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    proj_model.or(shell_model),
+                    proj_account.or(shell_account),
+                )
+                .await;
+                if let Some(proj) = fetched_proj.as_ref() {
+                    self.mirror_turns_from_projection(
+                        &wave,
+                        &role,
+                        thread,
+                        proj,
+                        TerminalTurnState::Suppressed,
+                    )
                     .await;
+                }
                 self.call_wave_observe(
                     wave,
                     role,
@@ -1110,11 +1169,7 @@ impl T3Bridge {
                     },
                 )
                 .await;
-                let fetched_proj = if mirror_candidate {
-                    self.fetch_thread_projection(thread).await.ok()
-                } else {
-                    None
-                };
+                let fetched_proj = self.fetch_thread_projection(thread).await.ok();
                 let (proj_model, proj_account) = fetched_proj
                     .as_ref()
                     .map(extract_runtime_meta_from_value)
@@ -1126,23 +1181,55 @@ impl T3Bridge {
                     proj_account.or(shell_account),
                 )
                 .await;
-                if let Some(proj) = fetched_proj.as_ref()
-                    && let Some(Activity::Refused { reason }) =
-                        derive_activity_from_projection(unwrap_projection(proj))
-                {
+                if !mirror_candidate {
+                    if let Some(proj) = fetched_proj.as_ref() {
+                        self.mirror_turns_from_projection(
+                            &wave,
+                            &role,
+                            thread,
+                            proj,
+                            TerminalTurnState::Suppressed,
+                        )
+                        .await;
+                    }
                     self.call_wave_observe(
                         wave,
                         role,
                         Observation::Activity {
-                            activity: Activity::Refused { reason },
+                            activity: Activity::Idle,
                         },
                     )
                     .await;
                     return false;
                 }
                 if let Some(proj) = fetched_proj.as_ref() {
-                    self.mirror_completed_turn_from_projection(&wave, &role, thread, proj)
-                        .await;
+                    let unwrapped = unwrap_projection(proj);
+                    match derive_activity_from_projection(unwrapped) {
+                        Some(activity @ (Activity::Refused { .. } | Activity::Errored { .. })) => {
+                            self.mirror_turns_from_projection(
+                                &wave,
+                                &role,
+                                thread,
+                                unwrapped,
+                                TerminalTurnState::Suppressed,
+                            )
+                            .await;
+                            self.call_wave_observe(wave, role, Observation::Activity { activity })
+                                .await;
+                            return false;
+                        }
+                        _ => {
+                            let terminal_state = classify_projection_terminal_state(unwrapped);
+                            self.mirror_turns_from_projection(
+                                &wave,
+                                &role,
+                                thread,
+                                unwrapped,
+                                terminal_state,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 self.call_wave_observe(
                     wave,
@@ -1157,15 +1244,16 @@ impl T3Bridge {
         }
     }
 
-    async fn mirror_completed_turn_from_projection(
+    async fn mirror_turns_from_projection(
         &self,
         wave: &WaveSlug,
         role: &RoleName,
         thread: &BbThreadId,
         projection: &Value,
+        terminal_state: TerminalTurnState,
     ) {
         let _mirror_guard = self.mirror_lock.lock().await;
-        let checks = inspect_completed_turns_in_order(projection);
+        let checks = inspect_turns_in_order(projection, terminal_state);
         if checks.is_empty() {
             return;
         }
@@ -1186,11 +1274,16 @@ impl T3Bridge {
         };
         let stream = StreamId::Room { room: room.clone() };
 
-        let total = checks.len();
-        for (idx, (check, next_run_start_at)) in checks.into_iter().enumerate() {
-            let allow_watermark_advance = idx + 1 == total && next_run_start_at.is_none();
+        for inspected in checks {
+            let check = inspected.check;
+            let next_run_start_at = inspected.next_turn_start_at;
+            let has_later_turn = inspected.has_later_turn;
+            let is_suppressed = matches!(check, TurnMirrorCheck::Suppressed { .. });
+            let allow_watermark_advance =
+                !has_later_turn && next_run_start_at.is_none() && !is_suppressed;
             let turn_keys: Vec<String> = match &check {
                 TurnMirrorCheck::Ignore => continue,
+                TurnMirrorCheck::Suppressed { turn_keys, .. } => turn_keys.clone(),
                 TurnMirrorCheck::PostedViaTool { run_key, .. } => run_key.iter().cloned().collect(),
                 TurnMirrorCheck::Unposted(c) => {
                     let mut keys = vec![c.anchor.clone()];
@@ -1238,7 +1331,72 @@ impl T3Bridge {
 
             let completed = match check {
                 TurnMirrorCheck::Ignore => continue,
-                TurnMirrorCheck::PostedViaTool { run_end_at, .. } => {
+                TurnMirrorCheck::Suppressed {
+                    run_start_at,
+                    run_end_at,
+                    tight_end_bound,
+                    ..
+                } => {
+                    let can_claim_direct =
+                        !has_later_turn || run_end_at > 0 || next_run_start_at.is_some();
+                    let mut suppressed_claimed = Vec::new();
+                    if can_claim_direct {
+                        loop {
+                            let Ok(WireReply::Read(page)) = backend
+                                .call_as(
+                                    sys.clone(),
+                                    Read::stream(stream.clone(), cursor, Some(500)).into_wire(),
+                                )
+                                .await
+                            else {
+                                break;
+                            };
+                            let Some(last) = page.entries.last() else {
+                                break;
+                            };
+                            if last.seq <= cursor {
+                                break;
+                            }
+                            cursor = last.seq;
+                            for env in &page.entries {
+                                if env.by == worker_principal
+                                    && let Event::Room(RoomEvent::Posted { idem, origin, .. }) =
+                                        &env.event
+                                {
+                                    let is_mirrored_row = *origin
+                                        == rex_wave_api::room::PostOrigin::MirroredTurn
+                                        || idem
+                                            .as_ref()
+                                            .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
+                                    if !is_mirrored_row
+                                        && !claimed_direct_posts.contains(&env.seq)
+                                        && (run_start_at == 0 || env.at.0 >= run_start_at)
+                                    {
+                                        let post_after = (run_end_at > 0 && env.at.0 > run_end_at)
+                                            || next_run_start_at.is_some_and(|ns| env.at.0 >= ns);
+                                        if !post_after
+                                            && (!has_later_turn
+                                                || tight_end_bound
+                                                || suppressed_claimed.is_empty())
+                                        {
+                                            suppressed_claimed.push(env.seq);
+                                        }
+                                    }
+                                }
+                            }
+                            if page.entries.len() < 500 {
+                                break;
+                            }
+                        }
+                    }
+                    settle_turn(watermark, turn_keys, suppressed_claimed);
+                    continue;
+                }
+                TurnMirrorCheck::PostedViaTool {
+                    run_end_at,
+                    tight_end_bound,
+                    ..
+                } => {
                     let mut tool_reached_end = false;
                     let mut tool_claimed = Vec::new();
                     loop {
@@ -1275,9 +1433,7 @@ impl T3Bridge {
                                     if post_after {
                                         watermark_pinned = true;
                                     } else if !claimed_direct_posts.contains(&env.seq)
-                                        && (run_end_at > 0
-                                            || next_run_start_at.is_some()
-                                            || tool_claimed.is_empty())
+                                        && (tight_end_bound || tool_claimed.is_empty())
                                     {
                                         tool_claimed.push(env.seq);
                                     }
@@ -1300,7 +1456,6 @@ impl T3Bridge {
                 TurnMirrorCheck::Unposted(c) => c,
             };
 
-            // `WaveConductor` skips peer wakeups when idem starts with `wave:` and contains `:turn:`.
             let Ok(idem_key) = mirror_idem_key(wave, role, thread, &completed.anchor) else {
                 settle_turn(watermark, turn_keys, Vec::new());
                 continue;
@@ -1316,7 +1471,7 @@ impl T3Bridge {
             let mut already_posted = false;
             let mut reached_end = false;
             let mut claimed_seqs = Vec::new();
-            let bounded_window = completed.run_end_at > 0 || next_run_start_at.is_some();
+            let bounded_window = completed.tight_end_bound;
             loop {
                 let Ok(WireReply::Read(page)) = backend
                     .call_as(
@@ -1512,6 +1667,17 @@ impl T3Bridge {
             }
 
             if let Some(pending) = active_pending_interaction(proj) {
+                let (proj_model, proj_account) = extract_runtime_meta_from_value(proj);
+                self.observe_runtime_meta_if_present(&wave, &role, proj_model, proj_account)
+                    .await;
+                self.mirror_turns_from_projection(
+                    &wave,
+                    &role,
+                    &thread,
+                    proj,
+                    TerminalTurnState::InProgress,
+                )
+                .await;
                 if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
                     self.call_wave_observe(
                         wave,
@@ -1539,14 +1705,9 @@ impl T3Bridge {
                 continue;
             }
             if let Some(activity) = derived {
-                let runs_present = proj
-                    .get("runs")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|a| !a.is_empty());
-                if matches!(activity, Activity::Idle) || runs_present {
-                    self.mirror_completed_turn_from_projection(&wave, &role, &thread, proj)
-                        .await;
-                }
+                let terminal_state = classify_projection_terminal_state(proj);
+                self.mirror_turns_from_projection(&wave, &role, &thread, proj, terminal_state)
+                    .await;
                 if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
                     self.call_wave_observe(wave, role, Observation::Activity { activity })
                         .await;
@@ -1666,6 +1827,17 @@ impl T3Bridge {
                     return Ok(Some(Observation::Archived));
                 }
                 if let Some(Activity::Refused { reason }) = derive_activity_from_projection(proj) {
+                    if let Some((wave, role, _, false)) = self.resolve_worker_identity(thread).await
+                    {
+                        self.mirror_turns_from_projection(
+                            &wave,
+                            &role,
+                            thread,
+                            proj,
+                            TerminalTurnState::Suppressed,
+                        )
+                        .await;
+                    }
                     return Ok(Some(Observation::Activity {
                         activity: Activity::Refused { reason },
                     }));
@@ -2111,11 +2283,88 @@ fn classify_t3_missing_or_archived(msg: &str) -> Option<Observation> {
     }
 }
 
+fn classify_projection_terminal_state(proj: &Value) -> TerminalTurnState {
+    if active_pending_interaction(proj).is_some() {
+        return TerminalTurnState::InProgress;
+    }
+    let thread_obs = proj
+        .get("thread")
+        .and_then(|t| derive_shell_observation(t, None));
+    if let Some(runs) = proj
+        .get("runs")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        && let Some((_, latest)) = runs.iter().enumerate().max_by_key(|(idx, r)| {
+            (
+                r.get("ordinal")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*idx as u64),
+                *idx,
+            )
+        })
+        && let Some(status) = latest.get("status").and_then(|v| v.as_str())
+    {
+        return match status {
+            "preparing" | "queued" | "starting" | "running" | "waiting" => {
+                TerminalTurnState::InProgress
+            }
+            "failed" | "interrupted" | "cancelled" | "rolled_back" => TerminalTurnState::Suppressed,
+            other if rex_wave_api::wave::is_refusal_stop_reason(other) => {
+                TerminalTurnState::Suppressed
+            }
+            "idle" | "completed" => {
+                if extract_explicit_stop_refusal(latest).is_some()
+                    || matches!(
+                        thread_obs,
+                        Some(
+                            ShellObservation::Refused(_)
+                                | ShellObservation::Errored(_)
+                                | ShellObservation::Idle {
+                                    mirror_candidate: false,
+                                }
+                        )
+                    )
+                {
+                    TerminalTurnState::Suppressed
+                } else {
+                    TerminalTurnState::Completed
+                }
+            }
+            _ => TerminalTurnState::InProgress,
+        };
+    }
+    match thread_obs {
+        Some(ShellObservation::Working | ShellObservation::Blocked { .. }) => {
+            TerminalTurnState::InProgress
+        }
+        Some(
+            ShellObservation::Refused(_)
+            | ShellObservation::Errored(_)
+            | ShellObservation::Idle {
+                mirror_candidate: false,
+            }
+            | ShellObservation::Archived,
+        ) => TerminalTurnState::Suppressed,
+        Some(ShellObservation::Idle {
+            mirror_candidate: true,
+        })
+        | None => TerminalTurnState::Completed,
+    }
+}
+
 fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
+    let thread_obs = proj
+        .get("thread")
+        .and_then(|t| derive_shell_observation(t, None));
     if let Some(runs) = proj.get("runs").and_then(|v| v.as_array())
-        && let Some(latest) = runs
-            .iter()
-            .max_by_key(|r| r.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0))
+        && let Some((_, latest)) = runs.iter().enumerate().max_by_key(|(idx, r)| {
+            (
+                r.get("ordinal")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*idx as u64),
+                *idx,
+            )
+        })
         && let Some(status) = latest.get("status").and_then(|v| v.as_str())
     {
         return match status {
@@ -2137,7 +2386,11 @@ fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
                 if let Some(reason) = extract_explicit_stop_refusal(latest) {
                     return Some(Activity::Refused { reason });
                 }
-                Some(Activity::Idle)
+                match thread_obs {
+                    Some(ShellObservation::Refused(reason)) => Some(Activity::Refused { reason }),
+                    Some(ShellObservation::Errored(error)) => Some(Activity::Errored { error }),
+                    _ => Some(Activity::Idle),
+                }
             }
             "interrupted" | "cancelled" | "rolled_back" => Some(Activity::Idle),
             other if rex_wave_api::wave::is_refusal_stop_reason(other) => Some(Activity::Refused {
@@ -2146,16 +2399,13 @@ fn derive_activity_from_projection(proj: &Value) -> Option<Activity> {
             _ => None,
         };
     }
-    if let Some(thread) = proj.get("thread") {
-        return match derive_shell_observation(thread, None) {
-            Some(ShellObservation::Working) => Some(Activity::Working),
-            Some(ShellObservation::Refused(reason)) => Some(Activity::Refused { reason }),
-            Some(ShellObservation::Errored(error)) => Some(Activity::Errored { error }),
-            Some(ShellObservation::Idle { .. }) => Some(Activity::Idle),
-            _ => None,
-        };
+    match thread_obs {
+        Some(ShellObservation::Working) => Some(Activity::Working),
+        Some(ShellObservation::Refused(reason)) => Some(Activity::Refused { reason }),
+        Some(ShellObservation::Errored(error)) => Some(Activity::Errored { error }),
+        Some(ShellObservation::Idle { .. }) => Some(Activity::Idle),
+        _ => None,
     }
-    None
 }
 
 /// `rex_wave_waves::AgentHost` adapter backed by [`T3Bridge`].

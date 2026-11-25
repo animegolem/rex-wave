@@ -2503,6 +2503,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
     let wave = WaveSlug::parse("item-only-v1").unwrap();
     let role = RoleName::parse("writer").unwrap();
     let upgrade_role = RoleName::parse("upgrader").unwrap();
+    let refused_role = RoleName::parse("refuser").unwrap();
     let project = BbProjectId::parse("uuid-item-only").unwrap();
     operator
         .call(WaveStart {
@@ -2538,6 +2539,14 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                         writes: Vec::new(),
                         return_schema: None,
                     },
+                    WorkerSpec {
+                        role: refused_role.clone(),
+                        brief: Body::parse("Suppress refused draft across later replay").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
                 ],
             },
             idem: None,
@@ -2547,11 +2556,13 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
 
     let expected_tid = BbThreadId::parse("t3:item-only-v1:writer:a1").unwrap();
     let upgrade_tid = BbThreadId::parse("t3:item-only-v1:upgrader:a1").unwrap();
+    let refused_tid = BbThreadId::parse("t3:item-only-v1:refuser:a1").unwrap();
     wait_until(Duration::from_secs(3), || {
         let operator = operator.clone();
         let wave = wave.clone();
         let expected_tid = expected_tid.clone();
         let upgrade_tid = upgrade_tid.clone();
+        let refused_tid = refused_tid.clone();
         async move {
             let Ok(snap) = operator.call(WaveView { wave }).await else {
                 return false;
@@ -2562,7 +2573,10 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
             let w2 = snap.workers.iter().any(|(_, _, phase)| {
                 matches!(phase, WorkerPhase::Live { thread, .. } if thread == &upgrade_tid)
             });
-            w1 && w2
+            let w3 = snap.workers.iter().any(|(_, _, phase)| {
+                matches!(phase, WorkerPhase::Live { thread, .. } if thread == &refused_tid)
+            });
+            w1 && w2 && w3
         }
     })
     .await;
@@ -2614,6 +2628,51 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
 
     {
         let mut st = server.state.lock().await;
+        let r_proj = st.thread_projections.get_mut(refused_tid.as_str()).unwrap();
+        r_proj["runs"] = json!([]);
+        r_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "refused_draft", "text": "Refused draft turn 1" }
+        ]);
+        r_proj["thread"]["status"] = json!("completed");
+        r_proj["thread"]["stopReason"] = json!("safety");
+    }
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 29,
+            "location": "active",
+            "thread": {
+                "id": refused_tid.as_str(),
+                "status": "completed",
+                "stopReason": "safety"
+            }
+        }))
+        .await;
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let refused_role = refused_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            snap.workers.iter().any(|(r, _, phase)| {
+                r == &refused_role
+                    && matches!(
+                        phase,
+                        WorkerPhase::Live {
+                            activity: Activity::Refused { .. },
+                            ..
+                        }
+                    )
+            })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
         let base = rex_wave_runtime::now().0;
         let proj = st
             .thread_projections
@@ -2621,8 +2680,8 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
             .unwrap();
         proj["runs"] = json!([]);
         proj["turnItems"] = json!([
-            { "ordinal": 0, "type": "user_message", "createdAt": base.saturating_sub(1_000) },
-            { "ordinal": 1, "type": "assistant_message", "id": "final1", "text": "First wrap-up" },
+            { "ordinal": 0, "type": "user_message" },
+            { "ordinal": 1, "type": "assistant_message", "id": "final1", "text": "First wrap-up", "createdAt": base + 5 },
             { "ordinal": 2, "type": "user_message", "createdAt": base + 10 },
             { "ordinal": 3, "type": "assistant_message", "id": "final2", "text": "Second reply", "createdAt": base + 20 }
         ]);
@@ -2636,12 +2695,23 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
             { "ordinal": 4, "type": "user_message", "text": "u3" },
             { "ordinal": 5, "type": "assistant_message", "id": "final3", "text": "Turn 3" }
         ]);
+        let r_proj = st.thread_projections.get_mut(refused_tid.as_str()).unwrap();
+        r_proj["runs"] = json!([]);
+        r_proj["thread"]["stopReason"] = Value::Null;
+        r_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "refused_draft", "text": "Refused draft turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "recovered_final", "text": "Recovered reply turn 2" }
+        ]);
     }
     for (seq, tid) in [
         (30u64, expected_tid.as_str()),
         (31u64, expected_tid.as_str()),
         (32u64, upgrade_tid.as_str()),
         (33u64, upgrade_tid.as_str()),
+        (34u64, refused_tid.as_str()),
+        (35u64, refused_tid.as_str()),
     ] {
         server
             .push_shell_item(json!({
@@ -2664,6 +2734,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         let wave = wave.clone();
         let role = role.clone();
         let upgrade_role = upgrade_role.clone();
+        let refused_role = refused_role.clone();
         async move {
             let Ok(page) = operator
                 .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
@@ -2691,7 +2762,17 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                     } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
                 })
                 .count();
-            c1 == 2 && c2 == 3
+            let c3 = page
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.by == Principal::Worker {
+                        wave: wave.clone(),
+                        role: refused_role.clone(),
+                    } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                })
+                .count();
+            c1 == 2 && c2 == 3 && c3 == 1
         }
     })
     .await;
@@ -2741,6 +2822,21 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
         upgrade_bodies,
         vec!["Pre-upgrade turn 2", "Turn 1", "Turn 3"]
     );
+    let refused_bodies: Vec<&str> = room_page
+        .entries
+        .iter()
+        .filter(|e| {
+            e.by == Principal::Worker {
+                wave: wave.clone(),
+                role: refused_role.clone(),
+            }
+        })
+        .filter_map(|e| match &e.event {
+            Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused_bodies, vec!["Recovered reply turn 2"]);
 
     let _ = shutdown_tx.send(true);
     conductor_task.abort();
