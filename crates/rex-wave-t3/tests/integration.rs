@@ -4622,3 +4622,419 @@ async fn t3_chained_empty_projection_outage_run_id_item_only_recovery_and_legacy
     conductor_task.abort();
     bridge_task.abort();
 }
+
+#[tokio::test]
+async fn t3_double_outage_partial_replay_run_id_only_item_projection_and_index_zero_o0_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_r20".into(),
+        projects: vec![json!({
+            "id": "uuid-r20",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_r20").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let host_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let conductor_task = spawn_reactor(WaveConductor::new(T3Host(bridge.clone())), host_client);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("r20-edge-v1").unwrap();
+    let project = BbProjectId::parse("uuid-r20").unwrap();
+    let two_unattr_role = RoleName::parse("twounattr").unwrap();
+    let run_only_role = RoleName::parse("runonly").unwrap();
+    let idx_zero_o0_role = RoleName::parse("idxzeroo0").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse(
+                    "Verify 1-for-1 outage ticket resolution, runId-only item projection, and index-0 o0 claim",
+                )
+                .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![
+                    WorkerSpec {
+                        role: two_unattr_role.clone(),
+                        brief: Body::parse("Two unattributed refusals then partial single-turn replay")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: run_only_role.clone(),
+                        brief: Body::parse("Refusal with latestRunId only on item-only projection")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: idx_zero_o0_role.clone(),
+                        brief: Body::parse("Index-zero o0 exact match claims seq before identical later turn")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let two_tid = BbThreadId::parse("t3:r20-edge-v1:twounattr:a1").unwrap();
+    let run_only_tid = BbThreadId::parse("t3:r20-edge-v1:runonly:a1").unwrap();
+    let idx_zero_tid = BbThreadId::parse("t3:r20-edge-v1:idxzeroo0:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let two_tid = two_tid.clone();
+        let run_only_tid = run_only_tid.clone();
+        let idx_zero_tid = idx_zero_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&two_tid, &run_only_tid, &idx_zero_tid]
+                .into_iter()
+                .all(|want_tid| {
+                    snap.workers.iter().any(|(_, _, p)| {
+                        matches!(p, WorkerPhase::Live { thread, .. } if thread == want_tid)
+                    })
+                })
+        }
+    })
+    .await;
+
+    let room = wave_room(&wave, &project);
+    let idx_zero_worker = LocalClient::new(
+        router.clone(),
+        Principal::Worker {
+            wave: wave.clone(),
+            role: idx_zero_o0_role.clone(),
+        },
+    );
+    idx_zero_worker
+        .call(rex_wave_api::room::RoomPost {
+            room: rex_wave_api::room::RoomRef::Id { id: room.clone() },
+            body: Body::parse("Successful turn 1").unwrap(),
+            re: None,
+            after: None,
+            labels: Vec::new(),
+            task: None,
+            idem: Some(
+                rex_wave_waves::mirror_idem_key(
+                    &wave,
+                    &idx_zero_role_alias(&idx_zero_o0_role),
+                    &idx_zero_tid,
+                    "o0",
+                )
+                .unwrap(),
+            ),
+            origin: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    {
+        let mut st = server.state.lock().await;
+        let t_proj = st.thread_projections.get_mut(two_tid.as_str()).unwrap();
+        t_proj["runs"] = json!([]);
+        t_proj["mockUnavailable"] = json!(true);
+
+        let r_proj = st
+            .thread_projections
+            .get_mut(run_only_tid.as_str())
+            .unwrap();
+        r_proj["runs"] = json!([]);
+        r_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" }
+        ]);
+        r_proj["thread"]["status"] = json!("completed");
+        r_proj["thread"]["stopReason"] = Value::Null;
+
+        let z_proj = st
+            .thread_projections
+            .get_mut(idx_zero_tid.as_str())
+            .unwrap();
+        z_proj["runs"] = json!([]);
+        z_proj["turnItems"] = json!([
+            { "type": "assistant_message", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" }
+        ]);
+        z_proj["thread"]["status"] = json!("completed");
+        z_proj["thread"]["stopReason"] = Value::Null;
+    }
+
+    for (seq, tid, ic, run_id) in [
+        (10u64, two_tid.as_str(), None, None),
+        (11u64, run_only_tid.as_str(), None, Some("r2")),
+        (12u64, idx_zero_tid.as_str(), Some(4u64), None),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "latestRunId": run_id,
+                    "itemCount": ic
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let two_unattr_role = two_unattr_role.clone();
+        let run_only_role = run_only_role.clone();
+        let idx_zero_o0_role = idx_zero_o0_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&two_unattr_role, &run_only_role, &idx_zero_o0_role]
+                .into_iter()
+                .all(|want| {
+                    snap.workers.iter().any(|(r, _, p)| {
+                        r == want
+                            && matches!(
+                                p,
+                                WorkerPhase::Live {
+                                    activity: Activity::Refused { .. },
+                                    ..
+                                }
+                            )
+                    })
+                })
+        }
+    })
+    .await;
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 14,
+            "location": "active",
+            "thread": {
+                "id": two_tid.as_str(),
+                "status": "completed",
+                "stopReason": "safety"
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    {
+        let mut st = server.state.lock().await;
+        let t_proj = st.thread_projections.get_mut(two_tid.as_str()).unwrap();
+        t_proj["mockUnavailable"] = json!(false);
+        t_proj["thread"]["status"] = json!("completed");
+        t_proj["thread"]["stopReason"] = Value::Null;
+        t_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" }
+        ]);
+    }
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 15,
+            "location": "active",
+            "thread": {
+                "id": two_tid.as_str(),
+                "status": "completed"
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    {
+        let mut st = server.state.lock().await;
+        let t_proj = st.thread_projections.get_mut(two_tid.as_str()).unwrap();
+        t_proj["thread"]["status"] = json!("completed");
+        t_proj["thread"]["stopReason"] = Value::Null;
+        t_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second refused draft" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" }
+        ]);
+
+        let r_proj = st
+            .thread_projections
+            .get_mut(run_only_tid.as_str())
+            .unwrap();
+        r_proj["thread"]["status"] = json!("completed");
+        r_proj["thread"]["stopReason"] = Value::Null;
+        r_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" },
+            { "ordinal": 5, "type": "user_message", "text": "u3" },
+            { "ordinal": 6, "type": "assistant_message", "id": "good_turn3", "text": "Third recovered" }
+        ]);
+
+        let z_proj = st
+            .thread_projections
+            .get_mut(idx_zero_tid.as_str())
+            .unwrap();
+        z_proj["thread"]["status"] = json!("completed");
+        z_proj["thread"]["stopReason"] = Value::Null;
+        z_proj["turnItems"] = json!([
+            { "type": "assistant_message", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "error", "message": "refused" },
+            { "ordinal": 5, "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Successful turn 1" }
+        ]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_r20").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    for (seq, tid, rid) in [
+        (20u64, two_tid.as_str(), None),
+        (21u64, run_only_tid.as_str(), Some("r3")),
+        (22u64, idx_zero_tid.as_str(), None),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "latestRunId": rid,
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let two_unattr_role = two_unattr_role.clone();
+        let run_only_role = run_only_role.clone();
+        let idx_zero_o0_role = idx_zero_o0_role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            let count_for = |r: &RoleName| {
+                page.entries
+                    .iter()
+                    .filter(|e| {
+                        e.by == Principal::Worker {
+                            wave: wave.clone(),
+                            role: r.clone(),
+                        } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                    })
+                    .count()
+            };
+            count_for(&two_unattr_role) == 1
+                && count_for(&run_only_role) == 2
+                && count_for(&idx_zero_o0_role) == 2
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let page = operator
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .await
+        .unwrap();
+    let bodies_for = |r: &RoleName| -> Vec<&str> {
+        page.entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(bodies_for(&two_unattr_role), vec!["Recovered third turn"]);
+    assert_eq!(
+        bodies_for(&run_only_role),
+        vec!["Successful turn 1", "Third recovered"]
+    );
+    assert_eq!(
+        bodies_for(&idx_zero_o0_role),
+        vec!["Successful turn 1", "Successful turn 1"]
+    );
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
+    bridge_task.abort();
+}
+
+fn idx_zero_role_alias(r: &RoleName) -> RoleName {
+    r.clone()
+}

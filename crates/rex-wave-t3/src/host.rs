@@ -7,18 +7,18 @@ use crate::projects::{
 };
 use crate::protocol::{
     ExplicitFailurePlan, InspectedTurn, LiveSeqTracker, ShellObservation, TerminalTurnState,
-    TurnMirrorCheck, active_pending_interaction, any_turn_inherently_suppressed,
-    collect_turn_candidates_before, default_model_from_server_config, derive_shell_observation,
-    deterministic_thread_id, explicit_shell_suppression_keys, extract_explicit_stop_refusal,
-    extract_refusal_reason, extract_runtime_meta_from_value, force_stop_thread_payload,
+    TurnMirrorCheck, active_pending_interaction, active_unmatched_ticket_ids,
+    any_turn_inherently_suppressed, collect_turn_candidates_in_range,
+    default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
+    explicit_shell_suppression_keys, extract_explicit_stop_refusal, extract_refusal_reason,
+    extract_runtime_meta_from_value, force_stop_thread_payload,
     inspect_closed_turns_before_ahead_failure, inspect_turns_in_order, is_t3_thread_id,
-    launch_thread_payload, message_dispatch_payload, mirror_idem_key,
-    next_unattributed_failure_key, normalize_turn_item, parse_pending_interaction_from_projection,
-    parse_provider_turns_usage, parse_t3_thread_id, plan_explicit_failure_turns,
-    projection_has_ahead_suppression, projection_turn_slot_count, resolve_all_unattributed_keys,
-    runtime_request_respond_payload, shell_explicit_turn_target, strip_t3_provider_prefix,
-    terminal_suppressed_lookup_keys, thread_archive_payload, thread_stop_payload,
-    unattributed_failure_counts, unwrap_projection,
+    launch_thread_payload, message_dispatch_payload, mirror_idem_key, next_failure_ticket_key,
+    normalize_turn_item, parse_pending_interaction_from_projection, parse_provider_turns_usage,
+    parse_t3_thread_id, plan_explicit_failure_turns, projection_has_ahead_suppression,
+    projection_turn_slot_count, resolve_ticket_keys, runtime_request_respond_payload,
+    shell_explicit_turn_target, strip_t3_provider_prefix, terminal_suppressed_lookup_keys,
+    thread_archive_payload, thread_stop_payload, unwrap_projection,
 };
 use crate::rpc::{StreamEvent, T3RpcClient};
 use crate::worker_tokens::{WorkerTokenMinter, provision_worker_token, remove_worker_token_file};
@@ -1390,16 +1390,16 @@ impl T3Bridge {
         let Some(proj) = fetched_proj else {
             let _mirror_guard = self.mirror_lock.lock().await;
             let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
-            let explicit_keys =
+            let mut keys =
                 explicit_shell_suppression_keys(explicit_run_id.as_deref(), explicit_item_count);
-            if !explicit_keys.is_empty() {
-                self.record_suppressed_keys_locked(wave, role, thread, explicit_keys)
-                    .await;
-            } else {
-                let key = next_unattributed_failure_key(&settled_keys);
-                self.record_suppressed_keys_locked(wave, role, thread, vec![key])
-                    .await;
+            if explicit_item_count.is_none()
+                && let Some(ticket) =
+                    next_failure_ticket_key(&settled_keys, explicit_run_id.as_deref())
+            {
+                keys.push(ticket);
             }
+            self.record_suppressed_keys_locked(wave, role, thread, keys)
+                .await;
             return;
         };
 
@@ -1413,13 +1413,18 @@ impl T3Bridge {
         ) {
             let _mirror_guard = self.mirror_lock.lock().await;
             let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
-            let (failed_cnt, resolved_cnt) = unattributed_failure_counts(&settled_keys);
-            let pending_unattributed = failed_cnt > resolved_cnt;
+            let active_tickets = active_unmatched_ticket_ids(Some(unwrapped), &settled_keys);
             match plan {
-                ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys } => {
+                ExplicitFailurePlan::TargetAheadOfProjection { mut explicit_keys } => {
+                    if explicit_item_count.is_none()
+                        && let Some(ticket) =
+                            next_failure_ticket_key(&settled_keys, explicit_run_id.as_deref())
+                    {
+                        explicit_keys.push(ticket);
+                    }
                     self.record_suppressed_keys_locked(wave, role, thread, explicit_keys)
                         .await;
-                    if pending_unattributed {
+                    if !active_tickets.is_empty() {
                         return;
                     }
                     let checks = inspect_closed_turns_before_ahead_failure(
@@ -1431,23 +1436,27 @@ impl T3Bridge {
                         .await;
                 }
                 ExplicitFailurePlan::Matched { target_pos, turns } => {
-                    if pending_unattributed {
+                    if !active_tickets.is_empty() {
                         if target_pos > 0 {
-                            self.suppress_unattributed_turns_before_locked(
-                                wave,
-                                role,
-                                thread,
-                                unwrapped,
-                                target_pos,
-                                None,
-                                None,
-                                false,
-                                false,
-                                &settled_keys,
-                            )
-                            .await;
+                            let _ = self
+                                .suppress_turns_in_range_locked(
+                                    wave,
+                                    role,
+                                    thread,
+                                    unwrapped,
+                                    0,
+                                    target_pos,
+                                    None,
+                                    None,
+                                    false,
+                                    true,
+                                    &active_tickets,
+                                    true,
+                                )
+                                .await;
                         } else {
-                            let resolved_keys = resolve_all_unattributed_keys(&settled_keys);
+                            let resolved_keys =
+                                resolve_ticket_keys(&active_tickets, active_tickets.len());
                             self.record_suppressed_keys_locked(wave, role, thread, resolved_keys)
                                 .await;
                         }
@@ -1581,43 +1590,46 @@ impl T3Bridge {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn suppress_unattributed_turns_before_locked(
+    async fn suppress_turns_in_range_locked(
         &self,
         wave: &WaveSlug,
         role: &RoleName,
         thread: &BbThreadId,
         unwrapped_projection: &Value,
+        start_pos: usize,
         end_pos: usize,
         explicit_run_id: Option<&str>,
         explicit_item_count: Option<usize>,
         check_terminal_suppression: bool,
-        only_resolve_when_suppressed: bool,
-        settled_keys: &BTreeSet<String>,
-    ) {
+        filter_clean_runs: bool,
+        ticket_ids: &[usize],
+        resolve_all_tickets: bool,
+    ) -> usize {
         let is_unattributed = explicit_run_id.is_none() && explicit_item_count.is_none();
-        let resolved_markers = resolve_all_unattributed_keys(settled_keys);
-        let candidates = collect_turn_candidates_before(
+        let candidates = collect_turn_candidates_in_range(
             unwrapped_projection,
+            start_pos,
             end_pos,
             explicit_run_id,
             explicit_item_count,
         );
         if candidates.is_empty() {
-            if !only_resolve_when_suppressed {
-                self.record_suppressed_keys_locked(wave, role, thread, resolved_markers)
+            if resolve_all_tickets && !ticket_ids.is_empty() {
+                let resolved = resolve_ticket_keys(ticket_ids, ticket_ids.len());
+                self.record_suppressed_keys_locked(wave, role, thread, resolved)
                     .await;
             }
-            return;
+            return 0;
         }
         let Some(backend) = self.backend.get() else {
-            return;
+            return 0;
         };
         let sys = self.cfg.system_principal.clone();
         let Ok(WireReply::WaveView(snap)) = backend
             .call_as(sys.clone(), WaveView { wave: wave.clone() }.into_wire())
             .await
         else {
-            return;
+            return 0;
         };
         let room = rex_wave_waves::wave_room(wave, &snap.spec.project);
         let worker_principal = Principal::Worker {
@@ -1646,7 +1658,7 @@ impl T3Bridge {
             }
         }
 
-        if is_unattributed && !unsettled.is_empty() {
+        if is_unattributed && filter_clean_runs && !unsettled.is_empty() {
             let unsettled_terminal_suppressed = if check_terminal_suppression {
                 let proj_term_state = classify_projection_terminal_state(unwrapped_projection);
                 if let Some(term_lookup) =
@@ -1688,6 +1700,7 @@ impl T3Bridge {
         }
 
         let mut newly_suppressed: Vec<String> = Vec::new();
+        let mut suppressed_turn_count: usize = 0;
 
         for (cand, watermark, claimed_direct_posts) in unsettled {
             let mirror_match_spec = match &cand.check {
@@ -1754,6 +1767,7 @@ impl T3Bridge {
                             mirror_match_spec
                         {
                             if idem.as_ref().is_some_and(|k| exact_keys.contains(k)) {
+                                claimed_seqs.push(env.seq);
                                 already_mirrored_in_room = true;
                                 break;
                             }
@@ -1800,46 +1814,20 @@ impl T3Bridge {
                 claimed_seqs,
             });
             if !already_mirrored_in_room {
+                suppressed_turn_count += 1;
                 newly_suppressed.extend(cand.suppression_keys);
             }
         }
 
-        if !only_resolve_when_suppressed || !newly_suppressed.is_empty() {
-            newly_suppressed.extend(resolved_markers);
-        }
+        let resolve_count = if resolve_all_tickets {
+            ticket_ids.len()
+        } else {
+            suppressed_turn_count.min(ticket_ids.len())
+        };
+        newly_suppressed.extend(resolve_ticket_keys(ticket_ids, resolve_count));
         self.record_suppressed_keys_locked(wave, role, thread, newly_suppressed)
             .await;
-    }
-
-    async fn suppress_lagged_preterminal_failure_locked(
-        &self,
-        wave: &WaveSlug,
-        role: &RoleName,
-        thread: &BbThreadId,
-        shell: Option<&Value>,
-        unwrapped_projection: &Value,
-        settled_keys: &BTreeSet<String>,
-    ) {
-        let slot_count = projection_turn_slot_count(unwrapped_projection);
-        if slot_count < 2 {
-            return;
-        }
-        let (explicit_run_id, explicit_item_count) = shell
-            .map(shell_explicit_turn_target)
-            .unwrap_or((None, None));
-        self.suppress_unattributed_turns_before_locked(
-            wave,
-            role,
-            thread,
-            unwrapped_projection,
-            slot_count - 1,
-            explicit_run_id.as_deref(),
-            explicit_item_count,
-            true,
-            false,
-            settled_keys,
-        )
-        .await;
+        suppressed_turn_count
     }
 
     async fn suppress_lagged_preterminal_failure(
@@ -1852,15 +1840,28 @@ impl T3Bridge {
     ) {
         let _mirror_guard = self.mirror_lock.lock().await;
         let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
-        self.suppress_lagged_preterminal_failure_locked(
-            wave,
-            role,
-            thread,
-            Some(shell),
-            unwrapped_projection,
-            &settled_keys,
-        )
-        .await;
+        let slot_count = projection_turn_slot_count(unwrapped_projection);
+        if slot_count < 2 {
+            return;
+        }
+        let active_tickets = active_unmatched_ticket_ids(Some(unwrapped_projection), &settled_keys);
+        let (explicit_run_id, explicit_item_count) = shell_explicit_turn_target(shell);
+        let _ = self
+            .suppress_turns_in_range_locked(
+                wave,
+                role,
+                thread,
+                unwrapped_projection,
+                0,
+                slot_count - 1,
+                explicit_run_id.as_deref(),
+                explicit_item_count,
+                true,
+                true,
+                &active_tickets,
+                false,
+            )
+            .await;
     }
 
     async fn mirror_turns_from_projection(
@@ -1874,9 +1875,8 @@ impl T3Bridge {
     ) {
         let _mirror_guard = self.mirror_lock.lock().await;
         let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
-        let (failed_cnt, resolved_cnt) = unattributed_failure_counts(&settled_keys);
-        let pending_unattributed = failed_cnt > resolved_cnt;
         let unwrapped = unwrap_projection(projection);
+        let active_tickets = active_unmatched_ticket_ids(Some(unwrapped), &settled_keys);
         let (shell_run_id, shell_item_count) = shell_hint
             .map(shell_explicit_turn_target)
             .unwrap_or((None, None));
@@ -1887,7 +1887,7 @@ impl T3Bridge {
             shell_item_count,
         );
         if ahead_hold {
-            if pending_unattributed {
+            if !active_tickets.is_empty() {
                 return;
             }
             let checks = inspect_closed_turns_before_ahead_failure(
@@ -1900,31 +1900,47 @@ impl T3Bridge {
             return;
         }
         let slot_count = projection_turn_slot_count(unwrapped);
-        if pending_unattributed {
-            if slot_count >= 2 {
-                self.suppress_lagged_preterminal_failure_locked(
-                    wave,
-                    role,
-                    thread,
-                    None,
-                    unwrapped,
-                    &settled_keys,
-                )
-                .await;
-            } else if slot_count == 1 && terminal_state != TerminalTurnState::InProgress {
-                self.suppress_unattributed_turns_before_locked(
+        if !active_tickets.is_empty() {
+            let suppressed_pre = if slot_count >= 2 {
+                self.suppress_turns_in_range_locked(
                     wave,
                     role,
                     thread,
                     unwrapped,
-                    1,
+                    0,
+                    slot_count - 1,
                     None,
                     None,
-                    false,
                     true,
-                    &settled_keys,
+                    true,
+                    &active_tickets,
+                    false,
                 )
-                .await;
+                .await
+            } else {
+                0
+            };
+            let remaining_tickets = &active_tickets[suppressed_pre.min(active_tickets.len())..];
+            if !remaining_tickets.is_empty() {
+                if slot_count >= 1 && terminal_state != TerminalTurnState::InProgress {
+                    let _ = self
+                        .suppress_turns_in_range_locked(
+                            wave,
+                            role,
+                            thread,
+                            unwrapped,
+                            slot_count - 1,
+                            slot_count,
+                            None,
+                            None,
+                            false,
+                            false,
+                            &remaining_tickets[..1],
+                            false,
+                        )
+                        .await;
+                }
+                return;
             }
         }
         let checks = inspect_turns_in_order(unwrapped, terminal_state);
@@ -2230,6 +2246,7 @@ impl T3Bridge {
                             if !watermark_pinned {
                                 safe_watermark = env.seq;
                             }
+                            claimed_seqs.push(env.seq);
                             already_posted = true;
                             break;
                         }

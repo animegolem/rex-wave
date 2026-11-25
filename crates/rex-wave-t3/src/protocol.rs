@@ -1029,34 +1029,89 @@ pub enum TerminalTurnState {
 
 use std::collections::BTreeSet;
 
-pub const UNATTRIBUTED_FAILURE_PREFIX: &str = "unattributed_failure:";
-pub const UNATTRIBUTED_RESOLVED_PREFIX: &str = "unattributed_resolved:";
+pub const FAILURE_TICKET_PREFIX: &str = "fail_ticket:";
+pub const FAILURE_RESOLVED_PREFIX: &str = "fail_resolved:";
 
-pub fn unattributed_failure_counts(settled_keys: &BTreeSet<String>) -> (usize, usize) {
-    let failed = settled_keys
-        .iter()
-        .filter_map(|k| k.strip_prefix(UNATTRIBUTED_FAILURE_PREFIX))
-        .filter_map(|s| s.parse::<usize>().ok())
-        .max()
-        .unwrap_or(0);
-    let resolved = settled_keys
-        .iter()
-        .filter_map(|k| k.strip_prefix(UNATTRIBUTED_RESOLVED_PREFIX))
-        .filter_map(|s| s.parse::<usize>().ok())
-        .max()
-        .unwrap_or(0);
-    (failed, resolved.min(failed))
+fn parse_failure_ticket(key: &str) -> Option<(usize, Option<&str>)> {
+    let rest = key.strip_prefix(FAILURE_TICKET_PREFIX)?;
+    let (id_str, kind) = rest.split_once(':')?;
+    let id = id_str.parse::<usize>().ok()?;
+    if kind == "any" {
+        Some((id, None))
+    } else if let Some(run_id) = kind.strip_prefix("run:") {
+        (!run_id.is_empty()).then_some((id, Some(run_id)))
+    } else {
+        None
+    }
 }
 
-pub fn next_unattributed_failure_key(settled_keys: &BTreeSet<String>) -> String {
-    let (failed, _) = unattributed_failure_counts(settled_keys);
-    format!("{UNATTRIBUTED_FAILURE_PREFIX}{}", failed + 1)
+pub fn next_failure_ticket_key(
+    settled_keys: &BTreeSet<String>,
+    run_id: Option<&str>,
+) -> Option<String> {
+    let clean_run = run_id.filter(|s| !s.is_empty());
+    if let Some(want_run) = clean_run
+        && settled_keys
+            .iter()
+            .any(|k| parse_failure_ticket(k).is_some_and(|(_, r)| r == Some(want_run)))
+    {
+        return None;
+    }
+    let max_id = settled_keys
+        .iter()
+        .filter_map(|k| parse_failure_ticket(k).map(|(id, _)| id))
+        .max()
+        .unwrap_or(0);
+    let next_id = max_id + 1;
+    Some(match clean_run {
+        Some(rid) => format!("{FAILURE_TICKET_PREFIX}{next_id}:run:{rid}"),
+        None => format!("{FAILURE_TICKET_PREFIX}{next_id}:any"),
+    })
 }
 
-pub fn resolve_all_unattributed_keys(settled_keys: &BTreeSet<String>) -> Vec<String> {
-    let (failed, resolved) = unattributed_failure_counts(settled_keys);
-    ((resolved + 1)..=failed)
-        .map(|i| format!("{UNATTRIBUTED_RESOLVED_PREFIX}{i}"))
+pub fn projection_contains_run_id(projection: &Value, want_run: &str) -> bool {
+    if want_run.is_empty() {
+        return false;
+    }
+    let (_, _, raw_turns) = slice_projection_turns(projection);
+    raw_turns.iter().any(|t| {
+        t.target_run_id == Some(want_run)
+            || t.slice
+                .iter()
+                .any(|(_, _, it)| it.get("runId").and_then(|v| v.as_str()) == Some(want_run))
+    })
+}
+
+pub fn active_unmatched_ticket_ids(
+    projection: Option<&Value>,
+    settled_keys: &BTreeSet<String>,
+) -> Vec<usize> {
+    let mut ids: Vec<usize> = settled_keys
+        .iter()
+        .filter_map(|k| {
+            let (id, run_id) = parse_failure_ticket(k)?;
+            let resolved_key = format!("{FAILURE_RESOLVED_PREFIX}{id}");
+            if settled_keys.contains(&resolved_key) {
+                return None;
+            }
+            if let (Some(proj), Some(rid)) = (projection, run_id)
+                && projection_contains_run_id(proj, rid)
+            {
+                return None;
+            }
+            Some(id)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+pub fn resolve_ticket_keys(ticket_ids: &[usize], count: usize) -> Vec<String> {
+    ticket_ids
+        .iter()
+        .take(count)
+        .map(|id| format!("{FAILURE_RESOLVED_PREFIX}{id}"))
         .collect()
 }
 
@@ -1977,33 +2032,36 @@ pub fn terminal_suppressed_lookup_keys(
     ))
 }
 
-pub fn collect_turn_candidates_before(
+pub fn collect_turn_candidates_in_range(
     projection: &Value,
+    start_pos: usize,
     end_pos: usize,
     explicit_run_id: Option<&str>,
     explicit_item_count: Option<usize>,
 ) -> Vec<PreterminalCandidate> {
     let (_, is_runs_mode, raw_turns) = slice_projection_turns(projection);
     let bound = end_pos.min(raw_turns.len());
-    if bound == 0 {
+    if start_pos >= bound {
         return Vec::new();
     }
     let matched_pos = if is_runs_mode {
         explicit_run_id.and_then(|want| {
-            raw_turns[..bound]
+            raw_turns[start_pos..bound]
                 .iter()
-                .position(|t| t.target_run_id == Some(want))
+                .find(|t| t.target_run_id == Some(want))
+                .map(|t| t.pos)
         })
     } else {
         explicit_item_count.and_then(|ic| {
-            raw_turns[..bound]
+            raw_turns[start_pos..bound]
                 .iter()
-                .position(|t| t.slice.iter().any(|(_, item_ic, _)| *item_ic == ic))
+                .find(|t| t.slice.iter().any(|(_, item_ic, _)| *item_ic == ic))
+                .map(|t| t.pos)
         })
     };
 
     let mut out = Vec::new();
-    for raw in &raw_turns[..bound] {
+    for raw in &raw_turns[start_pos..bound] {
         if matched_pos.is_some_and(|mp| mp != raw.pos) {
             continue;
         }
@@ -2049,6 +2107,15 @@ pub fn collect_turn_candidates_before(
         });
     }
     out
+}
+
+pub fn collect_turn_candidates_before(
+    projection: &Value,
+    end_pos: usize,
+    explicit_run_id: Option<&str>,
+    explicit_item_count: Option<usize>,
+) -> Vec<PreterminalCandidate> {
+    collect_turn_candidates_in_range(projection, 0, end_pos, explicit_run_id, explicit_item_count)
 }
 
 pub fn collect_preterminal_turn_candidates(
