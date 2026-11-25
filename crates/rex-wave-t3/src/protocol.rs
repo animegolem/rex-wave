@@ -1082,11 +1082,17 @@ pub fn projection_contains_run_id(projection: &Value, want_run: &str) -> bool {
     })
 }
 
-pub fn active_unmatched_ticket_ids(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTicket {
+    pub id: usize,
+    pub run_id: Option<String>,
+}
+
+pub fn active_unmatched_tickets(
     projection: Option<&Value>,
     settled_keys: &BTreeSet<String>,
-) -> Vec<usize> {
-    let mut ids: Vec<usize> = settled_keys
+) -> Vec<PendingTicket> {
+    let mut tickets: Vec<PendingTicket> = settled_keys
         .iter()
         .filter_map(|k| {
             let (id, run_id) = parse_failure_ticket(k)?;
@@ -1099,7 +1105,34 @@ pub fn active_unmatched_ticket_ids(
             {
                 return None;
             }
-            Some(id)
+            Some(PendingTicket {
+                id,
+                run_id: run_id.map(str::to_owned),
+            })
+        })
+        .collect();
+    tickets.sort_by_key(|t| t.id);
+    tickets.dedup_by_key(|t| t.id);
+    tickets
+}
+
+pub fn matching_run_ticket_ids_for_target(
+    settled_keys: &BTreeSet<String>,
+    run_ids: &[String],
+) -> Vec<usize> {
+    if run_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut ids: Vec<usize> = settled_keys
+        .iter()
+        .filter_map(|k| {
+            let (id, run_id) = parse_failure_ticket(k)?;
+            let rid = run_id?;
+            if !run_ids.iter().any(|want| want == rid) {
+                return None;
+            }
+            let resolved_key = format!("{FAILURE_RESOLVED_PREFIX}{id}");
+            (!settled_keys.contains(&resolved_key)).then_some(id)
         })
         .collect();
     ids.sort_unstable();
@@ -1107,10 +1140,9 @@ pub fn active_unmatched_ticket_ids(
     ids
 }
 
-pub fn resolve_ticket_keys(ticket_ids: &[usize], count: usize) -> Vec<String> {
+pub fn resolve_ticket_ids(ticket_ids: &[usize]) -> Vec<String> {
     ticket_ids
         .iter()
-        .take(count)
         .map(|id| format!("{FAILURE_RESOLVED_PREFIX}{id}"))
         .collect()
 }
@@ -1159,6 +1191,8 @@ pub enum ExplicitFailurePlan {
     },
     Matched {
         target_pos: usize,
+        target_run_ids: Vec<String>,
+        target_lookup_keys: Vec<String>,
         turns: Vec<InspectedTurn>,
     },
 }
@@ -1168,6 +1202,7 @@ pub struct PreterminalCandidate {
     pub check: TurnMirrorCheck,
     pub suppression_keys: Vec<String>,
     pub lookup_keys: Vec<String>,
+    pub run_ids: Vec<String>,
     pub inherently_suppressed: bool,
     pub completed_cleanly: bool,
     pub run_start_at: u64,
@@ -1881,6 +1916,38 @@ pub fn plan_explicit_failure_turns(
         }
     };
 
+    let mut target_run_ids = Vec::new();
+    if let Some(erid) = explicit_run_id.filter(|s| !s.is_empty()) {
+        push_unique_key(&mut target_run_ids, erid.to_owned());
+    }
+    let target_lookup_keys = if let Some(target_raw) = raw_turns.get(target_pos) {
+        if let Some(trid) = target_raw.target_run_id {
+            push_unique_key(&mut target_run_ids, trid.to_owned());
+        }
+        for (_, _, it) in &target_raw.slice {
+            if let Some(irid) = it
+                .get("runId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                push_unique_key(&mut target_run_ids, irid.to_owned());
+            }
+        }
+        let base_supp = collect_suppressed_turn_keys(
+            &target_raw.slice,
+            target_raw.target_run_id,
+            target_raw.suppressed_run_key.clone(),
+        );
+        collect_turn_lookup_keys(
+            &target_raw.slice,
+            target_raw.target_run_id,
+            target_raw.suppressed_run_key.as_deref(),
+            &base_supp,
+        )
+    } else {
+        Vec::new()
+    };
+
     let mut turns = Vec::new();
     for raw in &raw_turns {
         let is_terminal = !raw.has_later_turn;
@@ -1905,7 +1972,12 @@ pub fn plan_explicit_failure_turns(
             turns.push(inspected);
         }
     }
-    Some(ExplicitFailurePlan::Matched { target_pos, turns })
+    Some(ExplicitFailurePlan::Matched {
+        target_pos,
+        target_run_ids,
+        target_lookup_keys,
+        turns,
+    })
 }
 
 pub fn closed_turn_count_before_ahead_failure(
@@ -2094,10 +2166,24 @@ pub fn collect_turn_candidates_in_range(
             raw.suppressed_run_key.as_deref(),
             &suppression_keys,
         );
+        let mut run_ids = Vec::new();
+        if let Some(trid) = raw.target_run_id {
+            push_unique_key(&mut run_ids, trid.to_owned());
+        }
+        for (_, _, it) in &raw.slice {
+            if let Some(irid) = it
+                .get("runId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                push_unique_key(&mut run_ids, irid.to_owned());
+            }
+        }
         out.push(PreterminalCandidate {
             check,
             suppression_keys,
             lookup_keys,
+            run_ids,
             inherently_suppressed,
             completed_cleanly,
             run_start_at: raw.run_start_at,

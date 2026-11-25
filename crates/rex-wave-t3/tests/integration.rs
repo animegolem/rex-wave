@@ -5038,3 +5038,345 @@ async fn t3_double_outage_partial_replay_run_id_only_item_projection_and_index_z
 fn idx_zero_role_alias(r: &RoleName) -> RoleName {
     r.clone()
 }
+
+#[tokio::test]
+async fn t3_matched_run_preserves_other_run_ticket_and_single_ticket_budget_preserves_later_success()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_r21".into(),
+        projects: vec![json!({
+            "id": "uuid-r21",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_r21").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let host_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let conductor_task = spawn_reactor(WaveConductor::new(T3Host(bridge.clone())), host_client);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("r21-edge-v1").unwrap();
+    let project = BbProjectId::parse("uuid-r21").unwrap();
+    let matched_run_role = RoleName::parse("matchedrun").unwrap();
+    let budget_cap_role = RoleName::parse("budgetcap").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse(
+                    "Verify matched run preserves other run tickets and 1-ticket budget preserves multiple recoveries",
+                )
+                .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![
+                    WorkerSpec {
+                        role: matched_run_role.clone(),
+                        brief: Body::parse("Explicit r1 match preserves pending r2 ticket").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: budget_cap_role.clone(),
+                        brief: Body::parse("Single remaining ticket suppresses one turn before two successes")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let matched_tid = BbThreadId::parse("t3:r21-edge-v1:matchedrun:a1").unwrap();
+    let budget_tid = BbThreadId::parse("t3:r21-edge-v1:budgetcap:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let matched_tid = matched_tid.clone();
+        let budget_tid = budget_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&matched_tid, &budget_tid].into_iter().all(|want_tid| {
+                snap.workers.iter().any(
+                    |(_, _, p)| matches!(p, WorkerPhase::Live { thread, .. } if thread == want_tid),
+                )
+            })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        for tid in [matched_tid.as_str(), budget_tid.as_str()] {
+            let proj = st.thread_projections.get_mut(tid).unwrap();
+            proj["runs"] = json!([]);
+            proj["mockUnavailable"] = json!(true);
+        }
+    }
+
+    for (seq, tid, run_id) in [
+        (10u64, matched_tid.as_str(), Some("r1")),
+        (11u64, budget_tid.as_str(), None),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "latestRunId": run_id
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let matched_run_role = matched_run_role.clone();
+        let budget_cap_role = budget_cap_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&matched_run_role, &budget_cap_role]
+                .into_iter()
+                .all(|want| {
+                    snap.workers.iter().any(|(r, _, p)| {
+                        r == want
+                            && matches!(
+                                p,
+                                WorkerPhase::Live {
+                                    activity: Activity::Refused { .. },
+                                    ..
+                                }
+                            )
+                    })
+                })
+        }
+    })
+    .await;
+
+    for (seq, tid, run_id) in [
+        (14u64, matched_tid.as_str(), Some("r2")),
+        (15u64, budget_tid.as_str(), None),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "latestRunId": run_id
+                }
+            }))
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    {
+        let mut st = server.state.lock().await;
+        let m_proj = st.thread_projections.get_mut(matched_tid.as_str()).unwrap();
+        m_proj["mockUnavailable"] = json!(false);
+        m_proj["thread"]["status"] = json!("completed");
+        m_proj["thread"]["stopReason"] = Value::Null;
+        m_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" }
+        ]);
+
+        let b_proj = st.thread_projections.get_mut(budget_tid.as_str()).unwrap();
+        b_proj["mockUnavailable"] = json!(false);
+        b_proj["thread"]["status"] = json!("completed");
+        b_proj["thread"]["stopReason"] = Value::Null;
+        b_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" }
+        ]);
+    }
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 16,
+            "location": "active",
+            "thread": {
+                "id": matched_tid.as_str(),
+                "status": "completed",
+                "stopReason": "safety",
+                "latestRunId": "r1"
+            }
+        }))
+        .await;
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 17,
+            "location": "active",
+            "thread": {
+                "id": budget_tid.as_str(),
+                "status": "completed"
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    {
+        let mut st = server.state.lock().await;
+        let m_proj = st.thread_projections.get_mut(matched_tid.as_str()).unwrap();
+        m_proj["thread"]["status"] = json!("completed");
+        m_proj["thread"]["stopReason"] = Value::Null;
+        m_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second refused draft" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" }
+        ]);
+
+        let b_proj = st.thread_projections.get_mut(budget_tid.as_str()).unwrap();
+        b_proj["thread"]["status"] = json!("completed");
+        b_proj["thread"]["stopReason"] = Value::Null;
+        b_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second refused draft" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" },
+            { "type": "user_message", "text": "u4" },
+            { "type": "assistant_message", "text": "Fourth success" }
+        ]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_r21").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    for (seq, tid) in [(20u64, matched_tid.as_str()), (21u64, budget_tid.as_str())] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    let room = wave_room(&wave, &project);
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let matched_run_role = matched_run_role.clone();
+        let budget_cap_role = budget_cap_role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            let count_for = |r: &RoleName| {
+                page.entries
+                    .iter()
+                    .filter(|e| {
+                        e.by == Principal::Worker {
+                            wave: wave.clone(),
+                            role: r.clone(),
+                        } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                    })
+                    .count()
+            };
+            count_for(&matched_run_role) == 1 && count_for(&budget_cap_role) == 2
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let page = operator
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .await
+        .unwrap();
+    let bodies_for = |r: &RoleName| -> Vec<&str> {
+        page.entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(bodies_for(&matched_run_role), vec!["Recovered third turn"]);
+    assert_eq!(
+        bodies_for(&budget_cap_role),
+        vec!["Recovered third turn", "Fourth success"]
+    );
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
+    bridge_task.abort();
+}
