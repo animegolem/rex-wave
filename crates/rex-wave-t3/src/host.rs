@@ -8,13 +8,14 @@ use crate::projects::{
 use crate::protocol::{
     ExplicitFailurePlan, InspectedTurn, LiveSeqTracker, ShellObservation, TerminalTurnState,
     TurnMirrorCheck, UNATTRIBUTED_FAILURE_KEY, active_pending_interaction,
-    collect_preterminal_turn_candidates, default_model_from_server_config,
-    derive_shell_observation, deterministic_thread_id, explicit_shell_suppression_keys,
-    extract_explicit_stop_refusal, extract_refusal_reason, extract_runtime_meta_from_value,
-    force_stop_thread_payload, inspect_closed_turns_before_ahead_failure, inspect_turns_in_order,
-    is_t3_thread_id, launch_thread_payload, message_dispatch_payload, mirror_idem_key,
-    normalize_turn_item, parse_pending_interaction_from_projection, parse_provider_turns_usage,
-    parse_t3_thread_id, plan_explicit_failure_turns, projection_turn_slot_count,
+    closed_turn_count_before_ahead_failure, collect_turn_candidates_before,
+    default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
+    explicit_shell_suppression_keys, extract_explicit_stop_refusal, extract_refusal_reason,
+    extract_runtime_meta_from_value, force_stop_thread_payload,
+    inspect_closed_turns_before_ahead_failure, inspect_turns_in_order, is_t3_thread_id,
+    launch_thread_payload, message_dispatch_payload, mirror_idem_key, normalize_turn_item,
+    parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
+    plan_explicit_failure_turns, projection_has_ahead_suppression, projection_turn_slot_count,
     runtime_request_respond_payload, shell_explicit_turn_target, strip_t3_provider_prefix,
     terminal_suppressed_lookup_keys, thread_archive_payload, thread_stop_payload,
     unwrap_projection,
@@ -114,6 +115,12 @@ enum StateMsg {
         role: RoleName,
         thread: BbThreadId,
         reply: oneshot::Sender<(bool, bool)>,
+    },
+    SettledTurnKeys {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        reply: oneshot::Sender<BTreeSet<String>>,
     },
     ApplyHydratedSuppressions {
         wave: WaveSlug,
@@ -282,6 +289,20 @@ impl StateOwner {
                         _ => (false, false),
                     };
                     let _ = reply.send(status);
+                }
+                StateMsg::SettledTurnKeys {
+                    wave,
+                    role,
+                    thread,
+                    reply,
+                } => {
+                    let keys = match self.workers_by_role.get(&(wave, role)) {
+                        Some(rec) if rec.thread.as_ref() == Some(&thread) => {
+                            rec.settled_turn_keys.clone()
+                        }
+                        _ => BTreeSet::new(),
+                    };
+                    let _ = reply.send(keys);
                 }
                 StateMsg::ApplyHydratedSuppressions {
                     wave,
@@ -1143,6 +1164,7 @@ impl T3Bridge {
                         &wave,
                         &role,
                         thread,
+                        Some(shell),
                         proj,
                         TerminalTurnState::InProgress,
                     )
@@ -1309,6 +1331,7 @@ impl T3Bridge {
                                 &wave,
                                 &role,
                                 thread,
+                                Some(shell),
                                 unwrapped,
                                 TerminalTurnState::Suppressed,
                             )
@@ -1323,6 +1346,7 @@ impl T3Bridge {
                                 &wave,
                                 &role,
                                 thread,
+                                Some(shell),
                                 unwrapped,
                                 terminal_state,
                             )
@@ -1406,17 +1430,37 @@ impl T3Bridge {
             explicit_item_count,
         ) {
             let _mirror_guard = self.mirror_lock.lock().await;
-            let _ = self
+            let pending_unattributed = self
                 .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
                 .await;
             match plan {
-                ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys } => {
+                ExplicitFailurePlan::TargetAheadOfProjection { mut explicit_keys } => {
+                    let closed_end = closed_turn_count_before_ahead_failure(
+                        unwrapped,
+                        explicit_run_id.as_deref(),
+                        explicit_item_count,
+                    );
+                    if pending_unattributed {
+                        if closed_end > 0 {
+                            self.suppress_unattributed_turns_before_locked(
+                                wave, role, thread, unwrapped, closed_end, None, None, false,
+                            )
+                            .await;
+                        } else if !explicit_keys.iter().any(|k| k == UNATTRIBUTED_FAILURE_KEY) {
+                            explicit_keys.push(UNATTRIBUTED_FAILURE_KEY.to_owned());
+                        }
+                    }
+                    let concrete_keys: Vec<String> = explicit_keys
+                        .iter()
+                        .filter(|k| k.as_str() != UNATTRIBUTED_FAILURE_KEY)
+                        .cloned()
+                        .collect();
                     let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
                         wave: wave.clone(),
                         role: role.clone(),
                         thread: thread.clone(),
                         seq: Seq::ORIGIN,
-                        turn_keys: explicit_keys.clone(),
+                        turn_keys: concrete_keys,
                         claimed_seqs: Vec::new(),
                     });
                     self.call_wave_observe(
@@ -1436,7 +1480,22 @@ impl T3Bridge {
                     self.execute_inspected_turns_locked(wave, role, thread, checks)
                         .await;
                 }
-                ExplicitFailurePlan::Matched { turns } => {
+                ExplicitFailurePlan::Matched { target_pos, turns } => {
+                    if pending_unattributed {
+                        if target_pos > 0 {
+                            self.suppress_unattributed_turns_before_locked(
+                                wave, role, thread, unwrapped, target_pos, None, None, false,
+                            )
+                            .await;
+                        } else {
+                            let _ = self.state.send(StateMsg::SetPendingUnattributedFailure {
+                                wave: wave.clone(),
+                                role: role.clone(),
+                                thread: thread.clone(),
+                                pending: false,
+                            });
+                        }
+                    }
                     self.execute_inspected_turns_locked(wave, role, thread, turns)
                         .await;
                 }
@@ -1452,6 +1511,7 @@ impl T3Bridge {
                 wave,
                 role,
                 thread,
+                Some(shell),
                 unwrapped,
                 TerminalTurnState::Suppressed,
             )
@@ -1576,21 +1636,23 @@ impl T3Bridge {
         pending_unattributed
     }
 
-    async fn suppress_lagged_preterminal_failure_locked(
+    #[allow(clippy::too_many_arguments)]
+    async fn suppress_unattributed_turns_before_locked(
         &self,
         wave: &WaveSlug,
         role: &RoleName,
         thread: &BbThreadId,
-        shell: Option<&Value>,
         unwrapped_projection: &Value,
+        end_pos: usize,
+        explicit_run_id: Option<&str>,
+        explicit_item_count: Option<usize>,
+        check_terminal_suppression: bool,
     ) {
-        let (explicit_run_id, explicit_item_count) = shell
-            .map(shell_explicit_turn_target)
-            .unwrap_or((None, None));
         let is_unattributed = explicit_run_id.is_none() && explicit_item_count.is_none();
-        let candidates = collect_preterminal_turn_candidates(
+        let candidates = collect_turn_candidates_before(
             unwrapped_projection,
-            explicit_run_id.as_deref(),
+            end_pos,
+            explicit_run_id,
             explicit_item_count,
         );
         if candidates.is_empty() {
@@ -1640,21 +1702,25 @@ impl T3Bridge {
         }
 
         if is_unattributed && !unsettled.is_empty() {
-            let proj_term_state = classify_projection_terminal_state(unwrapped_projection);
-            let unsettled_terminal_suppressed = if let Some(term_lookup) =
-                terminal_suppressed_lookup_keys(unwrapped_projection, proj_term_state)
-            {
-                let (wm_tx, wm_rx) = oneshot::channel();
-                let _ = self.state.send(StateMsg::MirrorState {
-                    wave: wave.clone(),
-                    role: role.clone(),
-                    thread: thread.clone(),
-                    turn_keys: term_lookup,
-                    reply: wm_tx,
-                });
-                let (_, term_settled, _) =
-                    wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
-                !term_settled
+            let unsettled_terminal_suppressed = if check_terminal_suppression {
+                let proj_term_state = classify_projection_terminal_state(unwrapped_projection);
+                if let Some(term_lookup) =
+                    terminal_suppressed_lookup_keys(unwrapped_projection, proj_term_state)
+                {
+                    let (wm_tx, wm_rx) = oneshot::channel();
+                    let _ = self.state.send(StateMsg::MirrorState {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        thread: thread.clone(),
+                        turn_keys: term_lookup,
+                        reply: wm_tx,
+                    });
+                    let (_, term_settled, _) =
+                        wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
+                    !term_settled
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -1663,6 +1729,8 @@ impl T3Bridge {
                 || unsettled.iter().any(|(c, _, _)| c.inherently_suppressed)
             {
                 unsettled.retain(|(c, _, _)| c.inherently_suppressed);
+            } else if !check_terminal_suppression {
+                unsettled.retain(|(c, _, _)| !c.completed_cleanly);
             } else if unsettled.iter().any(|(c, _, _)| !c.completed_cleanly)
                 && unsettled.iter().any(|(c, _, _)| c.completed_cleanly)
             {
@@ -1675,12 +1743,20 @@ impl T3Bridge {
         for (cand, watermark, claimed_direct_posts) in unsettled {
             let mirror_match_spec = match &cand.check {
                 TurnMirrorCheck::Unposted(c) => {
-                    let idem = mirror_idem_key(wave, role, thread, &c.anchor).ok();
-                    let legacy = rex_wave_waves::legacy_truncated_mirror_idem_key(
-                        wave, role, thread, &c.anchor,
-                    );
+                    let mut exact_keys = Vec::new();
+                    let mut legacy_keys = Vec::new();
+                    for a in std::iter::once(&c.anchor).chain(c.alt_anchors.iter()) {
+                        if let Ok(k) = mirror_idem_key(wave, role, thread, a) {
+                            exact_keys.push(k);
+                        }
+                        if let Some(lk) =
+                            rex_wave_waves::legacy_truncated_mirror_idem_key(wave, role, thread, a)
+                        {
+                            legacy_keys.push(lk);
+                        }
+                    }
                     let trimmed = truncate_with_notice(&c.text, 64 * 1024);
-                    Some((idem, legacy, trimmed))
+                    Some((exact_keys, legacy_keys, trimmed))
                 }
                 _ => None,
             };
@@ -1712,16 +1788,15 @@ impl T3Bridge {
                         body, idem, origin, ..
                     }) = &env.event
                     {
-                        if let Some((ref exact_key, ref legacy_key, ref trimmed)) =
+                        if let Some((ref exact_keys, ref legacy_keys, ref trimmed)) =
                             mirror_match_spec
                         {
-                            if exact_key.is_some() && idem == exact_key {
+                            if idem.as_ref().is_some_and(|k| exact_keys.contains(k)) {
                                 already_mirrored_in_room = true;
                                 break;
                             }
                             if env.by == worker_principal
-                                && legacy_key.is_some()
-                                && idem == legacy_key
+                                && idem.as_ref().is_some_and(|k| legacy_keys.contains(k))
                                 && body.as_str() == trimmed.as_str()
                                 && !claimed_direct_posts.contains(&env.seq)
                             {
@@ -1786,6 +1861,34 @@ impl T3Bridge {
         }
     }
 
+    async fn suppress_lagged_preterminal_failure_locked(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        shell: Option<&Value>,
+        unwrapped_projection: &Value,
+    ) {
+        let slot_count = projection_turn_slot_count(unwrapped_projection);
+        if slot_count < 2 {
+            return;
+        }
+        let (explicit_run_id, explicit_item_count) = shell
+            .map(shell_explicit_turn_target)
+            .unwrap_or((None, None));
+        self.suppress_unattributed_turns_before_locked(
+            wave,
+            role,
+            thread,
+            unwrapped_projection,
+            slot_count - 1,
+            explicit_run_id.as_deref(),
+            explicit_item_count,
+            true,
+        )
+        .await;
+    }
+
     async fn suppress_lagged_preterminal_failure(
         &self,
         wave: &WaveSlug,
@@ -1813,6 +1916,7 @@ impl T3Bridge {
         wave: &WaveSlug,
         role: &RoleName,
         thread: &BbThreadId,
+        shell_hint: Option<&Value>,
         projection: &Value,
         terminal_state: TerminalTurnState,
     ) {
@@ -1821,6 +1925,36 @@ impl T3Bridge {
             .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
             .await;
         let unwrapped = unwrap_projection(projection);
+        let (sk_tx, sk_rx) = oneshot::channel();
+        let _ = self.state.send(StateMsg::SettledTurnKeys {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            reply: sk_tx,
+        });
+        let settled_keys = sk_rx.await.unwrap_or_default();
+        let (shell_run_id, shell_item_count) = shell_hint
+            .map(shell_explicit_turn_target)
+            .unwrap_or((None, None));
+        let (ahead_hold, ahead_run_id, ahead_item_count) = projection_has_ahead_suppression(
+            unwrapped,
+            &settled_keys,
+            shell_run_id.as_deref(),
+            shell_item_count,
+        );
+        if ahead_hold {
+            if pending_unattributed {
+                return;
+            }
+            let checks = inspect_closed_turns_before_ahead_failure(
+                unwrapped,
+                ahead_run_id.as_deref(),
+                ahead_item_count,
+            );
+            self.execute_inspected_turns_locked(wave, role, thread, checks)
+                .await;
+            return;
+        }
         let slot_count = projection_turn_slot_count(unwrapped);
         let mut effective_terminal_state = terminal_state;
         if pending_unattributed {
@@ -1885,6 +2019,7 @@ impl T3Bridge {
                 TurnMirrorCheck::PostedViaTool { run_key, .. } => run_key.iter().cloned().collect(),
                 TurnMirrorCheck::Unposted(c) => {
                     let mut keys = vec![c.anchor.clone()];
+                    keys.extend(c.alt_anchors.iter().cloned());
                     if let Some(rk) = &c.run_key {
                         keys.push(rk.clone());
                     }
@@ -2070,13 +2205,31 @@ impl T3Bridge {
                 continue;
             };
 
-            let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
-            let legacy_trunc_key = rex_wave_waves::legacy_truncated_mirror_idem_key(
+            let mut exact_idem_keys = vec![idem_key.clone()];
+            let mut legacy_trunc_keys = Vec::new();
+            if let Some(lk) = rex_wave_waves::legacy_truncated_mirror_idem_key(
                 wave,
                 role,
                 thread,
                 &completed.anchor,
-            );
+            ) {
+                legacy_trunc_keys.push(lk);
+            }
+            for alt in &completed.alt_anchors {
+                if let Ok(ak) = mirror_idem_key(wave, role, thread, alt)
+                    && !exact_idem_keys.contains(&ak)
+                {
+                    exact_idem_keys.push(ak);
+                }
+                if let Some(lk) =
+                    rex_wave_waves::legacy_truncated_mirror_idem_key(wave, role, thread, alt)
+                    && !legacy_trunc_keys.contains(&lk)
+                {
+                    legacy_trunc_keys.push(lk);
+                }
+            }
+
+            let trimmed = truncate_with_notice(&completed.text, 64 * 1024);
             let mut already_posted = false;
             let mut reached_end = false;
             let mut claimed_seqs = Vec::new();
@@ -2097,7 +2250,7 @@ impl T3Bridge {
                 };
                 if last.seq <= cursor {
                     break;
-                }
+                };
                 cursor = last.seq;
                 room_head = last.seq;
                 let count = page.entries.len();
@@ -2106,7 +2259,7 @@ impl T3Bridge {
                         body, idem, origin, ..
                     }) = &env.event
                     {
-                        if idem.as_ref() == Some(&idem_key) {
+                        if idem.as_ref().is_some_and(|k| exact_idem_keys.contains(k)) {
                             if !watermark_pinned {
                                 safe_watermark = env.seq;
                             }
@@ -2120,8 +2273,7 @@ impl T3Bridge {
                                 .is_some_and(rex_wave_waves::is_legacy_mirror_idem_key);
                         if is_mirrored_row {
                             if env.by == worker_principal
-                                && legacy_trunc_key.is_some()
-                                && idem == &legacy_trunc_key
+                                && idem.as_ref().is_some_and(|k| legacy_trunc_keys.contains(k))
                                 && body.as_str() == trimmed
                                 && !claimed_direct_posts.contains(&env.seq)
                             {
@@ -2283,6 +2435,7 @@ impl T3Bridge {
                     &wave,
                     &role,
                     &thread,
+                    None,
                     proj,
                     TerminalTurnState::InProgress,
                 )
@@ -2315,8 +2468,15 @@ impl T3Bridge {
             }
             if let Some(activity) = derived {
                 let terminal_state = classify_projection_terminal_state(proj);
-                self.mirror_turns_from_projection(&wave, &role, &thread, proj, terminal_state)
-                    .await;
+                self.mirror_turns_from_projection(
+                    &wave,
+                    &role,
+                    &thread,
+                    None,
+                    proj,
+                    terminal_state,
+                )
+                .await;
                 if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
                     self.call_wave_observe(wave, role, Observation::Activity { activity })
                         .await;
@@ -2442,6 +2602,7 @@ impl T3Bridge {
                             &wave,
                             &role,
                             thread,
+                            None,
                             proj,
                             TerminalTurnState::Suppressed,
                         )

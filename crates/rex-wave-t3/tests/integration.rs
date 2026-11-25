@@ -3839,3 +3839,397 @@ async fn t3_run_id_item_only_ahead_item_count_and_unattributed_outage_preserve_g
     conductor_task.abort();
     bridge_task.abort();
 }
+
+#[tokio::test]
+async fn t3_ahead_hold_across_stale_completion_chained_refusals_and_run_metadata_upgrade() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_r18".into(),
+        projects: vec![json!({
+            "id": "uuid-r18",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_r18").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let host_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let conductor_task = spawn_reactor(WaveConductor::new(T3Host(bridge.clone())), host_client);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("r18-edge-v1").unwrap();
+    let project = BbProjectId::parse("uuid-r18").unwrap();
+    let stale_hold_role = RoleName::parse("stalehold").unwrap();
+    let chained_fail_role = RoleName::parse("chainfail").unwrap();
+    let mode_upgrade_role = RoleName::parse("modeup").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse("Verify stale ahead hold, chained refusals, and runId dedupe")
+                    .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![
+                    WorkerSpec {
+                        role: stale_hold_role.clone(),
+                        brief: Body::parse("Hold open tail across stale completion").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: chained_fail_role.clone(),
+                        brief: Body::parse("Suppress first outage refusal before explicit second")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: mode_upgrade_role.clone(),
+                        brief: Body::parse("Deduplicate item-only post when runs metadata arrives")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let stale_tid = BbThreadId::parse("t3:r18-edge-v1:stalehold:a1").unwrap();
+    let chain_tid = BbThreadId::parse("t3:r18-edge-v1:chainfail:a1").unwrap();
+    let mode_tid = BbThreadId::parse("t3:r18-edge-v1:modeup:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let stale_tid = stale_tid.clone();
+        let chain_tid = chain_tid.clone();
+        let mode_tid = mode_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&stale_tid, &chain_tid, &mode_tid]
+                .into_iter()
+                .all(|want_tid| {
+                    snap.workers.iter().any(|(_, _, p)| {
+                        matches!(p, WorkerPhase::Live { thread, .. } if thread == want_tid)
+                    })
+                })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        for tid in [stale_tid.as_str(), mode_tid.as_str()] {
+            let proj = st.thread_projections.get_mut(tid).unwrap();
+            proj["runs"] = json!([]);
+            proj["turnItems"] = json!([
+                { "ordinal": 0, "type": "user_message", "text": "u1" },
+                { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+                { "ordinal": 2, "type": "user_message", "text": "u2" },
+                { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" }
+            ]);
+            proj["thread"]["status"] = json!("completed");
+            proj["thread"]["stopReason"] = Value::Null;
+        }
+        let c_proj = st.thread_projections.get_mut(chain_tid.as_str()).unwrap();
+        c_proj["runs"] = json!([]);
+        c_proj["mockUnavailable"] = json!(true);
+    }
+
+    for (seq, tid, ic) in [
+        (10u64, stale_tid.as_str(), Some(5u64)),
+        (11u64, chain_tid.as_str(), None),
+        (12u64, mode_tid.as_str(), Some(5u64)),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "itemCount": ic
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let stale_hold_role = stale_hold_role.clone();
+        let chained_fail_role = chained_fail_role.clone();
+        let mode_upgrade_role = mode_upgrade_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&stale_hold_role, &chained_fail_role, &mode_upgrade_role]
+                .into_iter()
+                .all(|want| {
+                    snap.workers.iter().any(|(r, _, p)| {
+                        r == want
+                            && matches!(
+                                p,
+                                WorkerPhase::Live {
+                                    activity: Activity::Refused { .. },
+                                    ..
+                                }
+                            )
+                    })
+                })
+        }
+    })
+    .await;
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 13,
+            "location": "active",
+            "thread": {
+                "id": stale_tid.as_str(),
+                "status": "completed",
+                "itemCount": 7
+            }
+        }))
+        .await;
+
+    {
+        let mut st = server.state.lock().await;
+        let c_proj = st.thread_projections.get_mut(chain_tid.as_str()).unwrap();
+        c_proj["mockUnavailable"] = json!(false);
+        c_proj["thread"]["status"] = json!("completed");
+        c_proj["runs"] = json!([]);
+        c_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second refused draft" }
+        ]);
+    }
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 14,
+            "location": "active",
+            "thread": {
+                "id": chain_tid.as_str(),
+                "status": "completed",
+                "stopReason": "safety",
+                "itemCount": 4
+            }
+        }))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let room = wave_room(&wave, &project);
+    let mid_page = operator
+        .call(Read::stream(
+            StreamId::Room { room: room.clone() },
+            Seq::ORIGIN,
+            Some(50),
+        ))
+        .await
+        .unwrap();
+    let mid_bodies_for = |r: &RoleName| -> Vec<&str> {
+        mid_page
+            .entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(mid_bodies_for(&stale_hold_role), vec!["Successful turn 1"]);
+    assert!(mid_bodies_for(&chained_fail_role).is_empty());
+
+    {
+        let mut st = server.state.lock().await;
+        let s_proj = st.thread_projections.get_mut(stale_tid.as_str()).unwrap();
+        s_proj["thread"]["status"] = json!("completed");
+        s_proj["thread"]["stopReason"] = Value::Null;
+        s_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "error", "message": "refused" },
+            { "ordinal": 5, "type": "user_message", "text": "u3" },
+            { "ordinal": 6, "type": "assistant_message", "id": "good_turn3", "text": "Third recovered" }
+        ]);
+
+        let m_proj = st.thread_projections.get_mut(mode_tid.as_str()).unwrap();
+        m_proj["thread"]["status"] = json!("completed");
+        m_proj["thread"]["stopReason"] = Value::Null;
+        m_proj["runs"] = json!([
+            { "id": "r1", "ordinal": 0, "status": "completed" },
+            { "id": "r2", "ordinal": 1, "status": "failed" },
+            { "id": "r3", "ordinal": 2, "status": "completed" }
+        ]);
+        m_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "runId": "r1", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "runId": "r1", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "runId": "r2", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "runId": "r2", "id": "failed_turn2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "error", "runId": "r2", "message": "refused" },
+            { "ordinal": 5, "type": "user_message", "runId": "r3", "text": "u3" },
+            { "ordinal": 6, "type": "assistant_message", "runId": "r3", "id": "good_turn3", "text": "Third recovered" }
+        ]);
+
+        let c_proj = st.thread_projections.get_mut(chain_tid.as_str()).unwrap();
+        c_proj["thread"]["status"] = json!("completed");
+        c_proj["thread"]["stopReason"] = Value::Null;
+        c_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second refused draft" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" }
+        ]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_r18").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    for (seq, tid) in [
+        (20u64, stale_tid.as_str()),
+        (21u64, chain_tid.as_str()),
+        (22u64, mode_tid.as_str()),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let stale_hold_role = stale_hold_role.clone();
+        let chained_fail_role = chained_fail_role.clone();
+        let mode_upgrade_role = mode_upgrade_role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            let count_for = |r: &RoleName| {
+                page.entries
+                    .iter()
+                    .filter(|e| {
+                        e.by == Principal::Worker {
+                            wave: wave.clone(),
+                            role: r.clone(),
+                        } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                    })
+                    .count()
+            };
+            count_for(&stale_hold_role) == 2
+                && count_for(&chained_fail_role) == 1
+                && count_for(&mode_upgrade_role) == 2
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let page = operator
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .await
+        .unwrap();
+    let bodies_for = |r: &RoleName| -> Vec<&str> {
+        page.entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        bodies_for(&stale_hold_role),
+        vec!["Successful turn 1", "Third recovered"]
+    );
+    assert_eq!(bodies_for(&chained_fail_role), vec!["Recovered third turn"]);
+    assert_eq!(
+        bodies_for(&mode_upgrade_role),
+        vec!["Successful turn 1", "Third recovered"]
+    );
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
+    bridge_task.abort();
+}
