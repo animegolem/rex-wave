@@ -551,8 +551,15 @@ impl StateOwner {
                     rec.activity = Activity::Working;
                     rec.pending_interaction = None;
                 }
-                Observation::Activity { activity, .. } => {
+                Observation::Activity {
+                    activity, thread, ..
+                } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
+                        if let Some(ref th) = thread
+                            && rec.thread.as_ref().is_some_and(|prev| prev != th)
+                        {
+                            return;
+                        }
                         rec.pending_interaction = match &activity {
                             Activity::Blocked { interaction } => Some(interaction.clone()),
                             _ => None,
