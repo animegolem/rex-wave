@@ -8,7 +8,7 @@ use crate::projects::{
 use crate::protocol::{
     ExplicitFailurePlan, InspectedTurn, LiveSeqTracker, PendingTicket, ShellObservation,
     TerminalTurnState, TurnMirrorCheck, active_pending_interaction, active_unmatched_tickets,
-    any_turn_inherently_suppressed, collect_turn_candidates_in_range,
+    all_matching_run_ticket_ids, any_turn_inherently_suppressed, collect_turn_candidates_in_range,
     default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
     explicit_shell_suppression_keys, extract_explicit_stop_refusal, extract_refusal_reason,
     extract_runtime_meta_from_value, force_stop_thread_payload,
@@ -60,12 +60,13 @@ struct TrackedWorker {
     shell_epoch: u64,
     mirror_room_watermark: Seq,
     settled_turn_keys: BTreeSet<String>,
+    suppressed_turn_keys: BTreeSet<String>,
     claimed_direct_posts: BTreeSet<Seq>,
     hydrated_suppressions: bool,
 }
 
 type LiveWorkerRow = (WaveSlug, RoleName, BbThreadId, Activity, u64);
-type MirrorStateSnapshot = (Seq, bool, BTreeSet<Seq>);
+type MirrorStateSnapshot = (Seq, bool, bool, BTreeSet<Seq>);
 
 enum StateMsg {
     BindThread {
@@ -108,6 +109,7 @@ enum StateMsg {
         thread: BbThreadId,
         seq: Seq,
         turn_keys: Vec<String>,
+        mark_suppressed: bool,
         claimed_seqs: Vec<Seq>,
     },
     HydrationStatus {
@@ -169,6 +171,7 @@ impl StateOwner {
                             shell_epoch: 0,
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
+                            suppressed_turn_keys: BTreeSet::new(),
                             claimed_direct_posts: BTreeSet::new(),
                             hydrated_suppressions: false,
                         });
@@ -176,6 +179,7 @@ impl StateOwner {
                         rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
+                        rec.suppressed_turn_keys.clear();
                         rec.claimed_direct_posts.clear();
                         rec.hydrated_suppressions = false;
                     }
@@ -230,16 +234,21 @@ impl StateOwner {
                 } => {
                     let st = match self.workers_by_role.get(&(wave, role)) {
                         Some(r) if r.thread.as_ref() == Some(&thread) => {
-                            let settled = turn_keys
+                            let suppressed = turn_keys
                                 .iter()
-                                .any(|k| !k.is_empty() && r.settled_turn_keys.contains(k));
+                                .any(|k| !k.is_empty() && r.suppressed_turn_keys.contains(k));
+                            let settled = suppressed
+                                || turn_keys
+                                    .iter()
+                                    .any(|k| !k.is_empty() && r.settled_turn_keys.contains(k));
                             (
                                 r.mirror_room_watermark,
                                 settled,
+                                suppressed,
                                 r.claimed_direct_posts.clone(),
                             )
                         }
-                        _ => (Seq::ORIGIN, false, BTreeSet::new()),
+                        _ => (Seq::ORIGIN, false, false, BTreeSet::new()),
                     };
                     let _ = reply.send(st);
                 }
@@ -249,6 +258,7 @@ impl StateOwner {
                     thread,
                     seq,
                     turn_keys,
+                    mark_suppressed,
                     claimed_seqs,
                 } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
@@ -259,6 +269,9 @@ impl StateOwner {
                         }
                         for k in turn_keys {
                             if !k.is_empty() {
+                                if mark_suppressed {
+                                    rec.suppressed_turn_keys.insert(k.clone());
+                                }
                                 rec.settled_turn_keys.insert(k);
                             }
                         }
@@ -289,7 +302,7 @@ impl StateOwner {
                 } => {
                     let keys = match self.workers_by_role.get(&(wave, role)) {
                         Some(rec) if rec.thread.as_ref() == Some(&thread) => {
-                            rec.settled_turn_keys.clone()
+                            rec.suppressed_turn_keys.clone()
                         }
                         _ => BTreeSet::new(),
                     };
@@ -306,6 +319,7 @@ impl StateOwner {
                     {
                         for k in turn_keys {
                             if !k.is_empty() {
+                                rec.suppressed_turn_keys.insert(k.clone());
                                 rec.settled_turn_keys.insert(k);
                             }
                         }
@@ -339,6 +353,7 @@ impl StateOwner {
                         shell_epoch: 0,
                         mirror_room_watermark: Seq::ORIGIN,
                         settled_turn_keys: BTreeSet::new(),
+                        suppressed_turn_keys: BTreeSet::new(),
                         claimed_direct_posts: BTreeSet::new(),
                         hydrated_suppressions: false,
                     },
@@ -357,6 +372,7 @@ impl StateOwner {
                             rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
                             rec.mirror_room_watermark = Seq::ORIGIN;
                             rec.settled_turn_keys.clear();
+                            rec.suppressed_turn_keys.clear();
                             rec.claimed_direct_posts.clear();
                             rec.hydrated_suppressions = false;
                         }
@@ -382,6 +398,7 @@ impl StateOwner {
                             shell_epoch: 0,
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
+                            suppressed_turn_keys: BTreeSet::new(),
                             claimed_direct_posts: BTreeSet::new(),
                             hydrated_suppressions: false,
                         });
@@ -389,6 +406,7 @@ impl StateOwner {
                         rec.shell_epoch = rec.shell_epoch.wrapping_add(1);
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
+                        rec.suppressed_turn_keys.clear();
                         rec.claimed_direct_posts.clear();
                         rec.hydrated_suppressions = false;
                     }
@@ -428,6 +446,7 @@ impl StateOwner {
                     {
                         for k in keys {
                             if !k.is_empty() {
+                                rec.suppressed_turn_keys.insert(k.clone());
                                 rec.settled_turn_keys.insert(k);
                             }
                         }
@@ -1347,6 +1366,7 @@ impl T3Bridge {
             thread: thread.clone(),
             seq: Seq::ORIGIN,
             turn_keys: keys.clone(),
+            mark_suppressed: true,
             claimed_seqs: Vec::new(),
         });
         self.call_wave_observe(
@@ -1358,6 +1378,31 @@ impl T3Bridge {
             },
         )
         .await;
+    }
+
+    async fn promote_suppressed_anchors_locked(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        suppression_keys: Vec<String>,
+        run_ids: &[String],
+    ) {
+        let suppressed_set = self.settled_turn_keys_locked(wave, role, thread).await;
+        let mut missing: Vec<String> = suppression_keys
+            .into_iter()
+            .filter(|k| !k.is_empty() && !suppressed_set.contains(k))
+            .collect();
+        let unresolved_run_ids = matching_run_ticket_ids_for_target(&suppressed_set, run_ids);
+        for rk in resolve_ticket_ids(&unresolved_run_ids) {
+            if !suppressed_set.contains(&rk) && !missing.contains(&rk) {
+                missing.push(rk);
+            }
+        }
+        if !missing.is_empty() {
+            self.record_suppressed_keys_locked(wave, role, thread, missing)
+                .await;
+        }
     }
 
     async fn settled_turn_keys_locked(
@@ -1442,20 +1487,26 @@ impl T3Bridge {
                     target_lookup_keys,
                     turns,
                 } => {
-                    let direct_run_ids =
+                    let all_direct_ids =
+                        all_matching_run_ticket_ids(&settled_keys, &target_run_ids);
+                    let unresolved_direct_ids =
                         matching_run_ticket_ids_for_target(&settled_keys, &target_run_ids);
-                    if !direct_run_ids.is_empty() {
+                    if !unresolved_direct_ids.is_empty() {
                         self.record_suppressed_keys_locked(
                             wave,
                             role,
                             thread,
-                            resolve_ticket_ids(&direct_run_ids),
+                            resolve_ticket_ids(&unresolved_direct_ids),
                         )
                         .await;
                     }
+                    let min_target_ticket_id = all_direct_ids.iter().copied().min();
                     let mut pre_tickets: Vec<PendingTicket> = active_tickets
                         .into_iter()
-                        .filter(|t| !direct_run_ids.contains(&t.id))
+                        .filter(|t| {
+                            !all_direct_ids.contains(&t.id)
+                                && min_target_ticket_id.is_none_or(|bound| t.id < bound)
+                        })
                         .collect();
                     if target_pos > 0 && !pre_tickets.is_empty() {
                         let consumed = self
@@ -1476,10 +1527,7 @@ impl T3Bridge {
                             .await;
                         pre_tickets.retain(|t| !consumed.contains(&t.id));
                     }
-                    if explicit_run_id.is_none()
-                        && direct_run_ids.is_empty()
-                        && !pre_tickets.is_empty()
-                    {
+                    if all_direct_ids.is_empty() && !pre_tickets.is_empty() {
                         let (wm_tx, wm_rx) = oneshot::channel();
                         let _ = self.state.send(StateMsg::MirrorState {
                             wave: wave.clone(),
@@ -1488,8 +1536,10 @@ impl T3Bridge {
                             turn_keys: target_lookup_keys,
                             reply: wm_tx,
                         });
-                        let (_, target_already_settled, _) =
-                            wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
+                        let (_, target_already_settled, _, _) =
+                            wm_rx
+                                .await
+                                .unwrap_or((Seq::ORIGIN, false, false, BTreeSet::new()));
                         if !target_already_settled
                             && let Some(matched_ticket) =
                                 pre_tickets.iter().find(|t| match &t.run_id {
@@ -1697,9 +1747,19 @@ impl T3Bridge {
                 turn_keys: cand.lookup_keys.clone(),
                 reply: wm_tx,
             });
-            let (watermark, already_settled, claimed_direct_posts) =
-                wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
-            if !already_settled {
+            let (watermark, already_settled, already_suppressed, claimed_direct_posts) = wm_rx
+                .await
+                .unwrap_or((Seq::ORIGIN, false, false, BTreeSet::new()));
+            if already_suppressed {
+                self.promote_suppressed_anchors_locked(
+                    wave,
+                    role,
+                    thread,
+                    cand.suppression_keys,
+                    &cand.run_ids,
+                )
+                .await;
+            } else if !already_settled {
                 unsettled.push((cand, watermark, claimed_direct_posts));
             }
         }
@@ -1718,8 +1778,10 @@ impl T3Bridge {
                         turn_keys: term_lookup,
                         reply: wm_tx,
                     });
-                    let (_, term_settled, _) =
-                        wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
+                    let (_, term_settled, _, _) =
+                        wm_rx
+                            .await
+                            .unwrap_or((Seq::ORIGIN, false, false, BTreeSet::new()));
                     !term_settled
                 } else {
                     false
@@ -1867,6 +1929,7 @@ impl T3Bridge {
                 thread: thread.clone(),
                 seq: watermark,
                 turn_keys: cand.suppression_keys.clone(),
+                mark_suppressed: !already_mirrored_in_room,
                 claimed_seqs,
             });
             if !already_mirrored_in_room {
@@ -2037,6 +2100,8 @@ impl T3Bridge {
         for inspected in checks {
             let check = inspected.check;
             let lookup_keys = inspected.lookup_keys;
+            let promotion_keys = inspected.suppression_keys;
+            let inspected_run_ids = inspected.run_ids;
             let next_run_start_at = inspected.next_turn_start_at;
             let has_later_turn = inspected.has_later_turn;
             let is_suppressed = matches!(check, TurnMirrorCheck::Suppressed { .. });
@@ -2064,9 +2129,25 @@ impl T3Bridge {
                 turn_keys: lookup_keys,
                 reply: wm_tx,
             });
-            let (watermark, already_settled, claimed_direct_posts) =
-                wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
+            let (watermark, already_settled, already_suppressed, claimed_direct_posts) = wm_rx
+                .await
+                .unwrap_or((Seq::ORIGIN, false, false, BTreeSet::new()));
             if already_settled {
+                if already_suppressed || is_suppressed {
+                    let keys_to_promote = if is_suppressed {
+                        turn_keys
+                    } else {
+                        promotion_keys
+                    };
+                    self.promote_suppressed_anchors_locked(
+                        wave,
+                        role,
+                        thread,
+                        keys_to_promote,
+                        &inspected_run_ids,
+                    )
+                    .await;
+                }
                 continue;
             }
 
@@ -2075,7 +2156,10 @@ impl T3Bridge {
             let mut safe_watermark = watermark;
             let mut watermark_pinned = !allow_watermark_advance;
 
-            let settle_turn = |target_seq: Seq, keys: Vec<String>, claimed_seqs: Vec<Seq>| {
+            let settle_turn = |target_seq: Seq,
+                               keys: Vec<String>,
+                               mark_suppressed: bool,
+                               claimed_seqs: Vec<Seq>| {
                 let next_seq = if allow_watermark_advance {
                     target_seq
                 } else {
@@ -2087,6 +2171,7 @@ impl T3Bridge {
                     thread: thread.clone(),
                     seq: next_seq,
                     turn_keys: keys,
+                    mark_suppressed,
                     claimed_seqs,
                 });
             };
@@ -2151,7 +2236,7 @@ impl T3Bridge {
                             }
                         }
                     }
-                    settle_turn(watermark, turn_keys.clone(), suppressed_claimed);
+                    settle_turn(watermark, turn_keys.clone(), true, suppressed_claimed);
                     if !turn_keys.is_empty() {
                         self.call_wave_observe(
                             wave.clone(),
@@ -2222,7 +2307,7 @@ impl T3Bridge {
                         }
                     }
                     if tool_reached_end {
-                        settle_turn(safe_watermark, turn_keys, tool_claimed);
+                        settle_turn(safe_watermark, turn_keys, false, tool_claimed);
                     }
                     continue;
                 }
@@ -2230,7 +2315,7 @@ impl T3Bridge {
             };
 
             let Ok(idem_key) = mirror_idem_key(wave, role, thread, &completed.anchor) else {
-                settle_turn(watermark, turn_keys, Vec::new());
+                settle_turn(watermark, turn_keys, false, Vec::new());
                 continue;
             };
 
@@ -2366,12 +2451,12 @@ impl T3Bridge {
             }
 
             if already_posted {
-                settle_turn(safe_watermark, turn_keys, claimed_seqs);
+                settle_turn(safe_watermark, turn_keys, false, claimed_seqs);
                 continue;
             }
 
             let Ok(body) = Body::parse(trimmed) else {
-                settle_turn(safe_watermark, turn_keys, Vec::new());
+                settle_turn(safe_watermark, turn_keys, false, Vec::new());
                 continue;
             };
             let post_cmd =
@@ -2416,7 +2501,7 @@ impl T3Bridge {
                     } else {
                         safe_watermark
                     };
-                settle_turn(posted_head, turn_keys, Vec::new());
+                settle_turn(posted_head, turn_keys, false, vec![posted.seq]);
             } else {
                 return;
             }
@@ -2818,6 +2903,7 @@ impl T3Bridge {
                                 shell_epoch: 0,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
+                                suppressed_turn_keys: BTreeSet::new(),
                                 claimed_direct_posts: BTreeSet::new(),
                                 hydrated_suppressions: false,
                             })
@@ -2838,6 +2924,7 @@ impl T3Bridge {
                                 shell_epoch: 0,
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
+                                suppressed_turn_keys: BTreeSet::new(),
                                 claimed_direct_posts: BTreeSet::new(),
                                 hydrated_suppressions: false,
                             })

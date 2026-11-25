@@ -1116,7 +1116,7 @@ pub fn active_unmatched_tickets(
     tickets
 }
 
-pub fn matching_run_ticket_ids_for_target(
+pub fn all_matching_run_ticket_ids(
     settled_keys: &BTreeSet<String>,
     run_ids: &[String],
 ) -> Vec<usize> {
@@ -1128,16 +1128,22 @@ pub fn matching_run_ticket_ids_for_target(
         .filter_map(|k| {
             let (id, run_id) = parse_failure_ticket(k)?;
             let rid = run_id?;
-            if !run_ids.iter().any(|want| want == rid) {
-                return None;
-            }
-            let resolved_key = format!("{FAILURE_RESOLVED_PREFIX}{id}");
-            (!settled_keys.contains(&resolved_key)).then_some(id)
+            run_ids.iter().any(|want| want == rid).then_some(id)
         })
         .collect();
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+pub fn matching_run_ticket_ids_for_target(
+    settled_keys: &BTreeSet<String>,
+    run_ids: &[String],
+) -> Vec<usize> {
+    all_matching_run_ticket_ids(settled_keys, run_ids)
+        .into_iter()
+        .filter(|id| !settled_keys.contains(&format!("{FAILURE_RESOLVED_PREFIX}{id}")))
+        .collect()
 }
 
 pub fn resolve_ticket_ids(ticket_ids: &[usize]) -> Vec<String> {
@@ -1180,6 +1186,8 @@ pub enum TurnMirrorCheck {
 pub struct InspectedTurn {
     pub check: TurnMirrorCheck,
     pub lookup_keys: Vec<String>,
+    pub suppression_keys: Vec<String>,
+    pub run_ids: Vec<String>,
     pub next_turn_start_at: Option<u64>,
     pub has_later_turn: bool,
 }
@@ -1787,10 +1795,33 @@ fn evaluate_raw_turn(
         raw.suppressed_run_key.as_deref(),
         &check_keys,
     );
+    let mut suppression_keys = collect_suppressed_turn_keys(
+        &raw.slice,
+        raw.target_run_id,
+        raw.suppressed_run_key.clone(),
+    );
+    for extra in extra_suppressed_keys {
+        push_unique_key(&mut suppression_keys, extra.clone());
+    }
+    let mut run_ids = Vec::new();
+    if let Some(trid) = raw.target_run_id {
+        push_unique_key(&mut run_ids, trid.to_owned());
+    }
+    for (_, _, it) in &raw.slice {
+        if let Some(irid) = it
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            push_unique_key(&mut run_ids, irid.to_owned());
+        }
+    }
 
     Some(InspectedTurn {
         check,
         lookup_keys,
+        suppression_keys,
+        run_ids,
         next_turn_start_at: raw.next_turn_start_at,
         has_later_turn: raw.has_later_turn,
     })
