@@ -1027,7 +1027,7 @@ pub enum TerminalTurnState {
     Suppressed,
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const FAILURE_TICKET_PREFIX: &str = "fail_ticket:";
 pub const FAILURE_RESOLVED_PREFIX: &str = "fail_resolved:";
@@ -1051,6 +1051,29 @@ fn parse_failure_bind(key: &str) -> Option<(usize, &str)> {
     let (id_str, anchor) = rest.split_once(':')?;
     let id = id_str.parse::<usize>().ok()?;
     (!anchor.is_empty()).then_some((id, anchor))
+}
+
+fn collect_tickets_by_id(settled_keys: &BTreeSet<String>) -> BTreeMap<usize, Option<String>> {
+    let mut by_id: BTreeMap<usize, Option<String>> = BTreeMap::new();
+    for k in settled_keys {
+        if let Some((id, run_id)) = parse_failure_ticket(k) {
+            let entry = by_id.entry(id).or_insert(None);
+            if entry.is_none()
+                && let Some(rid) = run_id
+            {
+                *entry = Some(rid.to_owned());
+            }
+        } else if let Some((id, bound)) = parse_failure_bind(k)
+            && let Some(rid) = bound.strip_prefix("run:")
+            && !rid.is_empty()
+        {
+            let entry = by_id.entry(id).or_insert(None);
+            if entry.is_none() {
+                *entry = Some(rid.to_owned());
+            }
+        }
+    }
+    by_id
 }
 
 pub fn bind_ticket_anchor_keys(ticket_ids: &[usize], turn_keys: &[String]) -> Vec<String> {
@@ -1098,19 +1121,26 @@ pub fn next_failure_ticket_key(
     run_id: Option<&str>,
 ) -> Option<String> {
     let clean_run = run_id.filter(|s| !s.is_empty());
-    if let Some(want_run) = clean_run
-        && settled_keys
-            .iter()
-            .any(|k| parse_failure_ticket(k).is_some_and(|(_, r)| r == Some(want_run)))
-    {
-        return None;
+    let tickets_by_id = collect_tickets_by_id(settled_keys);
+    if let Some(want_run) = clean_run {
+        if settled_keys.contains(&format!("run:{want_run}"))
+            || tickets_by_id
+                .values()
+                .any(|r| r.as_deref() == Some(want_run))
+        {
+            return None;
+        }
+        if let Some((&anon_id, _)) = tickets_by_id.iter().rev().find(|(id, rid)| {
+            rid.is_none()
+                && !settled_keys.contains(&format!("{FAILURE_RESOLVED_PREFIX}{id}"))
+                && !settled_keys
+                    .iter()
+                    .any(|k| parse_failure_bind(k).is_some_and(|(bid, _)| bid == **id))
+        }) {
+            return Some(format!("{FAILURE_TICKET_PREFIX}{anon_id}:run:{want_run}"));
+        }
     }
-    let max_id = settled_keys
-        .iter()
-        .filter_map(|k| parse_failure_ticket(k).map(|(id, _)| id))
-        .max()
-        .unwrap_or(0);
-    let next_id = max_id + 1;
+    let next_id = tickets_by_id.keys().next_back().copied().unwrap_or(0) + 1;
     Some(match clean_run {
         Some(rid) => format!("{FAILURE_TICKET_PREFIX}{next_id}:run:{rid}"),
         None => format!("{FAILURE_TICKET_PREFIX}{next_id}:any"),
@@ -1140,28 +1170,21 @@ pub fn active_unmatched_tickets(
     projection: Option<&Value>,
     settled_keys: &BTreeSet<String>,
 ) -> Vec<PendingTicket> {
-    let mut tickets: Vec<PendingTicket> = settled_keys
-        .iter()
-        .filter_map(|k| {
-            let (id, run_id) = parse_failure_ticket(k)?;
+    collect_tickets_by_id(settled_keys)
+        .into_iter()
+        .filter_map(|(id, run_id)| {
             let resolved_key = format!("{FAILURE_RESOLVED_PREFIX}{id}");
             if settled_keys.contains(&resolved_key) {
                 return None;
             }
-            if let (Some(proj), Some(rid)) = (projection, run_id)
+            if let (Some(proj), Some(rid)) = (projection, run_id.as_deref())
                 && projection_contains_run_id(proj, rid)
             {
                 return None;
             }
-            Some(PendingTicket {
-                id,
-                run_id: run_id.map(str::to_owned),
-            })
+            Some(PendingTicket { id, run_id })
         })
-        .collect();
-    tickets.sort_by_key(|t| t.id);
-    tickets.dedup_by_key(|t| t.id);
-    tickets
+        .collect()
 }
 
 pub fn all_matching_run_ticket_ids(
@@ -1171,17 +1194,13 @@ pub fn all_matching_run_ticket_ids(
     if run_ids.is_empty() {
         return Vec::new();
     }
-    let mut ids: Vec<usize> = settled_keys
-        .iter()
-        .filter_map(|k| {
-            let (id, run_id) = parse_failure_ticket(k)?;
+    collect_tickets_by_id(settled_keys)
+        .into_iter()
+        .filter_map(|(id, run_id)| {
             let rid = run_id?;
-            run_ids.iter().any(|want| want == rid).then_some(id)
+            run_ids.iter().any(|want| want == &rid).then_some(id)
         })
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
+        .collect()
 }
 
 pub fn matching_run_ticket_ids_for_target(

@@ -3225,7 +3225,7 @@ impl BbBridge {
         thread: &BbThreadId,
         start_seq: Option<u64>,
         end_seq: Option<u64>,
-    ) {
+    ) -> bool {
         let mut keys = Vec::new();
         if let Some(s) = start_seq.filter(|&s| s > 0) {
             keys.push(format!("s{s}"));
@@ -3233,19 +3233,40 @@ impl BbBridge {
         if let Some(e) = end_seq.filter(|&e| e > 0) {
             keys.push(format!("e{e}"));
         }
-        if !keys.is_empty()
-            && !self
+        if !keys.is_empty() {
+            let mut committed = self
                 .try_wave_observe(
                     wave.clone(),
                     role.clone(),
                     Observation::TurnsSuppressed {
                         thread: thread.clone(),
-                        keys,
+                        keys: keys.clone(),
                     },
                 )
-                .await
-        {
-            return;
+                .await;
+            if !committed {
+                tokio::task::yield_now().await;
+                committed = self
+                    .try_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::TurnsSuppressed {
+                            thread: thread.clone(),
+                            keys,
+                        },
+                    )
+                    .await;
+            }
+            if !committed {
+                let _ = self.owner.send(OwnerMsg::SetPendingMirror {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    since_end_seq: None,
+                    mark_unknown_dirty: true,
+                });
+                return false;
+            }
         }
         let _ = self.owner.send(OwnerMsg::SuppressTurn {
             wave: wave.clone(),
@@ -3254,6 +3275,7 @@ impl BbBridge {
             start_seq,
             end_seq,
         });
+        true
     }
 
     async fn ensure_bb_journal_suppressions_hydrated(
@@ -3514,19 +3536,26 @@ impl BbBridge {
                             .or_else(|| refusal_from_latest_turn(&rows));
                         if let Some(reason) = refusal_reason {
                             let (sup_start, sup_end) = terminal_turn_bounds(&rows);
-                            self.record_suppressed_bb_turn(
-                                &wave, &role, &thread, sup_start, sup_end,
-                            )
-                            .await;
+                            if !self
+                                .record_suppressed_bb_turn(
+                                    &wave, &role, &thread, sup_start, sup_end,
+                                )
+                                .await
+                            {
+                                return;
+                            }
                             let prior_rows = rows_before_terminal_turn(&rows);
-                            let _ = self
+                            if !self
                                 .mirror_outstanding_turns_from_tail(
                                     &wave,
                                     &role,
                                     &thread,
                                     &prior_rows,
                                 )
-                                .await;
+                                .await
+                            {
+                                return;
+                            }
                             if self.is_current_live_thread(&wave, &role, &thread).await {
                                 self.call_wave_observe(
                                     wave,
@@ -3576,10 +3605,14 @@ impl BbBridge {
                                     final_model = final_model.or(rm);
                                     final_account = final_account.or(ra);
                                     let (sup_start, sup_end) = terminal_turn_bounds(&rows);
-                                    self.record_suppressed_bb_turn(
-                                        &wave, &role, &thread, sup_start, sup_end,
-                                    )
-                                    .await;
+                                    if !self
+                                        .record_suppressed_bb_turn(
+                                            &wave, &role, &thread, sup_start, sup_end,
+                                        )
+                                        .await
+                                    {
+                                        return;
+                                    }
                                     let prior_rows = rows_before_terminal_turn(&rows);
                                     let _ = self
                                         .mirror_outstanding_turns_from_tail(

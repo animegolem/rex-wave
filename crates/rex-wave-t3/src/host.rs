@@ -6,13 +6,13 @@ use crate::projects::{
     project_names_map, resolve_or_ensure_t3_project,
 };
 use crate::protocol::{
-    ExplicitFailurePlan, InspectedTurn, LiveSeqTracker, PendingTicket, ShellObservation,
-    TerminalTurnState, TurnMirrorCheck, active_pending_interaction, active_unmatched_tickets,
-    all_matching_run_ticket_ids, any_turn_inherently_suppressed, bind_ticket_anchor_keys,
-    closed_turn_count_before_ahead_failure, collect_turn_candidates_in_range,
-    default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
-    explicit_shell_suppression_keys, extract_explicit_stop_refusal, extract_refusal_reason,
-    extract_runtime_meta_from_value, force_stop_thread_payload,
+    ExplicitFailurePlan, FAILURE_TICKET_PREFIX, InspectedTurn, LiveSeqTracker, PendingTicket,
+    ShellObservation, TerminalTurnState, TurnMirrorCheck, active_pending_interaction,
+    active_unmatched_tickets, all_matching_run_ticket_ids, any_turn_inherently_suppressed,
+    bind_ticket_anchor_keys, closed_turn_count_before_ahead_failure,
+    collect_turn_candidates_in_range, default_model_from_server_config, derive_shell_observation,
+    deterministic_thread_id, explicit_shell_suppression_keys, extract_explicit_stop_refusal,
+    extract_refusal_reason, extract_runtime_meta_from_value, force_stop_thread_payload,
     inspect_closed_turns_before_ahead_failure, inspect_turns_in_order, is_t3_thread_id,
     launch_thread_payload, matching_run_ticket_ids_for_target, message_dispatch_payload,
     mirror_idem_key, next_failure_ticket_key, normalize_turn_item,
@@ -64,8 +64,16 @@ struct TrackedWorker {
     mirror_room_watermark: Seq,
     settled_turn_keys: BTreeSet<String>,
     suppressed_turn_keys: BTreeSet<String>,
+    unsaved_suppressed_keys: BTreeSet<String>,
     claimed_direct_posts: BTreeSet<Seq>,
     hydrated_suppressions: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellUpdateDisposition {
+    Processed,
+    TerminalArchived,
+    RetryNeeded,
 }
 
 type LiveWorkerRow = (WaveSlug, RoleName, BbThreadId, Activity, u64);
@@ -127,6 +135,18 @@ enum StateMsg {
         thread: BbThreadId,
         reply: oneshot::Sender<BTreeSet<String>>,
     },
+    QueueUnsavedSuppressions {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        turn_keys: Vec<String>,
+    },
+    PendingUnsavedSuppressions {
+        wave: WaveSlug,
+        role: RoleName,
+        thread: BbThreadId,
+        reply: oneshot::Sender<Vec<String>>,
+    },
     ApplyHydratedSuppressions {
         wave: WaveSlug,
         role: RoleName,
@@ -175,6 +195,7 @@ impl StateOwner {
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
                             suppressed_turn_keys: BTreeSet::new(),
+                            unsaved_suppressed_keys: BTreeSet::new(),
                             claimed_direct_posts: BTreeSet::new(),
                             hydrated_suppressions: false,
                         });
@@ -183,6 +204,7 @@ impl StateOwner {
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
                         rec.suppressed_turn_keys.clear();
+                        rec.unsaved_suppressed_keys.clear();
                         rec.claimed_direct_posts.clear();
                         rec.hydrated_suppressions = false;
                     }
@@ -273,6 +295,7 @@ impl StateOwner {
                         for k in turn_keys {
                             if !k.is_empty() {
                                 if mark_suppressed {
+                                    rec.unsaved_suppressed_keys.remove(&k);
                                     rec.suppressed_turn_keys.insert(k.clone());
                                 }
                                 rec.settled_turn_keys.insert(k);
@@ -311,6 +334,36 @@ impl StateOwner {
                     };
                     let _ = reply.send(keys);
                 }
+                StateMsg::QueueUnsavedSuppressions {
+                    wave,
+                    role,
+                    thread,
+                    turn_keys,
+                } => {
+                    if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
+                        && rec.thread.as_ref() == Some(&thread)
+                    {
+                        for k in turn_keys {
+                            if !k.is_empty() && !rec.suppressed_turn_keys.contains(&k) {
+                                rec.unsaved_suppressed_keys.insert(k);
+                            }
+                        }
+                    }
+                }
+                StateMsg::PendingUnsavedSuppressions {
+                    wave,
+                    role,
+                    thread,
+                    reply,
+                } => {
+                    let pending = match self.workers_by_role.get(&(wave, role)) {
+                        Some(rec) if rec.thread.as_ref() == Some(&thread) => {
+                            rec.unsaved_suppressed_keys.iter().cloned().collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let _ = reply.send(pending);
+                }
                 StateMsg::ApplyHydratedSuppressions {
                     wave,
                     role,
@@ -322,6 +375,7 @@ impl StateOwner {
                     {
                         for k in turn_keys {
                             if !k.is_empty() {
+                                rec.unsaved_suppressed_keys.remove(&k);
                                 rec.suppressed_turn_keys.insert(k.clone());
                                 rec.settled_turn_keys.insert(k);
                             }
@@ -357,6 +411,7 @@ impl StateOwner {
                         mirror_room_watermark: Seq::ORIGIN,
                         settled_turn_keys: BTreeSet::new(),
                         suppressed_turn_keys: BTreeSet::new(),
+                        unsaved_suppressed_keys: BTreeSet::new(),
                         claimed_direct_posts: BTreeSet::new(),
                         hydrated_suppressions: false,
                     },
@@ -376,6 +431,7 @@ impl StateOwner {
                             rec.mirror_room_watermark = Seq::ORIGIN;
                             rec.settled_turn_keys.clear();
                             rec.suppressed_turn_keys.clear();
+                            rec.unsaved_suppressed_keys.clear();
                             rec.claimed_direct_posts.clear();
                             rec.hydrated_suppressions = false;
                         }
@@ -402,6 +458,7 @@ impl StateOwner {
                             mirror_room_watermark: Seq::ORIGIN,
                             settled_turn_keys: BTreeSet::new(),
                             suppressed_turn_keys: BTreeSet::new(),
+                            unsaved_suppressed_keys: BTreeSet::new(),
                             claimed_direct_posts: BTreeSet::new(),
                             hydrated_suppressions: false,
                         });
@@ -410,6 +467,7 @@ impl StateOwner {
                         rec.mirror_room_watermark = Seq::ORIGIN;
                         rec.settled_turn_keys.clear();
                         rec.suppressed_turn_keys.clear();
+                        rec.unsaved_suppressed_keys.clear();
                         rec.claimed_direct_posts.clear();
                         rec.hydrated_suppressions = false;
                     }
@@ -449,6 +507,7 @@ impl StateOwner {
                     {
                         for k in keys {
                             if !k.is_empty() {
+                                rec.unsaved_suppressed_keys.remove(&k);
                                 rec.suppressed_turn_keys.insert(k.clone());
                                 rec.settled_turn_keys.insert(k);
                             }
@@ -739,8 +798,14 @@ impl T3Bridge {
                     StreamEvent::Closed(_) => break,
                     StreamEvent::Values(values) => {
                         for val in values {
-                            self.handle_shell_item(&val, &mut last_seq, &lease, &mut per_thread)
-                                .await;
+                            self.handle_shell_item(
+                                &val,
+                                &mut last_seq,
+                                &lease,
+                                &mut per_thread,
+                                &shutdown,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -766,6 +831,7 @@ impl T3Bridge {
         last_seq: &mut Option<u64>,
         lease: &crate::rpc::RpcStreamLease,
         per_thread: &mut HashMap<BbThreadId, mpsc::UnboundedSender<ThreadShellAction>>,
+        shutdown: &watch::Receiver<bool>,
     ) {
         let Some(kind) = item.get("kind").and_then(|v| v.as_str()) else {
             return;
@@ -781,12 +847,22 @@ impl T3Bridge {
                     self.replace_or_merge_project_names(&projects, true);
                     if let Some(threads) = snap.get("threads").and_then(|v| v.as_array()) {
                         for th in threads {
-                            self.enqueue_shell_thread(per_thread, Some("active"), th.clone());
+                            self.enqueue_shell_thread(
+                                per_thread,
+                                Some("active"),
+                                th.clone(),
+                                shutdown,
+                            );
                         }
                     }
                     if let Some(archived) = snap.get("archivedThreads").and_then(|v| v.as_array()) {
                         for th in archived {
-                            self.enqueue_shell_thread(per_thread, Some("archive"), th.clone());
+                            self.enqueue_shell_thread(
+                                per_thread,
+                                Some("archive"),
+                                th.clone(),
+                                shutdown,
+                            );
                         }
                     }
                 }
@@ -822,7 +898,7 @@ impl T3Bridge {
                 }
                 let loc = item.get("location").and_then(|v| v.as_str());
                 if let Some(th) = item.get("thread") {
-                    self.enqueue_shell_thread(per_thread, loc, th.clone());
+                    self.enqueue_shell_thread(per_thread, loc, th.clone(), shutdown);
                 }
             }
             "thread.removed" => {
@@ -834,7 +910,12 @@ impl T3Bridge {
                     && let Ok(tid) = BbThreadId::parse(id_raw)
                     && is_t3_thread_id(&tid)
                 {
-                    self.enqueue_thread_action(per_thread, tid, ThreadShellAction::Removed);
+                    self.enqueue_thread_action(
+                        per_thread,
+                        tid,
+                        ThreadShellAction::Removed,
+                        shutdown,
+                    );
                 }
             }
             _ => {}
@@ -846,6 +927,7 @@ impl T3Bridge {
         per_thread: &mut HashMap<BbThreadId, mpsc::UnboundedSender<ThreadShellAction>>,
         location: Option<&str>,
         shell: Value,
+        shutdown: &watch::Receiver<bool>,
     ) {
         let Some(id_raw) = shell.get("id").and_then(|v| v.as_str()) else {
             return;
@@ -863,6 +945,7 @@ impl T3Bridge {
                 location: location.map(str::to_owned),
                 shell,
             },
+            shutdown,
         );
     }
 
@@ -872,6 +955,7 @@ impl T3Bridge {
         per_thread: &mut HashMap<BbThreadId, mpsc::UnboundedSender<ThreadShellAction>>,
         thread: BbThreadId,
         action: ThreadShellAction,
+        shutdown: &watch::Receiver<bool>,
     ) {
         let pending = match per_thread.get(&thread) {
             Some(tx) => match tx.send(action) {
@@ -881,7 +965,7 @@ impl T3Bridge {
             None => action,
         };
         per_thread.remove(&thread);
-        let tx = self.ensure_thread_queue(per_thread, thread);
+        let tx = self.ensure_thread_queue(per_thread, thread, shutdown);
         let _ = tx.send(pending);
     }
 
@@ -889,6 +973,7 @@ impl T3Bridge {
         self: &Arc<Self>,
         per_thread: &mut HashMap<BbThreadId, mpsc::UnboundedSender<ThreadShellAction>>,
         thread: BbThreadId,
+        shutdown: &watch::Receiver<bool>,
     ) -> mpsc::UnboundedSender<ThreadShellAction> {
         per_thread.retain(|_, tx| !tx.is_closed());
         if let Some(tx) = per_thread.get(&thread) {
@@ -897,17 +982,46 @@ impl T3Bridge {
         let (tx, mut rx) = mpsc::unbounded_channel::<ThreadShellAction>();
         let bridge = self.clone();
         let tid = thread.clone();
+        let mut thread_shutdown = shutdown.clone();
         tokio::spawn(async move {
             while let Some(action) = rx.recv().await {
-                let done = match action {
-                    ThreadShellAction::Updated { location, shell } => {
-                        bridge
-                            .process_thread_shell_update(&tid, location.as_deref(), &shell)
-                            .await
+                let mut retry_attempt = 0u32;
+                let done = loop {
+                    if *thread_shutdown.borrow() {
+                        break true;
                     }
-                    ThreadShellAction::Removed => {
-                        bridge.process_thread_removed(&tid).await;
-                        true
+                    let disp = match &action {
+                        ThreadShellAction::Updated { location, shell } => {
+                            bridge
+                                .process_thread_shell_update(&tid, location.as_deref(), shell)
+                                .await
+                        }
+                        ThreadShellAction::Removed => {
+                            if bridge.process_thread_removed(&tid).await {
+                                ShellUpdateDisposition::TerminalArchived
+                            } else {
+                                ShellUpdateDisposition::RetryNeeded
+                            }
+                        }
+                    };
+                    match disp {
+                        ShellUpdateDisposition::Processed => break false,
+                        ShellUpdateDisposition::TerminalArchived => break true,
+                        ShellUpdateDisposition::RetryNeeded => {
+                            retry_attempt = retry_attempt.saturating_add(1);
+                            if retry_attempt == 1 {
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            tokio::select! {
+                                changed = thread_shutdown.changed() => {
+                                    if changed.is_err() || *thread_shutdown.borrow() {
+                                        break true;
+                                    }
+                                }
+                                () = tokio::time::sleep(std::time::Duration::from_millis(15)) => {}
+                            }
+                        }
                     }
                 };
                 if done {
@@ -1020,17 +1134,22 @@ impl T3Bridge {
         self.rpc.http_get_json(&path).await
     }
 
-    async fn process_thread_removed(&self, thread: &BbThreadId) {
-        self.unlink_worker_token(thread);
+    async fn process_thread_removed(&self, thread: &BbThreadId) -> bool {
         if let Some((wave, role, _, _)) = self.resolve_worker_identity(thread).await {
             let _ = self.state.send(StateMsg::BumpShellEpoch {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
             });
-            self.call_wave_observe(wave, role, Observation::Archived)
-                .await;
+            if !self
+                .try_wave_observe(wave, role, Observation::Archived)
+                .await
+            {
+                return false;
+            }
         }
+        self.unlink_worker_token(thread);
+        true
     }
 
     async fn current_shell_epoch(
@@ -1077,13 +1196,13 @@ impl T3Bridge {
         thread: &BbThreadId,
         location: Option<&str>,
         shell: &Value,
-    ) -> bool {
+    ) -> ShellUpdateDisposition {
         let Some(obs) = derive_shell_observation(shell, location) else {
-            return false;
+            return ShellUpdateDisposition::Processed;
         };
         let Some((wave, role, attempt, retiring)) = self.resolve_worker_identity(thread).await
         else {
-            return false;
+            return ShellUpdateDisposition::Processed;
         };
         let _ = self.state.send(StateMsg::BumpShellEpoch {
             wave: wave.clone(),
@@ -1092,21 +1211,29 @@ impl T3Bridge {
         });
         if retiring {
             if matches!(obs, ShellObservation::Archived) {
+                if !self
+                    .try_wave_observe(wave, role, Observation::Archived)
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
                 self.unlink_worker_token(thread);
-                self.call_wave_observe(wave, role, Observation::Archived)
-                    .await;
-                return true;
+                return ShellUpdateDisposition::TerminalArchived;
             }
-            return false;
+            return ShellUpdateDisposition::Processed;
         }
         let (shell_model, shell_account) = extract_runtime_meta_from_value(shell);
 
         match obs {
             ShellObservation::Archived => {
+                if !self
+                    .try_wave_observe(wave, role, Observation::Archived)
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
                 self.unlink_worker_token(thread);
-                self.call_wave_observe(wave, role, Observation::Archived)
-                    .await;
-                true
+                ShellUpdateDisposition::TerminalArchived
             }
             ShellObservation::Blocked {
                 request_id,
@@ -1130,17 +1257,21 @@ impl T3Bridge {
                         )
                     });
                 let Some(interaction) = interaction else {
-                    return false;
+                    return ShellUpdateDisposition::Processed;
                 };
-                self.call_wave_observe(
-                    wave.clone(),
-                    role.clone(),
-                    Observation::Spawned {
-                        attempt,
-                        thread: thread.clone(),
-                    },
-                )
-                .await;
+                if !self
+                    .try_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Spawned {
+                            attempt,
+                            thread: thread.clone(),
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
                 let (proj_model, proj_account) = projection
                     .as_ref()
                     .map(extract_runtime_meta_from_value)
@@ -1152,99 +1283,130 @@ impl T3Bridge {
                     proj_account.or(shell_account),
                 )
                 .await;
-                if let Some(proj) = projection.as_ref() {
-                    self.mirror_turns_from_projection(
+                if let Some(proj) = projection.as_ref()
+                    && !self
+                        .mirror_turns_from_projection(
+                            &wave,
+                            &role,
+                            thread,
+                            Some(shell),
+                            proj,
+                            TerminalTurnState::InProgress,
+                        )
+                        .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                if !self
+                    .try_wave_observe(
+                        wave,
+                        role,
+                        Observation::Activity {
+                            activity: Activity::Blocked { interaction },
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                ShellUpdateDisposition::Processed
+            }
+            ShellObservation::Working => {
+                if !self
+                    .try_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Spawned {
+                            attempt,
+                            thread: thread.clone(),
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
+                    .await;
+                if !self
+                    .try_wave_observe(
+                        wave,
+                        role,
+                        Observation::Activity {
+                            activity: Activity::Working,
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                ShellUpdateDisposition::Processed
+            }
+            ShellObservation::Refused(reason) => {
+                if !self
+                    .try_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Spawned {
+                            attempt,
+                            thread: thread.clone(),
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                let fetched_proj = self.fetch_thread_projection(thread).await.ok();
+                let (proj_model, proj_account) = fetched_proj
+                    .as_ref()
+                    .map(extract_runtime_meta_from_value)
+                    .unwrap_or((None, None));
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    proj_model.or(shell_model),
+                    proj_account.or(shell_account),
+                )
+                .await;
+                if !self
+                    .handle_shell_failure_projection(
                         &wave,
                         &role,
                         thread,
-                        Some(shell),
-                        proj,
-                        TerminalTurnState::InProgress,
+                        shell,
+                        fetched_proj.as_ref(),
                     )
-                    .await;
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
                 }
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Blocked { interaction },
-                    },
-                )
-                .await;
-                false
-            }
-            ShellObservation::Working => {
-                self.call_wave_observe(
-                    wave.clone(),
-                    role.clone(),
-                    Observation::Spawned {
-                        attempt,
-                        thread: thread.clone(),
-                    },
-                )
-                .await;
-                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
-                    .await;
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Working,
-                    },
-                )
-                .await;
-                false
-            }
-            ShellObservation::Refused(reason) => {
-                self.call_wave_observe(
-                    wave.clone(),
-                    role.clone(),
-                    Observation::Spawned {
-                        attempt,
-                        thread: thread.clone(),
-                    },
-                )
-                .await;
-                let fetched_proj = self.fetch_thread_projection(thread).await.ok();
-                let (proj_model, proj_account) = fetched_proj
-                    .as_ref()
-                    .map(extract_runtime_meta_from_value)
-                    .unwrap_or((None, None));
-                self.observe_runtime_meta_if_present(
-                    &wave,
-                    &role,
-                    proj_model.or(shell_model),
-                    proj_account.or(shell_account),
-                )
-                .await;
-                self.handle_shell_failure_projection(
-                    &wave,
-                    &role,
-                    thread,
-                    shell,
-                    fetched_proj.as_ref(),
-                )
-                .await;
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Refused { reason },
-                    },
-                )
-                .await;
-                false
+                if !self
+                    .try_wave_observe(
+                        wave,
+                        role,
+                        Observation::Activity {
+                            activity: Activity::Refused { reason },
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                ShellUpdateDisposition::Processed
             }
             ShellObservation::Errored(error) => {
-                self.call_wave_observe(
-                    wave.clone(),
-                    role.clone(),
-                    Observation::Spawned {
-                        attempt,
-                        thread: thread.clone(),
-                    },
-                )
-                .await;
+                if !self
+                    .try_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Spawned {
+                            attempt,
+                            thread: thread.clone(),
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
                 let fetched_proj = self.fetch_thread_projection(thread).await.ok();
                 let (proj_model, proj_account) = fetched_proj
                     .as_ref()
@@ -1257,34 +1419,46 @@ impl T3Bridge {
                     proj_account.or(shell_account),
                 )
                 .await;
-                self.handle_shell_failure_projection(
-                    &wave,
-                    &role,
-                    thread,
-                    shell,
-                    fetched_proj.as_ref(),
-                )
-                .await;
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Errored { error },
-                    },
-                )
-                .await;
-                false
+                if !self
+                    .handle_shell_failure_projection(
+                        &wave,
+                        &role,
+                        thread,
+                        shell,
+                        fetched_proj.as_ref(),
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                if !self
+                    .try_wave_observe(
+                        wave,
+                        role,
+                        Observation::Activity {
+                            activity: Activity::Errored { error },
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
+                ShellUpdateDisposition::Processed
             }
             ShellObservation::Idle { mirror_candidate } => {
-                self.call_wave_observe(
-                    wave.clone(),
-                    role.clone(),
-                    Observation::Spawned {
-                        attempt,
-                        thread: thread.clone(),
-                    },
-                )
-                .await;
+                if !self
+                    .try_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::Spawned {
+                            attempt,
+                            thread: thread.clone(),
+                        },
+                    )
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
+                }
                 let fetched_proj = self.fetch_thread_projection(thread).await.ok();
                 let (proj_model, proj_account) = fetched_proj
                     .as_ref()
@@ -1298,64 +1472,88 @@ impl T3Bridge {
                 )
                 .await;
                 if !mirror_candidate {
-                    self.handle_shell_failure_projection(
-                        &wave,
-                        &role,
-                        thread,
-                        shell,
-                        fetched_proj.as_ref(),
-                    )
-                    .await;
-                    self.call_wave_observe(
+                    if !self
+                        .handle_shell_failure_projection(
+                            &wave,
+                            &role,
+                            thread,
+                            shell,
+                            fetched_proj.as_ref(),
+                        )
+                        .await
+                    {
+                        return ShellUpdateDisposition::RetryNeeded;
+                    }
+                    if !self
+                        .try_wave_observe(
+                            wave,
+                            role,
+                            Observation::Activity {
+                                activity: Activity::Idle,
+                            },
+                        )
+                        .await
+                    {
+                        return ShellUpdateDisposition::RetryNeeded;
+                    }
+                    return ShellUpdateDisposition::Processed;
+                }
+                if let Some(proj) = fetched_proj.as_ref() {
+                    let unwrapped = unwrap_projection(proj);
+                    match derive_activity_from_projection(unwrapped) {
+                        Some(activity @ (Activity::Refused { .. } | Activity::Errored { .. })) => {
+                            if !self
+                                .mirror_turns_from_projection(
+                                    &wave,
+                                    &role,
+                                    thread,
+                                    Some(shell),
+                                    unwrapped,
+                                    TerminalTurnState::Suppressed,
+                                )
+                                .await
+                            {
+                                return ShellUpdateDisposition::RetryNeeded;
+                            }
+                            if !self
+                                .try_wave_observe(wave, role, Observation::Activity { activity })
+                                .await
+                            {
+                                return ShellUpdateDisposition::RetryNeeded;
+                            }
+                            return ShellUpdateDisposition::Processed;
+                        }
+                        _ => {
+                            let terminal_state = classify_projection_terminal_state(unwrapped);
+                            if !self
+                                .mirror_turns_from_projection(
+                                    &wave,
+                                    &role,
+                                    thread,
+                                    Some(shell),
+                                    unwrapped,
+                                    terminal_state,
+                                )
+                                .await
+                            {
+                                return ShellUpdateDisposition::RetryNeeded;
+                            }
+                        }
+                    }
+                }
+                if !self
+                    .try_wave_observe(
                         wave,
                         role,
                         Observation::Activity {
                             activity: Activity::Idle,
                         },
                     )
-                    .await;
-                    return false;
+                    .await
+                {
+                    return ShellUpdateDisposition::RetryNeeded;
                 }
-                if let Some(proj) = fetched_proj.as_ref() {
-                    let unwrapped = unwrap_projection(proj);
-                    match derive_activity_from_projection(unwrapped) {
-                        Some(activity @ (Activity::Refused { .. } | Activity::Errored { .. })) => {
-                            self.mirror_turns_from_projection(
-                                &wave,
-                                &role,
-                                thread,
-                                Some(shell),
-                                unwrapped,
-                                TerminalTurnState::Suppressed,
-                            )
-                            .await;
-                            self.call_wave_observe(wave, role, Observation::Activity { activity })
-                                .await;
-                            return false;
-                        }
-                        _ => {
-                            let terminal_state = classify_projection_terminal_state(unwrapped);
-                            self.mirror_turns_from_projection(
-                                &wave,
-                                &role,
-                                thread,
-                                Some(shell),
-                                unwrapped,
-                                terminal_state,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                self.call_wave_observe(
-                    wave,
-                    role,
-                    Observation::Activity {
-                        activity: Activity::Idle,
-                    },
-                )
-                .await;
-                false
+                ShellUpdateDisposition::Processed
             }
         }
     }
@@ -1381,6 +1579,12 @@ impl T3Bridge {
             )
             .await
         {
+            let _ = self.state.send(StateMsg::QueueUnsavedSuppressions {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+                turn_keys: keys,
+            });
             return false;
         }
         let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
@@ -1403,7 +1607,12 @@ impl T3Bridge {
         suppression_keys: Vec<String>,
         run_ids: &[String],
     ) -> bool {
-        let suppressed_set = self.settled_turn_keys_locked(wave, role, thread).await;
+        let Some(suppressed_set) = self
+            .flush_and_settled_turn_keys_locked(wave, role, thread)
+            .await
+        else {
+            return false;
+        };
         let all_run_tids = all_matching_run_ticket_ids(&suppressed_set, run_ids);
         let unresolved_run_ids = matching_run_ticket_ids_for_target(&suppressed_set, run_ids);
         let bound_keys = bind_ticket_anchor_keys(&all_run_tids, &suppression_keys);
@@ -1425,15 +1634,34 @@ impl T3Bridge {
             .await
     }
 
-    async fn settled_turn_keys_locked(
+    async fn flush_and_settled_turn_keys_locked(
         &self,
         wave: &WaveSlug,
         role: &RoleName,
         thread: &BbThreadId,
-    ) -> BTreeSet<String> {
-        let _ = self
+    ) -> Option<BTreeSet<String>> {
+        if !self
             .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
-            .await;
+            .await
+            && self.backend.get().is_some()
+        {
+            return None;
+        }
+        let (u_tx, u_rx) = oneshot::channel();
+        let _ = self.state.send(StateMsg::PendingUnsavedSuppressions {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            reply: u_tx,
+        });
+        let unsaved = u_rx.await.unwrap_or_default();
+        if !unsaved.is_empty()
+            && !self
+                .record_suppressed_keys_locked(wave, role, thread, unsaved)
+                .await
+        {
+            return None;
+        }
         let (sk_tx, sk_rx) = oneshot::channel();
         let _ = self.state.send(StateMsg::SettledTurnKeys {
             wave: wave.clone(),
@@ -1441,7 +1669,7 @@ impl T3Bridge {
             thread: thread.clone(),
             reply: sk_tx,
         });
-        sk_rx.await.unwrap_or_default()
+        Some(sk_rx.await.unwrap_or_default())
     }
 
     async fn handle_shell_failure_projection(
@@ -1451,11 +1679,16 @@ impl T3Bridge {
         thread: &BbThreadId,
         shell: &Value,
         fetched_proj: Option<&Value>,
-    ) {
+    ) -> bool {
         let (explicit_run_id, explicit_item_count) = shell_explicit_turn_target(shell);
         let Some(proj) = fetched_proj else {
             let _mirror_guard = self.mirror_lock.lock().await;
-            let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
+            let Some(settled_keys) = self
+                .flush_and_settled_turn_keys_locked(wave, role, thread)
+                .await
+            else {
+                return false;
+            };
             let mut keys =
                 explicit_shell_suppression_keys(explicit_run_id.as_deref(), explicit_item_count);
             if explicit_item_count.is_none()
@@ -1464,10 +1697,9 @@ impl T3Bridge {
             {
                 keys.push(ticket);
             }
-            let _ = self
+            return self
                 .record_suppressed_keys_locked(wave, role, thread, keys)
                 .await;
-            return;
         };
 
         let unwrapped = unwrap_projection(proj);
@@ -1479,7 +1711,12 @@ impl T3Bridge {
             explicit_item_count,
         ) {
             let _mirror_guard = self.mirror_lock.lock().await;
-            let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
+            let Some(settled_keys) = self
+                .flush_and_settled_turn_keys_locked(wave, role, thread)
+                .await
+            else {
+                return false;
+            };
             let active_tickets = active_unmatched_tickets(Some(unwrapped), &settled_keys);
             let mut anchors = projection_run_ticket_anchors(unwrapped, &settled_keys);
             match plan {
@@ -1494,7 +1731,7 @@ impl T3Bridge {
                         .record_suppressed_keys_locked(wave, role, thread, explicit_keys)
                         .await
                     {
-                        return;
+                        return false;
                     }
                     let closed_end = closed_turn_count_before_ahead_failure(
                         unwrapped,
@@ -1507,14 +1744,15 @@ impl T3Bridge {
                         &active_tickets,
                         &anchors,
                     ) {
-                        return;
+                        return true;
                     }
                     let checks = inspect_closed_turns_before_ahead_failure(
                         unwrapped,
                         explicit_run_id.as_deref(),
                         explicit_item_count,
                     );
-                    self.execute_inspected_turns_locked(wave, role, thread, checks)
+                    return self
+                        .execute_inspected_turns_locked(wave, role, thread, checks)
                         .await;
                 }
                 ExplicitFailurePlan::Matched {
@@ -1593,7 +1831,7 @@ impl T3Bridge {
                             )
                             .await
                         else {
-                            return;
+                            return false;
                         };
                         pre_tickets.retain(|t| !consumed.contains(&t.id));
                     }
@@ -1618,6 +1856,11 @@ impl T3Bridge {
                         && let Some(target_turn) = turns.iter_mut().find(|t| t.pos == target_pos)
                     {
                         let mut extra = resolve_ticket_ids(&target_resolved_ids);
+                        if let Some(erid) = explicit_run_id.as_deref().filter(|s| !s.is_empty()) {
+                            for &tid in &target_ticket_ids {
+                                extra.push(format!("{FAILURE_TICKET_PREFIX}{tid}:run:{erid}"));
+                            }
+                        }
                         extra.extend(bind_ticket_anchor_keys(
                             &target_ticket_ids,
                             &target_turn.suppression_keys,
@@ -1637,16 +1880,16 @@ impl T3Bridge {
                         }
                     }
 
-                    self.execute_inspected_turns_locked(wave, role, thread, turns)
+                    return self
+                        .execute_inspected_turns_locked(wave, role, thread, turns)
                         .await;
                 }
             }
-            return;
         }
 
         if projection_advanced_past_failure(unwrapped) {
             self.suppress_lagged_preterminal_failure(wave, role, thread, shell, unwrapped)
-                .await;
+                .await
         } else {
             self.mirror_turns_from_projection(
                 wave,
@@ -1656,7 +1899,7 @@ impl T3Bridge {
                 unwrapped,
                 TerminalTurnState::Suppressed,
             )
-            .await;
+            .await
         }
     }
 
@@ -2064,33 +2307,38 @@ impl T3Bridge {
         thread: &BbThreadId,
         shell: &Value,
         unwrapped_projection: &Value,
-    ) {
+    ) -> bool {
         let _mirror_guard = self.mirror_lock.lock().await;
-        let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
+        let Some(settled_keys) = self
+            .flush_and_settled_turn_keys_locked(wave, role, thread)
+            .await
+        else {
+            return false;
+        };
         let slot_count = projection_turn_slot_count(unwrapped_projection);
         if slot_count < 2 {
-            return;
+            return true;
         }
         let active_tickets = active_unmatched_tickets(Some(unwrapped_projection), &settled_keys);
         let anchors = projection_run_ticket_anchors(unwrapped_projection, &settled_keys);
         let (explicit_run_id, explicit_item_count) = shell_explicit_turn_target(shell);
-        let _ = self
-            .suppress_turns_in_range_locked(
-                wave,
-                role,
-                thread,
-                unwrapped_projection,
-                0,
-                slot_count - 1,
-                explicit_run_id.as_deref(),
-                explicit_item_count,
-                true,
-                true,
-                &active_tickets,
-                1,
-                &anchors,
-            )
-            .await;
+        self.suppress_turns_in_range_locked(
+            wave,
+            role,
+            thread,
+            unwrapped_projection,
+            0,
+            slot_count - 1,
+            explicit_run_id.as_deref(),
+            explicit_item_count,
+            true,
+            true,
+            &active_tickets,
+            1,
+            &anchors,
+        )
+        .await
+        .is_some()
     }
 
     async fn mirror_turns_from_projection(
@@ -2101,9 +2349,14 @@ impl T3Bridge {
         shell_hint: Option<&Value>,
         projection: &Value,
         terminal_state: TerminalTurnState,
-    ) {
+    ) -> bool {
         let _mirror_guard = self.mirror_lock.lock().await;
-        let settled_keys = self.settled_turn_keys_locked(wave, role, thread).await;
+        let Some(settled_keys) = self
+            .flush_and_settled_turn_keys_locked(wave, role, thread)
+            .await
+        else {
+            return false;
+        };
         let unwrapped = unwrap_projection(projection);
         let active_tickets = active_unmatched_tickets(Some(unwrapped), &settled_keys);
         let anchors = projection_run_ticket_anchors(unwrapped, &settled_keys);
@@ -2128,16 +2381,16 @@ impl T3Bridge {
                 &active_tickets,
                 &anchors,
             ) {
-                return;
+                return true;
             }
             let checks = inspect_closed_turns_before_ahead_failure(
                 unwrapped,
                 ahead_run_id.as_deref(),
                 ahead_item_count,
             );
-            self.execute_inspected_turns_locked(wave, role, thread, checks)
+            return self
+                .execute_inspected_turns_locked(wave, role, thread, checks)
                 .await;
-            return;
         }
         let slot_count = projection_turn_slot_count(unwrapped);
         if !active_tickets.is_empty() {
@@ -2160,7 +2413,7 @@ impl T3Bridge {
                     )
                     .await
                 else {
-                    return;
+                    return false;
                 };
                 consumed
             } else {
@@ -2196,7 +2449,7 @@ impl T3Bridge {
                         )
                         .await
                     else {
-                        return;
+                        return false;
                     };
                     remaining_tickets.retain(|t| !consumed_term.contains(&t.id));
                 }
@@ -2207,12 +2460,12 @@ impl T3Bridge {
                 &remaining_tickets,
                 &anchors,
             ) {
-                return;
+                return true;
             }
         }
         let checks = inspect_turns_in_order(unwrapped, terminal_state);
         self.execute_inspected_turns_locked(wave, role, thread, checks)
-            .await;
+            .await
     }
 
     async fn execute_inspected_turns_locked(
@@ -2221,19 +2474,19 @@ impl T3Bridge {
         role: &RoleName,
         thread: &BbThreadId,
         checks: Vec<InspectedTurn>,
-    ) {
+    ) -> bool {
         if checks.is_empty() {
-            return;
+            return true;
         }
         let Some(backend) = self.backend.get() else {
-            return;
+            return true;
         };
         let sys = self.cfg.system_principal.clone();
         let Ok(WireReply::WaveView(snap)) = backend
             .call_as(sys.clone(), WaveView { wave: wave.clone() }.into_wire())
             .await
         else {
-            return;
+            return false;
         };
         let room = rex_wave_waves::wave_room(wave, &snap.spec.project);
         let worker_principal = Principal::Worker {
@@ -2293,7 +2546,7 @@ impl T3Bridge {
                         )
                         .await
                 {
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -2395,7 +2648,13 @@ impl T3Bridge {
                             )
                             .await
                     {
-                        return;
+                        let _ = self.state.send(StateMsg::QueueUnsavedSuppressions {
+                            wave: wave.clone(),
+                            role: role.clone(),
+                            thread: thread.clone(),
+                            turn_keys,
+                        });
+                        return false;
                     }
                     settle_turn(watermark, turn_keys, true, suppressed_claimed);
                     continue;
@@ -2415,7 +2674,7 @@ impl T3Bridge {
                             )
                             .await
                         else {
-                            return;
+                            return false;
                         };
                         let Some(last) = page.entries.last() else {
                             tool_reached_end = true;
@@ -2519,7 +2778,7 @@ impl T3Bridge {
                     )
                     .await
                 else {
-                    return;
+                    return false;
                 };
                 let Some(last) = page.entries.last() else {
                     reached_end = true;
@@ -2597,7 +2856,7 @@ impl T3Bridge {
             }
 
             if !already_posted && !reached_end {
-                return;
+                return false;
             }
 
             if already_posted {
@@ -2653,9 +2912,10 @@ impl T3Bridge {
                     };
                 settle_turn(posted_head, turn_keys, false, vec![posted.seq]);
             } else {
-                return;
+                return false;
             }
         }
+        true
     }
 
     async fn reconcile_live_workers(&self) {
@@ -2709,16 +2969,18 @@ impl T3Bridge {
                 let (proj_model, proj_account) = extract_runtime_meta_from_value(proj);
                 self.observe_runtime_meta_if_present(&wave, &role, proj_model, proj_account)
                     .await;
-                self.mirror_turns_from_projection(
-                    &wave,
-                    &role,
-                    &thread,
-                    None,
-                    proj,
-                    TerminalTurnState::InProgress,
-                )
-                .await;
-                if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
+                if self
+                    .mirror_turns_from_projection(
+                        &wave,
+                        &role,
+                        &thread,
+                        None,
+                        proj,
+                        TerminalTurnState::InProgress,
+                    )
+                    .await
+                    && self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch)
+                {
                     self.call_wave_observe(
                         wave,
                         role,
@@ -2746,16 +3008,11 @@ impl T3Bridge {
             }
             if let Some(activity) = derived {
                 let terminal_state = classify_projection_terminal_state(proj);
-                self.mirror_turns_from_projection(
-                    &wave,
-                    &role,
-                    &thread,
-                    None,
-                    proj,
-                    terminal_state,
-                )
-                .await;
-                if self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch) {
+                if self
+                    .mirror_turns_from_projection(&wave, &role, &thread, None, proj, terminal_state)
+                    .await
+                    && self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch)
+                {
                     self.call_wave_observe(wave, role, Observation::Activity { activity })
                         .await;
                 }
@@ -3054,6 +3311,7 @@ impl T3Bridge {
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
                                 suppressed_turn_keys: BTreeSet::new(),
+                                unsaved_suppressed_keys: BTreeSet::new(),
                                 claimed_direct_posts: BTreeSet::new(),
                                 hydrated_suppressions: false,
                             })
@@ -3075,6 +3333,7 @@ impl T3Bridge {
                                 mirror_room_watermark: Seq::ORIGIN,
                                 settled_turn_keys: BTreeSet::new(),
                                 suppressed_turn_keys: BTreeSet::new(),
+                                unsaved_suppressed_keys: BTreeSet::new(),
                                 claimed_direct_posts: BTreeSet::new(),
                                 hydrated_suppressions: false,
                             })
