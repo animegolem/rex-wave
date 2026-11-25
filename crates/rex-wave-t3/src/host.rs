@@ -11,12 +11,13 @@ use crate::protocol::{
     collect_preterminal_turn_candidates, default_model_from_server_config,
     derive_shell_observation, deterministic_thread_id, explicit_shell_suppression_keys,
     extract_explicit_stop_refusal, extract_refusal_reason, extract_runtime_meta_from_value,
-    force_stop_thread_payload, inspect_turns_in_order, is_t3_thread_id, launch_thread_payload,
-    message_dispatch_payload, mirror_idem_key, normalize_turn_item,
-    parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
-    plan_explicit_failure_turns, projection_turn_slot_count, runtime_request_respond_payload,
-    shell_explicit_turn_target, strip_t3_provider_prefix, thread_archive_payload,
-    thread_stop_payload, unwrap_projection,
+    force_stop_thread_payload, inspect_closed_turns_before_ahead_failure, inspect_turns_in_order,
+    is_t3_thread_id, launch_thread_payload, message_dispatch_payload, mirror_idem_key,
+    normalize_turn_item, parse_pending_interaction_from_projection, parse_provider_turns_usage,
+    parse_t3_thread_id, plan_explicit_failure_turns, projection_turn_slot_count,
+    runtime_request_respond_payload, shell_explicit_turn_target, strip_t3_provider_prefix,
+    terminal_suppressed_lookup_keys, thread_archive_payload, thread_stop_payload,
+    unwrap_projection,
 };
 use crate::rpc::{StreamEvent, T3RpcClient};
 use crate::worker_tokens::{WorkerTokenMinter, provision_worker_token, remove_worker_token_file};
@@ -1405,15 +1406,9 @@ impl T3Bridge {
             explicit_item_count,
         ) {
             let _mirror_guard = self.mirror_lock.lock().await;
-            let pending_unattributed = self
+            let _ = self
                 .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
                 .await;
-            if pending_unattributed && projection_turn_slot_count(unwrapped) >= 2 {
-                self.suppress_lagged_preterminal_failure_locked(
-                    wave, role, thread, None, unwrapped,
-                )
-                .await;
-            }
             match plan {
                 ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys } => {
                     let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
@@ -1433,7 +1428,11 @@ impl T3Bridge {
                         },
                     )
                     .await;
-                    let checks = inspect_turns_in_order(unwrapped, proj_terminal_state);
+                    let checks = inspect_closed_turns_before_ahead_failure(
+                        unwrapped,
+                        explicit_run_id.as_deref(),
+                        explicit_item_count,
+                    );
                     self.execute_inspected_turns_locked(wave, role, thread, checks)
                         .await;
                 }
@@ -1588,12 +1587,19 @@ impl T3Bridge {
         let (explicit_run_id, explicit_item_count) = shell
             .map(shell_explicit_turn_target)
             .unwrap_or((None, None));
+        let is_unattributed = explicit_run_id.is_none() && explicit_item_count.is_none();
         let candidates = collect_preterminal_turn_candidates(
             unwrapped_projection,
             explicit_run_id.as_deref(),
             explicit_item_count,
         );
         if candidates.is_empty() {
+            let _ = self.state.send(StateMsg::SetPendingUnattributedFailure {
+                wave: wave.clone(),
+                role: role.clone(),
+                thread: thread.clone(),
+                pending: false,
+            });
             return;
         }
         let Some(backend) = self.backend.get() else {
@@ -1612,8 +1618,8 @@ impl T3Bridge {
             role: role.clone(),
         };
         let stream = StreamId::Room { room };
-        let mut newly_suppressed: Vec<String> = Vec::new();
 
+        let mut unsettled = Vec::new();
         for cand in candidates {
             if cand.suppression_keys.is_empty() {
                 continue;
@@ -1628,10 +1634,45 @@ impl T3Bridge {
             });
             let (watermark, already_settled, claimed_direct_posts) =
                 wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
-            if already_settled {
-                continue;
+            if !already_settled {
+                unsettled.push((cand, watermark, claimed_direct_posts));
             }
+        }
 
+        if is_unattributed && !unsettled.is_empty() {
+            let proj_term_state = classify_projection_terminal_state(unwrapped_projection);
+            let unsettled_terminal_suppressed = if let Some(term_lookup) =
+                terminal_suppressed_lookup_keys(unwrapped_projection, proj_term_state)
+            {
+                let (wm_tx, wm_rx) = oneshot::channel();
+                let _ = self.state.send(StateMsg::MirrorState {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    turn_keys: term_lookup,
+                    reply: wm_tx,
+                });
+                let (_, term_settled, _) =
+                    wm_rx.await.unwrap_or((Seq::ORIGIN, false, BTreeSet::new()));
+                !term_settled
+            } else {
+                false
+            };
+
+            if unsettled_terminal_suppressed
+                || unsettled.iter().any(|(c, _, _)| c.inherently_suppressed)
+            {
+                unsettled.retain(|(c, _, _)| c.inherently_suppressed);
+            } else if unsettled.iter().any(|(c, _, _)| !c.completed_cleanly)
+                && unsettled.iter().any(|(c, _, _)| c.completed_cleanly)
+            {
+                unsettled.retain(|(c, _, _)| !c.completed_cleanly);
+            }
+        }
+
+        let mut newly_suppressed: Vec<String> = Vec::new();
+
+        for (cand, watermark, claimed_direct_posts) in unsettled {
             let mirror_match_spec = match &cand.check {
                 TurnMirrorCheck::Unposted(c) => {
                     let idem = mirror_idem_key(wave, role, thread, &c.anchor).ok();

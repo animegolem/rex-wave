@@ -1075,6 +1075,8 @@ pub struct PreterminalCandidate {
     pub check: TurnMirrorCheck,
     pub suppression_keys: Vec<String>,
     pub lookup_keys: Vec<String>,
+    pub inherently_suppressed: bool,
+    pub completed_cleanly: bool,
     pub run_start_at: u64,
     pub run_end_at: u64,
     pub tight_end_bound: bool,
@@ -1132,11 +1134,25 @@ fn collect_suppressed_turn_keys(
 ) -> Vec<String> {
     let mut keys = Vec::new();
     for (orig_idx, _, item) in slice {
+        let item_run_id = item
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         if item.get("type").and_then(|v| v.as_str()) == Some("assistant_message") {
             push_unique_key(
                 &mut keys,
                 assistant_item_anchor(*orig_idx, item, target_run_id),
             );
+            push_unique_key(&mut keys, assistant_item_anchor(*orig_idx, item, None));
+            if let Some(irid) = item_run_id {
+                push_unique_key(
+                    &mut keys,
+                    assistant_item_anchor(*orig_idx, item, Some(irid)),
+                );
+            }
+        }
+        if let Some(irid) = item_run_id {
+            push_unique_key(&mut keys, format!("run:{irid}"));
         }
     }
     if let Some(rk) = run_key {
@@ -1153,11 +1169,25 @@ fn collect_turn_lookup_keys(
 ) -> Vec<String> {
     let mut keys = Vec::new();
     for (orig_idx, _, item) in slice {
+        let item_run_id = item
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         if item.get("type").and_then(|v| v.as_str()) == Some("assistant_message") {
             push_unique_key(
                 &mut keys,
                 assistant_item_anchor(*orig_idx, item, target_run_id),
             );
+            push_unique_key(&mut keys, assistant_item_anchor(*orig_idx, item, None));
+            if let Some(irid) = item_run_id {
+                push_unique_key(
+                    &mut keys,
+                    assistant_item_anchor(*orig_idx, item, Some(irid)),
+                );
+            }
+        }
+        if let Some(irid) = item_run_id {
+            push_unique_key(&mut keys, format!("run:{irid}"));
         }
     }
     if let Some(pk) = primary_key {
@@ -1693,28 +1723,30 @@ pub fn plan_explicit_failure_turns(
         } else {
             return None;
         }
-    } else if let Some(ic) = explicit_item_count {
-        if ic > ordered_item_len {
+    } else {
+        let by_run_id = explicit_run_id.and_then(|want_run| {
+            raw_turns.iter().position(|t| {
+                t.slice
+                    .iter()
+                    .any(|(_, _, it)| it.get("runId").and_then(|v| v.as_str()) == Some(want_run))
+            })
+        });
+        if let Some(pos) = by_run_id {
+            pos
+        } else if let Some(ic) = explicit_item_count {
+            if ic > ordered_item_len {
+                return Some(ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys });
+            }
+            let Some(pos) = raw_turns
+                .iter()
+                .position(|t| t.slice.iter().any(|(_, item_ic, _)| *item_ic == ic))
+            else {
+                return Some(ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys });
+            };
+            pos
+        } else {
             return Some(ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys });
         }
-        let Some(pos) = raw_turns
-            .iter()
-            .position(|t| t.slice.iter().any(|(_, item_ic, _)| *item_ic == ic))
-        else {
-            return Some(ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys });
-        };
-        pos
-    } else if let Some(want_run) = explicit_run_id {
-        let Some(pos) = raw_turns.iter().position(|t| {
-            t.slice
-                .iter()
-                .any(|(_, _, it)| it.get("runId").and_then(|v| v.as_str()) == Some(want_run))
-        }) else {
-            return Some(ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys });
-        };
-        pos
-    } else {
-        return None;
     };
 
     let mut turns = Vec::new();
@@ -1742,6 +1774,70 @@ pub fn plan_explicit_failure_turns(
         }
     }
     Some(ExplicitFailurePlan::Matched { turns })
+}
+
+pub fn inspect_closed_turns_before_ahead_failure(
+    projection: &Value,
+    explicit_run_id: Option<&str>,
+    explicit_item_count: Option<usize>,
+) -> Vec<InspectedTurn> {
+    let (_, is_runs_mode, raw_turns) = slice_projection_turns(projection);
+    if raw_turns.is_empty() {
+        return Vec::new();
+    }
+    let closed_end = if is_runs_mode && explicit_item_count.is_none() {
+        if let Some(want_run) = explicit_run_id {
+            let last_is_distinct_tagged_run = raw_turns.last().is_some_and(|last| {
+                last.target_run_id.is_some_and(|rid| rid != want_run)
+                    && !last.slice.is_empty()
+                    && last.slice.iter().all(|(_, _, it)| {
+                        it.get("runId").and_then(|v| v.as_str()) == last.target_run_id
+                    })
+            });
+            if last_is_distinct_tagged_run {
+                raw_turns.len()
+            } else {
+                raw_turns.len().saturating_sub(1)
+            }
+        } else {
+            raw_turns.len().saturating_sub(1)
+        }
+    } else {
+        raw_turns.len().saturating_sub(1)
+    };
+
+    let mut out = Vec::new();
+    for raw in &raw_turns[..closed_end] {
+        if let Some(mut inspected) =
+            evaluate_raw_turn(raw, false, TerminalTurnState::Completed, &[], false)
+        {
+            inspected.has_later_turn = true;
+            out.push(inspected);
+        }
+    }
+    out
+}
+
+pub fn terminal_suppressed_lookup_keys(
+    projection: &Value,
+    terminal_state: TerminalTurnState,
+) -> Option<Vec<String>> {
+    let (_, _, raw_turns) = slice_projection_turns(projection);
+    let last = raw_turns.last()?;
+    if terminal_state != TerminalTurnState::Suppressed && !raw_turn_inherently_suppressed(last) {
+        return None;
+    }
+    let supp = collect_suppressed_turn_keys(
+        &last.slice,
+        last.target_run_id,
+        last.suppressed_run_key.clone(),
+    );
+    Some(collect_turn_lookup_keys(
+        &last.slice,
+        last.target_run_id,
+        last.suppressed_run_key.as_deref(),
+        &supp,
+    ))
 }
 
 pub fn collect_preterminal_turn_candidates(
@@ -1773,6 +1869,11 @@ pub fn collect_preterminal_turn_candidates(
         if matched_pos.is_some_and(|mp| mp != raw.pos) {
             continue;
         }
+        let inherently_suppressed = raw_turn_inherently_suppressed(raw);
+        let completed_cleanly = raw.run_val.is_some_and(|run| {
+            let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(status, "completed" | "idle") && !inherently_suppressed
+        });
         let suppression_keys = collect_suppressed_turn_keys(
             &raw.slice,
             raw.target_run_id,
@@ -1801,6 +1902,8 @@ pub fn collect_preterminal_turn_candidates(
             check,
             suppression_keys,
             lookup_keys,
+            inherently_suppressed,
+            completed_cleanly,
             run_start_at: raw.run_start_at,
             run_end_at: raw.run_end_at,
             tight_end_bound: raw.tight_end_bound,

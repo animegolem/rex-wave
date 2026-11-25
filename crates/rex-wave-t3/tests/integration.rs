@@ -3483,3 +3483,359 @@ async fn t3_explicit_shell_item_count_and_projection_outage_suppress_refused_dra
     conductor_task.abort();
     bridge_task.abort();
 }
+
+#[tokio::test]
+async fn t3_run_id_item_only_ahead_item_count_and_unattributed_outage_preserve_good_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_r17".into(),
+        projects: vec![json!({
+            "id": "uuid-r17",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_r17").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let host_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let conductor_task = spawn_reactor(WaveConductor::new(T3Host(bridge.clone())), host_client);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("r17-edge-v1").unwrap();
+    let project = BbProjectId::parse("uuid-r17").unwrap();
+    let run_outage_role = RoleName::parse("runoutage").unwrap();
+    let ahead_ic_role = RoleName::parse("aheadic").unwrap();
+    let unattr_runs_role = RoleName::parse("unattrruns").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse(
+                    "Verify runId item-only outage, ahead itemCount, and unattributed runs outage",
+                )
+                .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![
+                    WorkerSpec {
+                        role: run_outage_role.clone(),
+                        brief: Body::parse("Outage with latestRunId replayed as item-only")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: ahead_ic_role.clone(),
+                        brief: Body::parse("Refused with itemCount ahead of trailing error item")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: unattr_runs_role.clone(),
+                        brief: Body::parse(
+                            "Unattributed outage followed by completed/failed/completed runs",
+                        )
+                        .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let run_outage_tid = BbThreadId::parse("t3:r17-edge-v1:runoutage:a1").unwrap();
+    let ahead_ic_tid = BbThreadId::parse("t3:r17-edge-v1:aheadic:a1").unwrap();
+    let unattr_runs_tid = BbThreadId::parse("t3:r17-edge-v1:unattrruns:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let run_outage_tid = run_outage_tid.clone();
+        let ahead_ic_tid = ahead_ic_tid.clone();
+        let unattr_runs_tid = unattr_runs_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&run_outage_tid, &ahead_ic_tid, &unattr_runs_tid]
+                .into_iter()
+                .all(|want_tid| {
+                    snap.workers.iter().any(|(_, _, p)| {
+                        matches!(p, WorkerPhase::Live { thread, .. } if thread == want_tid)
+                    })
+                })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        let o_proj = st
+            .thread_projections
+            .get_mut(run_outage_tid.as_str())
+            .unwrap();
+        o_proj["runs"] = json!([]);
+        o_proj["mockUnavailable"] = json!(true);
+        o_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "runId": "r-outage", "id": "outage_refused_draft", "text": "Refused draft turn 1" }
+        ]);
+
+        let a_proj = st
+            .thread_projections
+            .get_mut(ahead_ic_tid.as_str())
+            .unwrap();
+        a_proj["runs"] = json!([]);
+        a_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" }
+        ]);
+        a_proj["thread"]["status"] = json!("completed");
+        a_proj["thread"]["stopReason"] = Value::Null;
+
+        let u_proj = st
+            .thread_projections
+            .get_mut(unattr_runs_tid.as_str())
+            .unwrap();
+        u_proj["runs"] = json!([]);
+        u_proj["mockUnavailable"] = json!(true);
+    }
+
+    for (seq, tid, ic, run_id) in [
+        (10u64, run_outage_tid.as_str(), None, Some("r-outage")),
+        (11u64, ahead_ic_tid.as_str(), Some(5u64), None),
+        (12u64, unattr_runs_tid.as_str(), None, None),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "itemCount": ic,
+                    "latestRunId": run_id
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let run_outage_role = run_outage_role.clone();
+        let ahead_ic_role = ahead_ic_role.clone();
+        let unattr_runs_role = unattr_runs_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&run_outage_role, &ahead_ic_role, &unattr_runs_role]
+                .into_iter()
+                .all(|want| {
+                    snap.workers.iter().any(|(r, _, p)| {
+                        r == want
+                            && matches!(
+                                p,
+                                WorkerPhase::Live {
+                                    activity: Activity::Refused { .. },
+                                    ..
+                                }
+                            )
+                    })
+                })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        let o_proj = st
+            .thread_projections
+            .get_mut(run_outage_tid.as_str())
+            .unwrap();
+        o_proj["mockUnavailable"] = json!(false);
+        o_proj["thread"]["status"] = json!("completed");
+        o_proj["thread"]["stopReason"] = Value::Null;
+        o_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "runId": "r-outage", "id": "outage_refused_draft", "text": "Refused draft turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "outage_recovered_final", "text": "Recovered reply turn 2" }
+        ]);
+
+        let a_proj = st
+            .thread_projections
+            .get_mut(ahead_ic_tid.as_str())
+            .unwrap();
+        a_proj["thread"]["status"] = json!("completed");
+        a_proj["thread"]["stopReason"] = Value::Null;
+        a_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "error", "message": "refused" },
+            { "ordinal": 5, "type": "user_message", "text": "u3" },
+            { "ordinal": 6, "type": "assistant_message", "id": "good_turn3", "text": "Third recovered" }
+        ]);
+
+        let u_proj = st
+            .thread_projections
+            .get_mut(unattr_runs_tid.as_str())
+            .unwrap();
+        u_proj["mockUnavailable"] = json!(false);
+        u_proj["thread"]["status"] = json!("completed");
+        u_proj["thread"]["stopReason"] = Value::Null;
+        u_proj["runs"] = json!([
+            { "id": "r1", "ordinal": 0, "status": "completed" },
+            { "id": "r2", "ordinal": 1, "status": "failed" },
+            { "id": "r3", "ordinal": 2, "status": "completed" }
+        ]);
+        u_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "runId": "r1", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "runId": "r1", "id": "unobs_t1", "text": "Successful unobserved first turn" },
+            { "ordinal": 2, "type": "user_message", "runId": "r2", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "runId": "r2", "id": "failed_t2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "user_message", "runId": "r3", "text": "u3" },
+            { "ordinal": 5, "type": "assistant_message", "runId": "r3", "id": "good_t3", "text": "Third recovered" }
+        ]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_r17").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    for (seq, tid) in [
+        (20u64, run_outage_tid.as_str()),
+        (21u64, ahead_ic_tid.as_str()),
+        (22u64, unattr_runs_tid.as_str()),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    let room = wave_room(&wave, &project);
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let run_outage_role = run_outage_role.clone();
+        let ahead_ic_role = ahead_ic_role.clone();
+        let unattr_runs_role = unattr_runs_role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            let count_for = |r: &RoleName| {
+                page.entries
+                    .iter()
+                    .filter(|e| {
+                        e.by == Principal::Worker {
+                            wave: wave.clone(),
+                            role: r.clone(),
+                        } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                    })
+                    .count()
+            };
+            count_for(&run_outage_role) == 1
+                && count_for(&ahead_ic_role) == 2
+                && count_for(&unattr_runs_role) == 2
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let page = operator
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .await
+        .unwrap();
+    let bodies_for = |r: &RoleName| -> Vec<&str> {
+        page.entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(bodies_for(&run_outage_role), vec!["Recovered reply turn 2"]);
+    assert_eq!(
+        bodies_for(&ahead_ic_role),
+        vec!["Successful turn 1", "Third recovered"]
+    );
+    assert_eq!(
+        bodies_for(&unattr_runs_role),
+        vec!["Successful unobserved first turn", "Third recovered"]
+    );
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
+    bridge_task.abort();
+}
