@@ -6240,13 +6240,13 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
                 {
                     if role.as_str() == "singlefail"
                         && keys.iter().any(|k| k == "o1")
-                        && self.failed_single.fetch_add(1, Ordering::SeqCst) < 3
+                        && self.failed_single.fetch_add(1, Ordering::SeqCst) < 8
                     {
                         return Err(StoreError::Backend("injected single failed append".into()));
                     }
                     if role.as_str() == "beforerefine"
                         && keys.iter().any(|k| k == "fail_ticket:1:any")
-                        && self.failed_anon_ticket.fetch_add(1, Ordering::SeqCst) < 3
+                        && self.failed_anon_ticket.fetch_add(1, Ordering::SeqCst) < 8
                     {
                         return Err(StoreError::Backend(
                             "injected outage anonymous ticket failed append".into(),
@@ -6681,8 +6681,8 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
             "Recovered third turn"
         ]
     );
-    assert!(counts.failed_single.load(Ordering::SeqCst) >= 4);
-    assert!(counts.failed_anon_ticket.load(Ordering::SeqCst) >= 4);
+    assert!(counts.failed_single.load(Ordering::SeqCst) >= 9);
+    assert!(counts.failed_anon_ticket.load(Ordering::SeqCst) >= 9);
 
     let _ = shutdown_tx.send(true);
     conductor_task.abort();
