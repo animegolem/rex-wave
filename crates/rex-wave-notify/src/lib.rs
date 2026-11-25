@@ -463,6 +463,7 @@ impl HeraldView {
                 wave::WaveEvent::WorkerObserved { role, observation } => match observation {
                     wave::Observation::Activity {
                         activity: wave::Activity::Blocked { interaction },
+                        ..
                     } => {
                         let key = (wave.clone(), role.clone());
                         if let Some((old_id, old_summary)) = self.blocked.remove(&key)
@@ -479,6 +480,19 @@ impl HeraldView {
                             .insert(key, (interaction.id.clone(), interaction.summary.clone()));
                     }
                     wave::Observation::RuntimeMeta { .. } => {}
+                    wave::Observation::TurnsSuppressed { keys, .. } => {
+                        if wave::failure_activity_from_suppression_keys(keys).is_some()
+                            && let Some((old_id, old_summary)) =
+                                self.blocked.remove(&(wave.clone(), role.clone()))
+                        {
+                            self.cleared_interactions.push((
+                                wave.clone(),
+                                role.clone(),
+                                old_id,
+                                old_summary,
+                            ));
+                        }
+                    }
                     _ => {
                         if let Some((old_id, old_summary)) =
                             self.blocked.remove(&(wave.clone(), role.clone()))
@@ -1296,6 +1310,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             wave::WaveEvent::WorkerObserved { role, observation } => match observation {
                 wave::Observation::Activity {
                     activity: wave::Activity::Blocked { interaction },
+                    ..
                 } => {
                     let actions = interaction_actions(wave, role, interaction);
                     for op in view.operators_for_wave(wave) {
@@ -1317,6 +1332,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 }
                 wave::Observation::Activity {
                     activity: wave::Activity::Refused { reason },
+                    ..
                 } => {
                     for op in view.operators_for_wave(wave) {
                         out.push((
@@ -1338,6 +1354,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 }
                 wave::Observation::Activity {
                     activity: wave::Activity::Errored { error },
+                    ..
                 }
                 | wave::Observation::SpawnFailed { error, .. } => {
                     for op in view.operators_for_wave(wave) {
@@ -1358,10 +1375,53 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                         ));
                     }
                 }
+                wave::Observation::TurnsSuppressed { keys, .. } => {
+                    match wave::failure_activity_from_suppression_keys(keys) {
+                        Some(wave::Activity::Refused { reason }) => {
+                            for op in view.operators_for_wave(wave) {
+                                out.push((
+                                    op,
+                                    NotificationDraft {
+                                        kind: NotifyKind::WorkerRefused {
+                                            wave: wave.clone(),
+                                            role: role.clone(),
+                                            reason: reason.clone(),
+                                            seq: entry.seq,
+                                        },
+                                        title: format!("@{wave}/{role} refused"),
+                                        preview: snippet(&reason, 160),
+                                        actions: Vec::new(),
+                                        dedupe: format!("worker-refused:{wave}:{role}"),
+                                    },
+                                ));
+                            }
+                        }
+                        Some(wave::Activity::Errored { error }) => {
+                            for op in view.operators_for_wave(wave) {
+                                out.push((
+                                    op,
+                                    NotificationDraft {
+                                        kind: NotifyKind::WorkerStuck {
+                                            wave: wave.clone(),
+                                            role: role.clone(),
+                                            why: error.clone(),
+                                            seq: entry.seq,
+                                        },
+                                        title: format!("@{wave}/{role} stuck"),
+                                        preview: snippet(&error, 160),
+                                        actions: Vec::new(),
+                                        dedupe: format!("worker-stuck:{wave}:{role}"),
+                                    },
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 wave::Observation::Spawned { .. }
                 | wave::Observation::Activity { .. }
                 | wave::Observation::RuntimeMeta { .. }
-                | wave::Observation::Archived => {}
+                | wave::Observation::Archived { .. } => {}
             },
             wave::WaveEvent::Finished { outcome } => {
                 let detail = match outcome {

@@ -6659,7 +6659,7 @@
     "inputSchema": {
       "$defs": {
         "BbSeq": {
-          "description": "BB's own per-thread event sequence (foreign cursor; never mixed with [`Seq`]).",
+          "description": "Host's own per-thread event sequence (foreign cursor; never mixed with [`Seq`]).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

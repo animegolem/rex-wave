@@ -1,27 +1,34 @@
-//! Multi-host routing: `CompositeHost` (`AgentHost`) and `CompositeFeed` (`AgentFeed`).
-//!
-//! Structurally enforces the 2026-11-21 routing rule: bare `antigravity` ALWAYS routes
-//! to `T3Host`, and `bb:antigravity` is rejected outright.
+//! Compatibility adapters (`CompositeHost`, `CompositeFeed`) delegating to the
+//! N-way [`rex_wave_waves::HostRouter`] and [`rex_wave_runtime::FeedRouter`].
 
-use crate::protocol::is_t3_thread_id;
 use rex_wave_api::read::ThreadPageView;
 use rex_wave_api::room::Body;
 use rex_wave_api::wave::{InteractionResolution, Observation, SteerDeliveryMode};
 use rex_wave_api::{
-    ApiError, BbInteractionId, BbProjectId, BbSeq, BbThreadId, Family, FrameStream, ProviderId,
-    RoleName, WaveSlug,
+    ApiError, BbInteractionId, BbProjectId, BbSeq, BbThreadId, FrameStream, ProviderId, RoleName,
+    RunnerKind, WaveSlug,
 };
-use rex_wave_runtime::{AgentFeed, BoxFut};
-use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
+use rex_wave_runtime::{AgentFeed, BoxFut, FeedRouter};
+use rex_wave_waves::{AgentHost, HostError, HostRouter, SpawnRequest};
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::watch;
+
+pub use rex_wave_runtime::ThreadIdResolver;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerTarget {
     Bb,
     T3,
+}
+
+impl From<RunnerTarget> for RunnerKind {
+    fn from(t: RunnerTarget) -> Self {
+        match t {
+            RunnerTarget::Bb => RunnerKind::Bb,
+            RunnerTarget::T3 => RunnerKind::T3,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,84 +37,51 @@ pub struct RoutedProvider {
     pub provider: ProviderId,
 }
 
-/// Resolves which host owns `provider` and strips any explicit `t3:` / `bb:` prefix.
-///
-/// Bare `antigravity` ALWAYS routes to `RunnerTarget::T3` regardless of `default_runner`,
-/// and `bb:antigravity` is rejected to structurally enforce the T3-only Gemini policy.
 pub fn route_provider(
     provider: &ProviderId,
     default_runner: RunnerTarget,
 ) -> Result<RoutedProvider, HostError> {
-    let raw = provider.as_str().trim();
-    if let Some(rest) = raw.strip_prefix("t3:") {
-        let clean = rest.trim();
-        if clean.is_empty() {
-            return Err(HostError::Rejected(
-                "empty provider name after 't3:' prefix".into(),
-            ));
+    let routed = rex_wave_waves::route_provider(provider, default_runner.into())?;
+    let target = match routed.target {
+        RunnerKind::Bb => RunnerTarget::Bb,
+        RunnerKind::T3 => RunnerTarget::T3,
+        other => {
+            return Err(HostError::Rejected(format!(
+                "runner '{}' requires N-way HostRouter",
+                other.as_str()
+            )));
         }
-        let parsed = ProviderId::parse(clean).map_err(|e| HostError::Rejected(e.to_string()))?;
-        return Ok(RoutedProvider {
-            target: RunnerTarget::T3,
-            provider: parsed,
-        });
-    }
-
-    if let Some(rest) = raw.strip_prefix("bb:") {
-        let clean = rest.trim();
-        if clean.is_empty() {
-            return Err(HostError::Rejected(
-                "empty provider name after 'bb:' prefix".into(),
-            ));
-        }
-        if clean.eq_ignore_ascii_case("antigravity") {
-            return Err(HostError::Rejected(
-                "provider 'antigravity' must route through T3 Code, never BB".into(),
-            ));
-        }
-        let parsed = ProviderId::parse(clean).map_err(|e| HostError::Rejected(e.to_string()))?;
-        return Ok(RoutedProvider {
-            target: RunnerTarget::Bb,
-            provider: parsed,
-        });
-    }
-
-    if raw.eq_ignore_ascii_case("antigravity") {
-        let parsed = ProviderId::parse(raw).map_err(|e| HostError::Rejected(e.to_string()))?;
-        return Ok(RoutedProvider {
-            target: RunnerTarget::T3,
-            provider: parsed,
-        });
-    }
-
+    };
     Ok(RoutedProvider {
-        target: default_runner,
-        provider: provider.clone(),
+        target,
+        provider: routed.provider,
     })
 }
 
 pub fn route_thread(thread: &BbThreadId) -> RunnerTarget {
-    if is_t3_thread_id(thread) {
-        RunnerTarget::T3
-    } else {
-        RunnerTarget::Bb
+    match rex_wave_waves::route_thread(thread) {
+        RunnerKind::T3 => RunnerTarget::T3,
+        _ => RunnerTarget::Bb,
     }
 }
 
-/// Multiplexes `AgentHost` calls across an optional BB host and an optional T3 host.
+/// Two-runner compatibility wrapper around [`HostRouter`].
 #[derive(Clone)]
 pub struct CompositeHost<B, T> {
-    bb: Option<B>,
-    t3: Option<T>,
+    inner: HostRouter,
     default_runner: RunnerTarget,
+    _marker: std::marker::PhantomData<fn() -> (B, T)>,
 }
 
-impl<B, T> CompositeHost<B, T> {
+impl<B: AgentHost, T: AgentHost> CompositeHost<B, T> {
     pub fn new(bb: Option<B>, t3: Option<T>, default_runner: RunnerTarget) -> Self {
+        let inner = HostRouter::new(default_runner.into())
+            .with_optional_host(RunnerKind::Bb, bb)
+            .with_optional_host(RunnerKind::T3, t3);
         CompositeHost {
-            bb,
-            t3,
+            inner,
             default_runner,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -121,30 +95,8 @@ impl<B, T> CompositeHost<B, T> {
 }
 
 impl<B: AgentHost, T: AgentHost> AgentHost for CompositeHost<B, T> {
-    fn spawn(
-        &self,
-        mut req: SpawnRequest,
-    ) -> impl Future<Output = Result<BbThreadId, HostError>> + Send {
-        let routed = route_provider(&req.agent.provider, self.default_runner);
-        async move {
-            let routed = routed?;
-            let is_antigravity = routed.provider.as_str().eq_ignore_ascii_case("antigravity");
-            req.agent.provider = routed.provider;
-            match routed.target {
-                RunnerTarget::T3 => match &self.t3 {
-                    Some(t3) => t3.spawn(req).await,
-                    None if is_antigravity => Err(HostError::Rejected(
-                        "provider 'antigravity' requires T3 Code, but no T3 host is configured"
-                            .into(),
-                    )),
-                    None => Err(HostError::Unreachable("T3 host is not configured".into())),
-                },
-                RunnerTarget::Bb => match &self.bb {
-                    Some(bb) => bb.spawn(req).await,
-                    None => Err(HostError::Unreachable("BB host is not configured".into())),
-                },
-            }
-        }
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<BbThreadId, HostError>> {
+        self.inner.spawn(req)
     }
 
     fn tell(
@@ -152,22 +104,8 @@ impl<B: AgentHost, T: AgentHost> AgentHost for CompositeHost<B, T> {
         thread: &BbThreadId,
         body: &Body,
         mode: SteerDeliveryMode,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
-        let target = route_thread(thread);
-        let thread = thread.clone();
-        let body = body.clone();
-        async move {
-            match target {
-                RunnerTarget::T3 => match &self.t3 {
-                    Some(t3) => t3.tell(&thread, &body, mode).await,
-                    None => Err(HostError::Unreachable("T3 host is not configured".into())),
-                },
-                RunnerTarget::Bb => match &self.bb {
-                    Some(bb) => bb.tell(&thread, &body, mode).await,
-                    None => Err(HostError::Unreachable("BB host is not configured".into())),
-                },
-            }
-        }
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        self.inner.tell(thread, body, mode)
     }
 
     fn resolve(
@@ -175,157 +113,44 @@ impl<B: AgentHost, T: AgentHost> AgentHost for CompositeHost<B, T> {
         thread: &BbThreadId,
         interaction: &BbInteractionId,
         resolution: &InteractionResolution,
-    ) -> impl Future<Output = Result<(), HostError>> + Send {
-        let target = route_thread(thread);
-        let thread = thread.clone();
-        let interaction = interaction.clone();
-        let resolution = resolution.clone();
-        async move {
-            match target {
-                RunnerTarget::T3 => match &self.t3 {
-                    Some(t3) => t3.resolve(&thread, &interaction, &resolution).await,
-                    None => Err(HostError::Unreachable("T3 host is not configured".into())),
-                },
-                RunnerTarget::Bb => match &self.bb {
-                    Some(bb) => bb.resolve(&thread, &interaction, &resolution).await,
-                    None => Err(HostError::Unreachable("BB host is not configured".into())),
-                },
-            }
-        }
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        self.inner.resolve(thread, interaction, resolution)
     }
 
-    fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send {
-        let target = route_thread(thread);
-        let thread = thread.clone();
-        async move {
-            match target {
-                RunnerTarget::T3 => match &self.t3 {
-                    Some(t3) => t3.retire(&thread).await,
-                    None => Err(HostError::Unreachable("T3 host is not configured".into())),
-                },
-                RunnerTarget::Bb => match &self.bb {
-                    Some(bb) => bb.retire(&thread).await,
-                    None => Err(HostError::Unreachable("BB host is not configured".into())),
-                },
-            }
-        }
+    fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
+        self.inner.retire(thread)
     }
 
     fn check_live(
         &self,
         thread: &BbThreadId,
-    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
-        let target = route_thread(thread);
-        let thread = thread.clone();
-        async move {
-            match target {
-                RunnerTarget::T3 => match &self.t3 {
-                    Some(t3) => t3.check_live(&thread).await,
-                    None => Err(HostError::Unreachable("T3 host is not configured".into())),
-                },
-                RunnerTarget::Bb => match &self.bb {
-                    Some(bb) => bb.check_live(&thread).await,
-                    None => Err(HostError::Unreachable("BB host is not configured".into())),
-                },
-            }
-        }
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        self.inner.check_live(thread)
     }
 }
 
-pub type ThreadIdResolver =
-    Arc<dyn Fn(&WaveSlug, &RoleName) -> BoxFut<'static, Option<BbThreadId>> + Send + Sync>;
-
-/// Multiplexes `AgentFeed` across BB and T3 feeds, routing by `t3:` thread-ID prefix
-/// and merging both `project_names` watch channels.
+/// Two-runner compatibility wrapper around [`FeedRouter`].
 pub struct CompositeFeed {
-    bb: Option<Arc<dyn AgentFeed>>,
-    t3: Option<Arc<dyn AgentFeed>>,
-    resolver: Option<ThreadIdResolver>,
-    merged_project_names: Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>>,
+    inner: FeedRouter,
 }
 
 impl CompositeFeed {
     pub fn new(bb: Option<Arc<dyn AgentFeed>>, t3: Option<Arc<dyn AgentFeed>>) -> Self {
-        let merged_project_names = merge_project_name_watches(
-            bb.as_ref().and_then(|f| f.project_names()),
-            t3.as_ref().and_then(|f| f.project_names()),
-        );
+        let mut entries = Vec::new();
+        if let Some(t) = t3 {
+            entries.push((RunnerKind::T3, t));
+        }
+        if let Some(b) = bb {
+            entries.push((RunnerKind::Bb, b));
+        }
         CompositeFeed {
-            bb,
-            t3,
-            resolver: None,
-            merged_project_names,
+            inner: FeedRouter::new(entries),
         }
     }
 
     pub fn with_thread_resolver(mut self, resolver: ThreadIdResolver) -> Self {
-        self.resolver = Some(resolver);
+        self.inner = self.inner.with_thread_resolver(resolver);
         self
-    }
-
-    async fn resolve_target(&self, wave: &WaveSlug, role: &RoleName) -> Option<RunnerTarget> {
-        let resolver = self.resolver.as_ref()?;
-        let thread = resolver(wave, role).await?;
-        Some(route_thread(&thread))
-    }
-}
-
-fn merge_maps(
-    bb: &BTreeMap<BbProjectId, String>,
-    t3: &BTreeMap<BbProjectId, String>,
-) -> Arc<BTreeMap<BbProjectId, String>> {
-    let mut out = t3.clone();
-    for (k, v) in bb {
-        out.insert(k.clone(), v.clone());
-    }
-    Arc::new(out)
-}
-
-fn merge_project_name_watches(
-    bb_rx: Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>>,
-    t3_rx: Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>>,
-) -> Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>> {
-    match (bb_rx, t3_rx) {
-        (None, None) => None,
-        (Some(rx), None) | (None, Some(rx)) => Some(rx),
-        (Some(mut bb), Some(mut t3)) => {
-            let initial = merge_maps(&bb.borrow_and_update(), &t3.borrow_and_update());
-            let (tx, rx) = watch::channel(initial);
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let mut bb_open = true;
-                    let mut t3_open = true;
-                    while bb_open || t3_open {
-                        tokio::select! {
-                            biased;
-                            () = tx.closed() => break,
-                            res = bb.changed(), if bb_open => {
-                                if res.is_err() {
-                                    bb_open = false;
-                                    continue;
-                                }
-                            }
-                            res = t3.changed(), if t3_open => {
-                                if res.is_err() {
-                                    t3_open = false;
-                                    continue;
-                                }
-                            }
-                        }
-                        let next = merge_maps(&bb.borrow_and_update(), &t3.borrow_and_update());
-                        tx.send_if_modified(|cur| {
-                            if **cur != *next {
-                                *cur = next;
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                    }
-                });
-            }
-            Some(rx)
-        }
     }
 }
 
@@ -337,81 +162,15 @@ impl AgentFeed for CompositeFeed {
         after: Option<BbSeq>,
         limit: u32,
     ) -> BoxFut<'_, Result<ThreadPageView, ApiError>> {
-        let wave = wave.clone();
-        let role = role.clone();
-        Box::pin(async move {
-            if let Some(target) = self.resolve_target(&wave, &role).await {
-                return match target {
-                    RunnerTarget::T3 => match &self.t3 {
-                        Some(f) => f.page(&wave, &role, after, limit).await,
-                        None => Err(ApiError::Unavailable {
-                            family: Family::Wave,
-                        }),
-                    },
-                    RunnerTarget::Bb => match &self.bb {
-                        Some(f) => f.page(&wave, &role, after, limit).await,
-                        None => Err(ApiError::Unavailable {
-                            family: Family::Wave,
-                        }),
-                    },
-                };
-            }
-
-            if let Some(t3) = &self.t3 {
-                match t3.page(&wave, &role, after, limit).await {
-                    Ok(page) => return Ok(page),
-                    Err(ApiError::NotFound { .. }) if self.bb.is_some() => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            if let Some(bb) = &self.bb {
-                return bb.page(&wave, &role, after, limit).await;
-            }
-            Err(ApiError::Unavailable {
-                family: Family::Wave,
-            })
-        })
+        self.inner.page(wave, role, after, limit)
     }
 
     fn live(&self, wave: &WaveSlug, role: &RoleName) -> BoxFut<'_, Result<FrameStream, ApiError>> {
-        let wave = wave.clone();
-        let role = role.clone();
-        Box::pin(async move {
-            if let Some(target) = self.resolve_target(&wave, &role).await {
-                return match target {
-                    RunnerTarget::T3 => match &self.t3 {
-                        Some(f) => f.live(&wave, &role).await,
-                        None => Err(ApiError::Unavailable {
-                            family: Family::Wave,
-                        }),
-                    },
-                    RunnerTarget::Bb => match &self.bb {
-                        Some(f) => f.live(&wave, &role).await,
-                        None => Err(ApiError::Unavailable {
-                            family: Family::Wave,
-                        }),
-                    },
-                };
-            }
-
-            if let Some(t3) = &self.t3 {
-                match t3.live(&wave, &role).await {
-                    Ok(stream) => return Ok(stream),
-                    Err(ApiError::NotFound { .. }) if self.bb.is_some() => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            if let Some(bb) = &self.bb {
-                return bb.live(&wave, &role).await;
-            }
-            Err(ApiError::Unavailable {
-                family: Family::Wave,
-            })
-        })
+        self.inner.live(wave, role)
     }
 
     fn project_names(&self) -> Option<watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>> {
-        self.merged_project_names.clone()
+        self.inner.project_names()
     }
 }
 

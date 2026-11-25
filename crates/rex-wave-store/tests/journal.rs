@@ -26,6 +26,7 @@ fn post(text: &str) -> Event {
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
 }
 

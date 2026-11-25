@@ -183,9 +183,7 @@ async fn restore_worker_working(
                 WaveCommand::WaveObserve(WaveObserve {
                     wave: wave.clone(),
                     role: role.clone(),
-                    observation: Observation::Activity {
-                        activity: Activity::Working,
-                    },
+                    observation: Observation::activity(Activity::Working),
                 }),
                 system_ctx(),
             )
@@ -246,6 +244,22 @@ impl Drop for WorkerWaitGuard {
 }
 
 impl Router {
+    /// Constructs a partial-deployment or test [`Router`] where every command
+    /// family defaults to [`Unavailable`] over `read`. Callers override only
+    /// the families under test while production composition roots still name
+    /// every field explicitly.
+    pub fn unavailable_with(read: Arc<ReadSide>) -> Self {
+        Router {
+            room: Arc::new(Unavailable(Family::Room)),
+            wave: Arc::new(Unavailable(Family::Wave)),
+            board: Arc::new(Unavailable(Family::Board)),
+            inbox: Arc::new(Unavailable(Family::Inbox)),
+            mail: Arc::new(Unavailable(Family::Mail)),
+            presence: Arc::new(Unavailable(Family::Presence)),
+            read,
+        }
+    }
+
     pub async fn dispatch(&self, by: &Principal, cmd: WireCommand) -> Result<WireReply, ApiError> {
         authorize(cmd.meta().audience, by)?;
         let ctx = DecideCtx::new(by.clone(), now());
@@ -309,9 +323,10 @@ impl Router {
                             WaveCommand::WaveObserve(WaveObserve {
                                 wave: wave.clone(),
                                 role: role.clone(),
-                                observation: Observation::Activity {
-                                    activity: Activity::Parked { room, since },
-                                },
+                                observation: Observation::activity(Activity::Parked {
+                                    room,
+                                    since,
+                                }),
                             }),
                             system_ctx(),
                         )
@@ -415,5 +430,40 @@ impl Client for LocalClient {
         from: Cursor,
     ) -> impl Future<Output = Result<FrameStream, ApiError>> + Send {
         self.router.watch(&self.session, interest, from)
+    }
+}
+
+/// Host-bridge backend abstraction shared by `BbBridge`, `T3Bridge`, and native
+/// runners so bridges can run in-process against `Arc<Router>` or against
+/// custom test backends.
+pub trait BridgeBackend: Send + Sync + 'static {
+    type C: Client + Clone + 'static;
+    fn client(&self, me: Principal) -> Self::C;
+    fn handles_worker_wait_parking(&self) -> bool {
+        false
+    }
+    fn parked_room_and_since(
+        &self,
+        worker: &Principal,
+        wait: &rex_wave_api::read::Wait,
+    ) -> Option<(Option<rex_wave_api::room::RoomId>, Seq)> {
+        crate::fallback_parked_room_and_since(worker, wait)
+    }
+}
+
+impl BridgeBackend for Arc<Router> {
+    type C = LocalClient;
+    fn client(&self, me: Principal) -> LocalClient {
+        LocalClient::new(self.clone(), me)
+    }
+    fn handles_worker_wait_parking(&self) -> bool {
+        true
+    }
+    fn parked_room_and_since(
+        &self,
+        worker: &Principal,
+        wait: &rex_wave_api::read::Wait,
+    ) -> Option<(Option<rex_wave_api::room::RoomId>, Seq)> {
+        self.read.parked_room_and_since(worker, wait)
     }
 }

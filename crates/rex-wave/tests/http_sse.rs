@@ -14,7 +14,6 @@ use rex_wave_notify::Inbox;
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
     BoxFut, DecideCtx, Hub, NoAgentFeed, ReadSide, Registry, Router, Service, SidebarProjection,
-    Unavailable,
 };
 use rex_wave_store::Journal;
 use rex_wave_transport::{Authenticator, StateDirAuthenticator};
@@ -115,17 +114,13 @@ fn real_router() -> Arc<Router> {
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     })
 }
 
@@ -664,17 +659,14 @@ async fn http_routes_cover_409_conflict_tasks_labels_presence_inbox_sidebar_and_
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Arc::new(StubPhase3Rooms),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
         presence: Arc::new(StubPresence),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
         op.clone(),
@@ -1084,16 +1076,13 @@ async fn http_disconnect_cancels_worker_wait_and_restores_working() {
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
-        board: Arc::new(Unavailable(Family::Board)),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let op_client = LocalClient::new(router.clone(), Principal::Operator { seat: op.clone() });

@@ -38,6 +38,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("stream {0:?} already has a live writer")]
@@ -46,6 +48,8 @@ pub enum StoreError {
     WrongStream(StreamId),
     #[error("head moved underneath writer (expected {expected:?}, found {found:?})")]
     HeadMoved { expected: Seq, found: Seq },
+    #[error("unsupported journal schema version {found} (max supported: {max_supported})")]
+    UnsupportedSchemaVersion { found: u32, max_supported: u32 },
     #[error("storage: {0}")]
     Backend(String),
 }
@@ -92,9 +96,228 @@ CREATE TABLE IF NOT EXISTS entries(
 ) STRICT;
 ";
 
+fn strip_sql_leading_trivia(mut sql: &str) -> &str {
+    loop {
+        let trimmed = sql.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            sql = match rest.find('\n') {
+                Some(idx) => &rest[idx + 1..],
+                None => "",
+            };
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            sql = match rest.find("*/") {
+                Some(idx) => &rest[idx + 2..],
+                None => "",
+            };
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn leading_sql_verb(sql: &str) -> &str {
+    let clean = strip_sql_leading_trivia(sql);
+    let end = clean
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(clean.len());
+    &clean[..end]
+}
+
+fn top_level_semicolons(sql: &str) -> Vec<usize> {
+    let mut semis = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !in_single && !in_double && !in_backtick && !in_bracket {
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'`' => in_backtick = true,
+                b'[' => in_bracket = true,
+                b';' => semis.push(i),
+                _ => {}
+            }
+        } else if in_single && b == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_single = false;
+        } else if in_double && b == b'"' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_double = false;
+        } else if in_backtick && b == b'`' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+                i += 2;
+                continue;
+            }
+            in_backtick = false;
+        } else if in_bracket && b == b']' {
+            in_bracket = false;
+        }
+        i += 1;
+    }
+    semis
+}
+
+fn is_incomplete_sqlite_err(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+            if msg.eq_ignore_ascii_case("incomplete input")
+    )
+}
+
+/// Sealed initialization handle passed to [`CommitHook::on_init`]. Keeps
+/// `rusqlite` and transaction control private to `rex-wave-store`.
+pub struct InitContext<'a> {
+    conn: &'a Connection,
+}
+
+impl InitContext<'_> {
+    pub fn execute_ddl(&mut self, sql: &str) -> Result<(), StoreError> {
+        if self.conn.is_autocommit() {
+            return Err(StoreError::Backend(
+                "init hook called outside an active SQLite transaction".into(),
+            ));
+        }
+        let mut start = 0usize;
+        while start < sql.len() {
+            let rem = strip_sql_leading_trivia(&sql[start..]);
+            if rem.is_empty() {
+                break;
+            }
+            let verb = leading_sql_verb(rem);
+            if !verb.eq_ignore_ascii_case("CREATE") {
+                return Err(StoreError::Backend(format!(
+                    "init hook DDL only allows CREATE statements (got {verb:?})"
+                )));
+            }
+            let semis = top_level_semicolons(&sql[start..]);
+            let mut executed = false;
+            for rel_semi in semis {
+                let end = start + rel_semi;
+                let candidate = &sql[start..=end];
+                match self.conn.prepare(candidate) {
+                    Ok(mut stmt) => {
+                        if self.conn.is_autocommit() {
+                            return Err(StoreError::Backend(
+                                "init hook called outside an active SQLite transaction".into(),
+                            ));
+                        }
+                        stmt.execute([])?;
+                        if self.conn.is_autocommit() {
+                            return Err(StoreError::Backend(
+                                "init hook illegally terminated enclosing SQLite transaction"
+                                    .into(),
+                            ));
+                        }
+                        start = end + 1;
+                        executed = true;
+                        break;
+                    }
+                    Err(e) if is_incomplete_sqlite_err(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !executed {
+                if self.conn.is_autocommit() {
+                    return Err(StoreError::Backend(
+                        "init hook called outside an active SQLite transaction".into(),
+                    ));
+                }
+                let mut stmt = self.conn.prepare(&sql[start..])?;
+                stmt.execute([])?;
+                if self.conn.is_autocommit() {
+                    return Err(StoreError::Backend(
+                        "init hook illegally terminated enclosing SQLite transaction".into(),
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sealed transaction handle passed to [`CommitHook::on_append`] inside the
+/// same `IMMEDIATE` SQLite transaction that appends `entries`.
+pub struct TxContext<'a, 'conn> {
+    tx: &'a rusqlite::Transaction<'conn>,
+}
+
+impl TxContext<'_, '_> {
+    pub fn execute_sql(&self, sql: &str, text_params: &[&str]) -> Result<usize, StoreError> {
+        if self.tx.is_autocommit() {
+            return Err(StoreError::Backend(
+                "commit hook called after enclosing SQLite transaction ended".into(),
+            ));
+        }
+        let verb = leading_sql_verb(sql);
+        if !matches!(
+            verb.to_ascii_uppercase().as_str(),
+            "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+        ) {
+            return Err(StoreError::Backend(format!(
+                "commit hook SQL only allows single INSERT/UPDATE/DELETE/REPLACE statements (got {verb:?})"
+            )));
+        }
+        let mut stmt = self.tx.prepare(sql)?;
+        let count = stmt.execute(rusqlite::params_from_iter(text_params.iter()))?;
+        if self.tx.is_autocommit() {
+            return Err(StoreError::Backend(
+                "commit hook illegally terminated enclosing SQLite transaction".into(),
+            ));
+        }
+        Ok(count)
+    }
+}
+
+/// Atomic side-table / outbox hook invoked inside [`StreamWriter::append`]'s
+/// `IMMEDIATE` transaction before `COMMIT`, plus an optional post-commit wakeup.
+pub trait CommitHook: Send + Sync + 'static {
+    fn on_init(&self, _ctx: &mut InitContext<'_>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn on_append(
+        &self,
+        _tx: &TxContext<'_, '_>,
+        _committed: &[Envelope],
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn after_commit(&self, _committed: &[Envelope]) {}
+}
+
 struct Inner {
     conn: Mutex<Connection>,
     claimed: Mutex<HashSet<String>>,
+    hook: Option<Arc<dyn CommitHook>>,
 }
 
 impl Inner {
@@ -223,6 +446,14 @@ fn legacy_dm_candidates(a: &Principal, b: &Principal) -> Vec<RoomId> {
 impl Journal {
     /// Open (creating if needed) the journal at `path` in WAL mode.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_hook(path, None)
+    }
+
+    /// Open the journal at `path` in WAL mode with an optional [`CommitHook`].
+    pub fn open_with_hook(
+        path: &Path,
+        hook: Option<Arc<dyn CommitHook>>,
+    ) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -231,22 +462,56 @@ impl Journal {
             )));
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
-        Self::init(conn)
+        Self::init(conn, hook)
     }
 
     /// In-memory journal for tests and embedded demos.
     pub fn in_memory() -> Result<Self, StoreError> {
-        Self::init(Connection::open_in_memory()?)
+        Self::in_memory_with_hook(None)
     }
 
-    fn init(conn: Connection) -> Result<Self, StoreError> {
-        conn.execute_batch(SCHEMA)?;
+    /// In-memory journal with an optional [`CommitHook`].
+    pub fn in_memory_with_hook(hook: Option<Arc<dyn CommitHook>>) -> Result<Self, StoreError> {
+        Self::init(Connection::open_in_memory()?, hook)
+    }
+
+    fn init(mut conn: Connection, hook: Option<Arc<dyn CommitHook>>) -> Result<Self, StoreError> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let raw_ver: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let found = u32::try_from(raw_ver)
+            .map_err(|_| StoreError::Backend(format!("negative SQLite user_version: {raw_ver}")))?;
+        if found > JOURNAL_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion {
+                found,
+                max_supported: JOURNAL_SCHEMA_VERSION,
+            });
+        }
+        tx.execute_batch(SCHEMA)?;
+        if found < JOURNAL_SCHEMA_VERSION {
+            tx.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+        }
+        if let Some(ref h) = hook {
+            let mut init_ctx = InitContext { conn: &tx };
+            h.on_init(&mut init_ctx)?;
+        }
+        tx.commit()?;
         Ok(Journal {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
                 claimed: Mutex::new(HashSet::new()),
+                hook,
             }),
         })
+    }
+
+    /// Current SQLite `PRAGMA user_version` recorded in this journal.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        let raw: i64 = self
+            .inner
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        u32::try_from(raw)
+            .map_err(|_| StoreError::Backend(format!("negative SQLite user_version: {raw}")))
     }
 
     /// The unique writer for `stream`. Fails while another one is alive.
@@ -337,7 +602,8 @@ impl Journal {
 
     /// Resolve a DM room for a command carrying an optional idempotency key:
     /// - When `allow_legacy_fallback` is false (explicit `RoomRef::Id`), keeps
-    ///   `room` pinned to its exact stream while verifying `idem` authorship.
+    ///   `room` pinned to its exact stream (matching `Read` and `Wait` on
+    ///   `RoomRef::Id`) while verifying `idem` authorship.
     /// - When `allow_legacy_fallback` is true (`RoomRef::Dm`), checks both
     ///   canonical and pre-PR-26 `(Operator, peer)` histories for `idem`,
     ///   routing to the unique stream where `by` (`same_actor`) committed `idem`,
@@ -458,55 +724,70 @@ impl StreamWriter {
         if events.iter().any(|e| !e.fits(&self.stream)) {
             return Err(StoreError::WrongStream(self.stream.clone()));
         }
-        let mut conn = self.inner.conn();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(idem) = idem
-            && let Some(prior) = find_idem(&tx, &self.stream, idem)?
-        {
-            return Ok(Appended::Replayed(prior));
-        }
-        let found = head_of(&tx, &self.stream)?;
-        if found != self.head {
-            return Err(StoreError::HeadMoved {
-                expected: self.head,
-                found,
-            });
-        }
-        let by_json = serde_json::to_string(by)?;
-        let batch = events.len() as i64;
-        let mut committed = Vec::with_capacity(events.len());
-        let mut seq = self.head;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO entries(stream, seq, at, by, idem, batch, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for (i, event) in events.into_iter().enumerate() {
-                seq = seq.next();
-                let (row_idem, row_batch) = if i == 0 {
-                    (idem.map(IdemKey::as_str), batch)
-                } else {
-                    (None, 0)
-                };
-                insert.execute(params![
-                    self.key,
-                    seq.0 as i64,
-                    at.0 as i64,
-                    by_json,
-                    row_idem,
-                    row_batch,
-                    serde_json::to_string(&event)?
-                ])?;
-                committed.push(Envelope {
-                    stream: self.stream.clone(),
-                    seq,
-                    at,
-                    by: by.clone(),
-                    event,
+        let committed = {
+            let mut conn = self.inner.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(idem) = idem
+                && let Some(prior) = find_idem(&tx, &self.stream, idem)?
+            {
+                return Ok(Appended::Replayed(prior));
+            }
+            let found = head_of(&tx, &self.stream)?;
+            if found != self.head {
+                return Err(StoreError::HeadMoved {
+                    expected: self.head,
+                    found,
                 });
             }
+            let by_json = serde_json::to_string(by)?;
+            let batch = events.len() as i64;
+            let mut committed = Vec::with_capacity(events.len());
+            let mut seq = self.head;
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO entries(stream, seq, at, by, idem, batch, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                for (i, event) in events.into_iter().enumerate() {
+                    seq = seq.next();
+                    let (row_idem, row_batch) = if i == 0 {
+                        (idem.map(IdemKey::as_str), batch)
+                    } else {
+                        (None, 0)
+                    };
+                    insert.execute(params![
+                        self.key,
+                        seq.0 as i64,
+                        at.0 as i64,
+                        by_json,
+                        row_idem,
+                        row_batch,
+                        serde_json::to_string(&event)?
+                    ])?;
+                    committed.push(Envelope {
+                        stream: self.stream.clone(),
+                        seq,
+                        at,
+                        by: by.clone(),
+                        event,
+                    });
+                }
+            }
+            if let Some(ref hook) = self.inner.hook {
+                let tx_ctx = TxContext { tx: &tx };
+                hook.on_append(&tx_ctx, &committed)?;
+                if tx.is_autocommit() {
+                    return Err(StoreError::Backend(
+                        "commit hook illegally terminated enclosing SQLite transaction".into(),
+                    ));
+                }
+            }
+            tx.commit()?;
+            self.head = seq;
+            committed
+        };
+        if let Some(ref hook) = self.inner.hook {
+            hook.after_commit(&committed);
         }
-        tx.commit()?;
-        self.head = seq;
         Ok(Appended::Fresh(committed))
     }
 }
@@ -569,6 +850,7 @@ mod legacy_dm_tests {
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: rex_wave_api::room::PostOrigin::Direct,
                     }),
                 ],
             )
@@ -579,6 +861,13 @@ mod legacy_dm_tests {
             reopened.resolve_dm_room(canon_room.clone()).unwrap(),
             legacy_room,
             "single legacy DM stream continues without splitting"
+        );
+        assert_eq!(
+            reopened
+                .resolve_dm_room_with_idem(canon_room.clone(), &op, None, false)
+                .unwrap(),
+            DmIdemResolution::Route(canon_room.clone()),
+            "explicit canonical RoomRef::Id stays pinned to exact canonical stream"
         );
         assert_eq!(
             reopened
@@ -618,6 +907,7 @@ mod legacy_dm_tests {
                             labels: Vec::new(),
                             task: None,
                             idem: None,
+                            origin: rex_wave_api::room::PostOrigin::Direct,
                         }),
                     ],
                 )
@@ -646,6 +936,7 @@ mod legacy_dm_tests {
                             labels: Vec::new(),
                             task: None,
                             idem: None,
+                            origin: rex_wave_api::room::PostOrigin::Direct,
                         }),
                     ],
                 )
@@ -709,5 +1000,218 @@ mod legacy_dm_tests {
                 .unwrap(),
             DmIdemResolution::CrossAuthor { .. }
         ));
+    }
+
+    #[test]
+    fn user_version_upgrades_from_zero_and_rejects_future_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ver.sqlite3");
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            raw.execute_batch(SCHEMA).unwrap();
+            let v0: i64 = raw
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v0, 0);
+        }
+        let upgraded = Journal::open(&db_path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), JOURNAL_SCHEMA_VERSION);
+        drop(upgraded);
+
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            raw.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION + 7)
+                .unwrap();
+        }
+        let err = match Journal::open(&db_path) {
+            Ok(_) => panic!("future schema version must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            StoreError::UnsupportedSchemaVersion {
+                found,
+                max_supported: JOURNAL_SCHEMA_VERSION,
+            } if found == JOURNAL_SCHEMA_VERSION + 7
+        ));
+    }
+
+    #[test]
+    fn commit_hook_is_atomic_with_append_and_skips_idempotent_replays() {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+        struct TestHook {
+            fail: AtomicBool,
+            try_commit_sql: AtomicBool,
+            try_rollback_recovery: AtomicBool,
+            on_append_calls: AtomicUsize,
+            after_commit_calls: AtomicUsize,
+            observed_head_in_after_commit: AtomicU64,
+            journal: OnceLock<Journal>,
+            stream: StreamId,
+        }
+
+        impl CommitHook for TestHook {
+            fn on_init(&self, ctx: &mut InitContext<'_>) -> Result<(), StoreError> {
+                assert!(ctx.execute_ddl("COMMIT;").is_err());
+                assert!(ctx.execute_ddl("PRAGMA user_version = 99;").is_err());
+                ctx.execute_ddl(
+                    "CREATE TABLE IF NOT EXISTS side_index(seq INTEGER PRIMARY KEY, stream TEXT NOT NULL) STRICT;
+                     CREATE TABLE IF NOT EXISTS side_audit(cnt INTEGER NOT NULL) STRICT;
+                     CREATE TRIGGER IF NOT EXISTS side_index_audit AFTER INSERT ON side_index
+                     BEGIN
+                         INSERT INTO side_audit(cnt) VALUES (NEW.seq);
+                     END;",
+                )
+            }
+
+            fn on_append(
+                &self,
+                tx: &TxContext<'_, '_>,
+                committed: &[Envelope],
+            ) -> Result<(), StoreError> {
+                self.on_append_calls.fetch_add(1, Ordering::SeqCst);
+                if self.try_commit_sql.load(Ordering::SeqCst) {
+                    return tx.execute_sql("COMMIT", &[]).map(|_| ());
+                }
+                if self.try_rollback_recovery.load(Ordering::SeqCst) {
+                    tx.execute_sql(
+                        "INSERT INTO side_index(seq, stream) VALUES (1, 'seed')",
+                        &[],
+                    )?;
+                    let _ = tx.execute_sql(
+                        "INSERT OR ROLLBACK INTO side_index(seq, stream) VALUES (1, 'dup')",
+                        &[],
+                    );
+                    // Enclosing transaction was rolled back into autocommit mode; any recovery
+                    // write MUST be rejected before executing so nothing persists outside a tx.
+                    return tx
+                        .execute_sql(
+                            "INSERT INTO side_index(seq, stream) VALUES (99, 'escaped')",
+                            &[],
+                        )
+                        .map(|_| ());
+                }
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(StoreError::Backend("injected hook failure".into()));
+                }
+                for env in committed {
+                    let s = env.seq.0.to_string();
+                    let k = key(&env.stream);
+                    tx.execute_sql(
+                        "INSERT INTO side_index(seq, stream) VALUES (CAST(?1 AS INTEGER), ?2)",
+                        &[&s, &k],
+                    )?;
+                }
+                Ok(())
+            }
+
+            fn after_commit(&self, _committed: &[Envelope]) {
+                if let Some(j) = self.journal.get() {
+                    let h = j
+                        .head(&self.stream)
+                        .expect("journal unlocked in after_commit");
+                    self.observed_head_in_after_commit
+                        .store(h.0, Ordering::SeqCst);
+                }
+                self.after_commit_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let alice = Principal::Seat {
+            seat: SeatName::parse("alice").unwrap(),
+        };
+        let room = RoomRef::parse_str("#general")
+            .unwrap()
+            .resolve(&alice)
+            .unwrap();
+        let stream = StreamId::Room { room: room.clone() };
+        let hook = Arc::new(TestHook {
+            fail: AtomicBool::new(true),
+            try_commit_sql: AtomicBool::new(true),
+            try_rollback_recovery: AtomicBool::new(true),
+            on_append_calls: AtomicUsize::new(0),
+            after_commit_calls: AtomicUsize::new(0),
+            observed_head_in_after_commit: AtomicU64::new(0),
+            journal: OnceLock::new(),
+            stream: stream.clone(),
+        });
+        let j = Journal::in_memory_with_hook(Some(hook.clone())).unwrap();
+        let _ = hook.journal.set(j.clone());
+        let mut w = j.claim(stream.clone()).unwrap();
+        let idem = IdemKey::parse("post-1").unwrap();
+        let ev = Event::Room(RoomEvent::Opened {
+            id: room,
+            origin: RoomOrigin::Manual,
+            topic: None,
+        });
+
+        // Transaction-control SQL (`COMMIT`) inside `on_append` is rejected with 0 rows committed.
+        assert!(
+            w.append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+                .is_err()
+        );
+        assert_eq!(w.head(), Seq::ORIGIN);
+        assert_eq!(j.head(&stream).unwrap(), Seq::ORIGIN);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 0);
+        hook.try_commit_sql.store(false, Ordering::SeqCst);
+
+        // Constraint-induced `INSERT OR ROLLBACK` followed by a recovery write is rejected
+        // BEFORE executing in autocommit mode, leaving 0 rows in `side_index` or `entries`.
+        assert!(
+            w.append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+                .is_err()
+        );
+        assert_eq!(w.head(), Seq::ORIGIN);
+        assert_eq!(j.head(&stream).unwrap(), Seq::ORIGIN);
+        let leaked_rows: i64 = j
+            .inner
+            .conn()
+            .query_row("SELECT COUNT(*) FROM side_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            leaked_rows, 0,
+            "recovery write must not execute in autocommit mode"
+        );
+        hook.try_rollback_recovery.store(false, Ordering::SeqCst);
+
+        // Failing hook rolls back `entries` and leaves `head` at ORIGIN.
+        assert!(
+            w.append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+                .is_err()
+        );
+        assert_eq!(w.head(), Seq::ORIGIN);
+        assert_eq!(j.head(&stream).unwrap(), Seq::ORIGIN);
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 0);
+
+        // Succeeding retry commits `entries`, `side_index`, and the `CREATE TRIGGER` audit row,
+        // and `after_commit` reads the committed head on the cloned Journal without deadlocking.
+        hook.fail.store(false, Ordering::SeqCst);
+        let first = w
+            .append(&alice, UnixMs(100), Some(&idem), vec![ev.clone()])
+            .unwrap();
+        assert!(matches!(first, Appended::Fresh(_)));
+        assert_eq!(w.head(), Seq(1));
+        assert_eq!(hook.observed_head_in_after_commit.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
+        let trigger_rows: i64 = j
+            .inner
+            .conn()
+            .query_row("SELECT COUNT(*) FROM side_audit WHERE cnt = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(trigger_rows, 1);
+
+        // Idempotent replay does NOT re-invoke `on_append` or `after_commit`.
+        let replay = w
+            .append(&alice, UnixMs(200), Some(&idem), vec![ev])
+            .unwrap();
+        assert!(matches!(replay, Appended::Replayed(_)));
+        assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
     }
 }

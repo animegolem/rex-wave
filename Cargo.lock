@@ -1368,6 +1368,7 @@ dependencies = [
  "rex-wave-api",
  "rex-wave-fs",
  "rex-wave-runtime",
+ "rex-wave-store",
  "rex-wave-waves",
  "serde",
  "serde_json",
@@ -1492,6 +1493,7 @@ dependencies = [
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
+ "rex-wave-transport",
  "rex-wave-waves",
  "rusqlite",
  "serde",
@@ -1508,6 +1510,7 @@ version = "0.1.0"
 dependencies = [
  "futures-core",
  "futures-util",
+ "getrandom 0.3.4",
  "rex-wave-api",
  "rex-wave-fs",
  "rex-wave-runtime",
@@ -1537,8 +1540,12 @@ dependencies = [
  "rex-wave-api",
  "rex-wave-fs",
  "rex-wave-runtime",
+ "rusqlite",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

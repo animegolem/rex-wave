@@ -4,7 +4,7 @@ use rex_wave_api::room::*;
 use rex_wave_api::*;
 use rex_wave_rooms::{Rooms, resolve_mentions, room_history};
 use rex_wave_runtime::{
-    Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, SidebarProjection, Unavailable,
+    Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, SidebarProjection,
 };
 use rex_wave_store::Journal;
 use std::collections::BTreeMap;
@@ -16,17 +16,12 @@ fn build_harness(journal: Journal, idle: Duration) -> Arc<Router> {
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     Arc::new(Router {
         room: Registry::<Rooms>::with_idle(journal.clone(), hub.clone(), idle),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     })
 }
 
@@ -183,6 +178,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap_err();
@@ -205,6 +201,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -267,6 +264,7 @@ async fn ensure_is_idempotent_across_global_project_wave_and_canonical_dms() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap_err();
@@ -415,6 +413,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
             labels: Vec::new(),
             task: None,
             idem: Some(IdemKey::parse("post-1").unwrap()),
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -429,6 +428,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap_err();
@@ -448,6 +448,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
             labels: Vec::new(),
             task: None,
             idem: Some(IdemKey::parse("post-1").unwrap()),
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -465,6 +466,7 @@ async fn join_leave_handle_uniqueness_and_room_history_across_passivation() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -562,6 +564,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
                         labels: Vec::new(),
                         task: None,
                         idem: None,
+                        origin: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -623,6 +626,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -635,6 +639,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -647,6 +652,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -692,6 +698,7 @@ async fn concurrent_posts_and_anti_sleep_through_wait_slices() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1847,6 +1854,7 @@ async fn room_post_keeps_raw_idem_keys_for_pre_upgrade_journal_dedupe() {
                         labels: vec![],
                         task: None,
                         idem: Some(raw_key.clone()),
+                        origin: Default::default(),
                     }),
                 ],
             )

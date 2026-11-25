@@ -17,25 +17,25 @@ use rex_wave_mailbridge::{BellCourier, MailBridge, Presence, SandboxRoot};
 use rex_wave_notify::{Herald, HeraldHandle, Inbox};
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
-    AgentFeed, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection, spawn_reactor,
+    AgentFeed, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection,
+    ThreadIdResolver, spawn_reactor,
 };
 use rex_wave_store::Journal;
 use rex_wave_t3::{
-    CompositeFeed, CompositeHost, RunnerTarget, T3AuthSource, T3Bridge, T3Config, T3EndpointSource,
-    T3Feed, T3Host, T3Origin, ThreadIdResolver, runtime_file_path, worker_tokens_dir,
+    T3AuthSource, T3Bridge, T3Config, T3EndpointSource, T3Feed, T3Host, T3Origin, runtime_file_path,
 };
 use rex_wave_transport::{
     Authenticator, ConnectionHooks, Endpoint, PrincipalTokenTable, StateDirAuthenticator,
-    WorkerTokenFile, bind_unix_prepared, is_safe_worker_token_id, read_private_file,
-    serve_listener_with_hooks, write_worker_token_file,
+    bind_unix_prepared, is_safe_worker_token_id, mint_random_token, read_private_file,
+    serve_listener_with_hooks,
 };
-use rex_wave_waves::{WaveConductor, Waves};
+use rex_wave_waves::{HostRouter, WaveConductor, Waves};
 use std::collections::HashSet;
-use std::io::{self, Read as _};
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_BB_URL: &str = "ws://127.0.0.1:38886/api/v1/plugins/rex-wave/http/bridge";
@@ -174,28 +174,9 @@ pub fn tokens_path_for(sock_path: &Path) -> PathBuf {
     sock_path.with_file_name("tokens.json")
 }
 
-fn token_store_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct TokenStoreGuard {
-    _in_proc: std::sync::MutexGuard<'static, ()>,
-    _lock_file: std::fs::File,
-}
-
-fn lock_token_store(tokens_path: &Path) -> io::Result<TokenStoreGuard> {
-    let in_proc = token_store_lock().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parent) = tokens_path.parent() {
-        rex_wave_fs::create_missing_private_dir(parent)?;
-    }
-    let lock_path = tokens_path.with_extension("json.lock");
-    let lock_file = rex_wave_fs::open_lock_nofollow(&lock_path)?;
-    lock_file.lock()?;
-    Ok(TokenStoreGuard {
-        _in_proc: in_proc,
-        _lock_file: lock_file,
-    })
+fn lock_token_store(tokens_path: &Path) -> io::Result<rex_wave_transport::StateTokenLockGuard> {
+    let state_dir = tokens_path.parent().unwrap_or_else(|| Path::new("."));
+    rex_wave_transport::lock_state_dir_tokens(state_dir)
 }
 
 fn operator_seat_path(state_dir: &Path) -> PathBuf {
@@ -230,17 +211,6 @@ fn resolve_effective_operator_with_env(sock_path: &Path, env_val: Option<&str>) 
         return seat;
     }
     SeatName::parse("owner").expect("valid default operator seat")
-}
-
-fn random_token(prefix: &str) -> io::Result<String> {
-    let mut entropy = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
-    let mut token = String::from(prefix);
-    for byte in entropy {
-        use std::fmt::Write as _;
-        let _ = write!(token, "{byte:02x}");
-    }
-    Ok(token)
 }
 
 /// Mints a random 256-bit capability token for `principal` via [`PrincipalTokenTable`].
@@ -288,40 +258,37 @@ fn mint_principal_token_for_operator(
     };
 
     let tokens_path = tokens_path_for(sock_path);
-    let _guard = lock_token_store(&tokens_path)?;
+    let guard = lock_token_store(&tokens_path)?;
 
     if let Some(tid) = thread_id {
-        if !matches!(principal, Principal::Worker { .. }) {
+        let Principal::Worker { wave, role } = principal else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "thread-scoped worker token files only allow Principal::Worker",
             ));
-        }
+        };
         if !is_safe_worker_token_id(tid) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker token thread id must be a single safe filename",
             ));
         }
+        let parsed_tid = HostThreadId::parse(tid)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let state_dir = state_dir_for(sock_path);
-        let dir = worker_tokens_dir(&state_dir);
-        rex_wave_fs::ensure_private_dir(&dir)?;
-        let path = dir.join(tid);
-        if let Ok(Some(raw)) = read_private_file(&path, None, "worker token file")
-            && let Ok(existing) = serde_json::from_slice::<WorkerTokenFile>(&raw)
-            && existing.principal == *principal
-            && !existing.token.is_empty()
-        {
-            return Ok(existing.token);
-        }
-        let token = random_token(prefix)?;
-        write_worker_token_file(&dir, tid, &token, principal)?;
-        return Ok(token);
+        let provisioned = rex_wave_transport::provision_worker_token_locked(
+            &guard,
+            &state_dir,
+            wave,
+            role,
+            &parsed_tid,
+        )?;
+        return Ok(provisioned.token);
     }
 
     let mut table = PrincipalTokenTable::load_tokens_file(&tokens_path, None)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let token = random_token(prefix)?;
+    let token = mint_random_token(prefix)?;
     table.remove_principal(principal);
     table
         .insert(token.clone(), principal.clone())
@@ -536,13 +503,19 @@ fn journal_thread_resolver(journal: Journal) -> ThreadIdResolver {
                 }
                 for env in page {
                     after = env.seq;
-                    if let Event::Wave(WaveEvent::WorkerObserved {
-                        role: obs_role,
-                        observation: Observation::Spawned { thread, .. },
-                    }) = env.event
-                        && obs_role == role
-                    {
-                        latest = Some(thread);
+                    match env.event {
+                        Event::Wave(WaveEvent::WorkerRequested { role: req_role, .. })
+                            if req_role == role =>
+                        {
+                            latest = None;
+                        }
+                        Event::Wave(WaveEvent::WorkerObserved {
+                            role: obs_role,
+                            observation: Observation::Spawned { thread, .. },
+                        }) if obs_role == role => {
+                            latest = Some(thread);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -580,8 +553,14 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     }
 
     let runner_mode = resolve_runner_mode(&args);
+    let default_target = match runner_mode {
+        RunnerMode::T3 => RunnerKind::T3,
+        RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
+    };
     let t3_cfg = match runner_mode {
-        RunnerMode::T3 | RunnerMode::Both => Some(build_t3_config(&args, &state_dir)?),
+        RunnerMode::T3 | RunnerMode::Both => {
+            Some(build_t3_config(&args, &state_dir)?.with_default_runner(default_target))
+        }
         RunnerMode::Bb => None,
     };
 
@@ -610,38 +589,43 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         .map_err(|e| format!("persist operator seat: {e}"))?;
 
     let bb_bridge = match runner_mode {
-        RunnerMode::Bb | RunnerMode::Both => Some(BbBridge::with_code_runner(
-            BridgeConfig {
-                url: args.bb_url.clone(),
-                token: args.bb_token.clone(),
-            },
-            Arc::new(|client, args| {
-                Box::pin(async move {
-                    let res = rex_wave_mcp::McpServer::new(client)
-                        .call_tool(rex_wave_mcp::RUN_CODE_TOOL, args)
-                        .await;
-                    let text = res
-                        .content
-                        .into_iter()
-                        .find_map(|c| c.get("text").and_then(|t| t.as_str()).map(str::to_owned))
-                        .unwrap_or_else(|| "null".into());
-                    if res.is_error { Err(text) } else { Ok(text) }
-                })
-            }),
-        )),
+        RunnerMode::Bb | RunnerMode::Both => Some(
+            BbBridge::with_code_runner(
+                BridgeConfig {
+                    url: args.bb_url.clone(),
+                    token: args.bb_token.clone(),
+                },
+                Arc::new(|client, args| {
+                    Box::pin(async move {
+                        let res = rex_wave_mcp::McpServer::new(client)
+                            .call_tool(rex_wave_mcp::RUN_CODE_TOOL, args)
+                            .await;
+                        let text = res
+                            .content
+                            .into_iter()
+                            .find_map(|c| c.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+                            .unwrap_or_else(|| "null".into());
+                        if res.is_error { Err(text) } else { Ok(text) }
+                    })
+                }),
+            )
+            .with_default_runner(default_target),
+        ),
         RunnerMode::T3 => None,
     };
 
     let t3_bridge = t3_cfg.map(T3Bridge::new);
 
+    let mut feed_entries: Vec<(RunnerKind, Arc<dyn AgentFeed>)> = Vec::new();
+    if let Some(ref t) = t3_bridge {
+        feed_entries.push((RunnerKind::T3, Arc::new(T3Feed(t.clone()))));
+    }
+    if let Some(ref b) = bb_bridge {
+        feed_entries.push((RunnerKind::Bb, b.clone()));
+    }
     let composite_feed: Arc<dyn AgentFeed> = Arc::new(
-        CompositeFeed::new(
-            bb_bridge.as_ref().map(|b| b.clone() as Arc<dyn AgentFeed>),
-            t3_bridge
-                .as_ref()
-                .map(|t| Arc::new(T3Feed(t.clone())) as Arc<dyn AgentFeed>),
-        )
-        .with_thread_resolver(journal_thread_resolver(journal.clone())),
+        FeedRouter::new(feed_entries)
+            .with_thread_resolver(journal_thread_resolver(journal.clone())),
     );
 
     let router = Arc::new(Router {
@@ -665,18 +649,22 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     });
 
     let default_target = match runner_mode {
-        RunnerMode::T3 => RunnerTarget::T3,
-        RunnerMode::Bb | RunnerMode::Both => RunnerTarget::Bb,
+        RunnerMode::T3 => RunnerKind::T3,
+        RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
     };
-    let composite_host = CompositeHost::new(
-        bb_bridge.as_ref().map(|b| BbHost(b.clone())),
-        t3_bridge.as_ref().map(|t| T3Host(t.clone())),
-        default_target,
-    );
+    let host_router = HostRouter::new(default_target)
+        .with_optional_host(
+            RunnerKind::Bb,
+            bb_bridge.as_ref().map(|b| BbHost(b.clone())),
+        )
+        .with_optional_host(
+            RunnerKind::T3,
+            t3_bridge.as_ref().map(|t| T3Host(t.clone())),
+        );
 
     let system = |part| LocalClient::new(router.clone(), Principal::System { part });
     let conductor_task = spawn_reactor(
-        WaveConductor::new(composite_host),
+        WaveConductor::new(host_router),
         system(SystemPart::WaveConductor),
     );
     let herald = Herald::with_grace(Duration::from_millis(args.herald_grace_ms))

@@ -4,16 +4,20 @@ use rex_wave_api::notify::{InboxEvent, NotificationId, NotifyKind, NotifyState};
 use rex_wave_api::read::*;
 use rex_wave_api::room::{Mentions, RoomEvent, RoomId, RoomOrigin, RoomScope};
 use rex_wave_api::stage::derive_osc7501_status;
-use rex_wave_api::wave::{AgentSpec, WaveEvent, WaveOutcome, WorkerPhase};
+use rex_wave_api::wave::{AgentSpec, UnsettledFailure, WaveEvent, WaveOutcome, WorkerPhase};
 use rex_wave_api::{
     BbProjectId, Cursor, Envelope, Event, Principal, RoleName, Seq, StreamId, WaveSlug,
 };
 use rex_wave_store::Journal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tokio::sync::{broadcast::error::RecvError, watch};
+use tokio::sync::{
+    broadcast::error::{RecvError, TryRecvError},
+    watch,
+};
 
 const REPLAY_PAGE: usize = 512;
+const MAX_COALESCED_BURST: usize = 256;
 
 /// Derived, rebuildable projection of the journal for `Sidebar` and
 /// `Interest::Sidebar`.
@@ -32,20 +36,37 @@ impl SidebarProjection {
     /// replay or in `tap`; `World::apply` ignores seqs it has already folded.
     pub fn spawn(journal: Journal, hub: Hub) -> Arc<Self> {
         let mut tap = hub.tap();
-        let mut world = World::default();
-        catch_up(&journal, &mut world);
-        let (tx, world_rx) = watch::channel(Arc::new(world.clone()));
+        let mut initial = World::default();
+        catch_up(&journal, &mut initial);
+        let mut current = Arc::new(initial);
+        let (tx, world_rx) = watch::channel(current.clone());
         tokio::spawn(async move {
             loop {
                 match tap.recv().await {
                     Ok(env) => {
-                        if world.apply(&env) && tx.send(Arc::new(world.clone())).is_err() {
+                        let world = Arc::make_mut(&mut current);
+                        let mut dirty = world.apply(&env);
+                        let mut drained = 0usize;
+                        while drained < MAX_COALESCED_BURST {
+                            match tap.try_recv() {
+                                Ok(next_env) => {
+                                    dirty |= world.apply(&next_env);
+                                    drained += 1;
+                                }
+                                Err(TryRecvError::Lagged(_)) => {
+                                    dirty |= catch_up(&journal, world);
+                                    break;
+                                }
+                                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                            }
+                        }
+                        if dirty && tx.send(current.clone()).is_err() {
                             break;
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
-                        if catch_up(&journal, &mut world)
-                            && tx.send(Arc::new(world.clone())).is_err()
+                        if catch_up(&journal, Arc::make_mut(&mut current))
+                            && tx.send(current.clone()).is_err()
                         {
                             break;
                         }
@@ -102,10 +123,10 @@ fn catch_up(journal: &Journal, world: &mut World) -> bool {
 
 #[derive(Clone, Default)]
 pub(crate) struct World {
-    rooms: BTreeMap<RoomId, RoomEntry>,
-    waves: BTreeMap<WaveSlug, WaveEntry>,
-    boards: BTreeMap<BoardId, BoardEntry>,
-    inboxes: BTreeMap<Principal, InboxEntry>,
+    rooms: BTreeMap<RoomId, Arc<RoomEntry>>,
+    waves: BTreeMap<WaveSlug, Arc<WaveEntry>>,
+    boards: BTreeMap<BoardId, Arc<BoardEntry>>,
+    inboxes: BTreeMap<Principal, Arc<InboxEntry>>,
     archived_projects: BTreeSet<BbProjectId>,
     archived_waves: BTreeSet<WaveSlug>,
     archived_rooms: BTreeSet<RoomId>,
@@ -116,7 +137,7 @@ pub(crate) struct World {
 struct RoomEntry {
     origin: Option<RoomOrigin>,
     members: BTreeSet<Principal>,
-    posts: Vec<PostMeta>,
+    posts: Arc<Vec<PostMeta>>,
 }
 
 #[derive(Clone)]
@@ -131,7 +152,7 @@ struct WaveEntry {
     project: BbProjectId,
     room: RoomId,
     finished: Option<WaveOutcome>,
-    workers: BTreeMap<RoleName, (AgentSpec, WorkerPhase)>,
+    workers: BTreeMap<RoleName, (AgentSpec, WorkerPhase, UnsettledFailure)>,
 }
 
 #[derive(Clone, Default)]
@@ -154,7 +175,7 @@ impl World {
         self.cursor.advance(&env.stream, env.seq);
         match (&env.stream, &env.event) {
             (StreamId::Room { room }, Event::Room(ev)) => {
-                let r = self.rooms.entry(room.clone()).or_default();
+                let r = Arc::make_mut(self.rooms.entry(room.clone()).or_default());
                 if let RoomId::Direct { pair } = room {
                     let (a, b): (Principal, Principal) = pair.clone().into();
                     r.members.insert(a);
@@ -169,7 +190,7 @@ impl World {
                         r.members.remove(member);
                     }
                     RoomEvent::Posted { mentions, .. } => {
-                        r.posts.push(PostMeta {
+                        Arc::make_mut(&mut r.posts).push(PostMeta {
                             seq: env.seq,
                             by: env.by.clone(),
                             mentions: mentions.clone(),
@@ -187,12 +208,12 @@ impl World {
                 WaveEvent::Started { spec, room, .. } => {
                     self.waves.insert(
                         wave.clone(),
-                        WaveEntry {
+                        Arc::new(WaveEntry {
                             project: spec.project.clone(),
                             room: room.clone(),
                             finished: None,
                             workers: BTreeMap::new(),
-                        },
+                        }),
                     );
                 }
                 WaveEvent::WorkerRequested {
@@ -202,38 +223,43 @@ impl World {
                     ..
                 } => {
                     if let Some(w) = self.waves.get_mut(wave) {
-                        w.workers.insert(
+                        Arc::make_mut(w).workers.insert(
                             role.clone(),
-                            (agent.clone(), WorkerPhase::Requested { attempt: *attempt }),
+                            (
+                                agent.clone(),
+                                WorkerPhase::Requested { attempt: *attempt },
+                                UnsettledFailure::default(),
+                            ),
                         );
                     }
                 }
                 WaveEvent::WorkerObserved { role, observation } => {
                     if let Some(w) = self.waves.get_mut(wave)
-                        && let Some((_, phase)) = w.workers.get_mut(role)
+                        && let Some((_, phase, unsettled)) = Arc::make_mut(w).workers.get_mut(role)
                     {
-                        *phase = phase.observe(observation);
+                        *phase = unsettled.observe(phase, observation);
                     }
                 }
                 WaveEvent::WorkerRetiring { role, .. } => {
                     if let Some(w) = self.waves.get_mut(wave)
-                        && let Some((_, phase)) = w.workers.get_mut(role)
+                        && let Some((_, phase, unsettled)) = Arc::make_mut(w).workers.get_mut(role)
                     {
-                        *phase = phase.retiring();
+                        *phase = unsettled.retiring(phase);
                     }
                 }
                 WaveEvent::Finished { outcome } => {
                     if let Some(w) = self.waves.get_mut(wave) {
+                        let w = Arc::make_mut(w);
                         w.finished = Some(outcome.clone());
-                        for (_, phase) in w.workers.values_mut() {
-                            *phase = phase.retiring();
+                        for (_, phase, unsettled) in w.workers.values_mut() {
+                            *phase = unsettled.retiring(phase);
                         }
                     }
                 }
                 WaveEvent::Told { .. } | WaveEvent::InteractionResolved { .. } => {}
             },
             (StreamId::Board { board }, Event::Board(ev)) => {
-                let b = self.boards.entry(board.clone()).or_default();
+                let b = Arc::make_mut(self.boards.entry(board.clone()).or_default());
                 match ev {
                     BoardEvent::Opened { lanes, .. } => {
                         for l in lanes {
@@ -276,7 +302,7 @@ impl World {
                 }
             }
             (StreamId::Inbox { owner }, Event::Inbox(ev)) => {
-                let inbox = self.inboxes.entry(owner.clone()).or_default();
+                let inbox = Arc::make_mut(self.inboxes.entry(owner.clone()).or_default());
                 match ev {
                     InboxEvent::Raised { id, draft, .. } => {
                         inbox.items.insert(
@@ -354,7 +380,7 @@ impl World {
         let in_room = self.is_member(room, viewer);
         let mut unread = 0u32;
         let mut mentions = 0u32;
-        for p in &r.posts {
+        for p in r.posts.iter() {
             if p.seq > upto && !viewer.same_actor(&p.by) {
                 unread += 1;
                 let system_to_operator =
@@ -425,7 +451,7 @@ impl World {
             let workers = w
                 .workers
                 .iter()
-                .map(|(role, (spec, phase))| WaveWorkerLeaf {
+                .map(|(role, (spec, phase, _))| WaveWorkerLeaf {
                     role: role.clone(),
                     provider: spec.provider.clone(),
                     model: spec.model.clone(),
@@ -511,7 +537,7 @@ impl World {
         let all_phases = self
             .waves
             .values()
-            .flat_map(|w| w.workers.values().map(|(_, p)| p));
+            .flat_map(|w| w.workers.values().map(|(_, p, _)| p));
         let osc7501 = derive_osc7501_status(&inbox, all_phases);
         SidebarTreeSnapshot {
             inbox,

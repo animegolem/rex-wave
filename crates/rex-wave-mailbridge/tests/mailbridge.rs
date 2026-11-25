@@ -10,8 +10,7 @@ use rex_wave_mailbridge::{
 };
 use rex_wave_rooms::{Rooms, room_history};
 use rex_wave_runtime::{
-    Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, SidebarProjection, Unavailable,
-    spawn_reactor,
+    Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, SidebarProjection, spawn_reactor,
 };
 use rex_wave_store::Journal;
 use sha2::{Digest, Sha256};
@@ -446,17 +445,13 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     ));
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: mail_service.clone(),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let owner = LocalClient::new(
@@ -499,6 +494,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -511,6 +507,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -635,6 +632,7 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -750,17 +748,13 @@ async fn wake_bell_deduplicates_schedule_mark_hardens_http_and_delivers_seat_dm(
     ));
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: mail_service,
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let bell_client = LocalClient::new(
@@ -938,17 +932,13 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
     ));
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
         mail: mail_service,
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let sam = LocalClient::new(
         router.clone(),

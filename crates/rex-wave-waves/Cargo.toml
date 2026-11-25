@@ -11,11 +11,15 @@ publish.workspace = true
 rex-wave-fs.workspace = true
 rex-wave-api.workspace = true
 rex-wave-runtime.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 rex-wave-runtime = { path = "../rex-wave-runtime", features = ["test-support"] }
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

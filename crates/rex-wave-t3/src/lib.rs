@@ -28,9 +28,9 @@ pub use projects::{
 pub use protocol::{
     CompletedTurn, ITEM_SEQ_STRIDE, LiveSeqTracker, ShellObservation, T3_THREAD_PREFIX,
     TurnMirrorCheck, active_pending_interaction, delivery_intent_str, derive_shell_observation,
-    deterministic_thread_id, force_stop_thread_payload, inspect_latest_completed_turn,
-    is_t3_thread_id, item_event_seq, launch_thread_payload, message_dispatch_mode,
-    message_dispatch_payload, mirror_idem_key, normalize_turn_item,
+    deterministic_thread_id, force_stop_thread_payload, inspect_completed_turns_in_order,
+    inspect_latest_completed_turn, is_t3_thread_id, item_event_seq, launch_thread_payload,
+    message_dispatch_mode, message_dispatch_payload, mirror_idem_key, normalize_turn_item,
     parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_rfc3339_ms,
     parse_t3_thread_id, parse_timestamp_ms, parse_token_usage, runtime_mode_str,
     runtime_request_respond_payload, spawn_command_id, spawn_message_id, strip_t3_provider_prefix,

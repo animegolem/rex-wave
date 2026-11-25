@@ -169,6 +169,7 @@ fn is_own_wait_bookkeeping(viewer: &Principal, env: &Envelope) -> bool {
                 role: ev_role,
                 observation: wave::Observation::Activity {
                     activity: wave::Activity::Parked { .. } | wave::Activity::Working,
+                    ..
                 },
             })
         ) if ev_wave == wave && ev_role == role
@@ -187,7 +188,7 @@ impl ReadSide {
     /// Resolve `room` for `viewer`, routing `@<peer>` (`RoomRef::Dm`) to an
     /// existing pre-PR-26 `(Operator, peer)` DM stream when the canonical
     /// `(Seat, peer)` stream does not exist yet, while keeping explicit
-    /// `RoomRef::Id` targets untouched.
+    /// `RoomRef::Id` targets pinned to their exact stream (matching writes).
     pub fn resolve_room_ref(
         &self,
         room: &rex_wave_api::room::RoomRef,
@@ -300,19 +301,7 @@ impl ReadSide {
         // watch even if the new target fails validation.
         let (generation, mut gen_rx) = session.focus();
         let viewer = session.me().clone();
-        let inner_interest = match &target {
-            StageTarget::Inbox => Interest::MyInbox,
-            StageTarget::Kanban { board } => Interest::Streams {
-                streams: vec![StreamId::Board {
-                    board: board.clone(),
-                }],
-            },
-            StageTarget::Room { room } => Interest::Room { room: room.clone() },
-            StageTarget::Agent { wave, role } => Interest::Agent {
-                wave: wave.clone(),
-                role: role.clone(),
-            },
-        };
+        let inner_interest = target.to_inner_interest();
         let mut inner = match inner_interest {
             Interest::Agent { wave, role } => self.agents.live(&wave, &role).await?,
             other => self.watch_journal(viewer, other, from)?,
@@ -705,6 +694,15 @@ impl ReadSide {
         viewer: &Principal,
         req: &read::Wait,
     ) -> Result<Cursor, ApiError> {
+        let remap_dm_cursor = matches!(
+            req.interest,
+            Interest::Room {
+                room: rex_wave_api::room::RoomRef::Dm { .. }
+            } | Interest::RoomFiltered {
+                room: rex_wave_api::room::RoomRef::Dm { .. },
+                ..
+            }
+        ) || matches!(req.room, Some(rex_wave_api::room::RoomRef::Dm { .. }));
         let target_stream = match &req.room {
             Some(room_ref) => Some(StreamId::Room {
                 room: self.resolve_room_ref(room_ref, viewer)?,
@@ -712,7 +710,7 @@ impl ReadSide {
             None => None,
         };
         if let Some(ref c) = req.cursor {
-            let mut out = self.sanitize_and_remap_cursor(viewer, c, false)?;
+            let mut out = self.sanitize_and_remap_cursor(viewer, c, remap_dm_cursor)?;
             if let Some(ref target) = target_stream
                 && can_read(viewer, target).is_ok()
             {
@@ -739,7 +737,7 @@ impl ReadSide {
             }
             return Ok(base);
         }
-        self.sanitize_and_remap_cursor(viewer, &req.after, false)
+        self.sanitize_and_remap_cursor(viewer, &req.after, remap_dm_cursor)
     }
 
     pub fn parked_room_and_since(

@@ -83,6 +83,7 @@ impl Decider for ToyRooms {
                 labels: c.labels.clone(),
                 task: c.task.clone(),
                 idem: c.idem.clone(),
+                origin: Default::default(),
             }]),
             _ => Ok(vec![]),
         }
@@ -198,17 +199,12 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
     let leases = Arc::new(AtomicUsize::new(0));
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(LeaseFeed(leases.clone())),
-        }),
+        }))
     });
     let auth: Arc<dyn Authenticator> = Arc::new(TableAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
@@ -293,6 +289,7 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
                 labels: Vec::new(),
                 task: None,
                 idem: None,
+                origin: Default::default(),
             })
             .await
             .unwrap()
@@ -352,6 +349,7 @@ async fn uds_hello_multiplexed_calls_watches_and_cancellations_round_trip() {
         labels: Vec::new(),
         task: None,
         idem: None,
+        origin: Default::default(),
     })
     .await
     .unwrap();
@@ -450,17 +448,12 @@ async fn abrupt_socket_hangup_wakes_pending_call_with_transport_error() {
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Arc::new(HangingService),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let auth: Arc<dyn Authenticator> = Arc::new(TableAuthenticator {
         operator: SeatName::parse("owner").unwrap(),
@@ -621,17 +614,12 @@ fn router_with(journal: &Journal, room: Arc<dyn Service<RoomCommand>>) -> Arc<Ro
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     Arc::new(Router {
         room,
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     })
 }
 
@@ -641,17 +629,12 @@ fn toy_router(journal: &Journal) -> Arc<Router> {
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal: journal.clone(),
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     })
 }
 
@@ -668,15 +651,7 @@ fn serve_on(sock: &std::path::Path, router: Arc<Router>) -> tokio::task::JoinHan
 }
 
 fn post(body: &str) -> RoomPost {
-    RoomPost {
-        room: general(),
-        body: Body::parse(body).unwrap(),
-        re: None,
-        after: None,
-        labels: Vec::new(),
-        task: None,
-        idem: None,
-    }
+    RoomPost::new(general(), Body::parse(body).unwrap())
 }
 
 async fn next_frame(stream: &mut FrameStream) -> Frame {
@@ -849,17 +824,13 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
         presence: Arc::new(CapturePresence(seen.clone())),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let auth: Arc<dyn Authenticator> = Arc::new(StateDirAuthenticator::from_state_dir(
         SeatName::parse("owner").unwrap(),
@@ -1020,6 +991,7 @@ async fn daemon_restart_reconnects_and_resumes_watches_from_their_cursor() {
             labels: Vec::new(),
             task: None,
             idem: None,
+            origin: Default::default(),
         })
         .await
         .unwrap();
@@ -1123,17 +1095,12 @@ async fn principal_tokens_and_worker_token_files_authenticate_seat_worker_operat
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
     let server = tokio::spawn(serve_listener(listener, router, auth));
 
@@ -1370,17 +1337,12 @@ async fn serve_listener_with_hooks_fires_raii_disconnect_on_eof_and_abort() {
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
         room: Registry::<ToyRooms>::new(journal.clone(), hub.clone()),
-        wave: Arc::new(Unavailable(Family::Wave)),
-        board: Arc::new(Unavailable(Family::Board)),
-        inbox: Arc::new(Unavailable(Family::Inbox)),
-        mail: Arc::new(Unavailable(Family::Mail)),
-        presence: Arc::new(Unavailable(Family::Presence)),
-        read: Arc::new(ReadSide {
+        ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
             sidebar,
             agents: Arc::new(NoAgentFeed),
-        }),
+        }))
     });
 
     let server = tokio::spawn(serve_listener_with_hooks(listener, router, auth, hooks));

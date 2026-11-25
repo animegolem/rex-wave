@@ -62,7 +62,7 @@ pub struct Cli {
     /// Daemon Unix socket path (default: `$XDG_STATE_HOME/rex-wave/daemon.sock`; on macOS, must share `/tmp`'s filesystem).
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
-    /// Capability token for seat or worker authentication (falls back to `T3CODE_THREAD_ID` worker token, then Unix peer UID).
+    /// Capability token for seat or worker authentication (falls back to `REX_WAVE_WORKER_THREAD_ID` / `T3CODE_THREAD_ID` worker token, then Unix peer UID).
     #[arg(long, global = true, env = "REX_WAVE_TOKEN")]
     pub token: Option<String>,
     /// Emit machine-readable JSON replies instead of human summaries.
@@ -1047,8 +1047,9 @@ fn resolve_seat_arg(explicit: Option<&String>, me: &Principal) -> Result<SeatNam
 
 /// Resolves CLI credentials in precedence order:
 /// 1. Explicit `--token` / `REX_WAVE_TOKEN`.
-/// 2. `<state_dir>/worker-tokens/$T3CODE_THREAD_ID` when `T3CODE_THREAD_ID` is set.
-/// 3. Unix `Credential::PeerUid` (failing closed if a `t3:` worker token file is missing or invalid).
+/// 2. `<state_dir>/worker-tokens/$REX_WAVE_WORKER_THREAD_ID` when `REX_WAVE_WORKER_THREAD_ID` is set (always fails closed on missing/invalid file).
+/// 3. `<state_dir>/worker-tokens/$T3CODE_THREAD_ID` when `T3CODE_THREAD_ID` is set (fails closed for wave worker schemes `t3:`, `acp:`, `claude:`, `codex:`).
+/// 4. Unix `Credential::PeerUid`.
 pub fn resolve_cli_credential(
     sock_path: &Path,
     explicit_token: Option<&str>,
@@ -1058,18 +1059,53 @@ pub fn resolve_cli_credential(
             token: tok.to_owned(),
         });
     }
-    if let Ok(raw_tid) = std::env::var("T3CODE_THREAD_ID") {
-        let tid = raw_tid.trim();
+    if let Some(raw_os) = std::env::var_os(rex_wave_transport::WORKER_THREAD_ENV) {
+        let Some(raw_str) = raw_os.to_str() else {
+            return Err(format!(
+                "{} contains non-UTF-8 bytes; refusing PeerUid fallback",
+                rex_wave_transport::WORKER_THREAD_ENV
+            ));
+        };
+        let tid = raw_str.trim();
+        if tid.is_empty() {
+            return Err(format!(
+                "{} is set to an empty value; refusing PeerUid fallback",
+                rex_wave_transport::WORKER_THREAD_ENV
+            ));
+        }
+        let state_dir = daemon::state_dir_for(sock_path);
+        return match rex_wave_transport::read_worker_token_file(&state_dir, tid) {
+            Ok(Some(token)) => Ok(Credential::Token { token }),
+            Ok(None) => Err(format!(
+                "wave worker token missing or retired for {}={tid}; refusing PeerUid fallback",
+                rex_wave_transport::WORKER_THREAD_ENV
+            )),
+            Err(e) => Err(format!(
+                "failed reading worker token for {}={tid}: {e}",
+                rex_wave_transport::WORKER_THREAD_ENV
+            )),
+        };
+    }
+    if let Some(raw_os) = std::env::var_os(rex_wave_transport::T3_WORKER_THREAD_ENV) {
+        let Some(raw_str) = raw_os.to_str() else {
+            return Err(format!(
+                "{} contains non-UTF-8 bytes; refusing PeerUid fallback",
+                rex_wave_transport::T3_WORKER_THREAD_ENV
+            ));
+        };
+        let tid = raw_str.trim();
         if !tid.is_empty() {
+            let has_worker_prefix = RunnerKind::from_thread_str(tid) != RunnerKind::Bb;
             let state_dir = daemon::state_dir_for(sock_path);
-            match rex_wave_t3::read_worker_token_file(&state_dir, tid) {
+            match rex_wave_transport::read_worker_token_file(&state_dir, tid) {
                 Ok(Some(token)) => return Ok(Credential::Token { token }),
-                Ok(None) if tid.starts_with(rex_wave_t3::T3_THREAD_PREFIX) => {
+                Ok(None) if has_worker_prefix => {
                     return Err(format!(
                         "T3 wave worker token missing or retired for thread {tid}; refusing PeerUid fallback"
                     ));
                 }
                 Ok(None) => {}
+                Err(e) if !has_worker_prefix && e.kind() == std::io::ErrorKind::InvalidInput => {}
                 Err(e) => {
                     return Err(format!(
                         "failed reading worker token for T3CODE_THREAD_ID={tid}: {e}"
@@ -1198,6 +1234,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                     Some(k) => Some(IdemKey::parse(k.clone())?),
                     None => None,
                 },
+                origin: Default::default(),
             }))
         }
         Cmd::Reply {
@@ -1218,6 +1255,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
                 Some(k) => Some(IdemKey::parse(k.clone())?),
                 None => None,
             },
+            origin: Default::default(),
         })),
         Cmd::Read {
             room,
@@ -1765,6 +1803,7 @@ fn task_to_command(cmd: &TaskCmd, me: &Principal) -> Result<WireCommand, ApiErro
                     Some(k) => Some(IdemKey::parse(k.clone())?),
                     None => None,
                 },
+                origin: Default::default(),
             }))
         }
         TaskCmd::Move {

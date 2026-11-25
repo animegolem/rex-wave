@@ -1,16 +1,28 @@
 //! Wave decider (`Waves`), `AgentHost` port, and `WaveConductor` reactor.
 
+pub mod router;
+pub mod workspace;
+
+pub use rex_wave_runtime::BoxFut;
+pub use router::{HostRouter, RoutedProvider, route_provider, route_thread};
+pub use workspace::{
+    BbProjectLocation, ProjectWorkspaceLocation, default_bb_data_dir, expand_tilde,
+    looks_like_workspace_path, lookup_bb_project_location, normalize_workspace_path_key,
+    resolve_project_workspace_location,
+};
+
 use rex_wave_api::board::{BoardEnsure, BoardId, project_board};
 use rex_wave_api::room::{
-    Body, Mentions, RoomEnsure, RoomEvent, RoomId, RoomJoin, RoomOrigin, RoomPost, RoomRef,
-    RoomScope,
+    Body, Mentions, PostOrigin, RoomEnsure, RoomEvent, RoomId, RoomJoin, RoomOrigin, RoomPost,
+    RoomRef, RoomScope,
 };
 use rex_wave_api::wave::*;
 use rex_wave_api::*;
 use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, LocalClient, Reactor};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
     let name =
@@ -25,6 +37,91 @@ pub fn wave_room(slug: &WaveSlug, project: &BbProjectId) -> RoomId {
 
 pub const MAX_SPAWN_ATTEMPTS: u32 = 3;
 pub const MAX_RETIRE_ATTEMPTS: u32 = 3;
+
+/// Builds a collision-free idempotency key for final-turn room mirroring while
+/// preserving the `wave:<wave>:turn:` prefix.
+pub fn mirror_idem_key(
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+    anchor: &str,
+) -> Result<IdemKey, InvalidId> {
+    let raw = format!("wave:{wave}:turn:{role}:{thread}:{anchor}");
+    if raw.len() <= 256 {
+        return IdemKey::parse(raw);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(thread.as_str().as_bytes());
+    hasher.update(b":");
+    hasher.update(anchor.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    IdemKey::parse(format!("wave:{wave}:turn:{role}:h{hex}"))
+}
+
+/// Pre-PR-27 BB turn-mirror idempotency key for inputs exceeding 256 bytes,
+/// preserved solely to recognize already-journaled rows across upgrades.
+pub fn legacy_truncated_mirror_idem_key(
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+    anchor: &str,
+) -> Option<IdemKey> {
+    let raw = format!("wave:{wave}:turn:{role}:{thread}:{anchor}");
+    if raw.len() <= 256 {
+        return None;
+    }
+    let mut end = 256usize;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    IdemKey::parse(&raw[..end]).ok()
+}
+
+pub fn is_legacy_mirror_idem_key(idem: &IdemKey) -> bool {
+    idem.as_str().starts_with("wave:") && idem.as_str().contains(":turn:")
+}
+
+/// Classifies whether `idem` matches an existing pre-upgrade BB turn-mirror row for
+/// `(wave, role, thread)`. Returns `Some(true)` for an exact full start-anchor match
+/// (`s<turn_start_seq>`), `Some(false)` for a 256-byte-truncated start or end key that
+/// requires chronological turn-to-post reconciliation, or `None` when `idem` cannot
+/// belong to this completed turn. Start-anchored keys (`s<N>`) never match without a
+/// recovered `turn_start_seq`.
+pub fn classify_legacy_bb_mirror_idem(
+    idem: &IdemKey,
+    wave: &WaveSlug,
+    role: &RoleName,
+    thread: &HostThreadId,
+    turn_start_seq: Option<u64>,
+    turn_end_seq: u64,
+) -> Option<bool> {
+    if let Some(s) = turn_start_seq {
+        let start_anchor = format!("s{s}");
+        if mirror_idem_key(wave, role, thread, &start_anchor)
+            .ok()
+            .as_ref()
+            == Some(idem)
+        {
+            return Some(true);
+        }
+        if legacy_truncated_mirror_idem_key(wave, role, thread, &start_anchor).as_ref()
+            == Some(idem)
+        {
+            return Some(false);
+        }
+    }
+
+    let end_anchor = format!("e{turn_end_seq}");
+    if legacy_truncated_mirror_idem_key(wave, role, thread, &end_anchor).as_ref() == Some(idem) {
+        return Some(false);
+    }
+    None
+}
 
 pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase, String> {
     match (phase, obs) {
@@ -56,23 +153,43 @@ pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase
             },
             Observation::Activity {
                 activity: Activity::Errored { .. },
+                thread: obs_thread,
+                ..
             },
-        ) => Ok(WorkerPhase::Live {
+        ) if obs_thread.as_ref().is_none_or(|t| t == thread) => Ok(WorkerPhase::Live {
             thread: thread.clone(),
             activity: Activity::Refused {
                 reason: reason.clone(),
             },
         }),
-        (WorkerPhase::Live { thread, .. }, Observation::Activity { activity }) => {
-            Ok(WorkerPhase::Live {
-                thread: thread.clone(),
-                activity: activity.clone(),
-            })
-        }
         (
-            WorkerPhase::Live { .. } | WorkerPhase::Retiring { .. } | WorkerPhase::Requested { .. },
-            Observation::Archived,
-        ) => Ok(phase.observe(obs)),
+            WorkerPhase::Live { thread, .. },
+            Observation::Activity {
+                activity,
+                thread: obs_thread,
+                ..
+            },
+        ) if obs_thread.as_ref().is_none_or(|t| t == thread) => Ok(WorkerPhase::Live {
+            thread: thread.clone(),
+            activity: activity.clone(),
+        }),
+        (
+            WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread, .. },
+            Observation::Archived {
+                thread: obs_thread, ..
+            },
+        ) if obs_thread.as_ref().is_none_or(|t| t == thread) => Ok(phase.observe(obs)),
+        (
+            WorkerPhase::Requested { attempt },
+            Observation::Archived {
+                thread: obs_thread,
+                attempt: obs_attempt,
+            },
+        ) if obs_attempt.is_none_or(|a| a == *attempt)
+            && (obs_thread.is_none() || obs_attempt.is_some()) =>
+        {
+            Ok(phase.observe(obs))
+        }
         _ => Err(format!(
             "observation {obs:?} does not apply in phase {phase:?}"
         )),
@@ -196,6 +313,10 @@ struct WorkerRecord {
     writes: Vec<PathBuf>,
     return_schema: Option<serde_json::Value>,
     meta: WorkerRuntimeMeta,
+    suppressed_thread: Option<BbThreadId>,
+    suppressed_turns: BTreeSet<String>,
+    settled_turn_seq: u64,
+    unsettled_failure: UnsettledFailure,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -507,9 +628,19 @@ impl Decider for Waves {
                     let mut refused = Vec::new();
                     let mut errored = Vec::new();
                     for (role, rec) in &state.workers {
-                        if rec.phase.refusal().is_some() {
+                        if rec.phase.refusal().is_some()
+                            || matches!(
+                                rec.unsettled_failure.activity(),
+                                Some(Activity::Refused { .. })
+                            )
+                        {
                             refused.push(format!("@{role}"));
-                        } else if rec.phase.error().is_some() {
+                        } else if rec.phase.error().is_some()
+                            || matches!(
+                                rec.unsettled_failure.activity(),
+                                Some(Activity::Errored { .. })
+                            )
+                        {
                             errored.push(format!("@{role}"));
                         }
                     }
@@ -587,9 +718,118 @@ impl Decider for Waves {
                         observation: c.observation.clone(),
                     }]);
                 }
+                if let Observation::TurnsSuppressed { thread, keys } = &c.observation {
+                    let matches_thread = match &rec.phase {
+                        WorkerPhase::Live { thread: t, .. }
+                        | WorkerPhase::Retiring { thread: t, .. } => t == thread,
+                        WorkerPhase::Requested { .. } => true,
+                        WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
+                    };
+                    if !matches_thread {
+                        return Ok(vec![]);
+                    }
+                    let thread_matches_existing = rec.suppressed_thread.as_ref() == Some(thread);
+                    let mut clean: Vec<String> = Vec::new();
+                    for key in keys {
+                        let trimmed = key.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let already_recorded =
+                            thread_matches_existing && rec.suppressed_turns.contains(trimmed);
+                        if !already_recorded && !clean.iter().any(|existing| existing == trimmed) {
+                            clean.push(trimmed.to_owned());
+                        }
+                    }
+                    if clean.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    return Ok(vec![WaveEvent::WorkerObserved {
+                        role: c.role.clone(),
+                        observation: Observation::TurnsSuppressed {
+                            thread: thread.clone(),
+                            keys: clean,
+                        },
+                    }]);
+                }
+                if let WorkerPhase::Requested { .. } = &rec.phase
+                    && let Observation::Archived {
+                        thread: Some(obs_th),
+                        ..
+                    } = &c.observation
+                {
+                    let is_t3 = obs_th.as_str().starts_with("t3:");
+                    let prov = rec.agent.provider.as_str();
+                    if (is_t3 && matches!(prov, "pi" | "cursor"))
+                        || (!is_t3 && prov == "antigravity")
+                    {
+                        return Ok(vec![]);
+                    }
+                }
                 let Ok(next) = worker_step(&rec.phase, &c.observation) else {
                     return Ok(vec![]);
                 };
+                if let Observation::Activity {
+                    thread,
+                    settled_seq,
+                    suppress_keys,
+                    ..
+                } = &c.observation
+                    && let WorkerPhase::Live {
+                        thread: ref live_thread,
+                        activity: ref effective_activity,
+                    } = next
+                {
+                    if thread.as_ref().is_some_and(|t| t != live_thread) {
+                        return Ok(vec![]);
+                    }
+                    let effective_activity =
+                        match (effective_activity, rec.unsettled_failure.activity()) {
+                            (Activity::Errored { .. }, Some(Activity::Refused { reason })) => {
+                                Activity::Refused {
+                                    reason: reason.clone(),
+                                }
+                            }
+                            (act, _) => act.clone(),
+                        };
+                    let thread_matches_existing =
+                        rec.suppressed_thread.as_ref() == Some(live_thread);
+                    let mut clean_keys: Vec<String> = Vec::new();
+                    for key in suppress_keys {
+                        let trimmed = key.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let already_recorded =
+                            thread_matches_existing && rec.suppressed_turns.contains(trimmed);
+                        if !already_recorded
+                            && !clean_keys.iter().any(|existing| existing == trimmed)
+                        {
+                            clean_keys.push(trimmed.to_owned());
+                        }
+                    }
+                    let clean_settled = settled_seq.filter(|&s| s > 0);
+                    let settled_advanced = clean_settled
+                        .is_some_and(|s| !thread_matches_existing || s > rec.settled_turn_seq);
+                    let effective_phase = WorkerPhase::Live {
+                        thread: live_thread.clone(),
+                        activity: effective_activity.clone(),
+                    };
+                    if effective_phase == rec.phase && !settled_advanced && clean_keys.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let carry_thread = (clean_settled.is_some() || !clean_keys.is_empty())
+                        .then(|| live_thread.clone());
+                    return Ok(vec![WaveEvent::WorkerObserved {
+                        role: c.role.clone(),
+                        observation: Observation::Activity {
+                            activity: effective_activity,
+                            thread: carry_thread,
+                            settled_seq: clean_settled,
+                            suppress_keys: clean_keys,
+                        },
+                    }]);
+                }
                 if next == rec.phase {
                     return Ok(vec![]);
                 }
@@ -597,7 +837,6 @@ impl Decider for Waves {
                     role: c.role.clone(),
                     observation: c.observation.clone(),
                 }];
-                // Emit explicit retry `WorkerRequested` so SidebarProjection and WaveConductor stay in lockstep.
                 if let WorkerPhase::Requested { attempt } = next {
                     events.push(WaveEvent::WorkerRequested {
                         role: c.role.clone(),
@@ -660,6 +899,10 @@ impl Decider for Waves {
                             actual_account: None,
                             run_stamp: Some(run_stamp),
                         },
+                        suppressed_thread: None,
+                        suppressed_turns: BTreeSet::new(),
+                        settled_turn_seq: 0,
+                        unsettled_failure: UnsettledFailure::default(),
                     },
                 );
             }
@@ -677,8 +920,63 @@ impl Decider for Waves {
                                 rec.meta.actual_account = Some(account.clone());
                             }
                         }
+                        Observation::TurnsSuppressed { thread, keys } => {
+                            if rec.suppressed_thread.as_ref() != Some(thread) {
+                                rec.suppressed_thread = Some(thread.clone());
+                                rec.suppressed_turns.clear();
+                                rec.settled_turn_seq = 0;
+                            }
+                            for key in keys {
+                                if !key.is_empty() {
+                                    rec.suppressed_turns.insert(key.clone());
+                                }
+                            }
+                            let next_phase = rec.unsettled_failure.observe(&rec.phase, observation);
+                            if next_phase != rec.phase {
+                                rec.phase = next_phase;
+                                rec.resolved_interaction = None;
+                            }
+                        }
                         other => {
-                            rec.phase = rec.phase.observe(other);
+                            if let Observation::Spawned { thread, .. } = other
+                                && rec.suppressed_thread.as_ref() != Some(thread)
+                            {
+                                rec.suppressed_thread = Some(thread.clone());
+                                rec.suppressed_turns.clear();
+                                rec.settled_turn_seq = 0;
+                            }
+                            if let Observation::Activity {
+                                thread,
+                                settled_seq,
+                                suppress_keys,
+                                ..
+                            } = other
+                            {
+                                let thread_ok = match &rec.phase {
+                                    WorkerPhase::Live { thread: lt, .. } => {
+                                        thread.as_ref().is_none_or(|t| t == lt)
+                                    }
+                                    _ => false,
+                                };
+                                if thread_ok {
+                                    if let Some(th) = thread
+                                        && rec.suppressed_thread.as_ref() != Some(th)
+                                    {
+                                        rec.suppressed_thread = Some(th.clone());
+                                        rec.suppressed_turns.clear();
+                                        rec.settled_turn_seq = 0;
+                                    }
+                                    if let Some(s) = settled_seq {
+                                        rec.settled_turn_seq = rec.settled_turn_seq.max(*s);
+                                    }
+                                    for key in suppress_keys {
+                                        if !key.is_empty() {
+                                            rec.suppressed_turns.insert(key.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            rec.phase = rec.unsettled_failure.observe(&rec.phase, other);
                             rec.resolved_interaction = None;
                         }
                     }
@@ -686,7 +984,7 @@ impl Decider for Waves {
             }
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = state.workers.get_mut(role) {
-                    rec.phase = rec.phase.retiring();
+                    rec.phase = rec.unsettled_failure.retiring(&rec.phase);
                     rec.resolved_interaction = None;
                 }
             }
@@ -695,7 +993,7 @@ impl Decider for Waves {
                     outcome: outcome.clone(),
                 });
                 for rec in state.workers.values_mut() {
-                    rec.phase = rec.phase.retiring();
+                    rec.phase = rec.unsettled_failure.retiring(&rec.phase);
                     rec.resolved_interaction = None;
                 }
             }
@@ -798,36 +1096,103 @@ pub struct SpawnRequest {
 }
 
 pub trait AgentHost: Send + Sync + 'static {
-    fn spawn(
-        &self,
-        req: SpawnRequest,
-    ) -> impl Future<Output = Result<BbThreadId, HostError>> + Send;
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>>;
     fn tell(
         &self,
-        thread: &BbThreadId,
+        thread: &HostThreadId,
         body: &Body,
         mode: SteerDeliveryMode,
-    ) -> impl Future<Output = Result<(), HostError>> + Send;
+    ) -> BoxFut<'_, Result<(), HostError>>;
     fn resolve(
         &self,
-        thread: &BbThreadId,
-        interaction: &BbInteractionId,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
         resolution: &InteractionResolution,
-    ) -> impl Future<Output = Result<(), HostError>> + Send;
-    fn retire(&self, thread: &BbThreadId) -> impl Future<Output = Result<(), HostError>> + Send;
+    ) -> BoxFut<'_, Result<(), HostError>>;
+    fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>>;
     /// Probe whether a previously-`Live` host thread still exists after a reboot
     /// or reconnect. Returning `Ok(Some(obs))` submits a corrective `WaveObserve`
     /// (for example `Activity::Errored` when the host thread vanished after restart,
     /// or `Observation::Archived` when the thread was already archived).
     fn check_live(
         &self,
-        _thread: &BbThreadId,
-    ) -> impl Future<Output = Result<Option<Observation>, HostError>> + Send {
-        async { Ok(None) }
+        _thread: &HostThreadId,
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
-pub struct WaveConductor<H: AgentHost> {
+impl<H: AgentHost + ?Sized> AgentHost for Arc<H> {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
+        (**self).spawn(req)
+    }
+
+    fn tell(
+        &self,
+        thread: &HostThreadId,
+        body: &Body,
+        mode: SteerDeliveryMode,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).tell(thread, body, mode)
+    }
+
+    fn resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).resolve(thread, interaction, resolution)
+    }
+
+    fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).retire(thread)
+    }
+
+    fn check_live(
+        &self,
+        thread: &HostThreadId,
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        (**self).check_live(thread)
+    }
+}
+
+impl<H: AgentHost + ?Sized> AgentHost for Box<H> {
+    fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
+        (**self).spawn(req)
+    }
+
+    fn tell(
+        &self,
+        thread: &HostThreadId,
+        body: &Body,
+        mode: SteerDeliveryMode,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).tell(thread, body, mode)
+    }
+
+    fn resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).resolve(thread, interaction, resolution)
+    }
+
+    fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).retire(thread)
+    }
+
+    fn check_live(
+        &self,
+        thread: &HostThreadId,
+    ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+        (**self).check_live(thread)
+    }
+}
+
+pub struct WaveConductor<H: AgentHost = Arc<dyn AgentHost>> {
     host: H,
     view: BTreeMap<WaveSlug, WaveState>,
     room_waves: BTreeMap<RoomId, WaveSlug>,
@@ -872,7 +1237,7 @@ impl<H: AgentHost> WaveConductor<H> {
             (StreamId::Wave { wave }, Event::Wave(ev)) => {
                 if let WaveEvent::WorkerObserved {
                     role,
-                    observation: Observation::Archived,
+                    observation: Observation::Archived { .. },
                 } = ev
                     && let Some(
                         WorkerPhase::Live { thread, .. } | WorkerPhase::Retiring { thread, .. },
@@ -1180,6 +1545,7 @@ impl<H: AgentHost> WaveConductor<H> {
                     body,
                     mentions,
                     idem,
+                    origin,
                     ..
                 }),
             ) => {
@@ -1192,9 +1558,9 @@ impl<H: AgentHost> WaveConductor<H> {
                 ) {
                     return Ok(());
                 }
-                if idem.as_ref().is_some_and(|k| {
-                    k.as_str().starts_with("wave:") && k.as_str().contains(":turn:")
-                }) {
+                if *origin == PostOrigin::MirroredTurn
+                    || idem.as_ref().is_some_and(is_legacy_mirror_idem_key)
+                {
                     return Ok(());
                 }
                 self.route_post_wakeups(room, env.seq, &env.by, body, mentions)
@@ -1421,7 +1787,7 @@ impl<H: AgentHost> WaveConductor<H> {
             .call(WaveObserve {
                 wave: wave.clone(),
                 role: role.clone(),
-                observation: Observation::Archived,
+                observation: Observation::archived_for(thread.clone(), None),
             })
             .await?;
         Ok(())
@@ -1919,19 +2285,15 @@ mod tests {
             &mut state,
             &mut seq,
             &author,
-            Observation::Activity {
-                activity: Activity::Errored {
-                    error: "ServiceUnavailableError".into(),
-                },
-            },
+            Observation::activity(Activity::Errored {
+                error: "ServiceUnavailableError".into(),
+            }),
         );
         observe(
             &mut state,
             &mut seq,
             &verifier,
-            Observation::Activity {
-                activity: Activity::Idle,
-            },
+            Observation::activity(Activity::Idle),
         );
         let blocked_finish = apply_cmd(
             &mut state,
@@ -1990,8 +2352,8 @@ mod tests {
         );
         assert_eq!(retiring["verifier"].error(), None);
 
-        observe(&mut state, &mut seq, &author, Observation::Archived);
-        observe(&mut state, &mut seq, &verifier, Observation::Archived);
+        observe(&mut state, &mut seq, &author, Observation::archived());
+        observe(&mut state, &mut seq, &verifier, Observation::archived());
         let retired = phases(&mut state, &mut seq);
         assert_eq!(
             retired["author"],
@@ -2050,88 +2412,98 @@ mod tests {
     }
 
     impl AgentHost for FakeHost {
-        async fn spawn(&self, req: SpawnRequest) -> Result<BbThreadId, HostError> {
-            if self.unreachable_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
-                return Err(HostError::Unreachable("transient disconnect".into()));
-            }
-            if self.rejected_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
-                return Err(HostError::Rejected(
-                    "environment provider requires a machine".into(),
-                ));
-            }
-            self.calls.lock().unwrap().push(HostCall::Spawn {
-                wave: req.wave.to_string(),
-                role: req.role.to_string(),
-                attempt: req.attempt,
-                provider: req.agent.provider.to_string(),
-                workspace: req.agent.workspace.clone(),
-            });
-            let id =
-                BbThreadId::parse(format!("th_{}_{}_{}", req.wave, req.role, req.attempt)).unwrap();
-            self.spawn_requests.lock().unwrap().push(req);
-            Ok(id)
+        fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<BbThreadId, HostError>> {
+            Box::pin(async move {
+                if self.unreachable_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
+                    return Err(HostError::Unreachable("transient disconnect".into()));
+                }
+                if self.rejected_role.lock().unwrap().as_deref() == Some(req.role.as_str()) {
+                    return Err(HostError::Rejected(
+                        "environment provider requires a machine".into(),
+                    ));
+                }
+                self.calls.lock().unwrap().push(HostCall::Spawn {
+                    wave: req.wave.to_string(),
+                    role: req.role.to_string(),
+                    attempt: req.attempt,
+                    provider: req.agent.provider.to_string(),
+                    workspace: req.agent.workspace.clone(),
+                });
+                let id = BbThreadId::parse(format!("th_{}_{}_{}", req.wave, req.role, req.attempt))
+                    .unwrap();
+                self.spawn_requests.lock().unwrap().push(req);
+                Ok(id)
+            })
         }
 
-        async fn tell(
+        fn tell(
             &self,
             thread: &BbThreadId,
             body: &Body,
             mode: SteerDeliveryMode,
-        ) -> Result<(), HostError> {
-            self.calls.lock().unwrap().push(HostCall::Tell {
-                thread: thread.to_string(),
-                mode,
-                text: body.as_str().to_owned(),
-            });
-            Ok(())
+        ) -> BoxFut<'_, Result<(), HostError>> {
+            let thread = thread.to_string();
+            let text = body.as_str().to_owned();
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(HostCall::Tell { thread, mode, text });
+                Ok(())
+            })
         }
 
-        async fn resolve(
+        fn resolve(
             &self,
             thread: &BbThreadId,
             interaction: &BbInteractionId,
             resolution: &InteractionResolution,
-        ) -> Result<(), HostError> {
-            self.calls.lock().unwrap().push(HostCall::Resolve {
-                thread: thread.to_string(),
-                interaction: interaction.to_string(),
-                resolution: resolution.clone(),
-            });
-            Ok(())
+        ) -> BoxFut<'_, Result<(), HostError>> {
+            let thread = thread.to_string();
+            let interaction = interaction.to_string();
+            let resolution = resolution.clone();
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(HostCall::Resolve {
+                    thread,
+                    interaction,
+                    resolution,
+                });
+                Ok(())
+            })
         }
 
-        async fn retire(&self, thread: &BbThreadId) -> Result<(), HostError> {
-            *self.retire_attempts.lock().unwrap() += 1;
-            if *self.unreachable_retire.lock().unwrap() {
-                return Err(HostError::Unreachable("BB bridge disconnected".into()));
-            }
-            if *self.reject_retire.lock().unwrap() {
-                return Err(HostError::Rejected("thread remained stopping".into()));
-            }
-            self.calls.lock().unwrap().push(HostCall::Retire {
-                thread: thread.to_string(),
-            });
-            Ok(())
+        fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
+            let thread = thread.to_string();
+            Box::pin(async move {
+                *self.retire_attempts.lock().unwrap() += 1;
+                if *self.unreachable_retire.lock().unwrap() {
+                    return Err(HostError::Unreachable("BB bridge disconnected".into()));
+                }
+                if *self.reject_retire.lock().unwrap() {
+                    return Err(HostError::Rejected("thread remained stopping".into()));
+                }
+                self.calls.lock().unwrap().push(HostCall::Retire { thread });
+                Ok(())
+            })
         }
 
-        async fn check_live(&self, thread: &BbThreadId) -> Result<Option<Observation>, HostError> {
-            *self.check_live_calls.lock().unwrap() += 1;
-            if *self.unreachable_check_live.lock().unwrap() {
-                return Err(HostError::Unreachable("host disconnected".into()));
-            }
-            if self
-                .missing_threads
-                .lock()
-                .unwrap()
-                .contains(thread.as_str())
-            {
-                return Ok(Some(Observation::Activity {
-                    activity: Activity::Errored {
+        fn check_live(
+            &self,
+            thread: &BbThreadId,
+        ) -> BoxFut<'_, Result<Option<Observation>, HostError>> {
+            let thread = thread.to_string();
+            Box::pin(async move {
+                *self.check_live_calls.lock().unwrap() += 1;
+                if *self.unreachable_check_live.lock().unwrap() {
+                    return Err(HostError::Unreachable("host disconnected".into()));
+                }
+                if self.missing_threads.lock().unwrap().contains(&thread) {
+                    return Ok(Some(Observation::activity(Activity::Errored {
                         error: "host thread missing after restart".into(),
-                    },
-                }));
-            }
-            Ok(None)
+                    })));
+                }
+                Ok(None)
+            })
         }
     }
 
@@ -2323,6 +2695,7 @@ mod tests {
                                     labels: c.labels,
                                     task: c.task,
                                     idem: c.idem.clone(),
+                                    origin: Default::default(),
                                 }),
                             );
                             if let Some(idem) = c.idem {
@@ -2442,20 +2815,16 @@ mod tests {
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: author.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Parked {
-                    room: Some(started.room.clone()),
-                    since: Seq(1),
-                },
-            },
+            observation: Observation::activity(Activity::Parked {
+                room: Some(started.room.clone()),
+                since: Seq(1),
+            }),
         }))
         .unwrap();
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: verifier.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Idle,
-            },
+            observation: Observation::activity(Activity::Idle),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -2511,15 +2880,13 @@ mod tests {
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: verifier.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Blocked {
-                    interaction: PendingInteraction {
-                        id: int_id.clone(),
-                        kind: InteractionKind::Permission,
-                        summary: "Run git status".into(),
-                    },
+            observation: Observation::activity(Activity::Blocked {
+                interaction: PendingInteraction {
+                    id: int_id.clone(),
+                    kind: InteractionKind::Permission,
+                    summary: "Run git status".into(),
                 },
-            },
+            }),
         }))
         .unwrap();
         block_on(op.call(WaveResolve {
@@ -3117,11 +3484,9 @@ mod tests {
             WaveCommand::WaveObserve(WaveObserve {
                 wave: spec.slug.clone(),
                 role: author.clone(),
-                observation: Observation::Activity {
-                    activity: Activity::Refused {
-                        reason: "cyber_safeguard: refusal".into(),
-                    },
-                },
+                observation: Observation::activity(Activity::Refused {
+                    reason: "cyber_safeguard: refusal".into(),
+                }),
             }),
         )
         .unwrap();
@@ -3132,9 +3497,7 @@ mod tests {
             WaveCommand::WaveObserve(WaveObserve {
                 wave: spec.slug.clone(),
                 role: verifier.clone(),
-                observation: Observation::Activity {
-                    activity: Activity::Idle,
-                },
+                observation: Observation::activity(Activity::Idle),
             }),
         )
         .unwrap();
@@ -3173,11 +3536,9 @@ mod tests {
             WaveCommand::WaveObserve(WaveObserve {
                 wave: spec.slug.clone(),
                 role: author.clone(),
-                observation: Observation::Activity {
-                    activity: Activity::Errored {
-                        error: "generic thread.failed".into(),
-                    },
-                },
+                observation: Observation::activity(Activity::Errored {
+                    error: "generic thread.failed".into(),
+                }),
             }),
         )
         .unwrap();
@@ -3280,7 +3641,7 @@ mod tests {
                 WaveCommand::WaveObserve(WaveObserve {
                     wave: spec.slug.clone(),
                     role: role.clone(),
-                    observation: Observation::Archived,
+                    observation: Observation::archived(),
                 }),
             )
             .unwrap();

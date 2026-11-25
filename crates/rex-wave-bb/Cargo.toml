@@ -17,6 +17,7 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rex-wave-store.workspace = true
 rex-wave-runtime = { path = "../rex-wave-runtime", features = ["test-support"] }
 
 [lints]

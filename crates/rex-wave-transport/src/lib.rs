@@ -20,6 +20,16 @@
 //! flight at the drop fail with the cause, since the daemon may or may not have
 //! run them.
 
+pub mod worker_tokens;
+
+pub use worker_tokens::{
+    ProvisionedWorkerToken, StateTokenLockGuard, T3_WORKER_THREAD_ENV, WORKER_THREAD_ENV,
+    WORKER_TOKENS_DIR, WorkerTokenFile, is_safe_worker_token_id, lock_state_dir_tokens,
+    mint_random_token, provision_worker_token_in_state_dir, provision_worker_token_locked,
+    read_worker_token_file, remove_worker_token_file, worker_token_path, worker_tokens_dir,
+    write_worker_token_file, write_worker_token_record,
+};
+
 use futures_util::StreamExt;
 use rex_wave_api::*;
 use rex_wave_runtime::{Router, Session};
@@ -383,11 +393,6 @@ fn verify_private_dir(dir: &Path, expected_uid: Option<u32>) -> Result<bool, Api
     Ok(true)
 }
 
-/// Validates a single safe filename for `<state_dir>/worker-tokens/<id>`.
-pub fn is_safe_worker_token_id(id: &str) -> bool {
-    rex_wave_fs::SafeName::parse_plain(id).is_ok()
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum TokenMapValue {
@@ -451,7 +456,7 @@ fn verify_legacy_worker_thread_token(
     let dir = tokens_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("worker-tokens");
+        .join(WORKER_TOKENS_DIR);
     if !verify_private_dir(&dir, expected_uid).unwrap_or(false) {
         return false;
     }
@@ -471,18 +476,10 @@ fn verify_legacy_worker_thread_token(
             return false;
         };
         parsed.principal == *expected_principal
-            && constant_time_eq(parsed.token.as_bytes(), expected_token.as_bytes())
+            && constant_time_eq(parsed.token.trim().as_bytes(), expected_token.as_bytes())
     } else {
         constant_time_eq(trimmed.as_bytes(), expected_token.as_bytes())
     }
-}
-
-/// On-disk JSON payload for one per-worker token file under `<state_dir>/worker-tokens/`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerTokenFile {
-    pub token: String,
-    pub principal: Principal,
 }
 
 /// Principal-scoped capability token table supporting `Seat`, `Worker`, and
@@ -491,6 +488,7 @@ pub struct WorkerTokenFile {
 pub struct PrincipalTokenTable {
     tokens: BTreeMap<String, Principal>,
     legacy_thread_ids: BTreeMap<String, String>,
+    skipped_file_tokens: std::collections::BTreeSet<String>,
 }
 
 impl PrincipalTokenTable {
@@ -533,6 +531,20 @@ impl PrincipalTokenTable {
         self.insert(token, Principal::Worker { wave, role })
     }
 
+    pub fn insert_legacy_worker_thread(
+        &mut self,
+        token: impl Into<String>,
+        wave: WaveSlug,
+        role: RoleName,
+        thread_id: impl Into<String>,
+    ) -> Result<(), ApiError> {
+        let token = token.into();
+        let tid = thread_id.into();
+        self.insert(token.clone(), Principal::Worker { wave, role })?;
+        self.legacy_thread_ids.insert(token, tid);
+        Ok(())
+    }
+
     pub fn insert_operator(
         &mut self,
         token: impl Into<String>,
@@ -555,6 +567,7 @@ impl PrincipalTokenTable {
                 self.legacy_thread_ids.insert(token, tid.clone());
             }
         }
+        self.skipped_file_tokens.extend(other.skipped_file_tokens);
         Ok(())
     }
 
@@ -566,6 +579,38 @@ impl PrincipalTokenTable {
             }
         }
         matched
+    }
+
+    pub fn legacy_thread_id(&self, candidate: &str) -> Option<&str> {
+        let mut matched: Option<&str> = None;
+        for (stored, tid) in &self.legacy_thread_ids {
+            if constant_time_eq(stored.as_bytes(), candidate.as_bytes()) {
+                matched = Some(tid.as_str());
+            }
+        }
+        matched
+    }
+
+    pub fn allows_worker_token_reuse(
+        &self,
+        candidate: &str,
+        principal: &Principal,
+        thread_id: &str,
+        is_structured: bool,
+    ) -> bool {
+        let mut in_file = self.get(candidate).is_some();
+        for skipped in &self.skipped_file_tokens {
+            if constant_time_eq(skipped.as_bytes(), candidate.as_bytes()) {
+                in_file = true;
+            }
+        }
+        let verified_thread_match = self.get(candidate) == Some(principal)
+            && self.legacy_thread_id(candidate) == Some(thread_id);
+        if is_structured {
+            !in_file || verified_thread_match
+        } else {
+            verified_thread_match
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -628,6 +673,7 @@ impl PrincipalTokenTable {
             if let Some(tid) = legacy_tid {
                 if !verify_legacy_worker_thread_token(path, &tid, &token, &principal, expected_uid)
                 {
+                    table.skipped_file_tokens.insert(token);
                     continue;
                 }
                 table.insert(token.clone(), principal)?;
@@ -712,42 +758,6 @@ impl PrincipalTokenTable {
     }
 }
 
-/// Atomically writes one mode-`0600` per-worker token file under `dir/<id>`.
-pub fn write_worker_token_file(
-    dir: &Path,
-    id: &str,
-    token: &str,
-    principal: &Principal,
-) -> io::Result<PathBuf> {
-    if !is_safe_worker_token_id(id) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "worker token file id must be a single safe filename",
-        ));
-    }
-    if !matches!(principal, Principal::Worker { .. }) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "worker token file only allows Principal::Worker",
-        ));
-    }
-    validate_token_principal(token, principal)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-
-    rex_wave_fs::ensure_private_dir(dir)?;
-
-    let payload = WorkerTokenFile {
-        token: token.to_owned(),
-        principal: principal.clone(),
-    };
-    let encoded = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let dest = dir.join(id);
-    rex_wave_fs::write_atomic_path(&dest, &encoded, 0o600, false)?;
-    Ok(dest)
-}
-
 /// Authenticator backed by an in-memory [`PrincipalTokenTable`].
 pub struct PrincipalAuthenticator {
     pub operator: SeatName,
@@ -805,7 +815,7 @@ impl StateDirAuthenticator {
             operator,
             daemon_uid,
             tokens_path: state_dir.join("tokens.json"),
-            worker_tokens_dir: state_dir.join("worker-tokens"),
+            worker_tokens_dir: worker_tokens_dir(state_dir),
         }
     }
 }
