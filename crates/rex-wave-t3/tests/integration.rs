@@ -6222,7 +6222,10 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
     use rex_wave_store::{CommitHook, StoreError, TxContext};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct FailOnceSingleRefusal(AtomicBool);
+    struct FailOnceSingleRefusal {
+        failed_single: AtomicBool,
+        failed_anon_ticket: AtomicBool,
+    }
     impl CommitHook for FailOnceSingleRefusal {
         fn on_append(
             &self,
@@ -6234,11 +6237,21 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
                     role,
                     observation: Observation::TurnsSuppressed { keys, .. },
                 }) = &env.event
-                    && role.as_str() == "singlefail"
-                    && keys.iter().any(|k| k == "o1")
-                    && !self.0.swap(true, Ordering::SeqCst)
                 {
-                    return Err(StoreError::Backend("injected single failed append".into()));
+                    if role.as_str() == "singlefail"
+                        && keys.iter().any(|k| k == "o1")
+                        && !self.failed_single.swap(true, Ordering::SeqCst)
+                    {
+                        return Err(StoreError::Backend("injected single failed append".into()));
+                    }
+                    if role.as_str() == "beforerefine"
+                        && keys.iter().any(|k| k == "fail_ticket:1:any")
+                        && !self.failed_anon_ticket.swap(true, Ordering::SeqCst)
+                    {
+                        return Err(StoreError::Backend(
+                            "injected outage anonymous ticket failed append".into(),
+                        ));
+                    }
                 }
             }
             Ok(())
@@ -6262,7 +6275,10 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
     let bridge = T3Bridge::new(cfg);
     let journal = Journal::open_with_hook(
         &tmp.path().join("journal.sqlite3"),
-        Some(Arc::new(FailOnceSingleRefusal(AtomicBool::new(false)))),
+        Some(Arc::new(FailOnceSingleRefusal {
+            failed_single: AtomicBool::new(false),
+            failed_anon_ticket: AtomicBool::new(false),
+        })),
     )
     .unwrap();
     let hub = Hub::new(256);

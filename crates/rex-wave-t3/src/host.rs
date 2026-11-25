@@ -69,6 +69,32 @@ struct TrackedWorker {
     hydrated_suppressions: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct ShellActionAttemptState {
+    allocated_ticket_key: Option<String>,
+    failure_projection_settled: bool,
+}
+
+fn reusable_attempt_ticket(
+    prev: Option<&str>,
+    settled_keys: &BTreeSet<String>,
+    explicit_run_id: Option<&str>,
+) -> Option<String> {
+    if let Some(erid) = explicit_run_id
+        && next_failure_ticket_key(settled_keys, Some(erid)).is_none()
+    {
+        return None;
+    }
+    let prev = prev?;
+    let rest = prev.strip_prefix(FAILURE_TICKET_PREFIX)?;
+    let (id_str, _) = rest.split_once(':')?;
+    let id_prefix = format!("{FAILURE_TICKET_PREFIX}{id_str}:");
+    if settled_keys.iter().any(|k| k.starts_with(&id_prefix)) {
+        return None;
+    }
+    Some(prev.to_owned())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellUpdateDisposition {
     Processed,
@@ -340,6 +366,30 @@ impl StateOwner {
                     thread,
                     turn_keys,
                 } => {
+                    if is_t3_thread_id(&thread)
+                        && !self
+                            .workers_by_role
+                            .contains_key(&(wave.clone(), role.clone()))
+                    {
+                        let attempt = parse_t3_thread_id(&thread).map_or(1, |(_, _, a)| a);
+                        self.workers_by_role.insert(
+                            (wave.clone(), role.clone()),
+                            TrackedWorker {
+                                attempt,
+                                thread: Some(thread.clone()),
+                                live: false,
+                                activity: Activity::Working,
+                                pending_interaction: None,
+                                shell_epoch: 0,
+                                mirror_room_watermark: Seq::ORIGIN,
+                                settled_turn_keys: BTreeSet::new(),
+                                suppressed_turn_keys: BTreeSet::new(),
+                                unsaved_suppressed_keys: BTreeSet::new(),
+                                claimed_direct_posts: BTreeSet::new(),
+                                hydrated_suppressions: false,
+                            },
+                        );
+                    }
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
                     {
@@ -370,6 +420,30 @@ impl StateOwner {
                     thread,
                     turn_keys,
                 } => {
+                    if is_t3_thread_id(&thread)
+                        && !self
+                            .workers_by_role
+                            .contains_key(&(wave.clone(), role.clone()))
+                    {
+                        let attempt = parse_t3_thread_id(&thread).map_or(1, |(_, _, a)| a);
+                        self.workers_by_role.insert(
+                            (wave.clone(), role.clone()),
+                            TrackedWorker {
+                                attempt,
+                                thread: Some(thread.clone()),
+                                live: false,
+                                activity: Activity::Working,
+                                pending_interaction: None,
+                                shell_epoch: 0,
+                                mirror_room_watermark: Seq::ORIGIN,
+                                settled_turn_keys: BTreeSet::new(),
+                                suppressed_turn_keys: BTreeSet::new(),
+                                unsaved_suppressed_keys: BTreeSet::new(),
+                                claimed_direct_posts: BTreeSet::new(),
+                                hydrated_suppressions: false,
+                            },
+                        );
+                    }
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
                     {
@@ -986,6 +1060,7 @@ impl T3Bridge {
         tokio::spawn(async move {
             while let Some(action) = rx.recv().await {
                 let mut retry_attempt = 0u32;
+                let mut attempt_state = ShellActionAttemptState::default();
                 let done = loop {
                     if *thread_shutdown.borrow() {
                         break true;
@@ -993,7 +1068,12 @@ impl T3Bridge {
                     let disp = match &action {
                         ThreadShellAction::Updated { location, shell } => {
                             bridge
-                                .process_thread_shell_update(&tid, location.as_deref(), shell)
+                                .process_thread_shell_update(
+                                    &tid,
+                                    location.as_deref(),
+                                    shell,
+                                    &mut attempt_state,
+                                )
                                 .await
                         }
                         ThreadShellAction::Removed => {
@@ -1196,6 +1276,7 @@ impl T3Bridge {
         thread: &BbThreadId,
         location: Option<&str>,
         shell: &Value,
+        attempt_state: &mut ShellActionAttemptState,
     ) -> ShellUpdateDisposition {
         let Some(obs) = derive_shell_observation(shell, location) else {
             return ShellUpdateDisposition::Processed;
@@ -1367,17 +1448,21 @@ impl T3Bridge {
                     proj_account.or(shell_account),
                 )
                 .await;
-                if !self
-                    .handle_shell_failure_projection(
-                        &wave,
-                        &role,
-                        thread,
-                        shell,
-                        fetched_proj.as_ref(),
-                    )
-                    .await
-                {
-                    return ShellUpdateDisposition::RetryNeeded;
+                if !attempt_state.failure_projection_settled {
+                    if !self
+                        .handle_shell_failure_projection(
+                            &wave,
+                            &role,
+                            thread,
+                            shell,
+                            fetched_proj.as_ref(),
+                            attempt_state,
+                        )
+                        .await
+                    {
+                        return ShellUpdateDisposition::RetryNeeded;
+                    }
+                    attempt_state.failure_projection_settled = true;
                 }
                 if !self
                     .try_wave_observe(
@@ -1419,17 +1504,21 @@ impl T3Bridge {
                     proj_account.or(shell_account),
                 )
                 .await;
-                if !self
-                    .handle_shell_failure_projection(
-                        &wave,
-                        &role,
-                        thread,
-                        shell,
-                        fetched_proj.as_ref(),
-                    )
-                    .await
-                {
-                    return ShellUpdateDisposition::RetryNeeded;
+                if !attempt_state.failure_projection_settled {
+                    if !self
+                        .handle_shell_failure_projection(
+                            &wave,
+                            &role,
+                            thread,
+                            shell,
+                            fetched_proj.as_ref(),
+                            attempt_state,
+                        )
+                        .await
+                    {
+                        return ShellUpdateDisposition::RetryNeeded;
+                    }
+                    attempt_state.failure_projection_settled = true;
                 }
                 if !self
                     .try_wave_observe(
@@ -1472,17 +1561,21 @@ impl T3Bridge {
                 )
                 .await;
                 if !mirror_candidate {
-                    if !self
-                        .handle_shell_failure_projection(
-                            &wave,
-                            &role,
-                            thread,
-                            shell,
-                            fetched_proj.as_ref(),
-                        )
-                        .await
-                    {
-                        return ShellUpdateDisposition::RetryNeeded;
+                    if !attempt_state.failure_projection_settled {
+                        if !self
+                            .handle_shell_failure_projection(
+                                &wave,
+                                &role,
+                                thread,
+                                shell,
+                                fetched_proj.as_ref(),
+                                attempt_state,
+                            )
+                            .await
+                        {
+                            return ShellUpdateDisposition::RetryNeeded;
+                        }
+                        attempt_state.failure_projection_settled = true;
                     }
                     if !self
                         .try_wave_observe(
@@ -1565,6 +1658,18 @@ impl T3Bridge {
         thread: &BbThreadId,
         keys: Vec<String>,
     ) -> bool {
+        self.record_suppressed_keys_with_transient_ticket_locked(wave, role, thread, keys, None)
+            .await
+    }
+
+    async fn record_suppressed_keys_with_transient_ticket_locked(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        keys: Vec<String>,
+        transient_ticket: Option<&str>,
+    ) -> bool {
         if keys.is_empty() {
             return true;
         }
@@ -1579,12 +1684,18 @@ impl T3Bridge {
             )
             .await
         {
-            let _ = self.state.send(StateMsg::QueueUnsavedSuppressions {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-                turn_keys: keys,
-            });
+            let unsaved: Vec<String> = keys
+                .into_iter()
+                .filter(|k| Some(k.as_str()) != transient_ticket)
+                .collect();
+            if !unsaved.is_empty() {
+                let _ = self.state.send(StateMsg::QueueUnsavedSuppressions {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    turn_keys: unsaved,
+                });
+            }
             return false;
         }
         let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
@@ -1679,6 +1790,7 @@ impl T3Bridge {
         thread: &BbThreadId,
         shell: &Value,
         fetched_proj: Option<&Value>,
+        attempt_state: &mut ShellActionAttemptState,
     ) -> bool {
         let (explicit_run_id, explicit_item_count) = shell_explicit_turn_target(shell);
         let Some(proj) = fetched_proj else {
@@ -1689,16 +1801,35 @@ impl T3Bridge {
             else {
                 return false;
             };
-            let mut keys =
-                explicit_shell_suppression_keys(explicit_run_id.as_deref(), explicit_item_count);
-            if explicit_item_count.is_none()
-                && let Some(ticket) =
-                    next_failure_ticket_key(&settled_keys, explicit_run_id.as_deref())
-            {
-                keys.push(ticket);
+            let mut keys: Vec<String> =
+                explicit_shell_suppression_keys(explicit_run_id.as_deref(), explicit_item_count)
+                    .into_iter()
+                    .filter(|k| !settled_keys.contains(k))
+                    .collect();
+            let mut transient_ticket: Option<String> = None;
+            if explicit_item_count.is_none() {
+                let ticket = reusable_attempt_ticket(
+                    attempt_state.allocated_ticket_key.as_deref(),
+                    &settled_keys,
+                    explicit_run_id.as_deref(),
+                )
+                .or_else(|| next_failure_ticket_key(&settled_keys, explicit_run_id.as_deref()));
+                if let Some(tk) = ticket {
+                    attempt_state.allocated_ticket_key = Some(tk.clone());
+                    transient_ticket = Some(tk.clone());
+                    if !settled_keys.contains(&tk) && !keys.contains(&tk) {
+                        keys.push(tk);
+                    }
+                }
             }
             return self
-                .record_suppressed_keys_locked(wave, role, thread, keys)
+                .record_suppressed_keys_with_transient_ticket_locked(
+                    wave,
+                    role,
+                    thread,
+                    keys,
+                    transient_ticket.as_deref(),
+                )
                 .await;
         };
 
@@ -1720,15 +1851,37 @@ impl T3Bridge {
             let active_tickets = active_unmatched_tickets(Some(unwrapped), &settled_keys);
             let mut anchors = projection_run_ticket_anchors(unwrapped, &settled_keys);
             match plan {
-                ExplicitFailurePlan::TargetAheadOfProjection { mut explicit_keys } => {
-                    if explicit_item_count.is_none()
-                        && let Some(ticket) =
+                ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys } => {
+                    let mut keys: Vec<String> = explicit_keys
+                        .into_iter()
+                        .filter(|k| !settled_keys.contains(k))
+                        .collect();
+                    let mut transient_ticket: Option<String> = None;
+                    if explicit_item_count.is_none() {
+                        let ticket = reusable_attempt_ticket(
+                            attempt_state.allocated_ticket_key.as_deref(),
+                            &settled_keys,
+                            explicit_run_id.as_deref(),
+                        )
+                        .or_else(|| {
                             next_failure_ticket_key(&settled_keys, explicit_run_id.as_deref())
-                    {
-                        explicit_keys.push(ticket);
+                        });
+                        if let Some(tk) = ticket {
+                            attempt_state.allocated_ticket_key = Some(tk.clone());
+                            transient_ticket = Some(tk.clone());
+                            if !settled_keys.contains(&tk) && !keys.contains(&tk) {
+                                keys.push(tk);
+                            }
+                        }
                     }
                     if !self
-                        .record_suppressed_keys_locked(wave, role, thread, explicit_keys)
+                        .record_suppressed_keys_with_transient_ticket_locked(
+                            wave,
+                            role,
+                            thread,
+                            keys,
+                            transient_ticket.as_deref(),
+                        )
                         .await
                     {
                         return false;
