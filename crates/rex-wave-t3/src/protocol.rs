@@ -1029,12 +1029,42 @@ pub enum TerminalTurnState {
 
 use std::collections::BTreeSet;
 
-pub const UNATTRIBUTED_FAILURE_KEY: &str = "__unattributed_failure__";
+pub const UNATTRIBUTED_FAILURE_PREFIX: &str = "unattributed_failure:";
+pub const UNATTRIBUTED_RESOLVED_PREFIX: &str = "unattributed_resolved:";
+
+pub fn unattributed_failure_counts(settled_keys: &BTreeSet<String>) -> (usize, usize) {
+    let failed = settled_keys
+        .iter()
+        .filter_map(|k| k.strip_prefix(UNATTRIBUTED_FAILURE_PREFIX))
+        .filter_map(|s| s.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    let resolved = settled_keys
+        .iter()
+        .filter_map(|k| k.strip_prefix(UNATTRIBUTED_RESOLVED_PREFIX))
+        .filter_map(|s| s.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    (failed, resolved.min(failed))
+}
+
+pub fn next_unattributed_failure_key(settled_keys: &BTreeSet<String>) -> String {
+    let (failed, _) = unattributed_failure_counts(settled_keys);
+    format!("{UNATTRIBUTED_FAILURE_PREFIX}{}", failed + 1)
+}
+
+pub fn resolve_all_unattributed_keys(settled_keys: &BTreeSet<String>) -> Vec<String> {
+    let (failed, resolved) = unattributed_failure_counts(settled_keys);
+    ((resolved + 1)..=failed)
+        .map(|i| format!("{UNATTRIBUTED_RESOLVED_PREFIX}{i}"))
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedTurn {
     pub anchor: String,
     pub alt_anchors: Vec<String>,
+    pub legacy_body_anchors: Vec<String>,
     pub run_key: Option<String>,
     pub run_start_at: u64,
     pub run_end_at: u64,
@@ -1284,7 +1314,7 @@ fn inspect_turn_slice(
         }
     }
 
-    let mut last_assistant: Option<(String, Vec<String>, String)> = None;
+    let mut last_assistant: Option<(String, Vec<String>, Vec<String>, String)> = None;
     for (orig_idx, _, item) in slice {
         if item.get("type").and_then(|v| v.as_str()) != Some("assistant_message") {
             continue;
@@ -1303,6 +1333,10 @@ fn inspect_turn_slice(
             continue;
         }
         let anchor = assistant_item_anchor(*orig_idx, item, None);
+        let item_run_id = item
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let mut alt_anchors = Vec::new();
         if target_run_id.is_some() {
             push_unique_key(
@@ -1310,27 +1344,42 @@ fn inspect_turn_slice(
                 assistant_item_anchor(*orig_idx, item, target_run_id),
             );
         }
-        if let Some(irid) = item
-            .get("runId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(irid) = item_run_id {
             push_unique_key(
                 &mut alt_anchors,
                 assistant_item_anchor(*orig_idx, item, Some(irid)),
             );
         }
         alt_anchors.retain(|a| a != &anchor);
-        last_assistant = Some((anchor, alt_anchors, text.to_owned()));
+
+        let has_stable_id = item
+            .get("messageId")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+            || item.get("ordinal").and_then(|v| v.as_u64()).is_some();
+        let mut legacy_body_anchors = Vec::new();
+        if !has_stable_id {
+            push_unique_key(&mut legacy_body_anchors, "o0".to_owned());
+            if let Some(trid) = target_run_id {
+                push_unique_key(&mut legacy_body_anchors, format!("r{trid}:o0"));
+            }
+            if let Some(irid) = item_run_id {
+                push_unique_key(&mut legacy_body_anchors, format!("r{irid}:o0"));
+            }
+            legacy_body_anchors.retain(|a| a != &anchor && !alt_anchors.contains(a));
+        }
+        last_assistant = Some((anchor, alt_anchors, legacy_body_anchors, text.to_owned()));
     }
 
-    let Some((anchor, alt_anchors, text)) = last_assistant else {
+    let Some((anchor, alt_anchors, legacy_body_anchors, text)) = last_assistant else {
         return TurnMirrorCheck::Ignore;
     };
 
     TurnMirrorCheck::Unposted(CompletedTurn {
         anchor,
         alt_anchors,
+        legacy_body_anchors,
         run_key,
         run_start_at,
         run_end_at,
@@ -1858,6 +1907,11 @@ pub fn inspect_closed_turns_before_ahead_failure(
     out
 }
 
+pub fn any_turn_inherently_suppressed(projection: &Value) -> bool {
+    let (_, _, raw_turns) = slice_projection_turns(projection);
+    raw_turns.iter().any(raw_turn_inherently_suppressed)
+}
+
 pub fn projection_has_ahead_suppression(
     projection: &Value,
     settled_keys: &BTreeSet<String>,
@@ -1876,7 +1930,7 @@ pub fn projection_has_ahead_suppression(
         .max()
         .filter(|&ic| ic > ordered_item_len);
 
-    let run_present = |want: &str| {
+    let has_run_in_turns = |want: &str| {
         raw_turns.iter().any(|t| {
             t.target_run_id == Some(want)
                 || t.slice
@@ -1884,29 +1938,19 @@ pub fn projection_has_ahead_suppression(
                     .any(|(_, _, it)| it.get("runId").and_then(|v| v.as_str()) == Some(want))
         })
     };
-    let tail_has_no_run_id = raw_turns.last().is_some_and(|last| {
-        last.target_run_id.is_none()
-            && last
-                .slice
+    let ahead_run = if is_runs_mode {
+        if let Some(sr) = shell_run_id.filter(|s| !s.is_empty()) {
+            (!has_run_in_turns(sr)).then(|| sr.to_owned())
+        } else {
+            settled_keys
                 .iter()
-                .all(|(_, _, it)| it.get("runId").and_then(|v| v.as_str()).is_none())
-    });
-
-    let ahead_shell_run = shell_run_id
-        .filter(|want| {
-            !want.is_empty() && !run_present(want) && (is_runs_mode || tail_has_no_run_id)
-        })
-        .map(str::to_owned);
-    let ahead_settled_run = if ahead_shell_run.is_none() && tail_has_no_run_id {
-        settled_keys
-            .iter()
-            .filter_map(|k| k.strip_prefix("run:"))
-            .find(|sup_rid| !sup_rid.is_empty() && !run_present(sup_rid))
-            .map(str::to_owned)
+                .filter_map(|k| k.strip_prefix("run:"))
+                .find(|want| !want.is_empty() && !has_run_in_turns(want))
+                .map(str::to_owned)
+        }
     } else {
         None
     };
-    let ahead_run = ahead_shell_run.or(ahead_settled_run);
     let hold = ahead_ic.is_some() || ahead_run.is_some();
     (hold, ahead_run, ahead_ic)
 }
