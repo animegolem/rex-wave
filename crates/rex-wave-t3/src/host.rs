@@ -6,15 +6,17 @@ use crate::projects::{
     project_names_map, resolve_or_ensure_t3_project,
 };
 use crate::protocol::{
-    LiveSeqTracker, ShellObservation, TerminalTurnState, TurnMirrorCheck,
-    active_pending_interaction, collect_preterminal_turn_candidates,
-    default_model_from_server_config, derive_shell_observation, deterministic_thread_id,
+    ExplicitFailurePlan, InspectedTurn, LiveSeqTracker, ShellObservation, TerminalTurnState,
+    TurnMirrorCheck, UNATTRIBUTED_FAILURE_KEY, active_pending_interaction,
+    collect_preterminal_turn_candidates, default_model_from_server_config,
+    derive_shell_observation, deterministic_thread_id, explicit_shell_suppression_keys,
     extract_explicit_stop_refusal, extract_refusal_reason, extract_runtime_meta_from_value,
     force_stop_thread_payload, inspect_turns_in_order, is_t3_thread_id, launch_thread_payload,
     message_dispatch_payload, mirror_idem_key, normalize_turn_item,
     parse_pending_interaction_from_projection, parse_provider_turns_usage, parse_t3_thread_id,
-    projection_turn_slot_count, runtime_request_respond_payload, shell_explicit_turn_target,
-    strip_t3_provider_prefix, thread_archive_payload, thread_stop_payload, unwrap_projection,
+    plan_explicit_failure_turns, projection_turn_slot_count, runtime_request_respond_payload,
+    shell_explicit_turn_target, strip_t3_provider_prefix, thread_archive_payload,
+    thread_stop_payload, unwrap_projection,
 };
 use crate::rpc::{StreamEvent, T3RpcClient};
 use crate::worker_tokens::{WorkerTokenMinter, provision_worker_token, remove_worker_token_file};
@@ -117,6 +119,7 @@ enum StateMsg {
         role: RoleName,
         thread: BbThreadId,
         turn_keys: Vec<String>,
+        unattributed_failure: bool,
     },
     SetPendingUnattributedFailure {
         wave: WaveSlug,
@@ -284,14 +287,18 @@ impl StateOwner {
                     role,
                     thread,
                     turn_keys,
+                    unattributed_failure,
                 } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
                     {
                         for k in turn_keys {
-                            if !k.is_empty() {
+                            if !k.is_empty() && k != UNATTRIBUTED_FAILURE_KEY {
                                 rec.settled_turn_keys.insert(k);
                             }
+                        }
+                        if unattributed_failure {
+                            rec.pending_unattributed_failure = true;
                         }
                         rec.hydrated_suppressions = true;
                     }
@@ -316,10 +323,13 @@ impl StateOwner {
         match event {
             WaveEvent::Started { .. } => {}
             WaveEvent::WorkerRequested { role, attempt, .. } => {
-                if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone()))
-                    && let Some(ref th) = prev.thread
-                {
-                    self.role_by_thread.remove(th);
+                if let Some(prev) = self.workers_by_role.get(&(wave.clone(), role.clone())) {
+                    if prev.attempt == attempt && prev.thread.is_some() {
+                        return;
+                    }
+                    if let Some(ref th) = prev.thread {
+                        self.role_by_thread.remove(th);
+                    }
                 }
                 self.workers_by_role.insert(
                     (wave, role),
@@ -423,10 +433,17 @@ impl StateOwner {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && rec.thread.as_ref() == Some(&thread)
                     {
+                        let mut saw_concrete = false;
                         for k in keys {
-                            if !k.is_empty() {
+                            if k == UNATTRIBUTED_FAILURE_KEY {
+                                rec.pending_unattributed_failure = true;
+                            } else if !k.is_empty() {
+                                saw_concrete = true;
                                 rec.settled_turn_keys.insert(k);
                             }
+                        }
+                        if saw_concrete {
+                            rec.pending_unattributed_failure = false;
                         }
                     }
                 }
@@ -1333,16 +1350,101 @@ impl T3Bridge {
         shell: &Value,
         fetched_proj: Option<&Value>,
     ) {
+        let (explicit_run_id, explicit_item_count) = shell_explicit_turn_target(shell);
         let Some(proj) = fetched_proj else {
-            let _ = self.state.send(StateMsg::SetPendingUnattributedFailure {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-                pending: true,
-            });
+            let _mirror_guard = self.mirror_lock.lock().await;
+            let _ = self
+                .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
+                .await;
+            let explicit_keys =
+                explicit_shell_suppression_keys(explicit_run_id.as_deref(), explicit_item_count);
+            if !explicit_keys.is_empty() {
+                let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    seq: Seq::ORIGIN,
+                    turn_keys: explicit_keys.clone(),
+                    claimed_seqs: Vec::new(),
+                });
+                self.call_wave_observe(
+                    wave.clone(),
+                    role.clone(),
+                    Observation::TurnsSuppressed {
+                        thread: thread.clone(),
+                        keys: explicit_keys,
+                    },
+                )
+                .await;
+            } else {
+                let _ = self.state.send(StateMsg::SetPendingUnattributedFailure {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    pending: true,
+                });
+                self.call_wave_observe(
+                    wave.clone(),
+                    role.clone(),
+                    Observation::TurnsSuppressed {
+                        thread: thread.clone(),
+                        keys: vec![UNATTRIBUTED_FAILURE_KEY.to_owned()],
+                    },
+                )
+                .await;
+            }
             return;
         };
+
         let unwrapped = unwrap_projection(proj);
+        let proj_terminal_state = classify_projection_terminal_state(unwrapped);
+        if let Some(plan) = plan_explicit_failure_turns(
+            unwrapped,
+            proj_terminal_state,
+            explicit_run_id.as_deref(),
+            explicit_item_count,
+        ) {
+            let _mirror_guard = self.mirror_lock.lock().await;
+            let pending_unattributed = self
+                .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
+                .await;
+            if pending_unattributed && projection_turn_slot_count(unwrapped) >= 2 {
+                self.suppress_lagged_preterminal_failure_locked(
+                    wave, role, thread, None, unwrapped,
+                )
+                .await;
+            }
+            match plan {
+                ExplicitFailurePlan::TargetAheadOfProjection { explicit_keys } => {
+                    let _ = self.state.send(StateMsg::AdvanceMirrorWatermark {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        thread: thread.clone(),
+                        seq: Seq::ORIGIN,
+                        turn_keys: explicit_keys.clone(),
+                        claimed_seqs: Vec::new(),
+                    });
+                    self.call_wave_observe(
+                        wave.clone(),
+                        role.clone(),
+                        Observation::TurnsSuppressed {
+                            thread: thread.clone(),
+                            keys: explicit_keys,
+                        },
+                    )
+                    .await;
+                    let checks = inspect_turns_in_order(unwrapped, proj_terminal_state);
+                    self.execute_inspected_turns_locked(wave, role, thread, checks)
+                        .await;
+                }
+                ExplicitFailurePlan::Matched { turns } => {
+                    self.execute_inspected_turns_locked(wave, role, thread, turns)
+                        .await;
+                }
+            }
+            return;
+        }
+
         if projection_advanced_past_failure(unwrapped) {
             self.suppress_lagged_preterminal_failure(wave, role, thread, shell, unwrapped)
                 .await;
@@ -1382,6 +1484,7 @@ impl T3Bridge {
         let mut cursor = Seq::ORIGIN;
         let mut active_thread: Option<BbThreadId> = None;
         let mut keys: Vec<String> = Vec::new();
+        let mut hydrated_unattributed = false;
         let mut reached_end = false;
         loop {
             let Ok(WireReply::Read(page)) = backend
@@ -1409,6 +1512,7 @@ impl T3Bridge {
                         WaveEvent::WorkerRequested { role: r, .. } if r == role => {
                             active_thread = None;
                             keys.clear();
+                            hydrated_unattributed = false;
                         }
                         WaveEvent::WorkerObserved {
                             role: r,
@@ -1417,6 +1521,7 @@ impl T3Bridge {
                             if active_thread.as_ref() != Some(th) {
                                 active_thread = Some(th.clone());
                                 keys.clear();
+                                hydrated_unattributed = false;
                             }
                         }
                         WaveEvent::WorkerObserved {
@@ -1430,8 +1535,20 @@ impl T3Bridge {
                             if active_thread.as_ref() != Some(th) {
                                 active_thread = Some(th.clone());
                                 keys.clear();
+                                hydrated_unattributed = false;
                             }
-                            keys.extend(ks.iter().cloned());
+                            let mut saw_concrete = false;
+                            for k in ks {
+                                if k == UNATTRIBUTED_FAILURE_KEY {
+                                    hydrated_unattributed = true;
+                                } else if !k.is_empty() {
+                                    saw_concrete = true;
+                                    keys.push(k.clone());
+                                }
+                            }
+                            if saw_concrete {
+                                hydrated_unattributed = false;
+                            }
                         }
                         _ => {}
                     }
@@ -1443,17 +1560,19 @@ impl T3Bridge {
             }
         }
         if reached_end {
-            let matching = if active_thread.as_ref() == Some(thread) {
-                keys
+            let (matching, unattributed_failure) = if active_thread.as_ref() == Some(thread) {
+                (keys, hydrated_unattributed)
             } else {
-                Vec::new()
+                (Vec::new(), false)
             };
             let _ = self.state.send(StateMsg::ApplyHydratedSuppressions {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
                 turn_keys: matching,
+                unattributed_failure,
             });
+            return pending_unattributed || unattributed_failure;
         }
         pending_unattributed
     }
@@ -1504,7 +1623,7 @@ impl T3Bridge {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
-                turn_keys: cand.suppression_keys.clone(),
+                turn_keys: cand.lookup_keys.clone(),
                 reply: wm_tx,
             });
             let (watermark, already_settled, claimed_direct_posts) =
@@ -1661,18 +1780,36 @@ impl T3Bridge {
             .ensure_journal_suppressions_hydrated_locked(wave, role, thread)
             .await;
         let unwrapped = unwrap_projection(projection);
-        if pending_unattributed && projection_advanced_past_failure(unwrapped) {
-            self.suppress_lagged_preterminal_failure_locked(wave, role, thread, None, unwrapped)
+        let slot_count = projection_turn_slot_count(unwrapped);
+        let mut effective_terminal_state = terminal_state;
+        if pending_unattributed {
+            if slot_count >= 2 {
+                self.suppress_lagged_preterminal_failure_locked(
+                    wave, role, thread, None, unwrapped,
+                )
                 .await;
-        } else if pending_unattributed && terminal_state == TerminalTurnState::Suppressed {
-            let _ = self.state.send(StateMsg::SetPendingUnattributedFailure {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-                pending: false,
-            });
+            } else if slot_count == 1 && terminal_state != TerminalTurnState::InProgress {
+                effective_terminal_state = TerminalTurnState::Suppressed;
+                let _ = self.state.send(StateMsg::SetPendingUnattributedFailure {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                    pending: false,
+                });
+            }
         }
-        let checks = inspect_turns_in_order(unwrapped, terminal_state);
+        let checks = inspect_turns_in_order(unwrapped, effective_terminal_state);
+        self.execute_inspected_turns_locked(wave, role, thread, checks)
+            .await;
+    }
+
+    async fn execute_inspected_turns_locked(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        thread: &BbThreadId,
+        checks: Vec<InspectedTurn>,
+    ) {
         if checks.is_empty() {
             return;
         }
@@ -1695,6 +1832,7 @@ impl T3Bridge {
 
         for inspected in checks {
             let check = inspected.check;
+            let lookup_keys = inspected.lookup_keys;
             let next_run_start_at = inspected.next_turn_start_at;
             let has_later_turn = inspected.has_later_turn;
             let is_suppressed = matches!(check, TurnMirrorCheck::Suppressed { .. });
@@ -1718,7 +1856,7 @@ impl T3Bridge {
                 wave: wave.clone(),
                 role: role.clone(),
                 thread: thread.clone(),
-                turn_keys: turn_keys.clone(),
+                turn_keys: lookup_keys,
                 reply: wm_tx,
             });
             let (watermark, already_settled, claimed_direct_posts) =

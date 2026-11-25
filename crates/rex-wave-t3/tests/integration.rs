@@ -418,14 +418,25 @@ async fn handle_mock_conn(mut stream: TcpStream, state: Arc<Mutex<MockT3State>>)
             let tid = percent_decode(raw_tid);
             let st = state.lock().await;
             if let Some(proj) = st.thread_projections.get(&tid) {
-                write_http_json(
-                    &mut stream,
-                    200,
-                    "OK",
-                    &json!({"snapshotSequence": 10, "projection": proj}),
-                    true,
-                )
-                .await;
+                if proj.get("mockUnavailable").and_then(|v| v.as_bool()) == Some(true) {
+                    write_http_json(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        &json!({"error": "projection store busy"}),
+                        false,
+                    )
+                    .await;
+                } else {
+                    write_http_json(
+                        &mut stream,
+                        200,
+                        "OK",
+                        &json!({"snapshotSequence": 10, "projection": proj}),
+                        true,
+                    )
+                    .await;
+                }
             } else {
                 write_http_json(
                     &mut stream,
@@ -3123,5 +3134,352 @@ async fn t3_bridge_respects_bb_default_runner_on_requested_and_ignores_retiring_
     .await;
 
     let _ = shutdown_tx.send(true);
+    bridge_task.abort();
+}
+
+#[tokio::test]
+async fn t3_explicit_shell_item_count_and_projection_outage_suppress_refused_drafts_across_restart()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_explicit_ic".into(),
+        projects: vec![json!({
+            "id": "uuid-explicit-ic",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_explicit_ic").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let router = build_test_router(tmp.path(), bridge.clone());
+    let host_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let conductor_task = spawn_reactor(WaveConductor::new(T3Host(bridge.clone())), host_client);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("explicit-ic-v1").unwrap();
+    let project = BbProjectId::parse("uuid-explicit-ic").unwrap();
+    let outage_role = RoleName::parse("outage").unwrap();
+    let terminal_ic_role = RoleName::parse("termic").unwrap();
+    let double_fail_role = RoleName::parse("dblfail").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse("Verify explicit shell itemCount and HTTP 503 outage replay")
+                    .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![
+                    WorkerSpec {
+                        role: outage_role.clone(),
+                        brief: Body::parse("Refused during HTTP 503 outage").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: terminal_ic_role.clone(),
+                        brief: Body::parse(
+                            "Refused current turn with itemCount while HTTP running",
+                        )
+                        .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: double_fail_role.clone(),
+                        brief: Body::parse("Two consecutive refused turns with lagged itemCount")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let outage_tid = BbThreadId::parse("t3:explicit-ic-v1:outage:a1").unwrap();
+    let terminal_ic_tid = BbThreadId::parse("t3:explicit-ic-v1:termic:a1").unwrap();
+    let double_fail_tid = BbThreadId::parse("t3:explicit-ic-v1:dblfail:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let outage_tid = outage_tid.clone();
+        let terminal_ic_tid = terminal_ic_tid.clone();
+        let double_fail_tid = double_fail_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            let ok1 = snap.workers.iter().any(
+                |(_, _, p)| matches!(p, WorkerPhase::Live { thread, .. } if thread == &outage_tid),
+            );
+            let ok2 = snap.workers.iter().any(|(_, _, p)| {
+                matches!(p, WorkerPhase::Live { thread, .. } if thread == &terminal_ic_tid)
+            });
+            let ok3 = snap.workers.iter().any(|(_, _, p)| {
+                matches!(p, WorkerPhase::Live { thread, .. } if thread == &double_fail_tid)
+            });
+            ok1 && ok2 && ok3
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        let o_proj = st.thread_projections.get_mut(outage_tid.as_str()).unwrap();
+        o_proj["runs"] = json!([]);
+        o_proj["mockUnavailable"] = json!(true);
+        o_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "outage_refused_draft", "text": "Refused draft turn 1" }
+        ]);
+
+        let t_proj = st
+            .thread_projections
+            .get_mut(terminal_ic_tid.as_str())
+            .unwrap();
+        t_proj["runs"] = json!([]);
+        t_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" }
+        ]);
+        t_proj["thread"]["status"] = json!("running");
+        t_proj["thread"]["stopReason"] = Value::Null;
+
+        let d_proj = st
+            .thread_projections
+            .get_mut(double_fail_tid.as_str())
+            .unwrap();
+        d_proj["runs"] = json!([]);
+        d_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "lagged_refused_t1", "text": "Lagged refused draft turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "refused_t2", "text": "Failed draft turn 2" }
+        ]);
+        d_proj["thread"]["status"] = json!("completed");
+        d_proj["thread"]["stopReason"] = json!("safety");
+    }
+
+    for (seq, tid, ic) in [
+        (10u64, outage_tid.as_str(), 2u64),
+        (11u64, terminal_ic_tid.as_str(), 4u64),
+        (12u64, double_fail_tid.as_str(), 2u64),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "itemCount": ic
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let outage_role = outage_role.clone();
+        let terminal_ic_role = terminal_ic_role.clone();
+        let double_fail_role = double_fail_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&outage_role, &terminal_ic_role, &double_fail_role]
+                .into_iter()
+                .all(|want| {
+                    snap.workers.iter().any(|(r, _, p)| {
+                        r == want
+                            && matches!(
+                                p,
+                                WorkerPhase::Live {
+                                    activity: Activity::Refused { .. },
+                                    ..
+                                }
+                            )
+                    })
+                })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        let o_proj = st.thread_projections.get_mut(outage_tid.as_str()).unwrap();
+        o_proj["mockUnavailable"] = json!(false);
+        o_proj["thread"]["status"] = json!("completed");
+        o_proj["thread"]["stopReason"] = Value::Null;
+        o_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "outage_refused_draft", "text": "Refused draft turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "outage_recovered_final", "text": "Recovered reply turn 2" }
+        ]);
+
+        let t_proj = st
+            .thread_projections
+            .get_mut(terminal_ic_tid.as_str())
+            .unwrap();
+        t_proj["thread"]["status"] = json!("completed");
+        t_proj["thread"]["stopReason"] = Value::Null;
+        t_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "good_turn1", "text": "Successful turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "failed_turn2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "user_message", "text": "u3" },
+            { "ordinal": 5, "type": "assistant_message", "id": "good_turn3", "text": "Third recovered" }
+        ]);
+
+        let d_proj = st
+            .thread_projections
+            .get_mut(double_fail_tid.as_str())
+            .unwrap();
+        d_proj["thread"]["status"] = json!("completed");
+        d_proj["thread"]["stopReason"] = Value::Null;
+        d_proj["turnItems"] = json!([
+            { "ordinal": 0, "type": "user_message", "text": "u1" },
+            { "ordinal": 1, "type": "assistant_message", "id": "lagged_refused_t1", "text": "Lagged refused draft turn 1" },
+            { "ordinal": 2, "type": "user_message", "text": "u2" },
+            { "ordinal": 3, "type": "assistant_message", "id": "refused_t2", "text": "Failed draft turn 2" },
+            { "ordinal": 4, "type": "user_message", "text": "u3" },
+            { "ordinal": 5, "type": "assistant_message", "id": "recovered_t3", "text": "Third recovered" }
+        ]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_explicit_ic").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    for (seq, tid) in [
+        (20u64, outage_tid.as_str()),
+        (21u64, terminal_ic_tid.as_str()),
+        (22u64, double_fail_tid.as_str()),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    let room = wave_room(&wave, &project);
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let outage_role = outage_role.clone();
+        let terminal_ic_role = terminal_ic_role.clone();
+        let double_fail_role = double_fail_role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            let count_for = |r: &RoleName| {
+                page.entries
+                    .iter()
+                    .filter(|e| {
+                        e.by == Principal::Worker {
+                            wave: wave.clone(),
+                            role: r.clone(),
+                        } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                    })
+                    .count()
+            };
+            count_for(&outage_role) == 1
+                && count_for(&terminal_ic_role) == 2
+                && count_for(&double_fail_role) == 1
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let page = operator
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .await
+        .unwrap();
+    let bodies_for = |r: &RoleName| -> Vec<&str> {
+        page.entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(bodies_for(&outage_role), vec!["Recovered reply turn 2"]);
+    assert_eq!(
+        bodies_for(&terminal_ic_role),
+        vec!["Successful turn 1", "Third recovered"]
+    );
+    assert_eq!(bodies_for(&double_fail_role), vec!["Third recovered"]);
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
     bridge_task.abort();
 }
