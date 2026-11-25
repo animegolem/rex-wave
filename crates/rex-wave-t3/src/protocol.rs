@@ -1031,6 +1031,7 @@ use std::collections::BTreeSet;
 
 pub const FAILURE_TICKET_PREFIX: &str = "fail_ticket:";
 pub const FAILURE_RESOLVED_PREFIX: &str = "fail_resolved:";
+pub const FAILURE_BIND_PREFIX: &str = "fail_bind:";
 
 fn parse_failure_ticket(key: &str) -> Option<(usize, Option<&str>)> {
     let rest = key.strip_prefix(FAILURE_TICKET_PREFIX)?;
@@ -1043,6 +1044,53 @@ fn parse_failure_ticket(key: &str) -> Option<(usize, Option<&str>)> {
     } else {
         None
     }
+}
+
+fn parse_failure_bind(key: &str) -> Option<(usize, &str)> {
+    let rest = key.strip_prefix(FAILURE_BIND_PREFIX)?;
+    let (id_str, anchor) = rest.split_once(':')?;
+    let id = id_str.parse::<usize>().ok()?;
+    (!anchor.is_empty()).then_some((id, anchor))
+}
+
+pub fn bind_ticket_anchor_keys(ticket_ids: &[usize], turn_keys: &[String]) -> Vec<String> {
+    if ticket_ids.is_empty() || turn_keys.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &id in ticket_ids {
+        for k in turn_keys {
+            if k.is_empty()
+                || k.starts_with("seg:")
+                || k.starts_with("run_pos:")
+                || k.starts_with("run_ord:")
+                || k.starts_with("item_count:")
+                || k.starts_with(FAILURE_TICKET_PREFIX)
+                || k.starts_with(FAILURE_RESOLVED_PREFIX)
+                || k.starts_with(FAILURE_BIND_PREFIX)
+            {
+                continue;
+            }
+            push_unique_key(&mut out, format!("{FAILURE_BIND_PREFIX}{id}:{k}"));
+        }
+    }
+    out
+}
+
+pub fn bound_ticket_ids_for_keys(settled_keys: &BTreeSet<String>, keys: &[String]) -> Vec<usize> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut ids: Vec<usize> = settled_keys
+        .iter()
+        .filter_map(|sk| {
+            let (id, bound_anchor) = parse_failure_bind(sk)?;
+            keys.iter().any(|k| k == bound_anchor).then_some(id)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 pub fn next_failure_ticket_key(
@@ -1184,6 +1232,7 @@ pub enum TurnMirrorCheck {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InspectedTurn {
+    pub pos: usize,
     pub check: TurnMirrorCheck,
     pub lookup_keys: Vec<String>,
     pub suppression_keys: Vec<String>,
@@ -1207,6 +1256,7 @@ pub enum ExplicitFailurePlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreterminalCandidate {
+    pub pos: usize,
     pub check: TurnMirrorCheck,
     pub suppression_keys: Vec<String>,
     pub lookup_keys: Vec<String>,
@@ -1818,6 +1868,7 @@ fn evaluate_raw_turn(
     }
 
     Some(InspectedTurn {
+        pos: raw.pos,
         check,
         lookup_keys,
         suppression_keys,
@@ -2211,6 +2262,7 @@ pub fn collect_turn_candidates_in_range(
             }
         }
         out.push(PreterminalCandidate {
+            pos: raw.pos,
             check,
             suppression_keys,
             lookup_keys,
@@ -2224,6 +2276,137 @@ pub fn collect_turn_candidates_in_range(
         });
     }
     out
+}
+
+pub fn projection_run_ticket_anchors(
+    projection: &Value,
+    settled_keys: &BTreeSet<String>,
+) -> Vec<(usize, usize)> {
+    let (_, _, raw_turns) = slice_projection_turns(projection);
+    let mut anchors = Vec::new();
+    for raw in &raw_turns {
+        let mut run_ids = Vec::new();
+        if let Some(trid) = raw.target_run_id {
+            push_unique_key(&mut run_ids, trid.to_owned());
+        }
+        for (_, _, it) in &raw.slice {
+            if let Some(irid) = it
+                .get("runId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                push_unique_key(&mut run_ids, irid.to_owned());
+            }
+        }
+        let supp_keys = collect_suppressed_turn_keys(
+            &raw.slice,
+            raw.target_run_id,
+            raw.suppressed_run_key.clone(),
+        );
+        for tid in all_matching_run_ticket_ids(settled_keys, &run_ids)
+            .into_iter()
+            .chain(bound_ticket_ids_for_keys(settled_keys, &supp_keys))
+        {
+            if !anchors.contains(&(raw.pos, tid)) {
+                anchors.push((raw.pos, tid));
+            }
+        }
+    }
+    anchors
+}
+
+pub fn ticket_causally_eligible_at_pos(
+    ticket: &PendingTicket,
+    cand_pos: usize,
+    cand_run_ids: &[String],
+    anchors: &[(usize, usize)],
+) -> bool {
+    if let Some(rid) = &ticket.run_id
+        && !cand_run_ids.is_empty()
+        && !cand_run_ids.iter().any(|r| r == rid)
+    {
+        return false;
+    }
+    for &(anchor_pos, anchor_tid) in anchors {
+        if ticket.id == anchor_tid && cand_pos != anchor_pos {
+            return false;
+        }
+        if cand_pos <= anchor_pos && ticket.id > anchor_tid {
+            return false;
+        }
+        if cand_pos >= anchor_pos && ticket.id < anchor_tid {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn projection_slot_eligible_tickets(
+    projection: &Value,
+    pos: usize,
+    tickets: &[PendingTicket],
+    anchors: &[(usize, usize)],
+) -> Vec<PendingTicket> {
+    if tickets.is_empty() {
+        return Vec::new();
+    }
+    let (_, _, raw_turns) = slice_projection_turns(projection);
+    let Some(raw) = raw_turns.get(pos) else {
+        return Vec::new();
+    };
+    let mut run_ids = Vec::new();
+    if let Some(trid) = raw.target_run_id {
+        push_unique_key(&mut run_ids, trid.to_owned());
+    }
+    for (_, _, it) in &raw.slice {
+        if let Some(irid) = it
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            push_unique_key(&mut run_ids, irid.to_owned());
+        }
+    }
+    tickets
+        .iter()
+        .filter(|t| ticket_causally_eligible_at_pos(t, raw.pos, &run_ids, anchors))
+        .cloned()
+        .collect()
+}
+
+pub fn projection_slots_have_eligible_ticket(
+    projection: &Value,
+    end_pos: usize,
+    tickets: &[PendingTicket],
+    anchors: &[(usize, usize)],
+) -> bool {
+    if tickets.is_empty() || end_pos == 0 {
+        return false;
+    }
+    let (_, _, raw_turns) = slice_projection_turns(projection);
+    let bound = end_pos.min(raw_turns.len());
+    for raw in &raw_turns[..bound] {
+        let mut run_ids = Vec::new();
+        if let Some(trid) = raw.target_run_id {
+            push_unique_key(&mut run_ids, trid.to_owned());
+        }
+        for (_, _, it) in &raw.slice {
+            if let Some(irid) = it
+                .get("runId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                push_unique_key(&mut run_ids, irid.to_owned());
+            }
+        }
+        if tickets
+            .iter()
+            .any(|t| ticket_causally_eligible_at_pos(t, raw.pos, &run_ids, anchors))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn collect_turn_candidates_before(

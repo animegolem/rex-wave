@@ -3186,29 +3186,36 @@ impl BbBridge {
         None
     }
 
-    async fn call_wave_observe(&self, wave: WaveSlug, role: RoleName, observation: Observation) {
-        self.observe_wave_event(
-            wave.clone(),
-            WaveEvent::WorkerObserved {
-                role: role.clone(),
-                observation: observation.clone(),
-            },
-        );
+    async fn try_wave_observe(
+        &self,
+        wave: WaveSlug,
+        role: RoleName,
+        observation: Observation,
+    ) -> bool {
         if let Some(backend) = self.backend.get() {
-            let _ = backend
+            let res = backend
                 .call_as(
                     Principal::System {
                         part: SystemPart::BbBridge,
                     },
                     WaveObserve {
-                        wave,
-                        role,
-                        observation,
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        observation: observation.clone(),
                     }
                     .into_wire(),
                 )
                 .await;
+            if !matches!(res, Ok(WireReply::WaveObserve(_))) {
+                return false;
+            }
         }
+        self.observe_wave_event(wave, WaveEvent::WorkerObserved { role, observation });
+        true
+    }
+
+    async fn call_wave_observe(&self, wave: WaveSlug, role: RoleName, observation: Observation) {
+        let _ = self.try_wave_observe(wave, role, observation).await;
     }
 
     async fn record_suppressed_bb_turn(
@@ -3219,13 +3226,6 @@ impl BbBridge {
         start_seq: Option<u64>,
         end_seq: Option<u64>,
     ) {
-        let _ = self.owner.send(OwnerMsg::SuppressTurn {
-            wave: wave.clone(),
-            role: role.clone(),
-            thread: thread.clone(),
-            start_seq,
-            end_seq,
-        });
         let mut keys = Vec::new();
         if let Some(s) = start_seq.filter(|&s| s > 0) {
             keys.push(format!("s{s}"));
@@ -3233,17 +3233,27 @@ impl BbBridge {
         if let Some(e) = end_seq.filter(|&e| e > 0) {
             keys.push(format!("e{e}"));
         }
-        if !keys.is_empty() {
-            self.call_wave_observe(
-                wave.clone(),
-                role.clone(),
-                Observation::TurnsSuppressed {
-                    thread: thread.clone(),
-                    keys,
-                },
-            )
-            .await;
+        if !keys.is_empty()
+            && !self
+                .try_wave_observe(
+                    wave.clone(),
+                    role.clone(),
+                    Observation::TurnsSuppressed {
+                        thread: thread.clone(),
+                        keys,
+                    },
+                )
+                .await
+        {
+            return;
         }
+        let _ = self.owner.send(OwnerMsg::SuppressTurn {
+            wave: wave.clone(),
+            role: role.clone(),
+            thread: thread.clone(),
+            start_seq,
+            end_seq,
+        });
     }
 
     async fn ensure_bb_journal_suppressions_hydrated(

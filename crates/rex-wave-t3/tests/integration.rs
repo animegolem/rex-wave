@@ -5765,3 +5765,454 @@ async fn t3_causal_pre_ticket_bound_run_anchor_promotion_and_anonymous_to_run_re
     conductor_task.abort();
     bridge_task.abort();
 }
+
+#[tokio::test]
+async fn t3_ordinary_completion_causal_bound_prefixed_anon_refinement_and_failed_append_retry() {
+    use rex_wave_store::{CommitHook, StoreError, TxContext};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailOnceAnchorPromo(AtomicBool);
+    impl CommitHook for FailOnceAnchorPromo {
+        fn on_append(
+            &self,
+            _: &TxContext<'_, '_>,
+            committed: &[Envelope],
+        ) -> Result<(), StoreError> {
+            for env in committed {
+                if let Event::Wave(WaveEvent::WorkerObserved {
+                    role,
+                    observation: Observation::TurnsSuppressed { keys, .. },
+                }) = &env.event
+                    && role.as_str() == "anchorpromo"
+                    && keys.iter().any(|k| k == "o1")
+                    && !self.0.swap(true, Ordering::SeqCst)
+                {
+                    return Err(StoreError::Backend("injected one failed append".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockT3Server::start(MockT3State {
+        expected_bearer: "tok_r23".into(),
+        projects: vec![json!({
+            "id": "uuid-r23",
+            "title": "rex-wave",
+            "workspaceRoot": "/tmp/rex-wave"
+        })],
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg = T3Config::explicit(&server.origin(), "tok_r23").unwrap();
+    cfg.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg);
+    let journal = Journal::open_with_hook(
+        &tmp.path().join("journal.sqlite3"),
+        Some(Arc::new(FailOnceAnchorPromo(AtomicBool::new(false)))),
+    )
+    .unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+        board: Registry::<Board>::new(journal.clone(), hub.clone()),
+        ..Router::unavailable_with(Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar,
+            agents: bridge.clone(),
+        }))
+    });
+    let host_client = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    let conductor_task = spawn_reactor(WaveConductor::new(T3Host(bridge.clone())), host_client);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    let operator = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+    let wave = WaveSlug::parse("r23-edge-v1").unwrap();
+    let project = BbProjectId::parse("uuid-r23").unwrap();
+    let prior_good_role = RoleName::parse("priorgood").unwrap();
+    let anchor_promo_role = RoleName::parse("anchorpromo").unwrap();
+    let anon_refine_role = RoleName::parse("anonrefine").unwrap();
+
+    operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: project.clone(),
+                goal: Body::parse(
+                    "Verify ordinary completion causal bound, prefixed anon refinement, and failed append retry",
+                )
+                .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("antigravity").unwrap(),
+                    model: Some(ModelId::parse("gemini-4-neon").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![
+                    WorkerSpec {
+                        role: prior_good_role.clone(),
+                        brief: Body::parse("Ordinary completion preserves untagged success before r1")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: anchor_promo_role.clone(),
+                        brief: Body::parse("Retry anchor promotion cleanly after transient store failure")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                    WorkerSpec {
+                        role: anon_refine_role.clone(),
+                        brief: Body::parse("Refining anonymous ticket with r1 preserves earlier success")
+                            .unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    },
+                ],
+            },
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let prior_tid = BbThreadId::parse("t3:r23-edge-v1:priorgood:a1").unwrap();
+    let promo_tid = BbThreadId::parse("t3:r23-edge-v1:anchorpromo:a1").unwrap();
+    let anon_tid = BbThreadId::parse("t3:r23-edge-v1:anonrefine:a1").unwrap();
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let prior_tid = prior_tid.clone();
+        let promo_tid = promo_tid.clone();
+        let anon_tid = anon_tid.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&prior_tid, &promo_tid, &anon_tid]
+                .into_iter()
+                .all(|want_tid| {
+                    snap.workers.iter().any(|(_, _, p)| {
+                        matches!(p, WorkerPhase::Live { thread, .. } if thread == want_tid)
+                    })
+                })
+        }
+    })
+    .await;
+
+    {
+        let mut st = server.state.lock().await;
+        for tid in [prior_tid.as_str(), promo_tid.as_str(), anon_tid.as_str()] {
+            let proj = st.thread_projections.get_mut(tid).unwrap();
+            proj["runs"] = json!([]);
+            proj["mockUnavailable"] = json!(true);
+        }
+    }
+
+    for (seq, tid, run_id) in [
+        (10u64, prior_tid.as_str(), Some("r1")),
+        (11u64, promo_tid.as_str(), Some("r1")),
+        (12u64, anon_tid.as_str(), None),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": "safety",
+                    "latestRunId": run_id
+                }
+            }))
+            .await;
+    }
+
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let wave = wave.clone();
+        let prior_good_role = prior_good_role.clone();
+        let anchor_promo_role = anchor_promo_role.clone();
+        let anon_refine_role = anon_refine_role.clone();
+        async move {
+            let Ok(snap) = operator.call(WaveView { wave }).await else {
+                return false;
+            };
+            [&prior_good_role, &anchor_promo_role, &anon_refine_role]
+                .into_iter()
+                .all(|want| {
+                    snap.workers.iter().any(|(r, _, p)| {
+                        r == want
+                            && matches!(
+                                p,
+                                WorkerPhase::Live {
+                                    activity: Activity::Refused { .. },
+                                    ..
+                                }
+                            )
+                    })
+                })
+        }
+    })
+    .await;
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 14,
+            "location": "active",
+            "thread": {
+                "id": prior_tid.as_str(),
+                "status": "completed",
+                "stopReason": "safety",
+                "latestRunId": "r2"
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    {
+        let mut st = server.state.lock().await;
+        let p_proj = st.thread_projections.get_mut(prior_tid.as_str()).unwrap();
+        p_proj["mockUnavailable"] = json!(false);
+        p_proj["thread"]["status"] = json!("completed");
+        p_proj["thread"]["stopReason"] = Value::Null;
+        p_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "prior" },
+            { "type": "assistant_message", "text": "Earlier success" },
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" }
+        ]);
+
+        let a_proj = st.thread_projections.get_mut(promo_tid.as_str()).unwrap();
+        a_proj["mockUnavailable"] = json!(false);
+        a_proj["thread"]["status"] = json!("completed");
+        a_proj["thread"]["stopReason"] = Value::Null;
+        a_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" }
+        ]);
+
+        let n_proj = st.thread_projections.get_mut(anon_tid.as_str()).unwrap();
+        n_proj["mockUnavailable"] = json!(false);
+        n_proj["thread"]["status"] = json!("completed");
+        n_proj["thread"]["stopReason"] = Value::Null;
+        n_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "prior" },
+            { "type": "assistant_message", "text": "Earlier success" },
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" }
+        ]);
+    }
+
+    for (seq, tid, stop_reason) in [
+        (16u64, prior_tid.as_str(), Value::Null),
+        (17u64, promo_tid.as_str(), json!("safety")),
+        (18u64, anon_tid.as_str(), json!("safety")),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "stopReason": stop_reason,
+                    "latestRunId": "r1"
+                }
+            }))
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(140)).await;
+
+    server
+        .push_shell_item(json!({
+            "kind": "thread.updated",
+            "sequence": 19,
+            "location": "active",
+            "thread": {
+                "id": promo_tid.as_str(),
+                "status": "completed",
+                "stopReason": "safety",
+                "latestRunId": "r1"
+            }
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(140)).await;
+
+    {
+        let mut st = server.state.lock().await;
+        let p_proj = st.thread_projections.get_mut(prior_tid.as_str()).unwrap();
+        p_proj["thread"]["status"] = json!("completed");
+        p_proj["thread"]["stopReason"] = Value::Null;
+        p_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "prior" },
+            { "type": "assistant_message", "text": "Earlier success" },
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second refused draft" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" }
+        ]);
+
+        let a_proj = st.thread_projections.get_mut(promo_tid.as_str()).unwrap();
+        a_proj["thread"]["status"] = json!("completed");
+        a_proj["thread"]["stopReason"] = Value::Null;
+        a_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second successful turn" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" }
+        ]);
+
+        let n_proj = st.thread_projections.get_mut(anon_tid.as_str()).unwrap();
+        n_proj["thread"]["status"] = json!("completed");
+        n_proj["thread"]["stopReason"] = Value::Null;
+        n_proj["turnItems"] = json!([
+            { "type": "user_message", "text": "prior" },
+            { "type": "assistant_message", "text": "Earlier success" },
+            { "type": "user_message", "text": "u1" },
+            { "type": "assistant_message", "text": "First refused draft", "runId": "r1" },
+            { "type": "user_message", "text": "u2" },
+            { "type": "assistant_message", "text": "Second successful turn" },
+            { "type": "user_message", "text": "u3" },
+            { "type": "assistant_message", "text": "Recovered third turn" }
+        ]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    let mut cfg2 = T3Config::explicit(&server.origin(), "tok_r23").unwrap();
+    cfg2.reconnect_min = Duration::from_millis(15);
+    let bridge = T3Bridge::new(cfg2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge_task = tokio::spawn(bridge.clone().run_until(router.clone(), shutdown_rx));
+    wait_until(Duration::from_secs(3), || async { bridge.connected() }).await;
+
+    for (seq, tid) in [
+        (20u64, prior_tid.as_str()),
+        (21u64, promo_tid.as_str()),
+        (22u64, anon_tid.as_str()),
+    ] {
+        server
+            .push_shell_item(json!({
+                "kind": "thread.updated",
+                "sequence": seq,
+                "location": "active",
+                "thread": {
+                    "id": tid,
+                    "status": "completed",
+                    "pendingRuntimeRequest": null,
+                    "archivedAt": null
+                }
+            }))
+            .await;
+    }
+
+    let room = wave_room(&wave, &project);
+    wait_until(Duration::from_secs(3), || {
+        let operator = operator.clone();
+        let room = room.clone();
+        let wave = wave.clone();
+        let prior_good_role = prior_good_role.clone();
+        let anchor_promo_role = anchor_promo_role.clone();
+        let anon_refine_role = anon_refine_role.clone();
+        async move {
+            let Ok(page) = operator
+                .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+                .await
+            else {
+                return false;
+            };
+            let count_for = |r: &RoleName| {
+                page.entries
+                    .iter()
+                    .filter(|e| {
+                        e.by == Principal::Worker {
+                            wave: wave.clone(),
+                            role: r.clone(),
+                        } && matches!(e.event, Event::Room(RoomEvent::Posted { .. }))
+                    })
+                    .count()
+            };
+            count_for(&prior_good_role) == 2
+                && count_for(&anchor_promo_role) == 2
+                && count_for(&anon_refine_role) == 3
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let page = operator
+        .call(Read::stream(StreamId::Room { room }, Seq::ORIGIN, Some(50)))
+        .await
+        .unwrap();
+    let bodies_for = |r: &RoleName| -> Vec<&str> {
+        page.entries
+            .iter()
+            .filter(|e| {
+                e.by == Principal::Worker {
+                    wave: wave.clone(),
+                    role: r.clone(),
+                }
+            })
+            .filter_map(|e| match &e.event {
+                Event::Room(RoomEvent::Posted { body, .. }) => Some(body.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        bodies_for(&prior_good_role),
+        vec!["Earlier success", "Recovered third turn"]
+    );
+    assert_eq!(
+        bodies_for(&anchor_promo_role),
+        vec!["Second successful turn", "Recovered third turn"]
+    );
+    assert_eq!(
+        bodies_for(&anon_refine_role),
+        vec![
+            "Earlier success",
+            "Second successful turn",
+            "Recovered third turn"
+        ]
+    );
+
+    let _ = shutdown_tx.send(true);
+    conductor_task.abort();
+    bridge_task.abort();
+}
