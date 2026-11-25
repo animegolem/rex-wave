@@ -6220,13 +6220,13 @@ async fn t3_ordinary_completion_causal_bound_prefixed_anon_refinement_and_failed
 #[tokio::test]
 async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after_refinement() {
     use rex_wave_store::{CommitHook, StoreError, TxContext};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct FailOnceSingleRefusal {
-        failed_single: AtomicBool,
-        failed_anon_ticket: AtomicBool,
+    struct FailMultipleSingleRefusal {
+        failed_single: AtomicUsize,
+        failed_anon_ticket: AtomicUsize,
     }
-    impl CommitHook for FailOnceSingleRefusal {
+    impl CommitHook for FailMultipleSingleRefusal {
         fn on_append(
             &self,
             _: &TxContext<'_, '_>,
@@ -6240,13 +6240,13 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
                 {
                     if role.as_str() == "singlefail"
                         && keys.iter().any(|k| k == "o1")
-                        && !self.failed_single.swap(true, Ordering::SeqCst)
+                        && self.failed_single.fetch_add(1, Ordering::SeqCst) < 3
                     {
                         return Err(StoreError::Backend("injected single failed append".into()));
                     }
                     if role.as_str() == "beforerefine"
                         && keys.iter().any(|k| k == "fail_ticket:1:any")
-                        && !self.failed_anon_ticket.swap(true, Ordering::SeqCst)
+                        && self.failed_anon_ticket.fetch_add(1, Ordering::SeqCst) < 3
                     {
                         return Err(StoreError::Backend(
                             "injected outage anonymous ticket failed append".into(),
@@ -6273,14 +6273,12 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
     let mut cfg = T3Config::explicit(&server.origin(), "tok_r24").unwrap();
     cfg.reconnect_min = Duration::from_millis(15);
     let bridge = T3Bridge::new(cfg);
-    let journal = Journal::open_with_hook(
-        &tmp.path().join("journal.sqlite3"),
-        Some(Arc::new(FailOnceSingleRefusal {
-            failed_single: AtomicBool::new(false),
-            failed_anon_ticket: AtomicBool::new(false),
-        })),
-    )
-    .unwrap();
+    let counts = Arc::new(FailMultipleSingleRefusal {
+        failed_single: AtomicUsize::new(0),
+        failed_anon_ticket: AtomicUsize::new(0),
+    });
+    let journal =
+        Journal::open_with_hook(&tmp.path().join("journal.sqlite3"), Some(counts.clone())).unwrap();
     let hub = Hub::new(256);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let router = Arc::new(Router {
@@ -6683,6 +6681,8 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
             "Recovered third turn"
         ]
     );
+    assert!(counts.failed_single.load(Ordering::SeqCst) >= 4);
+    assert!(counts.failed_anon_ticket.load(Ordering::SeqCst) >= 4);
 
     let _ = shutdown_tx.send(true);
     conductor_task.abort();
