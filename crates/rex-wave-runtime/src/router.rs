@@ -183,9 +183,7 @@ async fn restore_worker_working(
                 WaveCommand::WaveObserve(WaveObserve {
                     wave: wave.clone(),
                     role: role.clone(),
-                    observation: Observation::Activity {
-                        activity: Activity::Working,
-                    },
+                    observation: Observation::activity(Activity::Working),
                 }),
                 system_ctx(),
             )
@@ -325,9 +323,10 @@ impl Router {
                             WaveCommand::WaveObserve(WaveObserve {
                                 wave: wave.clone(),
                                 role: role.clone(),
-                                observation: Observation::Activity {
-                                    activity: Activity::Parked { room, since },
-                                },
+                                observation: Observation::activity(Activity::Parked {
+                                    room,
+                                    since,
+                                }),
                             }),
                             system_ctx(),
                         )

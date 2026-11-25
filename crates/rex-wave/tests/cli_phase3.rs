@@ -638,11 +638,9 @@ async fn cli_wave_honesty_enforces_one_writer_refusals_finish_gate_account_misma
     sys.call(WaveObserve {
         wave: wave.clone(),
         role: auditor.clone(),
-        observation: Observation::Activity {
-            activity: Activity::Refused {
-                reason: "cyber_safeguard: blocked".into(),
-            },
-        },
+        observation: Observation::activity(Activity::Refused {
+            reason: "cyber_safeguard: blocked".into(),
+        }),
     })
     .await
     .unwrap();

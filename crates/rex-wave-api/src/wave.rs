@@ -145,7 +145,7 @@ impl WorkerPhase {
             ) if a == attempt => WorkerPhase::Failed {
                 error: error.clone(),
             },
-            (WorkerPhase::Live { thread, .. }, Observation::Activity { activity }) => {
+            (WorkerPhase::Live { thread, .. }, Observation::Activity { activity, .. }) => {
                 WorkerPhase::Live {
                     thread: thread.clone(),
                     activity: activity.clone(),
@@ -444,6 +444,12 @@ pub enum Observation {
     },
     Activity {
         activity: Activity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<BbThreadId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        suppress_keys: Vec<String>,
     },
     RuntimeMeta {
         #[serde(default)]
@@ -457,6 +463,31 @@ pub enum Observation {
         keys: Vec<String>,
     },
     Archived,
+}
+
+impl Observation {
+    pub fn activity(activity: Activity) -> Self {
+        Observation::Activity {
+            activity,
+            thread: None,
+            settled_seq: None,
+            suppress_keys: Vec::new(),
+        }
+    }
+
+    pub fn activity_with_bounds(
+        activity: Activity,
+        thread: BbThreadId,
+        settled_seq: Option<u64>,
+        suppress_keys: Vec<String>,
+    ) -> Self {
+        Observation::Activity {
+            activity,
+            thread: Some(thread),
+            settled_seq: settled_seq.filter(|&s| s > 0),
+            suppress_keys,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

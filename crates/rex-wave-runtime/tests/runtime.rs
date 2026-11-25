@@ -1352,8 +1352,9 @@ impl Service<WaveCommand> for RecordingWaves {
         Box::pin(async move {
             match cmd {
                 WaveCommand::WaveObserve(obs) => {
-                    if let rex_wave_api::wave::Observation::Activity { activity: ref a } =
-                        obs.observation
+                    if let rex_wave_api::wave::Observation::Activity {
+                        activity: ref a, ..
+                    } = obs.observation
                     {
                         *activity.lock().unwrap() = a.clone();
                     }
@@ -1501,13 +1502,15 @@ async fn worker_wait_emits_parked_and_working_and_restores_on_cancel() {
         assert!(matches!(
             &log[0].2,
             rex_wave_api::wave::Observation::Activity {
-                activity: Activity::Parked { room: Some(r), since: Seq(0) }
+                activity: Activity::Parked { room: Some(r), since: Seq(0) },
+                ..
             } if r == &room_id
         ));
         assert!(matches!(
             &log[1].2,
             rex_wave_api::wave::Observation::Activity {
-                activity: Activity::Working
+                activity: Activity::Working,
+                ..
             }
         ));
     }

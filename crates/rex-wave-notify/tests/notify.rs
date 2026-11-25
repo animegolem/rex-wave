@@ -523,15 +523,13 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Blocked {
-                    interaction: PendingInteraction {
-                        id: interaction_id.clone(),
-                        kind: InteractionKind::Permission,
-                        summary: "Execute database migration".into(),
-                    },
+            observation: Observation::activity(Activity::Blocked {
+                interaction: PendingInteraction {
+                    id: interaction_id.clone(),
+                    kind: InteractionKind::Permission,
+                    summary: "Execute database migration".into(),
                 },
-            },
+            }),
         })
         .await
         .unwrap();
@@ -623,9 +621,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Working,
-            },
+            observation: Observation::activity(Activity::Working),
         })
         .await
         .unwrap();
@@ -647,22 +643,20 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Blocked {
-                    interaction: PendingInteraction {
-                        id: BbInteractionId::parse("int_q1").unwrap(),
-                        kind: InteractionKind::Question {
-                            questions: vec![Question {
-                                id: "q1".into(),
-                                prompt: "Which branch?".into(),
-                                options: vec!["main".into()],
-                                multi: false,
-                            }],
-                        },
-                        summary: "Select target branch".into(),
+            observation: Observation::activity(Activity::Blocked {
+                interaction: PendingInteraction {
+                    id: BbInteractionId::parse("int_q1").unwrap(),
+                    kind: InteractionKind::Question {
+                        questions: vec![Question {
+                            id: "q1".into(),
+                            prompt: "Which branch?".into(),
+                            options: vec!["main".into()],
+                            multi: false,
+                        }],
                     },
+                    summary: "Select target branch".into(),
                 },
-            },
+            }),
         })
         .await
         .unwrap();
@@ -964,11 +958,9 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Errored {
-                    error: "Command thread.start failed".into(),
-                },
-            },
+            observation: Observation::activity(Activity::Errored {
+                error: "Command thread.start failed".into(),
+            }),
         })
         .await
         .unwrap();
@@ -976,11 +968,9 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Errored {
-                    error: "ServiceUnavailableError (503)".into(),
-                },
-            },
+            observation: Observation::activity(Activity::Errored {
+                error: "ServiceUnavailableError (503)".into(),
+            }),
         })
         .await
         .unwrap();
@@ -1040,11 +1030,9 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
         .call(WaveObserve {
             wave: wave_slug.clone(),
             role: role.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Errored {
-                    error: "ServiceUnavailableError (503)".into(),
-                },
-            },
+            observation: Observation::activity(Activity::Errored {
+                error: "ServiceUnavailableError (503)".into(),
+            }),
         })
         .await
         .unwrap();
@@ -2606,11 +2594,9 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
     bb.call(WaveObserve {
         wave: wave.clone(),
         role: role.clone(),
-        observation: Observation::Activity {
-            activity: Activity::Refused {
-                reason: long_reason.clone(),
-            },
-        },
+        observation: Observation::activity(Activity::Refused {
+            reason: long_reason.clone(),
+        }),
     })
     .await
     .unwrap();
@@ -2687,11 +2673,9 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
     bb.call(WaveObserve {
         wave: wave.clone(),
         role: role.clone(),
-        observation: Observation::Activity {
-            activity: Activity::Refused {
-                reason: "second refusal".into(),
-            },
-        },
+        observation: Observation::activity(Activity::Refused {
+            reason: "second refusal".into(),
+        }),
     })
     .await
     .unwrap();
@@ -3757,6 +3741,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
                 rex_wave_api::WaveCommand::WaveObserve(WaveObserve {
                     observation: Observation::Activity {
                         activity: Activity::Parked { .. },
+                        ..
                     },
                     ..
                 })

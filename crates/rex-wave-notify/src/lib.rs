@@ -463,6 +463,7 @@ impl HeraldView {
                 wave::WaveEvent::WorkerObserved { role, observation } => match observation {
                     wave::Observation::Activity {
                         activity: wave::Activity::Blocked { interaction },
+                        ..
                     } => {
                         let key = (wave.clone(), role.clone());
                         if let Some((old_id, old_summary)) = self.blocked.remove(&key)
@@ -1297,6 +1298,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             wave::WaveEvent::WorkerObserved { role, observation } => match observation {
                 wave::Observation::Activity {
                     activity: wave::Activity::Blocked { interaction },
+                    ..
                 } => {
                     let actions = interaction_actions(wave, role, interaction);
                     for op in view.operators_for_wave(wave) {
@@ -1318,6 +1320,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 }
                 wave::Observation::Activity {
                     activity: wave::Activity::Refused { reason },
+                    ..
                 } => {
                     for op in view.operators_for_wave(wave) {
                         out.push((
@@ -1339,6 +1342,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                 }
                 wave::Observation::Activity {
                     activity: wave::Activity::Errored { error },
+                    ..
                 }
                 | wave::Observation::SpawnFailed { error, .. } => {
                     for op in view.operators_for_wave(wave) {

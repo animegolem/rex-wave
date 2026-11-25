@@ -169,6 +169,7 @@ fn is_own_wait_bookkeeping(viewer: &Principal, env: &Envelope) -> bool {
                 role: ev_role,
                 observation: wave::Observation::Activity {
                     activity: wave::Activity::Parked { .. } | wave::Activity::Working,
+                    ..
                 },
             })
         ) if ev_wave == wave && ev_role == role

@@ -153,6 +153,7 @@ pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase
             },
             Observation::Activity {
                 activity: Activity::Errored { .. },
+                ..
             },
         ) => Ok(WorkerPhase::Live {
             thread: thread.clone(),
@@ -160,7 +161,7 @@ pub fn worker_step(phase: &WorkerPhase, obs: &Observation) -> Result<WorkerPhase
                 reason: reason.clone(),
             },
         }),
-        (WorkerPhase::Live { thread, .. }, Observation::Activity { activity }) => {
+        (WorkerPhase::Live { thread, .. }, Observation::Activity { activity, .. }) => {
             Ok(WorkerPhase::Live {
                 thread: thread.clone(),
                 activity: activity.clone(),
@@ -295,6 +296,7 @@ struct WorkerRecord {
     meta: WorkerRuntimeMeta,
     suppressed_thread: Option<BbThreadId>,
     suppressed_turns: BTreeSet<String>,
+    settled_turn_seq: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -723,6 +725,54 @@ impl Decider for Waves {
                 let Ok(next) = worker_step(&rec.phase, &c.observation) else {
                     return Ok(vec![]);
                 };
+                if let Observation::Activity {
+                    thread,
+                    settled_seq,
+                    suppress_keys,
+                    ..
+                } = &c.observation
+                    && let WorkerPhase::Live {
+                        thread: ref live_thread,
+                        activity: ref effective_activity,
+                    } = next
+                {
+                    let thread_ok = thread.as_ref().is_none_or(|t| t == live_thread);
+                    let thread_matches_existing =
+                        rec.suppressed_thread.as_ref() == Some(live_thread);
+                    let mut clean_keys: Vec<String> = Vec::new();
+                    if thread_ok {
+                        for key in suppress_keys {
+                            let trimmed = key.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let already_recorded =
+                                thread_matches_existing && rec.suppressed_turns.contains(trimmed);
+                            if !already_recorded
+                                && !clean_keys.iter().any(|existing| existing == trimmed)
+                            {
+                                clean_keys.push(trimmed.to_owned());
+                            }
+                        }
+                    }
+                    let clean_settled = settled_seq.filter(|&s| thread_ok && s > 0);
+                    let settled_advanced = clean_settled
+                        .is_some_and(|s| !thread_matches_existing || s > rec.settled_turn_seq);
+                    if next == rec.phase && !settled_advanced && clean_keys.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let carry_thread = (clean_settled.is_some() || !clean_keys.is_empty())
+                        .then(|| live_thread.clone());
+                    return Ok(vec![WaveEvent::WorkerObserved {
+                        role: c.role.clone(),
+                        observation: Observation::Activity {
+                            activity: effective_activity.clone(),
+                            thread: carry_thread,
+                            settled_seq: clean_settled,
+                            suppress_keys: clean_keys,
+                        },
+                    }]);
+                }
                 if next == rec.phase {
                     return Ok(vec![]);
                 }
@@ -730,7 +780,6 @@ impl Decider for Waves {
                     role: c.role.clone(),
                     observation: c.observation.clone(),
                 }];
-                // Emit explicit retry `WorkerRequested` so SidebarProjection and WaveConductor stay in lockstep.
                 if let WorkerPhase::Requested { attempt } = next {
                     events.push(WaveEvent::WorkerRequested {
                         role: c.role.clone(),
@@ -795,6 +844,7 @@ impl Decider for Waves {
                         },
                         suppressed_thread: None,
                         suppressed_turns: BTreeSet::new(),
+                        settled_turn_seq: 0,
                     },
                 );
             }
@@ -816,6 +866,7 @@ impl Decider for Waves {
                             if rec.suppressed_thread.as_ref() != Some(thread) {
                                 rec.suppressed_thread = Some(thread.clone());
                                 rec.suppressed_turns.clear();
+                                rec.settled_turn_seq = 0;
                             }
                             for key in keys {
                                 if !key.is_empty() {
@@ -829,6 +880,28 @@ impl Decider for Waves {
                             {
                                 rec.suppressed_thread = Some(thread.clone());
                                 rec.suppressed_turns.clear();
+                                rec.settled_turn_seq = 0;
+                            }
+                            if let Observation::Activity {
+                                thread: Some(th),
+                                settled_seq,
+                                suppress_keys,
+                                ..
+                            } = other
+                            {
+                                if rec.suppressed_thread.as_ref() != Some(th) {
+                                    rec.suppressed_thread = Some(th.clone());
+                                    rec.suppressed_turns.clear();
+                                    rec.settled_turn_seq = 0;
+                                }
+                                if let Some(s) = settled_seq {
+                                    rec.settled_turn_seq = rec.settled_turn_seq.max(*s);
+                                }
+                                for key in suppress_keys {
+                                    if !key.is_empty() {
+                                        rec.suppressed_turns.insert(key.clone());
+                                    }
+                                }
                             }
                             rec.phase = rec.phase.observe(other);
                             rec.resolved_interaction = None;
@@ -2139,19 +2212,15 @@ mod tests {
             &mut state,
             &mut seq,
             &author,
-            Observation::Activity {
-                activity: Activity::Errored {
-                    error: "ServiceUnavailableError".into(),
-                },
-            },
+            Observation::activity(Activity::Errored {
+                error: "ServiceUnavailableError".into(),
+            }),
         );
         observe(
             &mut state,
             &mut seq,
             &verifier,
-            Observation::Activity {
-                activity: Activity::Idle,
-            },
+            Observation::activity(Activity::Idle),
         );
         let blocked_finish = apply_cmd(
             &mut state,
@@ -2356,11 +2425,9 @@ mod tests {
                     return Err(HostError::Unreachable("host disconnected".into()));
                 }
                 if self.missing_threads.lock().unwrap().contains(&thread) {
-                    return Ok(Some(Observation::Activity {
-                        activity: Activity::Errored {
-                            error: "host thread missing after restart".into(),
-                        },
-                    }));
+                    return Ok(Some(Observation::activity(Activity::Errored {
+                        error: "host thread missing after restart".into(),
+                    })));
                 }
                 Ok(None)
             })
@@ -2675,20 +2742,16 @@ mod tests {
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: author.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Parked {
-                    room: Some(started.room.clone()),
-                    since: Seq(1),
-                },
-            },
+            observation: Observation::activity(Activity::Parked {
+                room: Some(started.room.clone()),
+                since: Seq(1),
+            }),
         }))
         .unwrap();
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: verifier.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Idle,
-            },
+            observation: Observation::activity(Activity::Idle),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -2744,15 +2807,13 @@ mod tests {
         block_on(sys_bridge.call(WaveObserve {
             wave: wave.clone(),
             role: verifier.clone(),
-            observation: Observation::Activity {
-                activity: Activity::Blocked {
-                    interaction: PendingInteraction {
-                        id: int_id.clone(),
-                        kind: InteractionKind::Permission,
-                        summary: "Run git status".into(),
-                    },
+            observation: Observation::activity(Activity::Blocked {
+                interaction: PendingInteraction {
+                    id: int_id.clone(),
+                    kind: InteractionKind::Permission,
+                    summary: "Run git status".into(),
                 },
-            },
+            }),
         }))
         .unwrap();
         block_on(op.call(WaveResolve {
@@ -3350,11 +3411,9 @@ mod tests {
             WaveCommand::WaveObserve(WaveObserve {
                 wave: spec.slug.clone(),
                 role: author.clone(),
-                observation: Observation::Activity {
-                    activity: Activity::Refused {
-                        reason: "cyber_safeguard: refusal".into(),
-                    },
-                },
+                observation: Observation::activity(Activity::Refused {
+                    reason: "cyber_safeguard: refusal".into(),
+                }),
             }),
         )
         .unwrap();
@@ -3365,9 +3424,7 @@ mod tests {
             WaveCommand::WaveObserve(WaveObserve {
                 wave: spec.slug.clone(),
                 role: verifier.clone(),
-                observation: Observation::Activity {
-                    activity: Activity::Idle,
-                },
+                observation: Observation::activity(Activity::Idle),
             }),
         )
         .unwrap();
@@ -3406,11 +3463,9 @@ mod tests {
             WaveCommand::WaveObserve(WaveObserve {
                 wave: spec.slug.clone(),
                 role: author.clone(),
-                observation: Observation::Activity {
-                    activity: Activity::Errored {
-                        error: "generic thread.failed".into(),
-                    },
-                },
+                observation: Observation::activity(Activity::Errored {
+                    error: "generic thread.failed".into(),
+                }),
             }),
         )
         .unwrap();

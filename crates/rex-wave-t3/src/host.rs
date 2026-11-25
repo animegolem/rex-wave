@@ -551,7 +551,7 @@ impl StateOwner {
                     rec.activity = Activity::Working;
                     rec.pending_interaction = None;
                 }
-                Observation::Activity { activity } => {
+                Observation::Activity { activity, .. } => {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
                         rec.pending_interaction = match &activity {
                             Activity::Blocked { interaction } => Some(interaction.clone()),
@@ -1382,9 +1382,7 @@ impl T3Bridge {
                     .try_wave_observe(
                         wave,
                         role,
-                        Observation::Activity {
-                            activity: Activity::Blocked { interaction },
-                        },
+                        Observation::activity(Activity::Blocked { interaction }),
                     )
                     .await
                 {
@@ -1409,13 +1407,7 @@ impl T3Bridge {
                 self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
                     .await;
                 if !self
-                    .try_wave_observe(
-                        wave,
-                        role,
-                        Observation::Activity {
-                            activity: Activity::Working,
-                        },
-                    )
+                    .try_wave_observe(wave, role, Observation::activity(Activity::Working))
                     .await
                 {
                     return ShellUpdateDisposition::RetryNeeded;
@@ -1468,9 +1460,7 @@ impl T3Bridge {
                     .try_wave_observe(
                         wave,
                         role,
-                        Observation::Activity {
-                            activity: Activity::Refused { reason },
-                        },
+                        Observation::activity(Activity::Refused { reason }),
                     )
                     .await
                 {
@@ -1524,9 +1514,7 @@ impl T3Bridge {
                     .try_wave_observe(
                         wave,
                         role,
-                        Observation::Activity {
-                            activity: Activity::Errored { error },
-                        },
+                        Observation::activity(Activity::Errored { error }),
                     )
                     .await
                 {
@@ -1578,13 +1566,7 @@ impl T3Bridge {
                         attempt_state.failure_projection_settled = true;
                     }
                     if !self
-                        .try_wave_observe(
-                            wave,
-                            role,
-                            Observation::Activity {
-                                activity: Activity::Idle,
-                            },
-                        )
+                        .try_wave_observe(wave, role, Observation::activity(Activity::Idle))
                         .await
                     {
                         return ShellUpdateDisposition::RetryNeeded;
@@ -1609,7 +1591,7 @@ impl T3Bridge {
                                 return ShellUpdateDisposition::RetryNeeded;
                             }
                             if !self
-                                .try_wave_observe(wave, role, Observation::Activity { activity })
+                                .try_wave_observe(wave, role, Observation::activity(activity))
                                 .await
                             {
                                 return ShellUpdateDisposition::RetryNeeded;
@@ -1635,13 +1617,7 @@ impl T3Bridge {
                     }
                 }
                 if !self
-                    .try_wave_observe(
-                        wave,
-                        role,
-                        Observation::Activity {
-                            activity: Activity::Idle,
-                        },
-                    )
+                    .try_wave_observe(wave, role, Observation::activity(Activity::Idle))
                     .await
                 {
                     return ShellUpdateDisposition::RetryNeeded;
@@ -3137,11 +3113,9 @@ impl T3Bridge {
                     self.call_wave_observe(
                         wave,
                         role,
-                        Observation::Activity {
-                            activity: Activity::Blocked {
-                                interaction: pending,
-                            },
-                        },
+                        Observation::activity(Activity::Blocked {
+                            interaction: pending,
+                        }),
                     )
                     .await;
                 }
@@ -3166,7 +3140,7 @@ impl T3Bridge {
                     .await
                     && self.current_shell_epoch(&wave, &role, &thread).await == Some(shell_epoch)
                 {
-                    self.call_wave_observe(wave, role, Observation::Activity { activity })
+                    self.call_wave_observe(wave, role, Observation::activity(activity))
                         .await;
                 }
             }
@@ -3296,9 +3270,7 @@ impl T3Bridge {
                         )
                         .await;
                     }
-                    return Ok(Some(Observation::Activity {
-                        activity: Activity::Refused { reason },
-                    }));
+                    return Ok(Some(Observation::activity(Activity::Refused { reason })));
                 }
                 Ok(None)
             }
@@ -3731,11 +3703,9 @@ fn classify_t3_missing_or_archived(msg: &str) -> Option<Observation> {
         || body.contains("thread deleted")
         || body.contains("thread_not_found")
     {
-        Some(Observation::Activity {
-            activity: Activity::Errored {
-                error: format!("host thread missing after restart ({msg})"),
-            },
-        })
+        Some(Observation::activity(Activity::Errored {
+            error: format!("host thread missing after restart ({msg})"),
+        }))
     } else if body.contains("returned http 410")
         || body.contains("already archived")
         || body.contains("thread archived")
@@ -4021,7 +3991,8 @@ mod tests {
         assert!(matches!(
             classify_t3_missing_or_archived(not_found_err),
             Some(Observation::Activity {
-                activity: Activity::Errored { ref error }
+                activity: Activity::Errored { ref error },
+                ..
             }) if error.contains("missing after restart")
         ));
 
