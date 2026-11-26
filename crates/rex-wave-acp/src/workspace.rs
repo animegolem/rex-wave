@@ -4,7 +4,10 @@ use rex_wave_api::wave::{BaseBranch, Workspace};
 use rex_wave_api::{ProjectId, RoleName, WaveSlug};
 use rex_wave_waves::{HostError, expand_tilde, resolve_project_workspace_location};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::process::Command;
+
+static WORKTREE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Resolves the working directory for a wave worker (`ProjectDefault`,
 /// `ExistingPath`, or `ManagedWorktree`). When `workspace` is `ManagedWorktree`
@@ -51,6 +54,10 @@ pub async fn resolve_acp_workspace(
             if !is_git_work_tree(&project_root).await {
                 return Ok((project_root, title));
             }
+            let _wt_guard = WORKTREE_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
             let worktrees_dir = project_root.join(".worktrees");
             std::fs::create_dir_all(&worktrees_dir).map_err(|e| {
                 HostError::Rejected(format!(

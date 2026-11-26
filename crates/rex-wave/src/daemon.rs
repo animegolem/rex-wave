@@ -649,7 +649,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         AcpConfig::from_env()
             .with_state_dir(state_dir.clone())
             .with_socket_path(sock_path.clone())
-            .with_default_runner(default_target),
+            .with_default_runner(default_target)
+            .with_config_watch(config_svc.subscribe()),
     );
     config_hook.bind_runner_liveness(
         bb_bridge.as_ref().map(|b| {

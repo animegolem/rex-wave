@@ -150,6 +150,7 @@ async fn write_json_line(stdin: &mut ChildStdin, payload: &Value) -> io::Result<
 }
 
 async fn wait_for_rpc_response(
+    stdin: &mut ChildStdin,
     reader_rx: &mut mpsc::Receiver<ReaderMsg>,
     expected_id: u64,
     timeout: Duration,
@@ -158,17 +159,21 @@ async fn wait_for_rpc_response(
     let fut = async {
         while let Some(msg) = reader_rx.recv().await {
             match msg {
-                ReaderMsg::Line(line) => {
-                    if let Some(InboundMessage::Response { id, result, error }) =
-                        parse_inbound_line(&line)
-                        && rpc_id_matches(&id, expected_id)
+                ReaderMsg::Line(line) => match parse_inbound_line(&line) {
+                    Some(InboundMessage::Response { id, result, error })
+                        if rpc_id_matches(&id, expected_id) =>
                     {
                         if let Some(err) = error {
                             return Ok(Err(err));
                         }
                         return Ok(Ok(result.unwrap_or(Value::Null)));
                     }
-                }
+                    Some(InboundMessage::Request { id, method, .. }) => {
+                        let reply = method_not_found_response(id, &method);
+                        let _ = write_json_line(stdin, &reply).await;
+                    }
+                    _ => {}
+                },
                 ReaderMsg::Eof => {
                     let tail = stderr_tail.lock().map(|g| g.text()).unwrap_or_default();
                     let suffix = if tail.trim().is_empty() {
@@ -595,7 +600,14 @@ impl SessionActor {
             )));
         }
         if self.active_prompt_id.is_none() {
-            return self.dispatch_prompt(body, true).await;
+            if let Err(err) = self.dispatch_prompt(body, true).await {
+                self.observe_activity(Activity::Errored {
+                    error: err.to_string(),
+                })
+                .await;
+                return Err(err);
+            }
+            return Ok(());
         }
         match mode {
             SteerDeliveryMode::Start => Err(HostError::Rejected(format!(
@@ -658,15 +670,28 @@ impl SessionActor {
             }
             InboundMessage::Request { id, method, params } => {
                 if method == "session/request_permission" {
-                    self.next_perm_seq = self.next_perm_seq.saturating_add(1);
-                    let parsed = parse_permission_request(id, &params, self.next_perm_seq);
-                    let interaction = parsed.interaction.clone();
-                    self.parked_permission = Some(parsed);
-                    self.entry.feed.push_event(AgentEventKind::Other {
-                        bb_type: format!("permission_request: {}", interaction.summary),
-                    });
-                    self.observe_activity(Activity::Blocked { interaction })
-                        .await;
+                    if self.cancel_requested_for_active || self.active_prompt_id.is_none() {
+                        if let Some(ref mut stdin) = self.stdin {
+                            let cancel_resp = permission_cancelled_response(id);
+                            let _ = write_json_line(stdin, &cancel_resp).await;
+                        }
+                    } else {
+                        if let Some(prev) = self.parked_permission.take()
+                            && let Some(ref mut stdin) = self.stdin
+                        {
+                            let cancel_resp = permission_cancelled_response(prev.rpc_id);
+                            let _ = write_json_line(stdin, &cancel_resp).await;
+                        }
+                        self.next_perm_seq = self.next_perm_seq.saturating_add(1);
+                        let parsed = parse_permission_request(id, &params, self.next_perm_seq);
+                        let interaction = parsed.interaction.clone();
+                        self.parked_permission = Some(parsed);
+                        self.entry.feed.push_event(AgentEventKind::Other {
+                            bb_type: format!("permission_request: {}", interaction.summary),
+                        });
+                        self.observe_activity(Activity::Blocked { interaction })
+                            .await;
+                    }
                 } else if let Some(ref mut stdin) = self.stdin {
                     let reply = method_not_found_response(id, &method);
                     let _ = write_json_line(stdin, &reply).await;
@@ -820,6 +845,7 @@ pub struct AcpBridge {
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     sessions: RwLock<HashMap<HostThreadId, Arc<SessionEntry>>>,
     sessions_by_role: RwLock<HashMap<(WaveSlug, RoleName), HostThreadId>>,
+    spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<ProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<ProjectId, String>>>,
 }
@@ -846,6 +872,7 @@ impl AcpBridge {
             backend: OnceLock::new(),
             sessions: RwLock::new(HashMap::new()),
             sessions_by_role: RwLock::new(HashMap::new()),
+            spawn_locks: Mutex::new(HashMap::new()),
             project_names_tx,
             project_names_rx,
         })
@@ -936,6 +963,14 @@ impl AcpBridge {
         req: SpawnRequest,
     ) -> Result<HostThreadId, HostError> {
         let thread = deterministic_thread_id(&req.wave, &req.role, req.attempt)?;
+        let thread_lock = {
+            let mut locks = self.spawn_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks
+                .entry(thread.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _spawn_guard = thread_lock.lock().await;
 
         if let Some(existing) = self.get_session(&thread)
             && existing.alive.load(Ordering::Acquire)
@@ -1033,6 +1068,7 @@ impl AcpBridge {
                 .await
                 .map_err(|e| HostError::Unreachable(format!("write ACP initialize: {e}")))?;
             match wait_for_rpc_response(
+                &mut stdin,
                 &mut reader_rx,
                 init_id,
                 self.cfg.handshake_timeout,
@@ -1065,6 +1101,7 @@ impl AcpBridge {
                 .await
                 .map_err(|e| HostError::Unreachable(format!("write ACP session/new: {e}")))?;
             let new_reply = match wait_for_rpc_response(
+                &mut stdin,
                 &mut reader_rx,
                 new_id,
                 self.cfg.handshake_timeout,
@@ -1096,6 +1133,7 @@ impl AcpBridge {
                 .await
                 .map_err(|e| HostError::Unreachable(format!("write ACP session/set_model: {e}")))?;
                 match wait_for_rpc_response(
+                    &mut stdin,
                     &mut reader_rx,
                     set_id,
                     self.cfg.handshake_timeout,
@@ -1161,7 +1199,13 @@ impl AcpBridge {
                 .sessions_by_role
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            by_role.insert((req.wave.clone(), req.role.clone()), thread.clone());
+            let should_replace = by_role
+                .get(&(req.wave.clone(), req.role.clone()))
+                .and_then(parse_acp_thread_id)
+                .is_none_or(|(_, _, prev_attempt)| prev_attempt <= req.attempt);
+            if should_replace {
+                by_role.insert((req.wave.clone(), req.role.clone()), thread.clone());
+            }
         }
 
         if let Some(model) = actual_model {

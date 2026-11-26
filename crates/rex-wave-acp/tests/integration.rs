@@ -374,6 +374,7 @@ fn build_test_stack(
         inbox: Registry::<rex_wave_notify::Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(rex_wave_runtime::Unavailable(Family::Mail)),
         presence: Arc::new(rex_wave_runtime::Unavailable(Family::Presence)),
+        config: Arc::new(rex_wave_runtime::Unavailable(Family::Config)),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -501,6 +502,7 @@ async fn acp_full_lifecycle_streaming_permission_refusal_and_pgroup_reap() {
             }],
         },
         idem: None,
+        config_defaults: Default::default(),
     })
     .await
     .unwrap();
@@ -839,6 +841,7 @@ async fn acp_steer_cancels_active_turn_and_dispatches_followup_prompt() {
             }],
         },
         idem: None,
+        config_defaults: Default::default(),
     })
     .await
     .unwrap();
@@ -1009,6 +1012,7 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
             ],
         },
         idem: None,
+        config_defaults: Default::default(),
     })
     .await
     .unwrap();

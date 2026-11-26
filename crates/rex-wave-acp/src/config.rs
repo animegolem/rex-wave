@@ -1,11 +1,13 @@
 //! Configuration and provider binary/argument resolution for native ACP stdio runners.
 
+use rex_wave_api::config::RexConfig;
 use rex_wave_api::wave::PermissionMode;
 use rex_wave_api::{ACP_THREAD_PREFIX, Principal, RunnerKind, SystemPart};
-use rex_wave_waves::{HostError, default_bb_data_dir};
+use rex_wave_waves::{HostError, default_bb_data_dir, expand_tilde};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::watch;
 
 pub const ENV_ACP_AGY_BIN: &str = "REX_WAVE_ACP_AGY_BIN";
 pub const ENV_ACP_OPENCODE_BIN: &str = "REX_WAVE_ACP_OPENCODE_BIN";
@@ -86,6 +88,7 @@ pub struct AcpConfig {
     pub default_runner: RunnerKind,
     pub handshake_timeout: Duration,
     pub retire_grace: Duration,
+    pub config_rx: Option<watch::Receiver<RexConfig>>,
 }
 
 impl Default for AcpConfig {
@@ -140,6 +143,7 @@ impl AcpConfig {
             default_runner: RunnerKind::Acp,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             retire_grace: DEFAULT_RETIRE_GRACE,
+            config_rx: None,
         }
     }
 
@@ -188,6 +192,11 @@ impl AcpConfig {
         self
     }
 
+    pub fn with_config_watch(mut self, rx: watch::Receiver<RexConfig>) -> Self {
+        self.config_rx = Some(rx);
+        self
+    }
+
     pub fn resolve_provider(
         &self,
         raw_provider: &str,
@@ -197,6 +206,21 @@ impl AcpConfig {
         let spec = self.providers.get(&key).ok_or_else(|| {
             HostError::Rejected(format!("unsupported ACP provider '{raw_provider}'"))
         })?;
+        let cfg_bin = self.config_rx.as_ref().and_then(|rx| {
+            let cfg = rx.borrow();
+            let raw_opt = match key.as_str() {
+                "antigravity" => cfg.harnesses.agy.binary.as_deref(),
+                "opencode" => cfg.harnesses.opencode.binary.as_deref(),
+                _ => None,
+            };
+            raw_opt
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(expand_tilde)
+        });
+        if let Some(override_bin) = cfg_bin {
+            return Ok((override_bin, spec.args.clone(), spec.env.clone()));
+        }
         Ok((
             spec.program.clone(),
             spec.effective_args(permission),
@@ -261,5 +285,20 @@ mod tests {
                 .resolve_provider("unknown", PermissionMode::Auto)
                 .is_err()
         );
+
+        let mut rex_cfg = RexConfig::default();
+        rex_cfg.harnesses.agy.binary = Some("/custom/config-agy".into());
+        rex_cfg.harnesses.opencode.binary = Some("/custom/config-opencode".into());
+        let (_tx, rx) = watch::channel(rex_cfg);
+        let watched = AcpConfig::with_env_overrides(None, None).with_config_watch(rx);
+        let (wp1, wa1, _) = watched
+            .resolve_provider("agy", PermissionMode::Full)
+            .unwrap();
+        assert_eq!(wp1, PathBuf::from("/custom/config-agy"));
+        assert_eq!(wa1, vec!["acp"]);
+        let (wp2, _, _) = watched
+            .resolve_provider("opencode", PermissionMode::AcceptEdits)
+            .unwrap();
+        assert_eq!(wp2, PathBuf::from("/custom/config-opencode"));
     }
 }

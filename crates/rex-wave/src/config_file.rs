@@ -874,9 +874,9 @@ impl ConfigHook for TomlConfigHook {
                 },
                 RunnerHealthStatus {
                     runner: RunnerRoute::Native,
-                    configured: false,
-                    healthy: false,
-                    detail: Some("PRs #30/#31".into()),
+                    configured: true,
+                    healthy: true,
+                    detail: Some("ACP (AGY, OpenCode)".into()),
                 },
             ];
 
