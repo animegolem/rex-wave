@@ -1239,7 +1239,7 @@ impl MailBridge {
                     let caller_ctx = auth_by
                         .as_ref()
                         .map(|p| DecideCtx::for_internal_replay(p.clone(), msg.created_at));
-                    if let Some(seq) = project_message_to_room_service(
+                    match crate::dissolved::project_message_to_room_service_checked(
                         rsvc.as_ref(),
                         msg,
                         parent_seq,
@@ -1247,19 +1247,23 @@ impl MailBridge {
                     )
                     .await
                     {
-                        self.state
-                            .lock()
-                            .await
-                            .mail
-                            .room_post_seqs
-                            .insert((room.clone(), msg.sha256.clone()), seq);
-                    } else {
-                        self.state
-                            .lock()
-                            .await
-                            .mail
-                            .failed_room_projections
-                            .insert((room.clone(), msg.sha256.clone()));
+                        crate::dissolved::RoomProjectionOutcome::Posted(seq) => {
+                            self.state
+                                .lock()
+                                .await
+                                .mail
+                                .room_post_seqs
+                                .insert((room.clone(), msg.sha256.clone()), seq);
+                        }
+                        crate::dissolved::RoomProjectionOutcome::PermanentCollision => {
+                            self.state
+                                .lock()
+                                .await
+                                .mail
+                                .failed_room_projections
+                                .insert((room.clone(), msg.sha256.clone()));
+                        }
+                        crate::dissolved::RoomProjectionOutcome::TransientFailure => {}
                     }
                 }
             }

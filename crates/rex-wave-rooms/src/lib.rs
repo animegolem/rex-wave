@@ -730,6 +730,20 @@ impl Decider for Rooms {
                         }));
                     }
                 }
+                if matches!(c.origin, Some(RoomOrigin::Mail { .. })) {
+                    if !ctx.by().is_operator_or_system() {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: "create mail channel".into(),
+                        });
+                    }
+                    if matches!(id, RoomId::Direct { .. }) {
+                        return Err(ApiError::Invalid(InvalidId {
+                            what: "room origin".into(),
+                            reason: "direct message rooms cannot have mail channel origin".into(),
+                        }));
+                    }
+                }
                 if let RoomId::Direct { pair } = &id {
                     ensure_dm_access(pair, ctx.by())?;
                 }
@@ -816,7 +830,9 @@ impl Decider for Rooms {
                         }
                     }
                 } else {
-                    let can_invite = if id.is_mail_channel() {
+                    let can_invite = if id.is_mail_channel()
+                        || matches!(origin, RoomOrigin::Mail { .. })
+                    {
                         ctx.by().is_operator_or_system()
                     } else {
                         ctx.by().is_operator_or_system() || state.opener.as_ref() == Some(ctx.by())
@@ -827,6 +843,13 @@ impl Decider for Rooms {
                             action: "join another principal to room".into(),
                         });
                     }
+                }
+                if let RoomOrigin::Mail { audience } = origin
+                    && !audience.contains(&target)
+                {
+                    return Err(ApiError::conflict(
+                        "private mail channel membership is fixed to its audience",
+                    ));
                 }
 
                 let mut events = Vec::new();
@@ -871,15 +894,23 @@ impl Decider for Rooms {
             RoomCommand::RoomLeave(c) => {
                 let id = c.room.resolve(ctx.by())?;
                 if matches!(id, RoomId::Direct { .. }) {
+                    ensure_dm_access(
+                        match &id {
+                            RoomId::Direct { pair } => pair,
+                            _ => unreachable!(),
+                        },
+                        ctx.by(),
+                    )?;
                     return Err(ApiError::conflict("cannot leave a direct message room"));
+                }
+                if id.is_mail_channel()
+                    || matches!(state.opened, Some((_, RoomOrigin::Mail { .. })))
+                {
+                    ensure_private_room_read_access(state, &id, ctx.by(), "leave room")?;
+                    return Err(ApiError::conflict("cannot leave a private mail channel"));
                 }
                 if state.opened.is_some() {
                     ensure_existing_room_write_access(state, &id, ctx.by(), "leave room")?;
-                } else if id.is_mail_channel() && !ctx.by().is_operator_or_system() {
-                    return Err(ApiError::Denied {
-                        principal: ctx.by().to_string(),
-                        action: "leave private mail channel without membership".into(),
-                    });
                 }
                 if !state.has_member(ctx.by()) {
                     return Err(ApiError::conflict(format!(
@@ -929,8 +960,13 @@ impl Decider for Rooms {
                                 });
                             }
                         }
-                        Some(RoomOrigin::Manual) => {
-                            if id.is_mail_channel()
+                        Some(RoomOrigin::Manual) | Some(RoomOrigin::Mail { .. }) => {
+                            let is_private_mail = id.is_mail_channel()
+                                || matches!(
+                                    state.opened.as_ref().map(|(_, o)| o),
+                                    Some(RoomOrigin::Mail { .. })
+                                );
+                            if is_private_mail
                                 && !state.has_member(ctx.by())
                                 && !ctx.by().is_operator_or_system()
                             {

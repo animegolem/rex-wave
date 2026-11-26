@@ -31,7 +31,7 @@ use crate::{
 use base64::Engine as _;
 use rex_wave_api::mail::*;
 use rex_wave_api::room::{
-    Body, PostOrigin, PrincipalPair, RoomEvent, RoomId, RoomPost, RoomRef, RoomScope,
+    Body, PostOrigin, PrincipalPair, RoomEvent, RoomId, RoomOrigin, RoomPost, RoomRef, RoomScope,
 };
 use rex_wave_api::*;
 use rex_wave_fs::{
@@ -42,7 +42,8 @@ use rex_wave_runtime::{DecideCtx, Hub, Service};
 use rex_wave_store::{Appended, Journal, StreamWriter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
@@ -834,6 +835,15 @@ pub fn mail_room_labels(msg: &MailMessage) -> Vec<Label> {
     labels
 }
 
+/// Original caller `--id` binding preserved independently of later `RecipientsAdded` events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendBinding {
+    pub idem: IdemKey,
+    pub by: Principal,
+    pub orig_to: Vec<SeatName>,
+    pub orig_cc: Vec<SeatName>,
+}
+
 /// One committed dissolved mail entry stored in [`MailState`].
 #[derive(Clone, Debug)]
 pub struct CommittedMailEntry {
@@ -842,20 +852,73 @@ pub struct CommittedMailEntry {
     pub message: MailMessage,
     pub mutated_after_ack: bool,
     pub prior_ack_sha: Option<String>,
-    pub send_bindings: Vec<(IdemKey, Principal)>,
+    pub send_bindings: Vec<SendBinding>,
+    pub historical_audiences: Vec<(Vec<SeatName>, Vec<SeatName>)>,
 }
 
 impl CommittedMailEntry {
-    /// Emits all provenance records needed to reconstruct this message's audience,
-    /// author, flags, and every committed caller `--id` binding on rebuild.
+    /// Emits all provenance records needed to reconstruct this message's audience
+    /// progression, author, flags, and every committed caller `--id` binding on rebuild.
     pub fn mirror_index_records(&self) -> Vec<MirrorIndexRecord> {
         let norm_path = normalize_letter_path(&self.message.path.to_string_lossy())
             .map(|n| n.canonical)
             .unwrap_or_else(|| self.message.path.to_string_lossy().into_owned());
-        if self.send_bindings.is_empty() {
-            let send_by =
-                (self.message.origin == MailOrigin::Send).then(|| self.committed_by.clone());
-            vec![MirrorIndexRecord {
+        let default_send_by = (self.message.origin == MailOrigin::Send
+            || !self.send_bindings.is_empty())
+        .then(|| self.committed_by.clone());
+
+        let mut records = Vec::new();
+        let mut covered_audiences: Vec<(Vec<SeatName>, Vec<SeatName>)> = Vec::new();
+
+        for b in &self.send_bindings {
+            records.push(MirrorIndexRecord {
+                schema: 1,
+                sha256: self.message.sha256.clone(),
+                path: norm_path.clone(),
+                to: b.orig_to.clone(),
+                cc: b.orig_cc.clone(),
+                created_at_ms: self.message.created_at.0,
+                mutated_after_ack: self.mutated_after_ack,
+                prior_ack_sha: self.prior_ack_sha.clone(),
+                origin: self.message.origin,
+                send_idem: Some(b.idem.clone()),
+                send_by: Some(b.by.clone()),
+            });
+            let pair = (b.orig_to.clone(), b.orig_cc.clone());
+            if !covered_audiences.contains(&pair) {
+                covered_audiences.push(pair);
+            }
+        }
+
+        let mut all_audiences = self.historical_audiences.clone();
+        let final_pair = (self.message.to.clone(), self.message.cc.clone());
+        if !all_audiences.contains(&final_pair) {
+            all_audiences.push(final_pair);
+        }
+
+        for (aud_to, aud_cc) in all_audiences {
+            let pair = (aud_to.clone(), aud_cc.clone());
+            if covered_audiences.contains(&pair) {
+                continue;
+            }
+            covered_audiences.push(pair);
+            records.push(MirrorIndexRecord {
+                schema: 1,
+                sha256: self.message.sha256.clone(),
+                path: norm_path.clone(),
+                to: aud_to,
+                cc: aud_cc,
+                created_at_ms: self.message.created_at.0,
+                mutated_after_ack: self.mutated_after_ack,
+                prior_ack_sha: self.prior_ack_sha.clone(),
+                origin: self.message.origin,
+                send_idem: None,
+                send_by: default_send_by.clone(),
+            });
+        }
+
+        if records.is_empty() {
+            records.push(MirrorIndexRecord {
                 schema: 1,
                 sha256: self.message.sha256.clone(),
                 path: norm_path,
@@ -866,26 +929,10 @@ impl CommittedMailEntry {
                 prior_ack_sha: self.prior_ack_sha.clone(),
                 origin: self.message.origin,
                 send_idem: None,
-                send_by,
-            }]
-        } else {
-            self.send_bindings
-                .iter()
-                .map(|(idem, by)| MirrorIndexRecord {
-                    schema: 1,
-                    sha256: self.message.sha256.clone(),
-                    path: norm_path.clone(),
-                    to: self.message.to.clone(),
-                    cc: self.message.cc.clone(),
-                    created_at_ms: self.message.created_at.0,
-                    mutated_after_ack: self.mutated_after_ack,
-                    prior_ack_sha: self.prior_ack_sha.clone(),
-                    origin: self.message.origin,
-                    send_idem: Some(idem.clone()),
-                    send_by: Some(by.clone()),
-                })
-                .collect()
+                send_by: default_send_by,
+            });
         }
+        records
     }
 }
 
@@ -1004,11 +1051,24 @@ impl MailState {
     }
 
     pub fn hydrate_room_posts(&mut self, journal: &Journal) -> Result<(), ApiError> {
-        let referenced_rooms: BTreeSet<RoomId> = self
-            .messages
-            .values()
-            .filter_map(|e| e.message.room.clone())
-            .collect();
+        let mut referenced_rooms: BTreeSet<RoomId> = BTreeSet::new();
+        for e in self.messages.values() {
+            if let Some(ref room) = e.message.room {
+                referenced_rooms.insert(room.clone());
+            }
+            for (aud_to, aud_cc) in &e.historical_audiences {
+                if let Some(room) = derive_mail_room(
+                    &e.message.from,
+                    aud_to,
+                    aud_cc,
+                    e.message.topic.as_deref(),
+                    &e.message.subject,
+                    &e.message.sha256,
+                ) {
+                    referenced_rooms.insert(room);
+                }
+            }
+        }
         for room in referenced_rooms {
             let stream = StreamId::Room { room: room.clone() };
             let mut after = Seq::ORIGIN;
@@ -1095,11 +1155,21 @@ impl MailState {
                         mutated_after_ack: *mutated_after_ack,
                         prior_ack_sha: prior_ack_sha.clone(),
                         send_bindings: Vec::new(),
+                        historical_audiences: vec![(message.to.clone(), message.cc.clone())],
                     });
+                let aud_pair = (message.to.clone(), message.cc.clone());
+                if !entry.historical_audiences.contains(&aud_pair) {
+                    entry.historical_audiences.push(aud_pair);
+                }
                 if let Some(idem) = send_idem
-                    && !entry.send_bindings.iter().any(|(k, _)| k == idem)
+                    && !entry.send_bindings.iter().any(|b| &b.idem == idem)
                 {
-                    entry.send_bindings.push((idem.clone(), env.by.clone()));
+                    entry.send_bindings.push(SendBinding {
+                        idem: idem.clone(),
+                        by: env.by.clone(),
+                        orig_to: message.to.clone(),
+                        orig_cc: message.cc.clone(),
+                    });
                 }
             }
             Event::Mail(MailEvent::RecipientsAdded { sha256, to }) => {
@@ -1112,6 +1182,10 @@ impl MailState {
                         }
                     }
                     if changed {
+                        let aud_pair = (entry.message.to.clone(), entry.message.cc.clone());
+                        if !entry.historical_audiences.contains(&aud_pair) {
+                            entry.historical_audiences.push(aud_pair);
+                        }
                         entry.message.room = derive_mail_room(
                             &entry.message.from,
                             &entry.message.to,
@@ -1936,12 +2010,23 @@ impl MirrorTarget {
     }
 
     /// Exports provenance rows to `<mirror>/state/mail-index.jsonl` idempotently
-    /// under serialized process + file locking anchored to `state/` descriptor.
+    /// under serialized process + file locking anchored to `state/` descriptor,
+    /// and repairs any torn/corrupt lines via atomic replacement when detected.
     pub fn append_index_batch_if_absent(
         &self,
         entries: &[MirrorIndexRecord],
     ) -> Result<usize, ApiError> {
-        if entries.is_empty() {
+        self.sync_index_batch(entries, false)
+    }
+
+    /// Synchronizes `entries` into `<mirror>/state/mail-index.jsonl` and atomically
+    /// rewrites the ledger when any malformed/torn JSONL line is detected.
+    pub fn sync_index_batch(
+        &self,
+        entries: &[MirrorIndexRecord],
+        repair_malformed: bool,
+    ) -> Result<usize, ApiError> {
+        if entries.is_empty() && !repair_malformed {
             return Ok(0);
         }
         let idx_cand = self.dir.path().join("state").join("mail-index.jsonl");
@@ -1980,14 +2065,52 @@ impl MirrorTarget {
             .map_err(|e| ApiError::Internal(format!("read mail-index.jsonl: {e}")))?;
 
         let mut existing_keys: HashSet<IndexRowKey> = HashSet::new();
+        let mut valid_existing: Vec<MirrorIndexRecord> = Vec::new();
+        let mut any_malformed = std::str::from_utf8(&existing_bytes).is_err();
         for line in String::from_utf8_lossy(&existing_bytes).lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(rec) = serde_json::from_str::<MirrorIndexRecord>(trimmed) {
-                existing_keys.insert(index_row_key(&rec));
+            match serde_json::from_str::<MirrorIndexRecord>(trimmed) {
+                Ok(rec) => {
+                    if existing_keys.insert(index_row_key(&rec)) {
+                        valid_existing.push(rec);
+                    }
+                }
+                Err(_) => {
+                    any_malformed = true;
+                }
             }
+        }
+
+        if any_malformed {
+            drop(f);
+            let mut clean_buf = Vec::new();
+            for rec in &valid_existing {
+                serde_json::to_writer(&mut clean_buf, rec)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                clean_buf.push(b'\n');
+            }
+            let mut appended = 0usize;
+            for entry in entries {
+                if !existing_keys.insert(index_row_key(entry)) {
+                    continue;
+                }
+                serde_json::to_writer(&mut clean_buf, entry)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                clean_buf.push(b'\n');
+                appended += 1;
+            }
+            rex_wave_fs::write_atomic_at(
+                &state_fd,
+                "mail-index.jsonl",
+                &clean_buf,
+                SANDBOX_FILE_MODE,
+                true,
+            )
+            .map_err(|e| ApiError::Internal(format!("repair mail-index.jsonl: {e}")))?;
+            return Ok(appended);
         }
 
         let mut out_buf = Vec::new();
@@ -2047,12 +2170,18 @@ impl MirrorTarget {
 
     /// Reads `<mirror>/state/mail-index.jsonl` safely via descriptor-anchored `openat`.
     pub fn read_mail_index(&self) -> Result<Vec<MirrorIndexRecord>, ApiError> {
+        Ok(self.read_mail_index_checked()?.0)
+    }
+
+    /// Reads `<mirror>/state/mail-index.jsonl` and reports whether any malformed
+    /// or non-UTF-8 line was encountered so `reconcile` can repair torn tails.
+    pub fn read_mail_index_checked(&self) -> Result<(Vec<MirrorIndexRecord>, bool), ApiError> {
         let Some(state_fd) = self.open_existing_subdir_fd(&["state"])? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let (file, meta) = match rex_wave_fs::open_regular_at(&state_fd, "mail-index.jsonl") {
             Ok(pair) => pair,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                 return Err(ApiError::Denied {
                     principal: "mailbridge".into(),
@@ -2068,7 +2197,9 @@ impl MirrorTarget {
             MAX_INDEX_FILE_BYTES,
         )
         .map_err(|e| ApiError::Internal(format!("read mail-index.jsonl: {e}")))?;
-        Ok(parse_mail_index_jsonl(&String::from_utf8_lossy(&bytes)))
+        let non_utf8 = std::str::from_utf8(&bytes).is_err();
+        let (records, bad_line) = parse_mail_index_jsonl_checked(&String::from_utf8_lossy(&bytes));
+        Ok((records, non_utf8 || bad_line))
     }
 }
 
@@ -2084,7 +2215,12 @@ fn index_row_key(rec: &MirrorIndexRecord) -> IndexRowKey {
 }
 
 pub fn parse_mail_index_jsonl(contents: &str) -> Vec<MirrorIndexRecord> {
+    parse_mail_index_jsonl_checked(contents).0
+}
+
+pub fn parse_mail_index_jsonl_checked(contents: &str) -> (Vec<MirrorIndexRecord>, bool) {
     let mut out = Vec::new();
+    let mut had_malformed = false;
     for (idx, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -2093,6 +2229,7 @@ pub fn parse_mail_index_jsonl(contents: &str) -> Vec<MirrorIndexRecord> {
         match serde_json::from_str::<MirrorIndexRecord>(trimmed) {
             Ok(rec) => out.push(rec),
             Err(e) => {
+                had_malformed = true;
                 eprintln!(
                     "rex-wave mail: skipping malformed row at state/mail-index.jsonl:{}: {e}",
                     idx + 1
@@ -2100,7 +2237,7 @@ pub fn parse_mail_index_jsonl(contents: &str) -> Vec<MirrorIndexRecord> {
             }
         }
     }
-    out
+    (out, had_malformed)
 }
 
 pub fn parse_mail_index_jsonl_strict(
@@ -2669,16 +2806,18 @@ pub fn scan_object_blobs(
 ) -> Result<Vec<(Sha256Hex, Vec<u8>, Option<UnixMs>)>, ApiError> {
     let mut dummy_cache = DiskScanCache::default();
     let empty_known = HashSet::new();
-    let (blobs, _) = scan_object_blobs_cached(mirror_root, &empty_known, true, &mut dummy_cache)?;
+    let (blobs, _) =
+        scan_object_blobs_cached(mirror_root, None, &empty_known, true, &mut dummy_cache)?;
     Ok(blobs)
 }
 
 /// Cached scan of `<mirror>/objects/<sha256>.md` outside the writer lock.
 /// When `strict` is `true` (`rebuild`), any hash mismatch fails closed with `Conflict`.
-/// When `strict` is `false` (live `reconcile`), a corrupt blob is quarantined aside
-/// with a loud warning so a git `autocrlf` or merge artifact never bricks daemon startup.
+/// When `strict` is `false` (live `reconcile`), a corrupt blob is checked against
+/// `guard` and quarantined aside with a unique `.corrupt-<pid>-<ts>-<nonce>-` name.
 pub fn scan_object_blobs_cached(
     mirror_root: &Path,
+    guard: Option<&ProtectedRootsGuard>,
     known_shas: &HashSet<Sha256Hex>,
     strict: bool,
     cache: &mut DiskScanCache,
@@ -2692,6 +2831,12 @@ pub fn scan_object_blobs_cached(
     let objects_dir = mirror_root.join("objects");
     if rex_wave_fs::entry_kind(&objects_dir).ok() != Some(EntryKind::Dir) {
         return Ok((Vec::new(), HashSet::new()));
+    }
+    if let Some(g) = guard {
+        g.verify_dir(&objects_dir).map_err(|e| ApiError::Denied {
+            principal: "mailbridge".into(),
+            action: format!("objects dir refused by protected-roots: {e}"),
+        })?;
     }
     let entries = fs::read_dir(&objects_dir)
         .map_err(|e| ApiError::Internal(format!("scan {}: {e}", objects_dir.display())))?;
@@ -2748,17 +2893,58 @@ pub fn scan_object_blobs_cached(
                     actual_sha
                 )));
             }
+            let pid = std::process::id();
+            let ts_ms = rex_wave_runtime::now().0;
             let nonce = DROP_CLAIM_NONCE.fetch_add(1, Ordering::Relaxed);
-            let qprefix = format!(".corrupt-{nonce:08x}-");
-            if let Ok(obj_fd) = rex_wave_fs::open_dir_nofollow(&objects_dir) {
-                let _ = rex_wave_fs::claim_regular_at(&obj_fd, &leaf_name, id, &qprefix);
+            let qprefix = format!(".corrupt-{pid}-{ts_ms}-{nonce:08x}-");
+            let dest_path = objects_dir.join(format!("{qprefix}{leaf_name}"));
+            if let Some(g) = guard {
+                g.check(&path, &path).map_err(|e| ApiError::Denied {
+                    principal: "mailbridge".into(),
+                    action: format!(
+                        "quarantine corrupt blob refused on source {}: {e}",
+                        path.display()
+                    ),
+                })?;
+                g.check(&dest_path, &dest_path)
+                    .map_err(|e| ApiError::Denied {
+                        principal: "mailbridge".into(),
+                        action: format!(
+                            "quarantine corrupt blob refused on destination {}: {e}",
+                            dest_path.display()
+                        ),
+                    })?;
             }
-            eprintln!(
-                "rex-wave mail: quarantined corrupt object blob {} (expected sha256 {}, got {})",
-                path.display(),
-                expected_sha,
-                actual_sha
-            );
+            let obj_fd = rex_wave_fs::open_dir_nofollow(&objects_dir).map_err(|e| {
+                ApiError::Internal(format!("open objects dir {}: {e}", objects_dir.display()))
+            })?;
+            match rex_wave_fs::claim_regular_at(&obj_fd, &leaf_name, id, &qprefix) {
+                Ok((quarantined_name, _, _)) => {
+                    let _ = obj_fd.sync_all();
+                    eprintln!(
+                        "rex-wave mail: quarantined corrupt object blob {} -> {} (expected sha256 {}, got {})",
+                        path.display(),
+                        quarantined_name,
+                        expected_sha,
+                        actual_sha
+                    );
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.to_string().contains("changed before claim") =>
+                {
+                    eprintln!(
+                        "rex-wave mail: corrupt object blob {} changed or vanished before quarantine",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(ApiError::Internal(format!(
+                        "quarantine corrupt object blob {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
             continue;
         }
         let mtime_ms = meta_mtime_ms(&meta);
@@ -2772,31 +2958,174 @@ pub fn scan_object_blobs_cached(
     Ok((unindexed, present_shas))
 }
 
+/// Outcome of projecting a dissolved mail message into its target room, separating
+/// permanent audience collisions from retryable transient or interrupted operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomProjectionOutcome {
+    Posted(Seq),
+    PermanentCollision,
+    TransientFailure,
+}
+
+impl RoomProjectionOutcome {
+    pub fn posted_seq(self) -> Option<Seq> {
+        match self {
+            Self::Posted(s) => Some(s),
+            Self::PermanentCollision | Self::TransientFailure => None,
+        }
+    }
+}
+
+fn find_parent_index_in_slice<T, F>(items: &[T], get_msg: F, in_reply_to: &str) -> Option<usize>
+where
+    F: Fn(&T) -> &MailMessage,
+{
+    let trimmed = in_reply_to.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(sha) = Sha256Hex::parse(trimmed.to_ascii_lowercase()) {
+        for (idx, item) in items.iter().enumerate() {
+            if get_msg(item).sha256 == sha {
+                return Some(idx);
+            }
+        }
+    }
+    for (idx, item) in items.iter().enumerate() {
+        if !get_msg(item).id.is_empty() && get_msg(item).id == trimmed {
+            return Some(idx);
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.len() >= 8 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut matched = None;
+        for (idx, item) in items.iter().enumerate() {
+            if get_msg(item).sha256.as_str().starts_with(&lower) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(idx);
+            }
+        }
+        return matched;
+    }
+    None
+}
+
+fn order_items_parent_first<T, F, K, FK>(items: Vec<T>, get_msg: F, get_key: FK) -> Vec<T>
+where
+    F: Fn(&T) -> &MailMessage,
+    K: Ord + Clone,
+    FK: Fn(&T) -> K,
+{
+    let n = items.len();
+    if n <= 1 {
+        return items;
+    }
+    let mut indegree = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, item) in items.iter().enumerate() {
+        if let Some(ref parent_ref) = get_msg(item).in_reply_to
+            && let Some(p) = find_parent_index_in_slice(&items, &get_msg, parent_ref)
+            && p != i
+        {
+            children[p].push(i);
+            indegree[i] += 1;
+        }
+    }
+    let keys: Vec<K> = items.iter().map(&get_key).collect();
+    let mut heap: BinaryHeap<Reverse<(K, usize)>> = BinaryHeap::new();
+    for (i, &deg) in indegree.iter().enumerate() {
+        if deg == 0 {
+            heap.push(Reverse((keys[i].clone(), i)));
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut visited = vec![false; n];
+    while let Some(Reverse((_, u))) = heap.pop() {
+        if visited[u] {
+            continue;
+        }
+        visited[u] = true;
+        order.push(u);
+        for &v in &children[u] {
+            indegree[v] = indegree[v].saturating_sub(1);
+            if indegree[v] == 0 {
+                heap.push(Reverse((keys[v].clone(), v)));
+            }
+        }
+    }
+    if order.len() < n {
+        let mut rem: Vec<usize> = (0..n).filter(|&i| !visited[i]).collect();
+        rem.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+        order.extend(rem);
+    }
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|idx| slots[idx].take())
+        .collect()
+}
+
 /// Projects a dissolved [`MailMessage`] into its target room via a live `RoomCommand` service,
-/// verifying complete audience identity on private `#mail-*` channels before joining or posting.
+/// persisting `RoomOrigin::Mail { audience }` on open and resuming partial member joins cleanly.
 pub async fn project_message_to_room_service(
     room_svc: &dyn Service<RoomCommand>,
     msg: &MailMessage,
     parent_seq: Option<Seq>,
     caller_ctx: Option<&DecideCtx>,
 ) -> Option<Seq> {
-    let room = msg.room.clone()?;
+    project_message_to_room_service_checked(room_svc, msg, parent_seq, caller_ctx)
+        .await
+        .posted_seq()
+}
+
+pub async fn project_message_to_room_service_checked(
+    room_svc: &dyn Service<RoomCommand>,
+    msg: &MailMessage,
+    parent_seq: Option<Seq>,
+    caller_ctx: Option<&DecideCtx>,
+) -> RoomProjectionOutcome {
+    let Some(room) = msg.room.clone() else {
+        return RoomProjectionOutcome::PermanentCollision;
+    };
     let sys_ctx = DecideCtx::for_system_part(SystemPart::MailBridge);
     if matches!(room, RoomId::Channel { .. }) {
         let expected_participants = mail_room_participants(msg);
-        let Ok(WireReply::RoomEnsure(view)) = room_svc
+        let audience_vec: Vec<Principal> = expected_participants.iter().cloned().collect();
+        let ensure_res = room_svc
             .dispatch(
                 RoomCommand::RoomEnsure(rex_wave_api::room::RoomEnsure {
                     room: RoomRef::Id { id: room.clone() },
-                    origin: None,
+                    origin: Some(RoomOrigin::Mail {
+                        audience: audience_vec,
+                    }),
                     topic: msg.topic.clone(),
                 }),
                 sys_ctx.clone(),
             )
-            .await
-        else {
-            return None;
+            .await;
+        let view = match ensure_res {
+            Ok(WireReply::RoomEnsure(v)) => v,
+            Err(ApiError::Conflict { .. }) => {
+                match room_svc
+                    .dispatch(
+                        RoomCommand::RoomEnsure(rex_wave_api::room::RoomEnsure {
+                            room: RoomRef::Id { id: room.clone() },
+                            origin: None,
+                            topic: None,
+                        }),
+                        sys_ctx.clone(),
+                    )
+                    .await
+                {
+                    Ok(WireReply::RoomEnsure(v)) => v,
+                    _ => return RoomProjectionOutcome::TransientFailure,
+                }
+            }
+            _ => return RoomProjectionOutcome::TransientFailure,
         };
+
         let existing_seats: BTreeSet<Principal> = view
             .members
             .iter()
@@ -2804,26 +3133,62 @@ pub async fn project_message_to_room_service(
             .filter(|p| matches!(p, Principal::Seat { .. }))
             .cloned()
             .collect();
-        if !existing_seats.is_empty() && existing_seats != expected_participants {
-            return None;
-        }
-        if existing_seats.is_empty() {
-            for member in expected_participants {
-                let _ = room_svc
-                    .dispatch(
-                        RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
-                            room: RoomRef::Id { id: room.clone() },
-                            member: Some(member),
-                            handle: None,
-                        }),
-                        sys_ctx.clone(),
-                    )
-                    .await;
+
+        match &view.origin {
+            RoomOrigin::Mail { audience } => {
+                let recorded_set: BTreeSet<Principal> = audience.iter().cloned().collect();
+                if recorded_set != expected_participants {
+                    return RoomProjectionOutcome::PermanentCollision;
+                }
+                for member in &expected_participants {
+                    if !existing_seats.contains(member) {
+                        let join_res = room_svc
+                            .dispatch(
+                                RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
+                                    room: RoomRef::Id { id: room.clone() },
+                                    member: Some(member.clone()),
+                                    handle: None,
+                                }),
+                                sys_ctx.clone(),
+                            )
+                            .await;
+                        if join_res.is_err() {
+                            return RoomProjectionOutcome::TransientFailure;
+                        }
+                    }
+                }
+            }
+            RoomOrigin::Manual => {
+                if !existing_seats.is_empty() && existing_seats != expected_participants {
+                    return RoomProjectionOutcome::PermanentCollision;
+                }
+                if existing_seats.is_empty() {
+                    for member in &expected_participants {
+                        let join_res = room_svc
+                            .dispatch(
+                                RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
+                                    room: RoomRef::Id { id: room.clone() },
+                                    member: Some(member.clone()),
+                                    handle: None,
+                                }),
+                                sys_ctx.clone(),
+                            )
+                            .await;
+                        if join_res.is_err() {
+                            return RoomProjectionOutcome::TransientFailure;
+                        }
+                    }
+                }
+            }
+            RoomOrigin::Wave { .. } => {
+                return RoomProjectionOutcome::PermanentCollision;
             }
         }
     }
 
-    let idem = IdemKey::parse(format!("mail:{}", msg.sha256)).ok()?;
+    let Ok(idem) = IdemKey::parse(format!("mail:{}", msg.sha256)) else {
+        return RoomProjectionOutcome::PermanentCollision;
+    };
     let post = RoomPost {
         room: RoomRef::Id { id: room.clone() },
         body: format_mail_room_body(msg),
@@ -2848,18 +3213,18 @@ pub async fn project_message_to_room_service(
         .dispatch(RoomCommand::RoomPost(post.clone()), primary_ctx)
         .await
     {
-        Ok(WireReply::RoomPost(posted)) => Some(posted.seq),
+        Ok(WireReply::RoomPost(posted)) => RoomProjectionOutcome::Posted(posted.seq),
         Err(ApiError::Denied { .. }) => {
             if let Ok(WireReply::RoomPost(posted)) = room_svc
                 .dispatch(RoomCommand::RoomPost(post), sys_ctx)
                 .await
             {
-                Some(posted.seq)
+                RoomProjectionOutcome::Posted(posted.seq)
             } else {
-                None
+                RoomProjectionOutcome::TransientFailure
             }
         }
-        _ => None,
+        _ => RoomProjectionOutcome::TransientFailure,
     }
 }
 
@@ -2881,10 +3246,13 @@ pub fn project_messages_to_journal_rooms_with_authors(
     use rex_wave_rooms::Rooms;
     use rex_wave_runtime::{Decider, EntryMeta};
 
-    let mut by_room: BTreeMap<RoomId, Vec<&MailMessage>> = BTreeMap::new();
-    for msg in messages {
+    let mut by_room: BTreeMap<RoomId, Vec<(usize, &MailMessage)>> = BTreeMap::new();
+    for (input_ord, msg) in messages.iter().enumerate() {
         if let Some(ref room) = msg.room {
-            by_room.entry(room.clone()).or_default().push(msg);
+            by_room
+                .entry(room.clone())
+                .or_default()
+                .push((input_ord, msg));
         }
     }
 
@@ -2894,8 +3262,13 @@ pub fn project_messages_to_journal_rooms_with_authors(
         part: SystemPart::MailBridge,
     };
 
-    for (room, mut room_msgs) in by_room {
-        room_msgs.sort_by(|a, b| (a.created_at, &a.sha256).cmp(&(b.created_at, &b.sha256)));
+    for (room, raw_room_msgs) in by_room {
+        let ordered = order_items_parent_first(
+            raw_room_msgs,
+            |(_, m)| *m,
+            |(ord, m)| (m.created_at, *ord, m.sha256.clone()),
+        );
+        let room_msgs: Vec<&MailMessage> = ordered.into_iter().map(|(_, m)| m).collect();
         let stream = StreamId::Room { room: room.clone() };
         let mut writer = journal
             .claim(stream.clone())
@@ -2968,10 +3341,13 @@ pub fn project_messages_to_journal_rooms_with_authors(
 
             if matches!(room, RoomId::Channel { .. }) {
                 let expected_participants = mail_room_participants(msg);
+                let audience_vec: Vec<Principal> = expected_participants.iter().cloned().collect();
                 let sys_ctx = DecideCtx::for_internal_replay(sys_by.clone(), msg.created_at);
                 let ensure_cmd = RoomCommand::RoomEnsure(rex_wave_api::room::RoomEnsure {
                     room: RoomRef::Id { id: room.clone() },
-                    origin: None,
+                    origin: (!room_state.is_opened()).then_some(RoomOrigin::Mail {
+                        audience: audience_vec,
+                    }),
                     topic: msg.topic.clone(),
                 });
                 let ensure_evs = <Rooms as Decider>::decide(&room_state, &ensure_cmd, &sys_ctx)?;
@@ -3002,18 +3378,18 @@ pub fn project_messages_to_journal_rooms_with_authors(
                     .filter(|p| matches!(p, Principal::Seat { .. }))
                     .cloned()
                     .collect();
-                if !existing_seats.is_empty() && existing_seats != expected_participants {
-                    continue;
-                }
-                if existing_seats.is_empty() {
-                    for member in expected_participants {
+                for member in &expected_participants {
+                    if !existing_seats.contains(member) {
                         let join_cmd = RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
                             room: RoomRef::Id { id: room.clone() },
-                            member: Some(member),
+                            member: Some(member.clone()),
                             handle: None,
                         });
-                        let join_evs =
-                            <Rooms as Decider>::decide(&room_state, &join_cmd, &sys_ctx)?;
+                        let Ok(join_evs) =
+                            <Rooms as Decider>::decide(&room_state, &join_cmd, &sys_ctx)
+                        else {
+                            break;
+                        };
                         if !join_evs.is_empty() {
                             let wrapped =
                                 join_evs.into_iter().map(<Rooms as Decider>::wrap).collect();
@@ -3035,6 +3411,14 @@ pub fn project_messages_to_journal_rooms_with_authors(
                             }
                         }
                     }
+                }
+                let final_seats: BTreeSet<Principal> = room_state
+                    .member_principals()
+                    .filter(|p| matches!(p, Principal::Seat { .. }))
+                    .cloned()
+                    .collect();
+                if final_seats != expected_participants {
+                    continue;
                 }
             }
 
@@ -3154,6 +3538,7 @@ fn merge_index_record(existing: &mut MirrorIndexRecord, newer: &MirrorIndexRecor
 pub struct DiskReconcileInputs {
     pub disk_acks: Vec<AckRecord>,
     pub disk_index: Vec<MirrorIndexRecord>,
+    pub index_had_malformed_lines: bool,
     pub disk_blobs: Vec<(Sha256Hex, Vec<u8>, Option<UnixMs>)>,
     pub present_blob_shas: HashSet<Sha256Hex>,
     pub disk_working: Vec<DiskMailFile>,
@@ -3174,9 +3559,14 @@ impl DiskReconcileInputs {
         cache: &mut DiskScanCache,
     ) -> Result<Self, ApiError> {
         let disk_acks = mirror.read_acks(aliases)?;
-        let disk_index = mirror.read_mail_index()?;
-        let (disk_blobs, present_blob_shas) =
-            scan_object_blobs_cached(mirror.path(), known_shas, false, cache)?;
+        let (disk_index, index_had_malformed_lines) = mirror.read_mail_index_checked()?;
+        let (disk_blobs, present_blob_shas) = scan_object_blobs_cached(
+            mirror.path(),
+            Some(mirror.guard()),
+            known_shas,
+            false,
+            cache,
+        )?;
         let (
             disk_working,
             present_working_paths,
@@ -3195,6 +3585,7 @@ impl DiskReconcileInputs {
         Ok(Self {
             disk_acks,
             disk_index,
+            index_had_malformed_lines,
             disk_blobs,
             present_blob_shas,
             disk_working,
@@ -3216,8 +3607,9 @@ pub struct PendingReconcileWork {
     pub blobs_to_export: Vec<(Sha256Hex, Vec<u8>)>,
     pub wt_to_export: Vec<(PathBuf, Vec<u8>)>,
     pub index_to_export: Vec<MirrorIndexRecord>,
+    pub repair_malformed_index: bool,
     pub acks_to_export: Vec<CommittedAckRecord>,
-    pub drop_files_to_finish: Vec<(DiskMailFile, MailMessage, Vec<MirrorIndexRecord>)>,
+    pub drop_files_to_finish: Vec<(DiskMailFile, MailMessage, Vec<MirrorIndexRecord>, bool)>,
 }
 
 /// Commits all disk ingests into `StreamId::Mail` and computes missing room
@@ -3246,12 +3638,25 @@ pub fn reconcile_commit_phase(
     };
 
     let mut index_by_sha: BTreeMap<Sha256Hex, MirrorIndexRecord> = BTreeMap::new();
+    let mut first_idem_by_sha: BTreeMap<Sha256Hex, MirrorIndexRecord> = BTreeMap::new();
+    let mut index_audiences_by_sha: BTreeMap<Sha256Hex, Vec<(Vec<SeatName>, Vec<SeatName>)>> =
+        BTreeMap::new();
     let mut disk_index_keys: HashSet<IndexRowKey> = HashSet::new();
     let mut disk_idem_bindings: Vec<MirrorIndexRecord> = Vec::new();
     for rec in inputs.disk_index {
         disk_index_keys.insert(index_row_key(&rec));
         if rec.send_idem.is_some() {
+            first_idem_by_sha
+                .entry(rec.sha256.clone())
+                .or_insert_with(|| rec.clone());
             disk_idem_bindings.push(rec.clone());
+        }
+        let aud_list = index_audiences_by_sha
+            .entry(rec.sha256.clone())
+            .or_default();
+        let aud_pair = (rec.to.clone(), rec.cc.clone());
+        if !aud_list.contains(&aud_pair) {
+            aud_list.push(aud_pair);
         }
         index_by_sha
             .entry(rec.sha256.clone())
@@ -3404,16 +3809,48 @@ pub fn reconcile_commit_phase(
                 &msg.sha256,
             );
         }
-        let send_idem = idx_rec.and_then(|r| r.send_idem.clone());
-        let by = idx_rec.and_then(|r| r.send_by.as_ref()).unwrap_or(&sys_by);
+        let first_idem = first_idem_by_sha.get(&f.sha256);
+        let final_to = msg.to.clone();
+        if let Some(orig) = first_idem {
+            msg.to = orig.to.clone();
+            msg.cc = orig.cc.clone();
+            msg.room = derive_mail_room(
+                &msg.from,
+                &msg.to,
+                &msg.cc,
+                msg.topic.as_deref(),
+                &msg.subject,
+                &msg.sha256,
+            );
+        } else if let Some(auds) = index_audiences_by_sha.get(&f.sha256)
+            && let Some((first_to, first_cc)) = auds.first()
+        {
+            msg.to = first_to.clone();
+            msg.cc = first_cc.clone();
+            msg.room = derive_mail_room(
+                &msg.from,
+                &msg.to,
+                &msg.cc,
+                msg.topic.as_deref(),
+                &msg.subject,
+                &msg.sha256,
+            );
+        }
+        let send_idem = first_idem.and_then(|r| r.send_idem.clone());
+        let by = first_idem
+            .and_then(|r| r.send_by.as_ref())
+            .or_else(|| idx_rec.and_then(|r| r.send_by.as_ref()))
+            .unwrap_or(&sys_by);
         let idem = match &send_idem {
             Some(k) => k.clone(),
             None => IdemKey::parse(format!("mail_msg:{}", msg.sha256))?,
         };
+        let msg_sha = msg.sha256.clone();
+        let msg_at = msg.created_at;
         let appended = writer
             .append(
                 by,
-                msg.created_at,
+                msg_at,
                 Some(&idem),
                 vec![Event::Mail(MailEvent::MessageCommitted {
                     message: Box::new(msg),
@@ -3432,6 +3869,62 @@ pub fn reconcile_commit_phase(
                 state.apply(e);
             }
             publish_batch(&envs, &mut fresh_envelopes);
+        }
+        if let Some(auds) = index_audiences_by_sha.get(&msg_sha) {
+            for (aud_to, _) in auds {
+                if let Some(cur) = state.messages.get(&msg_sha) {
+                    let step_add: Vec<SeatName> = aud_to
+                        .iter()
+                        .filter(|s| !cur.message.to.contains(s) && !cur.message.cc.contains(s))
+                        .cloned()
+                        .collect();
+                    if !step_add.is_empty() {
+                        let app_add = writer
+                            .append(
+                                &sys_by,
+                                msg_at,
+                                None,
+                                vec![Event::Mail(MailEvent::RecipientsAdded {
+                                    sha256: msg_sha.clone(),
+                                    to: step_add,
+                                })],
+                            )
+                            .map_err(|e| ApiError::Internal(e.to_string()))?;
+                        if let Appended::Fresh(envs) = app_add {
+                            for e in &envs {
+                                state.apply(e);
+                            }
+                            publish_batch(&envs, &mut fresh_envelopes);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cur) = state.messages.get(&msg_sha) {
+            let rem_add: Vec<SeatName> = final_to
+                .iter()
+                .filter(|s| !cur.message.to.contains(s) && !cur.message.cc.contains(s))
+                .cloned()
+                .collect();
+            if !rem_add.is_empty() {
+                let app_add = writer
+                    .append(
+                        &sys_by,
+                        msg_at,
+                        None,
+                        vec![Event::Mail(MailEvent::RecipientsAdded {
+                            sha256: msg_sha,
+                            to: rem_add,
+                        })],
+                    )
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                if let Appended::Fresh(envs) = app_add {
+                    for e in &envs {
+                        state.apply(e);
+                    }
+                    publish_batch(&envs, &mut fresh_envelopes);
+                }
+            }
         }
     }
 
@@ -3511,16 +4004,48 @@ pub fn reconcile_commit_phase(
         if let Some(r) = idx_rec {
             apply_index_provenance(&mut msg, r);
         }
-        let send_idem = idx_rec.and_then(|r| r.send_idem.clone());
-        let by = idx_rec.and_then(|r| r.send_by.as_ref()).unwrap_or(&sys_by);
+        let first_idem = first_idem_by_sha.get(sha);
+        let final_to = msg.to.clone();
+        if let Some(orig) = first_idem {
+            msg.to = orig.to.clone();
+            msg.cc = orig.cc.clone();
+            msg.room = derive_mail_room(
+                &msg.from,
+                &msg.to,
+                &msg.cc,
+                msg.topic.as_deref(),
+                &msg.subject,
+                &msg.sha256,
+            );
+        } else if let Some(auds) = index_audiences_by_sha.get(sha)
+            && let Some((first_to, first_cc)) = auds.first()
+        {
+            msg.to = first_to.clone();
+            msg.cc = first_cc.clone();
+            msg.room = derive_mail_room(
+                &msg.from,
+                &msg.to,
+                &msg.cc,
+                msg.topic.as_deref(),
+                &msg.subject,
+                &msg.sha256,
+            );
+        }
+        let send_idem = first_idem.and_then(|r| r.send_idem.clone());
+        let by = first_idem
+            .and_then(|r| r.send_by.as_ref())
+            .or_else(|| idx_rec.and_then(|r| r.send_by.as_ref()))
+            .unwrap_or(&sys_by);
         let idem = match &send_idem {
             Some(k) => k.clone(),
             None => IdemKey::parse(format!("mail_msg:{}", msg.sha256))?,
         };
+        let msg_sha = msg.sha256.clone();
+        let msg_at = msg.created_at;
         let appended = writer
             .append(
                 by,
-                msg.created_at,
+                msg_at,
                 Some(&idem),
                 vec![Event::Mail(MailEvent::MessageCommitted {
                     message: Box::new(msg),
@@ -3540,22 +4065,90 @@ pub fn reconcile_commit_phase(
             }
             publish_batch(&envs, &mut fresh_envelopes);
         }
+        if let Some(auds) = index_audiences_by_sha.get(&msg_sha) {
+            for (aud_to, _) in auds {
+                if let Some(cur) = state.messages.get(&msg_sha) {
+                    let step_add: Vec<SeatName> = aud_to
+                        .iter()
+                        .filter(|s| !cur.message.to.contains(s) && !cur.message.cc.contains(s))
+                        .cloned()
+                        .collect();
+                    if !step_add.is_empty() {
+                        let app_add = writer
+                            .append(
+                                &sys_by,
+                                msg_at,
+                                None,
+                                vec![Event::Mail(MailEvent::RecipientsAdded {
+                                    sha256: msg_sha.clone(),
+                                    to: step_add,
+                                })],
+                            )
+                            .map_err(|e| ApiError::Internal(e.to_string()))?;
+                        if let Appended::Fresh(envs) = app_add {
+                            for e in &envs {
+                                state.apply(e);
+                            }
+                            publish_batch(&envs, &mut fresh_envelopes);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cur) = state.messages.get(&msg_sha) {
+            let rem_add: Vec<SeatName> = final_to
+                .iter()
+                .filter(|s| !cur.message.to.contains(s) && !cur.message.cc.contains(s))
+                .cloned()
+                .collect();
+            if !rem_add.is_empty() {
+                let app_add = writer
+                    .append(
+                        &sys_by,
+                        msg_at,
+                        None,
+                        vec![Event::Mail(MailEvent::RecipientsAdded {
+                            sha256: msg_sha,
+                            to: rem_add,
+                        })],
+                    )
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                if let Appended::Fresh(envs) = app_add {
+                    for e in &envs {
+                        state.apply(e);
+                    }
+                    publish_batch(&envs, &mut fresh_envelopes);
+                }
+            }
+        }
     }
 
-    // 3b. Restore any additional `--id` send bindings recorded in `mail-index.jsonl`.
+    // 3b. Restore any additional `--id` send bindings recorded in `mail-index.jsonl`
+    // with their ORIGINAL `to`/`cc` request fields!
     for rec in &disk_idem_bindings {
         if let Some(ref sidem) = rec.send_idem
             && !state.by_send_idem.contains_key(sidem)
             && let Some(existing) = state.messages.get(&rec.sha256).cloned()
         {
+            let mut bound_msg = existing.message;
+            bound_msg.to = rec.to.clone();
+            bound_msg.cc = rec.cc.clone();
+            bound_msg.room = derive_mail_room(
+                &bound_msg.from,
+                &bound_msg.to,
+                &bound_msg.cc,
+                bound_msg.topic.as_deref(),
+                &bound_msg.subject,
+                &bound_msg.sha256,
+            );
             let by = rec.send_by.as_ref().unwrap_or(&sys_by);
             let appended = writer
                 .append(
                     by,
-                    existing.message.created_at,
+                    bound_msg.created_at,
                     Some(sidem),
                     vec![Event::Mail(MailEvent::MessageCommitted {
-                        message: Box::new(existing.message),
+                        message: Box::new(bound_msg),
                         mutated_after_ack: existing.mutated_after_ack,
                         prior_ack_sha: existing.prior_ack_sha,
                         send_idem: Some(sidem.clone()),
@@ -3657,10 +4250,13 @@ pub fn reconcile_commit_phase(
     let mut drop_files_to_finish = Vec::with_capacity(raw_drop_files.len());
     for (f, _initial_msg) in raw_drop_files {
         let final_entry = &state.messages[&f.sha256];
+        let is_current_head = normalize_letter_path(&final_entry.message.path.to_string_lossy())
+            .is_some_and(|n| state.current_by_path.get(&n.canonical) == Some(&f.sha256));
         drop_files_to_finish.push((
             f,
             final_entry.message.clone(),
             final_entry.mirror_index_records(),
+            is_current_head,
         ));
     }
 
@@ -3689,32 +4285,57 @@ pub fn reconcile_commit_phase(
         }
     }
 
-    // 5. Collect ALL committed non-flagged messages missing a durable room post
-    // (covering both newly ingested files AND crash recovery between SQLite commit and RoomPost).
-    let mut missing_entries: Vec<&CommittedMailEntry> = state
-        .messages
-        .values()
-        .filter(|e| {
-            !e.mutated_after_ack
-                && e.message.room.as_ref().is_some_and(|room| {
-                    let key = (room.clone(), e.message.sha256.clone());
-                    !state.room_post_seqs.contains_key(&key)
-                        && !state.failed_room_projections.contains(&key)
-                })
-        })
-        .collect();
-    missing_entries
-        .sort_by(|a, b| (a.message.created_at, a.seq).cmp(&(b.message.created_at, b.seq)));
-    let missing_room_msgs: Vec<(MailMessage, Option<Principal>)> = missing_entries
-        .into_iter()
-        .map(|e| {
-            let auth = if e.message.origin == MailOrigin::Send || !e.send_bindings.is_empty() {
-                Some(e.committed_by.clone())
-            } else {
-                None
+    // 5. Collect ALL committed non-flagged messages (across every historical audience room!)
+    // missing a durable room post, ordered parent-first so equal-timestamp replies resolve `re`.
+    let mut raw_missing_room_msgs: Vec<(Seq, MailMessage, Option<Principal>)> = Vec::new();
+    let mut seen_missing_keys: HashSet<(RoomId, Sha256Hex)> = HashSet::new();
+    for entry in state.messages.values() {
+        if entry.mutated_after_ack {
+            continue;
+        }
+        let auth = if entry.message.origin == MailOrigin::Send || !entry.send_bindings.is_empty() {
+            Some(entry.committed_by.clone())
+        } else {
+            None
+        };
+        let mut all_audiences = entry.historical_audiences.clone();
+        let cur_aud = (entry.message.to.clone(), entry.message.cc.clone());
+        if !all_audiences.contains(&cur_aud) {
+            all_audiences.push(cur_aud);
+        }
+        for (aud_to, aud_cc) in all_audiences {
+            let Some(room) = derive_mail_room(
+                &entry.message.from,
+                &aud_to,
+                &aud_cc,
+                entry.message.topic.as_deref(),
+                &entry.message.subject,
+                &entry.message.sha256,
+            ) else {
+                continue;
             };
-            (e.message.clone(), auth)
-        })
+            let key = (room.clone(), entry.message.sha256.clone());
+            if state.room_post_seqs.contains_key(&key)
+                || state.failed_room_projections.contains(&key)
+                || !seen_missing_keys.insert(key)
+            {
+                continue;
+            }
+            let mut msg_for_room = entry.message.clone();
+            msg_for_room.to = aud_to;
+            msg_for_room.cc = aud_cc;
+            msg_for_room.room = Some(room);
+            raw_missing_room_msgs.push((entry.seq, msg_for_room, auth.clone()));
+        }
+    }
+    let ordered_missing = order_items_parent_first(
+        raw_missing_room_msgs,
+        |(_, m, _)| m,
+        |(seq, m, _)| (m.created_at, *seq, m.sha256.clone()),
+    );
+    let missing_room_msgs: Vec<(MailMessage, Option<Principal>)> = ordered_missing
+        .into_iter()
+        .map(|(_, m, auth)| (m, auth))
         .collect();
 
     let mut blobs_to_export = Vec::new();
@@ -3727,25 +4348,25 @@ pub fn reconcile_commit_phase(
         let mut present_wt = inputs.present_working_paths;
         for entry in state.messages.values() {
             let msg = &entry.message;
-            let need_blob = present_blobs.insert(msg.sha256.clone());
-            let norm_wt = normalize_letter_path(&msg.path.to_string_lossy()).map(|n| n.canonical);
-            let need_wt = !msg.path.starts_with("objects")
-                && norm_wt
-                    .as_ref()
-                    .is_some_and(|canon| present_wt.insert(canon.clone()));
-            if need_blob || need_wt {
+            if present_blobs.insert(msg.sha256.clone()) {
                 let raw = message_raw_bytes(msg)?;
-                if need_blob {
-                    blobs_to_export.push((msg.sha256.clone(), raw.clone()));
-                }
-                if need_wt {
-                    wt_to_export.push((msg.path.clone(), raw));
-                }
+                blobs_to_export.push((msg.sha256.clone(), raw));
             }
             for idx_rec in entry.mirror_index_records() {
                 if !disk_index_keys.contains(&index_row_key(&idx_rec)) {
                     index_to_export.push(idx_rec);
                 }
+            }
+        }
+        // Export missing working-tree files strictly from `state.current_by_path` so an
+        // older revision in SHA order can never overwrite or claim a newer path head!
+        for (canon_path, head_sha) in &state.current_by_path {
+            if !canon_path.starts_with("objects/")
+                && present_wt.insert(canon_path.clone())
+                && let Some(head_entry) = state.messages.get(head_sha)
+            {
+                let raw = message_raw_bytes(&head_entry.message)?;
+                wt_to_export.push((PathBuf::from(canon_path), raw));
             }
         }
         for ack in state.ack_records.values() {
@@ -3762,6 +4383,7 @@ pub fn reconcile_commit_phase(
         blobs_to_export,
         wt_to_export,
         index_to_export,
+        repair_malformed_index: inputs.index_had_malformed_lines,
         acks_to_export,
         drop_files_to_finish,
     })
@@ -3782,8 +4404,8 @@ pub fn execute_reconcile_exports(
             work.report.working_tree_exported += 1;
         }
     }
-    if !work.index_to_export.is_empty() {
-        mirror.append_index_batch_if_absent(&work.index_to_export)?;
+    if !work.index_to_export.is_empty() || work.repair_malformed_index {
+        mirror.sync_index_batch(&work.index_to_export, work.repair_malformed_index)?;
     }
     if !work.acks_to_export.is_empty() {
         match mirror.append_acks_batch_if_absent(&work.acks_to_export) {
@@ -3794,11 +4416,11 @@ pub fn execute_reconcile_exports(
             }
         }
     }
-    for (drop_file, msg, idx_rows) in &work.drop_files_to_finish {
+    for (drop_file, msg, idx_rows, export_wt) in &work.drop_files_to_finish {
         if mirror.export_blob_if_absent(&msg.sha256, &drop_file.raw_bytes)? {
             work.report.blobs_exported += 1;
         }
-        if mirror.export_working_tree_if_absent(&msg.path, &drop_file.raw_bytes)? {
+        if *export_wt && mirror.export_working_tree_if_absent(&msg.path, &drop_file.raw_bytes)? {
             work.report.working_tree_exported += 1;
         }
         if !idx_rows.is_empty() {
@@ -3846,17 +4468,25 @@ pub async fn reconcile_mail_store(
                 let caller_ctx = auth_by
                     .as_ref()
                     .map(|p| DecideCtx::for_internal_replay(p.clone(), msg.created_at));
-                if let Some(seq) =
-                    project_message_to_room_service(rsvc, msg, parent_seq, caller_ctx.as_ref())
-                        .await
+                match project_message_to_room_service_checked(
+                    rsvc,
+                    msg,
+                    parent_seq,
+                    caller_ctx.as_ref(),
+                )
+                .await
                 {
-                    state
-                        .room_post_seqs
-                        .insert((room.clone(), msg.sha256.clone()), seq);
-                } else {
-                    state
-                        .failed_room_projections
-                        .insert((room.clone(), msg.sha256.clone()));
+                    RoomProjectionOutcome::Posted(seq) => {
+                        state
+                            .room_post_seqs
+                            .insert((room.clone(), msg.sha256.clone()), seq);
+                    }
+                    RoomProjectionOutcome::PermanentCollision => {
+                        state
+                            .failed_room_projections
+                            .insert((room.clone(), msg.sha256.clone()));
+                    }
+                    RoomProjectionOutcome::TransientFailure => {}
                 }
             }
         }
@@ -3931,33 +4561,30 @@ pub fn rebuild_mail_from_mirror(
         Err(e) => return Err(SandboxError::Io(format!("read mail-index.jsonl: {e}"))),
     };
     let mut index_by_sha: BTreeMap<Sha256Hex, MirrorIndexRecord> = BTreeMap::new();
-    let mut extra_idem_records: Vec<MirrorIndexRecord> = Vec::new();
+    let mut first_ord_by_sha: BTreeMap<Sha256Hex, usize> = BTreeMap::new();
+    let mut idem_records_by_sha: BTreeMap<Sha256Hex, Vec<MirrorIndexRecord>> = BTreeMap::new();
+    let mut audiences_by_sha: BTreeMap<Sha256Hex, Vec<(Vec<SeatName>, Vec<SeatName>)>> =
+        BTreeMap::new();
     let mut seen_idem_keys: HashSet<IdemKey> = HashSet::new();
-    for rec in index_records {
-        match index_by_sha.get_mut(&rec.sha256) {
-            Some(existing) => {
-                if let Some(ref sidem) = rec.send_idem
-                    && existing.send_idem.as_ref() != Some(sidem)
-                    && seen_idem_keys.insert(sidem.clone())
-                {
-                    if existing.send_idem.is_none() {
-                        existing.send_idem = Some(sidem.clone());
-                        if existing.send_by.is_none() {
-                            existing.send_by = rec.send_by.clone();
-                        }
-                    } else {
-                        extra_idem_records.push(rec.clone());
-                    }
-                }
-                merge_index_record(existing, &rec);
-            }
-            None => {
-                if let Some(ref sidem) = rec.send_idem {
-                    seen_idem_keys.insert(sidem.clone());
-                }
-                index_by_sha.insert(rec.sha256.clone(), rec);
-            }
+    for (ord, rec) in index_records.into_iter().enumerate() {
+        first_ord_by_sha.entry(rec.sha256.clone()).or_insert(ord);
+        if let Some(ref sidem) = rec.send_idem
+            && seen_idem_keys.insert(sidem.clone())
+        {
+            idem_records_by_sha
+                .entry(rec.sha256.clone())
+                .or_default()
+                .push(rec.clone());
         }
+        let aud_list = audiences_by_sha.entry(rec.sha256.clone()).or_default();
+        let aud_pair = (rec.to.clone(), rec.cc.clone());
+        if !aud_list.contains(&aud_pair) {
+            aud_list.push(aud_pair);
+        }
+        index_by_sha
+            .entry(rec.sha256.clone())
+            .and_modify(|existing| merge_index_record(existing, &rec))
+            .or_insert(rec);
     }
 
     let working = scan_working_tree_dir(ro.root(), aliases, false)
@@ -4132,15 +4759,16 @@ pub fn rebuild_mail_from_mirror(
         resolved_acks.keys().map(|(_, sha)| sha.clone()).collect();
 
     struct RebuiltMessageRow {
-        msg: MailMessage,
+        final_msg: MailMessage,
+        first_ord: usize,
         mutated_after_ack: bool,
         prior_ack_sha: Option<String>,
-        send_idem: Option<IdemKey>,
-        send_by: Option<Principal>,
+        idem_bindings: Vec<MirrorIndexRecord>,
+        historical_audiences: Vec<(Vec<SeatName>, Vec<SeatName>)>,
+        default_send_by: Option<Principal>,
     }
 
     let mut parsed_messages: Vec<RebuiltMessageRow> = Vec::with_capacity(by_sha.len());
-    let mut msg_by_sha_for_extra: BTreeMap<Sha256Hex, MailMessage> = BTreeMap::new();
     let mut send_authors: BTreeMap<Sha256Hex, Principal> = BTreeMap::new();
 
     for (cand_sha, cand) in by_sha {
@@ -4193,17 +4821,36 @@ pub fn rebuild_mail_from_mirror(
                 (prior.is_some(), prior)
             }
         };
-        msg_by_sha_for_extra.insert(msg.sha256.clone(), msg.clone());
+        let idem_bindings = idem_records_by_sha.remove(&cand_sha).unwrap_or_default();
+        let mut historical_audiences = audiences_by_sha.remove(&cand_sha).unwrap_or_default();
+        let final_aud = (msg.to.clone(), msg.cc.clone());
+        if !historical_audiences.contains(&final_aud) {
+            historical_audiences.push(final_aud);
+        }
         parsed_messages.push(RebuiltMessageRow {
-            msg,
+            first_ord: first_ord_by_sha
+                .get(&cand_sha)
+                .copied()
+                .unwrap_or(usize::MAX),
+            final_msg: msg,
             mutated_after_ack,
             prior_ack_sha,
-            send_idem: idx_rec.and_then(|r| r.send_idem.clone()),
-            send_by: idx_rec.and_then(|r| r.send_by.clone()),
+            idem_bindings,
+            historical_audiences,
+            default_send_by: idx_rec.and_then(|r| r.send_by.clone()),
         });
     }
-    parsed_messages
-        .sort_by(|a, b| (a.msg.created_at, &a.msg.sha256).cmp(&(b.msg.created_at, &b.msg.sha256)));
+    let parsed_messages = order_items_parent_first(
+        parsed_messages,
+        |r| &r.final_msg,
+        |r| {
+            (
+                r.final_msg.created_at,
+                r.first_ord,
+                r.final_msg.sha256.clone(),
+            )
+        },
+    );
 
     let journal = Journal::open(&verified_journal).map_err(|e| SandboxError::Io(e.to_string()))?;
     let mut mail_writer = journal
@@ -4217,64 +4864,153 @@ pub fn rebuild_mail_from_mirror(
     let mut messages_rebuilt = 0usize;
     let mut mutated_after_ack_flagged = 0usize;
     let mut non_flagged_for_rooms = Vec::new();
-    for row in &parsed_messages {
-        let idem = match &row.send_idem {
-            Some(k) => k.clone(),
-            None => IdemKey::parse(format!("mail_msg:{}", row.msg.sha256))
-                .map_err(|e| SandboxError::Io(e.to_string()))?,
-        };
-        let by = row.send_by.as_ref().unwrap_or(&sys_by);
-        let appended = mail_writer
-            .append(
-                by,
-                row.msg.created_at,
-                Some(&idem),
-                vec![Event::Mail(MailEvent::MessageCommitted {
-                    message: Box::new(row.msg.clone()),
-                    mutated_after_ack: row.mutated_after_ack,
-                    prior_ack_sha: row.prior_ack_sha.clone(),
-                    send_idem: row.send_idem.clone(),
-                })],
-            )
-            .map_err(|e| SandboxError::Io(e.to_string()))?;
-        if matches!(appended, Appended::Fresh(_)) {
-            messages_rebuilt += 1;
-            if row.mutated_after_ack {
-                mutated_after_ack_flagged += 1;
-            }
-            if !row.msg.path.starts_with("objects")
-                && let Some(norm) = normalize_letter_path(&row.msg.path.to_string_lossy())
-            {
-                last_committed_by_path.insert(norm.canonical, row.msg.sha256.clone());
-            }
-        }
-        if !row.mutated_after_ack {
-            non_flagged_for_rooms.push(row.msg.clone());
-        }
-    }
+    let mut seen_room_projections: HashSet<(RoomId, Sha256Hex)> = HashSet::new();
 
-    for extra in &extra_idem_records {
-        if let Some(ref sidem) = extra.send_idem
-            && let Some(msg) = msg_by_sha_for_extra.get(&extra.sha256)
-        {
-            let by = extra.send_by.as_ref().unwrap_or(&sys_by);
-            let _ = mail_writer
+    for row in &parsed_messages {
+        let mut committed_to: Vec<SeatName>;
+        let committed_cc: Vec<SeatName>;
+
+        if !row.idem_bindings.is_empty() {
+            let first_b = &row.idem_bindings[0];
+            committed_to = first_b.to.clone();
+            committed_cc = first_b.cc.clone();
+            for (b_idx, b_rec) in row.idem_bindings.iter().enumerate() {
+                let Some(ref sidem) = b_rec.send_idem else {
+                    continue;
+                };
+                let mut bound_msg = row.final_msg.clone();
+                bound_msg.to = b_rec.to.clone();
+                bound_msg.cc = b_rec.cc.clone();
+                bound_msg.room = derive_mail_room(
+                    &bound_msg.from,
+                    &bound_msg.to,
+                    &bound_msg.cc,
+                    bound_msg.topic.as_deref(),
+                    &bound_msg.subject,
+                    &bound_msg.sha256,
+                );
+                let by = b_rec
+                    .send_by
+                    .as_ref()
+                    .or(row.default_send_by.as_ref())
+                    .unwrap_or(&sys_by);
+                let appended = mail_writer
+                    .append(
+                        by,
+                        bound_msg.created_at,
+                        Some(sidem),
+                        vec![Event::Mail(MailEvent::MessageCommitted {
+                            message: Box::new(bound_msg),
+                            mutated_after_ack: row.mutated_after_ack,
+                            prior_ack_sha: row.prior_ack_sha.clone(),
+                            send_idem: Some(sidem.clone()),
+                        })],
+                    )
+                    .map_err(|e| SandboxError::Io(e.to_string()))?;
+                if b_idx == 0 && matches!(appended, Appended::Fresh(_)) {
+                    messages_rebuilt += 1;
+                    if row.mutated_after_ack {
+                        mutated_after_ack_flagged += 1;
+                    }
+                }
+                if !row.final_msg.path.starts_with("objects")
+                    && let Some(norm) = normalize_letter_path(&row.final_msg.path.to_string_lossy())
+                {
+                    last_committed_by_path.insert(norm.canonical, row.final_msg.sha256.clone());
+                }
+            }
+        } else {
+            let (init_to, init_cc) = row
+                .historical_audiences
+                .first()
+                .cloned()
+                .unwrap_or_else(|| (row.final_msg.to.clone(), row.final_msg.cc.clone()));
+            committed_to = init_to.clone();
+            committed_cc = init_cc.clone();
+            let mut init_msg = row.final_msg.clone();
+            init_msg.to = init_to;
+            init_msg.cc = init_cc;
+            init_msg.room = derive_mail_room(
+                &init_msg.from,
+                &init_msg.to,
+                &init_msg.cc,
+                init_msg.topic.as_deref(),
+                &init_msg.subject,
+                &init_msg.sha256,
+            );
+            let idem = IdemKey::parse(format!("mail_msg:{}", init_msg.sha256))
+                .map_err(|e| SandboxError::Io(e.to_string()))?;
+            let by = row.default_send_by.as_ref().unwrap_or(&sys_by);
+            let appended = mail_writer
                 .append(
                     by,
-                    msg.created_at,
-                    Some(sidem),
+                    init_msg.created_at,
+                    Some(&idem),
                     vec![Event::Mail(MailEvent::MessageCommitted {
-                        message: Box::new(msg.clone()),
-                        mutated_after_ack: extra.mutated_after_ack,
-                        prior_ack_sha: extra.prior_ack_sha.clone(),
-                        send_idem: Some(sidem.clone()),
+                        message: Box::new(init_msg),
+                        mutated_after_ack: row.mutated_after_ack,
+                        prior_ack_sha: row.prior_ack_sha.clone(),
+                        send_idem: None,
                     })],
                 )
                 .map_err(|e| SandboxError::Io(e.to_string()))?;
-            if !msg.path.starts_with("objects")
-                && let Some(norm) = normalize_letter_path(&msg.path.to_string_lossy())
-            {
-                last_committed_by_path.insert(norm.canonical, msg.sha256.clone());
+            if matches!(appended, Appended::Fresh(_)) {
+                messages_rebuilt += 1;
+                if row.mutated_after_ack {
+                    mutated_after_ack_flagged += 1;
+                }
+                if !row.final_msg.path.starts_with("objects")
+                    && let Some(norm) = normalize_letter_path(&row.final_msg.path.to_string_lossy())
+                {
+                    last_committed_by_path.insert(norm.canonical, row.final_msg.sha256.clone());
+                }
+            }
+        }
+
+        // Replay audience expansion steps so `MailState::from_journal` reproduces
+        // both the final `to` list and every intermediate `historical_audiences` step.
+        for (aud_to, _) in &row.historical_audiences {
+            let step_add: Vec<SeatName> = aud_to
+                .iter()
+                .filter(|s| !committed_to.contains(s) && !committed_cc.contains(s))
+                .cloned()
+                .collect();
+            if !step_add.is_empty() {
+                for s in &step_add {
+                    committed_to.push(s.clone());
+                }
+                mail_writer
+                    .append(
+                        &sys_by,
+                        row.final_msg.created_at,
+                        None,
+                        vec![Event::Mail(MailEvent::RecipientsAdded {
+                            sha256: row.final_msg.sha256.clone(),
+                            to: step_add,
+                        })],
+                    )
+                    .map_err(|e| SandboxError::Io(e.to_string()))?;
+            }
+        }
+
+        if !row.mutated_after_ack {
+            for (aud_to, aud_cc) in &row.historical_audiences {
+                let mut msg_for_room = row.final_msg.clone();
+                msg_for_room.to = aud_to.clone();
+                msg_for_room.cc = aud_cc.clone();
+                msg_for_room.room = derive_mail_room(
+                    &msg_for_room.from,
+                    &msg_for_room.to,
+                    &msg_for_room.cc,
+                    msg_for_room.topic.as_deref(),
+                    &msg_for_room.subject,
+                    &msg_for_room.sha256,
+                );
+                if let Some(ref r) = msg_for_room.room
+                    && seen_room_projections.insert((r.clone(), msg_for_room.sha256.clone()))
+                {
+                    non_flagged_for_rooms.push(msg_for_room);
+                }
             }
         }
     }
@@ -4751,6 +5487,7 @@ pub fn migrate_verify_interchange(
         mirror
             .export_blob_if_absent(&msg.sha256, &src.raw_bytes)
             .map_err(|e| SandboxError::Io(e.to_string()))?;
+        let canon_main = normalize_letter_path(&msg.path.to_string_lossy()).map(|n| n.canonical);
         let wt_created = mirror
             .export_working_tree_if_absent(&msg.path, &src.raw_bytes)
             .map_err(|e| SandboxError::Io(e.to_string()))?;
@@ -4758,8 +5495,14 @@ pub fn migrate_verify_interchange(
             expected_working_paths.push((msg.path.clone(), msg.sha256.clone()));
         }
         for extra_p in &src.all_paths {
-            if extra_p != &src.rel_path {
-                let _ = mirror.export_working_tree_if_absent(Path::new(extra_p), &src.raw_bytes);
+            let canon_extra = normalize_letter_path(extra_p).map(|n| n.canonical);
+            if extra_p != &src.rel_path && canon_extra != canon_main {
+                let extra_created = mirror
+                    .export_working_tree_if_absent(Path::new(extra_p), &src.raw_bytes)
+                    .map_err(|e| SandboxError::Io(e.to_string()))?;
+                if extra_created {
+                    expected_working_paths.push((PathBuf::from(extra_p), msg.sha256.clone()));
+                }
             }
         }
 

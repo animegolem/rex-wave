@@ -171,6 +171,26 @@
                 "wave"
               ],
               "type": "object"
+            },
+            {
+              "description": "`#mail-<slug>-<hash16>`: created by the mail bridge with fixed participant roster.",
+              "properties": {
+                "audience": {
+                  "items": {
+                    "$ref": "#/$defs/Principal"
+                  },
+                  "type": "array"
+                },
+                "origin": {
+                  "const": "mail",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "audience"
+              ],
+              "type": "object"
             }
           ]
         },

@@ -34,7 +34,7 @@ pub use file::{
     open_rw_append_at, open_rw_append_nofollow, open_sub_dir_at, prepare_unix_socket,
     read_claimed_at_if_unchanged, read_input_bounded, read_input_string, read_open_bounded,
     read_private_regular, read_regular_bounded, read_regular_string, socket_owner_uid, sync_dir,
-    unlink_regular_at, validate_unix_socket_target, verify_same_regular_nofollow,
+    unlink_regular_at, validate_unix_socket_target, verify_same_regular_nofollow, write_atomic_at,
     write_atomic_if_absent_at, write_atomic_if_absent_path, write_atomic_path,
 };
 pub use name::{

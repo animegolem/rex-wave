@@ -478,6 +478,83 @@ pub fn write_atomic_if_absent_at(
     }
 }
 
+/// Atomically write or replace regular file `name` inside `dir_fd` using
+/// `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` + `fsync` + `renameat`, refusing to
+/// overwrite a symlink or directory at `name`.
+pub fn write_atomic_at(
+    dir_fd: &File,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+    sync_dir: bool,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, renameat, statat, unlinkat};
+    validate_at_leaf_name(name)?;
+    match statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            let ft = FileType::from_raw_mode(st.st_mode);
+            if ft != FileType::RegularFile {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to overwrite non-regular file '{name}'"),
+                ));
+            }
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let raw_mode = mode as rustix::fs::RawMode;
+    let tmp_flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let pid = std::process::id();
+    let mut created = None;
+    for _ in 0..MAX_TEMP_ATTEMPTS {
+        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{name}.tmp.{pid}.{nonce}");
+        let cand = if tmp_name.len() > 255 {
+            format!(".rex.tmp.{pid}.{nonce}")
+        } else {
+            tmp_name
+        };
+        match openat(dir_fd, &cand, tmp_flags, Mode::from_raw_mode(raw_mode)) {
+            Ok(fd) => {
+                created = Some((cand, File::from(fd)));
+                break;
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(e) => return Err(io::Error::from(e)),
+        }
+    }
+    let Some((tmp_name, mut tmp_file)) = created else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("no free temp name beside '{name}'"),
+        ));
+    };
+    let private = mode & 0o077 == 0;
+    let filled = (if private {
+        tmp_file.set_permissions(Permissions::from_mode(mode))
+    } else {
+        Ok(())
+    })
+    .and_then(|()| tmp_file.write_all(bytes))
+    .and_then(|()| tmp_file.sync_all());
+    drop(tmp_file);
+    if let Err(e) = filled {
+        let _ = unlinkat(dir_fd, &tmp_name, AtFlags::empty());
+        return Err(e);
+    }
+    if let Err(e) = renameat(dir_fd, &tmp_name, dir_fd, name) {
+        let _ = unlinkat(dir_fd, &tmp_name, AtFlags::empty());
+        return Err(io::Error::from(e));
+    }
+    if sync_dir {
+        dir_fd.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Atomically claim regular file `name` inside `dir_fd` via `renameat` after
 /// verifying `open_regular_at(dir_fd, name)` matches `expected` `(dev, ino)`.
 pub fn claim_regular_at(

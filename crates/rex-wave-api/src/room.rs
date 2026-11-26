@@ -211,6 +211,10 @@ pub enum RoomOrigin {
     Wave {
         wave: WaveSlug,
     },
+    /// `#mail-<slug>-<hash16>`: created by the mail bridge with fixed participant roster.
+    Mail {
+        audience: Vec<Principal>,
+    },
 }
 
 /// A message body: 1..=64 KiB of text. Markdown-ish; never interpreted as commands.
