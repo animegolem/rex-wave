@@ -12,6 +12,7 @@ use tokio::process::Command;
 
 static WORKTREE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const OWNER_MARKER_FILE: &str = "rex-wave-owner.json";
+const INTENT_DIR_NAME: &str = "rex-wave-worktree-intents";
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct WorktreeOwnerMarker {
@@ -138,6 +139,7 @@ async fn ensure_managed_worktree(
     };
 
     let branch_name = format!("rex-wave/{}/{}", req.wave, req.role);
+    let intent_path = write_creation_intent(project_root, &req.wave, &req.role).await?;
     let out = git_in(project_root)
         .args(["worktree", "add", "-b", &branch_name])
         .arg(&wt_path)
@@ -159,12 +161,14 @@ async fn ensure_managed_worktree(
                     HostError::Unreachable(format!("run git worktree add --detach: {e}"))
                 })?;
             if !retry.status.success() {
+                let _ = std::fs::remove_file(&intent_path);
                 let retry_err = String::from_utf8_lossy(&retry.stderr).trim().to_owned();
                 return Err(HostError::Rejected(format!(
                     "git worktree add failed: {retry_err}"
                 )));
             }
         } else {
+            let _ = std::fs::remove_file(&intent_path);
             return Err(HostError::Rejected(format!(
                 "git worktree add failed: {stderr}"
             )));
@@ -172,8 +176,43 @@ async fn ensure_managed_worktree(
     }
 
     write_owner_marker(&wt_path, &req.wave, &req.role).await?;
+    let _ = std::fs::remove_file(&intent_path);
     let resolved = rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
     Ok(resolved)
+}
+
+fn intent_file_name(wave: &WaveSlug, role: &RoleName) -> String {
+    format!(
+        "{}--{}_{}.json",
+        wave.as_str().len(),
+        wave.as_str(),
+        role.as_str()
+    )
+}
+
+async fn write_creation_intent(
+    project_root: &Path,
+    wave: &WaveSlug,
+    role: &RoleName,
+) -> Result<PathBuf, HostError> {
+    let Some(proj_common) = git_rev_parse_path(project_root, "--git-common-dir").await else {
+        return Err(HostError::Rejected(format!(
+            "failed resolving git-common-dir for {}",
+            project_root.display()
+        )));
+    };
+    let intents_dir = proj_common.join(INTENT_DIR_NAME);
+    ensure_real_dir(&intents_dir, "worktree creation-intent directory")?;
+    let path = intents_dir.join(intent_file_name(wave, role));
+    let marker = WorktreeOwnerMarker {
+        wave: wave.as_str().to_owned(),
+        role: role.as_str().to_owned(),
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|e| HostError::Rejected(format!("encode creation intent: {e}")))?;
+    rex_wave_fs::write_atomic_path(&path, &bytes, 0o600, false)
+        .map_err(|e| HostError::Rejected(format!("write worktree creation intent: {e}")))?;
+    Ok(path)
 }
 
 async fn write_owner_marker(
@@ -297,9 +336,9 @@ async fn verify_or_heal_worktree_for(
         return marker.wave == wave.as_str() && marker.role == role.as_str();
     }
 
-    // Recover from an interrupted prior attempt that finished `git worktree add` at our
-    // verified injective `<project>/.worktrees/rex-wave/<wave>/<role>` path before writing
-    // `rex-wave-owner.json`.
+    // Recover from an interrupted prior attempt only when `rex-wave` recorded an explicit
+    // creation-intent marker in `<git-common-dir>/rex-wave-worktree-intents/` before invoking
+    // `git worktree add`, so unrelated user worktrees at the same path are never adopted.
     let expected_wt = canon_proj
         .join(".worktrees")
         .join("rex-wave")
@@ -308,5 +347,22 @@ async fn verify_or_heal_worktree_for(
     if canon_wt != expected_wt {
         return false;
     }
-    write_owner_marker(wt_path, wave, role).await.is_ok()
+    let intent_path = proj_common
+        .join(INTENT_DIR_NAME)
+        .join(intent_file_name(wave, role));
+    let Ok(intent_bytes) = rex_wave_fs::read_regular_bounded(&intent_path, 4096) else {
+        return false;
+    };
+    let Ok(intent) = serde_json::from_slice::<WorktreeOwnerMarker>(&intent_bytes) else {
+        return false;
+    };
+    if intent.wave != wave.as_str() || intent.role != role.as_str() {
+        return false;
+    }
+    if write_owner_marker(wt_path, wave, role).await.is_ok() {
+        let _ = std::fs::remove_file(&intent_path);
+        true
+    } else {
+        false
+    }
 }

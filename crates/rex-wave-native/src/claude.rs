@@ -1172,9 +1172,68 @@ impl ClaudeBridge {
             tq.dispatching = true;
         }
 
+        struct DispatchCancelGuard<'a> {
+            worker: &'a Arc<ClaudeWorkerState>,
+            armed: bool,
+        }
+        impl Drop for DispatchCancelGuard<'_> {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let (cancelled, has_live_stdin) = {
+                    let has_stdin = self
+                        .worker
+                        .stdin_tx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    let mut tq = self
+                        .worker
+                        .turn_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    tq.dispatching = false;
+                    if !has_stdin {
+                        tq.in_flight = false;
+                        tq.interrupt_pending = false;
+                        tq.unstarted_prompt = None;
+                        (tq.queued.drain(..).collect::<Vec<_>>(), false)
+                    } else {
+                        (Vec::new(), true)
+                    }
+                };
+                push_cancelled_claude_prompts(&self.worker.log, cancelled, "dispatch_cancelled");
+                if !has_live_stdin && !self.worker.retiring.load(Ordering::Acquire) {
+                    let can_resume = self
+                        .worker
+                        .session_id
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    if can_resume {
+                        self.worker.emit_activity(Activity::Idle, false);
+                    } else {
+                        self.worker.emit_activity(
+                            Activity::Errored {
+                                error: "Claude prompt dispatch cancelled before session start"
+                                    .into(),
+                            },
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut cancel_guard = DispatchCancelGuard {
+            worker,
+            armed: true,
+        };
         let res = self
             .dispatch_prompt_inner(worker, prompt_text, record_user_event)
             .await;
+        cancel_guard.armed = false;
 
         worker
             .turn_queue
@@ -1432,15 +1491,57 @@ impl ClaudeBridge {
         };
 
         if send_interrupt {
-            let stdin_tx = worker
+            let stdin_pair = worker
                 .stdin_tx
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .map(|(_, tx)| tx.clone());
-            if let Some(tx) = stdin_tx {
-                let seq = worker.interrupt_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = write_stdin_line(&tx, encode_claude_interrupt_request(seq), "Claude").await;
+                .cloned();
+            let write_err = match stdin_pair {
+                Some((stdin_gen, tx)) => {
+                    let seq = worker.interrupt_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    write_stdin_line(&tx, encode_claude_interrupt_request(seq), "Claude")
+                        .await
+                        .err()
+                        .map(|e| (Some(stdin_gen), e))
+                }
+                None => Some((None, "Claude worker stdin is closed".to_owned())),
+            };
+            if let Some((failed_gen, err)) = write_err {
+                let msg = format!("write Claude interrupt control_request: {err}");
+                if let Some(fg) = failed_gen {
+                    let mut slot = worker.stdin_tx.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.as_ref().is_some_and(|(g, _)| *g == fg) {
+                        *slot = None;
+                    }
+                }
+                let cancelled = {
+                    let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    if failed_gen.is_none_or(|fg| tq.in_flight_generation == fg) {
+                        tq.in_flight = false;
+                        tq.interrupt_pending = false;
+                        tq.unstarted_prompt = None;
+                    }
+                    tq.queued.drain(..).collect::<Vec<_>>()
+                };
+                push_cancelled_claude_prompts(&worker.log, cancelled, "interrupt_delivery_failed");
+                if !worker.retiring.load(Ordering::Acquire) {
+                    worker.emit_activity(Activity::Errored { error: msg.clone() }, true);
+                    if let Some(fg) = failed_gen {
+                        let maybe_live = {
+                            let mut guard = worker.live_child.lock().await;
+                            if guard.as_ref().is_some_and(|l| l.generation == fg) {
+                                guard.take()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(mut live) = maybe_live {
+                            terminate_process_group(&mut live, self.cfg.retire_grace).await;
+                        }
+                    }
+                }
+                return Err(HostError::Unreachable(msg));
             }
             return Ok(());
         }
@@ -1585,9 +1686,19 @@ impl ClaudeBridge {
                 tq.queued.drain(..).collect::<Vec<_>>()
             };
             push_cancelled_claude_prompts(&worker.log, cancelled, "approval_delivery_failed");
-            if !worker.retiring.load(Ordering::Acquire) {
+            if !worker.retiring.load(Ordering::Acquire)
+                && worker.generation.load(Ordering::Acquire) == stdin_gen
+            {
                 worker.emit_activity(Activity::Errored { error: msg.clone() }, true);
-                if let Some(mut live) = worker.live_child.lock().await.take() {
+                let maybe_live = {
+                    let mut guard = worker.live_child.lock().await;
+                    if guard.as_ref().is_some_and(|l| l.generation == stdin_gen) {
+                        guard.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut live) = maybe_live {
                     terminate_process_group(&mut live, self.cfg.retire_grace).await;
                 }
             }
@@ -1595,14 +1706,16 @@ impl ClaudeBridge {
         }
 
         let (popped, next_blocked) = {
+            let latest_gen = worker.generation.load(Ordering::Acquire);
             let mut controls = worker
                 .pending_controls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            controls.retain(|c| c.generation == cur_gen);
-            if controls
-                .front()
-                .is_some_and(|f| &f.interaction.id == interaction && f.generation == stdin_gen)
+            controls.retain(|c| c.generation == latest_gen);
+            if latest_gen == stdin_gen
+                && controls
+                    .front()
+                    .is_some_and(|f| &f.interaction.id == interaction && f.generation == stdin_gen)
             {
                 controls.pop_front();
                 (true, controls.front().map(|p| p.interaction.clone()))
@@ -1993,13 +2106,6 @@ fn handle_claude_line(
         return;
     }
 
-    {
-        let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
-        if tq.in_flight_generation == generation {
-            tq.unstarted_prompt = None;
-        }
-    }
-
     if let Some(sid) = val
         .get("session_id")
         .or_else(|| val.get("sessionId"))
@@ -2013,6 +2119,16 @@ fn handle_claude_line(
     let Some(ty) = val.get("type").and_then(|v| v.as_str()) else {
         return;
     };
+
+    // Only turn-execution frames prove the process consumed a newly written stdin prompt;
+    // ambient frames like `rate_limit_event` or `control_response` must leave `unstarted_prompt`
+    // armed so a process exiting cleanly before reading stdin still triggers `--resume`.
+    if matches!(ty, "assistant" | "user" | "control_request" | "result") {
+        let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if tq.in_flight_generation == generation {
+            tq.unstarted_prompt = None;
+        }
+    }
 
     match ty {
         "system" => {

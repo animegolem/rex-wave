@@ -2918,10 +2918,75 @@ for raw in sys.stdin:
     })
     .await;
 
-    // 6. Astra Should #5 & #6: Partial registered git worktree without marker heals on retry,
-    //    and queued prompt cancelled on turn error records `cancelled_queued_prompt`.
+    // 6. Astra Should #5 & R3 #3: Unrelated manual worktree without creation-intent is rejected,
+    //    whereas a worktree with `rex-wave`'s creation-intent marker heals cleanly on retry!
+    let manual_wt = h.project_dir.join(".worktrees/rex-wave/r3-manual/author");
+    std::fs::create_dir_all(manual_wt.parent().unwrap()).unwrap();
+    let mut manual_cmd = StdCommand::new("git");
+    for k in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        manual_cmd.env_remove(k);
+    }
+    assert!(
+        manual_cmd
+            .arg("-C")
+            .arg(&h.project_dir)
+            .args(["worktree", "add", "-b", "manual-investigation"])
+            .arg(&manual_wt)
+            .arg("HEAD")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let manual_reject = ClaudeHost(h.claude.clone())
+        .spawn(rex_wave_waves::SpawnRequest {
+            wave: WaveSlug::parse("r3-manual").unwrap(),
+            role: role.clone(),
+            attempt: 1,
+            project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+            agent: AgentSpec {
+                provider: ProviderId::parse("claude-code").unwrap(),
+                model: None,
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::AcceptEdits,
+                workspace: Workspace::ManagedWorktree {
+                    base: BaseBranch::Default,
+                },
+            },
+            room: rex_wave_waves::wave_room(
+                &WaveSlug::parse("r3-manual").unwrap(),
+                &ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+            ),
+            prompt: Body::parse("hi").unwrap(),
+            title: "[r3-manual] @author".into(),
+            run_stamp: "r3-manual:author:a1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        })
+        .await;
+    assert!(
+        manual_reject.is_err(),
+        "manual worktree without creation-intent marker must never be adopted"
+    );
+
     let partial_wt = h.project_dir.join(".worktrees/rex-wave/r3-partial/author");
     std::fs::create_dir_all(partial_wt.parent().unwrap()).unwrap();
+    let intents_dir = h.project_dir.join(".git/rex-wave-worktree-intents");
+    std::fs::create_dir_all(&intents_dir).unwrap();
+    std::fs::write(
+        intents_dir.join("10--r3-partial_author.json"),
+        r#"{"wave":"r3-partial","role":"author"}"#,
+    )
+    .unwrap();
     let mut wt_cmd = StdCommand::new("git");
     for k in [
         "GIT_DIR",

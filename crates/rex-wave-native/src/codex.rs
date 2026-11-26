@@ -519,6 +519,20 @@ fn collect_offered_fs_paths(fs_obj: &Map<String, Value>, mode: &str) -> HashSet<
     allowed
 }
 
+fn collect_requested_deny_paths(fs_obj: &Map<String, Value>) -> Vec<Value> {
+    let mut denies = Vec::new();
+    if let Some(entries) = fs_obj.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            if entry.get("access").and_then(Value::as_str) == Some("deny")
+                && let Some(p) = entry.get("path")
+            {
+                denies.push(p.clone());
+            }
+        }
+    }
+    denies
+}
+
 fn validate_codex_grant_subset(
     gp: &GrantedPermissions,
     requested_permissions: Option<&Value>,
@@ -549,6 +563,11 @@ fn validate_codex_grant_subset(
                 "granted_permissions grants filesystem paths when Codex requested none".into(),
             ));
         };
+        if !collect_requested_deny_paths(req_fs).is_empty() {
+            return Err(HostError::Rejected(
+                "Codex permission request contains fileSystem deny restrictions that cannot be preserved by GrantedPermissions; use RequestAnswer with explicit deny entries".into(),
+            ));
+        }
         let offered_read = collect_offered_fs_paths(req_fs, "read");
         let offered_write = collect_offered_fs_paths(req_fs, "write");
         for r in &fs.read {
@@ -577,6 +596,11 @@ fn validate_codex_fs_path_entry(path_val: &Value) -> Result<Option<String>, Host
     };
     match pobj.get("type").and_then(Value::as_str) {
         Some("path") => {
+            if pobj.keys().any(|k| !matches!(k.as_str(), "type" | "path")) {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem path entry contains unknown fields".into(),
+                ));
+            }
             let Some(p) = pobj.get("path").and_then(Value::as_str) else {
                 return Err(HostError::Rejected(
                     "Codex fileSystem path entry requires string field 'path'".into(),
@@ -585,6 +609,14 @@ fn validate_codex_fs_path_entry(path_val: &Value) -> Result<Option<String>, Host
             Ok(Some(p.to_owned()))
         }
         Some("glob_pattern") => {
+            if pobj
+                .keys()
+                .any(|k| !matches!(k.as_str(), "type" | "pattern"))
+            {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem glob_pattern entry contains unknown fields".into(),
+                ));
+            }
             if !pobj.get("pattern").is_some_and(Value::is_string) {
                 return Err(HostError::Rejected(
                     "Codex fileSystem glob_pattern entry requires string field 'pattern'".into(),
@@ -593,24 +625,73 @@ fn validate_codex_fs_path_entry(path_val: &Value) -> Result<Option<String>, Host
             Ok(None)
         }
         Some("special") => {
+            if pobj.keys().any(|k| !matches!(k.as_str(), "type" | "value")) {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem special entry contains unknown fields".into(),
+                ));
+            }
             let Some(vobj) = pobj.get("value").and_then(Value::as_object) else {
                 return Err(HostError::Rejected(
                     "Codex fileSystem special entry requires object field 'value'".into(),
                 ));
             };
             let kind = vobj.get("kind").and_then(Value::as_str).unwrap_or("");
-            if !matches!(
-                kind,
-                "root" | "minimal" | "project_roots" | "tmpdir" | "slash_tmp" | "unknown"
-            ) {
-                return Err(HostError::Rejected(
-                    "Codex fileSystem special entry has invalid 'kind'".into(),
-                ));
-            }
-            if kind == "unknown" && !vobj.get("path").is_some_and(Value::is_string) {
-                return Err(HostError::Rejected(
-                    "Codex fileSystem unknown special entry requires string 'path'".into(),
-                ));
+            match kind {
+                "root" | "minimal" | "tmpdir" | "slash_tmp" => {
+                    if vobj.keys().any(|k| k != "kind") {
+                        return Err(HostError::Rejected(format!(
+                            "Codex fileSystem special '{kind}' entry allows only 'kind'"
+                        )));
+                    }
+                }
+                "project_roots" => {
+                    if vobj
+                        .keys()
+                        .any(|k| !matches!(k.as_str(), "kind" | "subpath"))
+                    {
+                        return Err(HostError::Rejected(
+                            "Codex fileSystem project_roots entry contains unknown fields".into(),
+                        ));
+                    }
+                    if let Some(sp) = vobj.get("subpath")
+                        && !sp.is_null()
+                        && !sp.is_string()
+                    {
+                        return Err(HostError::Rejected(
+                            "Codex fileSystem project_roots 'subpath' must be a string or null"
+                                .into(),
+                        ));
+                    }
+                }
+                "unknown" => {
+                    if vobj
+                        .keys()
+                        .any(|k| !matches!(k.as_str(), "kind" | "path" | "subpath"))
+                    {
+                        return Err(HostError::Rejected(
+                            "Codex fileSystem unknown special entry contains unknown fields".into(),
+                        ));
+                    }
+                    if !vobj.get("path").is_some_and(Value::is_string) {
+                        return Err(HostError::Rejected(
+                            "Codex fileSystem unknown special entry requires string 'path'".into(),
+                        ));
+                    }
+                    if let Some(sp) = vobj.get("subpath")
+                        && !sp.is_null()
+                        && !sp.is_string()
+                    {
+                        return Err(HostError::Rejected(
+                            "Codex fileSystem unknown special 'subpath' must be a string or null"
+                                .into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(HostError::Rejected(
+                        "Codex fileSystem special entry has invalid 'kind'".into(),
+                    ));
+                }
             }
             Ok(None)
         }
@@ -662,6 +743,7 @@ fn validate_codex_raw_permissions_profile(
 
     let mut granted_read_paths: Vec<String> = Vec::new();
     let mut granted_write_paths: Vec<String> = Vec::new();
+    let mut granted_deny_paths: Vec<Value> = Vec::new();
     let mut granted_structured_entries: Vec<(String, Value)> = Vec::new();
     let mut granted_glob_depth: Option<u64> = None;
 
@@ -729,6 +811,14 @@ fn validate_codex_raw_permissions_profile(
                         "Codex permissions.fileSystem.entries items must be objects".into(),
                     ));
                 };
+                if eobj
+                    .keys()
+                    .any(|k| !matches!(k.as_str(), "access" | "path"))
+                {
+                    return Err(HostError::Rejected(
+                        "Codex permissions.fileSystem.entries item contains unknown fields".into(),
+                    ));
+                }
                 let Some(access) = eobj.get("access").and_then(Value::as_str) else {
                     return Err(HostError::Rejected(
                         "Codex permissions.fileSystem.entries item requires string 'access'".into(),
@@ -749,7 +839,7 @@ fn validate_codex_raw_permissions_profile(
                 match (access, maybe_lit) {
                     ("read", Some(p)) => granted_read_paths.push(p),
                     ("write", Some(p)) => granted_write_paths.push(p),
-                    ("deny", _) => {}
+                    ("deny", _) => granted_deny_paths.push(path_val.clone()),
                     (_, None) => {
                         granted_structured_entries.push((access.to_owned(), path_val.clone()))
                     }
@@ -800,6 +890,13 @@ fn validate_codex_raw_permissions_profile(
                 "Codex RequestAnswer grants fileSystem permissions when none were requested".into(),
             ));
         };
+        for req_deny in collect_requested_deny_paths(req_fs) {
+            if !granted_deny_paths.contains(&req_deny) {
+                return Err(HostError::Rejected(
+                    "Codex RequestAnswer omits a requested fileSystem deny restriction".into(),
+                ));
+            }
+        }
         if let Some(depth) = granted_glob_depth {
             let req_depth = req_fs.get("globScanMaxDepth").and_then(Value::as_u64);
             if req_depth.is_none_or(|rd| depth > rd) {
@@ -3147,6 +3244,46 @@ mod tests {
             )
             .is_err(),
             "raw RequestAnswer granting unrequested network must be rejected"
+        );
+        assert!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::RequestAnswer {
+                    value: json!({
+                        "permissions": {
+                            "fileSystem": {
+                                "entries": [{
+                                    "access": "deny",
+                                    "path": {"type": "special", "value": {"kind": "project_roots", "subpath": 123}}
+                                }]
+                            }
+                        }
+                    })
+                },
+                Some(&json!({})),
+            )
+            .is_err(),
+            "deny-only project_roots entry with numeric subpath must be rejected"
+        );
+        assert!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::RequestAnswer {
+                    value: json!({
+                        "permissions": {
+                            "fileSystem": {"write": ["/repo"]}
+                        }
+                    })
+                },
+                Some(&json!({
+                    "fileSystem": {
+                        "write": ["/repo"],
+                        "entries": [{"access": "deny", "path": {"type": "path", "path": "/repo/.env"}}]
+                    }
+                })),
+            )
+            .is_err(),
+            "enclosing grant omitting requested deny restriction must be rejected"
         );
         assert_eq!(
             encode_codex_approval_result(
