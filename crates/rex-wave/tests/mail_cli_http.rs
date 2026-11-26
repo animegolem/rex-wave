@@ -330,17 +330,11 @@ async fn mail_cli_four_verbs_exit_codes_http_routes_and_offline_tools() {
 
     let s6c = sock_str.clone();
     let tok6c = bob_tok.clone();
+    let fsha6 = flagged_sha.clone();
     let flagged_ack = tokio::task::spawn_blocking(move || {
         rex_wave_at(&s6c)
             .args([
-                "--socket",
-                &s6c,
-                "--token",
-                &tok6c,
-                "--json",
-                "mail",
-                "ack",
-                &flagged_sha,
+                "--socket", &s6c, "--token", &tok6c, "--json", "mail", "ack", &fsha6,
             ])
             .output()
             .expect("flagged ack")
@@ -388,12 +382,38 @@ async fn mail_cli_four_verbs_exit_codes_http_routes_and_offline_tools() {
     assert_eq!(st_search, 200);
     assert_eq!(http_search["hits"].as_array().unwrap().len(), 1);
 
-    // Sam trying to read bob's mail or ack bob's mail via HTTP -> masked as 404 Not Found!
+    // Sam trying to read bob's mail, watch StreamId::Mail, or ack bob's mail (even flagged!) via HTTP -> masked as 404 Not Found!
     let (st_masked_check, _) =
         http_req(http_addr, "GET", "/v1/mail?seat=bob", Some(&sam_tok), None).await;
     assert_eq!(
         st_masked_check, 404,
         "unauthorized GET /v1/mail masked as 404"
+    );
+
+    let (st_masked_stream, _) = http_req(
+        http_addr,
+        "GET",
+        "/v1/events?stream=mail",
+        Some(&sam_tok),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st_masked_stream, 404,
+        "non-operator SSE stream=mail must be masked as 404"
+    );
+
+    let (st_masked_flagged_ack, _) = http_req(
+        http_addr,
+        "POST",
+        "/v1/mail/ack",
+        Some(&sam_tok),
+        Some(&json!({ "target": flagged_sha }).to_string()),
+    )
+    .await;
+    assert_eq!(
+        st_masked_flagged_ack, 404,
+        "non-recipient POST /v1/mail/ack on flagged letter must be masked as 404, never 409"
     );
 
     let (st_masked_ack, _) = http_req(
@@ -534,6 +554,33 @@ async fn mail_cli_four_verbs_exit_codes_http_routes_and_offline_tools() {
         "unreachable daemon must exit 1"
     );
 
+    // Non-mail CLI invalid/denied commands still return exit code 1 (Opus S6)!
+    let s_nonmail = sock_str.clone();
+    let tok_nonmail = sam_tok.clone();
+    let nonmail_denied = tokio::task::spawn_blocking(move || {
+        rex_wave_at(&s_nonmail)
+            .args([
+                "--socket",
+                &s_nonmail,
+                "--token",
+                &tok_nonmail,
+                "--json",
+                "config",
+                "set",
+                "runner.default",
+                "bb",
+            ])
+            .output()
+            .expect("run non-mail denied")
+    })
+    .await
+    .expect("join");
+    assert_eq!(
+        nonmail_denied.status.code(),
+        Some(1),
+        "non-mail denied commands keep exit code 1"
+    );
+
     uds_server.abort();
     http_server.abort();
 }
@@ -602,6 +649,7 @@ async fn herald_never_raises_mail_unrung_for_mutated_after_ack_dissolved_mail() 
             message: Box::new(msg),
             mutated_after_ack: true,
             prior_ack_sha: Some("0".repeat(64)),
+            send_idem: None,
         }),
     };
     herald

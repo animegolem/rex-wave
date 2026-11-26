@@ -904,10 +904,10 @@ enum CliError {
 }
 
 impl CliError {
-    fn exit_code(&self) -> ExitCode {
+    fn exit_code(&self, is_mail_cmd: bool) -> ExitCode {
         match self {
-            CliError::Refused(_)
-            | CliError::Api(ApiError::Denied { .. } | ApiError::Invalid(_)) => {
+            CliError::Refused(_) => ExitCode::from(EXIT_REFUSED),
+            CliError::Api(ApiError::Denied { .. } | ApiError::Invalid(_)) if is_mail_cmd => {
                 ExitCode::from(EXIT_REFUSED)
             }
             CliError::Api(ApiError::Conflict { .. }) | CliError::ConflictValue { .. } => {
@@ -4560,6 +4560,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let sock_path = daemon::resolve_socket_path(cli.socket.as_deref());
     let endpoint = Endpoint::Unix(sock_path.clone());
+    let is_mail_cmd = matches!(cli.cmd, Cmd::Mail(_));
 
     let outcome: Result<ExitCode, CliError> = match cli.cmd {
         Cmd::Daemon(args) => {
@@ -4833,7 +4834,7 @@ async fn main() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             print_error(&err, cli.json);
-            err.exit_code()
+            err.exit_code(is_mail_cmd)
         }
     }
 }

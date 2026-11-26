@@ -110,9 +110,11 @@ CREATE TABLE IF NOT EXISTS mail_fts_meta(
 ) STRICT;
 CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
   sha256 UNINDEXED,
+  msg_id,
   from_seat,
   recipients,
   subject,
+  topic,
   body,
   path,
   tokenize = 'porter unicode61'
@@ -256,15 +258,18 @@ fn index_mail_envelope(tx: &rusqlite::Transaction<'_>, env: &Envelope) -> Result
         ],
     )?;
     if inserted > 0 {
+        let topic_str = message.topic.as_deref().unwrap_or("");
         tx.execute(
-            "INSERT INTO mail_fts(rowid, sha256, from_seat, recipients, subject, body, path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO mail_fts(rowid, sha256, msg_id, from_seat, recipients, subject, topic, body, path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 env.seq.0 as i64,
                 message.sha256.as_str(),
+                message.id,
                 from_seat,
                 recipients_padded,
                 message.subject,
+                topic_str,
                 message.body,
                 path_str.as_ref(),
             ],
@@ -718,6 +723,22 @@ impl Journal {
                 max_supported: JOURNAL_SCHEMA_VERSION,
             });
         }
+        let existing_fts_sql: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mail_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(ref ddl) = existing_fts_sql
+            && (!ddl.contains("msg_id") || !ddl.contains("topic"))
+        {
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS mail_fts;
+                 DELETE FROM mail_fts_meta;
+                 DELETE FROM mail_fts_state;",
+            )?;
+        }
         tx.execute_batch(SCHEMA)?;
         if found < JOURNAL_SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
@@ -967,7 +988,7 @@ impl Journal {
                    m.subject,
                    m.path,
                    m.created_at,
-                   snippet(mail_fts, 4, '[', ']', '...', 18) AS snip
+                   snippet(mail_fts, 6, '[', ']', '...', 18) AS snip
                  FROM mail_fts
                  JOIN mail_fts_meta m ON m.seq = mail_fts.rowid
                  WHERE mail_fts MATCH ?1
@@ -994,10 +1015,13 @@ impl Journal {
 
         match run_query(&fts_query) {
             Ok(hits) => Ok(hits),
-            Err(_) => {
+            Err(rusqlite::Error::SqliteFailure(ffi_err, _))
+                if ffi_err.code == rusqlite::ErrorCode::Unknown =>
+            {
                 let literal = escape_fts_phrase(query.trim());
                 Ok(run_query(&literal)?)
             }
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -1601,6 +1625,7 @@ mod legacy_dm_tests {
                     message: Box::new(msg1.clone()),
                     mutated_after_ack: false,
                     prior_ack_sha: None,
+                    send_idem: None,
                 })],
             )
             .unwrap();
@@ -1614,6 +1639,7 @@ mod legacy_dm_tests {
                     message: Box::new(msg2.clone()),
                     mutated_after_ack: false,
                     prior_ack_sha: None,
+                    send_idem: None,
                 })],
             )
             .unwrap();

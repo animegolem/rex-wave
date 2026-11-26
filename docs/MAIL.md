@@ -33,9 +33,9 @@ rex-wave mail send \
 ```
 
 - 1:1 mail (`--to <one-seat>`, no `--cc`) dissolves into `RoomId::Direct` under `Direct Messages`.
-- Multi-seat mail dissolves into global channel `#mail-<topic-or-subject>`.
+- Multi-seat mail dissolves into a participant-scoped private channel `#mail-<topic-or-subject>-<hash8>` readable only by its participants and the Operator.
 - Pass `--body -` to read the body from stdin.
-- Retries with the same `--id` (or identical canonical bytes) return the existing `sha256` with `replayed: true`.
+- Retries are idempotent when `--id <idem-key>` is supplied (`replayed: true`), scoped per sender principal; reusing `--id` with a different mail payload is refused (`exit 2` / `HTTP 409`). Without `--id`, each call renders a new `created_at` timestamp and distinct `sha256`.
 - Returns `delivery_notices` immediately when a recipient seat is unregistered, dormant, retired, or offline.
 
 ### 2. `rex-wave mail check`
@@ -63,7 +63,7 @@ rex-wave mail ack <sha256-or-path> [--seat <seat>] [--sha256 <hex>] [--note <not
 rex-wave mail search <query> [--seat <seat>] [--limit <n>]
 ```
 
-- BM25-ranked SQLite FTS5 full-text search across subject, body, sender, recipients, topic, and path.
+- BM25-ranked SQLite FTS5 full-text search across message `id`, subject, body, sender, recipients, topic, and path.
 - Non-Operator seats are strictly scoped to mail they sent or received.
 
 ## Mirror Operations & Verification
@@ -106,7 +106,8 @@ Opens `<ro-dir>` strictly read-only, imports all letters and `state/acks.jsonl` 
   objects/<sha256>.md        # immutable content-addressed blob backup
   mail/<slug>.md             # human-readable working-tree letter
   to-<seat>/<slug>.md        # optional legacy per-seat drop directory
-  state/acks.jsonl           # append-only receipt ledger
+  state/acks.jsonl           # append-only receipt ledger (at_ms + note preserved)
+  state/mail-index.jsonl     # append-only provenance ledger for lossless rebuild
 ```
 
 Configuration keys (in `config.toml` or `rex-wave config set`):

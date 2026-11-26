@@ -97,6 +97,46 @@ impl SidebarProjection {
     pub(crate) fn is_member(&self, room: &RoomId, who: &Principal) -> bool {
         self.world.borrow().is_member(room, who)
     }
+
+    pub fn is_member_caught_up(&self, journal: &Journal, room: &RoomId, who: &Principal) -> bool {
+        let stream = StreamId::Room { room: room.clone() };
+        {
+            let world = self.world.borrow();
+            if let Ok(head) = journal.head(&stream)
+                && world.cursor.at(&stream) >= head
+            {
+                return world.is_member(room, who);
+            }
+        }
+        is_room_member_in_journal(journal, room, who)
+    }
+}
+
+pub fn is_room_member_in_journal(journal: &Journal, room: &RoomId, who: &Principal) -> bool {
+    if let RoomId::Direct { pair } = room {
+        return pair.other_for_viewer(who).is_some();
+    }
+    let stream = StreamId::Room { room: room.clone() };
+    let mut after = Seq::ORIGIN;
+    let mut member = false;
+    while let Ok(page) = journal.read(&stream, after, REPLAY_PAGE) {
+        if page.is_empty() {
+            break;
+        }
+        for env in &page {
+            after = env.seq;
+            match &env.event {
+                Event::Room(RoomEvent::MemberJoined { member: m, .. }) if m == who => {
+                    member = true;
+                }
+                Event::Room(RoomEvent::MemberLeft { member: m }) if m == who => {
+                    member = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    member
 }
 
 fn catch_up(journal: &Journal, world: &mut World) -> bool {
@@ -493,6 +533,12 @@ impl World {
                     scope: RoomScope::Global,
                     ..
                 } => {
+                    if room.is_mail_channel()
+                        && !viewer.is_operator_or_system()
+                        && !self.is_member(room, viewer)
+                    {
+                        continue;
+                    }
                     channels.push(ChannelLeaf {
                         room: room.clone(),
                         unread,

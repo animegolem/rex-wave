@@ -521,6 +521,12 @@ fn ensure_wave_name_policy(
             action: format!("open reserved wave channel #{name} without wave origin"),
         });
     }
+    if id.is_mail_channel() && !by.is_operator_or_system() {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: "open reserved mail channel without system or operator authority".into(),
+        });
+    }
     Ok(())
 }
 
@@ -538,6 +544,12 @@ fn ensure_existing_room_write_access(
             what: format!("room {id:?}"),
         });
     };
+    if id.is_mail_channel() && !state.has_member(by) && !by.is_operator_or_system() {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("{action} in private mail channel without membership"),
+        });
+    }
     if let RoomOrigin::Wave { wave } = origin {
         let allowed = state.has_member(by) || by.is_operator_or_system();
         if !allowed {
@@ -711,6 +723,15 @@ impl Decider for Rooms {
                     .map_or(&RoomOrigin::Manual, |(_, o)| o);
 
                 if target == *ctx.by() {
+                    if id.is_mail_channel()
+                        && !ctx.by().is_operator_or_system()
+                        && !state.has_member(ctx.by())
+                    {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: "self-join private mail channel".into(),
+                        });
+                    }
                     if let RoomOrigin::Wave { wave } = origin {
                         let allowed = ctx.by().is_operator_or_system()
                             || matches!(ctx.by(), Principal::Worker { wave: w, .. } if w == wave)
@@ -724,8 +745,11 @@ impl Decider for Rooms {
                         }
                     }
                 } else {
-                    let can_invite =
-                        ctx.by().is_operator_or_system() || state.opener.as_ref() == Some(ctx.by());
+                    let can_invite = if id.is_mail_channel() {
+                        ctx.by().is_operator_or_system()
+                    } else {
+                        ctx.by().is_operator_or_system() || state.opener.as_ref() == Some(ctx.by())
+                    };
                     if !can_invite {
                         return Err(ApiError::Denied {
                             principal: ctx.by().to_string(),
@@ -827,6 +851,16 @@ impl Decider for Rooms {
                             }
                         }
                         Some(RoomOrigin::Manual) => {
+                            if id.is_mail_channel()
+                                && !state.has_member(ctx.by())
+                                && !ctx.by().is_operator_or_system()
+                            {
+                                return Err(ApiError::Denied {
+                                    principal: ctx.by().to_string(),
+                                    action: "post to private mail channel without membership"
+                                        .into(),
+                                });
+                            }
                             if !members.values().any(|p| p == ctx.by())
                                 && !matches!(ctx.by(), Principal::System { .. })
                             {

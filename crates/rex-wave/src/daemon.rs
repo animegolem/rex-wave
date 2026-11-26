@@ -504,15 +504,15 @@ fn spawn_presence_disconnect_worker(
 
 fn spawn_mail_reconcile_poller(mail: Arc<MailBridge>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        const POLL_INTERVAL: Duration = Duration::from_millis(500);
-        const MAX_BACKOFF: Duration = Duration::from_secs(5);
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
         let mut err_streak: u32 = 0;
         loop {
             let sleep_dur = if err_streak == 0 {
                 POLL_INTERVAL
             } else {
                 let shift = err_streak.saturating_sub(1).min(4);
-                Duration::from_millis(500u64.saturating_mul(1u64 << shift)).min(MAX_BACKOFF)
+                Duration::from_secs(5u64.saturating_mul(1u64 << shift)).min(MAX_BACKOFF)
             };
             tokio::time::sleep(sleep_dur).await;
             match mail.reconcile().await {
@@ -752,7 +752,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let room_svc = Registry::<Rooms>::new(journal.clone(), hub.clone());
     let mail_bridge = Arc::new(
-        MailBridge::with_hub(sandbox.clone(), journal.clone(), mail_writer, hub.clone())
+        MailBridge::open_with_hub(sandbox.clone(), journal.clone(), mail_writer, hub.clone())
+            .map_err(|e| format!("init mail bridge: {e}"))?
             .with_room_service(room_svc.clone())
             .with_config_watch(config_svc.subscribe())
             .with_house_profile(presence.house().clone()),
@@ -781,7 +782,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             return Err(format!("startup mail reconcile refused: {action}"));
         }
         Err(err) => {
-            eprintln!("rex-wave daemon: startup mail reconcile warning: {err}");
+            return Err(format!("startup mail reconcile failed: {err}"));
         }
     }
 

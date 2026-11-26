@@ -336,7 +336,15 @@ async fn dissolved_mail_projects_1to1_dms_to_sidebar_multi_seat_channels_and_fts
     .await
     .expect("1:1 dissolved mail appears directly under Direct Messages in SidebarProjection");
 
-    // 3. Multi-seat mail (alice -> bob + sam) projects into #mail-arch-sync channel.
+    // 3. Multi-seat mail (alice -> bob + sam) projects into participant-scoped #mail-arch-sync-<hash8> channel.
+    let expected_group_room = rex_wave_mailbridge::derive_mail_room(
+        "alice",
+        &[bob.clone(), sam.clone()],
+        &[],
+        Some("arch-sync"),
+        "Quarterly architecture sync",
+        &first.sha256,
+    );
     let group = alice_client
         .call(MailSend {
             to: vec![bob.clone(), sam.clone()],
@@ -353,12 +361,17 @@ async fn dissolved_mail_projects_1to1_dms_to_sidebar_multi_seat_channels_and_fts
         })
         .await
         .expect("send multi-seat mail");
-    assert_eq!(
-        group.room,
-        Some(RoomId::Channel {
-            scope: RoomScope::Global,
-            name: ChannelName::parse("mail-arch-sync").expect("chan"),
-        })
+    assert_eq!(group.room, expected_group_room);
+    assert!(
+        matches!(
+            &group.room,
+            Some(RoomId::Channel {
+                scope: RoomScope::Global,
+                name
+            }) if name.as_str().starts_with("mail-arch-sync-")
+        ),
+        "expected participant-hashed mail channel, got {:?}",
+        group.room
     );
 
     // 4. Principal-scoped FTS5 search: sam sees group mail, NEVER sees alice<->bob 1:1 DM!
@@ -714,4 +727,669 @@ fn protected_roots_blocks_rebuild_and_migrate_verify_targets() {
     )
     .expect_err("migrate-verify work_dir inside protected root must be refused");
     assert!(matches!(mv_err, SandboxError::Production(_)));
+    assert!(
+        !protected_dir.join("work").exists(),
+        "migrate-verify must never create a directory inside protected/interchange root before refusing"
+    );
+}
+
+#[tokio::test]
+async fn council_round2_privacy_scoped_idem_rebuild_edits_extra_recips_crash_and_ack_auth() {
+    use rex_wave_api::read::{Read, Sidebar};
+    use rex_wave_api::room::{Body, RoomEvent, RoomJoin, RoomPost, RoomRef};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mirror_dir = tmp.path().join("mirror");
+    let journal_path = tmp.path().join("journal.sqlite3");
+    let protection = Protection {
+        roots: Vec::new(),
+        names: vec!["forbidden-box".into()],
+    };
+    let sandbox = make_sandbox(&mirror_dir, &protection);
+
+    let alice = SeatName::parse("alice").unwrap();
+    let bob = SeatName::parse("bob").unwrap();
+    let carol = SeatName::parse("carol").unwrap();
+    let dan = SeatName::parse("dan").unwrap();
+    let eve = SeatName::parse("eve").unwrap();
+    let owner = SeatName::parse("owner").unwrap();
+
+    // --- Check 1 (Astra B4): Protected descendant refused BEFORE mkdir ---
+    let mirror_target =
+        rex_wave_mailbridge::MirrorTarget::open_verified(&mirror_dir, None, &protection)
+            .expect("open mirror");
+    let forbidden_res =
+        mirror_target.export_working_tree_if_absent(Path::new("forbidden-box/leak.md"), b"hello\n");
+    assert!(matches!(forbidden_res, Err(ApiError::Denied { .. })));
+    assert!(
+        !mirror_dir.join("forbidden-box").exists(),
+        "protected directory name must be rejected BEFORE mkdir"
+    );
+
+    // --- Check 2 (Astra B7 + Opus S2): Crash after SQLite commit before RoomPost, then restart repairs room + preserves `re` ---
+    let crash_parent_sha = {
+        let j1 = Journal::open(&journal_path).unwrap();
+        let w1 = j1.claim(StreamId::Mail).unwrap();
+        // No room_svc attached -> simulates crash between SQLite MessageCommitted and RoomPost!
+        let b1 = MailBridge::open(sandbox.clone(), j1, w1).unwrap();
+        let WireReply::MailSend(sent) = b1
+            .dispatch(
+                MailCommand::MailSend(MailSend {
+                    to: vec![bob.clone()],
+                    cc: Vec::new(),
+                    subject: "Parent before crash".into(),
+                    body: "Committed before room projection.".into(),
+                    from: Some(alice.clone()),
+                    priority: LetterPriority::Normal,
+                    topic: Some("thread-repair".into()),
+                    in_reply_to: None,
+                    refs: Vec::new(),
+                    wait_export: true,
+                    idem: Some(IdemKey::parse("shared-key").unwrap()),
+                }),
+                DecideCtx::for_test(
+                    Principal::Seat {
+                        seat: alice.clone(),
+                    },
+                    UnixMs(1_795_510_000_000),
+                ),
+            )
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(
+            sent.room_seq.is_none(),
+            "no room post yet during planted crash"
+        );
+        sent.sha256
+    };
+
+    // Boot incarnation 2 WITH room_svc -> reconcile repairs the missing DM post!
+    let dm_alice_bob = RoomId::Direct {
+        pair: PrincipalPair::new(
+            Principal::Seat {
+                seat: alice.clone(),
+            },
+            Principal::Seat { seat: bob.clone() },
+        )
+        .unwrap(),
+    };
+    let parent_room_seq = {
+        let j2 = Journal::open(&journal_path).unwrap();
+        let hub2 = Hub::new(128);
+        let room_svc2 = Registry::<Rooms>::new(j2.clone(), hub2.clone());
+        let w2 = j2.claim(StreamId::Mail).unwrap();
+        let b2 = MailBridge::open_with_hub(sandbox.clone(), j2.clone(), w2, hub2)
+            .unwrap()
+            .with_room_service(room_svc2);
+        b2.reconcile().await.unwrap();
+
+        let dm_entries = j2
+            .read(
+                &StreamId::Room {
+                    room: dm_alice_bob.clone(),
+                },
+                Seq::ORIGIN,
+                32,
+            )
+            .unwrap();
+        let posted = dm_entries
+            .iter()
+            .find(|e| matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
+            .expect("reconcile repaired missing room post");
+        posted.seq
+    };
+
+    // Boot incarnation 3 (cold restart) -> reply naming crash_parent_sha MUST hydrate room_post_seqs and set `re = Some(parent_room_seq)`!
+    let journal = Journal::open(&journal_path).unwrap();
+    let hub = Hub::new(256);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let room_svc = Registry::<Rooms>::new(journal.clone(), hub.clone());
+    let presence_svc = Presence::default().registry(journal.clone(), hub.clone());
+    let mail_writer = journal.claim(StreamId::Mail).unwrap();
+    let mail_svc = Arc::new(
+        MailBridge::open_with_hub(sandbox.clone(), journal.clone(), mail_writer, hub.clone())
+            .unwrap()
+            .with_room_service(room_svc.clone()),
+    );
+    let router = Arc::new(Router {
+        room: room_svc,
+        mail: mail_svc.clone(),
+        presence: presence_svc,
+        ..Router::unavailable_with(Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar: sidebar.clone(),
+            agents: Arc::new(NoAgentFeed),
+        }))
+    });
+
+    let alice_c = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: alice.clone(),
+        },
+    );
+    let bob_c = LocalClient::new(router.clone(), Principal::Seat { seat: bob.clone() });
+    let carol_c = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: carol.clone(),
+        },
+    );
+    let dan_c = LocalClient::new(router.clone(), Principal::Seat { seat: dan.clone() });
+    let eve_c = LocalClient::new(router.clone(), Principal::Seat { seat: eve.clone() });
+    let worker_c = LocalClient::new(
+        router.clone(),
+        Principal::Worker {
+            wave: WaveSlug::parse("w1").unwrap(),
+            role: RoleName::parse("r1").unwrap(),
+        },
+    );
+    let owner_c = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: owner.clone(),
+        },
+    );
+
+    let threaded_reply = bob_c
+        .call(MailSend {
+            to: vec![alice.clone()],
+            cc: Vec::new(),
+            subject: "Re: Parent before crash".into(),
+            body: "Threaded after cold restart.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("thread-repair".into()),
+            in_reply_to: Some(crash_parent_sha.as_str().to_owned()),
+            refs: Vec::new(),
+            wait_export: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let dm_entries = journal
+        .read(
+            &StreamId::Room {
+                room: dm_alice_bob.clone(),
+            },
+            Seq::ORIGIN,
+            32,
+        )
+        .unwrap();
+    let reply_env = dm_entries
+        .iter()
+        .find(|e| Some(e.seq) == threaded_reply.room_seq)
+        .expect("reply room post");
+    assert!(
+        matches!(
+            reply_env.event,
+            Event::Room(RoomEvent::Posted { re: Some(r), .. }) if r == parent_room_seq
+        ),
+        "cold-restart reply must link re = Some({parent_room_seq:?}), got {:?}",
+        reply_env.event
+    );
+
+    // --- Check 3 (Opus B1 + Astra B1): StreamId::Mail blocked for seats/workers, participant-scoped private #mail-* channels ---
+    for non_op in [&alice_c, &dan_c, &worker_c] {
+        assert!(
+            matches!(
+                non_op
+                    .call(Read::stream(StreamId::Mail, Seq::ORIGIN, None))
+                    .await,
+                Err(ApiError::Denied { .. })
+            ),
+            "non-operators must never read StreamId::Mail"
+        );
+        assert!(
+            matches!(
+                non_op
+                    .watch(
+                        Interest::Streams {
+                            streams: vec![StreamId::Mail]
+                        },
+                        Cursor::default()
+                    )
+                    .await,
+                Err(ApiError::Denied { .. })
+            ),
+            "non-operators must never watch StreamId::Mail"
+        );
+    }
+    assert!(
+        owner_c
+            .call(Read::stream(StreamId::Mail, Seq::ORIGIN, None))
+            .await
+            .is_ok(),
+        "operator retains StreamId::Mail read access"
+    );
+
+    // Two unrelated groups with the SAME topic "status" get distinct private channels!
+    let grp1 = alice_c
+        .call(MailSend {
+            to: vec![bob.clone(), carol.clone()],
+            cc: Vec::new(),
+            subject: "Status check".into(),
+            body: "Secret group 1 status.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("status".into()),
+            in_reply_to: None,
+            refs: Vec::new(),
+            wait_export: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let grp2 = alice_c
+        .call(MailSend {
+            to: vec![dan.clone(), eve.clone()],
+            cc: Vec::new(),
+            subject: "Status check".into(),
+            body: "Secret group 2 status.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("status".into()),
+            in_reply_to: None,
+            refs: Vec::new(),
+            wait_export: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let grp1_room = grp1.room.clone().expect("grp1 room");
+    let grp2_room = grp2.room.clone().expect("grp2 room");
+    assert_ne!(
+        grp1_room, grp2_room,
+        "unrelated recipient groups on the same topic must never share a channel"
+    );
+
+    // Participants (carol) can read grp1_room; non-participants (dan, worker) are Denied on read, join, post, and hidden in Sidebar!
+    assert!(
+        carol_c
+            .call(Read::stream(
+                StreamId::Room {
+                    room: grp1_room.clone()
+                },
+                Seq::ORIGIN,
+                None
+            ))
+            .await
+            .is_ok()
+    );
+    for outsider in [&dan_c, &worker_c] {
+        assert!(matches!(
+            outsider
+                .call(Read::stream(
+                    StreamId::Room {
+                        room: grp1_room.clone()
+                    },
+                    Seq::ORIGIN,
+                    None
+                ))
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+        assert!(matches!(
+            outsider
+                .call(RoomJoin {
+                    room: RoomRef::Id {
+                        id: grp1_room.clone()
+                    },
+                    member: None,
+                    handle: None,
+                })
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+        assert!(matches!(
+            outsider
+                .call(RoomPost::new(
+                    RoomRef::Id {
+                        id: grp1_room.clone()
+                    },
+                    Body::parse("intrude").unwrap(),
+                ))
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let dan_sb = dan_c.call(Sidebar {}).await.unwrap();
+    assert!(
+        !dan_sb.channels.iter().any(|c| c.room == grp1_room),
+        "non-participant sidebar must omit private mail channel"
+    );
+
+    // --- Check 4 (Opus S3 + Astra B2 + Opus B2): Principal-scoped `--id`, conflict on different payload, self-cc preserved ---
+    // Bob using the exact same `--id shared-key` gets his OWN message, never Alice's!
+    let bob_same_key = bob_c
+        .call(MailSend {
+            to: vec![carol.clone()],
+            cc: Vec::new(),
+            subject: "Bob independent send".into(),
+            body: "Different principal, same caller key.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: None,
+            in_reply_to: None,
+            refs: Vec::new(),
+            wait_export: true,
+            idem: Some(IdemKey::parse("shared-key").unwrap()),
+        })
+        .await
+        .unwrap();
+    assert!(!bob_same_key.replayed);
+    assert_ne!(bob_same_key.sha256, crash_parent_sha);
+
+    // Alice reusing `shared-key` with DIFFERENT payload must return Conflict (409)!
+    let idem_conflict = alice_c
+        .call(MailSend {
+            to: vec![bob.clone()],
+            cc: Vec::new(),
+            subject: "Parent before crash".into(),
+            body: "DIFFERENT BODY REUSING KEY".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("thread-repair".into()),
+            in_reply_to: None,
+            refs: Vec::new(),
+            wait_export: false,
+            idem: Some(IdemKey::parse("shared-key").unwrap()),
+        })
+        .await
+        .expect_err("reusing --id with different payload must conflict");
+    assert!(matches!(idem_conflict, ApiError::Conflict { .. }));
+
+    // Opus B2: `--from alice --to bob --cc alice` preserves `cc=[alice]` and Channel room across rebuild!
+    let self_cc = alice_c
+        .call(MailSend {
+            to: vec![bob.clone()],
+            cc: vec![alice.clone()],
+            subject: "Self CC probe".into(),
+            body: "Keep explicit frontmatter cc.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("self-cc-probe".into()),
+            in_reply_to: None,
+            refs: Vec::new(),
+            wait_export: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(self_cc.cc, vec![alice.clone()]);
+    assert!(matches!(self_cc.room, Some(RoomId::Channel { .. })));
+
+    // --- Check 5 (Astra B5 + Opus S4 + Astra S1 + Astra B8 + Astra S4 + Astra N1):
+    //     3 revisions of a letter without frontmatter `id`, pre-ack edit order, ACK note + ms precision, ACK auth ordering ---
+    let plain_path = mirror_dir.join("mail/plain-no-fm.md");
+    let rev0 = b"---\nfrom: alice\nto: bob\nsubject: No frontmatter id\n---\n\nRevision zero.\n";
+    let rev0_sha = sha256_of(rev0);
+    fs::write(&plain_path, rev0).unwrap();
+    mail_svc.reconcile().await.unwrap();
+
+    // Ack rev0 with millisecond precision + note!
+    mail_svc
+        .dispatch(
+            MailCommand::MailAck(MailAck {
+                path: Some(Path::new("mail/plain-no-fm.md").to_path_buf()),
+                sha256: None,
+                seat: None,
+                note: Some("rev0 note preserved".into()),
+            }),
+            DecideCtx::for_test(
+                Principal::Seat { seat: bob.clone() },
+                UnixMs(1_795_520_000_123),
+            ),
+        )
+        .await
+        .unwrap();
+    // Retry ACK with a different note/time -> committed receipt must NOT be overwritten!
+    mail_svc
+        .dispatch(
+            MailCommand::MailAck(MailAck {
+                path: None,
+                sha256: Some(rev0_sha.clone()),
+                seat: None,
+                note: Some("late retry note ignored".into()),
+            }),
+            DecideCtx::for_test(
+                Principal::Seat { seat: bob.clone() },
+                UnixMs(1_795_520_999_999),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Edit twice in place after ack!
+    let rev1 =
+        b"---\nfrom: alice\nto: bob\nsubject: No frontmatter id\n---\n\nRevision ONE after ack.\n";
+    let rev1_sha = sha256_of(rev1);
+    fs::write(&plain_path, rev1).unwrap();
+    mail_svc.reconcile().await.unwrap();
+
+    let rev2 =
+        b"---\nfrom: alice\nto: bob\nsubject: No frontmatter id\n---\n\nRevision TWO after ack.\n";
+    let rev2_sha = sha256_of(rev2);
+    fs::write(&plain_path, rev2).unwrap();
+    mail_svc.reconcile().await.unwrap();
+
+    // Opus S4: Edit BEFORE ack (`pre_a` -> `pre_b`), then ack `pre_a` -> `pre_b` stays unflagged across rebuild!
+    let pre_path = mirror_dir.join("mail/pre-ack-edit.md");
+    let pre_a = b"---\nid: pre-a\nfrom: alice\nto: bob\nsubject: Pre ack\n---\n\nVersion A.\n";
+    let pre_a_sha = sha256_of(pre_a);
+    fs::write(&pre_path, pre_a).unwrap();
+    mail_svc.reconcile().await.unwrap();
+    let pre_b =
+        b"---\nid: pre-b\nfrom: alice\nto: bob\nsubject: Pre ack\n---\n\nVersion B before ack.\n";
+    let pre_b_sha = sha256_of(pre_b);
+    fs::write(&pre_path, pre_b).unwrap();
+    mail_svc.reconcile().await.unwrap();
+    bob_c
+        .call(MailAck {
+            path: None,
+            sha256: Some(pre_a_sha.clone()),
+            seat: None,
+            note: None,
+        })
+        .await
+        .unwrap();
+
+    // Astra S4: Path-only ACK by bob on `mail/plain-no-fm.md` must resolve to current flagged rev2 and REFUSE with Conflict!
+    assert!(matches!(
+        bob_c
+            .call(MailAck {
+                path: Some(Path::new("mail/plain-no-fm.md").to_path_buf()),
+                sha256: None,
+                seat: None,
+                note: None,
+            })
+            .await,
+        Err(ApiError::Conflict { .. })
+    ));
+
+    // Astra B8: Non-recipient `dan` probing `mail/plain-no-fm.md` (flagged!) or wrong sha on `mail/plain-no-fm.md`
+    // MUST get `Denied` (masked as 404 on HTTP), NEVER `Conflict`!
+    assert!(matches!(
+        dan_c
+            .call(MailAck {
+                path: Some(Path::new("mail/plain-no-fm.md").to_path_buf()),
+                sha256: None,
+                seat: None,
+                note: None,
+            })
+            .await,
+        Err(ApiError::Denied { .. })
+    ));
+    assert!(matches!(
+        dan_c
+            .call(MailAck {
+                path: Some(Path::new("mail/plain-no-fm.md").to_path_buf()),
+                sha256: Some(Sha256Hex::parse("f".repeat(64)).unwrap()),
+                seat: None,
+                note: None,
+            })
+            .await,
+        Err(ApiError::Denied { .. })
+    ));
+
+    // Astra N1: FTS5 finds imported letter by frontmatter `id` and `topic` even when filename differs!
+    let custom_id_file = mirror_dir.join("mail/unrelated-filename.md");
+    fs::write(
+        &custom_id_file,
+        b"---\nid: custom-msg-id-991\nfrom: alice\nto: bob\nsubject: Plain title\ntopic: custom-topic-772\n---\n\nPlain text.\n",
+    )
+    .unwrap();
+    mail_svc.reconcile().await.unwrap();
+    let id_hits = bob_c
+        .call(MailSearch {
+            query: "custom-msg-id-991".into(),
+            seat: None,
+            limit: Some(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(id_hits.hits.len(), 1);
+    let topic_hits = bob_c
+        .call(MailSearch {
+            query: "custom-topic-772".into(),
+            seat: None,
+            limit: Some(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(topic_hits.hits.len(), 1);
+
+    // Delete journal.sqlite3, run offline `rebuild_mail_from_mirror`, and verify:
+    // 1) Both rev1_sha and rev2_sha stay flagged (`EditNeverRingable`, NEVER unread!),
+    // 2) `pre_b_sha` stays unflagged (`Opus S4`),
+    // 3) `self_cc` keeps `cc=[alice]` and its exact Channel room (`Opus B2`),
+    // 4) `rev0_sha` ACK keeps `UnixMs(1_795_520_000_123)` and `"rev0 note preserved"` (`Astra S1`),
+    // 5) Retrying Alice's original `shared-key` `MailSend` returns `replayed=true` without duplicating (`Astra B2`)!
+    let count_before_rebuild = mail_svc.mail_state_snapshot().await.messages.len();
+    drop(alice_c);
+    drop(bob_c);
+    drop(carol_c);
+    drop(dan_c);
+    drop(eve_c);
+    drop(worker_c);
+    drop(owner_c);
+    drop(router);
+    drop(mail_svc);
+    drop(journal);
+
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = journal_path.as_os_str().to_os_string();
+        p.push(suffix);
+        let _ = fs::remove_file(std::path::PathBuf::from(p));
+    }
+
+    rebuild_mail_from_mirror(&mirror_dir, &journal_path, &AliasMap::empty(), &protection)
+        .expect("rebuild");
+
+    let j_after = Journal::open(&journal_path).unwrap();
+    let st_after = MailState::from_journal(&j_after).unwrap();
+    assert!(st_after.flagged_shas.contains(&rev1_sha));
+    assert!(st_after.flagged_shas.contains(&rev2_sha));
+    assert!(!st_after.ringable_for_seat(&bob).contains(&rev1_sha));
+    assert!(!st_after.ringable_for_seat(&bob).contains(&rev2_sha));
+    assert!(!st_after.flagged_shas.contains(&pre_b_sha));
+    assert!(st_after.ringable_for_seat(&bob).contains(&pre_b_sha));
+
+    let rebuilt_self_cc = &st_after.messages[&self_cc.sha256].message;
+    assert_eq!(rebuilt_self_cc.cc, vec![alice.clone()]);
+    assert_eq!(rebuilt_self_cc.room, self_cc.room);
+
+    let rebuilt_ack = &st_after.ack_records[&(bob.clone(), rev0_sha)];
+    assert_eq!(rebuilt_ack.at, UnixMs(1_795_520_000_123));
+    assert_eq!(rebuilt_ack.note.as_deref(), Some("rev0 note preserved"));
+
+    let w_after = j_after.claim(StreamId::Mail).unwrap();
+    let b_after = MailBridge::open(sandbox, j_after, w_after).unwrap();
+    let WireReply::MailSend(replayed_after_rebuild) = b_after
+        .dispatch(
+            MailCommand::MailSend(MailSend {
+                to: vec![bob.clone()],
+                cc: Vec::new(),
+                subject: "Parent before crash".into(),
+                body: "Committed before room projection.".into(),
+                from: Some(alice.clone()),
+                priority: LetterPriority::Normal,
+                topic: Some("thread-repair".into()),
+                in_reply_to: None,
+                refs: Vec::new(),
+                wait_export: false,
+                idem: Some(IdemKey::parse("shared-key").unwrap()),
+            }),
+            DecideCtx::for_test(
+                Principal::Seat {
+                    seat: alice.clone(),
+                },
+                UnixMs(1_795_599_000_000),
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(replayed_after_rebuild.replayed);
+    assert_eq!(replayed_after_rebuild.sha256, crash_parent_sha);
+    assert_eq!(
+        b_after.mail_state_snapshot().await.messages.len(),
+        count_before_rebuild,
+        "retry after rebuild must not create a duplicate message"
+    );
+
+    // --- Check 6 (Astra B3 + Astra B6): migrate-verify preserves mailbox-derived extra recipient & protects pre-existing work-dir journal ---
+    let src_interchange = tmp.path().join("src-interchange");
+    fs::create_dir_all(src_interchange.join("mail")).unwrap();
+    fs::create_dir_all(src_interchange.join("to-dan")).unwrap();
+    let shared_letter =
+        b"---\nid: 1795530000000-alice-to-bob\nfrom: alice\nto: [bob, carol]\nsubject: Extra mailbox copy\n---\n\nDelivered to Dan via box.\n";
+    fs::write(src_interchange.join("mail/shared.md"), shared_letter).unwrap();
+    fs::write(src_interchange.join("to-dan/shared.md"), shared_letter).unwrap();
+
+    // Overlap inside read-only source is refused BEFORE mkdir!
+    let overlap_target = src_interchange.join("nested-work");
+    assert!(
+        migrate_verify_interchange(
+            &src_interchange,
+            &overlap_target,
+            &AliasMap::empty(),
+            &Protection::default()
+        )
+        .is_err()
+    );
+    assert!(
+        !overlap_target.exists(),
+        "migrate-verify must reject work_dir inside interchange_dir before creating it"
+    );
+
+    // Pre-existing journal.sqlite3 in --work-dir is untouched!
+    let existing_work = tmp.path().join("existing-work");
+    fs::create_dir_all(&existing_work).unwrap();
+    let precious_journal = existing_work.join("journal.sqlite3");
+    fs::write(&precious_journal, b"precious-user-journal-bytes").unwrap();
+
+    let mv_report = migrate_verify_interchange(
+        &src_interchange,
+        &existing_work,
+        &AliasMap::empty(),
+        &Protection::default(),
+    )
+    .expect("migrate-verify with extra mailbox recipient");
+    assert!(
+        mv_report.parity_ok,
+        "strict parity check must pass with mailbox-derived recipient preserved: {mv_report:?}"
+    );
+    assert_eq!(
+        fs::read(&precious_journal).unwrap(),
+        b"precious-user-journal-bytes",
+        "pre-existing journal.sqlite3 in --work-dir must never be touched or deleted"
+    );
 }

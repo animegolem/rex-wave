@@ -221,6 +221,8 @@ pub struct AckRecord {
     pub sha256_full: Option<Sha256Hex>,
     pub sha16: Option<String>,
     pub ts: Option<String>,
+    pub at_ms: Option<rex_wave_api::UnixMs>,
+    pub note: Option<String>,
 }
 
 impl AckRecord {
@@ -373,6 +375,20 @@ fn extract_single_path(
     None
 }
 
+fn extract_at_ms(obj: &serde_json::Map<String, serde_json::Value>) -> Option<rex_wave_api::UnixMs> {
+    obj.get("at_ms")
+        .and_then(|v| v.as_u64())
+        .map(rex_wave_api::UnixMs)
+}
+
+fn extract_note(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    obj.get("note")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Extracts zero or more [`AckRecord`]s from a single parsed JSON object row.
 pub fn parse_ack_value(
     val: &serde_json::Value,
@@ -382,6 +398,8 @@ pub fn parse_ack_value(
     let obj = val.as_object()?;
     let (parent_seat, parent_raw_seat) = extract_seat(obj, aliases);
     let ts = extract_ts(obj);
+    let at_ms = extract_at_ms(obj);
+    let note = extract_note(obj);
     let (parent_full, parent_short) = extract_digests(obj);
 
     let mut out = Vec::new();
@@ -395,6 +413,8 @@ pub fn parse_ack_value(
             sha256_full: parent_full.clone(),
             sha16: parent_short.clone(),
             ts: ts.clone(),
+            at_ms,
+            note: note.clone(),
         });
     } else if parent_full.is_some() || parent_short.is_some() {
         out.push(AckRecord {
@@ -405,6 +425,8 @@ pub fn parse_ack_value(
             sha256_full: parent_full.clone(),
             sha16: parent_short.clone(),
             ts: ts.clone(),
+            at_ms,
+            note: note.clone(),
         });
     }
 
@@ -423,6 +445,8 @@ pub fn parse_ack_value(
                         sha256_full: parent_full.clone(),
                         sha16: parent_short.clone(),
                         ts: ts.clone(),
+                        at_ms,
+                        note: note.clone(),
                     });
                 }
             } else if let Some(item_obj) = item.as_object() {
@@ -438,6 +462,8 @@ pub fn parse_ack_value(
                         sha256_full: item_full.or_else(|| parent_full.clone()),
                         sha16: item_short.or_else(|| parent_short.clone()),
                         ts: extract_ts(item_obj).or_else(|| ts.clone()),
+                        at_ms: extract_at_ms(item_obj).or(at_ms),
+                        note: extract_note(item_obj).or_else(|| note.clone()),
                     });
                 }
             }

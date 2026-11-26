@@ -18,7 +18,9 @@ use rex_wave_api::room::{
     TaskSpec, TaskStatus, TaskTransition, TaskUpdate,
 };
 use rex_wave_api::*;
-use rex_wave_runtime::{LocalClient, Router, can_read_visible, mask_unauthorized_as_not_found};
+use rex_wave_runtime::{
+    LocalClient, Router, can_read_visible, can_read_visible_in, mask_unauthorized_as_not_found,
+};
 use rex_wave_transport::{Authenticator, Credential};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -901,11 +903,13 @@ fn check_room_visible(
         .read
         .resolve_room_ref(room_ref, principal)
         .map_err(HttpError::from_api)?;
-    can_read_visible(
+    can_read_visible_in(
         principal,
         &StreamId::Room {
             room: room_id.clone(),
         },
+        &router.read.journal,
+        Some(&router.read.sidebar),
         format!("room {raw_label}"),
     )
     .map_err(HttpError::from_api)?;
@@ -1534,7 +1538,14 @@ async fn dispatch_json_route(
                     },
                     None => r.stream.clone(),
                 };
-                can_read_visible(&principal, &target_stream, &tool).map_err(HttpError::from_api)?;
+                can_read_visible_in(
+                    &principal,
+                    &target_stream,
+                    &router.read.journal,
+                    Some(&router.read.sidebar),
+                    &tool,
+                )
+                .map_err(HttpError::from_api)?;
             }
             if let WireCommand::PresenceBind(ref b) = cmd
                 && matches!(
@@ -1590,7 +1601,14 @@ fn parse_sse_interest_and_cursor(
         }
     } else if let Some(stream_raw) = req.query_param("stream") {
         let stream = parse_sse_stream_param(stream_raw).map_err(HttpError::from_api)?;
-        can_read_visible(principal, &stream, "stream").map_err(HttpError::from_api)?;
+        can_read_visible_in(
+            principal,
+            &stream,
+            &router.read.journal,
+            Some(&router.read.sidebar),
+            "stream",
+        )
+        .map_err(HttpError::from_api)?;
         single_stream = Some(stream.clone());
         Interest::Streams {
             streams: vec![stream],

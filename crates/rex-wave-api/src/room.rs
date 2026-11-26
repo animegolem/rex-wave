@@ -34,6 +34,19 @@ pub enum RoomId {
     Direct { pair: PrincipalPair },
 }
 
+impl RoomId {
+    /// True when this room is a participant-scoped `#mail-*` dissolved mail channel.
+    pub fn is_mail_channel(&self) -> bool {
+        matches!(
+            self,
+            RoomId::Channel {
+                scope: RoomScope::Global,
+                name,
+            } if name.as_str().starts_with("mail-")
+        )
+    }
+}
+
 /// An unordered pair of distinct principals, stored normalized (lo < hi).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "(Principal, Principal)", into = "(Principal, Principal)")]

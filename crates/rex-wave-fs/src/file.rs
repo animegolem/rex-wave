@@ -233,6 +233,32 @@ pub fn open_lock_nofollow(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Acquire an exclusive advisory `flock` on an already-opened lock file handle.
+pub fn lock_exclusive_blocking(file: &File) -> io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)
+}
+
+/// Atomically claim `path` by renaming it to `<parent>/<claim_prefix><orig_name>`
+/// after verifying `path` still refers to regular file `expected` (`O_NOFOLLOW`).
+pub fn claim_regular_sibling(
+    path: &Path,
+    expected: FileId,
+    claim_prefix: &str,
+) -> io::Result<PathBuf> {
+    verify_same_regular_nofollow(path, expected)?;
+    let parent = parent_of(path)?;
+    let orig_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has non-UTF-8 or missing file name", path.display()),
+        )
+    })?;
+    let claim_path = parent.join(format!("{claim_prefix}{orig_name}"));
+    refuse_symlink_leaf(&claim_path)?;
+    fs::rename(path, &claim_path)?;
+    Ok(claim_path)
+}
+
 /// Create a fresh, exclusive temp file beside `path` (never following a
 /// symlink), fill it with `bytes` at `mode`, and sync it. Returns its path.
 fn write_temp_sibling(path: &Path, bytes: &[u8], mode: u32) -> io::Result<PathBuf> {
@@ -339,6 +365,9 @@ pub fn write_atomic_if_absent_path(
     mode: u32,
     sync_dir: bool,
 ) -> io::Result<bool> {
+    if entry_exists(path) {
+        return Ok(false);
+    }
     let tmp = write_temp_sibling(path, bytes, mode)?;
     let linked = fs::hard_link(&tmp, path);
     let _ = fs::remove_file(&tmp);
