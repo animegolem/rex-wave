@@ -1253,6 +1253,7 @@ fn gate1_case_06_a_transport_dies() {
                 incarnation_id: IncarnationId::parse("inc-quinn").unwrap(),
                 expected_epoch: None,
                 lease_expires_at: None,
+                only_if_pending_canary: false,
                 reason: "single thread EOF".into(),
             }),
             |_, _| true,

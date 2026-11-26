@@ -205,6 +205,10 @@ struct StrictMailToml {
     #[serde(default)]
     reconnect_grace_ms: Option<u64>,
     #[serde(default)]
+    defer_backoff_ms: Option<u64>,
+    #[serde(default)]
+    max_defer_tries: Option<u32>,
+    #[serde(default)]
     toast_cmd: Option<String>,
 }
 
@@ -259,6 +263,12 @@ pub fn parse_config_toml(raw: &str) -> Result<RexConfig, String> {
         }
         if let Some(ms) = m.reconnect_grace_ms {
             cfg.mail.reconnect_grace_ms = ms;
+        }
+        if let Some(ms) = m.defer_backoff_ms {
+            cfg.mail.defer_backoff_ms = ms;
+        }
+        if let Some(n) = m.max_defer_tries {
+            cfg.mail.max_defer_tries = n;
         }
         cfg.mail.toast_cmd = m.toast_cmd;
     }
@@ -462,6 +472,16 @@ pub fn render_config_toml_preserving_comments(
             "reconnect_grace_ms",
             cfg.mail.reconnect_grace_ms as i64,
         );
+        if cfg.mail.defer_backoff_ms != rex_wave_api::config::DEFAULT_MAIL_DEFER_BACKOFF_MS
+            || mail.contains_key("defer_backoff_ms")
+        {
+            set_i64_preserving_decor(mail, "defer_backoff_ms", cfg.mail.defer_backoff_ms as i64);
+        }
+        if cfg.mail.max_defer_tries != rex_wave_api::config::DEFAULT_MAIL_MAX_DEFER_TRIES
+            || mail.contains_key("max_defer_tries")
+        {
+            set_i64_preserving_decor(mail, "max_defer_tries", i64::from(cfg.mail.max_defer_tries));
+        }
         set_or_remove_str(mail, "toast_cmd", cfg.mail.toast_cmd.as_deref());
     }
 

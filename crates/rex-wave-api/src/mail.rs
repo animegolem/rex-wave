@@ -577,6 +577,8 @@ pub struct MailDeliveryFailure {
     pub incarnation_id: Option<IncarnationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_canary: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sha256s: Vec<Sha256Hex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,7 +590,8 @@ pub struct MailDeliveryFailure {
 }
 
 /// Phase of a [`MailRecordRing`] call: `Begin` writes a pre-dispatch claim to `StreamId::Mail`
-/// after filtering eligible unacked referents; `Complete` finalizes the ring outcome.
+/// after filtering eligible unacked referents; `Complete` finalizes the ring outcome; `Reconciled`
+/// records durable completion of a [`MailDeliveryFailure`]'s side-effects.
 #[derive(
     Clone,
     Copy,
@@ -608,6 +611,7 @@ pub enum RingRecordPhase {
     Begin,
     #[default]
     Complete,
+    Reconciled,
 }
 
 /// Sender-grouped slice of letters attached to a single `Refused` or `GiveUp` failure.
@@ -627,6 +631,8 @@ pub struct MailRecordRing {
     pub phase: RingRecordPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_failure_seq: Option<Seq>,
     pub courier: String,
     pub seat: SeatName,
     pub machine_id: String,
@@ -638,6 +644,8 @@ pub struct MailRecordRing {
     pub sha256s: Vec<Sha256Hex>,
     #[serde(default)]
     pub is_canary: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pre_spawn: bool,
     pub outcome: CourierOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -745,6 +753,8 @@ pub enum MailEvent {
         sha256s: Vec<Sha256Hex>,
         #[serde(default, skip_serializing_if = "is_false")]
         is_canary: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        pre_spawn: bool,
         outcome: CourierOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -762,6 +772,8 @@ pub enum MailEvent {
         incarnation_id: Option<IncarnationId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_canary: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sha256s: Vec<Sha256Hex>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -770,5 +782,10 @@ pub enum MailEvent {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+    /// Marks a [`MailEvent::DeliveryFailed`] entry reconciled once its expiry, notice letter,
+    /// and inbox alert have all completed durably.
+    DeliveryFailureReconciled {
+        failure_seq: Seq,
     },
 }

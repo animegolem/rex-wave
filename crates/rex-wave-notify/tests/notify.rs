@@ -1522,6 +1522,7 @@ fn sample_uds_binding(seat: &str, inc: &str, at: UnixMs) -> SeatBinding {
         bound_at: at,
         expires_at: None,
         canary_token: None,
+        canary_verified: false,
         status: BindingStatus::Live,
     }
 }
@@ -2334,6 +2335,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 bound_at: UnixMs(1_500),
                 expires_at: None,
                 canary_token: None,
+                canary_verified: false,
                 status: BindingStatus::TransportDown,
             },
             superseded: Vec::new(),
@@ -2401,6 +2403,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 bound_at: UnixMs(1_000),
                 expires_at: Some(UnixMs(5_000)),
                 canary_token: None,
+                canary_verified: false,
                 status: BindingStatus::Live,
             },
             superseded: Vec::new(),
@@ -4163,4 +4166,135 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         tokio::task::yield_now().await;
     }
     writer_thread.join().unwrap();
+}
+
+#[test]
+fn herald_same_incarnation_epoch_refresh_does_not_rearm_escalated_failed_mail() {
+    let mut view = HeraldView::default();
+    let bob = SeatName::parse("bob").unwrap();
+    let alice_p = Principal::Seat {
+        seat: SeatName::parse("alice").unwrap(),
+    };
+    let bob_p = Principal::Seat { seat: bob.clone() };
+    let sys_courier = Principal::System {
+        part: SystemPart::CourierHub,
+    };
+    let sys_mon = Principal::System {
+        part: SystemPart::PresenceMonitor,
+    };
+    let room = RoomId::Channel {
+        scope: RoomScope::Global,
+        name: ChannelName::parse("general").unwrap(),
+    };
+
+    // 1. Bob binds `inc-bob-1` at epoch 1.
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(1),
+        at: UnixMs(1_000),
+        by: bob_p.clone(),
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: sample_uds_binding("bob", "inc-bob-1", UnixMs(1_000)),
+            superseded: Vec::new(),
+        }),
+    });
+
+    // 2. Letter arrives and then escalates `GiveUp` against `(inc-bob-1, epoch=1)`.
+    let lref = letter_ref_for("bob", "already-escalated.md", 'a');
+    let lsha = lref.sha256.clone();
+    view.observe(&Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(1),
+        at: UnixMs(1_500),
+        by: alice_p,
+        event: Event::Mail(MailEvent::Banked {
+            from_room: room,
+            range: (Seq(1), Seq(1)),
+            letter: lref,
+        }),
+    });
+    view.observe(&Envelope {
+        stream: StreamId::Mail,
+        seq: Seq(2),
+        at: UnixMs(2_000),
+        by: sys_courier,
+        event: Event::Mail(MailEvent::DeliveryFailed {
+            kind: rex_wave_api::mail::DeliveryFailureKind::GiveUp,
+            courier: "t3-thread".into(),
+            seat: bob.clone(),
+            incarnation_id: Some(IncarnationId::parse("inc-bob-1").unwrap()),
+            expected_epoch: Some(1),
+            is_canary: false,
+            sha256s: vec![lsha],
+            sender_seat: Some(SeatName::parse("alice").unwrap()),
+            hub_owner_seat: SeatName::parse("postmaster").unwrap(),
+            reason: "max-tries".into(),
+            detail: None,
+        }),
+    });
+
+    // 3. Same `(inc-bob-1, epoch=1)` refreshes Live, then later drops: MUST NOT re-arm Operator MailUnrung!
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(2),
+        at: UnixMs(3_000),
+        by: bob_p.clone(),
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: sample_uds_binding("bob", "inc-bob-1", UnixMs(3_000)),
+            superseded: Vec::new(),
+        }),
+    });
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(3),
+        at: UnixMs(4_000),
+        by: sys_mon.clone(),
+        event: Event::Presence(PresenceEvent::Unbound {
+            seat: bob.clone(),
+            incarnation_id: IncarnationId::parse("inc-bob-1").unwrap(),
+            status: BindingStatus::Expired,
+            reason: Some("dropped".into()),
+        }),
+    });
+    assert_eq!(
+        view.evaluate_mail_unrung(&bob, UnixMs(100_000)),
+        MailUnrungEval::Suppress,
+        "refreshing the same (incarnation_id, epoch) must not re-arm already-escalated failed mail"
+    );
+
+    // 4. Binding a NEW epoch (`epoch = 2`) DOES re-arm if that new session later drops before acking!
+    let mut b2 = sample_uds_binding("bob", "inc-bob-2", UnixMs(5_000));
+    b2.epoch = 2;
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(4),
+        at: UnixMs(5_000),
+        by: bob_p,
+        event: Event::Presence(PresenceEvent::Bound {
+            binding: b2,
+            superseded: Vec::new(),
+        }),
+    });
+    view.observe(&Envelope {
+        stream: StreamId::Presence,
+        seq: Seq(5),
+        at: UnixMs(6_000),
+        by: sys_mon,
+        event: Event::Presence(PresenceEvent::Unbound {
+            seat: bob.clone(),
+            incarnation_id: IncarnationId::parse("inc-bob-2").unwrap(),
+            status: BindingStatus::Expired,
+            reason: Some("dropped-2".into()),
+        }),
+    });
+    assert!(
+        matches!(
+            view.evaluate_mail_unrung(&bob, UnixMs(100_000)),
+            MailUnrungEval::Raise {
+                unread_count: 1,
+                ..
+            }
+        ),
+        "genuinely new session epoch re-arms unacked mail if it later drops unacked"
+    );
 }

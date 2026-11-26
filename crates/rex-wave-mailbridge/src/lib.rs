@@ -1869,6 +1869,58 @@ impl MailBridge {
             None => None,
         };
 
+        if req.phase == mail::RingRecordPhase::Reconciled {
+            let Some(failure_seq) = req.reconciled_failure_seq else {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: "reconciled_failure_seq".into(),
+                    reason: "required when phase is reconciled".into(),
+                }));
+            };
+            let mut st = self.state.lock().await;
+            if !st.mail.unreconciled_failures.contains_key(&failure_seq) {
+                let cur = st
+                    .mail
+                    .courier_stats
+                    .get(&courier)
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok(MailRingRecorded {
+                    consecutive_unknown: cur.consecutive_unknown,
+                    degraded: cur.degraded,
+                    degraded_newly_triggered: false,
+                    eligible_sha256s: Vec::new(),
+                    committed_failures: Vec::new(),
+                });
+            }
+            let events = vec![Event::Mail(MailEvent::DeliveryFailureReconciled {
+                failure_seq,
+            })];
+            let appended = st
+                .writer
+                .append(ctx.by(), ctx.at(), None, events)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Appended::Fresh(envs) = &appended {
+                for env in envs {
+                    st.mail.apply(env);
+                }
+            }
+            let cur = st
+                .mail
+                .courier_stats
+                .get(&courier)
+                .cloned()
+                .unwrap_or_default();
+            drop(st);
+            self.publish_fresh(&appended);
+            return Ok(MailRingRecorded {
+                consecutive_unknown: cur.consecutive_unknown,
+                degraded: cur.degraded,
+                degraded_newly_triggered: false,
+                eligible_sha256s: Vec::new(),
+                committed_failures: Vec::new(),
+            });
+        }
+
         if req.phase == mail::RingRecordPhase::Begin {
             let Some(did) = dispatch_id else {
                 return Err(ApiError::Invalid(InvalidId {
@@ -1900,6 +1952,7 @@ impl MailBridge {
                         && !st.mail.is_failed_for_binding(
                             &req.seat,
                             req.incarnation_id.as_ref(),
+                            req.expected_epoch,
                             sha,
                         )
                         && !st.mail.has_inflight_for(&req.seat, sha)
@@ -1998,20 +2051,27 @@ impl MailBridge {
             .get(&req.seat)
             .copied()
             .unwrap_or(0);
-        let (next_unknown_streak, next_seat_streak) = match req.outcome {
-            CourierOutcome::Unknown => (
-                prev.consecutive_unknown.saturating_add(1),
-                prev_seat_streak.saturating_add(1),
-            ),
-            CourierOutcome::Rung => (0, 0),
-            CourierOutcome::Deferred | CourierOutcome::Refused => {
-                (prev.consecutive_unknown, prev_seat_streak)
+        let is_route_pending =
+            !req.is_canary && req.incarnation_id.is_none() && courier == "route-pending";
+        let (next_unknown_streak, next_seat_streak) = if is_route_pending {
+            (prev.consecutive_unknown, prev_seat_streak)
+        } else {
+            match req.outcome {
+                CourierOutcome::Unknown => (
+                    prev.consecutive_unknown.saturating_add(1),
+                    prev_seat_streak.saturating_add(1),
+                ),
+                CourierOutcome::Rung => (0, 0),
+                CourierOutcome::Deferred | CourierOutcome::Refused => {
+                    (prev.consecutive_unknown, prev_seat_streak)
+                }
             }
         };
         let newly_courier_degraded = !prev.degraded && next_unknown_streak >= threshold;
         let newly_seat_degraded =
             !prev.degraded_seats.contains(&req.seat) && next_seat_streak >= threshold;
-        let degraded_newly_triggered = req.outcome == CourierOutcome::Unknown
+        let degraded_newly_triggered = !is_route_pending
+            && req.outcome == CourierOutcome::Unknown
             && (newly_courier_degraded || newly_seat_degraded);
 
         let mut events = vec![Event::Mail(MailEvent::RingAttempted {
@@ -2022,6 +2082,7 @@ impl MailBridge {
             incarnation_id: req.incarnation_id.clone(),
             sha256s: req.sha256s.clone(),
             is_canary: req.is_canary,
+            pre_spawn: req.pre_spawn,
             outcome: req.outcome,
             reason: clean_reason.clone(),
             detail: clean_detail.clone(),
@@ -2040,6 +2101,7 @@ impl MailBridge {
                         seat: req.seat.clone(),
                         incarnation_id: req.incarnation_id.clone(),
                         expected_epoch: req.expected_epoch,
+                        is_canary: req.is_canary,
                         sha256s: grp.sha256s.clone(),
                         sender_seat: grp.sender_seat.clone(),
                         hub_owner_seat: req.hub_owner_seat.clone(),
@@ -2054,6 +2116,7 @@ impl MailBridge {
                     seat: req.seat.clone(),
                     incarnation_id: req.incarnation_id.clone(),
                     expected_epoch: req.expected_epoch,
+                    is_canary: req.is_canary,
                     sha256s: req.sha256s.clone(),
                     sender_seat: req.sender_seat.clone(),
                     hub_owner_seat: req.hub_owner_seat.clone(),
@@ -2071,6 +2134,7 @@ impl MailBridge {
                 seat: req.seat.clone(),
                 incarnation_id: req.incarnation_id.clone(),
                 expected_epoch: req.expected_epoch,
+                is_canary: false,
                 sha256s: req.sha256s.clone(),
                 sender_seat: None,
                 hub_owner_seat: req.hub_owner_seat.clone(),
@@ -2093,6 +2157,7 @@ impl MailBridge {
                     seat,
                     incarnation_id,
                     expected_epoch,
+                    is_canary,
                     sha256s,
                     sender_seat,
                     hub_owner_seat,
@@ -2108,6 +2173,7 @@ impl MailBridge {
                         seat: seat.clone(),
                         incarnation_id: incarnation_id.clone(),
                         expected_epoch: *expected_epoch,
+                        is_canary: *is_canary,
                         sha256s: sha256s.clone(),
                         sender_seat: sender_seat.clone(),
                         hub_owner_seat: hub_owner_seat.clone(),

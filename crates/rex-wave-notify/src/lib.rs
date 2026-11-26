@@ -390,7 +390,7 @@ pub struct HeraldView {
     unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
     mail_meta_by_sha: BTreeMap<Sha256Hex, (String, PathBuf, bool)>,
-    failed_mail: BTreeSet<(SeatName, Sha256Hex)>,
+    failed_mail: BTreeMap<(SeatName, Sha256Hex), (Option<IncarnationId>, Option<u64>)>,
     raised_mail_unrung: BTreeMap<SeatName, RaisedMailUnrungState>,
     persisted_inbox_by_id: BTreeMap<(Principal, NotificationId), String>,
     persisted_inbox_dedupes: BTreeSet<(Principal, String)>,
@@ -418,16 +418,25 @@ impl HeraldView {
         self.observe_inner(entry, false);
     }
 
-    fn rearm_failed_mail_on_live_rebind(&mut self, seat: &SeatName, rebound_at: UnixMs) {
+    fn rearm_failed_mail_on_live_rebind(
+        &mut self,
+        seat: &SeatName,
+        new_inc: &IncarnationId,
+        new_epoch: u64,
+        rebound_at: UnixMs,
+    ) {
         let mut rearmed: Vec<Sha256Hex> = Vec::new();
-        self.failed_mail.retain(|(s, sha)| {
-            if s == seat {
-                rearmed.push(sha.clone());
-                false
-            } else {
-                true
-            }
-        });
+        self.failed_mail
+            .retain(|(s, sha), (failed_inc, failed_ep)| {
+                if s == seat
+                    && (failed_inc.as_ref(), *failed_ep) != (Some(new_inc), Some(new_epoch))
+                {
+                    rearmed.push(sha.clone());
+                    false
+                } else {
+                    true
+                }
+            });
         if rearmed.is_empty() {
             return;
         }
@@ -644,7 +653,12 @@ impl HeraldView {
                                 .entry(seat.clone())
                                 .and_modify(|prev| *prev = (*prev).max(entry.at))
                                 .or_insert(entry.at);
-                            self.rearm_failed_mail_on_live_rebind(&seat, entry.at);
+                            self.rearm_failed_mail_on_live_rebind(
+                                &seat,
+                                &binding.incarnation_id,
+                                binding.epoch,
+                                entry.at,
+                            );
                         }
                     } else if binding.status == presence::BindingStatus::PendingCanary {
                         seat_bindings.remove(&binding.incarnation_id);
@@ -684,7 +698,12 @@ impl HeraldView {
                                 .entry(seat.clone())
                                 .and_modify(|prev| *prev = (*prev).max(entry.at))
                                 .or_insert(entry.at);
-                            self.rearm_failed_mail_on_live_rebind(seat, entry.at);
+                            self.rearm_failed_mail_on_live_rebind(
+                                seat,
+                                incarnation_id,
+                                *epoch,
+                                entry.at,
+                            );
                         }
                     }
                     check_seats.insert(seat.clone());
@@ -791,6 +810,15 @@ impl HeraldView {
             },
             (StreamId::Mail, Event::Mail(ev)) => match ev {
                 mail::MailEvent::Banked { letter, .. } => {
+                    let sender_norm = letter
+                        .item
+                        .from
+                        .trim()
+                        .trim_start_matches('@')
+                        .to_ascii_lowercase();
+                    self.mail_meta_by_sha
+                        .entry(letter.sha256.clone())
+                        .or_insert_with(|| (sender_norm, letter.path.clone(), false));
                     if let Ok(seat) = SeatName::parse(&letter.item.to) {
                         self.record_incoming_mail(
                             seat.clone(),
@@ -803,17 +831,25 @@ impl HeraldView {
                     }
                 }
                 mail::MailEvent::Projected { item } => {
-                    if item.state != "acked"
-                        && let Ok(seat) = SeatName::parse(&item.to)
-                    {
-                        self.record_incoming_mail(
-                            seat.clone(),
-                            item.reference.sha256.clone(),
-                            item.reference.path.clone(),
-                            entry.at,
-                            emit_mail_unrung,
-                        );
-                        check_seats.insert(seat);
+                    if item.state != "acked" {
+                        let sender_norm = item
+                            .from
+                            .trim()
+                            .trim_start_matches('@')
+                            .to_ascii_lowercase();
+                        self.mail_meta_by_sha
+                            .entry(item.reference.sha256.clone())
+                            .or_insert_with(|| (sender_norm, item.reference.path.clone(), false));
+                        if let Ok(seat) = SeatName::parse(&item.to) {
+                            self.record_incoming_mail(
+                                seat.clone(),
+                                item.reference.sha256.clone(),
+                                item.reference.path.clone(),
+                                entry.at,
+                                emit_mail_unrung,
+                            );
+                            check_seats.insert(seat);
+                        }
                     }
                 }
                 mail::MailEvent::MessageCommitted {
@@ -901,6 +937,8 @@ impl HeraldView {
                 mail::MailEvent::DeliveryFailed {
                     kind,
                     seat,
+                    incarnation_id,
+                    expected_epoch,
                     sha256s,
                     ..
                 } => {
@@ -911,7 +949,10 @@ impl HeraldView {
                         mail::DeliveryFailureKind::Refused | mail::DeliveryFailureKind::GiveUp
                     ) {
                         for sha in sha256s {
-                            self.failed_mail.insert((seat.clone(), sha.clone()));
+                            self.failed_mail.insert(
+                                (seat.clone(), sha.clone()),
+                                (incarnation_id.clone(), *expected_epoch),
+                            );
                             if let Some(map) = self.pending_mail.get_mut(seat) {
                                 map.remove(sha);
                             }
@@ -924,6 +965,7 @@ impl HeraldView {
                 }
                 mail::MailEvent::RingDispatched { .. }
                 | mail::MailEvent::RingAttempted { .. }
+                | mail::MailEvent::DeliveryFailureReconciled { .. }
                 | mail::MailEvent::BellRang { .. } => {}
             },
             (StreamId::Inbox { owner }, Event::Inbox(ev)) => match ev {
@@ -1049,7 +1091,9 @@ impl HeraldView {
         track_unrung: bool,
     ) {
         if self.acked_mail.contains(&(seat.clone(), sha256.clone()))
-            || self.failed_mail.contains(&(seat.clone(), sha256.clone()))
+            || self
+                .failed_mail
+                .contains_key(&(seat.clone(), sha256.clone()))
         {
             return;
         }
@@ -1788,7 +1832,8 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             | mail::MailEvent::PathHeadUpdated { .. }
             | mail::MailEvent::RingDispatched { .. }
             | mail::MailEvent::RingAttempted { .. }
-            | mail::MailEvent::DeliveryFailed { .. } => {}
+            | mail::MailEvent::DeliveryFailed { .. }
+            | mail::MailEvent::DeliveryFailureReconciled { .. } => {}
         },
 
         _ => {}

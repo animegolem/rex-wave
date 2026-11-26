@@ -115,10 +115,13 @@ Opens `<ro-dir>` strictly read-only, imports all letters and `state/acks.jsonl` 
 Configuration keys (in `config.toml` or `rex-wave config set`):
 
 - `mail.export_enabled` (`true` | `false`): toggle mirror export without affecting SQLite commits.
+- `mail.require_canary` (`true` | `false`): require canary confirmation for push-courier Presence binds by default.
 - `mail.mirror_dir`: optional mirror root override (checked against `protected-roots`).
 - `mail.drop_dir`: optional external drop folder scanned for hand-dropped `.md` files and consumed into `<mirror>` + SQLite after durable commit.
 - `mail.couriers_dir`: optional directory containing executable output adapters (defaults to `<config_dir>/couriers.d/`).
 - `mail.hub_owner_seat`: seat notified loudly on courier refusals, give-ups, and `AdapterDegraded` events (default `postmaster`).
+- `mail.defer_backoff_ms`: base retry backoff in milliseconds for `"deferred"` rings (default `30000`, per-step cap `300000`).
+- `mail.max_defer_tries`: maximum retry attempts before loud `give_up` escalation (default `8`).
 
 ## Executable `couriers.d/` Adapters (`specs/mail/MailMachines.tla`)
 
@@ -127,8 +130,8 @@ Configuration keys (in `config.toml` or `rex-wave config set`):
 ### Adapter Discovery & Isolation
 
 - Adapters live as regular executable (`0755`) files directly inside `mail.couriers_dir` (or `<config_dir>/couriers.d/`).
-- Every adapter is verified with `O_NOFOLLOW` regular-file checks and `protected-roots` before spawning (symlinks and directories are rejected).
-- Each invocation spawns in its own process group (`process_group(0)`), enforces a router timeout (`10 s` default), and reaps the entire process group with `SIGTERM` followed by `SIGKILL` on timeout.
+- Every adapter is verified via descriptor-anchored `O_DIRECTORY | O_NOFOLLOW` + `protected-roots` traversal and staged from the verified open file descriptor into a private `0700` directory under `/tmp/.rex-exec-*` before spawning (symlinks and directories are rejected). Note that `$0` / `__file__` inside a running adapter points to the staged `/tmp/.rex-exec-*` path rather than `couriers.d/`; the original verified path is passed in `REX_WAVE_COURIER_ORIGIN`.
+- Each invocation spawns in its own process group (`process_group(0)`), enforces a router timeout (`10 s` default) covering both process exit and pipe drain, and reaps the entire process group with `SIGTERM` followed by `SIGKILL` on timeout.
 - Endpoint mapping:
   - `TransportEndpoint::T3Thread` -> `couriers.d/t3-thread`
   - `TransportEndpoint::ClaudeSession` -> `couriers.d/claude-session`
@@ -172,8 +175,8 @@ The adapter writes one JSON outcome object to `stdout`:
 ```
 
 - **`rung`:** Marks each `(seat, sha256)` rung in `StreamId::Mail` (`NoDoubleRing`) and resets the adapter's consecutive-unknown counter for that seat to `0`.
-- **`unknown` (including non-zero exit, malformed stdout, timeout, or interrupted pre-dispatch claim on daemon restart):** Counts as rung on `(seat, sha256)` so an ambiguous delivery is **never** double-rung. After `K = 3` consecutive `unknown` outcomes, the courier is marked `degraded = true` and `AdapterDegraded` is escalated to `mail.hub_owner_seat` (`DegradedLoud`).
-- **`deferred`:** Retried with exponential backoff up to `MaxTries` (`5` default, persisted in `StreamId::Mail`) before loud `give_up` escalation.
+- **`unknown` (including non-zero exit, malformed stdout, timeout, or interrupted pre-dispatch claim on daemon restart):** Counts as rung on `(seat, sha256)` so an ambiguous post-spawn delivery is **never** double-rung (pre-spawn setup failures before a child process starts record `unknown` toward adapter health without consuming the letter's push eligibility). After `K = 3` consecutive `unknown` outcomes, the courier is marked `degraded = true` and `AdapterDegraded` is escalated to `mail.hub_owner_seat` (`DegradedLoud`).
+- **`deferred`:** Retried with exponential backoff (`mail.defer_backoff_ms`, default `30 s`, capped at `5 m` per step) up to `mail.max_defer_tries` (`8` default, persisted in `StreamId::Mail`) before loud `give_up` escalation.
 - **`refused` (first occurrence, e.g. `reason: "address-gone"` or `"name-shared"`):** Immediately expires the dead binding (`BindingStatus::Expired`) with **zero retries** on that incarnation, records `MailEvent::DeliveryFailed`, and escalates loudly to `mail.hub_owner_seat` and the original sender seat (visible in `rex-wave mail check` for the sender and in `rex-wave config show`). Unacked letters remain eligible if the seat later binds a new live session incarnation.
 
 ### Operator Attention Rule & Passive TUI Indicator
@@ -200,7 +203,7 @@ rex-wave presence confirm-canary --seat bob --incarnation <incarnation-id> --can
 
 ## Multi-Machine Ownership (`OneMachineRings`)
 
-Each daemon resolves a `machine_id` (`--machine-id` / `REX_WAVE_MACHINE_ID`, defaulting to host short name). `CourierHub` resolves one deterministic winning route across all machines and lanes first, ringing locally only when the winning route belongs to the local `machine_id`. Cross-machine `RouteSyncTable` replicas form a commutative join-semilattice with total `(claimed_at, machine_id, incarnation_id, confirmed)` version ordering and versioned withdrawal tombstones alongside commutative union sync on content-addressed messages and ACKs, while local `UdsSession` disconnects (`presence hold` exit) withdraw the local binding immediately.
+Each daemon resolves and persists `<state_dir>/machine-id` (`--machine-id` / `REX_WAVE_MACHINE_ID` override, seeded from the host short name on first boot so transient DHCP hostname changes across restarts do not orphan local bindings). `CourierHub` enforces `OneMachineRings` directly across hubs sharing the same `Presence` and `Mail` journal by resolving one deterministic global winning route across all machines and lanes first and ringing locally only when that winner belongs to the local `machine_id`. For multi-store deployments running separate journals, `MachineMailSyncState` and `RouteSyncTable` provide the commutative, associative, idempotent CRDT replica-merge primitives (total `(claimed_at, epoch, machine_id, incarnation_id, confirmed)` ordering with per-incarnation withdrawal tombstones alongside union sync on content-addressed messages and ACKs); independent stores must synchronize `MachineMailSyncState` before local dispatch to maintain single-owner delivery across separate journals.
 
 ## Loopback HTTP API (`rex-wave daemon --http 127.0.0.1:<port>`)
 

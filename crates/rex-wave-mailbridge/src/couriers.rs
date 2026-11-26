@@ -35,7 +35,8 @@
 use crate::acks::normalize_seat_token;
 use crate::dissolved::{CommittedMailEntry, DEFAULT_COURIER_DEGRADED_THRESHOLD, MailState};
 use crate::presence::{
-    IncarnationAffinity, Presence, PresenceState, select_binding_for_delivery_on_machine,
+    IncarnationAffinity, Presence, PresenceState, select_binding_for_delivery,
+    select_binding_for_delivery_on_machine,
 };
 use crate::sha256_short16;
 use rex_wave_api::config::RexConfig;
@@ -67,9 +68,11 @@ pub const COURIER_CLAIM_SCHEMA: u8 = 1;
 /// Default consecutive `"unknown"` outcomes before marking a courier degraded (`MailMachines.tla` `K`).
 pub const DEFAULT_DEGRADED_THRESHOLD: u32 = DEFAULT_COURIER_DEGRADED_THRESHOLD;
 /// Default maximum `"deferred"` retries before loud `GiveUp` (`MailHub.tla` `MaxTries`).
-pub const DEFAULT_MAX_DEFER_TRIES: u32 = 5;
-/// Default base backoff before retrying a `"deferred"` ring.
-pub const DEFAULT_DEFER_BACKOFF_MS: u64 = 1_000;
+pub const DEFAULT_MAX_DEFER_TRIES: u32 = rex_wave_api::config::DEFAULT_MAIL_MAX_DEFER_TRIES;
+/// Default base backoff before retrying a `"deferred"` ring (30 seconds).
+pub const DEFAULT_DEFER_BACKOFF_MS: u64 = rex_wave_api::config::DEFAULT_MAIL_DEFER_BACKOFF_MS;
+/// Per-step cap on exponential `"deferred"` retry delay (5 minutes, unless base is larger).
+const MAX_DEFER_STEP_DELAY_MS: u64 = 300_000;
 /// Maximum letter referents batched in one courier ring claim.
 pub const DEFAULT_MAX_REFERENTS_PER_RING: usize = 32;
 /// Default wall-clock timeout enforced per courier script invocation.
@@ -184,6 +187,17 @@ pub struct CourierReply {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// `true` when the failure occurred before spawning any child process, so normal
+    /// mail retains push eligibility rather than burning `(seat, sha256)` (`Opus S2`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pre_spawn: bool,
+}
+
+fn redact_raw_secret(text: String, secret: Option<&str>) -> String {
+    match secret.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(tok) => text.replace(tok, "[REDACTED_CANARY]"),
+        None => text,
+    }
 }
 
 impl CourierReply {
@@ -192,6 +206,16 @@ impl CourierReply {
             outcome: CourierOutcome::Unknown,
             reason: Some(reason.into()),
             detail,
+            pre_spawn: false,
+        }
+    }
+
+    pub fn pre_spawn_unknown(reason: impl Into<String>, detail: Option<String>) -> Self {
+        Self {
+            outcome: CourierOutcome::Unknown,
+            reason: Some(reason.into()),
+            detail,
+            pre_spawn: true,
         }
     }
 
@@ -240,6 +264,10 @@ fn clean_opt_text(raw: Option<String>, max_len: usize) -> Option<String> {
 /// or unrecognized outcome values fail safe to [`CourierOutcome::Unknown`] so an
 /// ambiguous delivery is never double-rung.
 pub fn parse_courier_stdout(raw: &[u8]) -> CourierReply {
+    parse_courier_stdout_redacted(raw, None)
+}
+
+fn parse_courier_stdout_redacted(raw: &[u8], secret: Option<&str>) -> CourierReply {
     let Ok(text) = std::str::from_utf8(raw) else {
         return CourierReply::unknown(
             "malformed-stdout",
@@ -261,12 +289,19 @@ pub fn parse_courier_stdout(raw: &[u8]) -> CourierReply {
     match parsed {
         Ok(reply) => CourierReply {
             outcome: reply.outcome,
-            reason: clean_opt_text(reply.reason, 128),
-            detail: clean_opt_text(reply.detail, 512),
+            reason: clean_opt_text(reply.reason.map(|r| redact_raw_secret(r, secret)), 128),
+            detail: clean_opt_text(reply.detail.map(|d| redact_raw_secret(d, secret)), 512),
+            pre_spawn: false,
         },
         Err(err) => CourierReply::unknown(
             "malformed-stdout",
-            Some(format!("invalid courier JSON reply: {err}")),
+            clean_opt_text(
+                Some(redact_raw_secret(
+                    format!("invalid courier JSON reply: {err}"),
+                    secret,
+                )),
+                512,
+            ),
         ),
     }
 }
@@ -370,8 +405,8 @@ pub fn discover_couriers_dir(
     out
 }
 
-/// Resolves one named executable adapter inside `couriers_dir` with `O_NOFOLLOW`
-/// and `protected-roots` verification.
+/// Resolves one named executable adapter inside `couriers_dir` with descriptor-anchored
+/// `O_DIRECTORY | O_NOFOLLOW` + `protected-roots` verification.
 pub fn resolve_courier_executable(
     dir: &Path,
     adapter_name: &str,
@@ -390,45 +425,47 @@ pub fn resolve_courier_executable(
         }
         Err(e) => return Err(format!("inspect couriers_dir {}: {e}", dir.display())),
     }
-    let verified_dir = match guard {
+    let (dir_file, verified_dir) = match guard {
         Some(g) => g
-            .verify_dir(dir)
+            .open_verified_dir(dir)
             .map_err(|e| format!("couriers_dir rejected by protected-roots: {e}"))?,
-        None => dir.to_path_buf(),
+        None => {
+            let f = rex_wave_fs::open_dir_nofollow(dir)
+                .map_err(|e| format!("open couriers_dir {}: {e}", dir.display()))?;
+            (f, dir.to_path_buf())
+        }
     };
     let full = verified_dir.join(adapter_name);
-    match rex_wave_fs::entry_kind(&full) {
-        Ok(EntryKind::File) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Ok(EntryKind::Symlink) => {
-            return Err(format!(
-                "refusing symlink courier adapter {}",
-                full.display()
-            ));
-        }
-        Ok(_) => {
-            return Err(format!(
-                "courier adapter {} is not a regular file",
-                full.display()
-            ));
-        }
-        Err(e) => return Err(format!("inspect courier {}: {e}", full.display())),
-    }
     if let Some(g) = guard
         && let Err(e) = g.check(&full, &full)
     {
         return Err(format!("courier adapter rejected by protected-roots: {e}"));
     }
-    match is_executable_file(&full) {
-        Ok(true) => Ok(Some(full)),
-        Ok(false) => Ok(None),
+    match rex_wave_fs::open_regular_at(&dir_file, adapter_name) {
+        Ok((_file, meta)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if (meta.permissions().mode() & 0o111) != 0 {
+                    Ok(Some(full))
+                } else {
+                    Ok(None)
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                Ok(Some(full))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("open courier {}: {e}", full.display())),
     }
 }
 
 async fn read_bounded_into<R: AsyncRead + Unpin>(
     mut reader: R,
-    dst: Arc<std::sync::Mutex<Vec<u8>>>,
+    dst: Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
     limit: usize,
 ) {
     let mut buf = [0u8; 4096];
@@ -437,9 +474,15 @@ async fn read_bounded_into<R: AsyncRead + Unpin>(
             Ok(0) => break,
             Ok(n) => {
                 let mut guard = dst.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.len() < limit {
-                    let take = (limit - guard.len()).min(n);
-                    guard.extend_from_slice(&buf[..take]);
+                let avail = limit.saturating_sub(guard.0.len());
+                if avail > 0 {
+                    let take = avail.min(n);
+                    guard.0.extend_from_slice(&buf[..take]);
+                    if n > take {
+                        guard.1 = true;
+                    }
+                } else {
+                    guard.1 = true;
                 }
             }
             Err(_) => break,
@@ -459,12 +502,14 @@ fn signal_process_group(raw_pid: u32, sig: rustix::process::Signal) {
 async fn reap_process_group_hard(child_pid: Option<u32>, grace_ms: u64) {
     #[cfg(unix)]
     if let Some(pid) = child_pid {
+        // Post-wait group signaling reaps descendants that stayed in `child_pid`'s
+        // process group. A grandchild that called `setsid()` leaves the group (leaving
+        // only the negligible theoretical PGID-reuse window after leader wait), which is
+        // already bounded on the caller side by `PIPE_DRAIN_GRACE_MS` + reader `abort()`.
         signal_process_group(pid, rustix::process::Signal::TERM);
         if grace_ms > 0 {
             tokio::time::sleep(Duration::from_millis(grace_ms)).await;
         }
-        // Always follow up with SIGKILL on the process group so descendants that
-        // ignore SIGTERM or outlive the leader are unconditionally terminated.
         signal_process_group(pid, rustix::process::Signal::KILL);
     }
     #[cfg(not(unix))]
@@ -513,7 +558,7 @@ pub async fn invoke_courier_script(
                 &owned_guard
             }
             Err(e) => {
-                return CourierReply::unknown(
+                return CourierReply::pre_spawn_unknown(
                     "protected-roots-unavailable",
                     Some(format!("failed to load protected-roots: {e}")),
                 )
@@ -532,37 +577,37 @@ async fn invoke_courier_script_guarded(
 ) -> CourierReply {
     let secret = claim.canary_token.as_deref();
     if rex_wave_fs::entry_kind(path).ok() != Some(EntryKind::File) {
-        return CourierReply::unknown(
+        return CourierReply::pre_spawn_unknown(
             "invalid-adapter",
             Some(format!("{} is not a regular file", path.display())),
         )
         .redact_secret(secret);
     }
     if let Err(e) = guard.check(path, path) {
-        return CourierReply::unknown(
+        return CourierReply::pre_spawn_unknown(
             "protected-root",
             Some(format!("adapter rejected by protected-roots: {e}")),
         )
         .redact_secret(secret);
     }
     let Some(parent) = path.parent() else {
-        return CourierReply::unknown(
+        return CourierReply::pre_spawn_unknown(
             "invalid-adapter",
             Some(format!("{} has no parent directory", path.display())),
         )
         .redact_secret(secret);
     };
     let Some(leaf) = path.file_name().and_then(|n| n.to_str()) else {
-        return CourierReply::unknown(
+        return CourierReply::pre_spawn_unknown(
             "invalid-adapter",
             Some(format!("{} has invalid UTF-8 file name", path.display())),
         )
         .redact_secret(secret);
     };
-    let canon_parent = match guard.verify_dir(parent) {
-        Ok(d) => d,
+    let (parent_dir_file, canon_parent) = match guard.open_verified_dir(parent) {
+        Ok(pair) => pair,
         Err(e) => {
-            return CourierReply::unknown(
+            return CourierReply::pre_spawn_unknown(
                 "protected-root",
                 Some(format!("adapter parent rejected by protected-roots: {e}")),
             )
@@ -571,32 +616,35 @@ async fn invoke_courier_script_guarded(
     };
     let canon_candidate = canon_parent.join(leaf);
     if let Err(e) = guard.check(&canon_candidate, path) {
-        return CourierReply::unknown(
+        return CourierReply::pre_spawn_unknown(
             "protected-root",
             Some(format!("adapter rejected by protected-roots: {e}")),
         )
         .redact_secret(secret);
     }
 
-    let staged = match rex_wave_fs::stage_verified_executable(
+    let staged = match rex_wave_fs::stage_verified_executable_at(
+        &parent_dir_file,
         &canon_parent,
         leaf,
         MAX_COURIER_EXECUTABLE_BYTES,
     ) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return CourierReply::unknown("not-executable", Some(e.to_string()))
+            return CourierReply::pre_spawn_unknown("not-executable", Some(e.to_string()))
                 .redact_secret(secret);
         }
         Err(e) => {
-            return CourierReply::unknown("open-failed", Some(e.to_string())).redact_secret(secret);
+            return CourierReply::pre_spawn_unknown("open-failed", Some(e.to_string()))
+                .redact_secret(secret);
         }
     };
+    drop(parent_dir_file);
 
     let mut payload = match serde_json::to_vec(claim) {
         Ok(bytes) => bytes,
         Err(e) => {
-            return CourierReply::unknown("serialize-failed", Some(e.to_string()))
+            return CourierReply::pre_spawn_unknown("serialize-failed", Some(e.to_string()))
                 .redact_secret(secret);
         }
     };
@@ -612,6 +660,7 @@ async fn invoke_courier_script_guarded(
         .env_remove("REX_WAVE_T3_TOKEN")
         .env_remove("REX_WAVE_WORKER_THREAD_ID")
         .env("REX_WAVE_COURIER_SCHEMA", COURIER_CLAIM_SCHEMA.to_string())
+        .env("REX_WAVE_COURIER_ORIGIN", &canon_candidate)
         .env("REX_WAVE_SEAT", claim.seat.as_str())
         .env("REX_WAVE_MACHINE_ID", &claim.machine_id)
         .env("REX_WAVE_INCARNATION_ID", claim.incarnation_id.as_str());
@@ -623,7 +672,7 @@ async fn invoke_courier_script_guarded(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return CourierReply::unknown(
+            return CourierReply::pre_spawn_unknown(
                 "spawn-failed",
                 Some(format!("spawn {}: {e}", canon_candidate.display())),
             )
@@ -636,8 +685,8 @@ async fn invoke_courier_script_guarded(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let stdout_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let stderr_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stdout_buf = Arc::new(std::sync::Mutex::new((Vec::new(), false)));
+    let stderr_buf = Arc::new(std::sync::Mutex::new((Vec::new(), false)));
     let stdout_buf_task = stdout_buf.clone();
     let stderr_buf_task = stderr_buf.clone();
 
@@ -688,22 +737,43 @@ async fn invoke_courier_script_guarded(
             }
             subproc_guard.armed = false;
 
-            let stdout_bytes = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let stderr_bytes = stderr_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (stdout_bytes, stdout_truncated) =
+                stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (stderr_bytes, stderr_truncated) =
+                stderr_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if !status.success() {
                 let code_str = status
                     .code()
                     .map_or_else(|| "signal".to_owned(), |c| c.to_string());
-                let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
-                let detail = if !stderr_text.is_empty() {
-                    clean_opt_text(Some(stderr_text), 512)
+                let detail = if secret.is_some() && (stderr_truncated || stdout_truncated) {
+                    Some(
+                        "[diagnostic omitted: output exceeded capture cap during canary ring]"
+                            .into(),
+                    )
                 } else {
-                    let stdout_text = String::from_utf8_lossy(&stdout_bytes).trim().to_owned();
-                    clean_opt_text(Some(stdout_text), 512)
+                    let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+                    if !stderr_text.is_empty() {
+                        clean_opt_text(Some(redact_raw_secret(stderr_text, secret)), 512)
+                    } else {
+                        let stdout_text = String::from_utf8_lossy(&stdout_bytes).trim().to_owned();
+                        clean_opt_text(Some(redact_raw_secret(stdout_text, secret)), 512)
+                    }
                 };
                 CourierReply::unknown(format!("exit-{code_str}"), detail)
             } else {
-                parse_courier_stdout(&stdout_bytes)
+                let mut parsed = parse_courier_stdout_redacted(&stdout_bytes, secret);
+                if secret.is_some() && stdout_truncated {
+                    if parsed.reason.is_some() {
+                        parsed.reason = Some("redacted-cap".into());
+                    }
+                    if parsed.detail.is_some() {
+                        parsed.detail = Some(
+                            "[diagnostic omitted: output exceeded capture cap during canary ring]"
+                                .into(),
+                        );
+                    }
+                }
+                parsed
             }
         }
         Ok(Err(e)) => {
@@ -751,6 +821,8 @@ pub struct RouteClaim {
     pub seat: SeatName,
     pub machine_id: String,
     pub incarnation_id: IncarnationId,
+    #[serde(default)]
+    pub epoch: u64,
     pub endpoint: TransportEndpoint,
     pub claimed_at: UnixMs,
     pub confirmed: bool,
@@ -767,23 +839,17 @@ impl RouteClaim {
                 .clone()
                 .unwrap_or_else(|| fallback_machine_id.to_owned()),
             incarnation_id: binding.incarnation_id.clone(),
+            epoch: binding.epoch,
             endpoint: binding.endpoint.clone(),
             claimed_at: binding.bound_at,
             confirmed: binding.status == BindingStatus::Live,
         }
     }
 
-    fn identity_prefix(&self) -> (UnixMs, &str, &IncarnationId) {
+    fn total_version_key(&self) -> (UnixMs, u64, &str, &IncarnationId, bool, String) {
         (
             self.claimed_at,
-            self.machine_id.as_str(),
-            &self.incarnation_id,
-        )
-    }
-
-    fn total_version_key(&self) -> (UnixMs, &str, &IncarnationId, bool, String) {
-        (
-            self.claimed_at,
+            self.epoch,
             self.machine_id.as_str(),
             &self.incarnation_id,
             self.confirmed,
@@ -792,37 +858,38 @@ impl RouteClaim {
     }
 }
 
-/// Versioned withdrawal tombstone recorded when a local session disconnects or
-/// expires so stale peer merges cannot resurrect a dropped route.
+/// Per-incarnation versioned withdrawal tombstone recorded when a session disconnects or
+/// expires so stale peer merges cannot resurrect that dropped incarnation while preserving
+/// newer claims on other machines or incarnations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteWithdrawal {
     pub withdrawn_at: UnixMs,
+    #[serde(default)]
+    pub epoch: u64,
     pub machine_id: String,
     pub incarnation_id: IncarnationId,
 }
 
 impl RouteWithdrawal {
-    fn key(&self) -> (UnixMs, &str, &IncarnationId) {
-        (
-            self.withdrawn_at,
-            self.machine_id.as_str(),
-            &self.incarnation_id,
-        )
+    fn version(&self) -> (UnixMs, u64) {
+        (self.withdrawn_at, self.epoch)
     }
 
     fn dominates(&self, claim: &RouteClaim) -> bool {
-        claim.identity_prefix() <= self.key()
+        self.machine_id == claim.machine_id
+            && self.incarnation_id == claim.incarnation_id
+            && (claim.claimed_at, claim.epoch) <= self.version()
     }
 }
 
-/// Commutative, associative, idempotent join-semilattice route table across machines
-/// with total `(claimed_at, machine_id, incarnation_id, confirmed)` version ordering
-/// and versioned withdrawal tombstones.
+/// Commutative, associative, idempotent Observed-Remove join-semilattice route table across
+/// machines with total `(claimed_at, epoch, machine_id, incarnation_id, confirmed)` version
+/// ordering and per-`(seat, machine_id, incarnation_id)` withdrawal tombstones.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteSyncTable {
-    claims: BTreeMap<SeatName, RouteClaim>,
+    candidates: BTreeMap<SeatName, BTreeMap<(String, IncarnationId), RouteClaim>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    withdrawn: BTreeMap<SeatName, RouteWithdrawal>,
+    withdrawn: BTreeMap<(SeatName, String, IncarnationId), RouteWithdrawal>,
 }
 
 impl RouteSyncTable {
@@ -831,45 +898,62 @@ impl RouteSyncTable {
     }
 
     fn apply_withdrawal(&mut self, seat: SeatName, w: RouteWithdrawal) -> bool {
-        let replace_w = match self.withdrawn.get(&seat) {
+        let w_key = (seat.clone(), w.machine_id.clone(), w.incarnation_id.clone());
+        let replace_w = match self.withdrawn.get(&w_key) {
             None => true,
-            Some(existing) => w.key() > existing.key(),
+            Some(existing) => w.version() > existing.version(),
         };
         let mut changed = false;
         if replace_w {
-            self.withdrawn.insert(seat.clone(), w);
+            self.withdrawn.insert(w_key.clone(), w);
             changed = true;
         }
-        if let Some(active_w) = self.withdrawn.get(&seat)
-            && self
-                .claims
-                .get(&seat)
-                .is_some_and(|c| active_w.dominates(c))
-        {
-            self.claims.remove(&seat);
-            changed = true;
+        if let Some(active_w) = self.withdrawn.get(&w_key) {
+            let sub_key = (active_w.machine_id.clone(), active_w.incarnation_id.clone());
+            let mut remove_seat_map = false;
+            if let Some(seat_map) = self.candidates.get_mut(&seat) {
+                if seat_map
+                    .get(&sub_key)
+                    .is_some_and(|c| active_w.dominates(c))
+                {
+                    seat_map.remove(&sub_key);
+                    changed = true;
+                }
+                remove_seat_map = seat_map.is_empty();
+            }
+            if remove_seat_map {
+                self.candidates.remove(&seat);
+            }
         }
         changed
     }
 
-    /// Inserts or replaces a seat's route claim when it is not dominated by a
-    /// withdrawal tombstone and strictly beats any existing claim in total version order.
+    /// Inserts or replaces a `(seat, machine_id, incarnation_id)` route claim when it is not
+    /// dominated by a withdrawal tombstone for that incarnation and strictly beats any stored
+    /// version of that incarnation.
     pub fn apply_claim(&mut self, claim: RouteClaim) -> bool {
+        let w_key = (
+            claim.seat.clone(),
+            claim.machine_id.clone(),
+            claim.incarnation_id.clone(),
+        );
         if self
             .withdrawn
-            .get(&claim.seat)
+            .get(&w_key)
             .is_some_and(|w| w.dominates(&claim))
         {
             return false;
         }
-        match self.claims.get(&claim.seat) {
+        let sub_key = (claim.machine_id.clone(), claim.incarnation_id.clone());
+        let seat_map = self.candidates.entry(claim.seat.clone()).or_default();
+        match seat_map.get(&sub_key) {
             None => {
-                self.claims.insert(claim.seat.clone(), claim);
+                seat_map.insert(sub_key, claim);
                 true
             }
             Some(existing) => {
                 if claim.total_version_key() > existing.total_version_key() {
-                    self.claims.insert(claim.seat.clone(), claim);
+                    seat_map.insert(sub_key, claim);
                     true
                 } else {
                     false
@@ -878,25 +962,37 @@ impl RouteSyncTable {
         }
     }
 
-    /// Withdraws a local claim immediately when a local session disconnects (`UdsSession`
-    /// / `presence hold` exit), recording a versioned withdrawal tombstone so stale peer
-    /// merges cannot resurrect the dropped claim.
+    /// Withdraws all active local claims for `seat` owned by `local_machine_id` immediately
+    /// when a local session disconnects (`UdsSession` / `presence hold` exit), recording
+    /// per-incarnation withdrawal tombstones while leaving newer claims on other machines intact.
     pub fn drop_local(&mut self, seat: &SeatName, local_machine_id: &str) -> bool {
-        let Some(existing) = self.claims.get(seat).cloned() else {
-            return false;
-        };
-        if existing.machine_id != local_machine_id {
-            return false;
+        let local_claims: Vec<RouteClaim> = self
+            .candidates
+            .get(seat)
+            .map(|m| {
+                m.values()
+                    .filter(|c| c.machine_id == local_machine_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut changed = false;
+        for c in local_claims {
+            changed |= self.apply_withdrawal(
+                seat.clone(),
+                RouteWithdrawal {
+                    withdrawn_at: c.claimed_at,
+                    epoch: c.epoch,
+                    machine_id: c.machine_id,
+                    incarnation_id: c.incarnation_id,
+                },
+            );
         }
-        let w = RouteWithdrawal {
-            withdrawn_at: existing.claimed_at,
-            machine_id: existing.machine_id,
-            incarnation_id: existing.incarnation_id,
-        };
-        self.apply_withdrawal(seat.clone(), w)
+        changed
     }
 
-    /// Withdraws a specific `(seat, machine_id, incarnation_id)` at `withdrawn_at`.
+    /// Withdraws a specific `(seat, machine_id, incarnation_id)` through `withdrawn_at`
+    /// without affecting claims from other machines or newer incarnations.
     pub fn drop_local_at(
         &mut self,
         seat: &SeatName,
@@ -904,15 +1000,11 @@ impl RouteSyncTable {
         incarnation_id: IncarnationId,
         withdrawn_at: UnixMs,
     ) -> bool {
-        let effective_at = self
-            .claims
-            .get(seat)
-            .filter(|c| c.machine_id == local_machine_id && c.incarnation_id == incarnation_id)
-            .map_or(withdrawn_at, |c| withdrawn_at.max(c.claimed_at));
         self.apply_withdrawal(
             seat.clone(),
             RouteWithdrawal {
-                withdrawn_at: effective_at,
+                withdrawn_at,
+                epoch: u64::MAX,
                 machine_id: local_machine_id.to_owned(),
                 incarnation_id,
             },
@@ -921,30 +1013,38 @@ impl RouteSyncTable {
 
     /// Commutative, associative, idempotent semilattice merge from `peer`.
     pub fn merge_from(&mut self, peer: &RouteSyncTable) {
-        for (seat, w) in &peer.withdrawn {
+        for ((seat, _, _), w) in &peer.withdrawn {
             self.apply_withdrawal(seat.clone(), w.clone());
         }
-        for claim in peer.claims.values() {
-            self.apply_claim(claim.clone());
+        for seat_map in peer.candidates.values() {
+            for claim in seat_map.values() {
+                self.apply_claim(claim.clone());
+            }
         }
     }
 
     pub fn get(&self, seat: &SeatName) -> Option<&RouteClaim> {
-        self.claims.get(seat)
+        self.candidates
+            .get(seat)?
+            .values()
+            .max_by_key(|c| c.total_version_key())
     }
 
     pub fn owner_machine(&self, seat: &SeatName) -> Option<&str> {
-        self.claims.get(seat).map(|c| c.machine_id.as_str())
+        self.get(seat).map(|c| c.machine_id.as_str())
     }
 
     pub fn is_owned_by_machine(&self, seat: &SeatName, machine_id: &str) -> bool {
-        self.claims
-            .get(seat)
+        self.get(seat)
             .is_some_and(|c| c.machine_id == machine_id && c.confirmed)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&SeatName, &RouteClaim)> {
-        self.claims.iter()
+        self.candidates.iter().filter_map(|(seat, m)| {
+            m.values()
+                .max_by_key(|c| c.total_version_key())
+                .map(|c| (seat, c))
+        })
     }
 }
 
@@ -1029,8 +1129,10 @@ pub struct CourierHubConfig {
     pub operator_seat: SeatName,
     pub timeout: Duration,
     pub defer_backoff: Duration,
+    defer_backoff_overridden: bool,
     pub degraded_threshold: u32,
     pub max_defer_tries: u32,
+    max_defer_tries_overridden: bool,
     pub max_referents_per_ring: usize,
     pub protection: Option<Protection>,
 }
@@ -1049,8 +1151,10 @@ impl CourierHubConfig {
             operator_seat,
             timeout: Duration::from_millis(DEFAULT_COURIER_TIMEOUT_MS),
             defer_backoff: Duration::from_millis(DEFAULT_DEFER_BACKOFF_MS),
+            defer_backoff_overridden: false,
             degraded_threshold: DEFAULT_DEGRADED_THRESHOLD,
             max_defer_tries: DEFAULT_MAX_DEFER_TRIES,
+            max_defer_tries_overridden: false,
             max_referents_per_ring: DEFAULT_MAX_REFERENTS_PER_RING,
             protection: None,
         }
@@ -1073,6 +1177,7 @@ impl CourierHubConfig {
 
     pub fn with_defer_backoff(mut self, backoff: Duration) -> Self {
         self.defer_backoff = backoff.max(Duration::from_millis(1));
+        self.defer_backoff_overridden = true;
         self
     }
 
@@ -1083,6 +1188,7 @@ impl CourierHubConfig {
 
     pub fn with_max_defer_tries(mut self, max_tries: u32) -> Self {
         self.max_defer_tries = max_tries.max(1);
+        self.max_defer_tries_overridden = true;
         self
     }
 
@@ -1100,12 +1206,29 @@ impl CourierHubConfig {
         seat == &self.operator_seat || self.house.is_operator_seat(seat.as_str())
     }
 
-    fn backoff_due_at(&self, last_at: UnixMs, tries: u32) -> UnixMs {
-        let base_ms = u64::try_from(self.defer_backoff.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
+    fn effective_defer_backoff_ms(&self, runtime_cfg: &RexConfig) -> u64 {
+        if self.defer_backoff_overridden {
+            u64::try_from(self.defer_backoff.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        } else {
+            runtime_cfg.mail.defer_backoff_ms.max(1)
+        }
+    }
+
+    fn effective_max_defer_tries(&self, runtime_cfg: &RexConfig) -> u32 {
+        if self.max_defer_tries_overridden {
+            self.max_defer_tries.max(1)
+        } else {
+            runtime_cfg.mail.max_defer_tries.max(1)
+        }
+    }
+
+    fn backoff_due_at(&self, runtime_cfg: &RexConfig, last_at: UnixMs, tries: u32) -> UnixMs {
+        let base_ms = self.effective_defer_backoff_ms(runtime_cfg);
+        let cap_ms = MAX_DEFER_STEP_DELAY_MS.max(base_ms);
         let shift = tries.saturating_sub(1).min(5);
-        let delay = base_ms.saturating_mul(1u64 << shift);
+        let delay = base_ms.saturating_mul(1u64 << shift).min(cap_ms);
         UnixMs(last_at.0.saturating_add(delay))
     }
 }
@@ -1113,12 +1236,12 @@ impl CourierHubConfig {
 struct CourierHubState {
     mail: MailState,
     presence: PresenceState,
-    routes: RouteSyncTable,
     caught_up: bool,
     fenced_refused_epochs: BTreeSet<(SeatName, IncarnationId, u64)>,
     optimistic_canary_rung: BTreeSet<(SeatName, IncarnationId, u64)>,
     optimistic_canary_due: BTreeMap<(SeatName, IncarnationId, u64), UnixMs>,
     optimistic_mail_due: BTreeMap<(SeatName, Sha256Hex), UnixMs>,
+    optimistic_no_route_due: BTreeMap<(SeatName, Sha256Hex), UnixMs>,
     reconciled_failure_seqs: BTreeSet<Seq>,
     affinity: IncarnationAffinity,
 }
@@ -1160,12 +1283,12 @@ impl CourierHub {
             state: Mutex::new(CourierHubState {
                 mail: MailState::default(),
                 presence,
-                routes: RouteSyncTable::new(),
                 caught_up: false,
                 fenced_refused_epochs: BTreeSet::new(),
                 optimistic_canary_rung: BTreeSet::new(),
                 optimistic_canary_due: BTreeMap::new(),
                 optimistic_mail_due: BTreeMap::new(),
+                optimistic_no_route_due: BTreeMap::new(),
                 reconciled_failure_seqs: BTreeSet::new(),
                 affinity: IncarnationAffinity::default(),
             }),
@@ -1226,6 +1349,7 @@ impl Reactor for CourierHub {
                                     // never trigger immediate feedback sweeps (preventing tight
                                     // retry loops and redundant 1,653-letter scans).
                                     MailEvent::RingAttempted {
+                                        courier,
                                         seat,
                                         incarnation_id,
                                         sha256s,
@@ -1238,10 +1362,18 @@ impl Reactor for CourierHub {
                                                     !(s == seat && i == inc)
                                                 });
                                             }
+                                        } else if incarnation_id.is_none()
+                                            && courier == "route-pending"
+                                        {
+                                            for sha in sha256s {
+                                                st.optimistic_no_route_due
+                                                    .remove(&(seat.clone(), sha.clone()));
+                                            }
                                         } else {
                                             for sha in sha256s {
-                                                st.optimistic_mail_due
-                                                    .remove(&(seat.clone(), sha.clone()));
+                                                let k = (seat.clone(), sha.clone());
+                                                st.optimistic_mail_due.remove(&k);
+                                                st.optimistic_no_route_due.remove(&k);
                                             }
                                         }
                                     }
@@ -1250,10 +1382,12 @@ impl Reactor for CourierHub {
                                         sha256,
                                         ..
                                     } => {
-                                        st.optimistic_mail_due
-                                            .remove(&(seat.clone(), sha256.clone()));
+                                        let k = (seat.clone(), sha256.clone());
+                                        st.optimistic_mail_due.remove(&k);
+                                        st.optimistic_no_route_due.remove(&k);
                                     }
                                     MailEvent::RingDispatched { .. }
+                                    | MailEvent::DeliveryFailureReconciled { .. }
                                     | MailEvent::Acked { seat: None, .. }
                                     | MailEvent::PathHeadUpdated { .. }
                                     | MailEvent::BellRang { .. } => {}
@@ -1266,12 +1400,7 @@ impl Reactor for CourierHub {
                                     by: env.by.clone(),
                                 };
                                 Presence::evolve(&mut st.presence, pe, &meta);
-                                fold_presence_into_hub_state(
-                                    &mut st,
-                                    pe,
-                                    env.at,
-                                    &inner.cfg.local_machine_id,
-                                );
+                                fold_presence_into_hub_state(&mut st, pe);
                                 trigger_sweep = true;
                             }
                             Event::Config(_) => {
@@ -1297,12 +1426,7 @@ impl Reactor for CourierHub {
     }
 }
 
-fn fold_presence_into_hub_state(
-    st: &mut CourierHubState,
-    pe: &PresenceEvent,
-    at: UnixMs,
-    fallback_machine_id: &str,
-) {
+fn fold_presence_into_hub_state(st: &mut CourierHubState, pe: &PresenceEvent) {
     match pe {
         PresenceEvent::Bound {
             binding,
@@ -1321,16 +1445,10 @@ fn fold_presence_into_hub_state(
                 st.mail
                     .canary_rung_incarnations
                     .remove(&(binding.seat.clone(), old_inc.clone()));
-                let old_mach = binding.machine_id.as_deref().unwrap_or(fallback_machine_id);
-                st.routes
-                    .drop_local_at(&binding.seat, old_mach, old_inc.clone(), at);
             }
-            if matches!(
-                binding.status,
-                BindingStatus::Live | BindingStatus::PendingCanary
-            ) {
-                st.routes
-                    .apply_claim(RouteClaim::from_binding(binding, fallback_machine_id));
+            if binding.status == BindingStatus::Live {
+                st.optimistic_no_route_due
+                    .retain(|(s, _), _| s != &binding.seat);
             }
         }
         PresenceEvent::CanaryConfirmed {
@@ -1342,22 +1460,13 @@ fn fold_presence_into_hub_state(
                 .retain(|(s, inc, _)| !(s == seat && inc == incarnation_id));
             st.optimistic_canary_due
                 .retain(|(s, inc, _), _| !(s == seat && inc == incarnation_id));
+            st.optimistic_no_route_due.retain(|(s, _), _| s != seat);
             st.mail
                 .canary_defer_state
                 .remove(&(seat.clone(), incarnation_id.clone()));
             st.mail
                 .canary_rung_incarnations
                 .remove(&(seat.clone(), incarnation_id.clone()));
-            if let Some(b) = st
-                .presence
-                .bindings_for(seat)
-                .into_iter()
-                .find(|b| &b.incarnation_id == incarnation_id)
-                .cloned()
-            {
-                st.routes
-                    .apply_claim(RouteClaim::from_binding(&b, fallback_machine_id));
-            }
         }
         PresenceEvent::Unbound {
             seat,
@@ -1376,15 +1485,6 @@ fn fold_presence_into_hub_state(
             st.mail
                 .canary_rung_incarnations
                 .remove(&(seat.clone(), incarnation_id.clone()));
-            let mach = st
-                .presence
-                .bindings_for(seat)
-                .into_iter()
-                .find(|b| &b.incarnation_id == incarnation_id)
-                .and_then(|b| b.machine_id.clone())
-                .unwrap_or_else(|| fallback_machine_id.to_owned());
-            st.routes
-                .drop_local_at(seat, &mach, incarnation_id.clone(), at);
         }
         _ => {}
     }
@@ -1440,6 +1540,7 @@ impl CourierHubInner {
                     .call(MailRecordRing {
                         phase: RingRecordPhase::Complete,
                         dispatch_id: Some(disp.dispatch_id),
+                        reconciled_failure_seq: None,
                         courier: disp.courier,
                         seat: disp.seat,
                         machine_id: disp.machine_id,
@@ -1447,6 +1548,7 @@ impl CourierHubInner {
                         expected_epoch: disp.expected_epoch,
                         sha256s: disp.sha256s,
                         is_canary: disp.is_canary,
+                        pre_spawn: false,
                         outcome: CourierOutcome::Unknown,
                         reason: Some("interrupted-on-restart".into()),
                         detail: Some(
@@ -1471,23 +1573,50 @@ impl CourierHubInner {
         self.reconcile_pending_failures(client).await;
     }
 
+    async fn mark_failure_reconciled(&self, failure: &MailDeliveryFailure, client: &LocalClient) {
+        self.state
+            .lock()
+            .await
+            .reconciled_failure_seqs
+            .insert(failure.seq);
+        let _ = client
+            .call(MailRecordRing {
+                phase: RingRecordPhase::Reconciled,
+                dispatch_id: None,
+                reconciled_failure_seq: Some(failure.seq),
+                courier: failure.courier.clone(),
+                seat: failure.seat.clone(),
+                machine_id: self.cfg.local_machine_id.clone(),
+                incarnation_id: failure.incarnation_id.clone(),
+                expected_epoch: failure.expected_epoch,
+                sha256s: Vec::new(),
+                is_canary: failure.is_canary,
+                pre_spawn: false,
+                outcome: CourierOutcome::Unknown,
+                reason: None,
+                detail: None,
+                sender_seat: None,
+                hub_owner_seat: failure.hub_owner_seat.clone(),
+                failure_kind: None,
+                failure_groups: Vec::new(),
+                degraded_threshold: Some(self.cfg.degraded_threshold),
+            })
+            .await;
+    }
+
     async fn reconcile_pending_failures(&self, client: &LocalClient) {
         let pending: Vec<MailDeliveryFailure> = {
             let st = self.state.lock().await;
             st.mail
-                .delivery_failures
-                .iter()
+                .unreconciled_failures
+                .values()
                 .filter(|f| !st.reconciled_failure_seqs.contains(&f.seq))
                 .cloned()
                 .collect()
         };
         for failure in &pending {
             if self.reconcile_one_failure(failure, client).await {
-                self.state
-                    .lock()
-                    .await
-                    .reconciled_failure_seqs
-                    .insert(failure.seq);
+                self.mark_failure_reconciled(failure, client).await;
             }
         }
     }
@@ -1500,10 +1629,14 @@ impl CourierHubInner {
         let mut all_ok = true;
 
         // 1. Expire dead binding on Refused or canary GiveUp if still active.
-        if (failure.kind == DeliveryFailureKind::Refused
-            || (failure.kind == DeliveryFailureKind::GiveUp && failure.sha256s.is_empty()))
-            && let Some(ref inc) = failure.incarnation_id
-        {
+        //    Canary failures pass `only_if_pending_canary: true` so a late canary reply
+        //    can NEVER expire a route that was already confirmed Live (`Astra B2`).
+        let expire_binding = failure.kind == DeliveryFailureKind::Refused
+            || (failure.kind == DeliveryFailureKind::GiveUp
+                && (failure.is_canary || failure.sha256s.is_empty()));
+        let only_if_pending_canary = failure.is_canary
+            || (failure.kind == DeliveryFailureKind::GiveUp && failure.sha256s.is_empty());
+        if expire_binding && let Some(ref inc) = failure.incarnation_id {
             let needs_expire = match client
                 .call(PresenceList {
                     project: None,
@@ -1518,12 +1651,17 @@ impl CourierHubInner {
                     .find(|s| s.record.seat == failure.seat)
                     .and_then(|s| s.bindings.iter().find(|b| &b.incarnation_id == inc))
                     .is_some_and(|b| {
-                        matches!(
-                            b.status,
-                            BindingStatus::Live
-                                | BindingStatus::PendingCanary
-                                | BindingStatus::TransportDown
-                        ) && failure.expected_epoch.is_none_or(|ep| b.epoch == ep)
+                        let status_ok = if only_if_pending_canary {
+                            b.status == BindingStatus::PendingCanary
+                        } else {
+                            matches!(
+                                b.status,
+                                BindingStatus::Live
+                                    | BindingStatus::PendingCanary
+                                    | BindingStatus::TransportDown
+                            )
+                        };
+                        status_ok && failure.expected_epoch.is_none_or(|ep| b.epoch == ep)
                     }),
                 Err(_) => true,
             };
@@ -1534,6 +1672,7 @@ impl CourierHubInner {
                         incarnation_id: inc.clone(),
                         expected_epoch: failure.expected_epoch,
                         lease_expires_at: None,
+                        only_if_pending_canary,
                         reason: format!(
                             "courier {} {}: {}",
                             failure.courier,
@@ -1868,7 +2007,9 @@ impl CourierHubInner {
                 } else if let Some(&due) = st.optimistic_canary_due.get(&ep_key) {
                     if now < due { Some(Some(due)) } else { None }
                 } else if let Some(rec) = st.mail.canary_defer_state.get(&ckey) {
-                    let due = self.cfg.backoff_due_at(rec.last_at, rec.tries);
+                    let due = self
+                        .cfg
+                        .backoff_due_at(&current_cfg, rec.last_at, rec.tries);
                     if now < due { Some(Some(due)) } else { None }
                 } else {
                     None
@@ -1884,24 +2025,6 @@ impl CourierHubInner {
             let Some(adapter) = resolve_adapter_name(&binding.endpoint) else {
                 continue;
             };
-            let script = match resolve_courier_executable(&couriers_dir, adapter, Some(&guard)) {
-                Ok(Some(s)) => s,
-                Ok(None) => continue,
-                Err(err) => {
-                    self.record_adapter_setup_unknown(
-                        adapter,
-                        &binding,
-                        Vec::new(),
-                        true,
-                        "invalid-adapter",
-                        err,
-                        &hub_owner_seat,
-                        client,
-                    )
-                    .await;
-                    continue;
-                }
-            };
             let now_step = rex_wave_runtime::now();
             if !self
                 .is_binding_still_authoritative(
@@ -1914,8 +2037,76 @@ impl CourierHubInner {
             {
                 continue;
             }
+            let script = match resolve_courier_executable(&couriers_dir, adapter, Some(&guard)) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    let exists_on_disk = rex_wave_fs::entry_exists(&couriers_dir.join(adapter));
+                    let (outcome, reason, detail) = if exists_on_disk {
+                        (
+                            CourierOutcome::Unknown,
+                            "not-executable",
+                            format!(
+                                "courier adapter {} is not executable",
+                                couriers_dir.join(adapter).display()
+                            ),
+                        )
+                    } else {
+                        (
+                            CourierOutcome::Deferred,
+                            "adapter-missing",
+                            format!(
+                                "courier adapter '{}' not found in {}",
+                                adapter,
+                                couriers_dir.display()
+                            ),
+                        )
+                    };
+                    if let Some(due) = self
+                        .record_canary_pre_spawn_attempt(
+                            &binding,
+                            adapter,
+                            outcome,
+                            reason,
+                            detail,
+                            &current_cfg,
+                            &hub_owner_seat,
+                            client,
+                        )
+                        .await
+                    {
+                        earliest_next_due = Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    if let Some(due) = self
+                        .record_canary_pre_spawn_attempt(
+                            &binding,
+                            adapter,
+                            CourierOutcome::Unknown,
+                            "invalid-adapter",
+                            err,
+                            &current_cfg,
+                            &hub_owner_seat,
+                            client,
+                        )
+                        .await
+                    {
+                        earliest_next_due = Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
+                    }
+                    continue;
+                }
+            };
             if let Some(due) = self
-                .execute_canary_job(binding, adapter, script, &hub_owner_seat, &guard, client)
+                .execute_canary_job(
+                    binding,
+                    adapter,
+                    script,
+                    &current_cfg,
+                    &hub_owner_seat,
+                    &guard,
+                    client,
+                )
                 .await
             {
                 earliest_next_due = Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
@@ -1923,6 +2114,8 @@ impl CourierHubInner {
         }
 
         // Phase B: Normal mail delivery rings for Live bindings owned by local_machine_id.
+        let couriers_dir_exists =
+            rex_wave_fs::entry_kind(&couriers_dir).ok() == Some(EntryKind::Dir);
         let seats_with_mail: Vec<SeatName> = {
             let st = self.state.lock().await;
             let mut set = BTreeSet::new();
@@ -1949,11 +2142,31 @@ impl CourierHubInner {
         };
 
         for seat in seats_with_mail {
+            let mut skipped_shas_in_sweep: BTreeSet<Sha256Hex> = BTreeSet::new();
             loop {
                 let now_step = rex_wave_runtime::now();
-                let candidate = {
+                enum SeatSweepStep {
+                    None,
+                    NoRouteEntries(Vec<CommittedMailEntry>),
+                    ReadyBatch {
+                        binding: SeatBinding,
+                        entries: Vec<CommittedMailEntry>,
+                        has_more_batches: bool,
+                    },
+                }
+
+                let step = {
                     let st = self.state.lock().await;
-                    let Some(binding) = select_binding_for_delivery_on_machine(
+                    let global_winner = select_binding_for_delivery(
+                        &st.presence,
+                        &seat,
+                        None,
+                        None,
+                        &st.affinity,
+                        now_step,
+                    )
+                    .cloned();
+                    match select_binding_for_delivery_on_machine(
                         &st.presence,
                         &seat,
                         None,
@@ -1962,96 +2175,232 @@ impl CourierHubInner {
                         Some(&self.cfg.local_machine_id),
                         now_step,
                     )
-                    .cloned() else {
-                        break;
-                    };
-                    if st.fenced_refused_epochs.contains(&(
-                        seat.clone(),
-                        binding.incarnation_id.clone(),
-                        binding.epoch,
-                    )) {
-                        break;
-                    }
-                    let horizon = st.presence.seat(&seat).and_then(|r| r.mail_horizon_at);
-                    let ringable_shas = st.mail.ringable_for_seat(&seat);
-                    let mut ready_entries: Vec<CommittedMailEntry> = Vec::new();
-                    for sha in ringable_shas {
-                        let k = (seat.clone(), sha.clone());
-                        if st.mail.rung_keys.contains(&k)
-                            || st.mail.is_failed_for_binding(
-                                &seat,
-                                Some(&binding.incarnation_id),
-                                &sha,
-                            )
-                            || st.mail.has_inflight_for(&seat, &sha)
-                        {
-                            continue;
-                        }
-                        if let Some(&opt_due) = st.optimistic_mail_due.get(&k)
-                            && now_step < opt_due
-                        {
-                            if opt_due < UnixMs(u64::MAX) {
-                                earliest_next_due =
-                                    Some(earliest_next_due.map_or(opt_due, |cur| cur.min(opt_due)));
+                    .cloned()
+                    {
+                        None => {
+                            if global_winner.is_some() || !couriers_dir_exists {
+                                SeatSweepStep::None
+                            } else {
+                                let horizon =
+                                    st.presence.seat(&seat).and_then(|r| r.mail_horizon_at);
+                                let ringable_shas = st.mail.ringable_for_seat(&seat);
+                                let mut no_route_ready: Vec<CommittedMailEntry> = Vec::new();
+                                for sha in ringable_shas {
+                                    if skipped_shas_in_sweep.contains(&sha) {
+                                        continue;
+                                    }
+                                    let k = (seat.clone(), sha.clone());
+                                    if st.mail.rung_keys.contains(&k)
+                                        || st.mail.has_any_failure_for_seat(&seat, &sha)
+                                        || st.mail.has_inflight_for(&seat, &sha)
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(&opt_due) = st.optimistic_no_route_due.get(&k)
+                                        && now_step < opt_due
+                                    {
+                                        if opt_due < UnixMs(u64::MAX) {
+                                            earliest_next_due = Some(
+                                                earliest_next_due
+                                                    .map_or(opt_due, |cur| cur.min(opt_due)),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(rec) = st.mail.no_route_defer_state.get(&k) {
+                                        let due = self.cfg.backoff_due_at(
+                                            &current_cfg,
+                                            rec.last_at,
+                                            rec.tries,
+                                        );
+                                        if now_step < due {
+                                            earliest_next_due = Some(
+                                                earliest_next_due.map_or(due, |cur| cur.min(due)),
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    let Some(entry) = st.mail.messages.get(&sha).cloned() else {
+                                        continue;
+                                    };
+                                    let is_courier_system_notice = entry.committed_by
+                                        == (Principal::System {
+                                            part: SystemPart::CourierHub,
+                                        })
+                                        && entry.message.from == COURIER_HUB_SENDER_ADDRESS;
+                                    if is_courier_system_notice
+                                        || horizon.is_some_and(|h| entry.message.created_at < h)
+                                    {
+                                        continue;
+                                    }
+                                    no_route_ready.push(entry);
+                                }
+                                if no_route_ready.is_empty() {
+                                    SeatSweepStep::None
+                                } else {
+                                    no_route_ready.sort_by_key(|e| (e.message.created_at, e.seq));
+                                    SeatSweepStep::NoRouteEntries(no_route_ready)
+                                }
                             }
-                            continue;
                         }
-                        if let Some(rec) = st.mail.defer_state.get(&k) {
-                            let due = self.cfg.backoff_due_at(rec.last_at, rec.tries);
-                            if now_step < due {
-                                earliest_next_due =
-                                    Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
-                                continue;
+                        Some(binding) => {
+                            if st.fenced_refused_epochs.contains(&(
+                                seat.clone(),
+                                binding.incarnation_id.clone(),
+                                binding.epoch,
+                            )) {
+                                SeatSweepStep::None
+                            } else {
+                                let horizon =
+                                    st.presence.seat(&seat).and_then(|r| r.mail_horizon_at);
+                                let ringable_shas = st.mail.ringable_for_seat(&seat);
+                                let mut ready_entries: Vec<CommittedMailEntry> = Vec::new();
+                                for sha in ringable_shas {
+                                    if skipped_shas_in_sweep.contains(&sha) {
+                                        continue;
+                                    }
+                                    let k = (seat.clone(), sha.clone());
+                                    if st.mail.rung_keys.contains(&k)
+                                        || st.mail.is_failed_for_binding(
+                                            &seat,
+                                            Some(&binding.incarnation_id),
+                                            Some(binding.epoch),
+                                            &sha,
+                                        )
+                                        || st.mail.has_inflight_for(&seat, &sha)
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(&opt_due) = st.optimistic_mail_due.get(&k)
+                                        && now_step < opt_due
+                                    {
+                                        if opt_due < UnixMs(u64::MAX) {
+                                            earliest_next_due = Some(
+                                                earliest_next_due
+                                                    .map_or(opt_due, |cur| cur.min(opt_due)),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(rec) = st.mail.defer_state.get(&k) {
+                                        let due = self.cfg.backoff_due_at(
+                                            &current_cfg,
+                                            rec.last_at,
+                                            rec.tries,
+                                        );
+                                        if now_step < due {
+                                            earliest_next_due = Some(
+                                                earliest_next_due.map_or(due, |cur| cur.min(due)),
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    let Some(entry) = st.mail.messages.get(&sha).cloned() else {
+                                        continue;
+                                    };
+                                    let is_courier_system_notice = entry.committed_by
+                                        == (Principal::System {
+                                            part: SystemPart::CourierHub,
+                                        })
+                                        && entry.message.from == COURIER_HUB_SENDER_ADDRESS;
+                                    if is_courier_system_notice
+                                        || horizon.is_some_and(|h| entry.message.created_at < h)
+                                    {
+                                        continue;
+                                    }
+                                    ready_entries.push(entry);
+                                }
+                                if ready_entries.is_empty() {
+                                    SeatSweepStep::None
+                                } else {
+                                    ready_entries.sort_by_key(|e| (e.message.created_at, e.seq));
+                                    let has_more_batches =
+                                        ready_entries.len() > self.cfg.max_referents_per_ring;
+                                    ready_entries.truncate(self.cfg.max_referents_per_ring);
+                                    SeatSweepStep::ReadyBatch {
+                                        binding,
+                                        entries: ready_entries,
+                                        has_more_batches,
+                                    }
+                                }
                             }
                         }
-                        let Some(entry) = st.mail.messages.get(&sha).cloned() else {
-                            continue;
-                        };
-                        let is_courier_system_notice = entry.committed_by
-                            == (Principal::System {
-                                part: SystemPart::CourierHub,
-                            })
-                            && entry.message.from == COURIER_HUB_SENDER_ADDRESS;
-                        if is_courier_system_notice
-                            || horizon.is_some_and(|h| entry.message.created_at < h)
-                        {
-                            continue;
-                        }
-                        ready_entries.push(entry);
                     }
-                    if ready_entries.is_empty() {
-                        break;
-                    }
-                    ready_entries.sort_by_key(|e| (e.message.created_at, e.seq));
-                    let has_more_batches = ready_entries.len() > self.cfg.max_referents_per_ring;
-                    ready_entries.truncate(self.cfg.max_referents_per_ring);
-                    Some((binding, ready_entries, has_more_batches))
                 };
 
-                let Some((binding, entries, has_more_batches)) = candidate else {
-                    break;
+                let (binding, entries, has_more_batches) = match step {
+                    SeatSweepStep::None => break,
+                    SeatSweepStep::NoRouteEntries(no_route_entries) => {
+                        if let Some(due) = self
+                            .record_no_route_defer_or_give_up(
+                                &seat,
+                                &no_route_entries,
+                                &current_cfg,
+                                &hub_owner_seat,
+                                client,
+                            )
+                            .await
+                        {
+                            earliest_next_due =
+                                Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
+                        }
+                        break;
+                    }
+                    SeatSweepStep::ReadyBatch {
+                        binding,
+                        entries,
+                        has_more_batches,
+                    } => (binding, entries, has_more_batches),
                 };
+
                 let Some(adapter) = resolve_adapter_name(&binding.endpoint) else {
                     break;
                 };
                 let script = match resolve_courier_executable(&couriers_dir, adapter, Some(&guard))
                 {
                     Ok(Some(s)) => s,
-                    Ok(None) => break,
+                    Ok(None) => {
+                        if rex_wave_fs::entry_exists(&couriers_dir.join(adapter))
+                            && let Some(due) = self
+                                .record_mail_pre_spawn_attempt(
+                                    &binding,
+                                    adapter,
+                                    &entries,
+                                    CourierOutcome::Unknown,
+                                    "not-executable",
+                                    format!(
+                                        "courier adapter {} is not executable",
+                                        couriers_dir.join(adapter).display()
+                                    ),
+                                    &current_cfg,
+                                    &hub_owner_seat,
+                                    client,
+                                )
+                                .await
+                        {
+                            earliest_next_due =
+                                Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
+                        }
+                        break;
+                    }
                     Err(err) => {
-                        let shas: Vec<Sha256Hex> =
-                            entries.iter().map(|e| e.message.sha256.clone()).collect();
-                        self.record_adapter_setup_unknown(
-                            adapter,
-                            &binding,
-                            shas,
-                            false,
-                            "invalid-adapter",
-                            err,
-                            &hub_owner_seat,
-                            client,
-                        )
-                        .await;
+                        if let Some(due) = self
+                            .record_mail_pre_spawn_attempt(
+                                &binding,
+                                adapter,
+                                &entries,
+                                CourierOutcome::Unknown,
+                                "invalid-adapter",
+                                err,
+                                &current_cfg,
+                                &hub_owner_seat,
+                                client,
+                            )
+                            .await
+                        {
+                            earliest_next_due =
+                                Some(earliest_next_due.map_or(due, |cur| cur.min(due)));
+                        }
                         break;
                     }
                 };
@@ -2069,6 +2418,8 @@ impl CourierHubInner {
                         adapter,
                         script,
                         entries,
+                        &mut skipped_shas_in_sweep,
+                        &current_cfg,
                         &hub_owner_seat,
                         &guard,
                         client,
@@ -2089,34 +2440,65 @@ impl CourierHubInner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn record_adapter_setup_unknown(
+    async fn record_canary_pre_spawn_attempt(
         &self,
-        adapter: &str,
         binding: &SeatBinding,
-        sha256s: Vec<Sha256Hex>,
-        is_canary: bool,
+        adapter: &str,
+        outcome: CourierOutcome,
         reason: &str,
         detail: String,
+        current_cfg: &RexConfig,
         hub_owner_seat: &SeatName,
         client: &LocalClient,
-    ) {
+    ) -> Option<UnixMs> {
+        let max_tries = self.cfg.effective_max_defer_tries(current_cfg);
+        let prior_tries = self
+            .state
+            .lock()
+            .await
+            .mail
+            .canary_defer_state
+            .get(&(binding.seat.clone(), binding.incarnation_id.clone()))
+            .map_or(0, |r| r.tries);
+        let next_tries = prior_tries.saturating_add(1);
+        let failure_kind = (next_tries >= max_tries).then_some(DeliveryFailureKind::GiveUp);
+        let ep_key = (
+            binding.seat.clone(),
+            binding.incarnation_id.clone(),
+            binding.epoch,
+        );
+        let now_done = rex_wave_runtime::now();
+        let mut scheduled_due = None;
+        {
+            let mut st = self.state.lock().await;
+            if failure_kind.is_some() {
+                st.fenced_refused_epochs.insert(ep_key);
+            } else {
+                let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
+                st.optimistic_canary_due.insert(ep_key, due);
+                scheduled_due = Some(due);
+            }
+        }
+
         if let Ok(rec) = client
             .call(MailRecordRing {
                 phase: RingRecordPhase::Complete,
                 dispatch_id: None,
+                reconciled_failure_seq: None,
                 courier: adapter.to_owned(),
                 seat: binding.seat.clone(),
                 machine_id: self.cfg.local_machine_id.clone(),
                 incarnation_id: Some(binding.incarnation_id.clone()),
                 expected_epoch: Some(binding.epoch),
-                sha256s,
-                is_canary,
-                outcome: CourierOutcome::Unknown,
+                sha256s: Vec::new(),
+                is_canary: true,
+                pre_spawn: true,
+                outcome,
                 reason: Some(reason.to_owned()),
                 detail: Some(detail),
                 sender_seat: None,
                 hub_owner_seat: hub_owner_seat.clone(),
-                failure_kind: None,
+                failure_kind,
                 failure_groups: Vec::new(),
                 degraded_threshold: Some(self.cfg.degraded_threshold),
             })
@@ -2124,21 +2506,200 @@ impl CourierHubInner {
         {
             for f in &rec.committed_failures {
                 if self.reconcile_one_failure(f, client).await {
-                    self.state
-                        .lock()
-                        .await
-                        .reconciled_failure_seqs
-                        .insert(f.seq);
+                    self.mark_failure_reconciled(f, client).await;
                 }
             }
         }
+        scheduled_due
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn record_mail_pre_spawn_attempt(
+        &self,
+        binding: &SeatBinding,
+        adapter: &str,
+        entries: &[CommittedMailEntry],
+        outcome: CourierOutcome,
+        reason: &str,
+        detail: String,
+        current_cfg: &RexConfig,
+        hub_owner_seat: &SeatName,
+        client: &LocalClient,
+    ) -> Option<UnixMs> {
+        let max_tries = self.cfg.effective_max_defer_tries(current_cfg);
+        let seat = binding.seat.clone();
+        let all_shas: Vec<Sha256Hex> = entries.iter().map(|e| e.message.sha256.clone()).collect();
+        let sender_groups = group_entries_by_sender(entries);
+        let primary_sender = sender_groups.first().and_then(|(s, _)| s.clone());
+
+        let mut given_up_entries: Vec<CommittedMailEntry> = Vec::new();
+        let mut earliest_due: Option<UnixMs> = None;
+        let now_done = rex_wave_runtime::now();
+        {
+            let mut st = self.state.lock().await;
+            for entry in entries {
+                let k = (seat.clone(), entry.message.sha256.clone());
+                let next_tries = st
+                    .mail
+                    .defer_state
+                    .get(&k)
+                    .map_or(0, |r| r.tries)
+                    .saturating_add(1);
+                if next_tries >= max_tries {
+                    st.optimistic_mail_due.insert(k, UnixMs(u64::MAX));
+                    st.mail.failed_incarnation_keys.insert((
+                        seat.clone(),
+                        binding.incarnation_id.clone(),
+                        Some(binding.epoch),
+                        entry.message.sha256.clone(),
+                    ));
+                    given_up_entries.push(entry.clone());
+                } else {
+                    let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
+                    st.optimistic_mail_due.insert(k, due);
+                    earliest_due = Some(earliest_due.map_or(due, |cur| cur.min(due)));
+                }
+            }
+        }
+
+        let (failure_kind, failure_groups) = if !given_up_entries.is_empty() {
+            let groups = group_entries_by_sender(&given_up_entries)
+                .into_iter()
+                .map(|(s, shas)| MailFailureGroup {
+                    sender_seat: s,
+                    sha256s: shas,
+                })
+                .collect();
+            (Some(DeliveryFailureKind::GiveUp), groups)
+        } else {
+            (None, Vec::new())
+        };
+
+        if let Ok(rec) = client
+            .call(MailRecordRing {
+                phase: RingRecordPhase::Complete,
+                dispatch_id: None,
+                reconciled_failure_seq: None,
+                courier: adapter.to_owned(),
+                seat,
+                machine_id: self.cfg.local_machine_id.clone(),
+                incarnation_id: Some(binding.incarnation_id.clone()),
+                expected_epoch: Some(binding.epoch),
+                sha256s: all_shas,
+                is_canary: false,
+                pre_spawn: true,
+                outcome,
+                reason: Some(reason.to_owned()),
+                detail: Some(detail),
+                sender_seat: primary_sender,
+                hub_owner_seat: hub_owner_seat.clone(),
+                failure_kind,
+                failure_groups,
+                degraded_threshold: Some(self.cfg.degraded_threshold),
+            })
+            .await
+        {
+            for f in &rec.committed_failures {
+                if self.reconcile_one_failure(f, client).await {
+                    self.mark_failure_reconciled(f, client).await;
+                }
+            }
+        }
+        earliest_due
+    }
+
+    async fn record_no_route_defer_or_give_up(
+        &self,
+        seat: &SeatName,
+        entries: &[CommittedMailEntry],
+        current_cfg: &RexConfig,
+        hub_owner_seat: &SeatName,
+        client: &LocalClient,
+    ) -> Option<UnixMs> {
+        let max_tries = self.cfg.effective_max_defer_tries(current_cfg);
+        let all_shas: Vec<Sha256Hex> = entries.iter().map(|e| e.message.sha256.clone()).collect();
+        let sender_groups = group_entries_by_sender(entries);
+        let primary_sender = sender_groups.first().and_then(|(s, _)| s.clone());
+
+        let mut given_up_entries: Vec<CommittedMailEntry> = Vec::new();
+        let mut earliest_due: Option<UnixMs> = None;
+        let now_done = rex_wave_runtime::now();
+        {
+            let mut st = self.state.lock().await;
+            for entry in entries {
+                let k = (seat.clone(), entry.message.sha256.clone());
+                let next_tries = st
+                    .mail
+                    .no_route_defer_state
+                    .get(&k)
+                    .map_or(0, |r| r.tries)
+                    .saturating_add(1);
+                if next_tries >= max_tries {
+                    st.optimistic_no_route_due
+                        .insert(k.clone(), UnixMs(u64::MAX));
+                    st.mail.failed_keys.insert(k);
+                    given_up_entries.push(entry.clone());
+                } else {
+                    let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
+                    st.optimistic_no_route_due.insert(k, due);
+                    earliest_due = Some(earliest_due.map_or(due, |cur| cur.min(due)));
+                }
+            }
+        }
+
+        let (failure_kind, failure_groups) = if !given_up_entries.is_empty() {
+            let groups = group_entries_by_sender(&given_up_entries)
+                .into_iter()
+                .map(|(s, shas)| MailFailureGroup {
+                    sender_seat: s,
+                    sha256s: shas,
+                })
+                .collect();
+            (Some(DeliveryFailureKind::GiveUp), groups)
+        } else {
+            (None, Vec::new())
+        };
+
+        if let Ok(rec) = client
+            .call(MailRecordRing {
+                phase: RingRecordPhase::Complete,
+                dispatch_id: None,
+                reconciled_failure_seq: None,
+                courier: "route-pending".to_owned(),
+                seat: seat.clone(),
+                machine_id: self.cfg.local_machine_id.clone(),
+                incarnation_id: None,
+                expected_epoch: None,
+                sha256s: all_shas,
+                is_canary: false,
+                pre_spawn: true,
+                outcome: CourierOutcome::Deferred,
+                reason: Some("no-confirmed-route".into()),
+                detail: Some(format!("no confirmed live route for @{seat}")),
+                sender_seat: primary_sender,
+                hub_owner_seat: hub_owner_seat.clone(),
+                failure_kind,
+                failure_groups,
+                degraded_threshold: Some(self.cfg.degraded_threshold),
+            })
+            .await
+        {
+            for f in &rec.committed_failures {
+                if self.reconcile_one_failure(f, client).await {
+                    self.mark_failure_reconciled(f, client).await;
+                }
+            }
+        }
+        earliest_due
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn execute_canary_job(
         &self,
         binding: SeatBinding,
         adapter: &'static str,
         script: PathBuf,
+        current_cfg: &RexConfig,
         hub_owner_seat: &SeatName,
         guard: &ProtectedRootsGuard,
         client: &LocalClient,
@@ -2148,6 +2709,7 @@ impl CourierHubInner {
             .call(MailRecordRing {
                 phase: RingRecordPhase::Begin,
                 dispatch_id: Some(dispatch_id.clone()),
+                reconciled_failure_seq: None,
                 courier: adapter.to_owned(),
                 seat: binding.seat.clone(),
                 machine_id: self.cfg.local_machine_id.clone(),
@@ -2155,6 +2717,7 @@ impl CourierHubInner {
                 expected_epoch: Some(binding.epoch),
                 sha256s: Vec::new(),
                 is_canary: true,
+                pre_spawn: false,
                 outcome: CourierOutcome::Deferred,
                 reason: None,
                 detail: None,
@@ -2173,6 +2736,20 @@ impl CourierHubInner {
         let claim = DeliveryClaim::for_canary(&binding, &self.cfg.local_machine_id);
         let reply = invoke_courier_script_guarded(&script, &claim, self.cfg.timeout, guard).await;
 
+        let now_done = rex_wave_runtime::now();
+        // Re-check whether the binding is STILL PendingCanary at `binding.epoch` (`Astra B2`):
+        // if the session confirmed its canary (promoting to Live) while the adapter was running,
+        // a late canary failure MUST NOT fence or expire the confirmed Live route!
+        let still_pending_canary = self
+            .is_binding_still_authoritative(
+                client,
+                &binding,
+                BindingStatus::PendingCanary,
+                now_done,
+            )
+            .await;
+
+        let max_tries = self.cfg.effective_max_defer_tries(current_cfg);
         let prior_tries = self
             .state
             .lock()
@@ -2183,14 +2760,16 @@ impl CourierHubInner {
             .map_or(0, |r| r.tries);
         let next_tries = prior_tries.saturating_add(1);
 
-        let failure_kind = match reply.outcome {
-            CourierOutcome::Refused => Some(DeliveryFailureKind::Refused),
-            CourierOutcome::Deferred | CourierOutcome::Unknown
-                if next_tries >= self.cfg.max_defer_tries =>
-            {
-                Some(DeliveryFailureKind::GiveUp)
+        let failure_kind = if !still_pending_canary {
+            None
+        } else {
+            match reply.outcome {
+                CourierOutcome::Refused => Some(DeliveryFailureKind::Refused),
+                CourierOutcome::Deferred | CourierOutcome::Unknown if next_tries >= max_tries => {
+                    Some(DeliveryFailureKind::GiveUp)
+                }
+                _ => None,
             }
-            _ => None,
         };
 
         let ep_key = (
@@ -2198,9 +2777,8 @@ impl CourierHubInner {
             binding.incarnation_id.clone(),
             binding.epoch,
         );
-        let now_done = rex_wave_runtime::now();
         let mut scheduled_due: Option<UnixMs> = None;
-        {
+        if still_pending_canary {
             let mut st = self.state.lock().await;
             if failure_kind.is_some() {
                 st.fenced_refused_epochs.insert(ep_key);
@@ -2210,7 +2788,7 @@ impl CourierHubInner {
                         st.optimistic_canary_rung.insert(ep_key);
                     }
                     CourierOutcome::Deferred | CourierOutcome::Unknown => {
-                        let due = self.cfg.backoff_due_at(now_done, next_tries);
+                        let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
                         st.optimistic_canary_due.insert(ep_key, due);
                         scheduled_due = Some(due);
                     }
@@ -2219,10 +2797,18 @@ impl CourierHubInner {
             }
         }
 
+        let effective_outcome = if !still_pending_canary && reply.outcome == CourierOutcome::Refused
+        {
+            CourierOutcome::Deferred
+        } else {
+            reply.outcome
+        };
+
         let recorded = client
             .call(MailRecordRing {
                 phase: RingRecordPhase::Complete,
                 dispatch_id: Some(dispatch_id),
+                reconciled_failure_seq: None,
                 courier: adapter.to_owned(),
                 seat: binding.seat.clone(),
                 machine_id: self.cfg.local_machine_id.clone(),
@@ -2230,7 +2816,8 @@ impl CourierHubInner {
                 expected_epoch: Some(binding.epoch),
                 sha256s: Vec::new(),
                 is_canary: true,
-                outcome: reply.outcome,
+                pre_spawn: reply.pre_spawn,
+                outcome: effective_outcome,
                 reason: reply.reason.clone(),
                 detail: reply.detail.clone(),
                 sender_seat: None,
@@ -2244,11 +2831,7 @@ impl CourierHubInner {
         if let Ok(rec) = recorded {
             for f in &rec.committed_failures {
                 if self.reconcile_one_failure(f, client).await {
-                    self.state
-                        .lock()
-                        .await
-                        .reconciled_failure_seqs
-                        .insert(f.seq);
+                    self.mark_failure_reconciled(f, client).await;
                 }
             }
         }
@@ -2263,6 +2846,8 @@ impl CourierHubInner {
         adapter: &'static str,
         script: PathBuf,
         candidate_entries: Vec<CommittedMailEntry>,
+        skipped_shas_in_sweep: &mut BTreeSet<Sha256Hex>,
+        current_cfg: &RexConfig,
         hub_owner_seat: &SeatName,
         guard: &ProtectedRootsGuard,
         client: &LocalClient,
@@ -2279,13 +2864,15 @@ impl CourierHubInner {
             .call(MailRecordRing {
                 phase: RingRecordPhase::Begin,
                 dispatch_id: Some(dispatch_id.clone()),
+                reconciled_failure_seq: None,
                 courier: adapter.to_owned(),
                 seat: binding.seat.clone(),
                 machine_id: self.cfg.local_machine_id.clone(),
                 incarnation_id: Some(binding.incarnation_id.clone()),
                 expected_epoch: Some(binding.epoch),
-                sha256s: candidate_shas,
+                sha256s: candidate_shas.clone(),
                 is_canary: false,
+                pre_spawn: false,
                 outcome: CourierOutcome::Deferred,
                 reason: None,
                 detail: None,
@@ -2300,12 +2887,19 @@ impl CourierHubInner {
             Ok(b) => b,
             Err(_) => return (false, None),
         };
+
+        let eligible_set: BTreeSet<&Sha256Hex> = begun.eligible_sha256s.iter().collect();
+        for sha in &candidate_shas {
+            if !eligible_set.contains(sha) {
+                // Record candidates rejected by authoritative MailBridge (e.g. concurrent ACK)
+                // so subsequent batch iterations in this sweep advance past them (`Astra B1`).
+                skipped_shas_in_sweep.insert(sha.clone());
+            }
+        }
         if begun.eligible_sha256s.is_empty() {
-            // Concurrent ACK or state change cleared all referents before dispatch!
             return (true, None);
         }
 
-        let eligible_set: BTreeSet<&Sha256Hex> = begun.eligible_sha256s.iter().collect();
         let entries: Vec<CommittedMailEntry> = candidate_entries
             .into_iter()
             .filter(|e| eligible_set.contains(&e.message.sha256))
@@ -2319,6 +2913,7 @@ impl CourierHubInner {
         );
         let reply = invoke_courier_script_guarded(&script, &claim, self.cfg.timeout, guard).await;
 
+        let max_tries = self.cfg.effective_max_defer_tries(current_cfg);
         let seat = binding.seat.clone();
         let all_shas: Vec<Sha256Hex> = entries.iter().map(|e| e.message.sha256.clone()).collect();
         let sender_groups = group_entries_by_sender(&entries);
@@ -2332,7 +2927,45 @@ impl CourierHubInner {
             let mut st = self.state.lock().await;
             st.mail.inflight_dispatches.remove(&dispatch_id);
             match reply.outcome {
-                CourierOutcome::Rung | CourierOutcome::Unknown => {
+                CourierOutcome::Rung => {
+                    for sha in &all_shas {
+                        st.optimistic_mail_due
+                            .insert((seat.clone(), sha.clone()), UnixMs(u64::MAX));
+                    }
+                    for entry in &entries {
+                        st.affinity.record_authored(
+                            entry.message.id.clone(),
+                            seat.clone(),
+                            binding.incarnation_id.clone(),
+                        );
+                    }
+                }
+                CourierOutcome::Unknown if reply.pre_spawn => {
+                    for entry in &entries {
+                        let k = (seat.clone(), entry.message.sha256.clone());
+                        let next_tries = st
+                            .mail
+                            .defer_state
+                            .get(&k)
+                            .map_or(0, |r| r.tries)
+                            .saturating_add(1);
+                        if next_tries >= max_tries {
+                            st.optimistic_mail_due.insert(k, UnixMs(u64::MAX));
+                            st.mail.failed_incarnation_keys.insert((
+                                seat.clone(),
+                                binding.incarnation_id.clone(),
+                                Some(binding.epoch),
+                                entry.message.sha256.clone(),
+                            ));
+                            given_up_entries.push(entry.clone());
+                        } else {
+                            let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
+                            st.optimistic_mail_due.insert(k, due);
+                            earliest_due = Some(earliest_due.map_or(due, |cur| cur.min(due)));
+                        }
+                    }
+                }
+                CourierOutcome::Unknown => {
                     for sha in &all_shas {
                         st.optimistic_mail_due
                             .insert((seat.clone(), sha.clone()), UnixMs(u64::MAX));
@@ -2357,6 +2990,7 @@ impl CourierHubInner {
                         st.mail.failed_incarnation_keys.insert((
                             seat.clone(),
                             binding.incarnation_id.clone(),
+                            Some(binding.epoch),
                             sha.clone(),
                         ));
                     }
@@ -2370,16 +3004,17 @@ impl CourierHubInner {
                             .get(&k)
                             .map_or(0, |r| r.tries)
                             .saturating_add(1);
-                        if next_tries >= self.cfg.max_defer_tries {
+                        if next_tries >= max_tries {
                             st.optimistic_mail_due.insert(k, UnixMs(u64::MAX));
                             st.mail.failed_incarnation_keys.insert((
                                 seat.clone(),
                                 binding.incarnation_id.clone(),
+                                Some(binding.epoch),
                                 entry.message.sha256.clone(),
                             ));
                             given_up_entries.push(entry.clone());
                         } else {
-                            let due = self.cfg.backoff_due_at(now_done, next_tries);
+                            let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
                             st.optimistic_mail_due.insert(k, due);
                             earliest_due = Some(earliest_due.map_or(due, |cur| cur.min(due)));
                         }
@@ -2400,11 +3035,11 @@ impl CourierHubInner {
                     .collect();
                 (Some(DeliveryFailureKind::Refused), groups, Some(r))
             }
-            CourierOutcome::Deferred if !given_up_entries.is_empty() => {
+            CourierOutcome::Deferred | CourierOutcome::Unknown if !given_up_entries.is_empty() => {
                 let r = reply
                     .reason
                     .clone()
-                    .unwrap_or_else(|| format!("max-tries-{}", self.cfg.max_defer_tries));
+                    .unwrap_or_else(|| format!("max-tries-{max_tries}"));
                 let groups = group_entries_by_sender(&given_up_entries)
                     .into_iter()
                     .map(|(s, shas)| MailFailureGroup {
@@ -2421,6 +3056,7 @@ impl CourierHubInner {
             .call(MailRecordRing {
                 phase: RingRecordPhase::Complete,
                 dispatch_id: Some(dispatch_id),
+                reconciled_failure_seq: None,
                 courier: adapter.to_owned(),
                 seat: seat.clone(),
                 machine_id: self.cfg.local_machine_id.clone(),
@@ -2428,6 +3064,7 @@ impl CourierHubInner {
                 expected_epoch: Some(binding.epoch),
                 sha256s: all_shas,
                 is_canary: false,
+                pre_spawn: reply.pre_spawn,
                 outcome: reply.outcome,
                 reason: effective_reason,
                 detail: reply.detail,
@@ -2442,19 +3079,13 @@ impl CourierHubInner {
         if let Ok(rec) = recorded {
             for f in &rec.committed_failures {
                 if self.reconcile_one_failure(f, client).await {
-                    self.state
-                        .lock()
-                        .await
-                        .reconciled_failure_seqs
-                        .insert(f.seq);
+                    self.mark_failure_reconciled(f, client).await;
                 }
             }
         }
 
-        let can_continue_batches = matches!(
-            reply.outcome,
-            CourierOutcome::Rung | CourierOutcome::Unknown
-        );
+        let can_continue_batches = reply.outcome == CourierOutcome::Rung
+            || (reply.outcome == CourierOutcome::Unknown && !reply.pre_spawn);
         (can_continue_batches, earliest_due)
     }
 }
@@ -2484,6 +3115,7 @@ mod tests {
                 outcome: CourierOutcome::Rung,
                 reason: None,
                 detail: None,
+                pre_spawn: false,
             }
         );
         assert_eq!(
@@ -2494,6 +3126,7 @@ mod tests {
                 outcome: CourierOutcome::Refused,
                 reason: Some("address-gone".into()),
                 detail: Some("thread archived".into()),
+                pre_spawn: false,
             }
         );
         assert_eq!(
@@ -2513,6 +3146,7 @@ mod tests {
             outcome: CourierOutcome::Unknown,
             reason: Some("bad token rwc_secret123".into()),
             detail: Some("stdin had canary_token=rwc_secret123 on failure".into()),
+            pre_spawn: false,
         };
         let clean = raw.redact_secret(Some("rwc_secret123"));
         assert!(!clean.reason.as_deref().unwrap().contains("rwc_secret123"));
@@ -2523,6 +3157,33 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("[REDACTED_CANARY]")
+        );
+
+        // Also verify boundary-straddling canary token (>512 chars) is redacted BEFORE truncation (`Astra S12`)!
+        let boundary_json = format!(
+            r#"{{"outcome":"unknown","reason":"{}rwc_boundary_tok_99","detail":"{}rwc_boundary_tok_99"}}"#,
+            "r".repeat(120),
+            "d".repeat(505),
+        );
+        let parsed =
+            parse_courier_stdout_redacted(boundary_json.as_bytes(), Some("rwc_boundary_tok_99"));
+        assert!(
+            !parsed
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rwc_boundary"),
+            "reason leaked truncated canary prefix: {:?}",
+            parsed.reason
+        );
+        assert!(
+            !parsed
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rwc_boundary"),
+            "detail leaked truncated canary prefix: {:?}",
+            parsed.detail
         );
     }
 

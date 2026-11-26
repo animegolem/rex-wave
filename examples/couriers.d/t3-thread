@@ -88,7 +88,7 @@ def send_via_http(base_url: str, token: str, thread_id: str, message: str, timeo
         detail = err.read().decode("utf-8", errors="replace").strip()[:240]
         if err.code in (404, 410) and is_confirmed_thread_gone(detail):
             return emit("refused", "address-gone", detail)
-        if err.code in (409, 429, 502, 503, 504):
+        if err.code in (409, 429, 503):
             return emit("deferred", f"http-{err.code}", detail or "thread busy")
         return emit("unknown", f"http-{err.code}", detail or str(err))
     except urllib.error.URLError as err:

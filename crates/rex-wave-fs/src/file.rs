@@ -1966,15 +1966,31 @@ pub fn stage_verified_executable(
     leaf_name: &str,
     max_bytes: u64,
 ) -> io::Result<StagedExecutable> {
+    validate_at_leaf_name(leaf_name)?;
+    let parent_dir = open_dir_nofollow(dir)?;
+    stage_verified_executable_at(&parent_dir, dir, leaf_name, max_bytes)
+}
+
+/// Stages `leaf_name` directly from an already-opened, verified directory descriptor
+/// `parent_dir` (e.g. returned by [`crate::ProtectedRootsGuard::open_verified_dir`])
+/// with zero pathname re-open between ancestor verification and staging.
+pub fn stage_verified_executable_at(
+    parent_dir: &File,
+    display_dir: &Path,
+    leaf_name: &str,
+    max_bytes: u64,
+) -> io::Result<StagedExecutable> {
     use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat};
 
     validate_at_leaf_name(leaf_name)?;
-    let parent_dir = open_dir_nofollow(dir)?;
-    let (file, meta) = open_regular_at(&parent_dir, leaf_name)?;
+    let (file, meta) = open_regular_at(parent_dir, leaf_name)?;
     if (meta.permissions().mode() & 0o111) == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{} is not executable", dir.join(leaf_name).display()),
+            format!(
+                "{} is not executable",
+                display_dir.join(leaf_name).display()
+            ),
         ));
     }
     if meta.len() > max_bytes {
@@ -1982,7 +1998,7 @@ pub fn stage_verified_executable(
             io::ErrorKind::InvalidData,
             format!(
                 "{} exceeds max executable size ({max_bytes} bytes)",
-                dir.join(leaf_name).display()
+                display_dir.join(leaf_name).display()
             ),
         ));
     }
@@ -1994,7 +2010,7 @@ pub fn stage_verified_executable(
     let exec_path = tmp_path.join(&stage.name).join(leaf_name);
 
     let linked_same_inode = match linkat(
-        &parent_dir,
+        parent_dir,
         leaf_name,
         stage.dir(),
         leaf_name,
@@ -2009,7 +2025,7 @@ pub fn stage_verified_executable(
 
     if !linked_same_inode {
         let _ = unlink_regular_at(stage.dir(), leaf_name);
-        let full_display = dir.join(leaf_name);
+        let full_display = display_dir.join(leaf_name);
         let bytes = read_open_bounded(&full_display, file, &meta, max_bytes)?;
         let out_fd = openat(
             stage.dir(),

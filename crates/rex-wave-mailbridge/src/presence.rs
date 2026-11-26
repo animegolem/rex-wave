@@ -1099,7 +1099,7 @@ pub fn select_binding_for_delivery<'a>(
             b.bound_at,
             b.machine_id
                 .as_deref()
-                .unwrap_or(DEFAULT_MACHINE_ID)
+                .unwrap_or(&state.local_machine_id)
                 .to_owned(),
             b.incarnation_id.clone(),
         )
@@ -1144,7 +1144,10 @@ pub fn select_binding_for_delivery_on_machine<'a>(
 ) -> Option<&'a SeatBinding> {
     let winner = select_binding_for_delivery(state, seat, lane, in_reply_to, affinity, now)?;
     if let Some(want_machine) = local_machine_id {
-        let actual_machine = winner.machine_id.as_deref().unwrap_or(DEFAULT_MACHINE_ID);
+        let actual_machine = winner
+            .machine_id
+            .as_deref()
+            .unwrap_or(&state.local_machine_id);
         if actual_machine != want_machine {
             return None;
         }
@@ -1461,7 +1464,7 @@ impl PresenceState {
                     && !self.down_transports.contains(&b.endpoint.kind())
                     && lane.is_none_or(|want| b.lane.as_deref() == Some(want))
                     && machine_id.is_none_or(|want| {
-                        b.machine_id.as_deref().unwrap_or(DEFAULT_MACHINE_ID) == want
+                        b.machine_id.as_deref().unwrap_or(&self.local_machine_id) == want
                     })
             })
             .collect();
@@ -1482,7 +1485,7 @@ impl PresenceState {
                 if b.status == BindingStatus::PendingCanary
                     && b.expires_at.is_none_or(|exp| exp > now)
                     && !self.down_transports.contains(&b.endpoint.kind())
-                    && b.machine_id.as_deref().unwrap_or(DEFAULT_MACHINE_ID) == machine_id
+                    && b.machine_id.as_deref().unwrap_or(&self.local_machine_id) == machine_id
                 {
                     out.push(b);
                 }
@@ -1561,6 +1564,7 @@ impl PresenceState {
                         incarnation_id: b.incarnation_id.clone(),
                         expected_epoch: Some(b.epoch),
                         lease_expires_at: Some(exp),
+                        only_if_pending_canary: false,
                         reason: format!("lease expired at {}", exp.0),
                     });
                     continue;
@@ -1573,6 +1577,7 @@ impl PresenceState {
                         incarnation_id: b.incarnation_id.clone(),
                         expected_epoch: Some(b.epoch),
                         lease_expires_at: None,
+                        only_if_pending_canary: false,
                         reason: format!("process pid={pid} no longer matches proc_start"),
                     });
                 }
@@ -2358,14 +2363,19 @@ impl Presence {
                     .is_some_and(|id| id == &b.incarnation_id);
                 if same_proc || same_incarnation {
                     if c.incarnation_id.is_none() || same_incarnation {
-                        let same_endpoint = b.endpoint == c.endpoint;
-                        let was_confirmed =
-                            matches!(b.status, BindingStatus::Live | BindingStatus::TransportDown);
+                        let b_machine = b.machine_id.as_deref().unwrap_or(&state.local_machine_id);
+                        let c_machine = machine_id.as_deref().unwrap_or(&state.local_machine_id);
+                        let same_endpoint = b.endpoint == c.endpoint && b_machine == c_machine;
+                        let was_canary_confirmed = b.canary_verified
+                            && matches!(
+                                b.status,
+                                BindingStatus::Live | BindingStatus::TransportDown
+                            );
                         refresh_target = Some((
                             b.incarnation_id.clone(),
                             b.epoch,
                             same_endpoint,
-                            was_confirmed,
+                            was_canary_confirmed,
                         ));
                     } else {
                         superseded.push(b.incarnation_id.clone());
@@ -2432,13 +2442,18 @@ impl Presence {
                 (id, next_epoch, false)
             };
 
-        let (status, canary_token) = if effective_require_canary && !preserve_confirmed {
-            (BindingStatus::PendingCanary, Some(mint_canary_token()?))
-        } else if state.down_transports.contains(&c.endpoint.kind()) {
-            (BindingStatus::TransportDown, None)
-        } else {
-            (BindingStatus::Live, None)
-        };
+        let (status, canary_token, canary_verified) =
+            if effective_require_canary && !preserve_confirmed {
+                (
+                    BindingStatus::PendingCanary,
+                    Some(mint_canary_token()?),
+                    false,
+                )
+            } else if state.down_transports.contains(&c.endpoint.kind()) {
+                (BindingStatus::TransportDown, None, preserve_confirmed)
+            } else {
+                (BindingStatus::Live, None, preserve_confirmed)
+            };
 
         let effective_horizon = c
             .mail_horizon_at
@@ -2488,6 +2503,7 @@ impl Presence {
             bound_at: ctx.at(),
             expires_at,
             canary_token,
+            canary_verified,
             status,
         };
         events.push(PresenceEvent::Bound {
@@ -2665,6 +2681,9 @@ impl Presence {
         ) {
             return Ok(vec![]);
         }
+        if c.only_if_pending_canary && binding.status != BindingStatus::PendingCanary {
+            return Ok(vec![]);
+        }
         if let Some(expected) = c.expected_epoch
             && binding.epoch != expected
         {
@@ -2788,6 +2807,7 @@ impl Decider for Presence {
                     && binding.status == BindingStatus::PendingCanary
                 {
                     binding.canary_token = None;
+                    binding.canary_verified = true;
                     binding.status = if state.down_transports.contains(&binding.endpoint.kind()) {
                         BindingStatus::TransportDown
                     } else {

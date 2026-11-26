@@ -795,6 +795,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
                     bound_at: ctx.at(),
                     expires_at: None,
                     canary_token: None,
+                    canary_verified: false,
                     status: BindingStatus::Live,
                 }))
             })

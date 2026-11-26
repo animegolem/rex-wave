@@ -1051,11 +1051,14 @@ pub struct MailState {
     pub rung_keys: BTreeSet<(SeatName, Sha256Hex)>,
     /// Unscoped `(seat, sha256)` failures when no `IncarnationId` was associated.
     pub failed_keys: BTreeSet<(SeatName, Sha256Hex)>,
-    /// Incarnation-scoped `(seat, incarnation_id, sha256)` failures so a refusal or
-    /// give-up on a dead session never suppresses delivery on a later rebound session.
-    pub failed_incarnation_keys: BTreeSet<(SeatName, IncarnationId, Sha256Hex)>,
-    /// Durable per-`(seat, sha256)` deferral retry state (`tries`, `last_at`).
+    /// Incarnation- and epoch-scoped `(seat, incarnation_id, expected_epoch, sha256)` failures
+    /// so a refusal or give-up on a dead session never suppresses delivery on a later rebound
+    /// session or a reconnected session reusing the same `incarnation_id` under a fresh epoch.
+    pub failed_incarnation_keys: BTreeSet<(SeatName, IncarnationId, Option<u64>, Sha256Hex)>,
+    /// Durable per-`(seat, sha256)` deferral retry state (`tries`, `last_at`) on live routes.
     pub defer_state: BTreeMap<(SeatName, Sha256Hex), DeferAttemptRecord>,
+    /// Durable per-`(seat, sha256)` retry state while waiting for a confirmed live route (`MailHub.Defer`).
+    pub no_route_defer_state: BTreeMap<(SeatName, Sha256Hex), DeferAttemptRecord>,
     /// Durable per-`(seat, incarnation_id)` canary retry state (`tries`, `last_at`) for
     /// `Deferred` or `Unknown` canary rings.
     pub canary_defer_state: BTreeMap<(SeatName, IncarnationId), DeferAttemptRecord>,
@@ -1063,7 +1066,10 @@ pub struct MailState {
     pub canary_rung_incarnations: BTreeSet<(SeatName, IncarnationId)>,
     /// Live per-courier delivery counters & degradation state.
     pub courier_stats: BTreeMap<String, CourierCounterState>,
-    /// Recent loud delivery failures (`refused`, `give_up`, `adapter_degraded`).
+    /// Uncapped map of outstanding `DeliveryFailed` entries awaiting durable follow-up
+    /// reconciliation (`PresenceExpire` + `MailSend` + `InboxRaise`).
+    pub unreconciled_failures: BTreeMap<Seq, MailDeliveryFailure>,
+    /// Recent loud delivery failures (`refused`, `give_up`, `adapter_degraded`) capped for UI display.
     pub delivery_failures: Vec<MailDeliveryFailure>,
 }
 
@@ -1277,6 +1283,7 @@ impl MailState {
                     self.acked.insert(key.clone());
                     self.acked_shas.insert(sha256.clone());
                     self.defer_state.remove(&key);
+                    self.no_route_defer_state.remove(&key);
                     self.ack_records
                         .entry(key.clone())
                         .or_insert_with(|| CommittedAckRecord {
@@ -1331,6 +1338,7 @@ impl MailState {
                 incarnation_id,
                 sha256s,
                 is_canary,
+                pre_spawn,
                 outcome,
                 degraded_threshold,
                 ..
@@ -1338,6 +1346,8 @@ impl MailState {
                 if let Some(did) = dispatch_id {
                     self.inflight_dispatches.remove(did);
                 }
+                let is_route_pending =
+                    !*is_canary && incarnation_id.is_none() && courier == "route-pending";
                 if *is_canary {
                     if let Some(inc) = incarnation_id {
                         let ckey = (seat.clone(), inc.clone());
@@ -1362,18 +1372,56 @@ impl MailState {
                             }
                         }
                     }
+                } else if is_route_pending {
+                    for sha in sha256s {
+                        let k = (seat.clone(), sha.clone());
+                        let prev = self.no_route_defer_state.get(&k).map_or(0, |r| r.tries);
+                        self.no_route_defer_state.insert(
+                            k,
+                            DeferAttemptRecord {
+                                tries: prev.saturating_add(1),
+                                last_at: env.at,
+                            },
+                        );
+                    }
                 } else {
                     match outcome {
-                        CourierOutcome::Rung | CourierOutcome::Unknown => {
+                        CourierOutcome::Rung => {
                             for sha in sha256s {
                                 let k = (seat.clone(), sha.clone());
                                 self.rung_keys.insert(k.clone());
                                 self.defer_state.remove(&k);
+                                self.no_route_defer_state.remove(&k);
+                            }
+                        }
+                        CourierOutcome::Unknown if *pre_spawn => {
+                            // Pre-spawn setup errors never executed the adapter, so letters
+                            // retain push eligibility while advancing bounded retry backoff.
+                            for sha in sha256s {
+                                let k = (seat.clone(), sha.clone());
+                                let prev = self.defer_state.get(&k).map_or(0, |r| r.tries);
+                                self.defer_state.insert(
+                                    k,
+                                    DeferAttemptRecord {
+                                        tries: prev.saturating_add(1),
+                                        last_at: env.at,
+                                    },
+                                );
+                            }
+                        }
+                        CourierOutcome::Unknown => {
+                            for sha in sha256s {
+                                let k = (seat.clone(), sha.clone());
+                                self.rung_keys.insert(k.clone());
+                                self.defer_state.remove(&k);
+                                self.no_route_defer_state.remove(&k);
                             }
                         }
                         CourierOutcome::Refused => {
                             for sha in sha256s {
-                                self.defer_state.remove(&(seat.clone(), sha.clone()));
+                                let k = (seat.clone(), sha.clone());
+                                self.defer_state.remove(&k);
+                                self.no_route_defer_state.remove(&k);
                             }
                         }
                         CourierOutcome::Deferred => {
@@ -1391,39 +1439,41 @@ impl MailState {
                         }
                     }
                 }
-                let threshold = degraded_threshold
-                    .unwrap_or(DEFAULT_COURIER_DEGRADED_THRESHOLD)
-                    .max(1);
-                let stats = self.courier_stats.entry(courier.clone()).or_default();
-                match outcome {
-                    CourierOutcome::Rung => {
-                        stats.rung = stats.rung.saturating_add(1);
-                        stats.consecutive_unknown = 0;
-                        stats.seat_consecutive_unknown.insert(seat.clone(), 0);
-                        stats.degraded_seats.remove(seat);
-                        stats.degraded = !stats.degraded_seats.is_empty();
-                    }
-                    CourierOutcome::Unknown => {
-                        stats.unknown = stats.unknown.saturating_add(1);
-                        stats.consecutive_unknown = stats.consecutive_unknown.saturating_add(1);
-                        let seat_streak = stats
-                            .seat_consecutive_unknown
-                            .entry(seat.clone())
-                            .or_insert(0);
-                        *seat_streak = seat_streak.saturating_add(1);
-                        if *seat_streak >= threshold {
-                            stats.degraded_seats.insert(seat.clone());
+                if !is_route_pending {
+                    let threshold = degraded_threshold
+                        .unwrap_or(DEFAULT_COURIER_DEGRADED_THRESHOLD)
+                        .max(1);
+                    let stats = self.courier_stats.entry(courier.clone()).or_default();
+                    match outcome {
+                        CourierOutcome::Rung => {
+                            stats.rung = stats.rung.saturating_add(1);
+                            stats.consecutive_unknown = 0;
+                            stats.seat_consecutive_unknown.insert(seat.clone(), 0);
+                            stats.degraded_seats.remove(seat);
+                            stats.degraded = !stats.degraded_seats.is_empty();
                         }
-                        if stats.consecutive_unknown >= threshold
-                            || !stats.degraded_seats.is_empty()
-                        {
-                            stats.degraded = true;
+                        CourierOutcome::Unknown => {
+                            stats.unknown = stats.unknown.saturating_add(1);
+                            stats.consecutive_unknown = stats.consecutive_unknown.saturating_add(1);
+                            let seat_streak = stats
+                                .seat_consecutive_unknown
+                                .entry(seat.clone())
+                                .or_insert(0);
+                            *seat_streak = seat_streak.saturating_add(1);
+                            if *seat_streak >= threshold {
+                                stats.degraded_seats.insert(seat.clone());
+                            }
+                            if stats.consecutive_unknown >= threshold
+                                || !stats.degraded_seats.is_empty()
+                            {
+                                stats.degraded = true;
+                            }
                         }
+                        CourierOutcome::Refused => {
+                            stats.refused = stats.refused.saturating_add(1);
+                        }
+                        CourierOutcome::Deferred => {}
                     }
-                    CourierOutcome::Refused => {
-                        stats.refused = stats.refused.saturating_add(1);
-                    }
-                    CourierOutcome::Deferred => {}
                 }
             }
             Event::Mail(MailEvent::DeliveryFailed {
@@ -1432,6 +1482,7 @@ impl MailState {
                 seat,
                 incarnation_id,
                 expected_epoch,
+                is_canary,
                 sha256s,
                 sender_seat,
                 hub_owner_seat,
@@ -1445,17 +1496,22 @@ impl MailState {
                     if let Some(inc) = incarnation_id {
                         self.canary_defer_state.remove(&(seat.clone(), inc.clone()));
                         for sha in sha256s {
-                            self.defer_state.remove(&(seat.clone(), sha.clone()));
+                            let k = (seat.clone(), sha.clone());
+                            self.defer_state.remove(&k);
+                            self.no_route_defer_state.remove(&k);
                             self.failed_incarnation_keys.insert((
                                 seat.clone(),
                                 inc.clone(),
+                                *expected_epoch,
                                 sha.clone(),
                             ));
                         }
                     } else {
                         for sha in sha256s {
-                            self.defer_state.remove(&(seat.clone(), sha.clone()));
-                            self.failed_keys.insert((seat.clone(), sha.clone()));
+                            let k = (seat.clone(), sha.clone());
+                            self.defer_state.remove(&k);
+                            self.no_route_defer_state.remove(&k);
+                            self.failed_keys.insert(k);
                         }
                     }
                 }
@@ -1464,7 +1520,7 @@ impl MailState {
                     stats.degraded_seats.insert(seat.clone());
                     stats.degraded = true;
                 }
-                self.delivery_failures.push(MailDeliveryFailure {
+                let record = MailDeliveryFailure {
                     seq: env.seq,
                     at: env.at,
                     kind: *kind,
@@ -1472,16 +1528,22 @@ impl MailState {
                     seat: seat.clone(),
                     incarnation_id: incarnation_id.clone(),
                     expected_epoch: *expected_epoch,
+                    is_canary: *is_canary,
                     sha256s: sha256s.clone(),
                     sender_seat: sender_seat.clone(),
                     hub_owner_seat: hub_owner_seat.clone(),
                     reason: reason.clone(),
                     detail: detail.clone(),
-                });
+                };
+                self.unreconciled_failures.insert(env.seq, record.clone());
+                self.delivery_failures.push(record);
                 if self.delivery_failures.len() > MAX_STORED_DELIVERY_FAILURES {
                     let drop_n = self.delivery_failures.len() - MAX_STORED_DELIVERY_FAILURES;
                     self.delivery_failures.drain(0..drop_n);
                 }
+            }
+            Event::Mail(MailEvent::DeliveryFailureReconciled { failure_seq }) => {
+                self.unreconciled_failures.remove(failure_seq);
             }
             Event::Mail(MailEvent::BellRang { .. }) => {}
             _ => {}
@@ -1517,19 +1579,41 @@ impl MailState {
     }
 
     /// Returns `true` when `sha` has already terminated (`Refused` or `GiveUp`) on
-    /// `incarnation_id` (or globally when unscoped), leaving new rebound incarnations
-    /// free to receive unacked mail.
+    /// `(incarnation_id, epoch)` (or globally when unscoped), leaving new rebound incarnations
+    /// and reconnected epochs of the same `incarnation_id` free to receive unacked mail.
     pub fn is_failed_for_binding(
         &self,
         seat: &SeatName,
         incarnation_id: Option<&IncarnationId>,
+        epoch: Option<u64>,
         sha: &Sha256Hex,
     ) -> bool {
         self.failed_keys.contains(&(seat.clone(), sha.clone()))
             || incarnation_id.is_some_and(|inc| {
-                self.failed_incarnation_keys
-                    .contains(&(seat.clone(), inc.clone(), sha.clone()))
+                self.failed_incarnation_keys.contains(&(
+                    seat.clone(),
+                    inc.clone(),
+                    None,
+                    sha.clone(),
+                )) || epoch.is_some_and(|ep| {
+                    self.failed_incarnation_keys.contains(&(
+                        seat.clone(),
+                        inc.clone(),
+                        Some(ep),
+                        sha.clone(),
+                    ))
+                })
             })
+    }
+
+    /// Returns `true` when any prior failure (`Refused` or `GiveUp`) has already been
+    /// escalated for `(seat, sha)` across any incarnation or unscoped route.
+    pub fn has_any_failure_for_seat(&self, seat: &SeatName, sha: &Sha256Hex) -> bool {
+        self.failed_keys.contains(&(seat.clone(), sha.clone()))
+            || self
+                .failed_incarnation_keys
+                .iter()
+                .any(|(s, _, _, h)| s == seat && h == sha)
     }
 
     /// Returns `true` when an unfinished pre-dispatch claim currently owns `(seat, sha)`.

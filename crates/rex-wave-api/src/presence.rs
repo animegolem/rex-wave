@@ -442,6 +442,8 @@ pub struct SeatBinding {
     pub expires_at: Option<UnixMs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canary_token: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub canary_verified: bool,
     pub status: BindingStatus,
 }
 
@@ -555,6 +557,8 @@ pub struct PresenceExpire {
     pub expected_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_if_pending_canary: bool,
     pub reason: String,
 }
 

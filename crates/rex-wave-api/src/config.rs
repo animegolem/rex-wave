@@ -251,6 +251,10 @@ impl HarnessesConfig {
 pub const DEFAULT_HUB_OWNER_SEAT: &str = "postmaster";
 pub const DEFAULT_MAIL_RECONNECT_GRACE_MS: u64 = 15_000;
 pub const MAX_MAIL_RECONNECT_GRACE_MS: u64 = 86_400_000;
+pub const DEFAULT_MAIL_DEFER_BACKOFF_MS: u64 = 30_000;
+pub const MAX_MAIL_DEFER_BACKOFF_MS: u64 = 3_600_000;
+pub const DEFAULT_MAIL_MAX_DEFER_TRIES: u32 = 8;
+pub const MAX_MAIL_MAX_DEFER_TRIES: u32 = 100;
 
 fn default_hub_owner_seat() -> SeatName {
     SeatName::parse(DEFAULT_HUB_OWNER_SEAT).expect("valid default hub_owner_seat")
@@ -258,6 +262,22 @@ fn default_hub_owner_seat() -> SeatName {
 
 const fn default_reconnect_grace_ms() -> u64 {
     DEFAULT_MAIL_RECONNECT_GRACE_MS
+}
+
+const fn default_defer_backoff_ms() -> u64 {
+    DEFAULT_MAIL_DEFER_BACKOFF_MS
+}
+
+const fn default_max_defer_tries() -> u32 {
+    DEFAULT_MAIL_MAX_DEFER_TRIES
+}
+
+const fn is_default_defer_backoff_ms(v: &u64) -> bool {
+    *v == DEFAULT_MAIL_DEFER_BACKOFF_MS
+}
+
+const fn is_default_max_defer_tries(v: &u32) -> bool {
+    *v == DEFAULT_MAIL_MAX_DEFER_TRIES
 }
 
 /// `[mail]` section of `config.toml`.
@@ -277,6 +297,16 @@ pub struct MailConfig {
     pub hub_owner_seat: SeatName,
     #[serde(default = "default_reconnect_grace_ms")]
     pub reconnect_grace_ms: u64,
+    #[serde(
+        default = "default_defer_backoff_ms",
+        skip_serializing_if = "is_default_defer_backoff_ms"
+    )]
+    pub defer_backoff_ms: u64,
+    #[serde(
+        default = "default_max_defer_tries",
+        skip_serializing_if = "is_default_max_defer_tries"
+    )]
+    pub max_defer_tries: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toast_cmd: Option<String>,
 }
@@ -291,6 +321,8 @@ impl Default for MailConfig {
             couriers_dir: None,
             hub_owner_seat: default_hub_owner_seat(),
             reconnect_grace_ms: DEFAULT_MAIL_RECONNECT_GRACE_MS,
+            defer_backoff_ms: DEFAULT_MAIL_DEFER_BACKOFF_MS,
+            max_defer_tries: DEFAULT_MAIL_MAX_DEFER_TRIES,
             toast_cmd: None,
         }
     }
@@ -582,6 +614,20 @@ pub static SETTINGS_FIELDS: &[SettingFieldSpec] = &[
     },
     SettingFieldSpec {
         section: "Mail & Couriers",
+        key: "mail.defer_backoff_ms",
+        label: "Defer backoff (ms)",
+        kind: SettingFieldKind::Number,
+        hint: "1..=3600000 (default 30000)",
+    },
+    SettingFieldSpec {
+        section: "Mail & Couriers",
+        key: "mail.max_defer_tries",
+        label: "Max defer tries",
+        kind: SettingFieldKind::Number,
+        hint: "1..=100 (default 8)",
+    },
+    SettingFieldSpec {
+        section: "Mail & Couriers",
         key: "mail.toast_cmd",
         label: "Toast command",
         kind: SettingFieldKind::Text,
@@ -782,6 +828,25 @@ impl RexConfig {
                 ),
             });
         }
+        if self.mail.defer_backoff_ms == 0 || self.mail.defer_backoff_ms > MAX_MAIL_DEFER_BACKOFF_MS
+        {
+            return Err(InvalidId {
+                what: "mail.defer_backoff_ms".into(),
+                reason: format!(
+                    "must be in 1..={MAX_MAIL_DEFER_BACKOFF_MS} ms (got {})",
+                    self.mail.defer_backoff_ms
+                ),
+            });
+        }
+        if self.mail.max_defer_tries == 0 || self.mail.max_defer_tries > MAX_MAIL_MAX_DEFER_TRIES {
+            return Err(InvalidId {
+                what: "mail.max_defer_tries".into(),
+                reason: format!(
+                    "must be in 1..={MAX_MAIL_MAX_DEFER_TRIES} (got {})",
+                    self.mail.max_defer_tries
+                ),
+            });
+        }
         if let Some(ref cmd) = self.mail.toast_cmd {
             validate_printable("mail.toast_cmd", cmd, 1024)?;
         }
@@ -816,6 +881,8 @@ impl RexConfig {
                 .map(|p| p.to_string_lossy().into_owned()),
             "mail.hub_owner_seat" => Some(self.mail.hub_owner_seat.to_string()),
             "mail.reconnect_grace_ms" => Some(self.mail.reconnect_grace_ms.to_string()),
+            "mail.defer_backoff_ms" => Some(self.mail.defer_backoff_ms.to_string()),
+            "mail.max_defer_tries" => Some(self.mail.max_defer_tries.to_string()),
             "mail.toast_cmd" => self.mail.toast_cmd.clone(),
             other => {
                 let rest = other
@@ -912,6 +979,42 @@ impl RexConfig {
                         ms
                     }
                     None => DEFAULT_MAIL_RECONNECT_GRACE_MS,
+                };
+            }
+            "mail.defer_backoff_ms" => {
+                self.mail.defer_backoff_ms = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(s) => {
+                        let ms = s.parse::<u64>().map_err(|_| InvalidId {
+                            what: canon.into(),
+                            reason: "expected positive integer milliseconds".into(),
+                        })?;
+                        if ms == 0 || ms > MAX_MAIL_DEFER_BACKOFF_MS {
+                            return Err(InvalidId {
+                                what: canon.into(),
+                                reason: format!("must be in 1..={MAX_MAIL_DEFER_BACKOFF_MS} ms"),
+                            });
+                        }
+                        ms
+                    }
+                    None => DEFAULT_MAIL_DEFER_BACKOFF_MS,
+                };
+            }
+            "mail.max_defer_tries" => {
+                self.mail.max_defer_tries = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(s) => {
+                        let n = s.parse::<u32>().map_err(|_| InvalidId {
+                            what: canon.into(),
+                            reason: "expected positive integer".into(),
+                        })?;
+                        if n == 0 || n > MAX_MAIL_MAX_DEFER_TRIES {
+                            return Err(InvalidId {
+                                what: canon.into(),
+                                reason: format!("must be in 1..={MAX_MAIL_MAX_DEFER_TRIES}"),
+                            });
+                        }
+                        n
+                    }
+                    None => DEFAULT_MAIL_MAX_DEFER_TRIES,
                 };
             }
             "mail.toast_cmd" => {

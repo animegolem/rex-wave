@@ -209,6 +209,34 @@ fn persist_operator_seat(state_dir: &Path, operator: &SeatName) -> io::Result<()
     rex_wave_fs::write_atomic_path(&path, format!("{operator}\n").as_bytes(), 0o600, false)
 }
 
+fn machine_id_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("machine-id")
+}
+
+/// Resolves `--machine-id` / `REX_WAVE_MACHINE_ID` when explicitly provided; otherwise
+/// loads or persists `<state_dir>/machine-id` (`0600`) so transient DHCP/network hostname
+/// changes across daemon restarts never orphan existing local Presence bindings.
+pub fn resolve_or_persist_machine_id(state_dir: &Path, explicit: Option<&str>) -> String {
+    if let Some(clean) = explicit.and_then(sanitize_machine_id) {
+        return clean;
+    }
+    if let Ok(env_id) = std::env::var("REX_WAVE_MACHINE_ID")
+        && let Some(clean) = sanitize_machine_id(&env_id)
+    {
+        return clean;
+    }
+    let path = machine_id_path(state_dir);
+    if let Ok(text) = rex_wave_fs::read_regular_string(&path, 256)
+        && let Some(saved) = sanitize_machine_id(&text)
+    {
+        return saved;
+    }
+    let generated = default_machine_id();
+    let _ =
+        rex_wave_fs::write_atomic_path(&path, format!("{generated}\n").as_bytes(), 0o600, false);
+    generated
+}
+
 /// Resolves the effective operator seat for `sock_path` using the same source
 /// of truth as the daemon: `<state_dir>/operator-seat` when written by a daemon
 /// on `sock_path`, then `REX_WAVE_OPERATOR`, then `"owner"`.
@@ -592,12 +620,6 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     }
     let house =
         rex_wave_mailbridge::load_house_profile().map_err(|e| format!("house profile: {e}"))?;
-    let local_machine_id = args
-        .machine_id
-        .as_deref()
-        .and_then(sanitize_machine_id)
-        .unwrap_or_else(default_machine_id);
-    let presence = Presence::with_house_profile(house).with_machine_id(local_machine_id.clone());
     let sock_path = resolve_socket_path(socket_override.as_deref());
     let state_dir = state_dir_for(&sock_path);
     let journal_path = args
@@ -611,6 +633,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     prepared_sock.arm_cleanup_on_drop();
     rex_wave_fs::create_missing_private_dir(&state_dir)
         .map_err(|e| format!("create socket dir {}: {e}", state_dir.display()))?;
+    let local_machine_id = resolve_or_persist_machine_id(&state_dir, args.machine_id.as_deref());
+    let presence = Presence::with_house_profile(house).with_machine_id(local_machine_id.clone());
     if let Some(parent) = journal_path.parent()
         && parent != state_dir.as_path()
     {

@@ -626,6 +626,7 @@ impl Service<PresenceCommand> for StubPresence {
                 bound_at: UnixMs(10),
                 expires_at: Some(UnixMs(900_010)),
                 canary_token: None,
+                canary_verified: false,
                 status: BindingStatus::Live,
             };
             match cmd {

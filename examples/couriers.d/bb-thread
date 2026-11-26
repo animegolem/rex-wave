@@ -56,19 +56,13 @@ def format_nudge(claim: dict) -> str:
 
 
 def is_confirmed_bb_thread_gone(err_code: int, raw_body: str) -> bool:
-    if err_code == 410:
-        return True
-    if err_code != 404:
+    if err_code not in (404, 410):
         return False
-    try:
-        parsed = json.loads(raw_body)
-        if isinstance(parsed, dict):
-            text = json.dumps(parsed).lower()
-            return "thread" in text or "not_found" in text or "not found" in text
-    except ValueError:
-        pass
     lower = raw_body.lower()
-    return "thread" in lower and ("not found" in lower or "archived" in lower or "deleted" in lower)
+    return "thread" in lower and any(
+        kw in lower
+        for kw in ("not_found", "not found", "archived", "deleted", "gone", "does not exist")
+    )
 
 
 def main() -> int:
@@ -123,7 +117,7 @@ def main() -> int:
         detail = raw_err[:240]
         if is_confirmed_bb_thread_gone(err.code, raw_err):
             return emit("refused", "address-gone", detail or f"bb thread {thread_id} not found")
-        if err.code in (409, 429, 502, 503, 504):
+        if err.code in (409, 429, 503):
             return emit("deferred", f"http-{err.code}", detail or "bb thread busy")
         return emit("unknown", f"http-{err.code}", detail or str(err))
     except urllib.error.URLError as err:
