@@ -973,6 +973,7 @@ impl AcpBridge {
             .stderr(Stdio::piped())
             .process_group(0)
             .env_remove(T3_WORKER_THREAD_ENV)
+            .env("BELL_GUARD", "1")
             .env(WORKER_THREAD_ENV, thread.as_str());
 
         if let Some(ref sock) = self.cfg.socket_path {
