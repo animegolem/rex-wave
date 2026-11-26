@@ -418,6 +418,42 @@ impl HeraldView {
         self.observe_inner(entry, false);
     }
 
+    fn rearm_failed_mail_on_live_rebind(&mut self, seat: &SeatName, rebound_at: UnixMs) {
+        let mut rearmed: Vec<Sha256Hex> = Vec::new();
+        self.failed_mail.retain(|(s, sha)| {
+            if s == seat {
+                rearmed.push(sha.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if rearmed.is_empty() {
+            return;
+        }
+        let horizon = self.seat_mail_horizon.get(seat).copied();
+        for sha in rearmed {
+            if self.acked_mail.contains(&(seat.clone(), sha.clone())) {
+                continue;
+            }
+            if let Some((sender_norm, path, non_ringable)) =
+                self.mail_meta_by_sha.get(&sha).cloned()
+                && !non_ringable
+                && seat.as_str() != sender_norm
+                && horizon.is_none_or(|h| rebound_at >= h)
+            {
+                self.pending_mail
+                    .entry(seat.clone())
+                    .or_default()
+                    .entry(sha)
+                    .or_insert(PendingLetter {
+                        path,
+                        at: rebound_at,
+                    });
+            }
+        }
+    }
+
     fn observe_inner(&mut self, entry: &Envelope, emit_mail_unrung: bool) {
         self.latest_at = self.latest_at.max(entry.at);
         self.cleared_interactions.clear();
@@ -608,6 +644,7 @@ impl HeraldView {
                                 .entry(seat.clone())
                                 .and_modify(|prev| *prev = (*prev).max(entry.at))
                                 .or_insert(entry.at);
+                            self.rearm_failed_mail_on_live_rebind(&seat, entry.at);
                         }
                     } else if binding.status == presence::BindingStatus::PendingCanary {
                         seat_bindings.remove(&binding.incarnation_id);
@@ -647,6 +684,7 @@ impl HeraldView {
                                 .entry(seat.clone())
                                 .and_modify(|prev| *prev = (*prev).max(entry.at))
                                 .or_insert(entry.at);
+                            self.rearm_failed_mail_on_live_rebind(seat, entry.at);
                         }
                     }
                     check_seats.insert(seat.clone());
@@ -884,7 +922,9 @@ impl HeraldView {
                         check_seats.insert(seat.clone());
                     }
                 }
-                mail::MailEvent::RingAttempted { .. } | mail::MailEvent::BellRang { .. } => {}
+                mail::MailEvent::RingDispatched { .. }
+                | mail::MailEvent::RingAttempted { .. }
+                | mail::MailEvent::BellRang { .. } => {}
             },
             (StreamId::Inbox { owner }, Event::Inbox(ev)) => match ev {
                 InboxEvent::Raised { id, draft, .. } | InboxEvent::Updated { id, draft, .. } => {
@@ -1746,6 +1786,7 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             | mail::MailEvent::MessageCommitted { .. }
             | mail::MailEvent::RecipientsAdded { .. }
             | mail::MailEvent::PathHeadUpdated { .. }
+            | mail::MailEvent::RingDispatched { .. }
             | mail::MailEvent::RingAttempted { .. }
             | mail::MailEvent::DeliveryFailed { .. } => {}
         },

@@ -46,17 +46,22 @@ def main() -> int:
         return emit("unknown", "invalid-claim", str(err))
 
     if claim.get("schema") != 1:
-        return emit("refused", "unsupported-schema", f"schema={claim.get('schema')}")
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
 
     endpoint = claim.get("endpoint") or {}
     if endpoint.get("transport") != "operator_toast":
-        return emit("refused", "wrong-transport", f"expected operator_toast, got {endpoint.get('transport')}")
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected operator_toast, got {endpoint.get('transport')}",
+        )
 
     seat = str(claim.get("seat") or "unknown")
+    incarnation = str(claim.get("incarnation_id") or "unknown")
     canary = claim.get("canary_token")
     if canary:
         title = f"rex-wave canary (@{seat})"
-        body = f"Confirm canary token: {canary}"
+        body = f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
     else:
         refs = claim.get("referents") or []
         first_subject = str(refs[0].get("subject", "New mail")) if refs else "New mail"
@@ -67,11 +72,11 @@ def main() -> int:
         return emit("rung", detail="dry-run")
 
     if platform.system() != "Darwin":
-        return emit("refused", "unsupported-platform", f"requires macOS (got {platform.system()})")
+        return emit("unknown", "unsupported-platform", f"requires macOS (got {platform.system()})")
 
     osascript = shutil.which("osascript")
     if not osascript:
-        return emit("refused", "address-gone", "osascript binary not found")
+        return emit("unknown", "osascript-missing", "osascript binary not found")
 
     try:
         proc = subprocess.run(

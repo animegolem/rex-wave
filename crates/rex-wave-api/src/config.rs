@@ -269,6 +269,8 @@ pub struct MailConfig {
     pub drop_dir: Option<PathBuf>,
     #[serde(default)]
     pub export_enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_canary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub couriers_dir: Option<PathBuf>,
     #[serde(default = "default_hub_owner_seat")]
@@ -285,6 +287,7 @@ impl Default for MailConfig {
             mirror_dir: None,
             drop_dir: None,
             export_enabled: false,
+            require_canary: false,
             couriers_dir: None,
             hub_owner_seat: default_hub_owner_seat(),
             reconnect_grace_ms: DEFAULT_MAIL_RECONNECT_GRACE_MS,
@@ -534,6 +537,13 @@ pub static SETTINGS_FIELDS: &[SettingFieldSpec] = &[
         label: "Markdown export",
         kind: SettingFieldKind::Bool,
         hint: "true | false",
+    },
+    SettingFieldSpec {
+        section: "Mail & Couriers",
+        key: "mail.require_canary",
+        label: "Require canary",
+        kind: SettingFieldKind::Bool,
+        hint: "true | false (gate push-courier binds)",
     },
     SettingFieldSpec {
         section: "Mail & Couriers",
@@ -788,6 +798,7 @@ impl RexConfig {
             "runners.agy" => self.runners.agy.map(|r| r.as_str().to_owned()),
             "runners.opencode" => self.runners.opencode.map(|r| r.as_str().to_owned()),
             "mail.export_enabled" => Some(self.mail.export_enabled.to_string()),
+            "mail.require_canary" => Some(self.mail.require_canary.to_string()),
             "mail.mirror_dir" => self
                 .mail
                 .mirror_dir
@@ -856,6 +867,9 @@ impl RexConfig {
             }
             "mail.export_enabled" => {
                 self.mail.export_enabled = parse_bool_str(canon, value)?;
+            }
+            "mail.require_canary" => {
+                self.mail.require_canary = parse_bool_str(canon, value)?;
             }
             "mail.mirror_dir" => {
                 self.mail.mirror_dir = match value.map(str::trim).filter(|s| !s.is_empty()) {

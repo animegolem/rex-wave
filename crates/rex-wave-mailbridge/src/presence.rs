@@ -1072,6 +1072,12 @@ pub fn sender_delivery_notice(
 /// Chooses the target live binding for a delivery to `seat`, honoring
 /// `in_reply_to` incarnation affinity first, then explicit `lane`, then the
 /// default lane, then the highest binding epoch.
+/// Selects the preferred live binding for `seat` across all machines and lanes:
+/// 1. Thread-affinity match (`in_reply_to` authored by a still-live incarnation of `seat`).
+/// 2. Explicit `lane` filter (when requested).
+/// 3. Unlaned (`lane == None`) primary binding, breaking ties deterministically by
+///    `(epoch, bound_at, machine_id, incarnation_id)`.
+/// 4. Highest `(epoch, bound_at, machine_id, incarnation_id)` live binding on any lane.
 ///
 /// Never selects [`BindingStatus::PendingCanary`] bindings (`RightSeat` / `MailHub.tla`).
 pub fn select_binding_for_delivery<'a>(
@@ -1082,26 +1088,22 @@ pub fn select_binding_for_delivery<'a>(
     affinity: &IncarnationAffinity,
     now: UnixMs,
 ) -> Option<&'a SeatBinding> {
-    select_binding_for_delivery_on_machine(state, seat, lane, in_reply_to, affinity, None, now)
-}
-
-/// Machine-scoped variant of [`select_binding_for_delivery`] enforcing `MailMachines.tla`
-/// `OneMachineRings`: when `local_machine_id` is `Some(m)`, only bindings whose `machine_id`
-/// matches `m` (or legacy pre-PR-33 bindings with `machine_id: None`) are eligible.
-/// Never selects [`BindingStatus::PendingCanary`] bindings.
-pub fn select_binding_for_delivery_on_machine<'a>(
-    state: &'a PresenceState,
-    seat: &SeatName,
-    lane: Option<&str>,
-    in_reply_to: Option<&str>,
-    affinity: &IncarnationAffinity,
-    local_machine_id: Option<&str>,
-    now: UnixMs,
-) -> Option<&'a SeatBinding> {
-    let live = state.live_bindings_for_machine(seat, None, local_machine_id, now);
+    let live = state.live_bindings_for_machine(seat, None, None, now);
     if live.is_empty() {
         return None;
     }
+
+    let order_key = |b: &SeatBinding| {
+        (
+            b.epoch,
+            b.bound_at,
+            b.machine_id
+                .as_deref()
+                .unwrap_or(DEFAULT_MACHINE_ID)
+                .to_owned(),
+            b.incarnation_id.clone(),
+        )
+    };
 
     if let Some(parent_id) = in_reply_to
         && let Some((aff_seat, aff_inc)) = affinity.lookup(parent_id)
@@ -1112,21 +1114,42 @@ pub fn select_binding_for_delivery_on_machine<'a>(
     }
 
     if let Some(want_lane) = lane {
-        if let Some(found) = live
+        return live
             .iter()
             .filter(|b| b.lane.as_deref() == Some(want_lane))
-            .max_by_key(|b| (b.epoch, b.bound_at))
-        {
-            return Some(*found);
-        }
-        return None;
+            .max_by_key(|b| order_key(b))
+            .copied();
     }
 
     live.iter()
         .filter(|b| b.lane.is_none())
-        .max_by_key(|b| (b.epoch, b.bound_at))
+        .max_by_key(|b| order_key(b))
         .copied()
-        .or_else(|| live.iter().max_by_key(|b| (b.epoch, b.bound_at)).copied())
+        .or_else(|| live.iter().max_by_key(|b| order_key(b)).copied())
+}
+
+/// Machine-scoped variant of [`select_binding_for_delivery`] enforcing `MailMachines.tla`
+/// `OneMachineRings`: resolves the single global winning binding across ALL machines and lanes
+/// first, then returns `Some(winner)` only when `winner`'s effective `machine_id` matches
+/// `local_machine_id`. Two hubs consuming the same `Presence` log can therefore never both ring
+/// the same seat. Never selects [`BindingStatus::PendingCanary`] bindings.
+pub fn select_binding_for_delivery_on_machine<'a>(
+    state: &'a PresenceState,
+    seat: &SeatName,
+    lane: Option<&str>,
+    in_reply_to: Option<&str>,
+    affinity: &IncarnationAffinity,
+    local_machine_id: Option<&str>,
+    now: UnixMs,
+) -> Option<&'a SeatBinding> {
+    let winner = select_binding_for_delivery(state, seat, lane, in_reply_to, affinity, now)?;
+    if let Some(want_machine) = local_machine_id {
+        let actual_machine = winner.machine_id.as_deref().unwrap_or(DEFAULT_MACHINE_ID);
+        if actual_machine != want_machine {
+            return None;
+        }
+    }
+    Some(winner)
 }
 
 fn process_identity(endpoint: &TransportEndpoint) -> Option<(u32, &str)> {
@@ -1314,6 +1337,8 @@ pub struct PresenceState {
     house: HouseProfile,
     /// Local machine identifier stamped on bindings that omit `machine_id`.
     local_machine_id: String,
+    /// Live operator policy (`mail.require_canary`) consulted at `PresenceBind` decision time.
+    require_canary_policy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     head: Seq,
     latest_at: UnixMs,
     seats: BTreeMap<SeatName, SeatRecord>,
@@ -1331,6 +1356,7 @@ impl Default for PresenceState {
         Self {
             house: HouseProfile::default(),
             local_machine_id: DEFAULT_MACHINE_ID.to_owned(),
+            require_canary_policy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             head: Seq::ORIGIN,
             latest_at: UnixMs(0),
             seats: BTreeMap::new(),
@@ -1361,6 +1387,19 @@ impl PresenceState {
             self.local_machine_id = clean;
         }
         self
+    }
+
+    pub fn with_require_canary_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.require_canary_policy = flag;
+        self
+    }
+
+    pub fn require_canary_policy(&self) -> bool {
+        self.require_canary_policy
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn local_machine_id(&self) -> &str {
@@ -1422,7 +1461,7 @@ impl PresenceState {
                     && !self.down_transports.contains(&b.endpoint.kind())
                     && lane.is_none_or(|want| b.lane.as_deref() == Some(want))
                     && machine_id.is_none_or(|want| {
-                        b.machine_id.as_deref().is_none_or(|actual| actual == want)
+                        b.machine_id.as_deref().unwrap_or(DEFAULT_MACHINE_ID) == want
                     })
             })
             .collect();
@@ -1431,7 +1470,7 @@ impl PresenceState {
     }
 
     /// Returns unexpired [`BindingStatus::PendingCanary`] bindings owned by `machine_id`
-    /// so `CourierHub` can dispatch one-shot canary confirmation rings locally.
+    /// so `CourierHub` can dispatch canary confirmation rings locally.
     pub fn pending_canary_bindings_for_machine(
         &self,
         machine_id: &str,
@@ -1443,9 +1482,7 @@ impl PresenceState {
                 if b.status == BindingStatus::PendingCanary
                     && b.expires_at.is_none_or(|exp| exp > now)
                     && !self.down_transports.contains(&b.endpoint.kind())
-                    && b.machine_id
-                        .as_deref()
-                        .is_none_or(|actual| actual == machine_id)
+                    && b.machine_id.as_deref().unwrap_or(DEFAULT_MACHINE_ID) == machine_id
                 {
                     out.push(b);
                 }
@@ -1746,6 +1783,7 @@ impl PresenceState {
 pub struct Presence {
     house: HouseProfile,
     local_machine_id: String,
+    require_canary_policy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for Presence {
@@ -1753,6 +1791,7 @@ impl Default for Presence {
         Self {
             house: HouseProfile::default(),
             local_machine_id: DEFAULT_MACHINE_ID.to_owned(),
+            require_canary_policy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -1768,6 +1807,7 @@ impl Presence {
         Self {
             house,
             local_machine_id: DEFAULT_MACHINE_ID.to_owned(),
+            require_canary_policy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1777,6 +1817,29 @@ impl Presence {
             self.local_machine_id = clean;
         }
         self
+    }
+
+    pub fn set_require_canary_policy(&self, required: bool) {
+        self.require_canary_policy
+            .store(required, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Keeps `require_canary_policy` synchronized with live `RexConfig.mail.require_canary`.
+    pub fn spawn_config_sync(
+        &self,
+        mut rx: tokio::sync::watch::Receiver<rex_wave_api::config::RexConfig>,
+    ) -> tokio::task::JoinHandle<()> {
+        let flag = self.require_canary_policy.clone();
+        flag.store(
+            rx.borrow_and_update().mail.require_canary,
+            std::sync::atomic::Ordering::Release,
+        );
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let req = rx.borrow_and_update().mail.require_canary;
+                flag.store(req, std::sync::atomic::Ordering::Release);
+            }
+        })
     }
 
     pub fn house(&self) -> &HouseProfile {
@@ -1791,6 +1854,7 @@ impl Presence {
     pub fn initial_state(&self) -> PresenceState {
         PresenceState::with_house_profile(self.house.clone())
             .with_machine_id(self.local_machine_id.clone())
+            .with_require_canary_flag(self.require_canary_policy.clone())
     }
 
     /// A Presence registry whose actors (including rehydrated ones) are seeded
@@ -2256,7 +2320,7 @@ impl Presence {
         };
 
         let mut superseded: Vec<IncarnationId> = Vec::new();
-        let mut refresh_target: Option<(IncarnationId, u64, bool)> = None;
+        let mut refresh_target: Option<(IncarnationId, u64, bool, bool)> = None;
 
         if let Some(existing_bindings) = state.bindings.get(&c.seat) {
             for b in existing_bindings.values() {
@@ -2295,7 +2359,14 @@ impl Presence {
                 if same_proc || same_incarnation {
                     if c.incarnation_id.is_none() || same_incarnation {
                         let same_endpoint = b.endpoint == c.endpoint;
-                        refresh_target = Some((b.incarnation_id.clone(), b.epoch, same_endpoint));
+                        let was_confirmed =
+                            matches!(b.status, BindingStatus::Live | BindingStatus::TransportDown);
+                        refresh_target = Some((
+                            b.incarnation_id.clone(),
+                            b.epoch,
+                            same_endpoint,
+                            was_confirmed,
+                        ));
                     } else {
                         superseded.push(b.incarnation_id.clone());
                     }
@@ -2331,24 +2402,37 @@ impl Presence {
             }
         }
 
-        let (incarnation_id, epoch) =
-            if let Some((existing_id, existing_epoch, same_endpoint)) = refresh_target {
-                let epoch = if same_endpoint && !c.require_canary {
-                    existing_epoch
+        let policy_requires_canary = state.require_canary_policy()
+            && crate::couriers::resolve_adapter_name(&c.endpoint).is_some()
+            && !matches!(c.endpoint, TransportEndpoint::OperatorToast { .. });
+        let effective_require_canary = c.require_canary || policy_requires_canary;
+
+        let (incarnation_id, epoch, preserve_confirmed) =
+            if let Some((existing_id, existing_epoch, same_endpoint, was_confirmed)) =
+                refresh_target
+            {
+                if same_endpoint && was_confirmed {
+                    // Refreshing an already-confirmed identical endpoint keeps it Live without
+                    // demoting a working route back to PendingCanary.
+                    (existing_id, existing_epoch, true)
                 } else {
-                    state.next_epoch(&c.seat)
-                };
-                (existing_id, epoch)
+                    let epoch = if same_endpoint && !effective_require_canary {
+                        existing_epoch
+                    } else {
+                        state.next_epoch(&c.seat)
+                    };
+                    (existing_id, epoch, false)
+                }
             } else {
                 let next_epoch = state.next_epoch(&c.seat);
                 let id = match &c.incarnation_id {
                     Some(explicit) => explicit.clone(),
                     None => IncarnationId::parse(format!("inc-{}-{next_epoch}", c.seat))?,
                 };
-                (id, next_epoch)
+                (id, next_epoch, false)
             };
 
-        let (status, canary_token) = if c.require_canary {
+        let (status, canary_token) = if effective_require_canary && !preserve_confirmed {
             (BindingStatus::PendingCanary, Some(mint_canary_token()?))
         } else if state.down_transports.contains(&c.endpoint.kind()) {
             (BindingStatus::TransportDown, None)

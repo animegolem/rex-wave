@@ -822,8 +822,9 @@ pub enum PresenceCmd {
         seat: Option<String>,
         #[arg(long)]
         incarnation: String,
-        #[arg(long)]
-        token: String,
+        /// One-shot canary secret delivered out-of-band by `CourierHub` (distinct from global `--token`).
+        #[arg(long = "canary", visible_alias = "canary-token")]
+        canary: String,
     },
     /// Bind a UDS socket-lifetime presence session and block until interrupted.
     Hold {
@@ -2432,11 +2433,11 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
         PresenceCmd::ConfirmCanary {
             seat,
             incarnation,
-            token,
+            canary,
         } => Ok(WireCommand::PresenceConfirmCanary(PresenceConfirmCanary {
             seat: resolve_seat_arg(seat.as_ref(), me)?,
             incarnation_id: IncarnationId::parse(incarnation.clone())?,
-            token: token.clone(),
+            token: canary.clone(),
         })),
         PresenceCmd::Hold { .. } => Err(invalid(
             "presence hold",
@@ -5588,15 +5589,18 @@ mod tests {
 
         let confirm_cli = parse_cli(&[
             "rex-wave",
+            "--token",
+            "seat-auth-cred-xyz",
             "presence",
             "confirm-canary",
             "--seat",
             "bob",
             "--incarnation",
             "inc-bob-1",
-            "--token",
+            "--canary",
             "rwc_0123456789abcdef0123456789abcdef",
         ]);
+        assert_eq!(confirm_cli.token.as_deref(), Some("seat-auth-cred-xyz"));
         let WireCommand::PresenceConfirmCanary(cc) = to_command(&confirm_cli.cmd).unwrap() else {
             panic!("expected PresenceConfirmCanary");
         };

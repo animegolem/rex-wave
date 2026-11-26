@@ -764,6 +764,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_thread_resolver(journal_thread_resolver(journal.clone())),
     );
 
+    let _presence_cfg_task = presence.spawn_config_sync(config_svc.subscribe());
     let presence_svc = presence.registry(journal.clone(), hub.clone());
     config_hook.bind_presence(presence_svc.clone());
 

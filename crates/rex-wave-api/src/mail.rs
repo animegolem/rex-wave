@@ -575,6 +575,8 @@ pub struct MailDeliveryFailure {
     pub seat: SeatName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation_id: Option<IncarnationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sha256s: Vec<Sha256Hex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -585,15 +587,53 @@ pub struct MailDeliveryFailure {
     pub detail: Option<String>,
 }
 
-/// System command issued by `SystemPart::CourierHub` to record a courier ring outcome
-/// and optional loud delivery failure in `StreamId::Mail`.
+/// Phase of a [`MailRecordRing`] call: `Begin` writes a pre-dispatch claim to `StreamId::Mail`
+/// after filtering eligible unacked referents; `Complete` finalizes the ring outcome.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RingRecordPhase {
+    Begin,
+    #[default]
+    Complete,
+}
+
+/// Sender-grouped slice of letters attached to a single `Refused` or `GiveUp` failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MailFailureGroup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_seat: Option<SeatName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sha256s: Vec<Sha256Hex>,
+}
+
+/// System command issued by `SystemPart::CourierHub` to claim a pre-dispatch ring or
+/// record a completed courier ring outcome and optional loud delivery failures in `StreamId::Mail`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MailRecordRing {
+    #[serde(default)]
+    pub phase: RingRecordPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
     pub courier: String,
     pub seat: SeatName,
     pub machine_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation_id: Option<IncarnationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sha256s: Vec<Sha256Hex>,
     #[serde(default)]
@@ -608,15 +648,24 @@ pub struct MailRecordRing {
     pub hub_owner_seat: SeatName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<DeliveryFailureKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_groups: Vec<MailFailureGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_threshold: Option<u32>,
 }
 
-/// Reply returned by [`MailRecordRing`] reporting the authoritative post-commit
-/// consecutive-unknown streak and degradation state for the courier.
+/// Reply returned by [`MailRecordRing`] reporting eligible claimed hashes (`Begin`) or
+/// authoritative post-commit consecutive-unknown streak, degradation state, and committed
+/// [`MailDeliveryFailure`] records (`Complete`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MailRingRecorded {
     pub consecutive_unknown: u32,
     pub degraded: bool,
     pub degraded_newly_triggered: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eligible_sha256s: Vec<Sha256Hex>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub committed_failures: Vec<MailDeliveryFailure>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -666,8 +715,27 @@ pub enum MailEvent {
         path: PathBuf,
         sha256: Sha256Hex,
     },
+    /// Pre-dispatch claim written to `StreamId::Mail` before spawning a courier adapter
+    /// so an interrupted or restarted `CourierHub` recovers unfinished claims as `Unknown`
+    /// rather than double-ringing (`NoDoubleRing`).
+    RingDispatched {
+        dispatch_id: String,
+        courier: String,
+        seat: SeatName,
+        machine_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation_id: Option<IncarnationId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sha256s: Vec<Sha256Hex>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_canary: bool,
+    },
     /// Durable courier ring attempt keyed by `(seat, sha256)` (`MailMachines.tla`).
     RingAttempted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_id: Option<String>,
         courier: String,
         seat: SeatName,
         machine_id: String,
@@ -682,6 +750,8 @@ pub enum MailEvent {
         reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        degraded_threshold: Option<u32>,
     },
     /// Loud mail delivery failure (`refused`, `give_up`, or `adapter_degraded`).
     DeliveryFailed {
@@ -690,6 +760,8 @@ pub enum MailEvent {
         seat: SeatName,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         incarnation_id: Option<IncarnationId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_epoch: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sha256s: Vec<Sha256Hex>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

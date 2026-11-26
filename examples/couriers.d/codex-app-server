@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
-"""Reference couriers.d/ adapter for Codex App Server sessions.
+"""Reference couriers.d/ adapter for Codex `app-server` threads.
+
+Speaks Codex `app-server` newline-delimited JSON-RPC 2.0 (`initialize` ->
+`initialized` -> `turn/start` with `{"threadId": <codex-thread-id>, "input": [...]}`)
+over a Unix domain socket (`CODEX_APP_SERVER_SOCKET` or `unix://` listener).
+
+Thread ID resolution:
+  1. `endpoint.client` suffix `codex:<thread_id>` or `codex-app-server:<thread_id>`.
+  2. `CODEX_THREAD_ID` environment override.
 
 Protocol:
   - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
     Letter bodies are never included.
   - Writes one JSON reply object on stdout:
       {"outcome": "rung" | "deferred" | "refused" | "unknown", ...}
-
-Environment overrides:
-  - CODEX_APP_SERVER_URL           Base HTTP origin (default: http://127.0.0.1:39200).
-  - CODEX_APP_SERVER_TOKEN         Optional bearer token.
-  - CODEX_APP_SERVER_TIMEOUT_SECS  HTTP timeout in seconds (default: 6).
-  - REX_WAVE_COURIER_DRY_RUN=1     Validate payload and emit {"outcome":"rung"}.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import socket
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 
 
 def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
@@ -42,7 +43,7 @@ def format_nudge(claim: dict) -> str:
     if canary:
         return (
             f"[rex-wave canary] Confirm session for @{seat} ({incarnation}):\n"
-            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --token {canary}"
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
         )
     refs = claim.get("referents") or []
     lines = [f"[rex-wave mail] {len(refs)} letter(s) waiting for @{seat}:"]
@@ -55,6 +56,100 @@ def format_nudge(claim: dict) -> str:
     return "\n".join(lines)
 
 
+def extract_codex_thread_id(endpoint: dict) -> str:
+    client = str(endpoint.get("client") or "").strip()
+    for prefix in ("codex-app-server:", "codex:"):
+        if client.lower().startswith(prefix):
+            tid = client[len(prefix) :].strip()
+            if tid:
+                return tid
+    return os.environ.get("CODEX_THREAD_ID", "").strip()
+
+
+def read_rpc_response(fh, target_id: int) -> dict:
+    while True:
+        line = fh.readline()
+        if not line:
+            raise EOFError("codex app-server closed connection before RPC response")
+        msg = json.loads(line)
+        if isinstance(msg, dict) and msg.get("id") == target_id:
+            return msg
+
+
+def send_jsonrpc_unix(sock_path: str, thread_id: str, prompt: str, timeout: float) -> int:
+    clean_path = sock_path[len("unix://") :] if sock_path.startswith("unix://") else sock_path
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    dispatched_turn = False
+    try:
+        sock.connect(clean_path)
+        rfile = sock.makefile("r", encoding="utf-8")
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "rex-wave-courier", "version": "0.1.0"},
+                "capabilities": {},
+            },
+        }
+        sock.sendall((json.dumps(init_req, separators=(",", ":")) + "\n").encode("utf-8"))
+        init_resp = read_rpc_response(rfile, 1)
+        if "error" in init_resp:
+            return emit("unknown", "rpc-init-failed", json.dumps(init_resp["error"])[:240])
+
+        notif = {"jsonrpc": "2.0", "method": "initialized", "params": {}}
+        turn_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+        }
+        sock.sendall(
+            (
+                json.dumps(notif, separators=(",", ":"))
+                + "\n"
+                + json.dumps(turn_req, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+        )
+        dispatched_turn = True
+        turn_resp = read_rpc_response(rfile, 2)
+        if "error" not in turn_resp:
+            return emit("rung")
+        err_obj = turn_resp.get("error") or {}
+        err_msg = str(err_obj.get("message") or err_obj)
+        lower = err_msg.lower()
+        if "thread" in lower and any(
+            kw in lower for kw in ("not found", "unknown", "no such", "archived", "deleted")
+        ):
+            return emit("refused", "address-gone", err_msg[:240])
+        if "busy" in lower or "active turn" in lower or "in progress" in lower:
+            return emit("deferred", "turn-active", err_msg[:240])
+        return emit("unknown", "rpc-error", err_msg[:240])
+    except TimeoutError:
+        if dispatched_turn:
+            return emit("unknown", "timeout", "codex turn/start timed out after dispatch")
+        return emit("deferred", "connect-timeout", "codex app-server handshake timed out")
+    except EOFError as err:
+        if dispatched_turn:
+            return emit("unknown", "eof-after-dispatch", str(err))
+        return emit("deferred", "server-closed", str(err))
+    except OSError as err:
+        if dispatched_turn:
+            return emit("unknown", "socket-io-after-dispatch", str(err))
+        if err.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.EAGAIN, errno.EWOULDBLOCK):
+            return emit("deferred", "server-unreachable", str(err))
+        return emit("unknown", "socket-error", str(err))
+    except ValueError as err:
+        return emit("unknown", "invalid-rpc-json", str(err))
+    finally:
+        sock.close()
+
+
 def main() -> int:
     try:
         claim = json.load(sys.stdin)
@@ -62,50 +157,37 @@ def main() -> int:
         return emit("unknown", "invalid-claim", str(err))
 
     if claim.get("schema") != 1:
-        return emit("refused", "unsupported-schema", f"schema={claim.get('schema')}")
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
 
-    incarnation = str(claim.get("incarnation_id") or "").strip()
-    if not incarnation:
-        return emit("refused", "address-gone", "missing incarnation_id")
+    endpoint = claim.get("endpoint") or {}
+    if endpoint.get("transport") != "uds_session":
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected uds_session, got {endpoint.get('transport')}",
+        )
 
     if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
         return emit("rung", detail="dry-run")
 
-    base_url = os.environ.get("CODEX_APP_SERVER_URL", "http://127.0.0.1:39200").rstrip("/")
-    token = os.environ.get("CODEX_APP_SERVER_TOKEN", "").strip()
+    thread_id = extract_codex_thread_id(endpoint)
+    if not thread_id:
+        return emit(
+            "unknown",
+            "missing-codex-thread-id",
+            "set client='codex:<thread_id>' or CODEX_THREAD_ID",
+        )
+
+    sock_path = os.environ.get("CODEX_APP_SERVER_SOCKET", "").strip()
+    if not sock_path:
+        return emit(
+            "unknown",
+            "missing-app-server-socket",
+            "set CODEX_APP_SERVER_SOCKET to the codex app-server unix socket",
+        )
+
     timeout = float(os.environ.get("CODEX_APP_SERVER_TIMEOUT_SECS", "6"))
-
-    body = json.dumps(
-        {
-            "seat": claim.get("seat"),
-            "incarnation_id": incarnation,
-            "message": format_nudge(claim),
-            "mode": "auto",
-        }
-    ).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    encoded_inc = urllib.parse.quote(incarnation, safe="")
-    url = f"{base_url}/api/v1/sessions/{encoded_inc}/nudge"
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if 200 <= resp.status < 300:
-                return emit("rung")
-            return emit("unknown", f"http-{resp.status}")
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace").strip()[:240]
-        if err.code in (404, 410):
-            return emit("refused", "address-gone", detail or f"session {incarnation} not found")
-        if err.code in (409, 429, 503):
-            return emit("deferred", f"http-{err.code}", detail or "session busy")
-        return emit("unknown", f"http-{err.code}", detail or str(err))
-    except urllib.error.URLError as err:
-        return emit("deferred", "server-unreachable", str(err.reason))
-    except TimeoutError:
-        return emit("unknown", "timeout", "codex-app-server request timed out")
+    return send_jsonrpc_unix(sock_path, thread_id, format_nudge(claim), timeout)
 
 
 if __name__ == "__main__":

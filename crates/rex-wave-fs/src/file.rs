@@ -1933,6 +1933,104 @@ impl ConfinedDir {
     }
 }
 
+/// Private `0700` execution staging handle inside root-verified sticky `/tmp`,
+/// guaranteeing that `Command::new(staged.path())` runs the exact `O_NOFOLLOW`
+/// regular file handle verified at open time with zero pathname swap window.
+pub struct StagedExecutable {
+    stage: OwnedSubdir,
+    leaf: String,
+    exec_path: PathBuf,
+}
+
+impl StagedExecutable {
+    pub fn path(&self) -> &Path {
+        &self.exec_path
+    }
+}
+
+impl Drop for StagedExecutable {
+    fn drop(&mut self) {
+        if let Some(ref sd) = self.stage.dir {
+            let _ = rustix::fs::unlinkat(sd, &self.leaf, rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
+/// Opens `leaf_name` inside `dir` via descriptor-confined `O_DIRECTORY | O_NOFOLLOW`
+/// and `openat(..., O_NOFOLLOW)`, verifies regular-file executable permissions and size,
+/// and stages it into a root-verified `0700` private `/tmp` directory (hard-linking and
+/// verifying identical `(dev, ino)` when on the same device, or copying directly from
+/// the already-open file descriptor without re-opening any pathname).
+pub fn stage_verified_executable(
+    dir: &Path,
+    leaf_name: &str,
+    max_bytes: u64,
+) -> io::Result<StagedExecutable> {
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat};
+
+    validate_at_leaf_name(leaf_name)?;
+    let parent_dir = open_dir_nofollow(dir)?;
+    let (file, meta) = open_regular_at(&parent_dir, leaf_name)?;
+    if (meta.permissions().mode() & 0o111) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not executable", dir.join(leaf_name).display()),
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds max executable size ({max_bytes} bytes)",
+                dir.join(leaf_name).display()
+            ),
+        ));
+    }
+
+    let expected_id = file_id(&meta);
+    let uid = current_process_uid()?;
+    let (tmp_dir, tmp_path) = open_verified_sticky_tmp_root(uid)?;
+    let stage = OwnedSubdir::create(tmp_dir, ".rex-exec-", 24, uid)?;
+    let exec_path = tmp_path.join(&stage.name).join(leaf_name);
+
+    let linked_same_inode = match linkat(
+        &parent_dir,
+        leaf_name,
+        stage.dir(),
+        leaf_name,
+        AtFlags::empty(),
+    ) {
+        Ok(()) => match open_regular_at(stage.dir(), leaf_name) {
+            Ok((_chk_f, chk_meta)) => file_id(&chk_meta) == expected_id,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+
+    if !linked_same_inode {
+        let _ = unlink_regular_at(stage.dir(), leaf_name);
+        let full_display = dir.join(leaf_name);
+        let bytes = read_open_bounded(&full_display, file, &meta, max_bytes)?;
+        let out_fd = openat(
+            stage.dir(),
+            leaf_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o500),
+        )
+        .map_err(io::Error::from)?;
+        let mut out_file = File::from(out_fd);
+        out_file.write_all(&bytes)?;
+        out_file.sync_all()?;
+        drop(out_file);
+    }
+
+    Ok(StagedExecutable {
+        stage,
+        leaf: leaf_name.to_owned(),
+        exec_path,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

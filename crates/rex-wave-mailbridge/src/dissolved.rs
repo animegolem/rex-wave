@@ -991,6 +991,29 @@ pub struct CommittedAckRecord {
 pub const DEFAULT_COURIER_DEGRADED_THRESHOLD: u32 = 3;
 const MAX_STORED_DELIVERY_FAILURES: usize = 200;
 
+/// Pre-dispatch courier claim folded from `MailEvent::RingDispatched` and cleared by
+/// `MailEvent::RingAttempted` (`NoDoubleRing` crash recovery).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InflightRingDispatch {
+    pub dispatch_id: String,
+    pub courier: String,
+    pub seat: SeatName,
+    pub machine_id: String,
+    pub incarnation_id: Option<IncarnationId>,
+    pub expected_epoch: Option<u64>,
+    pub sha256s: Vec<Sha256Hex>,
+    pub is_canary: bool,
+    pub at: UnixMs,
+}
+
+/// Durable retry counter and timestamp folded from `MailEvent::RingAttempted` so
+/// exponential backoff and `MaxTries` survive daemon restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferAttemptRecord {
+    pub tries: u32,
+    pub last_at: UnixMs,
+}
+
 /// Per-courier counters folded deterministically from `MailEvent::RingAttempted`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CourierCounterState {
@@ -1021,11 +1044,23 @@ pub struct MailState {
     pub room_post_seqs: BTreeMap<(RoomId, Sha256Hex), Seq>,
     pub failed_room_projections: HashSet<(RoomId, Sha256Hex)>,
     pub seen_wakes: HashSet<WakeId>,
+    /// Unfinished pre-dispatch courier claims keyed by `dispatch_id`.
+    pub inflight_dispatches: BTreeMap<String, InflightRingDispatch>,
     /// `(seat, sha256)` pairs already rung (`Rung` or `Unknown` both count as rung
     /// per `MailMachines.tla` `NoDoubleRing`).
     pub rung_keys: BTreeSet<(SeatName, Sha256Hex)>,
-    /// `(seat, sha256)` pairs terminated by loud delivery failure (`Refused` or `GiveUp`).
+    /// Unscoped `(seat, sha256)` failures when no `IncarnationId` was associated.
     pub failed_keys: BTreeSet<(SeatName, Sha256Hex)>,
+    /// Incarnation-scoped `(seat, incarnation_id, sha256)` failures so a refusal or
+    /// give-up on a dead session never suppresses delivery on a later rebound session.
+    pub failed_incarnation_keys: BTreeSet<(SeatName, IncarnationId, Sha256Hex)>,
+    /// Durable per-`(seat, sha256)` deferral retry state (`tries`, `last_at`).
+    pub defer_state: BTreeMap<(SeatName, Sha256Hex), DeferAttemptRecord>,
+    /// Durable per-`(seat, incarnation_id)` canary retry state (`tries`, `last_at`) for
+    /// `Deferred` or `Unknown` canary rings.
+    pub canary_defer_state: BTreeMap<(SeatName, IncarnationId), DeferAttemptRecord>,
+    /// `(seat, incarnation_id)` pairs whose canary was cleanly delivered (`Rung`).
+    pub canary_rung_incarnations: BTreeSet<(SeatName, IncarnationId)>,
     /// Live per-courier delivery counters & degradation state.
     pub courier_stats: BTreeMap<String, CourierCounterState>,
     /// Recent loud delivery failures (`refused`, `give_up`, `adapter_degraded`).
@@ -1241,6 +1276,7 @@ impl MailState {
                     let key = (acker.clone(), sha256.clone());
                     self.acked.insert(key.clone());
                     self.acked_shas.insert(sha256.clone());
+                    self.defer_state.remove(&key);
                     self.ack_records
                         .entry(key.clone())
                         .or_insert_with(|| CommittedAckRecord {
@@ -1263,19 +1299,101 @@ impl MailState {
                     }
                 }
             }
-            Event::Mail(MailEvent::RingAttempted {
+            Event::Mail(MailEvent::RingDispatched {
+                dispatch_id,
                 courier,
                 seat,
+                machine_id,
+                incarnation_id,
+                expected_epoch,
+                sha256s,
+                is_canary,
+            }) => {
+                self.inflight_dispatches.insert(
+                    dispatch_id.clone(),
+                    InflightRingDispatch {
+                        dispatch_id: dispatch_id.clone(),
+                        courier: courier.clone(),
+                        seat: seat.clone(),
+                        machine_id: machine_id.clone(),
+                        incarnation_id: incarnation_id.clone(),
+                        expected_epoch: *expected_epoch,
+                        sha256s: sha256s.clone(),
+                        is_canary: *is_canary,
+                        at: env.at,
+                    },
+                );
+            }
+            Event::Mail(MailEvent::RingAttempted {
+                dispatch_id,
+                courier,
+                seat,
+                incarnation_id,
                 sha256s,
                 is_canary,
                 outcome,
+                degraded_threshold,
                 ..
             }) => {
-                if !*is_canary && outcome.counts_as_rung() {
-                    for sha in sha256s {
-                        self.rung_keys.insert((seat.clone(), sha.clone()));
+                if let Some(did) = dispatch_id {
+                    self.inflight_dispatches.remove(did);
+                }
+                if *is_canary {
+                    if let Some(inc) = incarnation_id {
+                        let ckey = (seat.clone(), inc.clone());
+                        match outcome {
+                            CourierOutcome::Rung => {
+                                self.canary_rung_incarnations.insert(ckey.clone());
+                                self.canary_defer_state.remove(&ckey);
+                            }
+                            CourierOutcome::Refused => {
+                                self.canary_defer_state.remove(&ckey);
+                            }
+                            CourierOutcome::Deferred | CourierOutcome::Unknown => {
+                                let prev =
+                                    self.canary_defer_state.get(&ckey).map_or(0, |r| r.tries);
+                                self.canary_defer_state.insert(
+                                    ckey,
+                                    DeferAttemptRecord {
+                                        tries: prev.saturating_add(1),
+                                        last_at: env.at,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    match outcome {
+                        CourierOutcome::Rung | CourierOutcome::Unknown => {
+                            for sha in sha256s {
+                                let k = (seat.clone(), sha.clone());
+                                self.rung_keys.insert(k.clone());
+                                self.defer_state.remove(&k);
+                            }
+                        }
+                        CourierOutcome::Refused => {
+                            for sha in sha256s {
+                                self.defer_state.remove(&(seat.clone(), sha.clone()));
+                            }
+                        }
+                        CourierOutcome::Deferred => {
+                            for sha in sha256s {
+                                let k = (seat.clone(), sha.clone());
+                                let prev = self.defer_state.get(&k).map_or(0, |r| r.tries);
+                                self.defer_state.insert(
+                                    k,
+                                    DeferAttemptRecord {
+                                        tries: prev.saturating_add(1),
+                                        last_at: env.at,
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
+                let threshold = degraded_threshold
+                    .unwrap_or(DEFAULT_COURIER_DEGRADED_THRESHOLD)
+                    .max(1);
                 let stats = self.courier_stats.entry(courier.clone()).or_default();
                 match outcome {
                     CourierOutcome::Rung => {
@@ -1293,10 +1411,10 @@ impl MailState {
                             .entry(seat.clone())
                             .or_insert(0);
                         *seat_streak = seat_streak.saturating_add(1);
-                        if *seat_streak >= DEFAULT_COURIER_DEGRADED_THRESHOLD {
+                        if *seat_streak >= threshold {
                             stats.degraded_seats.insert(seat.clone());
                         }
-                        if stats.consecutive_unknown >= DEFAULT_COURIER_DEGRADED_THRESHOLD
+                        if stats.consecutive_unknown >= threshold
                             || !stats.degraded_seats.is_empty()
                         {
                             stats.degraded = true;
@@ -1313,6 +1431,7 @@ impl MailState {
                 courier,
                 seat,
                 incarnation_id,
+                expected_epoch,
                 sha256s,
                 sender_seat,
                 hub_owner_seat,
@@ -1323,12 +1442,26 @@ impl MailState {
                     kind,
                     DeliveryFailureKind::Refused | DeliveryFailureKind::GiveUp
                 ) {
-                    for sha in sha256s {
-                        self.failed_keys.insert((seat.clone(), sha.clone()));
+                    if let Some(inc) = incarnation_id {
+                        self.canary_defer_state.remove(&(seat.clone(), inc.clone()));
+                        for sha in sha256s {
+                            self.defer_state.remove(&(seat.clone(), sha.clone()));
+                            self.failed_incarnation_keys.insert((
+                                seat.clone(),
+                                inc.clone(),
+                                sha.clone(),
+                            ));
+                        }
+                    } else {
+                        for sha in sha256s {
+                            self.defer_state.remove(&(seat.clone(), sha.clone()));
+                            self.failed_keys.insert((seat.clone(), sha.clone()));
+                        }
                     }
                 }
                 if *kind == DeliveryFailureKind::AdapterDegraded {
                     let stats = self.courier_stats.entry(courier.clone()).or_default();
+                    stats.degraded_seats.insert(seat.clone());
                     stats.degraded = true;
                 }
                 self.delivery_failures.push(MailDeliveryFailure {
@@ -1338,6 +1471,7 @@ impl MailState {
                     courier: courier.clone(),
                     seat: seat.clone(),
                     incarnation_id: incarnation_id.clone(),
+                    expected_epoch: *expected_epoch,
                     sha256s: sha256s.clone(),
                     sender_seat: sender_seat.clone(),
                     hub_owner_seat: hub_owner_seat.clone(),
@@ -1380,6 +1514,29 @@ impl MailState {
             }
         }
         None
+    }
+
+    /// Returns `true` when `sha` has already terminated (`Refused` or `GiveUp`) on
+    /// `incarnation_id` (or globally when unscoped), leaving new rebound incarnations
+    /// free to receive unacked mail.
+    pub fn is_failed_for_binding(
+        &self,
+        seat: &SeatName,
+        incarnation_id: Option<&IncarnationId>,
+        sha: &Sha256Hex,
+    ) -> bool {
+        self.failed_keys.contains(&(seat.clone(), sha.clone()))
+            || incarnation_id.is_some_and(|inc| {
+                self.failed_incarnation_keys
+                    .contains(&(seat.clone(), inc.clone(), sha.clone()))
+            })
+    }
+
+    /// Returns `true` when an unfinished pre-dispatch claim currently owns `(seat, sha)`.
+    pub fn has_inflight_for(&self, seat: &SeatName, sha: &Sha256Hex) -> bool {
+        self.inflight_dispatches
+            .values()
+            .any(|d| !d.is_canary && &d.seat == seat && d.sha256s.contains(sha))
     }
 
     /// Returns the set of ringable (`db \ (acked ∪ flagged)`) message hashes for `seat`.

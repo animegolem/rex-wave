@@ -1145,6 +1145,8 @@ impl Client for DemoClient {
                         consecutive_unknown: 0,
                         degraded: false,
                         degraded_newly_triggered: false,
+                        eligible_sha256s: Vec::new(),
+                        committed_failures: Vec::new(),
                     })
                 }
                 WireCommand::MailSend(_)

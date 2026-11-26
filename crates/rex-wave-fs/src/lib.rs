@@ -27,14 +27,15 @@ mod name;
 mod protect;
 
 pub use file::{
-    ConfinedDir, EntryKind, FileId, PreparedUnixSocket, claim_regular_at, claim_regular_sibling,
-    create_missing_private_dir, current_process_uid, dir_metadata_nofollow, ensure_private_dir,
-    entry_exists, entry_kind, file_id, lock_exclusive_blocking, open_append_nofollow,
-    open_dir_nofollow, open_lock_at, open_lock_nofollow, open_regular_at, open_regular_nofollow,
-    open_rw_append_at, open_rw_append_nofollow, open_sub_dir_at, prepare_unix_socket,
-    read_claimed_at_if_unchanged, read_input_bounded, read_input_string, read_open_bounded,
-    read_private_regular, read_regular_bounded, read_regular_string, socket_owner_uid, sync_dir,
-    unlink_regular_at, validate_unix_socket_target, verify_same_regular_nofollow, write_atomic_at,
+    ConfinedDir, EntryKind, FileId, PreparedUnixSocket, StagedExecutable, claim_regular_at,
+    claim_regular_sibling, create_missing_private_dir, current_process_uid, dir_metadata_nofollow,
+    ensure_private_dir, entry_exists, entry_kind, file_id, lock_exclusive_blocking,
+    open_append_nofollow, open_dir_nofollow, open_lock_at, open_lock_nofollow, open_regular_at,
+    open_regular_nofollow, open_rw_append_at, open_rw_append_nofollow, open_sub_dir_at,
+    prepare_unix_socket, read_claimed_at_if_unchanged, read_input_bounded, read_input_string,
+    read_open_bounded, read_private_regular, read_regular_bounded, read_regular_string,
+    socket_owner_uid, stage_verified_executable, sync_dir, unlink_regular_at,
+    validate_unix_socket_target, verify_same_regular_nofollow, write_atomic_at,
     write_atomic_if_absent_at, write_atomic_if_absent_path, write_atomic_path,
 };
 pub use name::{

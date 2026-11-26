@@ -9,8 +9,7 @@ Safety guarantees enforced before delivering any body-blind nudge:
      `~/.claude/sessions/<pid>.json`) and refuses `address-gone` if the PID is dead,
      the session file or messaging socket disappeared, or `sessionId` rotated.
   4. `name-shared` refusal: scans sibling live session files and refuses `name-shared`
-     when multiple live sessions claim the same display name with different session IDs
-     and the binding relies on a derived/ambiguous name.
+     when multiple live sessions claim the same display name with different session IDs.
 
 Protocol:
   - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
@@ -108,7 +107,7 @@ def format_nudge(claim: dict) -> dict:
     if canary:
         text = (
             f"[rex-wave canary] Confirm route for @{seat} ({incarnation}): "
-            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --token {canary}"
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
         )
     else:
         refs = claim.get("referents") or []
@@ -134,14 +133,18 @@ def main() -> int:
         return emit("unknown", "invalid-claim", str(err))
 
     if claim.get("schema") != 1:
-        return emit("refused", "unsupported-schema", f"schema={claim.get('schema')}")
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
 
     if os.environ.get("BELL_GUARD") == "1":
         return emit("deferred", "bell-guard", "BELL_GUARD=1 suppresses Claude session rings")
 
     endpoint = claim.get("endpoint") or {}
     if endpoint.get("transport") != "claude_session":
-        return emit("refused", "wrong-transport", f"expected claude_session, got {endpoint.get('transport')}")
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected claude_session, got {endpoint.get('transport')}",
+        )
 
     kind = str(endpoint.get("kind") or "").strip()
     if kind not in ALLOWED_KINDS:
@@ -197,6 +200,8 @@ def main() -> int:
     try:
         st = os.lstat(sock_path)
     except OSError:
+        if pid_alive(pid):
+            return emit("deferred", "socket-restarting", f"messaging socket {sock_path} temporarily absent while pid {pid} is alive")
         return emit("refused", "address-gone", f"messaging socket {sock_path} missing")
     if not stat.S_ISSOCK(st.st_mode):
         return emit("refused", "address-gone", f"{sock_path} is not a Unix socket")
@@ -214,8 +219,10 @@ def main() -> int:
     except OSError as err:
         if sent:
             return emit("unknown", "socket-io-after-send", str(err))
-        if err.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTSOCK):
-            return emit("refused", "address-gone", f"socket unreachable: {err}")
+        if err.errno == errno.ECONNREFUSED and pid_alive(pid):
+            return emit("deferred", "socket-busy", f"socket refused connection while pid {pid} is alive: {err}")
+        if err.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTSOCK) and not pid_alive(pid):
+            return emit("refused", "address-gone", f"socket unreachable and pid {pid} exited: {err}")
         if err.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
             return emit("deferred", "busy", str(err))
         return emit("unknown", "socket-error", str(err))

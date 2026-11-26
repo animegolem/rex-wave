@@ -171,36 +171,36 @@ The adapter writes one JSON outcome object to `stdout`:
 { "outcome": "rung" | "deferred" | "refused" | "unknown", "reason": "optional", "detail": "optional" }
 ```
 
-- **`rung`:** Marks each `(seat, sha256)` rung in `StreamId::Mail` (`NoDoubleRing`) and resets the adapter's consecutive-unknown counter to `0`.
-- **`unknown` (including non-zero exit, malformed stdout, or timeout):** Counts as rung on `(seat, sha256)` so an ambiguous delivery is **never** double-rung. After `K = 3` consecutive `unknown` outcomes, the courier is marked `degraded = true` and `AdapterDegraded` is escalated to `mail.hub_owner_seat` (`DegradedLoud`).
-- **`deferred`:** Retried up to `MaxTries` (`5` default) before loud `give_up` escalation.
-- **`refused` (first occurrence, e.g. `reason: "address-gone"` or `"name-shared"`):** Immediately expires the dead binding (`BindingStatus::Expired`) with **zero retries**, records `MailEvent::DeliveryFailed`, and escalates loudly to `mail.hub_owner_seat` and the original sender seat (visible in `rex-wave mail check` for the sender and in `rex-wave config show`).
+- **`rung`:** Marks each `(seat, sha256)` rung in `StreamId::Mail` (`NoDoubleRing`) and resets the adapter's consecutive-unknown counter for that seat to `0`.
+- **`unknown` (including non-zero exit, malformed stdout, timeout, or interrupted pre-dispatch claim on daemon restart):** Counts as rung on `(seat, sha256)` so an ambiguous delivery is **never** double-rung. After `K = 3` consecutive `unknown` outcomes, the courier is marked `degraded = true` and `AdapterDegraded` is escalated to `mail.hub_owner_seat` (`DegradedLoud`).
+- **`deferred`:** Retried with exponential backoff up to `MaxTries` (`5` default, persisted in `StreamId::Mail`) before loud `give_up` escalation.
+- **`refused` (first occurrence, e.g. `reason: "address-gone"` or `"name-shared"`):** Immediately expires the dead binding (`BindingStatus::Expired`) with **zero retries** on that incarnation, records `MailEvent::DeliveryFailed`, and escalates loudly to `mail.hub_owner_seat` and the original sender seat (visible in `rex-wave mail check` for the sender and in `rex-wave config show`). Unacked letters remain eligible if the seat later binds a new live session incarnation.
 
 ### Operator Attention Rule & Passive TUI Indicator
 
 Courier refusals (`address-gone`), `give_up` failures, and `AdapterDegraded` alerts **never** ring, toast, or raise unread/blocking inbox cards on the human `Operator` principal. Instead:
 
-- Failure notices and `NotifyKind::MailDeliveryFailed` inbox entries go exclusively to `mail.hub_owner_seat` and the original sender seat.
+- Failure notices and `NotifyKind::MailDeliveryFailed` inbox entries go exclusively to `mail.hub_owner_seat` and the original sender seat, reconciled idempotently from durable `MailEvent::DeliveryFailed` entries across daemon restarts.
 - `rex-wave tui` displays a passive, non-interrupting clickable indicator on `⚙ Settings` (`SidebarTreeSnapshot.mail_health`) without affecting `InboxBadge` or `OSC 7501`. Clicking `⚙ Settings` (or pressing `,`) opens the Settings view displaying live courier counters and the `Mail Delivery Failures` log.
 
 ## Canary-Gated Routes (`specs/mail/MailHub.tla`)
 
-Sessions can self-claim a route behind a canary confirmation gate so normal mail never rings an unverified or forked destination (`RightSeat`, `NoFalseGiveUp`):
+Sessions can self-claim a route behind a canary confirmation gate (either per bind with `--require-canary` or daemon-wide for all push-courier endpoints via `mail.require_canary = true` in `config.toml`) so normal mail never rings an unverified or forked destination (`RightSeat`, `NoFalseGiveUp`):
 
 ```sh
-# 1. Bind in pending_canary state (mints a 128-bit canary token):
+# 1. Bind in pending_canary state (mints a 128-bit canary token, redacted from Presence replies/reads):
 rex-wave presence bind --seat bob --t3-thread thr-42 --require-canary
 
 # 2. CourierHub dispatches a body-blind canary DeliveryClaim (referents: [], canary_token: "rwc_...")
 #    to the candidate endpoint; normal mail waits until confirmation.
 
-# 3. Confirm from inside the claimed session to promote PendingCanary -> Live:
-rex-wave presence confirm-canary --seat bob --incarnation <incarnation-id> --token <canary-token>
+# 3. Confirm from inside the claimed session (distinct from global --token auth) to promote PendingCanary -> Live:
+rex-wave presence confirm-canary --seat bob --incarnation <incarnation-id> --canary <canary-token>
 ```
 
 ## Multi-Machine Ownership (`OneMachineRings`)
 
-Each daemon resolves a `machine_id` (`--machine-id` / `REX_WAVE_MACHINE_ID`, defaulting to host short name). `SeatBinding` records its owning `machine_id`, and `CourierHub` only rings bindings owned by the local machine. Cross-machine route tables merge deterministically via `(claimed_at, machine_id)` last-writer-wins ordering alongside commutative union sync on content-addressed messages and ACKs, while local `UdsSession` disconnects (`presence hold` exit) drop the local binding immediately.
+Each daemon resolves a `machine_id` (`--machine-id` / `REX_WAVE_MACHINE_ID`, defaulting to host short name). `CourierHub` resolves one deterministic winning route across all machines and lanes first, ringing locally only when the winning route belongs to the local `machine_id`. Cross-machine `RouteSyncTable` replicas form a commutative join-semilattice with total `(claimed_at, machine_id, incarnation_id, confirmed)` version ordering and versioned withdrawal tombstones alongside commutative union sync on content-addressed messages and ACKs, while local `UdsSession` disconnects (`presence hold` exit) withdraw the local binding immediately.
 
 ## Loopback HTTP API (`rex-wave daemon --http 127.0.0.1:<port>`)
 

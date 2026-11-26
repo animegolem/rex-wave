@@ -114,12 +114,7 @@ pub fn default_config_file_path(explicit: Option<&Path>) -> Option<PathBuf> {
 }
 
 pub fn effective_couriers_dir(cfg: &RexConfig, config_path: Option<&Path>) -> Option<PathBuf> {
-    if let Some(ref d) = cfg.mail.couriers_dir {
-        return Some(rex_wave_waves::expand_tilde(&d.to_string_lossy()));
-    }
-    config_path
-        .and_then(Path::parent)
-        .map(|p| p.join("couriers.d"))
+    rex_wave_mailbridge::effective_couriers_dir_for(cfg, config_path, None)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -202,6 +197,8 @@ struct StrictMailToml {
     #[serde(default)]
     export_enabled: Option<bool>,
     #[serde(default)]
+    require_canary: Option<bool>,
+    #[serde(default)]
     couriers_dir: Option<PathBuf>,
     #[serde(default)]
     hub_owner_seat: Option<SeatName>,
@@ -252,6 +249,9 @@ pub fn parse_config_toml(raw: &str) -> Result<RexConfig, String> {
         cfg.mail.drop_dir = m.drop_dir;
         if let Some(b) = m.export_enabled {
             cfg.mail.export_enabled = b;
+        }
+        if let Some(b) = m.require_canary {
+            cfg.mail.require_canary = b;
         }
         cfg.mail.couriers_dir = m.couriers_dir;
         if let Some(s) = m.hub_owner_seat {
@@ -434,6 +434,9 @@ pub fn render_config_toml_preserving_comments(
         let mail = ensure_subtable(doc.as_table_mut(), "mail");
         mail.set_implicit(false);
         set_bool_preserving_decor(mail, "export_enabled", cfg.mail.export_enabled);
+        if cfg.mail.require_canary || mail.contains_key("require_canary") {
+            set_bool_preserving_decor(mail, "require_canary", cfg.mail.require_canary);
+        }
         set_or_remove_str(
             mail,
             "mirror_dir",

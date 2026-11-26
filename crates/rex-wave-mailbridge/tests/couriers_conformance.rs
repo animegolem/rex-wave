@@ -757,6 +757,7 @@ impl MailMachinesCluster {
                         CourierOutcome::Unknown
                     };
                     self.record_mail_event(MailEvent::RingAttempted {
+                        dispatch_id: None,
                         courier: format!("courier-{recip}"),
                         seat: recip.clone(),
                         machine_id: m_id,
@@ -766,10 +767,12 @@ impl MailMachinesCluster {
                         outcome: recorded_outcome,
                         reason: Some("broken".into()),
                         detail: None,
+                        degraded_threshold: None,
                     });
                 } else {
                     self.ghost_unk.insert(recip.clone(), 0);
                     self.record_mail_event(MailEvent::RingAttempted {
+                        dispatch_id: None,
                         courier: format!("courier-{recip}"),
                         seat: recip,
                         machine_id: m_id,
@@ -779,6 +782,7 @@ impl MailMachinesCluster {
                         outcome: CourierOutcome::Rung,
                         reason: None,
                         detail: None,
+                        degraded_threshold: None,
                     });
                 }
             }
@@ -2065,4 +2069,1499 @@ async fn reference_courier_scripts_enforce_body_blind_dry_run_and_claude_safety_
     let parsed2 = rex_wave_mailbridge::parse_courier_stdout(&out2.stdout);
     assert_eq!(parsed2.outcome, CourierOutcome::Deferred);
     assert_eq!(parsed2.reason.as_deref(), Some("bell-guard"));
+}
+
+// =============================================================================
+// 4. Round 2 Hardening Regressions (CRDT Semilattice, Pipe Drain, Crash Recovery,
+//    Concurrent ACK / Refusal Fencing, Rebind Delivery, Deferred Backoff,
+//    Canary Redaction, Multi-Machine Multi-Lane, & Reference Adapter Wire Contracts)
+// =============================================================================
+
+#[derive(Clone, Debug)]
+enum RouteTableOp {
+    Claim {
+        seat_idx: usize,
+        machine_idx: usize,
+        inc_idx: usize,
+        ts: u64,
+        confirmed: bool,
+    },
+    Drop {
+        seat_idx: usize,
+        machine_idx: usize,
+        inc_idx: usize,
+        ts: u64,
+    },
+}
+
+fn route_table_op_strategy() -> impl Strategy<Value = RouteTableOp> {
+    prop_oneof![
+        (0usize..2, 0usize..3, 0usize..4, 1u64..5, any::<bool>()).prop_map(
+            |(seat_idx, machine_idx, inc_idx, ts, confirmed)| RouteTableOp::Claim {
+                seat_idx,
+                machine_idx,
+                inc_idx,
+                ts: ts * 100,
+                confirmed,
+            }
+        ),
+        (0usize..2, 0usize..3, 0usize..4, 1u64..5).prop_map(
+            |(seat_idx, machine_idx, inc_idx, ts)| RouteTableOp::Drop {
+                seat_idx,
+                machine_idx,
+                inc_idx,
+                ts: ts * 100,
+            }
+        ),
+    ]
+}
+
+fn build_route_table_from_ops(ops: &[RouteTableOp]) -> RouteSyncTable {
+    let seats = [seat("alice"), seat("bob")];
+    let machines = ["m-alpha", "m-beta", "m-gamma"];
+    let mut table = RouteSyncTable::new();
+    for op in ops {
+        match op {
+            RouteTableOp::Claim {
+                seat_idx,
+                machine_idx,
+                inc_idx,
+                ts,
+                confirmed,
+            } => {
+                let s = seats[seat_idx % seats.len()].clone();
+                let m = machines[machine_idx % machines.len()];
+                let i = inc(&format!("inc-{inc_idx}"));
+                table.apply_claim(RouteClaim {
+                    seat: s,
+                    machine_id: m.to_owned(),
+                    incarnation_id: i,
+                    endpoint: TransportEndpoint::T3Thread {
+                        thread_id: T3ThreadId::parse(format!("thr-{inc_idx}")).unwrap(),
+                    },
+                    claimed_at: UnixMs(*ts),
+                    confirmed: *confirmed,
+                });
+            }
+            RouteTableOp::Drop {
+                seat_idx,
+                machine_idx,
+                inc_idx,
+                ts,
+            } => {
+                let s = seats[seat_idx % seats.len()].clone();
+                let m = machines[machine_idx % machines.len()];
+                let i = inc(&format!("inc-{inc_idx}"));
+                table.drop_local_at(&s, m, i, UnixMs(*ts));
+            }
+        }
+    }
+    table
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+
+    #[test]
+    fn route_sync_table_is_commutative_associative_idempotent_semilattice_with_withdrawals(
+        ops_a in prop::collection::vec(route_table_op_strategy(), 0..20),
+        ops_b in prop::collection::vec(route_table_op_strategy(), 0..20),
+        ops_c in prop::collection::vec(route_table_op_strategy(), 0..20),
+    ) {
+        let a = build_route_table_from_ops(&ops_a);
+        let b = build_route_table_from_ops(&ops_b);
+        let c = build_route_table_from_ops(&ops_c);
+
+        // Idempotence: A ⊔ A == A
+        let mut idem = a.clone();
+        idem.merge_from(&a);
+        prop_assert_eq!(&idem, &a);
+
+        // Commutativity: A ⊔ B == B ⊔ A (even with equal (claimed_at, machine_id) & withdrawals!)
+        let mut ab = a.clone();
+        ab.merge_from(&b);
+        let mut ba = b.clone();
+        ba.merge_from(&a);
+        prop_assert_eq!(&ab, &ba);
+
+        // Associativity: (A ⊔ B) ⊔ C == A ⊔ (B ⊔ C)
+        let mut abc_left = ab.clone();
+        abc_left.merge_from(&c);
+        let mut bc = b.clone();
+        bc.merge_from(&c);
+        let mut abc_right = a.clone();
+        abc_right.merge_from(&bc);
+        prop_assert_eq!(&abc_left, &abc_right);
+    }
+}
+
+#[test]
+fn route_sync_table_withdrawal_tombstone_prevents_stale_peer_resurrection() {
+    let mut local = RouteSyncTable::new();
+    let mut stale_peer = RouteSyncTable::new();
+    let claim = RouteClaim {
+        seat: seat("bob"),
+        machine_id: "m-alpha".into(),
+        incarnation_id: inc("inc-bob-1"),
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-bob-1").unwrap(),
+        },
+        claimed_at: UnixMs(1_000),
+        confirmed: true,
+    };
+    local.apply_claim(claim.clone());
+    stale_peer.apply_claim(claim);
+    assert!(local.drop_local(&seat("bob"), "m-alpha"));
+    assert_eq!(local.owner_machine(&seat("bob")), None);
+
+    // Merging stale_peer into local MUST NOT resurrect the withdrawn claim!
+    local.merge_from(&stale_peer);
+    assert_eq!(local.owner_machine(&seat("bob")), None);
+
+    // Merging local into stale_peer propagates the withdrawal!
+    stale_peer.merge_from(&local);
+    assert_eq!(stale_peer.owner_machine(&seat("bob")), None);
+}
+
+#[tokio::test]
+async fn pipe_holding_grandchild_and_sigterm_ignoring_descendant_never_stall_courier_hub() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = rex_wave_fs::ProtectedRootsGuard::resolve(&Protection::default()).unwrap();
+    let dummy_claim = DeliveryClaim {
+        schema: 1,
+        seat: seat("bob"),
+        machine_id: "node-a".into(),
+        incarnation_id: inc("inc-pipe"),
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-pipe").unwrap(),
+        },
+        referents: vec![],
+        canary_token: None,
+    };
+
+    // 1. Leader exits in milliseconds after spawning a background child that holds stdout/stderr open.
+    let leak_pid_file = tmp.path().join("leak-grandchild.pid");
+    let leak_script = write_executable_script(
+        tmp.path(),
+        "pipe-leak",
+        &format!(
+            "#!/usr/bin/env sh\n\
+             sleep 30 &\n\
+             echo $! > {pidfile:?}\n\
+             printf '{{\"outcome\":\"rung\"}}\\n'\n\
+             exit 0\n",
+            pidfile = leak_pid_file.to_string_lossy()
+        ),
+    );
+    let started = tokio::time::Instant::now();
+    let reply = invoke_courier_script(
+        &leak_script,
+        &dummy_claim,
+        Duration::from_secs(5),
+        Some(&guard),
+    )
+    .await;
+    assert_eq!(reply.outcome, CourierOutcome::Rung);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "pipe-leaking grandchild must be drained/reaped within grace, took {:?}",
+        started.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    if let Ok(pid_txt) = read_text(&leak_pid_file)
+        && let Ok(pid) = pid_txt.trim().parse::<u32>()
+    {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(!alive, "background pipe-holding grandchild must be reaped");
+    }
+
+    // 2. Timeout where leader exits promptly on SIGTERM while a grandchild ignores SIGTERM.
+    let ign_pid_file = tmp.path().join("ign-grandchild.pid");
+    let ign_script = write_executable_script(
+        tmp.path(),
+        "sigterm-ignore",
+        &format!(
+            "#!/usr/bin/env sh\n\
+             (trap '' TERM; sleep 30) &\n\
+             echo $! > {pidfile:?}\n\
+             sleep 30\n",
+            pidfile = ign_pid_file.to_string_lossy()
+        ),
+    );
+    let reply2 = invoke_courier_script(
+        &ign_script,
+        &dummy_claim,
+        Duration::from_millis(150),
+        Some(&guard),
+    )
+    .await;
+    assert_eq!(reply2.outcome, CourierOutcome::Unknown);
+    assert_eq!(reply2.reason.as_deref(), Some("timeout"));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    if let Ok(pid_txt) = read_text(&ign_pid_file)
+        && let Ok(pid) = pid_txt.trim().parse::<u32>()
+    {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(
+            !alive,
+            "SIGTERM-ignoring descendant must be killed by unconditional group SIGKILL"
+        );
+    }
+}
+
+#[tokio::test]
+async fn e2e_refusal_fences_batch33_rebind_delivers_and_concurrent_ack_skips_ring() {
+    let h = E2eHarness::new("node-a", Duration::from_secs(5)).await;
+    let inv_log = h._tmp.path().join("invocations.jsonl");
+    let mode_file = h._tmp.path().join("route.mode");
+    std::fs::write(&mode_file, "refuse-dead").unwrap();
+
+    write_executable_script(
+        &h.couriers_dir,
+        "t3-thread",
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys, time
+claim = json.load(sys.stdin)
+mode = pathlib.Path({mode:?}).read_text().strip()
+if claim['seat'] == 'carol':
+    time.sleep(0.25)
+with open({log:?}, 'a', encoding='utf-8') as f:
+    f.write(json.dumps({{'seat': claim['seat'], 'inc': claim['incarnation_id'], 'n': len(claim['referents']), 'canary': bool(claim.get('canary_token'))}}) + '\n')
+if mode == 'refuse-dead' and claim['incarnation_id'] == 'inc-bob-dead':
+    print(json.dumps({{'outcome': 'refused', 'reason': 'address-gone', 'detail': 'dead thread'}}))
+else:
+    print(json.dumps({{'outcome': 'rung'}}))
+"#,
+            mode = mode_file.to_string_lossy(),
+            log = inv_log.to_string_lossy()
+        ),
+    );
+
+    let alice = h.seat_client("alice");
+    let bob = h.seat_client("bob");
+    let carol = h.seat_client("carol");
+    let dave = h.seat_client("dave");
+
+    // Part A: 33 letters (> max_referents_per_ring=32) on dead inc-bob-dead:
+    // First batch of 32 is refused -> dead epoch fenced & expired -> 33rd is NOT rung on inc-bob-dead!
+    // Then bob binds a new live session inc-bob-live-2 -> ALL 33 unacked letters ARE rung on inc-bob-live-2!
+    for i in 1..=33 {
+        let sender = if i % 2 == 0 { &alice } else { &carol };
+        sender
+            .call(MailSend {
+                to: vec![seat("bob")],
+                cc: vec![],
+                subject: format!("Batch letter #{i}"),
+                body: format!("Body #{i}"),
+                from: None,
+                priority: LetterPriority::Normal,
+                topic: Some(format!("batch-{i}")),
+                in_reply_to: None,
+                refs: vec![],
+                wait_export: false,
+                idem: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    bob.call(PresenceBind {
+        seat: seat("bob"),
+        incarnation_id: Some(inc("inc-bob-dead")),
+        machine_id: Some("node-a".into()),
+        lane: None,
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-bob-dead").unwrap(),
+        },
+        liveness: LivenessMode::LeaseOnly,
+        ttl_ms: Some(300_000),
+        takeover: false,
+        allow_fork: false,
+        require_canary: false,
+        mail_horizon_at: Some(UnixMs(0)),
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    wait_for(Duration::from_secs(3), || {
+        let p = inv_log.clone();
+        async move {
+            read_text(&p)
+                .map(|s| s.lines().count() >= 1)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    h.sweep_now().await;
+
+    let dead_calls: Vec<serde_json::Value> = read_text(&inv_log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["inc"] == "inc-bob-dead")
+        .collect();
+    assert_eq!(
+        dead_calls.len(),
+        1,
+        "dead binding must be invoked ONCE for the first 32 letters and never again for the 33rd: {dead_calls:?}"
+    );
+    assert_eq!(dead_calls[0]["n"], 32);
+
+    // Also verify courier_stats.refused incremented ONCE (even with 2 distinct senders alice & carol!),
+    // and escalation MailSend.refs carry full 64-char sha256 strings!
+    let (health, failures) = h
+        .mail_bridge
+        .courier_health_and_failures(&[("t3-thread".into(), true)], 20)
+        .await;
+    assert_eq!(
+        health[0].refused, 1,
+        "multi-sender refusal must increment refused counter once per script run"
+    );
+    assert_eq!(failures.len(), 2, "one DeliveryFailed per sender group");
+
+    // Now bob rebinds a fresh healthy session inc-bob-live-2 -> all 33 letters deliver!
+    bob.call(PresenceBind {
+        seat: seat("bob"),
+        incarnation_id: Some(inc("inc-bob-live-2")),
+        machine_id: Some("node-a".into()),
+        lane: None,
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-bob-live-2").unwrap(),
+        },
+        liveness: LivenessMode::LeaseOnly,
+        ttl_ms: Some(300_000),
+        takeover: true,
+        allow_fork: false,
+        require_canary: false,
+        mail_horizon_at: Some(UnixMs(0)),
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    wait_for(Duration::from_secs(3), || {
+        let p = inv_log.clone();
+        async move {
+            let total_live: u64 = read_text(&p)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["inc"] == "inc-bob-live-2")
+                .filter_map(|v| v["n"].as_u64())
+                .sum();
+            total_live == 33
+        }
+    })
+    .await;
+
+    // Part B: Concurrent ACK while a sibling seat's courier is busy (`NoRingAfterAck`!).
+    carol
+        .call(PresenceBind {
+            seat: seat("carol"),
+            incarnation_id: Some(inc("inc-carol-slow")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::T3Thread {
+                thread_id: T3ThreadId::parse("thr-carol").unwrap(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    dave.call(PresenceBind {
+        seat: seat("dave"),
+        incarnation_id: Some(inc("inc-dave-fast")),
+        machine_id: Some("node-a".into()),
+        lane: None,
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-dave").unwrap(),
+        },
+        liveness: LivenessMode::LeaseOnly,
+        ttl_ms: Some(300_000),
+        takeover: false,
+        allow_fork: false,
+        require_canary: false,
+        mail_horizon_at: Some(UnixMs(0)),
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    // Send one multi-recipient letter to carol (processed first alphabetically, sleeps 250ms) and dave.
+    let multi = alice
+        .call(MailSend {
+            to: vec![seat("carol"), seat("dave")],
+            cc: vec![],
+            subject: "Race ACK before dave rings".into(),
+            body: "Test concurrent ack".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("ack-race".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    // Immediately ACK as dave while carol's 250ms courier is running!
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    dave.call(MailAck {
+        path: None,
+        sha256: Some(multi.sha256.clone()),
+        seat: Some(seat("dave")),
+        note: Some("fast ack".into()),
+    })
+    .await
+    .unwrap();
+
+    wait_for(Duration::from_secs(3), || {
+        let p = inv_log.clone();
+        async move {
+            read_text(&p)
+                .unwrap_or_default()
+                .lines()
+                .any(|l| l.contains("\"inc-carol-slow\""))
+        }
+    })
+    .await;
+    h.sweep_now().await;
+
+    let dave_rings = read_text(&inv_log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("\"inc-dave-fast\""))
+        .count();
+    assert_eq!(
+        dave_rings, 0,
+        "dave ACKed while carol's courier was running; dave must NEVER be rung after ACK"
+    );
+}
+
+#[tokio::test]
+async fn e2e_deferred_backoff_canary_retry_token_redaction_and_restart_crash_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sb_dir = tmp.path().join("sandbox");
+    std::fs::create_dir_all(&sb_dir).unwrap();
+    std::fs::write(sb_dir.join(".rex-wave-sandbox"), b"ok\n").unwrap();
+    let couriers_dir = tmp.path().join("couriers.d");
+    std::fs::create_dir_all(&couriers_dir).unwrap();
+
+    let journal_path = tmp.path().join("journal.sqlite3");
+    let journal = Journal::open(&journal_path).unwrap();
+
+    // Pre-seed an unfinished `RingDispatched` claim + an unreconciled `DeliveryFailed`
+    // in the SQLite journal BEFORE starting CourierHub to prove crash recovery!
+    let pre_hub = Hub::new(1024);
+    let house = HouseProfile::default();
+    let presence = Presence::with_house_profile(house.clone()).with_machine_id("node-a");
+    let presence_svc = presence.registry(journal.clone(), pre_hub.clone());
+    let room_svc = Registry::<Rooms>::new(journal.clone(), pre_hub.clone());
+    let sandbox = SandboxRoot::verify_with(&sb_dir, &Protection::default()).unwrap();
+    let mail_writer = journal.claim(StreamId::Mail).unwrap();
+
+    let mut cfg = RexConfig::default();
+    cfg.mail.couriers_dir = Some(couriers_dir.clone());
+    cfg.mail.hub_owner_seat = seat("postmaster");
+    cfg.mail.require_canary = true;
+    let (_cfg_tx, cfg_rx) = watch::channel(cfg);
+    let _presence_sync = presence.spawn_config_sync(cfg_rx.clone());
+
+    let mail_bridge = Arc::new(
+        MailBridge::with_hub(sandbox, journal.clone(), mail_writer, pre_hub.clone())
+            .with_room_service(room_svc.clone())
+            .with_config_watch(cfg_rx.clone())
+            .with_house_profile(house.clone()),
+    );
+    let sidebar = SidebarProjection::spawn(journal.clone(), pre_hub.clone());
+    let router = Arc::new(Router {
+        room: room_svc,
+        inbox: Registry::<Inbox>::new(journal.clone(), pre_hub.clone()),
+        mail: mail_bridge.clone(),
+        presence: presence_svc,
+        read: Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: pre_hub.clone(),
+            sidebar: sidebar.clone(),
+            agents: Arc::new(NoAgentFeed),
+        }),
+        ..Router::unavailable_with(Arc::new(ReadSide {
+            journal: Journal::in_memory().unwrap(),
+            hub: Hub::new(8),
+            sidebar: sidebar.clone(),
+            agents: Arc::new(NoAgentFeed),
+        }))
+    });
+
+    let alice = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: seat("alice"),
+        },
+    );
+    let carol = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: seat("carol"),
+        },
+    );
+    let sys_courier = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::CourierHub,
+        },
+    );
+
+    // Carol binds (policy `mail.require_canary = true` puts T3Thread in PendingCanary automatically!)
+    let carol_bound = carol
+        .call(PresenceBind {
+            seat: seat("carol"),
+            incarnation_id: Some(inc("inc-carol-policy")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::T3Thread {
+                thread_id: T3ThreadId::parse("thr-carol-policy").unwrap(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_bound.status,
+        BindingStatus::PendingCanary,
+        "mail.require_canary=true policy must gate push-courier binds even without --require-canary"
+    );
+
+    // Send a letter to `dave` and record a pre-crash `RingDispatched` (no `RingAttempted`!)
+    // plus a pre-crash `DeliveryFailed` on `erin` whose `PresenceExpire`/`MailSend`/`InboxRaise` never ran!
+    let dave_client = LocalClient::new(router.clone(), Principal::Seat { seat: seat("dave") });
+    let erin_client = LocalClient::new(router.clone(), Principal::Seat { seat: seat("erin") });
+    // SelfWatcher bypasses push canary policy; let's bind dave & erin on OperatorToast (exempt) or confirm:
+    dave_client
+        .call(PresenceBind {
+            seat: seat("dave"),
+            incarnation_id: Some(inc("inc-dave-crash")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::OperatorToast {
+                command: "osascript".into(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    erin_client
+        .call(PresenceBind {
+            seat: seat("erin"),
+            incarnation_id: Some(inc("inc-erin-crash")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::OperatorToast {
+                command: "osascript".into(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let crash_letter = alice
+        .call(MailSend {
+            to: vec![seat("dave")],
+            cc: vec![],
+            subject: "In-flight before crash".into(),
+            body: "Should recover as unknown and NOT ring twice".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("crash".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let erin_letter = alice
+        .call(MailSend {
+            to: vec![seat("erin")],
+            cc: vec![],
+            subject: "Refused right before crash".into(),
+            body: "Escalation must reconcile on restart".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("crash-refused".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    // Operator caller MUST be denied `MailRecordRing` (restricted to SystemPart::CourierHub).
+    let op_denied = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: seat("owner"),
+        },
+    )
+    .call(MailRecordRing {
+        phase: RingRecordPhase::Begin,
+        dispatch_id: Some("disp-bad".into()),
+        courier: "macos-toast".into(),
+        seat: seat("dave"),
+        machine_id: "node-a".into(),
+        incarnation_id: Some(inc("inc-dave-crash")),
+        expected_epoch: Some(1),
+        sha256s: vec![crash_letter.sha256.clone()],
+        is_canary: false,
+        outcome: CourierOutcome::Deferred,
+        reason: None,
+        detail: None,
+        sender_seat: None,
+        hub_owner_seat: seat("postmaster"),
+        failure_kind: None,
+        failure_groups: vec![],
+        degraded_threshold: Some(2),
+    })
+    .await;
+    assert!(matches!(op_denied, Err(ApiError::Denied { .. })));
+
+    // Persist unfinished `Begin` on dave + committed `Refused` on erin (without running follow-ups!).
+    sys_courier
+        .call(MailRecordRing {
+            phase: RingRecordPhase::Begin,
+            dispatch_id: Some("disp-pre-crash-1".into()),
+            courier: "macos-toast".into(),
+            seat: seat("dave"),
+            machine_id: "node-a".into(),
+            incarnation_id: Some(inc("inc-dave-crash")),
+            expected_epoch: Some(1),
+            sha256s: vec![crash_letter.sha256.clone()],
+            is_canary: false,
+            outcome: CourierOutcome::Deferred,
+            reason: None,
+            detail: None,
+            sender_seat: None,
+            hub_owner_seat: seat("postmaster"),
+            failure_kind: None,
+            failure_groups: vec![],
+            degraded_threshold: Some(2),
+        })
+        .await
+        .unwrap();
+    sys_courier
+        .call(MailRecordRing {
+            phase: RingRecordPhase::Complete,
+            dispatch_id: None,
+            courier: "macos-toast".into(),
+            seat: seat("erin"),
+            machine_id: "node-a".into(),
+            incarnation_id: Some(inc("inc-erin-crash")),
+            expected_epoch: Some(1),
+            sha256s: vec![erin_letter.sha256.clone()],
+            is_canary: false,
+            outcome: CourierOutcome::Refused,
+            reason: Some("address-gone".into()),
+            detail: Some("crashed before escalate".into()),
+            sender_seat: Some(seat("alice")),
+            hub_owner_seat: seat("postmaster"),
+            failure_kind: Some(DeliveryFailureKind::Refused),
+            failure_groups: vec![],
+            degraded_threshold: Some(2),
+        })
+        .await
+        .unwrap();
+
+    // Install scripts:
+    // - `macos-toast` logs any invocation (must be 0 for dave's recovered letter & 0 for erin!).
+    // - `t3-thread` tests canary token redaction on first try (exiting 1 while echoing token to stderr!),
+    //   then returns `deferred` on second try, then `rung` on third try!
+    let toast_log = tmp.path().join("toast.log");
+    write_executable_script(
+        &couriers_dir,
+        "macos-toast",
+        &format!(
+            "#!/usr/bin/env python3\nimport json, sys\nc = json.load(sys.stdin)\nwith open({log:?}, 'a') as f:\n    f.write(c['seat'] + '\\n')\nprint(json.dumps({{'outcome':'rung'}}))\n",
+            log = toast_log.to_string_lossy()
+        ),
+    );
+
+    let t3_state = tmp.path().join("t3.step");
+    let t3_canary_out = tmp.path().join("t3.canary");
+    std::fs::write(&t3_state, "0").unwrap();
+    write_executable_script(
+        &couriers_dir,
+        "t3-thread",
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+claim = json.load(sys.stdin)
+p = pathlib.Path({st:?})
+step = int(p.read_text().strip()) + 1
+p.write_text(str(step))
+tok = claim.get('canary_token') or ''
+if tok:
+    pathlib.Path({cout:?}).write_text(tok)
+    if step == 1:
+        sys.stderr.write('boom leaked token=' + tok + '\n')
+        sys.exit(1)
+    if step == 2:
+        print(json.dumps({{'outcome': 'deferred', 'reason': 'busy'}}))
+        sys.exit(0)
+    print(json.dumps({{'outcome': 'rung'}}))
+    sys.exit(0)
+if step <= 5:
+    print(json.dumps({{'outcome': 'deferred', 'reason': 'rate-limit'}}))
+else:
+    print(json.dumps({{'outcome': 'rung'}}))
+"#,
+            st = t3_state.to_string_lossy(),
+            cout = t3_canary_out.to_string_lossy()
+        ),
+    );
+
+    // Boot CourierHub with fast 80ms defer_backoff and custom degraded_threshold = 2!
+    let courier_cfg = CourierHubConfig::new("node-a", house, seat("owner"))
+        .with_default_couriers_dir(Some(couriers_dir))
+        .with_defer_backoff(Duration::from_millis(80))
+        .with_degraded_threshold(2)
+        .with_max_defer_tries(4)
+        .with_protection(Protection::default());
+    let courier_hub = CourierHub::new(courier_cfg, cfg_rx);
+    let courier_task = spawn_reactor(courier_hub, sys_courier.clone());
+
+    // 1. Verify erin's pre-crash `DeliveryFailed` reconciled `PresenceExpire` + `MailSend` (full 64-hex refs) + `InboxRaise`,
+    //    AND dave's pre-crash `RingDispatched` recovered as `Unknown` with ZERO duplicate script invocations!
+    wait_for(Duration::from_secs(3), || {
+        let al = LocalClient::new(router.clone(), Principal::Seat { seat: seat("alice") });
+        async move {
+            let inb = al
+                .call(InboxList {
+                    include_done: false,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            inb.items
+                .iter()
+                .any(|i| matches!(&i.draft.kind, NotifyKind::MailDeliveryFailed { seat: s, .. } if s == &seat("erin")))
+        }
+    })
+    .await;
+    assert!(
+        !toast_log.exists(),
+        "pre-crash RingDispatched on dave and Refused on erin must NEVER invoke macos-toast again"
+    );
+    let pm_mail = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: seat("postmaster"),
+        },
+    )
+    .call(MailCheck {
+        seat: Some(seat("postmaster")),
+        include_all: true,
+        limit: None,
+    })
+    .await
+    .unwrap();
+    let full_notice_sha = pm_mail
+        .messages
+        .iter()
+        .find(|m| m.subject.contains("@erin"))
+        .expect("reconciled refusal notice to postmaster")
+        .sha256
+        .clone();
+    let raw_mail_stream = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: seat("owner"),
+        },
+    )
+    .call(rex_wave_api::read::Read {
+        stream: StreamId::Mail,
+        room: None,
+        after: Seq::ORIGIN,
+        cursor: None,
+        limit: Some(100),
+    })
+    .await
+    .unwrap();
+    let notice_msg = raw_mail_stream
+        .entries
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::Mail(MailEvent::MessageCommitted { message, .. })
+                if message.sha256 == full_notice_sha =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .expect("committed escalation notice");
+    assert_eq!(
+        notice_msg.refs,
+        vec![erin_letter.sha256.as_str().to_owned()],
+        "escalation refs must hold full 64-character sha256 strings"
+    );
+
+    // 2. Wait for carol's canary to retry across `Unknown` (step 1) -> `Deferred` (step 2) -> `Rung` (step 3) via backoff timer!
+    wait_for(Duration::from_secs(3), || {
+        let p = t3_state.clone();
+        async move {
+            read_text(&p)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .is_some_and(|n| n >= 3)
+        }
+    })
+    .await;
+
+    let actual_canary = read_text(&t3_canary_out).unwrap().trim().to_owned();
+    assert!(actual_canary.starts_with("rwc_"));
+
+    // Verify the canary token leaked to stderr on step 1 was REDACTED from StreamId::Mail!
+    let raw_mail_after = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: seat("owner"),
+        },
+    )
+    .call(rex_wave_api::read::Read {
+        stream: StreamId::Mail,
+        room: None,
+        after: Seq::ORIGIN,
+        cursor: None,
+        limit: Some(200),
+    })
+    .await
+    .unwrap();
+    let serialized_mail = serde_json::to_string(&raw_mail_after.entries).unwrap();
+    assert!(
+        !serialized_mail.contains(&actual_canary),
+        "active canary_token leaked on adapter stderr MUST be redacted before persistence!"
+    );
+    assert!(serialized_mail.contains("[REDACTED_CANARY]"));
+
+    // Confirm carol's canary -> Live, then verify refreshing the SAME endpoint with require_canary=true stays Live (Opus S7)!
+    let confirmed_carol = carol
+        .call(PresenceConfirmCanary {
+            seat: seat("carol"),
+            incarnation_id: inc("inc-carol-policy"),
+            token: actual_canary,
+        })
+        .await
+        .unwrap();
+    assert_eq!(confirmed_carol.status, BindingStatus::Live);
+
+    let refreshed_carol = carol
+        .call(PresenceBind {
+            seat: seat("carol"),
+            incarnation_id: Some(inc("inc-carol-policy")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::T3Thread {
+                thread_id: T3ThreadId::parse("thr-carol-policy").unwrap(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: true,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed_carol.status,
+        BindingStatus::Live,
+        "refreshing an already-confirmed identical endpoint must preserve Live status"
+    );
+    assert_eq!(refreshed_carol.epoch, confirmed_carol.epoch);
+
+    // Send a letter to carol -> defers twice with 80ms backoff (never tight-looping!) and rings on 3rd try!
+    let send_started = tokio::time::Instant::now();
+    alice
+        .call(MailSend {
+            to: vec![seat("carol")],
+            cc: vec![],
+            subject: "Deferred then rung".into(),
+            body: "Tests backoff timer".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("backoff".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for(Duration::from_secs(3), || {
+        let p = t3_state.clone();
+        async move {
+            read_text(&p)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .is_some_and(|n| n >= 6)
+        }
+    })
+    .await;
+    assert!(
+        send_started.elapsed() >= Duration::from_millis(140),
+        "two deferred retries with 80ms base backoff must wait for scheduled due times"
+    );
+
+    courier_task.abort();
+}
+
+#[tokio::test]
+async fn e2e_two_machines_multi_lane_ring_strictly_one_owner_and_sidebar_tracks_per_seat_degradation()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let sb_dir = tmp.path().join("sandbox");
+    std::fs::create_dir_all(&sb_dir).unwrap();
+    std::fs::write(sb_dir.join(".rex-wave-sandbox"), b"ok\n").unwrap();
+    let couriers_dir = tmp.path().join("couriers.d");
+    std::fs::create_dir_all(&couriers_dir).unwrap();
+
+    let ring_log = tmp.path().join("multi-hub-rings.log");
+    write_executable_script(
+        &couriers_dir,
+        "t3-thread",
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, sys
+claim = json.load(sys.stdin)
+with open({log:?}, 'a', encoding='utf-8') as f:
+    f.write(claim['machine_id'] + ':' + claim['incarnation_id'] + '\n')
+if claim['seat'] == 'carol':
+    sys.exit(1)
+print(json.dumps({{'outcome': 'rung'}}))
+"#,
+            log = ring_log.to_string_lossy()
+        ),
+    );
+
+    let sandbox = SandboxRoot::verify_with(&sb_dir, &Protection::default()).unwrap();
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(1024);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+
+    let mut cfg = RexConfig::default();
+    cfg.mail.couriers_dir = Some(couriers_dir.clone());
+    cfg.mail.hub_owner_seat = seat("postmaster");
+    let (_cfg_tx, cfg_rx) = watch::channel(cfg);
+
+    let house = HouseProfile::default();
+    let presence = Presence::with_house_profile(house.clone()).with_machine_id("machine-a");
+    let presence_svc = presence.registry(journal.clone(), hub.clone());
+    let room_svc = Registry::<Rooms>::new(journal.clone(), hub.clone());
+    let mail_writer = journal.claim(StreamId::Mail).unwrap();
+    let mail_bridge = Arc::new(
+        MailBridge::with_hub(sandbox, journal.clone(), mail_writer, hub.clone())
+            .with_room_service(room_svc.clone())
+            .with_config_watch(cfg_rx.clone())
+            .with_house_profile(house.clone()),
+    );
+    let router = Arc::new(Router {
+        room: room_svc,
+        inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+        mail: mail_bridge.clone(),
+        presence: presence_svc,
+        read: Arc::new(ReadSide {
+            journal,
+            hub,
+            sidebar: sidebar.clone(),
+            agents: Arc::new(NoAgentFeed),
+        }),
+        ..Router::unavailable_with(Arc::new(ReadSide {
+            journal: Journal::in_memory().unwrap(),
+            hub: Hub::new(8),
+            sidebar: sidebar.clone(),
+            agents: Arc::new(NoAgentFeed),
+        }))
+    });
+
+    // Spawn TWO CourierHubs (`machine-a` and `machine-b`) watching the exact same stream!
+    let sys_c = LocalClient::new(
+        router.clone(),
+        Principal::System {
+            part: SystemPart::CourierHub,
+        },
+    );
+    let hub_a = CourierHub::new(
+        CourierHubConfig::new("machine-a", house.clone(), seat("owner"))
+            .with_default_couriers_dir(Some(couriers_dir.clone()))
+            .with_degraded_threshold(2)
+            .with_protection(Protection::default()),
+        cfg_rx.clone(),
+    );
+    let hub_b = CourierHub::new(
+        CourierHubConfig::new("machine-b", house, seat("owner"))
+            .with_default_couriers_dir(Some(couriers_dir.clone()))
+            .with_degraded_threshold(2)
+            .with_protection(Protection::default()),
+        cfg_rx,
+    );
+    let handle_a = hub_a.handle();
+    let handle_b = hub_b.handle();
+    let task_a = spawn_reactor(hub_a, sys_c.clone());
+    let task_b = spawn_reactor(hub_b, sys_c.clone());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let bob = LocalClient::new(router.clone(), Principal::Seat { seat: seat("bob") });
+    let carol = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: seat("carol"),
+        },
+    );
+    let alice = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: seat("alice"),
+        },
+    );
+
+    // Bob binds TWO valid lanes: lane-a on machine-a, and lane-b on machine-b!
+    bob.call(PresenceBind {
+        seat: seat("bob"),
+        incarnation_id: Some(inc("inc-bob-ma")),
+        machine_id: Some("machine-a".into()),
+        lane: Some("lane-a".into()),
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-ma").unwrap(),
+        },
+        liveness: LivenessMode::LeaseOnly,
+        ttl_ms: Some(300_000),
+        takeover: false,
+        allow_fork: false,
+        require_canary: false,
+        mail_horizon_at: Some(UnixMs(0)),
+        idem: None,
+    })
+    .await
+    .unwrap();
+    bob.call(PresenceBind {
+        seat: seat("bob"),
+        incarnation_id: Some(inc("inc-bob-mb")),
+        machine_id: Some("machine-b".into()),
+        lane: Some("lane-b".into()),
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("thr-mb").unwrap(),
+        },
+        liveness: LivenessMode::LeaseOnly,
+        ttl_ms: Some(300_000),
+        takeover: false,
+        allow_fork: false,
+        require_canary: false,
+        mail_horizon_at: Some(UnixMs(0)),
+        idem: None,
+    })
+    .await
+    .unwrap();
+
+    alice
+        .call(MailSend {
+            to: vec![seat("bob")],
+            cc: vec![],
+            subject: "Multi-lane multi-machine test".into(),
+            body: "Only one machine may ring".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("one-machine".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for(Duration::from_secs(3), || {
+        let p = ring_log.clone();
+        async move {
+            read_text(&p)
+                .map(|s| s.lines().count() >= 1)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    handle_a.sweep(&sys_c).await;
+    handle_b.sweep(&sys_c).await;
+
+    let bob_lines: Vec<String> = read_text(&ring_log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        bob_lines,
+        vec!["machine-b:inc-bob-mb".to_owned()],
+        "strictly ONE machine (highest epoch global winner) may ring bob: {bob_lines:?}"
+    );
+
+    // Per-seat Sidebar degradation parity (`Astra S12`):
+    // Degrade `t3-thread` on seat `carol` (threshold = 2), then ring cleanly on `bob`:
+    // BOTH `MailState` AND `SidebarProjection` must remain degraded while `carol` is degraded!
+    carol
+        .call(PresenceBind {
+            seat: seat("carol"),
+            incarnation_id: Some(inc("inc-carol-ma")),
+            machine_id: Some("machine-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::T3Thread {
+                thread_id: T3ThreadId::parse("thr-carol").unwrap(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    for idx in 1..=2 {
+        alice
+            .call(MailSend {
+                to: vec![seat("carol")],
+                cc: vec![],
+                subject: format!("Carol fail #{idx}"),
+                body: "Triggers per-seat unknown".into(),
+                from: None,
+                priority: LetterPriority::Normal,
+                topic: Some(format!("cf-{idx}")),
+                in_reply_to: None,
+                refs: vec![],
+                wait_export: false,
+                idem: None,
+            })
+            .await
+            .unwrap();
+        wait_for(Duration::from_secs(3), || {
+            let p = ring_log.clone();
+            let want = idx + 1;
+            async move {
+                read_text(&p)
+                    .map(|s| s.lines().count() >= want)
+                    .unwrap_or(false)
+            }
+        })
+        .await;
+    }
+
+    // Now send a clean ring to `bob` (which returns `rung`!).
+    alice
+        .call(MailSend {
+            to: vec![seat("bob")],
+            cc: vec![],
+            subject: "Bob clean ring while carol degraded".into(),
+            body: "Sidebar must keep degraded_couriers == 1".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("bob-ok".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    wait_for(Duration::from_secs(3), || {
+        let p = ring_log.clone();
+        async move {
+            read_text(&p)
+                .map(|s| s.lines().count() >= 4)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (health, _) = mail_bridge
+        .courier_health_and_failures(&[("t3-thread".into(), true)], 10)
+        .await;
+    assert!(health[0].degraded);
+    let sb_snap = sidebar.snapshot(&Principal::Operator {
+        seat: seat("owner"),
+    });
+    assert_eq!(
+        sb_snap.mail_health.degraded_couriers, 1,
+        "Sidebar must retain degraded_couriers=1 while carol remains degraded even after bob rings cleanly"
+    );
+
+    task_a.abort();
+    task_b.abort();
+}
+
+#[tokio::test]
+async fn reference_adapters_speak_real_t3_cli_bb_send_and_codex_jsonrpc_contracts() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let examples_dir = manifest_dir.join("../../examples/couriers.d");
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+
+    // 1. `t3-thread`: verify positional `<thread> -` CLI contract + `--canary` confirmation flag!
+    let t3_args_log = tmp.path().join("t3-cli.json");
+    let fake_t3 = write_executable_script(
+        tmp.path(),
+        "fake-t3",
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, sys
+stdin_body = sys.stdin.read()
+with open({out:?}, 'w', encoding='utf-8') as f:
+    json.dump({{'argv': sys.argv[1:], 'stdin': stdin_body}}, f)
+print(json.dumps({{'ok': True}}))
+"#,
+            out = t3_args_log.to_string_lossy()
+        ),
+    );
+    let t3_claim = DeliveryClaim {
+        schema: 1,
+        seat: seat("bob"),
+        machine_id: "node-a".into(),
+        incarnation_id: inc("inc-t3-1"),
+        endpoint: TransportEndpoint::T3Thread {
+            thread_id: T3ThreadId::parse("mcp:thr-xyz").unwrap(),
+        },
+        referents: vec![],
+        canary_token: Some("rwc_testcanary999".into()),
+    };
+    let mut c1 = tokio::process::Command::new(examples_dir.join("t3-thread"));
+    c1.env("T3_BIN", &fake_t3)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut ch1 = c1.spawn().unwrap();
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut s = ch1.stdin.take().unwrap();
+        s.write_all(&serde_json::to_vec(&t3_claim).unwrap())
+            .await
+            .unwrap();
+    }
+    let out1 = ch1.wait_with_output().await.unwrap();
+    assert_eq!(
+        rex_wave_mailbridge::parse_courier_stdout(&out1.stdout).outcome,
+        CourierOutcome::Rung
+    );
+    let captured_t3: serde_json::Value =
+        serde_json::from_str(&read_text(&t3_args_log).unwrap()).unwrap();
+    assert_eq!(
+        captured_t3["argv"],
+        serde_json::json!(["thread", "send", "--json", "--", "mcp:thr-xyz", "-"])
+    );
+    assert!(
+        captured_t3["stdin"]
+            .as_str()
+            .unwrap()
+            .contains("--canary rwc_testcanary999"),
+        "canary nudge must use --canary (never colliding with global --token)"
+    );
+
+    // 2. `bb-thread`: verify `POST /api/v1/threads/<encoded>/send` with `input` + `mode: "auto"`!
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bb_server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = stream.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 29\r\n\r\n{\"ok\":true,\"delivery\":\"sent\"}",
+            )
+            .await
+            .unwrap();
+        req
+    });
+    let bb_claim = DeliveryClaim {
+        schema: 1,
+        seat: seat("bob"),
+        machine_id: "node-a".into(),
+        incarnation_id: inc("inc-bb-1"),
+        endpoint: TransportEndpoint::BbThread {
+            thread_id: BbThreadId::parse("thr_bb_42").unwrap(),
+        },
+        referents: vec![],
+        canary_token: Some("rwc_bbcanary".into()),
+    };
+    let mut c2 = tokio::process::Command::new(examples_dir.join("bb-thread"));
+    c2.env("BB_URL", format!("http://{addr}"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut ch2 = c2.spawn().unwrap();
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut s = ch2.stdin.take().unwrap();
+        s.write_all(&serde_json::to_vec(&bb_claim).unwrap())
+            .await
+            .unwrap();
+    }
+    let out2 = ch2.wait_with_output().await.unwrap();
+    assert_eq!(
+        rex_wave_mailbridge::parse_courier_stdout(&out2.stdout).outcome,
+        CourierOutcome::Rung
+    );
+    let raw_http_req = bb_server.await.unwrap();
+    assert!(
+        raw_http_req.starts_with("POST /api/v1/threads/thr_bb_42/send HTTP/1.1"),
+        "bb-thread must POST to /api/v1/threads/:id/send, got: {raw_http_req}"
+    );
+    let http_body = raw_http_req.split("\r\n\r\n").nth(1).unwrap();
+    let parsed_bb_body: serde_json::Value = serde_json::from_str(http_body).unwrap();
+    assert_eq!(parsed_bb_body["mode"], "auto");
+    assert_eq!(parsed_bb_body["input"][0]["type"], "text");
+    assert!(
+        parsed_bb_body["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("--canary rwc_bbcanary")
+    );
+
+    // 3. `codex-app-server`: verify JSON-RPC 2.0 `initialize` -> `initialized` -> `turn/start` over Unix socket!
+    let codex_sock = tmp.path().join("codex-app.sock");
+    let uds_listener = tokio::net::UnixListener::bind(&codex_sock).unwrap();
+    let codex_server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let (stream, _) = uds_listener.accept().await.unwrap();
+        let (rh, mut wh) = stream.into_split();
+        let mut lines = BufReader::new(rh).lines();
+        let mut received = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            received.push(msg.clone());
+            if method == "initialize" {
+                wh.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"mock\"}}}\n")
+                    .await
+                    .unwrap();
+            } else if method == "turn/start" {
+                wh.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"turnId\":\"t-1\"}}\n")
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+        received
+    });
+    let codex_claim = DeliveryClaim {
+        schema: 1,
+        seat: seat("bob"),
+        machine_id: "node-a".into(),
+        incarnation_id: inc("inc-codex-1"),
+        endpoint: TransportEndpoint::UdsSession {
+            conn_id: 7,
+            client: "codex:codex-thr-77".into(),
+        },
+        referents: vec![],
+        canary_token: None,
+    };
+    let mut c3 = tokio::process::Command::new(examples_dir.join("codex-app-server"));
+    c3.env("CODEX_APP_SERVER_SOCKET", &codex_sock)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut ch3 = c3.spawn().unwrap();
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut s = ch3.stdin.take().unwrap();
+        s.write_all(&serde_json::to_vec(&codex_claim).unwrap())
+            .await
+            .unwrap();
+    }
+    let out3 = ch3.wait_with_output().await.unwrap();
+    assert_eq!(
+        rex_wave_mailbridge::parse_courier_stdout(&out3.stdout).outcome,
+        CourierOutcome::Rung
+    );
+    let rpc_frames = codex_server.await.unwrap();
+    assert_eq!(rpc_frames.len(), 3);
+    assert_eq!(rpc_frames[0]["method"], "initialize");
+    assert_eq!(rpc_frames[1]["method"], "initialized");
+    assert_eq!(rpc_frames[2]["method"], "turn/start");
+    assert_eq!(rpc_frames[2]["params"]["threadId"], "codex-thr-77");
+
+    // 4. Tilde expansion parity (`Astra S13`): `~/...` in `mail.couriers_dir` resolves identically!
+    let mut tilde_cfg = RexConfig::default();
+    tilde_cfg.mail.couriers_dir = Some(PathBuf::from("~/custom-couriers-dir"));
+    let resolved_tilde =
+        rex_wave_mailbridge::effective_couriers_dir_for(&tilde_cfg, None, None).unwrap();
+    assert!(
+        resolved_tilde.is_absolute() && !resolved_tilde.to_string_lossy().starts_with('~'),
+        "effective_couriers_dir_for must expand ~/ prefix: {}",
+        resolved_tilde.display()
+    );
+
+    // 5. `stage_verified_executable` closes pathname TOCTOU swap window (`Astra B5`):
+    // Stage an executable, replace its original pathname with a symlink and another file
+    // BEFORE spawning `staged.path()`, and prove only the original verified code runs!
+    let swap_dir = tmp.path().join("swap-couriers");
+    write_executable_script(
+        &swap_dir,
+        "t3-thread",
+        "#!/usr/bin/env sh\nprintf '{\"outcome\":\"rung\",\"detail\":\"original-verified\"}\\n'\n",
+    );
+    let staged =
+        rex_wave_fs::stage_verified_executable(&swap_dir, "t3-thread", 1024 * 1024).unwrap();
+    let staged_exec_path = staged.path().to_path_buf();
+    std::fs::remove_file(swap_dir.join("t3-thread")).unwrap();
+    let attacker_target = write_executable_script(
+        tmp.path(),
+        "evil-replacement",
+        "#!/usr/bin/env sh\nprintf '{\"outcome\":\"rung\",\"detail\":\"SWAPPED-ATTACKER\"}\\n'\n",
+    );
+    std::os::unix::fs::symlink(&attacker_target, swap_dir.join("t3-thread")).unwrap();
+    let out_staged = tokio::process::Command::new(&staged_exec_path)
+        .output()
+        .await
+        .unwrap();
+    let staged_reply = rex_wave_mailbridge::parse_courier_stdout(&out_staged.stdout);
+    assert_eq!(staged_reply.detail.as_deref(), Some("original-verified"));
+    drop(staged);
+    assert!(
+        !staged_exec_path.exists(),
+        "staged executable cleaned up on drop"
+    );
+
+    // And a symlink at `couriers.d/t3-thread` is rejected outright by `stage_verified_executable`:
+    assert!(rex_wave_fs::stage_verified_executable(&swap_dir, "t3-thread", 1024 * 1024).is_err());
 }
