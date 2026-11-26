@@ -214,9 +214,13 @@ commands! {
         InboxRaise    -> Ack       : "inbox_raise",     System,   true,  "Herald files a notification into one principal's inbox.";
     }
     Mail(MailCommand) {
-        MailPromote  -> LetterRef : "promote_to_letter", Member, true, "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).";
-        MailAck      -> Ack       : "mail_ack",          Member, true, "ACK a sandbox letter by its exact sha256.";
-        MailWakeBell -> Ack       : "mail_wake_bell",    System, true, "wake-bell Sink ingress: deliver a scheduled prompt into a seat's DM.";
+        MailPromote   -> LetterRef           : "promote_to_letter", Member,   true,  "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).";
+        MailAck       -> MailAcked           : "mail_ack",          Member,   true,  "ACK a mail message or sandbox letter by exact sha256 or relative path (idempotent per seat+sha256).";
+        MailWakeBell  -> Ack                 : "mail_wake_bell",    System,   true,  "wake-bell Sink ingress: deliver a scheduled prompt into a seat's DM.";
+        MailSend      -> MailSent            : "mail_send",         Member,   true,  "Send a content-addressed (sha256) dissolved mail message committed durably to SQLite before mirror export.";
+        MailCheck     -> MailCheckView       : "mail_check",        Member,   false, "Fast check returning unread/unacked mail for a seat plus sender delivery notices.";
+        MailSearch    -> MailSearchView      : "mail_search",       Member,   false, "Full-text (SQLite FTS5) search across content-addressed mail messages.";
+        MailReconcile -> MailReconcileReport : "mail_reconcile",    Operator, true,  "Reconcile SQLite mail messages and acks with mirror blobs, working tree, acks.jsonl, and drop folder.";
     }
     Presence(PresenceCommand) {
         PresenceClaim           -> SeatRecord         : "presence_claim",            Member, true,  "Claim or update durable seat metadata (role, projects, aliases, status) with provenance.";

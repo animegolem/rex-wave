@@ -7,6 +7,7 @@
 //! structurally read-only shadow reactor ([`shadow`]), and Gate 2 scorer ([`score`]).
 
 pub mod acks;
+pub mod dissolved;
 pub mod frontmatter;
 pub mod presence;
 pub mod score;
@@ -15,6 +16,14 @@ pub mod shadow;
 pub use acks::{
     AckIndex, AckRecord, AcksParseReport, AliasMap, NormalizedLetterPath, SkippedAckLine,
     letter_paths_match, normalize_letter_path, normalize_seat_token, parse_acks_jsonl,
+};
+pub use dissolved::{
+    CommittedAckRecord, CommittedMailEntry, DiskMailFile, MailMigrateVerifyReport,
+    MailRebuildReport, MailState, MirrorTarget, delivery_notices_for_seats, derive_mail_room,
+    format_mail_room_body, has_emacs_lock, is_emacs_lock_or_autosave, mail_room_labels,
+    mail_snippet, message_raw_bytes, migrate_verify_interchange, parse_mail_message_from_bytes,
+    project_message_to_room_service, project_messages_to_journal_rooms, rebuild_mail_from_mirror,
+    reconcile_mail_store, scan_object_blobs, scan_working_tree_dir, synthesize_mail_message,
 };
 pub use frontmatter::{
     FrontmatterDoc, FrontmatterEntry, RecipientCandidate, parse_recipient_list, unquote_yaml,
@@ -50,13 +59,14 @@ use rex_wave_api::*;
 use rex_wave_runtime::{BoxFut, DecideCtx, Hub, LocalClient, Reactor, Service, can_read};
 use rex_wave_store::{Appended, Journal, StreamWriter};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -68,7 +78,7 @@ pub use rex_wave_fs::{
     load_protected_roots_from, parse_protected_roots, protected_roots_file, resolve_links,
 };
 
-const MARKER_FILE: &str = ".rex-wave-sandbox";
+pub(crate) const MARKER_FILE: &str = ".rex-wave-sandbox";
 const MAX_PROMOTE_SPAN: u64 = 1_000;
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 const MAX_HTTP_BODY: usize = 128 * 1024;
@@ -79,16 +89,16 @@ const MAX_BELL_FILE_BYTES: u64 = 1024 * 1024;
 /// The largest single JSONL line inside `state/acks.jsonl`.
 const MAX_ACK_LINE_BYTES: usize = 1024 * 1024;
 /// The largest letter read for projection or acknowledgement.
-const MAX_LETTER_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_LETTER_BYTES: u64 = 16 * 1024 * 1024;
 /// Mode of letters, bells and acks written into the sandbox.
-const SANDBOX_FILE_MODE: u32 = 0o644;
+pub(crate) const SANDBOX_FILE_MODE: u32 = 0o644;
 /// Mode of directories created in the sandbox.
-const SANDBOX_DIR_MODE: u32 = 0o755;
+pub(crate) const SANDBOX_DIR_MODE: u32 = 0o755;
 
 #[derive(Clone, Debug)]
 pub struct SandboxRoot {
-    dir: ConfinedDir,
-    guard: ProtectedRootsGuard,
+    pub(crate) dir: ConfinedDir,
+    pub(crate) guard: ProtectedRootsGuard,
 }
 
 impl SandboxRoot {
@@ -183,7 +193,7 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> Sha256Hex {
     Sha256Hex::parse(hex).expect("64 lower-hex sha256")
 }
 
-fn sha256_short16(input: &str) -> String {
+pub(crate) fn sha256_short16(input: &str) -> String {
     let mut h = Sha256::new();
     h.update(input.as_bytes());
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -384,7 +394,7 @@ fn priority_word(p: LetterPriority) -> &'static str {
     }
 }
 
-fn sanitize_topic_for_file(raw: &str) -> String {
+pub(crate) fn sanitize_topic_for_file(raw: &str) -> String {
     let mut out: String = raw
         .trim()
         .chars()
@@ -831,35 +841,7 @@ fn bell_digest16(seat: &SeatName, canonical_key: &str) -> String {
 
 struct MailWriterState {
     writer: StreamWriter,
-    seen_wakes: HashSet<WakeId>,
-}
-
-fn collect_seen_wakes(reader: &Journal) -> HashSet<WakeId> {
-    let mut seen = HashSet::new();
-    let mut after = Seq::ORIGIN;
-    while let Ok(page) = reader.read(&StreamId::Mail, after, 512) {
-        let Some(last) = page.last() else {
-            break;
-        };
-        after = last.seq;
-        for env in &page {
-            match &env.event {
-                Event::Mail(MailEvent::Banked { letter, .. }) => {
-                    seen.insert(letter.wake_id.clone());
-                }
-                Event::Mail(MailEvent::Projected { item }) => {
-                    let path_str = item.reference.path.to_string_lossy();
-                    if let Ok(seat) = SeatName::parse(&item.to)
-                        && let Some((box_name, file_name)) = path_str.rsplit_once('/')
-                    {
-                        seen.insert(wake_id(&seat, box_name, file_name, &item.reference.sha256));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    seen
+    mail: MailState,
 }
 
 pub struct MailBridge {
@@ -867,35 +849,537 @@ pub struct MailBridge {
     reader: Journal,
     state: Mutex<MailWriterState>,
     hub: Option<Hub>,
+    room_svc: Option<Arc<dyn Service<RoomCommand>>>,
+    config_watch: Option<tokio::sync::watch::Receiver<rex_wave_api::config::RexConfig>>,
+    house: rex_wave_api::presence::HouseProfile,
+    drop_dir: Option<PathBuf>,
+    export_enabled: Arc<AtomicBool>,
 }
 
 impl MailBridge {
     /// Without a [`Hub`], committed `Mail` entries persist for replay and `Read` only;
     /// live daemons pass a [`Hub`] via [`MailBridge::with_hub`].
     pub fn new(root: SandboxRoot, reader: Journal, writer: StreamWriter) -> Self {
-        let seen_wakes = collect_seen_wakes(&reader);
+        let mail = MailState::from_journal(&reader).unwrap_or_default();
         MailBridge {
             root,
             reader,
-            state: Mutex::new(MailWriterState { writer, seen_wakes }),
+            state: Mutex::new(MailWriterState { writer, mail }),
             hub: None,
+            room_svc: None,
+            config_watch: None,
+            house: rex_wave_api::presence::HouseProfile::default(),
+            drop_dir: None,
+            export_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn with_hub(root: SandboxRoot, reader: Journal, writer: StreamWriter, hub: Hub) -> Self {
-        let seen_wakes = collect_seen_wakes(&reader);
-        MailBridge {
-            root,
-            reader,
-            state: Mutex::new(MailWriterState { writer, seen_wakes }),
-            hub: Some(hub),
+        let mut bridge = Self::new(root, reader, writer);
+        bridge.hub = Some(hub);
+        bridge
+    }
+
+    pub fn with_room_service(mut self, room_svc: Arc<dyn Service<RoomCommand>>) -> Self {
+        self.room_svc = Some(room_svc);
+        self
+    }
+
+    pub fn with_config_watch(
+        mut self,
+        rx: tokio::sync::watch::Receiver<rex_wave_api::config::RexConfig>,
+    ) -> Self {
+        self.config_watch = Some(rx);
+        self
+    }
+
+    pub fn with_house_profile(mut self, house: rex_wave_api::presence::HouseProfile) -> Self {
+        self.house = house;
+        self
+    }
+
+    pub fn with_drop_dir(mut self, drop_dir: Option<PathBuf>) -> Self {
+        self.drop_dir = drop_dir;
+        self
+    }
+
+    /// Runtime toggle for mirror export (useful for deterministic crash/recovery tests).
+    pub fn set_export_enabled(&self, enabled: bool) {
+        self.export_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub async fn mail_state_snapshot(&self) -> MailState {
+        self.state.lock().await.mail.clone()
+    }
+
+    fn should_export(&self) -> bool {
+        if !self.export_enabled.load(Ordering::Acquire) {
+            return false;
         }
+        if let Some(ref rx) = self.config_watch {
+            return rx.borrow().mail.export_enabled;
+        }
+        true
+    }
+
+    fn active_mirror(&self) -> Result<MirrorTarget, ApiError> {
+        let (cfg_mirror, cfg_drop) = match &self.config_watch {
+            Some(rx) => {
+                let cfg = rx.borrow();
+                (cfg.mail.mirror_dir.clone(), cfg.mail.drop_dir.clone())
+            }
+            None => (None, None),
+        };
+        let effective_drop = cfg_drop.or_else(|| self.drop_dir.clone());
+        if let Some(mirror_path) = cfg_mirror {
+            return MirrorTarget::open_with_guard(
+                &mirror_path,
+                effective_drop.as_deref(),
+                self.root.guard.clone(),
+            )
+            .map_err(|e| match e {
+                SandboxError::Production(_) | SandboxError::Config(_) => ApiError::Denied {
+                    principal: "mailbridge".into(),
+                    action: format!("mirror_dir refused by protected-roots: {e}"),
+                },
+                other => ApiError::Internal(format!("open mirror_dir: {other}")),
+            });
+        }
+        if let Some(ref drop_path) = effective_drop {
+            let lex = rex_wave_fs::lexical_normalize(drop_path).map_err(|e| {
+                ApiError::Invalid(InvalidId {
+                    what: "drop_dir".into(),
+                    reason: e.to_string(),
+                })
+            })?;
+            self.root
+                .guard
+                .check(&lex, drop_path)
+                .map_err(|e| ApiError::Denied {
+                    principal: "mailbridge".into(),
+                    action: format!("drop_dir refused by protected-roots: {e}"),
+                })?;
+            if rex_wave_fs::entry_exists(&lex) {
+                self.root
+                    .guard
+                    .verify_dir(&lex)
+                    .map_err(|e| ApiError::Denied {
+                        principal: "mailbridge".into(),
+                        action: format!("drop_dir refused: {e}"),
+                    })?;
+            }
+        }
+        Ok(MirrorTarget::from_sandbox(&self.root, effective_drop))
+    }
+
+    fn replay_presence(&self) -> PresenceState {
+        let mut state = PresenceState::with_house_profile(self.house.clone());
+        let mut after = Seq::ORIGIN;
+        while let Ok(page) = self.reader.read(&StreamId::Presence, after, 512) {
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = last.seq;
+            for env in &page {
+                if let Event::Presence(ev) = &env.event {
+                    let meta = rex_wave_runtime::EntryMeta {
+                        seq: env.seq,
+                        at: env.at,
+                        by: env.by.clone(),
+                    };
+                    <Presence as rex_wave_runtime::Decider>::evolve(&mut state, ev, &meta);
+                }
+            }
+        }
+        state
     }
 
     fn publish_fresh(&self, appended: &Appended) {
         if let (Appended::Fresh(committed), Some(hub)) = (appended, &self.hub) {
             hub.publish(committed);
         }
+    }
+
+    /// Runs a load-bearing `MailStore.tla` `Reconciled` sweep between `journal.sqlite3`
+    /// and the active mirror + drop directory.
+    pub async fn reconcile(&self) -> Result<MailReconcileReport, ApiError> {
+        let mirror = self.active_mirror()?;
+        let presence = self.replay_presence();
+        let aliases = AliasMap::from_presence(&presence);
+        let export_enabled = self.should_export();
+        let now = rex_wave_runtime::now();
+
+        let (report, fresh_envelopes) = {
+            let mut st = self.state.lock().await;
+            let MailWriterState { writer, mail } = &mut *st;
+            reconcile_mail_store(
+                mail,
+                writer,
+                &mirror,
+                &aliases,
+                self.room_svc.as_deref(),
+                export_enabled,
+                now,
+            )
+            .await?
+        };
+        if !fresh_envelopes.is_empty()
+            && let Some(ref hub) = self.hub
+        {
+            hub.publish(&fresh_envelopes);
+        }
+        Ok(report)
+    }
+
+    async fn send(&self, req: MailSend, ctx: DecideCtx) -> Result<MailSent, ApiError> {
+        let from_seat = match ctx.by() {
+            Principal::Worker { .. } => {
+                return Err(ApiError::Denied {
+                    principal: ctx.by().to_string(),
+                    action: "send mail as worker".into(),
+                });
+            }
+            Principal::Seat { seat } => {
+                if let Some(ref explicit) = req.from
+                    && explicit != seat
+                {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by().to_string(),
+                        action: format!("send mail as @{explicit}"),
+                    });
+                }
+                seat.as_str().to_owned()
+            }
+            Principal::Operator { seat } => req.from.as_ref().unwrap_or(seat).as_str().to_owned(),
+            Principal::System { .. } => req
+                .from
+                .as_ref()
+                .ok_or_else(|| {
+                    ApiError::Invalid(InvalidId {
+                        what: "from".into(),
+                        reason: "system principals must supply explicit --from seat".into(),
+                    })
+                })?
+                .as_str()
+                .to_owned(),
+        };
+
+        // 1. Check caller-supplied idempotency key FIRST.
+        let mut st = self.state.lock().await;
+        if let Some(ref idem) = req.idem
+            && let Some(existing_envs) = st
+                .writer
+                .lookup(idem)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            && let Some(existing_msg) = existing_envs.iter().find_map(|env| match &env.event {
+                Event::Mail(MailEvent::MessageCommitted { message, .. }) => {
+                    Some((**message).clone())
+                }
+                _ => None,
+            })
+        {
+            let room_seq = existing_msg.room.as_ref().and_then(|r| {
+                st.mail
+                    .room_post_seqs
+                    .get(&(r.clone(), existing_msg.sha256.clone()))
+                    .copied()
+            });
+            drop(st);
+            let mut exported = false;
+            if self.should_export() {
+                let mirror = self.active_mirror()?;
+                let raw = message_raw_bytes(&existing_msg)?;
+                let res_b = mirror.export_blob_if_absent(&existing_msg.sha256, &raw);
+                let res_w = mirror.export_working_tree_if_absent(&existing_msg.path, &raw);
+                match (res_b, res_w) {
+                    (Ok(_), Ok(_)) => exported = true,
+                    (Err(e), _) | (_, Err(e)) if req.wait_export => return Err(e),
+                    _ => {}
+                }
+            }
+            let presence = self.replay_presence();
+            let delivery_notices = delivery_notices_for_seats(
+                existing_msg.to.iter().chain(existing_msg.cc.iter()),
+                &presence,
+                ctx.at(),
+            );
+            return Ok(MailSent {
+                sha256: existing_msg.sha256,
+                id: existing_msg.id,
+                path: existing_msg.path,
+                from: existing_msg.from,
+                to: existing_msg.to,
+                cc: existing_msg.cc,
+                subject: existing_msg.subject,
+                created_at: existing_msg.created_at,
+                room: existing_msg.room,
+                room_seq,
+                exported,
+                replayed: true,
+                delivery_notices,
+            });
+        }
+
+        let msg = synthesize_mail_message(
+            &from_seat,
+            req.to,
+            req.cc,
+            &req.subject,
+            &req.body,
+            req.priority,
+            req.topic.as_deref(),
+            req.in_reply_to.as_deref(),
+            &req.refs,
+            ctx.at(),
+        )?;
+
+        let mut replayed = false;
+        let committed_msg = if let Some(existing) = st.mail.messages.get(&msg.sha256) {
+            replayed = true;
+            existing.message.clone()
+        } else {
+            // Single commit point = SQLite transaction FIRST!
+            let effective_idem = match req.idem {
+                Some(k) => k,
+                None => IdemKey::parse(format!("mail_msg:{}", msg.sha256))?,
+            };
+            let appended = st
+                .writer
+                .append(
+                    ctx.by(),
+                    ctx.at(),
+                    Some(&effective_idem),
+                    vec![Event::Mail(MailEvent::MessageCommitted {
+                        message: Box::new(msg.clone()),
+                        mutated_after_ack: false,
+                        prior_ack_sha: None,
+                    })],
+                )
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            match &appended {
+                Appended::Fresh(envs) => {
+                    for env in envs {
+                        st.mail.apply(env);
+                    }
+                    self.publish_fresh(&appended);
+                    msg
+                }
+                Appended::Replayed(envs) => {
+                    replayed = true;
+                    envs.iter()
+                        .find_map(|env| match &env.event {
+                            Event::Mail(MailEvent::MessageCommitted { message, .. }) => {
+                                Some((**message).clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(msg)
+                }
+            }
+        };
+
+        let parent_seq = committed_msg.room.as_ref().and_then(|room| {
+            committed_msg
+                .in_reply_to
+                .as_deref()
+                .and_then(|p| st.mail.resolve_parent_room_seq(room, p))
+        });
+        let existing_room_seq = committed_msg.room.as_ref().and_then(|room| {
+            st.mail
+                .room_post_seqs
+                .get(&(room.clone(), committed_msg.sha256.clone()))
+                .copied()
+        });
+        drop(st);
+
+        // 2. Project into DM / multi-seat mail thread room.
+        let room_seq = if existing_room_seq.is_some() {
+            existing_room_seq
+        } else if let Some(ref rsvc) = self.room_svc
+            && let Some(ref room) = committed_msg.room
+        {
+            let seq = project_message_to_room_service(
+                rsvc.as_ref(),
+                &committed_msg,
+                parent_seq,
+                Some(&ctx),
+            )
+            .await;
+            if let Some(s) = seq {
+                self.state
+                    .lock()
+                    .await
+                    .mail
+                    .room_post_seqs
+                    .insert((room.clone(), committed_msg.sha256.clone()), s);
+            }
+            seq
+        } else {
+            None
+        };
+
+        // 3. Export to mirror AFTER durable SQLite commit.
+        let mut exported = false;
+        if self.should_export() {
+            let mirror = self.active_mirror()?;
+            let raw = message_raw_bytes(&committed_msg)?;
+            let blob_res = mirror.export_blob_if_absent(&committed_msg.sha256, &raw);
+            let wt_res = mirror.export_working_tree_if_absent(&committed_msg.path, &raw);
+            match (blob_res, wt_res) {
+                (Ok(_), Ok(_)) => exported = true,
+                (Err(e), _) | (_, Err(e)) if req.wait_export => return Err(e),
+                _ => {}
+            }
+        }
+
+        let presence = self.replay_presence();
+        let delivery_notices = delivery_notices_for_seats(
+            committed_msg.to.iter().chain(committed_msg.cc.iter()),
+            &presence,
+            ctx.at(),
+        );
+
+        Ok(MailSent {
+            sha256: committed_msg.sha256,
+            id: committed_msg.id,
+            path: committed_msg.path,
+            from: committed_msg.from,
+            to: committed_msg.to,
+            cc: committed_msg.cc,
+            subject: committed_msg.subject,
+            created_at: committed_msg.created_at,
+            room: committed_msg.room,
+            room_seq,
+            exported,
+            replayed,
+            delivery_notices,
+        })
+    }
+
+    async fn check(&self, req: MailCheck, ctx: DecideCtx) -> Result<MailCheckView, ApiError> {
+        let target_seat = match ctx.by() {
+            Principal::Worker { .. } => {
+                return Err(ApiError::Denied {
+                    principal: ctx.by().to_string(),
+                    action: "check mail as worker".into(),
+                });
+            }
+            Principal::Seat { seat } => {
+                if let Some(ref requested) = req.seat
+                    && requested != seat
+                {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by().to_string(),
+                        action: format!("check mail for @{requested}"),
+                    });
+                }
+                seat.clone()
+            }
+            Principal::Operator { seat } => req.seat.unwrap_or_else(|| seat.clone()),
+            Principal::System { .. } => req.seat.ok_or_else(|| {
+                ApiError::Invalid(InvalidId {
+                    what: "seat".into(),
+                    reason: "system principal must supply explicit --seat".into(),
+                })
+            })?,
+        };
+        let presence = self.replay_presence();
+        let st = self.state.lock().await;
+        Ok(st.mail.check_for_seat(
+            &target_seat,
+            req.include_all,
+            req.limit,
+            &presence,
+            ctx.at(),
+        ))
+    }
+
+    async fn search(&self, req: MailSearch, ctx: DecideCtx) -> Result<MailSearchView, ApiError> {
+        let trimmed = req.query.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "query".into(),
+                reason: "search query must not be empty".into(),
+            }));
+        }
+        let effective_seat = match ctx.by() {
+            Principal::Worker { .. } => {
+                return Err(ApiError::Denied {
+                    principal: ctx.by().to_string(),
+                    action: "search mail as worker".into(),
+                });
+            }
+            Principal::Seat { seat } => {
+                if let Some(ref requested) = req.seat
+                    && requested != seat
+                {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by().to_string(),
+                        action: format!("search mail for @{requested}"),
+                    });
+                }
+                Some(seat.clone())
+            }
+            Principal::Operator { .. } | Principal::System { .. } => req.seat,
+        };
+        let limit = req.limit.unwrap_or(50).clamp(1, 500) as usize;
+        let matches = self
+            .reader
+            .search_mail(
+                trimmed,
+                effective_seat.as_ref().map(SeatName::as_str),
+                limit,
+            )
+            .map_err(|e| ApiError::Internal(format!("mail search: {e}")))?;
+
+        let st = self.state.lock().await;
+        let mut hits = Vec::with_capacity(matches.len());
+        for m in matches {
+            if let Ok(sha) = Sha256Hex::parse(m.sha256)
+                && let Some(entry) = st.mail.messages.get(&sha)
+            {
+                let summary = st.mail.summarize_for(entry, effective_seat.as_ref());
+                let snippet = if m.snippet.trim().is_empty() {
+                    summary.snippet
+                } else {
+                    m.snippet
+                };
+                hits.push(MailSearchHit {
+                    sha256: summary.sha256,
+                    sha16: summary.sha16,
+                    id: summary.id,
+                    from: summary.from,
+                    to: summary.to,
+                    cc: summary.cc,
+                    subject: summary.subject,
+                    path: summary.path,
+                    created_at: summary.created_at,
+                    acked: summary.acked,
+                    mutated_after_ack: summary.mutated_after_ack,
+                    room: summary.room,
+                    snippet,
+                });
+            }
+        }
+        Ok(MailSearchView {
+            query: trimmed.to_owned(),
+            seat: effective_seat,
+            hits,
+        })
+    }
+
+    async fn reconcile_cmd(
+        &self,
+        _req: MailReconcile,
+        ctx: DecideCtx,
+    ) -> Result<MailReconcileReport, ApiError> {
+        if !ctx.by().is_operator_or_system() {
+            return Err(ApiError::Denied {
+                principal: ctx.by().to_string(),
+                action: "reconcile mail store".into(),
+            });
+        }
+        self.reconcile().await
     }
 
     async fn promote(&self, req: MailPromote, ctx: DecideCtx) -> Result<LetterRef, ApiError> {
@@ -1023,7 +1507,7 @@ impl MailBridge {
             .append(ctx.by(), ctx.at(), Some(&idem), events)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         for letter in &banked_letters {
-            st.seen_wakes.insert(letter.wake_id.clone());
+            st.mail.seen_wakes.insert(letter.wake_id.clone());
         }
         drop(st);
         self.publish_fresh(&appended);
@@ -1034,11 +1518,183 @@ impl MailBridge {
             .expect("non-empty recipients"))
     }
 
-    async fn ack(&self, req: MailAck, ctx: DecideCtx) -> Result<Ack, ApiError> {
-        let (abs_path, rel_path, exists) = self.root.confine(&req.path).map_err(|e| match e {
+    async fn ack(&self, req: MailAck, ctx: DecideCtx) -> Result<MailAcked, ApiError> {
+        if req.sha256.is_none() && req.path.is_none() {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "target".into(),
+                reason: "specify sha256 or path to acknowledge".into(),
+            }));
+        }
+
+        // First check if the target matches a dissolved content-addressed message in SQLite.
+        let mut st = self.state.lock().await;
+        let matched_dissolved = if let Some(ref sha) = req.sha256 {
+            if let Some(entry) = st.mail.messages.get(sha).cloned() {
+                if let Some(ref p) = req.path
+                    && !letter_paths_match(
+                        &entry.message.path.to_string_lossy(),
+                        &p.to_string_lossy(),
+                    )
+                {
+                    return Err(ApiError::conflict(format!(
+                        "path {} does not match message sha256 {}",
+                        p.display(),
+                        sha
+                    )));
+                }
+                Some(entry)
+            } else if let Some(ref p) = req.path
+                && let Some(entry) = st.mail.lookup_target(Some(p), None).cloned()
+            {
+                return Err(ApiError::conflict(format!(
+                    "sha256 mismatch for {}: expected {}, stored {}",
+                    p.display(),
+                    sha,
+                    entry.message.sha256
+                )));
+            } else {
+                None
+            }
+        } else if let Some(ref p) = req.path {
+            st.mail.lookup_target(Some(p), None).cloned()
+        } else {
+            None
+        };
+
+        if let Some(entry) = matched_dissolved {
+            if entry.mutated_after_ack {
+                return Err(ApiError::conflict(format!(
+                    "refusing to ack mutated_after_ack letter {} (sha256={})",
+                    entry.message.path.display(),
+                    entry.message.sha256
+                )));
+            }
+            let acker_seat = match ctx.by() {
+                Principal::Worker { .. } => {
+                    return Err(ApiError::Denied {
+                        principal: ctx.by().to_string(),
+                        action: "ack mail as worker".into(),
+                    });
+                }
+                Principal::Seat { seat } => {
+                    if let Some(ref explicit) = req.seat
+                        && explicit != seat
+                    {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: format!("ack mail on behalf of @{explicit}"),
+                        });
+                    }
+                    let is_recipient =
+                        entry.message.to.contains(seat) || entry.message.cc.contains(seat);
+                    if !is_recipient {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: format!(
+                                "ack mail {} not addressed to @{seat}",
+                                entry.message.sha256
+                            ),
+                        });
+                    }
+                    seat.clone()
+                }
+                Principal::Operator { seat } => {
+                    if let Some(ref explicit) = req.seat {
+                        explicit.clone()
+                    } else if entry.message.to.contains(seat) || entry.message.cc.contains(seat) {
+                        seat.clone()
+                    } else {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: format!(
+                                "ack mail {} addressed to another seat without explicit --seat",
+                                entry.message.sha256
+                            ),
+                        });
+                    }
+                }
+                Principal::System { .. } => {
+                    if let Some(ref explicit) = req.seat {
+                        explicit.clone()
+                    } else if entry.message.to.len() == 1 {
+                        entry.message.to[0].clone()
+                    } else {
+                        return Err(ApiError::Invalid(InvalidId {
+                            what: "seat".into(),
+                            reason: "explicit seat required for system ack".into(),
+                        }));
+                    }
+                }
+            };
+
+            let sha = entry.message.sha256.clone();
+            let rel_path = entry.message.path.clone();
+            let already_acked = st.mail.acked.contains(&(acker_seat.clone(), sha.clone()));
+
+            // Single commit point = SQLite FIRST!
+            let idem_hash = sha256_short16(&format!("ack/2\n{acker_seat}\n{sha}"));
+            let idem = IdemKey::parse(format!("ack:{idem_hash}"))?;
+            let appended = st
+                .writer
+                .append(
+                    ctx.by(),
+                    ctx.at(),
+                    Some(&idem),
+                    vec![Event::Mail(MailEvent::Acked {
+                        path: rel_path.clone(),
+                        sha256: sha.clone(),
+                        seat: Some(acker_seat.clone()),
+                        note: req.note.clone(),
+                    })],
+                )
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Appended::Fresh(envs) = &appended {
+                for env in envs {
+                    st.mail.apply(env);
+                }
+            }
+            drop(st);
+            self.publish_fresh(&appended);
+
+            let mut exported = false;
+            if self.should_export() {
+                let mirror = self.active_mirror()?;
+                mirror.append_ack_if_absent(
+                    &acker_seat,
+                    &rel_path,
+                    &sha,
+                    ctx.at(),
+                    req.note.as_deref(),
+                )?;
+                exported = true;
+            }
+
+            return Ok(MailAcked {
+                sha256: sha,
+                path: Some(rel_path),
+                seat: acker_seat,
+                already_acked,
+                exported,
+            });
+        }
+        drop(st);
+
+        // Fallback: legacy sandbox letter ack (e.g. letters banked by MailPromote into to-<seat>/).
+        let Some(ref raw_path) = req.path else {
+            return Err(ApiError::NotFound {
+                what: format!(
+                    "mail {}",
+                    req.sha256
+                        .as_ref()
+                        .map(Sha256Hex::as_str)
+                        .unwrap_or("unknown")
+                ),
+            });
+        };
+        let (abs_path, rel_path, exists) = self.root.confine(raw_path).map_err(|e| match e {
             SandboxError::Production(_) => ApiError::Denied {
                 principal: ctx.by().to_string(),
-                action: format!("ack path outside sandbox ({})", req.path.display()),
+                action: format!("ack path outside sandbox ({})", raw_path.display()),
             },
             other => ApiError::Invalid(InvalidId {
                 what: "path".into(),
@@ -1053,7 +1709,7 @@ impl MailBridge {
             .split_once('/')
             .and_then(|(first, _)| first.strip_prefix("to-"));
 
-        let acker_seat = match (ctx.by(), box_seat) {
+        let acker_seat_str = match (ctx.by(), box_seat) {
             (Principal::Seat { seat }, Some(target)) if seat.as_str() == target => {
                 seat.as_str().to_owned()
             }
@@ -1083,21 +1739,22 @@ impl MailBridge {
 
         let bytes = read_letter(&abs_path)?;
         let on_disk_sha = sha256_bytes(&bytes);
-        if on_disk_sha != req.sha256 {
+        if let Some(ref want_sha) = req.sha256
+            && &on_disk_sha != want_sha
+        {
             return Err(ApiError::conflict(format!(
-                "sha256 mismatch for {rel_path}: expected {}, on-disk {on_disk_sha}",
-                req.sha256
+                "sha256 mismatch for {rel_path}: expected {want_sha}, on-disk {on_disk_sha}"
             )));
         }
 
         let ts = ctx.at().to_rfc3339_sec();
         let ack_json = serde_json::json!({
             "schema": 1,
-            "seat": acker_seat,
+            "seat": acker_seat_str,
             "by": ctx.by().to_string(),
             "path": rel_path,
-            "sha256_full": req.sha256.as_str(),
-            "sha256": &req.sha256.as_str()[..16],
+            "sha256_full": on_disk_sha.as_str(),
+            "sha256": &on_disk_sha.as_str()[..16],
             "ts": ts,
         });
 
@@ -1105,7 +1762,8 @@ impl MailBridge {
         let state_dir = self.root.ensure_dir(&["state"])?;
         let acks_file = state_dir.join("acks.jsonl");
 
-        let scan = scan_sandbox_acks(&self.root, &acker_seat, &rel_path, &req.sha256, true)?;
+        let scan = scan_sandbox_acks(&self.root, &acker_seat_str, &rel_path, &on_disk_sha, true)?;
+        let already_acked = scan.matched;
         if !scan.matched {
             let (mut f, _) = rex_wave_fs::open_append_nofollow(&acks_file, SANDBOX_FILE_MODE)
                 .map_err(|e| {
@@ -1132,7 +1790,11 @@ impl MailBridge {
             fsync_dir(&state_dir).map_err(ApiError::Internal)?;
         }
 
-        let idem_hash = sha256_short16(&format!("ack/1\n{acker_seat}\n{rel_path}\n{}", req.sha256));
+        let parsed_seat = SeatName::parse(&acker_seat_str)
+            .unwrap_or_else(|_| SeatName::parse("owner").expect("valid fallback seat"));
+        let idem_hash = sha256_short16(&format!(
+            "ack/1\n{acker_seat_str}\n{rel_path}\n{on_disk_sha}"
+        ));
         let idem = IdemKey::parse(format!("ack:{idem_hash}"))?;
         let appended = st
             .writer
@@ -1142,13 +1804,26 @@ impl MailBridge {
                 Some(&idem),
                 vec![Event::Mail(MailEvent::Acked {
                     path: PathBuf::from(&rel_path),
-                    sha256: req.sha256,
+                    sha256: on_disk_sha.clone(),
+                    seat: Some(parsed_seat.clone()),
+                    note: req.note,
                 })],
             )
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if let Appended::Fresh(envs) = &appended {
+            for env in envs {
+                st.mail.apply(env);
+            }
+        }
         drop(st);
         self.publish_fresh(&appended);
-        Ok(Ack)
+        Ok(MailAcked {
+            sha256: on_disk_sha,
+            path: Some(PathBuf::from(rel_path)),
+            seat: parsed_seat,
+            already_acked,
+            exported: true,
+        })
     }
 
     async fn wake_bell(&self, req: MailWakeBell, ctx: DecideCtx) -> Result<Ack, ApiError> {
@@ -1267,14 +1942,14 @@ impl MailBridge {
                 let idem = IdemKey::parse(format!("proj:{}", wid.0))?;
 
                 let mut st = self.state.lock().await;
-                if st.seen_wakes.contains(&wid)
+                if st.mail.seen_wakes.contains(&wid)
                     || st
                         .writer
                         .lookup(&idem)
                         .map_err(|e| ApiError::Internal(e.to_string()))?
                         .is_some()
                 {
-                    st.seen_wakes.insert(wid);
+                    st.mail.seen_wakes.insert(wid);
                     continue;
                 }
                 let at = rex_wave_runtime::now();
@@ -1287,7 +1962,7 @@ impl MailBridge {
                         vec![Event::Mail(MailEvent::Projected { item })],
                     )
                     .map_err(|e| ApiError::Internal(e.to_string()))?;
-                st.seen_wakes.insert(wid);
+                st.mail.seen_wakes.insert(wid);
                 drop(st);
                 if matches!(appended, Appended::Fresh(_)) {
                     projected_count += 1;
@@ -1314,6 +1989,16 @@ impl Service<MailCommand> for MailBridge {
                 MailCommand::MailWakeBell(b) => {
                     Ok(WireReply::MailWakeBell(self.wake_bell(b, ctx).await?))
                 }
+                MailCommand::MailSend(req) => Ok(WireReply::MailSend(self.send(req, ctx).await?)),
+                MailCommand::MailCheck(req) => {
+                    Ok(WireReply::MailCheck(self.check(req, ctx).await?))
+                }
+                MailCommand::MailSearch(req) => {
+                    Ok(WireReply::MailSearch(self.search(req, ctx).await?))
+                }
+                MailCommand::MailReconcile(req) => Ok(WireReply::MailReconcile(
+                    self.reconcile_cmd(req, ctx).await?,
+                )),
             }
         })
     }

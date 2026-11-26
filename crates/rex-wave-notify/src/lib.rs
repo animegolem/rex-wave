@@ -721,8 +721,36 @@ impl HeraldView {
                         check_seats.insert(seat);
                     }
                 }
-                mail::MailEvent::Acked { path, sha256 } => {
-                    let seats_to_ack = self.seats_for_ack(&entry.by, path, sha256);
+                mail::MailEvent::MessageCommitted {
+                    message,
+                    mutated_after_ack,
+                    ..
+                } => {
+                    // MailStore.tla EditNeverRingable: post-ack edits and receipt-only
+                    // messages never become ringable or trigger MailUnrung alerts.
+                    if !mutated_after_ack && !message.receipt_only {
+                        for seat in message.to.iter().chain(message.cc.iter()) {
+                            self.record_incoming_mail(
+                                seat.clone(),
+                                message.sha256.clone(),
+                                message.path.clone(),
+                                entry.at,
+                                emit_mail_unrung,
+                            );
+                            check_seats.insert(seat.clone());
+                        }
+                    }
+                }
+                mail::MailEvent::Acked {
+                    path,
+                    sha256,
+                    seat: explicit_seat,
+                    ..
+                } => {
+                    let seats_to_ack = match explicit_seat {
+                        Some(s) => vec![s.clone()],
+                        None => self.seats_for_ack(&entry.by, path, sha256),
+                    };
                     for seat in seats_to_ack {
                         self.acked_mail.insert((seat.clone(), sha256.clone()));
                         if let Some(map) = self.pending_mail.get_mut(&seat) {
@@ -1533,10 +1561,10 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     let ack_action = NotifyAction {
                         label: "Acknowledge letter".into(),
                         key: Some('k'),
-                        run: Box::new(WireCommand::MailAck(mail::MailAck {
-                            path: letter.path.clone(),
-                            sha256: letter.sha256.clone(),
-                        })),
+                        run: Box::new(WireCommand::MailAck(mail::MailAck::for_path_and_sha(
+                            letter.path.clone(),
+                            letter.sha256.clone(),
+                        ))),
                     };
                     let preview = letter
                         .item
@@ -1566,10 +1594,10 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     let ack_action = NotifyAction {
                         label: "Acknowledge letter".into(),
                         key: Some('k'),
-                        run: Box::new(WireCommand::MailAck(mail::MailAck {
-                            path: item.reference.path.clone(),
-                            sha256: item.reference.sha256.clone(),
-                        })),
+                        run: Box::new(WireCommand::MailAck(mail::MailAck::for_path_and_sha(
+                            item.reference.path.clone(),
+                            item.reference.sha256.clone(),
+                        ))),
                     };
                     let preview = item
                         .label
@@ -1589,7 +1617,9 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
                     }
                 }
             }
-            mail::MailEvent::BellRang { .. } | mail::MailEvent::Acked { .. } => {}
+            mail::MailEvent::BellRang { .. }
+            | mail::MailEvent::Acked { .. }
+            | mail::MailEvent::MessageCommitted { .. } => {}
         },
 
         _ => {}

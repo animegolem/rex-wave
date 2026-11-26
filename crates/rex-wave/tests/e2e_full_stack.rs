@@ -1251,10 +1251,10 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
     .expect("MailBridge::with_hub published Banked to live Hub for Herald");
 
     sam_client
-        .call(MailAck {
-            path: letter.path.clone(),
-            sha256: letter.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            letter.path.clone(),
+            letter.sha256.clone(),
+        ))
         .await
         .expect("MailAck verified exact on-disk SHA-256");
 

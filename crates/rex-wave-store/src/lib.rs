@@ -31,10 +31,11 @@
 
 use rex_wave_api::{
     Envelope, Event, IdemKey, Principal, Seq, StreamId, UnixMs,
+    mail::MailEvent,
     room::{PrincipalPair, RoomId},
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -94,7 +95,238 @@ CREATE TABLE IF NOT EXISTS entries(
   PRIMARY KEY(stream, seq),
   UNIQUE(stream, idem)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS mail_fts_state(
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  last_seq INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS mail_fts_meta(
+  seq        INTEGER PRIMARY KEY,
+  sha256     TEXT NOT NULL UNIQUE,
+  from_seat  TEXT NOT NULL,
+  recipients TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+  sha256 UNINDEXED,
+  from_seat,
+  recipients,
+  subject,
+  body,
+  path,
+  tokenize = 'porter unicode61'
+);
 ";
+
+/// One ranked match returned by [`Journal::search_mail`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailFtsMatch {
+    pub seq: Seq,
+    pub sha256: String,
+    pub from_seat: String,
+    pub subject: String,
+    pub path: String,
+    pub created_at: UnixMs,
+    pub snippet: String,
+}
+
+fn normalize_fts_seat(raw: &str) -> String {
+    raw.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+fn escape_fts_phrase(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        if ch == '"' {
+            out.push_str("\"\"");
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn build_fts5_query(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut tokens: Vec<(String, bool)> = Vec::new();
+    let mut chars = trimmed.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' {
+            chars.next();
+            let mut phrase = String::new();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        phrase.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    phrase.push(c);
+                }
+            }
+            if !phrase.trim().is_empty() {
+                tokens.push((escape_fts_phrase(&phrase), false));
+            }
+            continue;
+        }
+        let mut word = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                break;
+            }
+            word.push(c);
+            chars.next();
+        }
+        if matches!(word.as_str(), "AND" | "OR" | "NOT") {
+            tokens.push((word, true));
+        } else if let Some(prefix) = word.strip_suffix('*')
+            && !prefix.is_empty()
+            && prefix
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
+        {
+            tokens.push((format!("{}*", escape_fts_phrase(prefix)), false));
+        } else {
+            tokens.push((escape_fts_phrase(&word), false));
+        }
+    }
+
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut last_was_op = true;
+    for (idx, (tok, is_op)) in tokens.iter().enumerate() {
+        if *is_op {
+            let next_is_term = tokens.get(idx + 1).is_some_and(|(_, next_op)| !next_op);
+            if !last_was_op && next_is_term {
+                out.push(tok.clone());
+                last_was_op = true;
+            }
+        } else {
+            out.push(tok.clone());
+            last_was_op = false;
+        }
+    }
+    if out.is_empty() {
+        Some(escape_fts_phrase(trimmed))
+    } else {
+        Some(out.join(" "))
+    }
+}
+
+fn index_mail_envelope(tx: &rusqlite::Transaction<'_>, env: &Envelope) -> Result<bool, StoreError> {
+    if env.stream != StreamId::Mail {
+        return Ok(false);
+    }
+    let Event::Mail(MailEvent::MessageCommitted { message, .. }) = &env.event else {
+        return Ok(false);
+    };
+    let from_seat = normalize_fts_seat(&message.from);
+    let mut recips = BTreeSet::new();
+    for s in message.to.iter().chain(message.cc.iter()) {
+        recips.insert(s.as_str().to_owned());
+    }
+    let recipients_padded = if recips.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", recips.into_iter().collect::<Vec<_>>().join(" "))
+    };
+    let path_str = message.path.to_string_lossy();
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO mail_fts_meta(seq, sha256, from_seat, recipients, subject, path, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            env.seq.0 as i64,
+            message.sha256.as_str(),
+            from_seat,
+            recipients_padded,
+            message.subject,
+            path_str.as_ref(),
+            message.created_at.0 as i64,
+        ],
+    )?;
+    if inserted > 0 {
+        tx.execute(
+            "INSERT INTO mail_fts(rowid, sha256, from_seat, recipients, subject, body, path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                env.seq.0 as i64,
+                message.sha256.as_str(),
+                from_seat,
+                recipients_padded,
+                message.subject,
+                message.body,
+                path_str.as_ref(),
+            ],
+        )?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn set_mail_fts_watermark(tx: &rusqlite::Transaction<'_>, seq: Seq) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO mail_fts_state(id, last_seq) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
+        params![seq.0 as i64],
+    )?;
+    Ok(())
+}
+
+fn mail_fts_watermark(conn: &Connection) -> Result<Seq, StoreError> {
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT last_seq FROM mail_fts_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(Seq(last.unwrap_or(0).max(0) as u64))
+}
+
+fn backfill_mail_fts_tx(tx: &rusqlite::Transaction<'_>) -> Result<usize, StoreError> {
+    let mail_head = head_of(tx, &StreamId::Mail)?;
+    let last = mail_fts_watermark(tx)?;
+    let meta_count: i64 = tx.query_row("SELECT COUNT(*) FROM mail_fts_meta", [], |r| r.get(0))?;
+    let fts_count: i64 = tx.query_row("SELECT COUNT(*) FROM mail_fts", [], |r| r.get(0))?;
+    let mut cursor = if fts_count < meta_count {
+        tx.execute("DELETE FROM mail_fts", [])?;
+        tx.execute("DELETE FROM mail_fts_meta", [])?;
+        tx.execute("DELETE FROM mail_fts_state", [])?;
+        Seq::ORIGIN
+    } else if mail_head <= last {
+        return Ok(0);
+    } else {
+        last
+    };
+
+    let mut indexed = 0usize;
+    while cursor < mail_head {
+        let page = read_rows(tx, &StreamId::Mail, cursor, Some(mail_head), 512)?;
+        if page.is_empty() {
+            break;
+        }
+        for env in &page {
+            cursor = env.seq;
+            if index_mail_envelope(tx, env)? {
+                indexed += 1;
+            }
+        }
+    }
+    set_mail_fts_watermark(tx, mail_head)?;
+    Ok(indexed)
+}
 
 fn strip_sql_leading_trivia(mut sql: &str) -> &str {
     loop {
@@ -490,6 +722,7 @@ impl Journal {
         if found < JOURNAL_SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
         }
+        backfill_mail_fts_tx(&tx)?;
         if let Some(ref h) = hook {
             let mut init_ctx = InitContext { conn: &tx };
             h.on_init(&mut init_ctx)?;
@@ -689,6 +922,84 @@ impl Journal {
         }
         Ok(out)
     }
+
+    /// Ensures all committed `StreamId::Mail` messages are indexed in SQLite FTS5.
+    /// Returns the number of newly indexed messages.
+    pub fn backfill_mail_fts(&self) -> Result<usize, StoreError> {
+        let mut conn = self.inner.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count = backfill_mail_fts_tx(&tx)?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Full-text search over dissolved `StreamId::Mail` messages via SQLite FTS5.
+    /// Automatically backfills if unindexed `StreamId::Mail` entries exist.
+    pub fn search_mail(
+        &self,
+        query: &str,
+        seat_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailFtsMatch>, StoreError> {
+        let Some(fts_query) = build_fts5_query(query) else {
+            return Ok(Vec::new());
+        };
+        let cap = limit.clamp(1, 1_000) as i64;
+        let seat_norm = seat_filter.map(normalize_fts_seat);
+        let seat_needle = seat_norm
+            .as_deref()
+            .map(|s| format!(" {s} "))
+            .unwrap_or_default();
+
+        let mut conn = self.inner.conn();
+        if head_of(&conn, &StreamId::Mail)? > mail_fts_watermark(&conn)? {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            backfill_mail_fts_tx(&tx)?;
+            tx.commit()?;
+        }
+
+        let run_query = |expr: &str| -> Result<Vec<MailFtsMatch>, rusqlite::Error> {
+            let mut stmt = conn.prepare_cached(
+                "SELECT
+                   m.seq,
+                   m.sha256,
+                   m.from_seat,
+                   m.subject,
+                   m.path,
+                   m.created_at,
+                   snippet(mail_fts, 4, '[', ']', '...', 18) AS snip
+                 FROM mail_fts
+                 JOIN mail_fts_meta m ON m.seq = mail_fts.rowid
+                 WHERE mail_fts MATCH ?1
+                   AND (?2 IS NULL OR m.from_seat = ?2 OR instr(m.recipients, ?3) > 0)
+                 ORDER BY bm25(mail_fts), m.created_at DESC, m.seq DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![expr, seat_norm.as_deref(), seat_needle.as_str(), cap],
+                |r| {
+                    Ok(MailFtsMatch {
+                        seq: Seq(r.get::<_, i64>(0)? as u64),
+                        sha256: r.get(1)?,
+                        from_seat: r.get(2)?,
+                        subject: r.get(3)?,
+                        path: r.get(4)?,
+                        created_at: UnixMs(r.get::<_, i64>(5)? as u64),
+                        snippet: r.get(6)?,
+                    })
+                },
+            )?;
+            rows.collect()
+        };
+
+        match run_query(&fts_query) {
+            Ok(hits) => Ok(hits),
+            Err(_) => {
+                let literal = escape_fts_phrase(query.trim());
+                Ok(run_query(&literal)?)
+            }
+        }
+    }
 }
 
 /// The single write capability for one stream.
@@ -771,6 +1082,12 @@ impl StreamWriter {
                         event,
                     });
                 }
+            }
+            if self.stream == StreamId::Mail {
+                for env in &committed {
+                    index_mail_envelope(&tx, env)?;
+                }
+                set_mail_fts_watermark(&tx, seq)?;
             }
             if let Some(ref hook) = self.inner.hook {
                 let tx_ctx = TxContext { tx: &tx };
@@ -1213,5 +1530,119 @@ mod legacy_dm_tests {
         assert!(matches!(replay, Appended::Replayed(_)));
         assert_eq!(hook.on_append_calls.load(Ordering::SeqCst), 4);
         assert_eq!(hook.after_commit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mail_fts5_indexes_transactionally_filters_by_seat_and_backfills_legacy_rows() {
+        use rex_wave_api::mail::{LetterPriority, MailEvent, MailMessage, MailOrigin};
+        use rex_wave_api::{SeatName, Sha256Hex};
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts.sqlite3");
+        let alice = SeatName::parse("alice").unwrap();
+        let bob = SeatName::parse("bob").unwrap();
+        let carol = SeatName::parse("carol").unwrap();
+
+        let msg1 = MailMessage {
+            sha256: Sha256Hex::parse("a".repeat(64)).unwrap(),
+            id: "1795500000001-alice-to-bob-11111111".into(),
+            from: "alice".into(),
+            to: vec![bob.clone()],
+            cc: Vec::new(),
+            subject: "OAuth refresh token rotation".into(),
+            body: "Rotate auth-v2 refresh tokens with atomic WAL commit.".into(),
+            path: PathBuf::from("mail/1795500000001-alice-to-bob-11111111.md"),
+            priority: LetterPriority::High,
+            topic: Some("auth-v2".into()),
+            in_reply_to: None,
+            refs: Vec::new(),
+            created_at: UnixMs(1_795_500_000_001),
+            created_at_iso: "2026-11-26T00:00:00Z".into(),
+            receipt_only: false,
+            room: None,
+            raw_markdown: "---\nfrom: alice\nto: bob\n---\n\nRotate auth-v2 refresh tokens.\n"
+                .into(),
+            raw_bytes_b64: None,
+            origin: MailOrigin::Send,
+        };
+        let msg2 = MailMessage {
+            sha256: Sha256Hex::parse("b".repeat(64)).unwrap(),
+            id: "1795500000002-carol-to-alice-22222222".into(),
+            from: "carol".into(),
+            to: vec![alice.clone()],
+            cc: Vec::new(),
+            subject: "Quarterly storage review".into(),
+            body: "SQLite FTS5 indexing covers every dissolved letter.".into(),
+            path: PathBuf::from("mail/1795500000002-carol-to-alice-22222222.md"),
+            priority: LetterPriority::Normal,
+            topic: None,
+            in_reply_to: None,
+            refs: Vec::new(),
+            created_at: UnixMs(1_795_500_000_002),
+            created_at_iso: "2026-11-26T00:00:01Z".into(),
+            receipt_only: false,
+            room: None,
+            raw_markdown: "---\nfrom: carol\nto: alice\n---\n\nSQLite FTS5 indexing.\n".into(),
+            raw_bytes_b64: None,
+            origin: MailOrigin::Send,
+        };
+
+        {
+            let j = Journal::open(&db_path).unwrap();
+            let mut w = j.claim(StreamId::Mail).unwrap();
+            w.append(
+                &Principal::Seat {
+                    seat: alice.clone(),
+                },
+                msg1.created_at,
+                Some(&IdemKey::parse("m1").unwrap()),
+                vec![Event::Mail(MailEvent::MessageCommitted {
+                    message: Box::new(msg1.clone()),
+                    mutated_after_ack: false,
+                    prior_ack_sha: None,
+                })],
+            )
+            .unwrap();
+            w.append(
+                &Principal::Seat {
+                    seat: carol.clone(),
+                },
+                msg2.created_at,
+                Some(&IdemKey::parse("m2").unwrap()),
+                vec![Event::Mail(MailEvent::MessageCommitted {
+                    message: Box::new(msg2.clone()),
+                    mutated_after_ack: false,
+                    prior_ack_sha: None,
+                })],
+            )
+            .unwrap();
+
+            // Hyphenated term must match as phrase, not FTS5 NOT operator.
+            let hyphen = j.search_mail("auth-v2", None, 10).unwrap();
+            assert_eq!(hyphen.len(), 1);
+            assert_eq!(hyphen[0].sha256, msg1.sha256.as_str());
+
+            // Seat filter restricts hits to sender/recipient participation.
+            let bob_hits = j.search_mail("SQLite", Some("bob"), 10).unwrap();
+            assert!(bob_hits.is_empty(), "bob must not see carol->alice mail");
+            let alice_hits = j.search_mail("SQLite", Some("alice"), 10).unwrap();
+            assert_eq!(alice_hits.len(), 1);
+            assert_eq!(alice_hits[0].sha256, msg2.sha256.as_str());
+
+            // Simulate pre-FTS5 legacy rows by clearing mail_fts + state and reopening.
+            j.inner
+                .conn()
+                .execute_batch(
+                    "DELETE FROM mail_fts; DELETE FROM mail_fts_meta; DELETE FROM mail_fts_state;",
+                )
+                .unwrap();
+        }
+
+        let reopened = Journal::open(&db_path).unwrap();
+        let hits = reopened.search_mail("rotation", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].sha256, msg1.sha256.as_str());
+        assert_eq!(reopened.backfill_mail_fts().unwrap(), 0);
     }
 }

@@ -1894,6 +1894,8 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
             vec![Event::Mail(MailEvent::Acked {
                 path: l1.path.clone(),
                 sha256: l1.sha256.clone(),
+                seat: None,
+                note: None,
             })],
         )
         .unwrap();
@@ -1935,6 +1937,8 @@ async fn herald_deduplicates_per_seat_mail_unrung_and_auto_resolves_on_rebind_an
             vec![Event::Mail(MailEvent::Acked {
                 path: l2.path.clone(),
                 sha256: l2.sha256.clone(),
+                seat: None,
+                note: None,
             })],
         )
         .unwrap();
