@@ -357,12 +357,18 @@ struct WorkerRecord {
 }
 
 fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool {
-    if let Some((expected_runner, _)) = RunnerKind::strip_provider_prefix(provider.as_str()) {
-        return obs_th.runner_kind() != expected_runner;
+    let prov = provider.as_str().trim();
+    let kind = obs_th.runner_kind();
+    if let Some((expected, _)) = RunnerKind::strip_provider_prefix(prov) {
+        return kind != expected;
     }
-    let is_t3 = obs_th.as_str().starts_with("t3:");
-    let prov = provider.as_str();
-    (is_t3 && matches!(prov, "pi" | "cursor")) || (!is_t3 && prov == "antigravity")
+    if prov.eq_ignore_ascii_case("antigravity") {
+        return kind != RunnerKind::T3;
+    }
+    if matches!(prov, "pi" | "cursor") {
+        return kind != RunnerKind::Bb;
+    }
+    false
 }
 
 #[derive(Clone, Debug, Default)]

@@ -61,7 +61,7 @@ const EXIT_TIMEOUT: u8 = 124;
 )]
 pub struct Cli {
     /// Daemon Unix socket path (default: `$XDG_STATE_HOME/rex-wave/daemon.sock`; on macOS, must share `/tmp`'s filesystem).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "REX_WAVE_SOCKET")]
     pub socket: Option<PathBuf>,
     /// Capability token for seat or worker authentication (falls back to `REX_WAVE_WORKER_THREAD_ID` / `T3CODE_THREAD_ID` worker token, then Unix peer UID).
     #[arg(long, global = true, env = "REX_WAVE_TOKEN")]

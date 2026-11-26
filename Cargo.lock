@@ -1469,6 +1469,7 @@ name = "rex-wave"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rex-wave-acp",
  "rex-wave-api",
  "rex-wave-bb",
  "rex-wave-board",
@@ -1489,6 +1490,29 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit",
+]
+
+[[package]]
+name = "rex-wave-acp"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "rex-wave-api",
+ "rex-wave-board",
+ "rex-wave-fs",
+ "rex-wave-notify",
+ "rex-wave-rooms",
+ "rex-wave-runtime",
+ "rex-wave-store",
+ "rex-wave-transport",
+ "rex-wave-waves",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
