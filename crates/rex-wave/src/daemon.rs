@@ -1,11 +1,11 @@
 //! Daemon composition root wiring `Journal`, `Hub`, `SidebarProjection`,
 //! subsystem `Registry`s (`Rooms`, `Waves`, `Board`, `Inbox`, `Presence`),
 //! `MailBridge`, reactors (`WaveConductor`, `Herald` with `HeraldHandle`
-//! reconnect-grace timer, `BellCourier`), `CompositeHost` / `CompositeFeed`
-//! (`BbBridge` + `T3Bridge`), the loopback `/sink` listener for `wake-bell`,
-//! optional loopback `--http` HTTP/1.1 + SSE server, and UDS
-//! `serve_listener_with_hooks` (`StateDirAuthenticator` + RAII `PresenceUnbind`)
-//! with graceful `ctrl_c` shutdown.
+//! reconnect-grace timer, `BellCourier`), `HostRouter` / `FeedRouter`
+//! (`BbBridge`, `T3Bridge`, `ClaudeBridge`, `CodexBridge`), the loopback
+//! `/sink` listener for `wake-bell`, optional loopback `--http` HTTP/1.1 + SSE
+//! server, and UDS `serve_listener_with_hooks` (`StateDirAuthenticator` + RAII
+//! `PresenceUnbind`) with graceful `ctrl_c` shutdown.
 
 use crate::config_file::{TomlConfigHook, daemon_config_file_path, reconcile_startup_config};
 use crate::http::{HttpConfig, bind_http, serve_http_listener};
@@ -17,6 +17,10 @@ use rex_wave_api::*;
 use rex_wave_bb::{BbBridge, BbHost, BridgeConfig};
 use rex_wave_board::Board;
 use rex_wave_mailbridge::{BellCourier, MailBridge, Presence, SandboxRoot};
+use rex_wave_native::{
+    ClaudeBridge, ClaudeFeed, ClaudeHost, ClaudeRunnerConfig, CodexBridge, CodexFeed, CodexHost,
+    CodexRunnerConfig,
+};
 use rex_wave_notify::{Herald, HeraldHandle, Inbox};
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
@@ -49,6 +53,9 @@ pub enum RunnerMode {
     T3,
     Both,
     Acp,
+    Claude,
+    Codex,
+    Native,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -68,9 +75,9 @@ pub struct DaemonArgs {
     /// BB plugin bridge bearer token.
     #[arg(long, env = "REX_WAVE_BB_TOKEN", default_value = "")]
     pub bb_token: String,
-    /// Worker host runner backend (`bb`, `t3`, `both`, or `acp`). Defaults to `both`
-    /// when T3 is configured or a local T3 runtime exists, otherwise `bb`.
-    /// Native ACP (`acp:antigravity`, `acp:opencode`) is always registered alongside.
+    /// Worker host runner backend (`bb`, `t3`, `both`, `acp`, `claude`, `codex`, or `native`).
+    /// Defaults to `both` when T3 is configured or a local T3 runtime exists, otherwise `bb`.
+    /// Native runners (`acp:*`, `claude:*`, `codex:*`) are always registered alongside.
     #[arg(long, value_enum)]
     pub runner: Option<RunnerMode>,
     /// T3 Code base directory (default: `~/.t3`).
@@ -565,13 +572,19 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let default_target = match runner_mode {
         RunnerMode::T3 => RunnerKind::T3,
         RunnerMode::Acp => RunnerKind::Acp,
+        RunnerMode::Claude | RunnerMode::Native => RunnerKind::Claude,
+        RunnerMode::Codex => RunnerKind::Codex,
         RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
     };
     let t3_cfg = match runner_mode {
         RunnerMode::T3 | RunnerMode::Both => {
             Some(build_t3_config(&args, &state_dir)?.with_default_runner(default_target))
         }
-        RunnerMode::Bb | RunnerMode::Acp => None,
+        RunnerMode::Bb
+        | RunnerMode::Acp
+        | RunnerMode::Claude
+        | RunnerMode::Codex
+        | RunnerMode::Native => None,
     };
 
     let http_listener = match args.http {
@@ -641,7 +654,11 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_config_watch(config_svc.subscribe())
             .with_pin_store(state_dir.join("router-pins.json")),
         ),
-        RunnerMode::T3 | RunnerMode::Acp => None,
+        RunnerMode::T3
+        | RunnerMode::Acp
+        | RunnerMode::Claude
+        | RunnerMode::Codex
+        | RunnerMode::Native => None,
     };
 
     let t3_bridge = t3_cfg.map(|cfg| T3Bridge::new(cfg.with_config_watch(config_svc.subscribe())));
@@ -652,6 +669,20 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_default_runner(default_target)
             .with_config_watch(config_svc.subscribe()),
     );
+    let mut claude_cfg = ClaudeRunnerConfig::from_env()
+        .with_state_dir(state_dir.clone())
+        .with_socket_path(sock_path.clone())
+        .with_config_watch(config_svc.subscribe());
+    let mut codex_cfg = CodexRunnerConfig::from_env()
+        .with_state_dir(state_dir.clone())
+        .with_socket_path(sock_path.clone())
+        .with_config_watch(config_svc.subscribe());
+    if let Ok(exe) = std::env::current_exe() {
+        claude_cfg = claude_cfg.with_rex_wave_bin(exe.clone());
+        codex_cfg = codex_cfg.with_rex_wave_bin(exe);
+    }
+    let claude_bridge = ClaudeBridge::new(claude_cfg);
+    let codex_bridge = CodexBridge::new(codex_cfg);
     config_hook.bind_runner_liveness(
         bb_bridge.as_ref().map(|b| {
             let b = b.clone();
@@ -673,6 +704,11 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     if let Some(ref b) = bb_bridge {
         feed_entries.push((RunnerKind::Bb, b.clone()));
     }
+    feed_entries.push((
+        RunnerKind::Claude,
+        Arc::new(ClaudeFeed(claude_bridge.clone())),
+    ));
+    feed_entries.push((RunnerKind::Codex, Arc::new(CodexFeed(codex_bridge.clone()))));
     let composite_feed: Arc<dyn AgentFeed> = Arc::new(
         FeedRouter::new(feed_entries)
             .with_thread_resolver(journal_thread_resolver(journal.clone())),
@@ -710,12 +746,16 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     });
 
     acp_bridge.attach_backend(router.clone());
+    claude_bridge.attach_router(router.clone());
+    codex_bridge.attach_router(router.clone());
 
     let host_router = Arc::new(
         HostRouter::new(default_target)
             .with_config_watch(config_svc.subscribe())
             .with_pin_store(state_dir.join("router-pins.json"))
             .with_host(RunnerKind::Acp, AcpHost(acp_bridge.clone()))
+            .with_host(RunnerKind::Claude, ClaudeHost(claude_bridge.clone()))
+            .with_host(RunnerKind::Codex, CodexHost(codex_bridge.clone()))
             .with_optional_host(
                 RunnerKind::Bb,
                 bb_bridge.as_ref().map(|b| BbHost(b.clone())),
@@ -864,11 +904,15 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         t.abort();
     }
     acp_task.abort();
-    acp_bridge.shutdown_all().await;
     if let Some(t) = http_task {
         t.abort();
     }
     sink_task.abort();
+    tokio::join!(
+        acp_bridge.shutdown_all(),
+        claude_bridge.shutdown(),
+        codex_bridge.shutdown(),
+    );
     let _ = prepared_sock.cleanup_bound();
 
     serve_result

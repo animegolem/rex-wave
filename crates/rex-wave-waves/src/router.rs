@@ -121,7 +121,13 @@ pub fn route_provider_with_config(
             Some(rex_wave_api::config::RunnerRoute::Native) => RunnerKind::Acp,
             Some(rex_wave_api::config::RunnerRoute::T3)
             | Some(rex_wave_api::config::RunnerRoute::Bb) => RunnerKind::T3,
-            None if default_runner == RunnerKind::Acp => RunnerKind::Acp,
+            None if matches!(
+                default_runner,
+                RunnerKind::Acp | RunnerKind::Claude | RunnerKind::Codex
+            ) =>
+            {
+                RunnerKind::Acp
+            }
             None => RunnerKind::T3,
         };
         return Ok(RoutedProvider {
@@ -133,6 +139,20 @@ pub fn route_provider_with_config(
     if let Some(route) = cfg.and_then(|c| c.runners.default_runner) {
         let target = route
             .resolve_for_provider(raw)
+            .map_err(HostError::Rejected)?;
+        return Ok(RoutedProvider {
+            target,
+            provider: normalize_provider_for_target(raw, target)?,
+        });
+    }
+
+    if matches!(
+        default_runner,
+        RunnerKind::Acp | RunnerKind::Claude | RunnerKind::Codex
+    ) && let Some(slot) = HarnessProvider::parse_slot(raw)
+    {
+        let target = rex_wave_api::config::RunnerRoute::Native
+            .resolve_for_provider(slot.slug())
             .map_err(HostError::Rejected)?;
         return Ok(RoutedProvider {
             target,
