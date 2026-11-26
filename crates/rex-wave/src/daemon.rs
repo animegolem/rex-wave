@@ -756,7 +756,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .map_err(|e| format!("init mail bridge: {e}"))?
             .with_room_service(room_svc.clone())
             .with_config_watch(config_svc.subscribe())
-            .with_house_profile(presence.house().clone()),
+            .with_house_profile(presence.house().clone())
+            .with_drop_quiet_ms(2_000),
     );
     match mail_bridge.reconcile().await {
         Ok(report) => {
@@ -782,7 +783,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             return Err(format!("startup mail reconcile refused: {action}"));
         }
         Err(err) => {
-            return Err(format!("startup mail reconcile failed: {err}"));
+            eprintln!("rex-wave daemon: startup mail reconcile warning (will retry): {err}");
         }
     }
 

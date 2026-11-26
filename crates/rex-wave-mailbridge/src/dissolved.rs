@@ -31,13 +31,12 @@ use crate::{
 use base64::Engine as _;
 use rex_wave_api::mail::*;
 use rex_wave_api::room::{
-    Body, Mentions, PostOrigin, PrincipalPair, RoomEvent, RoomId, RoomOrigin, RoomPost, RoomRef,
-    RoomScope,
+    Body, PostOrigin, PrincipalPair, RoomEvent, RoomId, RoomPost, RoomRef, RoomScope,
 };
 use rex_wave_api::*;
 use rex_wave_fs::{
-    ConfinedDir, EntryKind, FileId, OutsidePath, ProtectedRootsGuard, Protection, RelPath,
-    SafeName, SandboxError,
+    ConfinedDir, EntryKind, FileId, OutsidePath, ProtectedRootsGuard, Protection, SafeName,
+    SandboxError,
 };
 use rex_wave_runtime::{DecideCtx, Hub, Service};
 use rex_wave_store::{Appended, Journal, StreamWriter};
@@ -203,23 +202,23 @@ pub fn derive_mail_room(
         participants_hasher.update(s.as_str().as_bytes());
         participants_hasher.update(b"\n");
     }
-    let participants_hash8: String = participants_hasher
+    let participants_hash16: String = participants_hasher
         .finalize()
         .iter()
-        .take(4)
+        .take(8)
         .map(|b| format!("{b:02x}"))
         .collect();
 
     let base_slug = topic
-        .map(|t| sanitize_channel_slug(t, 44))
+        .map(|t| sanitize_channel_slug(t, 42))
         .filter(|s| !s.is_empty())
         .or_else(|| {
             let clean_subj = strip_reply_prefixes(subject);
-            let s = sanitize_channel_slug(clean_subj, 44);
+            let s = sanitize_channel_slug(clean_subj, 42);
             (!s.is_empty()).then_some(s)
         })
         .unwrap_or_else(|| sha256.as_str()[..12].to_owned());
-    let chan_name = format!("mail-{base_slug}-{participants_hash8}");
+    let chan_name = format!("mail-{base_slug}-{participants_hash16}");
     let truncated = if chan_name.len() > 64 {
         chan_name[..64].trim_end_matches('-').to_owned()
     } else {
@@ -231,6 +230,18 @@ pub fn derive_mail_room(
             scope: RoomScope::Global,
             name,
         })
+}
+
+/// Canonical participant set (`Principal::Seat` for sender + `to` + `cc`) of a mail message.
+pub fn mail_room_participants(msg: &MailMessage) -> BTreeSet<Principal> {
+    let mut set = BTreeSet::new();
+    if let Ok(sender_seat) = SeatName::parse(normalize_seat_token(&msg.from)) {
+        set.insert(Principal::Seat { seat: sender_seat });
+    }
+    for seat in msg.to.iter().chain(msg.cc.iter()) {
+        set.insert(Principal::Seat { seat: seat.clone() });
+    }
+    set
 }
 
 fn format_yaml_seat_list(seats: &[SeatName]) -> String {
@@ -503,10 +514,59 @@ pub fn synthesize_mail_message(
 }
 
 fn parse_yaml_string_list(val: &str) -> Vec<String> {
-    let trimmed = val.trim().trim_start_matches('[').trim_end_matches(']');
+    let trimmed = val.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let mut raw_items = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(ch) = chars.next() {
+        if in_single {
+            cur.push(ch);
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    if let Some(esc) = chars.next() {
+                        cur.push(esc);
+                    }
+                } else {
+                    in_single = false;
+                }
+            }
+        } else if in_double {
+            cur.push(ch);
+            if ch == '\\' {
+                if let Some(esc) = chars.next() {
+                    cur.push(esc);
+                }
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else {
+            match ch {
+                '\'' if cur.trim().is_empty() => {
+                    in_single = true;
+                    cur.push(ch);
+                }
+                '"' if cur.trim().is_empty() => {
+                    in_double = true;
+                    cur.push(ch);
+                }
+                ',' => {
+                    raw_items.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(ch),
+            }
+        }
+    }
+    raw_items.push(cur);
+
     let mut out = Vec::new();
-    for item in trimmed.split(',') {
-        let cleaned = unquote_yaml(item).trim().to_owned();
+    for item in raw_items {
+        let cleaned = unquote_yaml(item.trim()).trim().to_owned();
         if !cleaned.is_empty() && !out.contains(&cleaned) {
             out.push(cleaned);
         }
@@ -583,8 +643,9 @@ pub fn parse_mail_message_from_bytes(
 
     for entry in entries {
         let key = entry.key.to_ascii_lowercase();
+        let raw_val = entry.raw_value;
         let val = entry.value;
-        if val.is_empty() {
+        if val.is_empty() && raw_val.is_empty() {
             continue;
         }
         match key.as_str() {
@@ -606,7 +667,8 @@ pub fn parse_mail_message_from_bytes(
             "topic" => topic = Some(val),
             "priority" => priority = parse_priority_str(&val),
             "refs" => {
-                for r in parse_yaml_string_list(&val) {
+                let src = if raw_val.is_empty() { &val } else { &raw_val };
+                for r in parse_yaml_string_list(src) {
                     if !refs.contains(&r) {
                         refs.push(r);
                     }
@@ -780,7 +842,51 @@ pub struct CommittedMailEntry {
     pub message: MailMessage,
     pub mutated_after_ack: bool,
     pub prior_ack_sha: Option<String>,
-    pub send_idem: Option<IdemKey>,
+    pub send_bindings: Vec<(IdemKey, Principal)>,
+}
+
+impl CommittedMailEntry {
+    /// Emits all provenance records needed to reconstruct this message's audience,
+    /// author, flags, and every committed caller `--id` binding on rebuild.
+    pub fn mirror_index_records(&self) -> Vec<MirrorIndexRecord> {
+        let norm_path = normalize_letter_path(&self.message.path.to_string_lossy())
+            .map(|n| n.canonical)
+            .unwrap_or_else(|| self.message.path.to_string_lossy().into_owned());
+        if self.send_bindings.is_empty() {
+            let send_by =
+                (self.message.origin == MailOrigin::Send).then(|| self.committed_by.clone());
+            vec![MirrorIndexRecord {
+                schema: 1,
+                sha256: self.message.sha256.clone(),
+                path: norm_path,
+                to: self.message.to.clone(),
+                cc: self.message.cc.clone(),
+                created_at_ms: self.message.created_at.0,
+                mutated_after_ack: self.mutated_after_ack,
+                prior_ack_sha: self.prior_ack_sha.clone(),
+                origin: self.message.origin,
+                send_idem: None,
+                send_by,
+            }]
+        } else {
+            self.send_bindings
+                .iter()
+                .map(|(idem, by)| MirrorIndexRecord {
+                    schema: 1,
+                    sha256: self.message.sha256.clone(),
+                    path: norm_path.clone(),
+                    to: self.message.to.clone(),
+                    cc: self.message.cc.clone(),
+                    created_at_ms: self.message.created_at.0,
+                    mutated_after_ack: self.mutated_after_ack,
+                    prior_ack_sha: self.prior_ack_sha.clone(),
+                    origin: self.message.origin,
+                    send_idem: Some(idem.clone()),
+                    send_by: Some(by.clone()),
+                })
+                .collect()
+        }
+    }
 }
 
 /// Resolution of an ACK target against [`MailState`], allowing authorization
@@ -823,27 +929,6 @@ pub struct MirrorIndexRecord {
     pub send_by: Option<Principal>,
 }
 
-impl MirrorIndexRecord {
-    pub fn from_committed(entry: &CommittedMailEntry) -> Self {
-        let norm_path = normalize_letter_path(&entry.message.path.to_string_lossy())
-            .map(|n| n.canonical)
-            .unwrap_or_else(|| entry.message.path.to_string_lossy().into_owned());
-        Self {
-            schema: 1,
-            sha256: entry.message.sha256.clone(),
-            path: norm_path,
-            to: entry.message.to.clone(),
-            cc: entry.message.cc.clone(),
-            created_at_ms: entry.message.created_at.0,
-            mutated_after_ack: entry.mutated_after_ack,
-            prior_ack_sha: entry.prior_ack_sha.clone(),
-            origin: entry.message.origin,
-            send_idem: entry.send_idem.clone(),
-            send_by: entry.send_idem.as_ref().map(|_| entry.committed_by.clone()),
-        }
-    }
-}
-
 /// One committed ACK record stored in [`MailState`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedAckRecord {
@@ -861,6 +946,7 @@ pub struct CommittedAckRecord {
 pub struct MailState {
     pub messages: BTreeMap<Sha256Hex, CommittedMailEntry>,
     pub by_path: BTreeMap<String, Vec<Sha256Hex>>,
+    pub current_by_path: BTreeMap<String, Sha256Hex>,
     pub by_id: BTreeMap<String, Sha256Hex>,
     pub by_send_idem: BTreeMap<IdemKey, Sha256Hex>,
     pub acked: BTreeSet<(SeatName, Sha256Hex)>,
@@ -870,6 +956,7 @@ pub struct MailState {
     pub acked_shas: BTreeSet<Sha256Hex>,
     pub flagged_shas: BTreeSet<Sha256Hex>,
     pub room_post_seqs: BTreeMap<(RoomId, Sha256Hex), Seq>,
+    pub failed_room_projections: HashSet<(RoomId, Sha256Hex)>,
     pub seen_wakes: HashSet<WakeId>,
 }
 
@@ -977,9 +1064,12 @@ impl MailState {
             }) => {
                 let sha = message.sha256.clone();
                 if let Some(norm) = normalize_letter_path(&message.path.to_string_lossy()) {
-                    let list = self.by_path.entry(norm.canonical).or_default();
+                    let list = self.by_path.entry(norm.canonical.clone()).or_default();
                     if !list.contains(&sha) {
                         list.push(sha.clone());
+                    }
+                    if !message.path.starts_with("objects") {
+                        self.current_by_path.insert(norm.canonical, sha.clone());
                     }
                 }
                 if !message.id.is_empty() {
@@ -995,7 +1085,8 @@ impl MailState {
                 if *mutated_after_ack {
                     self.flagged_shas.insert(sha.clone());
                 }
-                self.messages
+                let entry = self
+                    .messages
                     .entry(sha)
                     .or_insert_with(|| CommittedMailEntry {
                         seq: env.seq,
@@ -1003,8 +1094,43 @@ impl MailState {
                         message: (**message).clone(),
                         mutated_after_ack: *mutated_after_ack,
                         prior_ack_sha: prior_ack_sha.clone(),
-                        send_idem: send_idem.clone(),
+                        send_bindings: Vec::new(),
                     });
+                if let Some(idem) = send_idem
+                    && !entry.send_bindings.iter().any(|(k, _)| k == idem)
+                {
+                    entry.send_bindings.push((idem.clone(), env.by.clone()));
+                }
+            }
+            Event::Mail(MailEvent::RecipientsAdded { sha256, to }) => {
+                if let Some(entry) = self.messages.get_mut(sha256) {
+                    let mut changed = false;
+                    for seat in to {
+                        if !entry.message.to.contains(seat) && !entry.message.cc.contains(seat) {
+                            entry.message.to.push(seat.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        entry.message.room = derive_mail_room(
+                            &entry.message.from,
+                            &entry.message.to,
+                            &entry.message.cc,
+                            entry.message.topic.as_deref(),
+                            &entry.message.subject,
+                            &entry.message.sha256,
+                        );
+                    }
+                }
+            }
+            Event::Mail(MailEvent::PathHeadUpdated { path, sha256 }) => {
+                if let Some(norm) = normalize_letter_path(&path.to_string_lossy()) {
+                    let list = self.by_path.entry(norm.canonical.clone()).or_default();
+                    if !list.contains(sha256) {
+                        list.push(sha256.clone());
+                    }
+                    self.current_by_path.insert(norm.canonical, sha256.clone());
+                }
             }
             Event::Mail(MailEvent::Acked {
                 path,
@@ -1076,7 +1202,9 @@ impl MailState {
         let mut out = BTreeSet::new();
         for (sha, entry) in &self.messages {
             let is_recipient = entry.message.to.contains(seat) || entry.message.cc.contains(seat);
+            let is_self_copy = normalize_seat_token(&entry.message.from) == seat.as_str();
             if !is_recipient
+                || is_self_copy
                 || entry.mutated_after_ack
                 || entry.message.receipt_only
                 || self.acked.contains(&(seat.clone(), sha.clone()))
@@ -1093,6 +1221,12 @@ impl MailState {
         self.messages.keys().cloned().collect()
     }
 
+    fn head_sha_for_canonical_path(&self, canon: &str) -> Option<&Sha256Hex> {
+        self.current_by_path
+            .get(canon)
+            .or_else(|| self.by_path.get(canon).and_then(|shas| shas.last()))
+    }
+
     /// Resolves the current (latest) revision at `path` or by exact `sha256`.
     pub fn lookup_target(
         &self,
@@ -1104,14 +1238,14 @@ impl MailState {
         }
         let p = path?;
         let norm = normalize_letter_path(&p.to_string_lossy())?;
-        if let Some(shas) = self.by_path.get(&norm.canonical) {
-            return shas.last().and_then(|s| self.messages.get(s));
+        if let Some(head_sha) = self.head_sha_for_canonical_path(&norm.canonical) {
+            return self.messages.get(head_sha);
         }
         let mut matched: Vec<&CommittedMailEntry> = Vec::new();
         for (p_key, shas) in &self.by_path {
             if letter_paths_match(p_key, &norm.canonical)
-                && let Some(last_sha) = shas.last()
-                && let Some(e) = self.messages.get(last_sha)
+                && let Some(head_sha) = self.current_by_path.get(p_key).or_else(|| shas.last())
+                && let Some(e) = self.messages.get(head_sha)
             {
                 matched.push(e);
             }
@@ -1120,7 +1254,7 @@ impl MailState {
     }
 
     /// Resolves an ACK target strictly to the exact `sha256` or the current
-    /// (latest) revision at `path`, refusing ambiguous bare filenames and
+    /// on-disk revision at `path`, refusing ambiguous bare filenames and
     /// preserving candidate entries so recipient authorization runs FIRST.
     pub fn resolve_ack_target(
         &self,
@@ -1161,8 +1295,8 @@ impl MailState {
         let Some(norm) = normalize_letter_path(&p.to_string_lossy()) else {
             return AckTargetResolution::NotDissolved;
         };
-        if let Some(shas) = self.by_path.get(&norm.canonical)
-            && let Some(latest) = shas.last().and_then(|s| self.messages.get(s)).cloned()
+        if let Some(head_sha) = self.head_sha_for_canonical_path(&norm.canonical)
+            && let Some(latest) = self.messages.get(head_sha).cloned()
         {
             return AckTargetResolution::Found {
                 entry: latest,
@@ -1173,7 +1307,8 @@ impl MailState {
         let mut candidates = Vec::new();
         for (p_key, shas) in &self.by_path {
             if letter_paths_match(p_key, &norm.canonical)
-                && let Some(latest) = shas.last().and_then(|s| self.messages.get(s)).cloned()
+                && let Some(head_sha) = self.current_by_path.get(p_key).or_else(|| shas.last())
+                && let Some(latest) = self.messages.get(head_sha).cloned()
             {
                 candidates.push(latest);
             }
@@ -1249,7 +1384,11 @@ impl MailState {
         let mut filtered: Vec<MailSummary> = Vec::new();
         for entry in all_for_seat {
             let summary = self.summarize_for(entry, Some(seat));
-            let is_unread = !summary.acked && !summary.mutated_after_ack && !summary.receipt_only;
+            let is_self_copy = normalize_seat_token(&entry.message.from) == seat.as_str();
+            let is_unread = !is_self_copy
+                && !summary.acked
+                && !summary.mutated_after_ack
+                && !summary.receipt_only;
             if is_unread {
                 unread_count += 1;
             }
@@ -1305,29 +1444,50 @@ impl MailState {
     }
 
     /// Looks up the projected room `Seq` of a parent message referenced by
-    /// `in_reply_to` (matching either a full `sha256`, 16-hex prefix, or `id`).
+    /// `in_reply_to` (matching either a full `sha256`, `>= 8`-hex prefix, or `id`).
     pub fn resolve_parent_room_seq(&self, room: &RoomId, in_reply_to: &str) -> Option<Seq> {
-        let trimmed = in_reply_to.trim();
-        if let Ok(sha) = Sha256Hex::parse(trimmed.to_ascii_lowercase())
-            && let Some(&seq) = self.room_post_seqs.get(&(room.clone(), sha))
-        {
-            return Some(seq);
-        }
-        if let Some(sha) = self.by_id.get(trimmed)
-            && let Some(&seq) = self.room_post_seqs.get(&(room.clone(), sha.clone()))
-        {
-            return Some(seq);
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.len() >= 8 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
-            for ((r, sha), &seq) in &self.room_post_seqs {
-                if r == room && sha.as_str().starts_with(&lower) {
-                    return Some(seq);
-                }
+        let mut seq_by_sha = BTreeMap::new();
+        for ((r, sha), &seq) in &self.room_post_seqs {
+            if r == room {
+                seq_by_sha.insert(sha.clone(), seq);
             }
         }
-        None
+        let mut seq_by_id = BTreeMap::new();
+        for (id, sha) in &self.by_id {
+            if let Some(&seq) = seq_by_sha.get(sha) {
+                seq_by_id.insert(id.clone(), seq);
+            }
+        }
+        resolve_parent_seq_in_maps(in_reply_to, &seq_by_sha, &seq_by_id)
     }
+}
+
+/// Shared parent-reference resolver used identically by live [`MailState`] and
+/// offline [`project_messages_to_journal_rooms_with_authors`]: resolves exact
+/// 64-hex `sha256`, exact message `id`, or `>= 8`-hex `sha256` prefix.
+pub fn resolve_parent_seq_in_maps(
+    in_reply_to: &str,
+    seq_by_sha: &BTreeMap<Sha256Hex, Seq>,
+    seq_by_id: &BTreeMap<String, Seq>,
+) -> Option<Seq> {
+    let trimmed = in_reply_to.trim();
+    if let Ok(sha) = Sha256Hex::parse(trimmed.to_ascii_lowercase())
+        && let Some(&seq) = seq_by_sha.get(&sha)
+    {
+        return Some(seq);
+    }
+    if let Some(&seq) = seq_by_id.get(trimmed) {
+        return Some(seq);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.len() >= 8 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        for (sha, &seq) in seq_by_sha {
+            if sha.as_str().starts_with(&lower) {
+                return Some(seq);
+            }
+        }
+    }
+    None
 }
 
 /// Evaluates presence delivery status for a set of recipient seats.
@@ -1467,24 +1627,24 @@ impl MirrorTarget {
         self.drop_dir.as_deref()
     }
 
-    fn ensure_subdir_segments(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
-        if segments.is_empty() {
-            return Ok(self.dir.path().to_path_buf());
-        }
+    pub fn guard(&self) -> &ProtectedRootsGuard {
+        &self.guard
+    }
+
+    fn validate_subdir_names(&self, segments: &[&str]) -> Result<Vec<SafeName>, ApiError> {
         let names = segments
             .iter()
             .map(|seg| SafeName::parse(seg))
             .collect::<Result<Vec<_>, _>>()
-            .and_then(RelPath::from_names)
             .map_err(|e| {
                 ApiError::Invalid(InvalidId {
                     what: "mirror subdir".into(),
                     reason: format!("invalid directory segment: {e}"),
                 })
             })?;
-        // Check protected descendants BEFORE creating any directory on disk.
+        // Check protected descendants BEFORE creating or opening any directory on disk.
         let mut candidate = self.dir.path().to_path_buf();
-        for seg in names.segments() {
+        for seg in &names {
             candidate.push(seg.as_str());
             if self.guard.check(&candidate, &candidate).is_err() {
                 return Err(ApiError::Denied {
@@ -1493,42 +1653,74 @@ impl MirrorTarget {
                 });
             }
         }
-        let sub = self
-            .dir
-            .ensure_subdir(&names, SANDBOX_DIR_MODE)
+        Ok(names)
+    }
+
+    fn ensure_subdir_fd(&self, segments: &[&str]) -> Result<fs::File, ApiError> {
+        let names = self.validate_subdir_names(segments)?;
+        self.dir
+            .open_subdir_fd(&names, Some(SANDBOX_DIR_MODE))
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::InvalidInput => ApiError::Denied {
                     principal: "mailbridge".into(),
-                    action: format!("write through symlink: {e}"),
+                    action: format!("write through symlink or non-directory: {e}"),
                 },
                 std::io::ErrorKind::NotADirectory => ApiError::conflict(e.to_string()),
-                _ => ApiError::Internal(format!("mkdir {names}: {e}")),
-            })?;
-        if self.guard.check(&sub, &sub).is_err() {
-            return Err(ApiError::Denied {
+                _ => ApiError::Internal(format!("openat mkdir {:?}: {e}", segments)),
+            })
+    }
+
+    fn open_existing_subdir_fd(&self, segments: &[&str]) -> Result<Option<fs::File>, ApiError> {
+        let names = self.validate_subdir_names(segments)?;
+        match self.dir.open_subdir_fd(&names, None) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(ApiError::Denied {
                 principal: "mailbridge".into(),
-                action: format!("escape mirror via {}", sub.display()),
-            });
+                action: format!("read through symlink or non-directory: {e}"),
+            }),
+            Err(e) => Err(ApiError::Internal(format!("openat {:?}: {e}", segments))),
         }
-        Ok(sub)
+    }
+
+    fn ensure_subdir_segments(&self, segments: &[&str]) -> Result<PathBuf, ApiError> {
+        let _fd = self.ensure_subdir_fd(segments)?;
+        let mut out = self.dir.path().to_path_buf();
+        for seg in segments {
+            out.push(seg);
+        }
+        Ok(out)
     }
 
     /// Exports immutable blob `<mirror>/objects/<sha256>.md` (`blobStore` in
-    /// `MailStore.tla`) using `write_atomic_if_absent_path`. Returns `Ok(true)`
-    /// when newly created, `Ok(false)` when already present.
+    /// `MailStore.tla`) via descriptor-anchored `openat` + `linkat`. Returns
+    /// `Ok(true)` when newly created, `Ok(false)` when already present.
     pub fn export_blob_if_absent(
         &self,
         sha256: &Sha256Hex,
         raw_bytes: &[u8],
     ) -> Result<bool, ApiError> {
-        let objects_dir = self.ensure_subdir_segments(&["objects"])?;
-        let dest = objects_dir.join(format!("{}.md", sha256.as_str()));
-        rex_wave_fs::write_atomic_if_absent_path(&dest, raw_bytes, SANDBOX_FILE_MODE, true)
-            .map_err(|e| ApiError::Internal(format!("export blob {}: {e}", dest.display())))
+        let objects_fd = self.ensure_subdir_fd(&["objects"])?;
+        let leaf = format!("{}.md", sha256.as_str());
+        let cand = self.dir.path().join("objects").join(&leaf);
+        if self.guard.check(&cand, &cand).is_err() {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("protected blob path refused: {}", cand.display()),
+            });
+        }
+        rex_wave_fs::write_atomic_if_absent_at(
+            &objects_fd,
+            &leaf,
+            raw_bytes,
+            SANDBOX_FILE_MODE,
+            true,
+        )
+        .map_err(|e| ApiError::Internal(format!("export blob {leaf}: {e}")))
     }
 
     /// Exports human-readable working-tree letter `<mirror>/<rel_path>`
-    /// (`mirrorPath` in `MailStore.tla`) using `write_atomic_if_absent_path`.
+    /// (`mirrorPath` in `MailStore.tla`) via descriptor-anchored `openat` + `linkat`.
     /// NEVER overwrites an existing working-tree file so `SingleHashPerPath`
     /// and in-place post-ack edits are preserved.
     pub fn export_working_tree_if_absent(
@@ -1565,52 +1757,53 @@ impl MirrorTarget {
                 reason: format!("unsafe filename '{file_name}'"),
             }));
         }
-        let parent_dir = self.ensure_subdir_segments(parent_segs)?;
-        let dest = parent_dir.join(file_name);
-        let (confined_abs, _, _) =
-            self.guard
-                .confine(self.dir.path(), &dest)
-                .map_err(|e| ApiError::Denied {
-                    principal: "mailbridge".into(),
-                    action: format!("confine working-tree path {}: {e}", dest.display()),
-                })?;
-        rex_wave_fs::write_atomic_if_absent_path(&confined_abs, raw_bytes, SANDBOX_FILE_MODE, true)
-            .map_err(|e| {
-                ApiError::Internal(format!("export letter {}: {e}", confined_abs.display()))
-            })
+        let mut cand = self.dir.path().to_path_buf();
+        for seg in &parts {
+            cand.push(seg);
+        }
+        if self.guard.check(&cand, &cand).is_err() {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("protected working-tree path refused: {}", cand.display()),
+            });
+        }
+        let parent_fd = self.ensure_subdir_fd(parent_segs)?;
+        rex_wave_fs::write_atomic_if_absent_at(
+            &parent_fd,
+            file_name,
+            raw_bytes,
+            SANDBOX_FILE_MODE,
+            true,
+        )
+        .map_err(|e| ApiError::Internal(format!("export letter {}: {e}", norm.canonical)))
     }
 
-    fn acquire_state_ledger_lock(&self, state_dir: &Path) -> Result<fs::File, ApiError> {
-        let lock_rel = RelPath::parse("state/.ledger.lock")
-            .map_err(|e| ApiError::Internal(format!("ledger lock relpath: {e}")))?;
-        let lock_path = self.dir.resolve(&lock_rel).map_err(|e| {
+    fn acquire_state_ledger_lock(&self, state_fd: &fs::File) -> Result<fs::File, ApiError> {
+        let lock_path = self.dir.path().join("state").join(".ledger.lock");
+        if self.guard.check(&lock_path, &lock_path).is_err() {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("protected ledger lock refused: {}", lock_path.display()),
+            });
+        }
+        let lock_file = rex_wave_fs::open_lock_at(state_fd, ".ledger.lock").map_err(|e| {
             if e.kind() == std::io::ErrorKind::InvalidInput {
                 ApiError::Denied {
                     principal: "mailbridge".into(),
-                    action: format!("state dir symlink refused: {e}"),
+                    action: format!("lock through symlink: {e}"),
                 }
             } else {
-                ApiError::Internal(format!("resolve {}: {e}", state_dir.display()))
-            }
-        })?;
-        let lock_file = rex_wave_fs::open_lock_nofollow(&lock_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidInput {
-                ApiError::Denied {
-                    principal: "mailbridge".into(),
-                    action: format!("lock through symlink {}: {e}", lock_path.display()),
-                }
-            } else {
-                ApiError::Internal(format!("open {}: {e}", lock_path.display()))
+                ApiError::Internal(format!("openat .ledger.lock: {e}"))
             }
         })?;
         rex_wave_fs::lock_exclusive_blocking(&lock_file)
-            .map_err(|e| ApiError::Internal(format!("flock {}: {e}", lock_path.display())))?;
+            .map_err(|e| ApiError::Internal(format!("flock .ledger.lock: {e}")))?;
         Ok(lock_file)
     }
 
     /// Exports a batch of ACK receipts to `<mirror>/state/acks.jsonl` idempotently
-    /// under serialized process + file locking, parsing the existing ledger at most
-    /// once and reading/writing through a single `O_NOFOLLOW` descriptor.
+    /// under serialized process + file locking, anchored directly to a verified
+    /// `state/` directory descriptor (`openat` + `O_NOFOLLOW`).
     pub fn append_acks_batch_if_absent(
         &self,
         acks: &[CommittedAckRecord],
@@ -1618,34 +1811,31 @@ impl MirrorTarget {
         if acks.is_empty() {
             return Ok(0);
         }
-        let state_dir = self.ensure_subdir_segments(&["state"])?;
+        let acks_cand = self.dir.path().join("state").join("acks.jsonl");
+        if self.guard.check(&acks_cand, &acks_cand).is_err() {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("protected acks.jsonl refused: {}", acks_cand.display()),
+            });
+        }
+        let state_fd = self.ensure_subdir_fd(&["state"])?;
         let proc_mtx = mirror_ledger_lock(self.dir.path());
         let _proc_guard = proc_mtx.lock().unwrap_or_else(|e| e.into_inner());
-        let _flock_guard = self.acquire_state_ledger_lock(&state_dir)?;
+        let _flock_guard = self.acquire_state_ledger_lock(&state_fd)?;
 
-        let acks_rel = RelPath::parse("state/acks.jsonl")
-            .map_err(|e| ApiError::Internal(format!("acks relpath: {e}")))?;
-        let acks_file = self.dir.resolve(&acks_rel).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidInput {
-                ApiError::Denied {
-                    principal: "mailbridge".into(),
-                    action: format!("resolve acks.jsonl refused: {e}"),
-                }
-            } else {
-                ApiError::Internal(format!("resolve acks.jsonl: {e}"))
-            }
-        })?;
-        let (mut f, meta) = rex_wave_fs::open_rw_append_nofollow(&acks_file, SANDBOX_FILE_MODE)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidInput {
-                    ApiError::Denied {
-                        principal: "mailbridge".into(),
-                        action: format!("open non-regular acks.jsonl {}: {e}", acks_file.display()),
+        let (mut f, meta) =
+            rex_wave_fs::open_rw_append_at(&state_fd, "acks.jsonl", SANDBOX_FILE_MODE).map_err(
+                |e| {
+                    if e.kind() == std::io::ErrorKind::InvalidInput {
+                        ApiError::Denied {
+                            principal: "mailbridge".into(),
+                            action: format!("open non-regular acks.jsonl: {e}"),
+                        }
+                    } else {
+                        ApiError::Internal(format!("openat acks.jsonl: {e}"))
                     }
-                } else {
-                    ApiError::Internal(format!("open acks.jsonl: {e}"))
-                }
-            })?;
+                },
+            )?;
         if meta.len() > MAX_ACKS_FILE_BYTES {
             return Err(ApiError::Internal(format!(
                 "acks.jsonl exceeds {MAX_ACKS_FILE_BYTES} bytes"
@@ -1663,26 +1853,13 @@ impl MirrorTarget {
         }
 
         let aliases = AliasMap::empty();
-        let text = std::str::from_utf8(&existing_bytes).map_err(|_| {
-            ApiError::Internal(
-                "corrupt non-UTF-8 content in state/acks.jsonl; repair before appending".into(),
-            )
-        })?;
-        for (idx_line, raw_line) in text.split('\n').enumerate() {
-            if raw_line.len() > crate::MAX_ACK_LINE_BYTES {
-                return Err(ApiError::Internal(format!(
-                    "oversized row at state/acks.jsonl:{} exceeds {} bytes",
-                    idx_line + 1,
-                    crate::MAX_ACK_LINE_BYTES
-                )));
-            }
-        }
-        let parsed_report = parse_acks_jsonl(text, &aliases);
-        if let Some(bad) = parsed_report.skipped_lines.first() {
-            return Err(ApiError::Internal(format!(
-                "corrupt JSON row at state/acks.jsonl:{} ({})",
-                bad.line_number, bad.reason
-            )));
+        let text = String::from_utf8_lossy(&existing_bytes);
+        let parsed_report = parse_acks_jsonl(&text, &aliases);
+        if !parsed_report.skipped_lines.is_empty() {
+            eprintln!(
+                "rex-wave mail: skipping {} malformed row(s) in state/acks.jsonl during export",
+                parsed_report.skipped_lines.len()
+            );
         }
         let idx = parsed_report.into_index();
         let mut seen_in_batch: BTreeSet<(SeatName, Sha256Hex)> = BTreeSet::new();
@@ -1711,7 +1888,7 @@ impl MirrorTarget {
                 "acked_by": ack.seat.as_str(),
                 "seat": ack.seat.as_str(),
             });
-            if let Some(n) = ack.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
+            if let Some(n) = ack.note.as_deref().filter(|n| !n.is_empty())
                 && let Some(map) = obj.as_object_mut()
             {
                 map.insert("note".into(), serde_json::Value::String(n.to_owned()));
@@ -1731,7 +1908,8 @@ impl MirrorTarget {
                 .map_err(|e| ApiError::Internal(format!("append acks.jsonl: {e}")))?;
             f.sync_all()
                 .map_err(|e| ApiError::Internal(format!("fsync acks.jsonl: {e}")))?;
-            rex_wave_fs::sync_dir(&state_dir)
+            state_fd
+                .sync_all()
                 .map_err(|e| ApiError::Internal(format!("fsync state dir: {e}")))?;
         }
         Ok(appended_count)
@@ -1758,7 +1936,7 @@ impl MirrorTarget {
     }
 
     /// Exports provenance rows to `<mirror>/state/mail-index.jsonl` idempotently
-    /// under serialized process + file locking through a single `O_NOFOLLOW` fd.
+    /// under serialized process + file locking anchored to `state/` descriptor.
     pub fn append_index_batch_if_absent(
         &self,
         entries: &[MirrorIndexRecord],
@@ -1766,37 +1944,30 @@ impl MirrorTarget {
         if entries.is_empty() {
             return Ok(0);
         }
-        let state_dir = self.ensure_subdir_segments(&["state"])?;
+        let idx_cand = self.dir.path().join("state").join("mail-index.jsonl");
+        if self.guard.check(&idx_cand, &idx_cand).is_err() {
+            return Err(ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("protected mail-index.jsonl refused: {}", idx_cand.display()),
+            });
+        }
+        let state_fd = self.ensure_subdir_fd(&["state"])?;
         let proc_mtx = mirror_ledger_lock(self.dir.path());
         let _proc_guard = proc_mtx.lock().unwrap_or_else(|e| e.into_inner());
-        let _flock_guard = self.acquire_state_ledger_lock(&state_dir)?;
+        let _flock_guard = self.acquire_state_ledger_lock(&state_fd)?;
 
-        let idx_rel = RelPath::parse("state/mail-index.jsonl")
-            .map_err(|e| ApiError::Internal(format!("mail-index relpath: {e}")))?;
-        let idx_file = self.dir.resolve(&idx_rel).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidInput {
-                ApiError::Denied {
-                    principal: "mailbridge".into(),
-                    action: format!("resolve mail-index.jsonl refused: {e}"),
-                }
-            } else {
-                ApiError::Internal(format!("resolve mail-index.jsonl: {e}"))
-            }
-        })?;
-        let (mut f, meta) = rex_wave_fs::open_rw_append_nofollow(&idx_file, SANDBOX_FILE_MODE)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidInput {
-                    ApiError::Denied {
-                        principal: "mailbridge".into(),
-                        action: format!(
-                            "open non-regular mail-index.jsonl {}: {e}",
-                            idx_file.display()
-                        ),
+        let (mut f, meta) =
+            rex_wave_fs::open_rw_append_at(&state_fd, "mail-index.jsonl", SANDBOX_FILE_MODE)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::InvalidInput {
+                        ApiError::Denied {
+                            principal: "mailbridge".into(),
+                            action: format!("open non-regular mail-index.jsonl: {e}"),
+                        }
+                    } else {
+                        ApiError::Internal(format!("openat mail-index.jsonl: {e}"))
                     }
-                } else {
-                    ApiError::Internal(format!("open mail-index.jsonl: {e}"))
-                }
-            })?;
+                })?;
         if meta.len() > MAX_INDEX_FILE_BYTES {
             return Err(ApiError::Internal(format!(
                 "mail-index.jsonl exceeds {MAX_INDEX_FILE_BYTES} bytes"
@@ -1808,14 +1979,14 @@ impl MirrorTarget {
             .read_to_end(&mut existing_bytes)
             .map_err(|e| ApiError::Internal(format!("read mail-index.jsonl: {e}")))?;
 
-        let mut existing_keys: HashSet<(Sha256Hex, Option<IdemKey>)> = HashSet::new();
+        let mut existing_keys: HashSet<IndexRowKey> = HashSet::new();
         for line in String::from_utf8_lossy(&existing_bytes).lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             if let Ok(rec) = serde_json::from_str::<MirrorIndexRecord>(trimmed) {
-                existing_keys.insert((rec.sha256, rec.send_idem));
+                existing_keys.insert(index_row_key(&rec));
             }
         }
 
@@ -1823,8 +1994,7 @@ impl MirrorTarget {
         let mut needs_leading_nl = !existing_bytes.is_empty() && !existing_bytes.ends_with(b"\n");
         let mut appended = 0usize;
         for entry in entries {
-            let key = (entry.sha256.clone(), entry.send_idem.clone());
-            if !existing_keys.insert(key) {
+            if !existing_keys.insert(index_row_key(entry)) {
                 continue;
             }
             if needs_leading_nl {
@@ -1841,19 +2011,20 @@ impl MirrorTarget {
                 .map_err(|e| ApiError::Internal(format!("append mail-index.jsonl: {e}")))?;
             f.sync_all()
                 .map_err(|e| ApiError::Internal(format!("fsync mail-index.jsonl: {e}")))?;
-            rex_wave_fs::sync_dir(&state_dir)
+            state_fd
+                .sync_all()
                 .map_err(|e| ApiError::Internal(format!("fsync state dir: {e}")))?;
         }
         Ok(appended)
     }
 
-    /// Reads `<mirror>/state/acks.jsonl` safely through `ConfinedDir` without creating it.
+    /// Reads `<mirror>/state/acks.jsonl` safely via descriptor-anchored `openat`.
     pub fn read_acks(&self, aliases: &AliasMap) -> Result<Vec<AckRecord>, ApiError> {
-        let Ok(rel) = RelPath::parse("state/acks.jsonl") else {
+        let Some(state_fd) = self.open_existing_subdir_fd(&["state"])? else {
             return Ok(Vec::new());
         };
-        let bytes = match self.dir.read_regular(&rel, MAX_ACKS_FILE_BYTES) {
-            Ok(b) => b,
+        let (file, meta) = match rex_wave_fs::open_regular_at(&state_fd, "acks.jsonl") {
+            Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                 return Err(ApiError::Denied {
@@ -1863,17 +2034,24 @@ impl MirrorTarget {
             }
             Err(e) => return Err(ApiError::Internal(format!("read acks.jsonl: {e}"))),
         };
+        let bytes = rex_wave_fs::read_open_bounded(
+            Path::new("state/acks.jsonl"),
+            file,
+            &meta,
+            MAX_ACKS_FILE_BYTES,
+        )
+        .map_err(|e| ApiError::Internal(format!("read acks.jsonl: {e}")))?;
         let text = String::from_utf8_lossy(&bytes);
         Ok(parse_acks_jsonl(&text, aliases).records)
     }
 
-    /// Reads `<mirror>/state/mail-index.jsonl` safely through `ConfinedDir` without creating it.
+    /// Reads `<mirror>/state/mail-index.jsonl` safely via descriptor-anchored `openat`.
     pub fn read_mail_index(&self) -> Result<Vec<MirrorIndexRecord>, ApiError> {
-        let Ok(rel) = RelPath::parse("state/mail-index.jsonl") else {
+        let Some(state_fd) = self.open_existing_subdir_fd(&["state"])? else {
             return Ok(Vec::new());
         };
-        let bytes = match self.dir.read_regular(&rel, MAX_INDEX_FILE_BYTES) {
-            Ok(b) => b,
+        let (file, meta) = match rex_wave_fs::open_regular_at(&state_fd, "mail-index.jsonl") {
+            Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                 return Err(ApiError::Denied {
@@ -1883,22 +2061,66 @@ impl MirrorTarget {
             }
             Err(e) => return Err(ApiError::Internal(format!("read mail-index.jsonl: {e}"))),
         };
+        let bytes = rex_wave_fs::read_open_bounded(
+            Path::new("state/mail-index.jsonl"),
+            file,
+            &meta,
+            MAX_INDEX_FILE_BYTES,
+        )
+        .map_err(|e| ApiError::Internal(format!("read mail-index.jsonl: {e}")))?;
         Ok(parse_mail_index_jsonl(&String::from_utf8_lossy(&bytes)))
     }
 }
 
+type IndexRowKey = (Sha256Hex, Option<IdemKey>, Vec<SeatName>, Vec<SeatName>);
+
+fn index_row_key(rec: &MirrorIndexRecord) -> IndexRowKey {
+    (
+        rec.sha256.clone(),
+        rec.send_idem.clone(),
+        rec.to.clone(),
+        rec.cc.clone(),
+    )
+}
+
 pub fn parse_mail_index_jsonl(contents: &str) -> Vec<MirrorIndexRecord> {
     let mut out = Vec::new();
-    for line in contents.lines() {
+    for (idx, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(rec) = serde_json::from_str::<MirrorIndexRecord>(trimmed) {
-            out.push(rec);
+        match serde_json::from_str::<MirrorIndexRecord>(trimmed) {
+            Ok(rec) => out.push(rec),
+            Err(e) => {
+                eprintln!(
+                    "rex-wave mail: skipping malformed row at state/mail-index.jsonl:{}: {e}",
+                    idx + 1
+                );
+            }
         }
     }
     out
+}
+
+pub fn parse_mail_index_jsonl_strict(
+    contents: &str,
+) -> Result<Vec<MirrorIndexRecord>, SandboxError> {
+    let mut out = Vec::new();
+    for (idx, line) in contents.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rec = serde_json::from_str::<MirrorIndexRecord>(trimmed).map_err(|e| {
+            SandboxError::Io(format!(
+                "corrupt row at state/mail-index.jsonl:{}: {e}",
+                idx + 1
+            ))
+        })?;
+        out.push(rec);
+    }
+    Ok(out)
 }
 
 fn verify_or_create_dir_outside(
@@ -1941,7 +2163,17 @@ fn meta_mtime_ms(meta: &fs::Metadata) -> Option<UnixMs> {
 pub struct DiskScanCache {
     pub blobs: BTreeMap<PathBuf, (StatSig, Option<UnixMs>)>,
     pub working: BTreeMap<PathBuf, (StatSig, Sha256Hex, Option<UnixMs>)>,
+    pub pending_drops: BTreeMap<PathBuf, StatSig>,
 }
+
+/// Return tuple of [`scan_working_tree_cached`]:
+/// `(unindexed_files, present_paths, current_sha_by_path, box_seats_by_sha)`.
+pub type WorkingTreeScanResult = (
+    Vec<DiskMailFile>,
+    HashSet<String>,
+    BTreeMap<String, Sha256Hex>,
+    BTreeMap<Sha256Hex, Vec<SeatName>>,
+);
 
 /// One scanned disk file discovered in a mirror working tree, object store, or
 /// drop folder.
@@ -1954,6 +2186,8 @@ pub struct DiskMailFile {
     pub raw_bytes: Vec<u8>,
     pub mtime_ms: Option<UnixMs>,
     pub claimed_sig: Option<(FileId, u64)>,
+    pub claimed_dir_path: Option<PathBuf>,
+    pub claimed_leaf_name: Option<String>,
 }
 
 fn strip_drop_claim_name(name: &str) -> Option<&str> {
@@ -1972,29 +2206,34 @@ pub fn scan_working_tree_dir(
 ) -> Result<Vec<DiskMailFile>, ApiError> {
     let mut dummy_cache = DiskScanCache::default();
     let empty_known = HashSet::new();
-    let (files, _) = if is_drop_dir {
-        (
-            scan_and_claim_drop_dir(Some(root), aliases, false)?,
-            HashSet::new(),
-        )
+    let files = if is_drop_dir {
+        scan_and_claim_drop_dir(
+            Some(root),
+            None,
+            aliases,
+            false,
+            0,
+            UnixMs(0),
+            &mut dummy_cache.pending_drops,
+        )?
     } else {
-        scan_working_tree_cached(root, aliases, &empty_known, &mut dummy_cache)?
+        scan_working_tree_cached(root, aliases, &empty_known, &mut dummy_cache)?.0
     };
     Ok(files)
 }
 
 /// Cached scan of `<mirror>` working-tree files outside the writer lock.
 /// Files whose `(dev, ino, len, mtime)` matches `cache` AND whose `sha256` is
-/// already in `known_shas` are recorded in `present_paths` without reading or
-/// hashing their contents.
+/// already in `known_shas` are recorded in `present_paths`, `current_by_path`,
+/// and `box_seats_by_sha` without reading or hashing their contents.
 pub fn scan_working_tree_cached(
     root: &Path,
     aliases: &AliasMap,
     known_shas: &HashSet<Sha256Hex>,
     cache: &mut DiskScanCache,
-) -> Result<(Vec<DiskMailFile>, HashSet<String>), ApiError> {
+) -> Result<WorkingTreeScanResult, ApiError> {
     if rex_wave_fs::entry_kind(root).ok() != Some(EntryKind::Dir) {
-        return Ok((Vec::new(), HashSet::new()));
+        return Ok((Vec::new(), HashSet::new(), BTreeMap::new(), BTreeMap::new()));
     }
     let top = fs::read_dir(root)
         .map_err(|e| ApiError::Internal(format!("scan {}: {e}", root.display())))?;
@@ -2057,11 +2296,14 @@ pub fn scan_working_tree_cached(
 
     let mut unindexed = Vec::new();
     let mut present_paths = HashSet::with_capacity(candidates.len());
+    let mut current_by_path: BTreeMap<String, Sha256Hex> = BTreeMap::new();
+    let mut box_seats_by_sha: BTreeMap<Sha256Hex, Vec<SeatName>> = BTreeMap::new();
     let mut next_cache = BTreeMap::new();
 
     for (rel_path, box_seat, fpath) in candidates {
-        if let Some(norm) = normalize_letter_path(&rel_path) {
-            present_paths.insert(norm.canonical);
+        let canon_rel = normalize_letter_path(&rel_path).map(|n| n.canonical);
+        if let Some(ref c) = canon_rel {
+            present_paths.insert(c.clone());
         }
         if has_emacs_lock(&fpath) {
             continue;
@@ -2074,6 +2316,15 @@ pub fn scan_working_tree_cached(
             && *prev_sig == sig
             && known_shas.contains(cached_sha)
         {
+            if let Some(c) = canon_rel {
+                current_by_path.insert(c, cached_sha.clone());
+            }
+            if let Some(seat) = box_seat {
+                let list = box_seats_by_sha.entry(cached_sha.clone()).or_default();
+                if !list.contains(&seat) {
+                    list.push(seat);
+                }
+            }
             next_cache.insert(fpath, (sig, cached_sha.clone(), *cached_mtime));
             continue;
         }
@@ -2083,6 +2334,15 @@ pub fn scan_working_tree_cached(
         };
         let sha256 = sha256_bytes(&raw_bytes);
         let mtime_ms = meta_mtime_ms(&meta);
+        if let Some(c) = canon_rel {
+            current_by_path.insert(c, sha256.clone());
+        }
+        if let Some(ref seat) = box_seat {
+            let list = box_seats_by_sha.entry(sha256.clone()).or_default();
+            if !list.contains(seat) {
+                list.push(seat.clone());
+            }
+        }
         next_cache.insert(fpath.clone(), (sig, sha256.clone(), mtime_ms));
         if !known_shas.contains(&sha256) {
             unindexed.push(DiskMailFile {
@@ -2093,37 +2353,68 @@ pub fn scan_working_tree_cached(
                 raw_bytes,
                 mtime_ms,
                 claimed_sig: None,
+                claimed_dir_path: None,
+                claimed_leaf_name: None,
             });
         }
     }
     cache.working = next_cache;
     unindexed.sort_by(|a, b| (&a.rel_path, &a.sha256).cmp(&(&b.rel_path, &b.sha256)));
-    Ok((unindexed, present_paths))
+    Ok((unindexed, present_paths, current_by_path, box_seats_by_sha))
+}
+
+fn check_drop_path_guard(guard: Option<&ProtectedRootsGuard>, path: &Path) -> Result<(), ApiError> {
+    if let Some(g) = guard
+        && g.check(path, path).is_err()
+    {
+        return Err(ApiError::Denied {
+            principal: "mailbridge".into(),
+            action: format!("drop path refused by protected-roots: {}", path.display()),
+        });
+    }
+    Ok(())
 }
 
 /// Scans `<drop_dir>` (and recovers any interrupted `.rex-claim-*` files),
-/// atomically claiming each regular unlocked drop file before reading its
-/// committed payload when `claim_for_consume` is true.
+/// checking every directory and leaf against `guard` (`protected-roots`),
+/// waiting for `drop_quiet_ms` (or two-pass `StatSig` stability) before claiming,
+/// and atomically claiming via descriptor-anchored `renameat`.
+#[allow(clippy::too_many_arguments)]
 pub fn scan_and_claim_drop_dir(
     drop_root: Option<&Path>,
+    guard: Option<&ProtectedRootsGuard>,
     aliases: &AliasMap,
     claim_for_consume: bool,
+    drop_quiet_ms: u64,
+    now: UnixMs,
+    pending_drops: &mut BTreeMap<PathBuf, StatSig>,
 ) -> Result<Vec<DiskMailFile>, ApiError> {
     let Some(root) = drop_root else {
+        pending_drops.clear();
         return Ok(Vec::new());
     };
+    check_drop_path_guard(guard, root)?;
     if rex_wave_fs::entry_kind(root).ok() != Some(EntryKind::Dir) {
+        pending_drops.clear();
         return Ok(Vec::new());
-    }
+    };
     let confined = ConfinedDir::open(root).map_err(|e| ApiError::Denied {
         principal: "mailbridge".into(),
         action: format!("open drop_dir {}: {e}", root.display()),
     })?;
     let base = confined.path();
+    check_drop_path_guard(guard, base)?;
+    if let Some(g) = guard {
+        g.verify_dir(base).map_err(|e| ApiError::Denied {
+            principal: "mailbridge".into(),
+            action: format!("verify drop_dir {}: {e}", base.display()),
+        })?;
+    }
+
     let top = fs::read_dir(base)
         .map_err(|e| ApiError::Internal(format!("scan {}: {e}", base.display())))?;
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-    let mut entries_to_process: Vec<(String, Option<SeatName>, PathBuf, bool)> = Vec::new();
+    let mut entries_to_process: Vec<(String, Option<SeatName>, PathBuf, String, bool)> = Vec::new();
 
     for entry in top.flatten() {
         let fname = entry.file_name();
@@ -2136,19 +2427,35 @@ pub fn scan_and_claim_drop_dir(
         if ft.is_symlink() {
             continue;
         }
+        let full_path = entry.path();
         if let Some(orig) = strip_drop_claim_name(name)
             && ft.is_file()
         {
-            entries_to_process.push((format!("mail/{orig}"), None, entry.path(), true));
+            check_drop_path_guard(guard, &full_path)?;
+            entries_to_process.push((
+                format!("mail/{orig}"),
+                None,
+                base.to_path_buf(),
+                name.to_owned(),
+                true,
+            ));
             continue;
         }
         if name.starts_with('.') || name == "objects" || name == "state" {
             continue;
         }
         if ft.is_dir() && (name == "mail" || name.starts_with("to-")) {
-            dirs.push((name.to_owned(), entry.path()));
+            check_drop_path_guard(guard, &full_path)?;
+            dirs.push((name.to_owned(), full_path));
         } else if ft.is_file() && !is_ignored_md_filename(name) {
-            entries_to_process.push((format!("mail/{name}"), None, entry.path(), false));
+            check_drop_path_guard(guard, &full_path)?;
+            entries_to_process.push((
+                format!("mail/{name}"),
+                None,
+                base.to_path_buf(),
+                name.to_owned(),
+                false,
+            ));
         }
     }
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2159,6 +2466,12 @@ pub fn scan_and_claim_drop_dir(
         };
         if rex_wave_fs::dir_metadata_nofollow(&dir_path).is_err() {
             continue;
+        }
+        if let Some(g) = guard {
+            g.verify_dir(&dir_path).map_err(|e| ApiError::Denied {
+                principal: "mailbridge".into(),
+                action: format!("verify drop subdir {}: {e}", dir_path.display()),
+            })?;
         }
         let box_seat = if dir_name == "mail" || dir_name == "to-desktop" {
             None
@@ -2181,32 +2494,55 @@ pub fn scan_and_claim_drop_dir(
             if !ft.is_file() || ft.is_symlink() {
                 continue;
             }
+            let leaf_full = f.path();
+            check_drop_path_guard(guard, &leaf_full)?;
             if let Some(orig) = strip_drop_claim_name(name) {
                 entries_to_process.push((
                     format!("{dir_name}/{orig}"),
                     box_seat.clone(),
-                    f.path(),
+                    dir_path.clone(),
+                    name.to_owned(),
                     true,
                 ));
             } else if !is_ignored_md_filename(name) {
                 entries_to_process.push((
                     format!("{dir_name}/{name}"),
                     box_seat.clone(),
-                    f.path(),
+                    dir_path.clone(),
+                    name.to_owned(),
                     false,
                 ));
             }
         }
     }
 
+    let mut next_pending: BTreeMap<PathBuf, StatSig> = BTreeMap::new();
     let mut out = Vec::new();
-    for (rel_path, box_seat, fpath, already_claimed) in entries_to_process {
+    for (rel_path, box_seat, parent_dir_path, leaf_name, already_claimed) in entries_to_process {
+        let fpath = parent_dir_path.join(&leaf_name);
+        check_drop_path_guard(guard, &parent_dir_path)?;
+        check_drop_path_guard(guard, &fpath)?;
         if !already_claimed && has_emacs_lock(&fpath) {
             continue;
         }
-        let Ok((file, meta)) = rex_wave_fs::open_regular_nofollow(&fpath) else {
+        let Ok(parent_fd) = rex_wave_fs::open_dir_nofollow(&parent_dir_path) else {
             continue;
         };
+        let Ok((file, meta)) = rex_wave_fs::open_regular_at(&parent_fd, &leaf_name) else {
+            continue;
+        };
+        let sig = stat_sig(&meta);
+        let mtime_opt = meta_mtime_ms(&meta);
+        if claim_for_consume && !already_claimed && drop_quiet_ms > 0 {
+            let old_enough = mtime_opt
+                .is_some_and(|m| now.0 >= m.0 && now.0.saturating_sub(m.0) >= drop_quiet_ms);
+            let stable_two_passes = pending_drops.get(&fpath) == Some(&sig);
+            if !old_enough && !stable_two_passes {
+                next_pending.insert(fpath, sig);
+                continue;
+            }
+        }
+
         let id = rex_wave_fs::file_id(&meta);
         let Ok(initial_bytes) =
             rex_wave_fs::read_open_bounded(&fpath, file, &meta, MAX_LETTER_BYTES)
@@ -2214,19 +2550,24 @@ pub fn scan_and_claim_drop_dir(
             continue;
         };
         if initial_bytes.is_empty() {
+            if claim_for_consume && !already_claimed && drop_quiet_ms > 0 {
+                next_pending.insert(fpath, sig);
+            }
             continue;
         }
 
-        let (effective_path, raw_bytes, mtime_ms, claimed_sig) =
+        let (effective_path, eff_leaf, raw_bytes, mtime_ms, claimed_sig) =
             if claim_for_consume && !already_claimed {
                 let nonce = DROP_CLAIM_NONCE.fetch_add(1, Ordering::Relaxed);
                 let prefix = format!(".rex-claim-{}-{nonce:08x}--", std::process::id());
-                let Ok(claim_path) = rex_wave_fs::claim_regular_sibling(&fpath, id, &prefix) else {
+                let claim_cand = parent_dir_path.join(format!("{prefix}{leaf_name}"));
+                check_drop_path_guard(guard, &claim_cand)?;
+                let Ok((claim_name, cf, cmeta)) =
+                    rex_wave_fs::claim_regular_at(&parent_fd, &leaf_name, id, &prefix)
+                else {
                     continue;
                 };
-                let Ok((cf, cmeta)) = rex_wave_fs::open_regular_nofollow(&claim_path) else {
-                    continue;
-                };
+                let claim_path = parent_dir_path.join(&claim_name);
                 let cid = rex_wave_fs::file_id(&cmeta);
                 let Ok(cbytes) =
                     rex_wave_fs::read_open_bounded(&claim_path, cf, &cmeta, MAX_LETTER_BYTES)
@@ -2237,12 +2578,24 @@ pub fn scan_and_claim_drop_dir(
                     continue;
                 }
                 let len = cbytes.len() as u64;
-                (claim_path, cbytes, meta_mtime_ms(&cmeta), Some((cid, len)))
+                (
+                    claim_path,
+                    Some(claim_name),
+                    cbytes,
+                    meta_mtime_ms(&cmeta),
+                    Some((cid, len)),
+                )
             } else if claim_for_consume && already_claimed {
                 let len = initial_bytes.len() as u64;
-                (fpath, initial_bytes, meta_mtime_ms(&meta), Some((id, len)))
+                (
+                    fpath,
+                    Some(leaf_name),
+                    initial_bytes,
+                    mtime_opt,
+                    Some((id, len)),
+                )
             } else {
-                (fpath, initial_bytes, meta_mtime_ms(&meta), None)
+                (fpath, None, initial_bytes, mtime_opt, None)
             };
 
         let sha256 = sha256_bytes(&raw_bytes);
@@ -2254,19 +2607,45 @@ pub fn scan_and_claim_drop_dir(
             raw_bytes,
             mtime_ms,
             claimed_sig,
+            claimed_dir_path: claimed_sig.map(|_| parent_dir_path),
+            claimed_leaf_name: eff_leaf,
         });
     }
+    *pending_drops = next_pending;
     out.sort_by(|a, b| (&a.rel_path, &a.sha256).cmp(&(&b.rel_path, &b.sha256)));
     Ok(out)
 }
 
-/// Unlinks a claimed drop file ONLY if its `(dev, ino)` and exact `sha256`
-/// still match what was committed and exported, preventing data loss if an
-/// open writer appended more bytes while reconciliation was in flight.
-pub fn finish_claimed_drop_file(drop: &DiskMailFile) -> bool {
+/// Unlinks a claimed drop file via descriptor-anchored `unlinkat` ONLY if its
+/// `(dev, ino)` and exact `sha256` still match what was committed and exported,
+/// preventing data loss if an open writer appended more bytes in flight.
+pub fn finish_claimed_drop_file(drop: &DiskMailFile, guard: Option<&ProtectedRootsGuard>) -> bool {
     let Some((expected_id, expected_len)) = drop.claimed_sig else {
         return false;
     };
+    if let (Some(dir_path), Some(leaf_name)) = (&drop.claimed_dir_path, &drop.claimed_leaf_name) {
+        if check_drop_path_guard(guard, dir_path).is_err()
+            || check_drop_path_guard(guard, &drop.abs_path).is_err()
+        {
+            return false;
+        }
+        let Ok(dir_fd) = rex_wave_fs::open_dir_nofollow(dir_path) else {
+            return false;
+        };
+        let Ok(Some(after_bytes)) = rex_wave_fs::read_claimed_at_if_unchanged(
+            &dir_fd,
+            leaf_name,
+            expected_id,
+            expected_len,
+            MAX_LETTER_BYTES,
+        ) else {
+            return false;
+        };
+        if sha256_bytes(&after_bytes) != drop.sha256 {
+            return false;
+        }
+        return rex_wave_fs::unlink_regular_at(&dir_fd, leaf_name).is_ok();
+    }
     let Ok((file, meta)) = rex_wave_fs::open_regular_nofollow(&drop.abs_path) else {
         return false;
     };
@@ -2284,23 +2663,24 @@ pub fn finish_claimed_drop_file(drop: &DiskMailFile) -> bool {
     fs::remove_file(&drop.abs_path).is_ok()
 }
 
-/// Scans `<mirror>/objects/<sha256>.md` verifying exact content-hash integrity.
+/// Scans `<mirror>/objects/<sha256>.md` strictly verifying exact content-hash integrity.
 pub fn scan_object_blobs(
     mirror_root: &Path,
 ) -> Result<Vec<(Sha256Hex, Vec<u8>, Option<UnixMs>)>, ApiError> {
     let mut dummy_cache = DiskScanCache::default();
     let empty_known = HashSet::new();
-    let (blobs, _) = scan_object_blobs_cached(mirror_root, &empty_known, &mut dummy_cache)?;
+    let (blobs, _) = scan_object_blobs_cached(mirror_root, &empty_known, true, &mut dummy_cache)?;
     Ok(blobs)
 }
 
 /// Cached scan of `<mirror>/objects/<sha256>.md` outside the writer lock.
-/// Blobs whose `(dev, ino, len, mtime)` matches a previously verified run AND
-/// whose `sha256` is already in `known_shas` are recorded in `present_shas`
-/// without reading or hashing their bytes.
+/// When `strict` is `true` (`rebuild`), any hash mismatch fails closed with `Conflict`.
+/// When `strict` is `false` (live `reconcile`), a corrupt blob is quarantined aside
+/// with a loud warning so a git `autocrlf` or merge artifact never bricks daemon startup.
 pub fn scan_object_blobs_cached(
     mirror_root: &Path,
     known_shas: &HashSet<Sha256Hex>,
+    strict: bool,
     cache: &mut DiskScanCache,
 ) -> Result<
     (
@@ -2315,7 +2695,7 @@ pub fn scan_object_blobs_cached(
     }
     let entries = fs::read_dir(&objects_dir)
         .map_err(|e| ApiError::Internal(format!("scan {}: {e}", objects_dir.display())))?;
-    let mut files: Vec<(Sha256Hex, PathBuf)> = Vec::new();
+    let mut files: Vec<(Sha256Hex, String, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let fname = entry.file_name();
         let Some(name) = fname.to_str() else {
@@ -2334,7 +2714,7 @@ pub fn scan_object_blobs_cached(
             .file_type()
             .is_ok_and(|ft| ft.is_file() && !ft.is_symlink())
         {
-            files.push((expected_sha, entry.path()));
+            files.push((expected_sha, name.to_owned(), entry.path()));
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2343,7 +2723,7 @@ pub fn scan_object_blobs_cached(
     let mut present_shas = HashSet::with_capacity(files.len());
     let mut next_cache = BTreeMap::new();
 
-    for (expected_sha, path) in files {
+    for (expected_sha, leaf_name, path) in files {
         let (file, meta) = rex_wave_fs::open_regular_nofollow(&path)
             .map_err(|e| ApiError::Internal(format!("open blob {}: {e}", path.display())))?;
         let sig = stat_sig(&meta);
@@ -2355,16 +2735,31 @@ pub fn scan_object_blobs_cached(
             next_cache.insert(path, (sig, *cached_mtime));
             continue;
         }
+        let id = rex_wave_fs::file_id(&meta);
         let bytes = rex_wave_fs::read_open_bounded(&path, file, &meta, MAX_LETTER_BYTES)
             .map_err(|e| ApiError::Internal(format!("read blob {}: {e}", path.display())))?;
         let actual_sha = sha256_bytes(&bytes);
         if actual_sha != expected_sha {
-            return Err(ApiError::conflict(format!(
-                "corrupt object blob {}: expected sha256 {}, got {}",
+            if strict {
+                return Err(ApiError::conflict(format!(
+                    "corrupt object blob {}: expected sha256 {}, got {}",
+                    path.display(),
+                    expected_sha,
+                    actual_sha
+                )));
+            }
+            let nonce = DROP_CLAIM_NONCE.fetch_add(1, Ordering::Relaxed);
+            let qprefix = format!(".corrupt-{nonce:08x}-");
+            if let Ok(obj_fd) = rex_wave_fs::open_dir_nofollow(&objects_dir) {
+                let _ = rex_wave_fs::claim_regular_at(&obj_fd, &leaf_name, id, &qprefix);
+            }
+            eprintln!(
+                "rex-wave mail: quarantined corrupt object blob {} (expected sha256 {}, got {})",
                 path.display(),
                 expected_sha,
                 actual_sha
-            )));
+            );
+            continue;
         }
         let mtime_ms = meta_mtime_ms(&meta);
         present_shas.insert(actual_sha.clone());
@@ -2377,7 +2772,8 @@ pub fn scan_object_blobs_cached(
     Ok((unindexed, present_shas))
 }
 
-/// Projects a dissolved [`MailMessage`] into its target room via a live `RoomCommand` service.
+/// Projects a dissolved [`MailMessage`] into its target room via a live `RoomCommand` service,
+/// verifying complete audience identity on private `#mail-*` channels before joining or posting.
 pub async fn project_message_to_room_service(
     room_svc: &dyn Service<RoomCommand>,
     msg: &MailMessage,
@@ -2385,32 +2781,45 @@ pub async fn project_message_to_room_service(
     caller_ctx: Option<&DecideCtx>,
 ) -> Option<Seq> {
     let room = msg.room.clone()?;
-    // For multi-seat mail channels, open the private `#mail-*` channel as
-    // `SystemPart::MailBridge` and join every participant BEFORE posting so
-    // participant-only read/write privacy holds at every sequence number.
+    let sys_ctx = DecideCtx::for_system_part(SystemPart::MailBridge);
     if matches!(room, RoomId::Channel { .. }) {
-        let sys_ctx = DecideCtx::for_system_part(SystemPart::MailBridge);
-        let mut participants: Vec<Principal> = Vec::new();
-        if let Ok(sender_seat) = SeatName::parse(normalize_seat_token(&msg.from)) {
-            participants.push(Principal::Seat { seat: sender_seat });
+        let expected_participants = mail_room_participants(msg);
+        let Ok(WireReply::RoomEnsure(view)) = room_svc
+            .dispatch(
+                RoomCommand::RoomEnsure(rex_wave_api::room::RoomEnsure {
+                    room: RoomRef::Id { id: room.clone() },
+                    origin: None,
+                    topic: msg.topic.clone(),
+                }),
+                sys_ctx.clone(),
+            )
+            .await
+        else {
+            return None;
+        };
+        let existing_seats: BTreeSet<Principal> = view
+            .members
+            .iter()
+            .map(|(_, p)| p)
+            .filter(|p| matches!(p, Principal::Seat { .. }))
+            .cloned()
+            .collect();
+        if !existing_seats.is_empty() && existing_seats != expected_participants {
+            return None;
         }
-        for seat in msg.to.iter().chain(msg.cc.iter()) {
-            let p = Principal::Seat { seat: seat.clone() };
-            if !participants.contains(&p) {
-                participants.push(p);
+        if existing_seats.is_empty() {
+            for member in expected_participants {
+                let _ = room_svc
+                    .dispatch(
+                        RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
+                            room: RoomRef::Id { id: room.clone() },
+                            member: Some(member),
+                            handle: None,
+                        }),
+                        sys_ctx.clone(),
+                    )
+                    .await;
             }
-        }
-        for member in participants {
-            let _ = room_svc
-                .dispatch(
-                    RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
-                        room: RoomRef::Id { id: room.clone() },
-                        member: Some(member),
-                        handle: None,
-                    }),
-                    sys_ctx.clone(),
-                )
-                .await;
         }
     }
 
@@ -2425,26 +2834,38 @@ pub async fn project_message_to_room_service(
         idem: Some(idem),
         origin: PostOrigin::Direct,
     };
-    let ctx = match caller_ctx {
+    let primary_ctx = match caller_ctx {
         Some(c) => match &room {
             RoomId::Direct { pair } if pair.contains(c.by()) || c.by().is_operator_or_system() => {
                 c.clone()
             }
             RoomId::Channel { .. } => c.clone(),
-            _ => DecideCtx::for_system_part(SystemPart::MailBridge),
+            _ => sys_ctx.clone(),
         },
-        None => DecideCtx::for_system_part(SystemPart::MailBridge),
+        None => sys_ctx.clone(),
     };
-    if let Ok(WireReply::RoomPost(posted)) =
-        room_svc.dispatch(RoomCommand::RoomPost(post), ctx).await
+    match room_svc
+        .dispatch(RoomCommand::RoomPost(post.clone()), primary_ctx)
+        .await
     {
-        return Some(posted.seq);
+        Ok(WireReply::RoomPost(posted)) => Some(posted.seq),
+        Err(ApiError::Denied { .. }) => {
+            if let Ok(WireReply::RoomPost(posted)) = room_svc
+                .dispatch(RoomCommand::RoomPost(post), sys_ctx)
+                .await
+            {
+                Some(posted.seq)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
-    None
 }
 
 /// Projects a batch of dissolved [`MailMessage`]s directly into `StreamId::Room`
-/// streams on an offline `Journal` (used by `rebuild` and `migrate-verify`).
+/// streams on an offline `Journal` using the exact [`rex_wave_rooms::Rooms`] decider
+/// so live room state and rebuilt room state are 100% identical.
 pub fn project_messages_to_journal_rooms(
     journal: &Journal,
     messages: &[MailMessage],
@@ -2457,6 +2878,9 @@ pub fn project_messages_to_journal_rooms_with_authors(
     messages: &[MailMessage],
     send_authors: &BTreeMap<Sha256Hex, Principal>,
 ) -> Result<(usize, usize), ApiError> {
+    use rex_wave_rooms::Rooms;
+    use rex_wave_runtime::{Decider, EntryMeta};
+
     let mut by_room: BTreeMap<RoomId, Vec<&MailMessage>> = BTreeMap::new();
     for msg in messages {
         if let Some(ref room) = msg.room {
@@ -2466,24 +2890,63 @@ pub fn project_messages_to_journal_rooms_with_authors(
 
     let mut dm_rooms = 0usize;
     let mut thread_channels = 0usize;
+    let sys_by = Principal::System {
+        part: SystemPart::MailBridge,
+    };
 
     for (room, mut room_msgs) in by_room {
         room_msgs.sort_by(|a, b| (a.created_at, &a.sha256).cmp(&(b.created_at, &b.sha256)));
-        match &room {
-            RoomId::Direct { .. } => dm_rooms += 1,
-            RoomId::Channel { .. } => thread_channels += 1,
-        }
-
         let stream = StreamId::Room { room: room.clone() };
         let mut writer = journal
             .claim(stream.clone())
             .map_err(|e| ApiError::Internal(format!("claim room stream: {e}")))?;
 
-        let mut opened = writer.head() > Seq::ORIGIN;
-        let mut joined: BTreeSet<Principal> = BTreeSet::new();
-        let mut used_handles: BTreeSet<String> = BTreeSet::new();
+        let mut room_state = <Rooms as Decider>::State::default();
         let mut seq_by_sha: BTreeMap<Sha256Hex, Seq> = BTreeMap::new();
         let mut seq_by_id: BTreeMap<String, Seq> = BTreeMap::new();
+        let mut id_by_sha: BTreeMap<Sha256Hex, String> = BTreeMap::new();
+        for m in &room_msgs {
+            if !m.id.is_empty() {
+                id_by_sha.insert(m.sha256.clone(), m.id.clone());
+            }
+        }
+
+        let mut after = Seq::ORIGIN;
+        loop {
+            let page = journal
+                .read(&stream, after, 512)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if page.is_empty() {
+                break;
+            }
+            for env in &page {
+                after = env.seq;
+                if let Some(ev) = <Rooms as Decider>::unwrap(&env.event) {
+                    <Rooms as Decider>::evolve(
+                        &mut room_state,
+                        ev,
+                        &EntryMeta {
+                            seq: env.seq,
+                            at: env.at,
+                            by: env.by.clone(),
+                        },
+                    );
+                }
+                if let Event::Room(RoomEvent::Posted {
+                    idem: Some(idem), ..
+                }) = &env.event
+                    && let Some(hex) = idem.as_str().strip_prefix("mail:")
+                    && let Ok(sha) = Sha256Hex::parse(hex)
+                {
+                    seq_by_sha.insert(sha.clone(), env.seq);
+                    if let Some(id) = id_by_sha.get(&sha) {
+                        seq_by_id.insert(id.clone(), env.seq);
+                    }
+                }
+            }
+        }
+
+        let mut room_projected_any = room_state.is_opened();
 
         for msg in room_msgs {
             let idem = IdemKey::parse(format!("mail:{}", msg.sha256))?;
@@ -2503,108 +2966,148 @@ pub fn project_messages_to_journal_rooms_with_authors(
                 continue;
             }
 
-            let author = send_authors
-                .get(&msg.sha256)
-                .cloned()
-                .unwrap_or(Principal::System {
-                    part: SystemPart::MailBridge,
-                });
-            let mut events: Vec<Event> = Vec::new();
-            if !opened {
-                events.push(Event::Room(RoomEvent::Opened {
-                    id: room.clone(),
-                    origin: RoomOrigin::Manual,
+            if matches!(room, RoomId::Channel { .. }) {
+                let expected_participants = mail_room_participants(msg);
+                let sys_ctx = DecideCtx::for_internal_replay(sys_by.clone(), msg.created_at);
+                let ensure_cmd = RoomCommand::RoomEnsure(rex_wave_api::room::RoomEnsure {
+                    room: RoomRef::Id { id: room.clone() },
+                    origin: None,
                     topic: msg.topic.clone(),
-                }));
-                opened = true;
-                if let RoomId::Direct { pair } = &room {
-                    let (a, b): (Principal, Principal) = pair.clone().into();
-                    for member in [a, b] {
-                        if joined.insert(member.clone()) {
-                            let handle = offline_handle(&member, &mut used_handles);
-                            events.push(Event::Room(RoomEvent::MemberJoined { member, handle }));
+                });
+                let ensure_evs = <Rooms as Decider>::decide(&room_state, &ensure_cmd, &sys_ctx)?;
+                if !ensure_evs.is_empty() {
+                    let wrapped = ensure_evs
+                        .into_iter()
+                        .map(<Rooms as Decider>::wrap)
+                        .collect();
+                    let app = writer
+                        .append(&sys_by, msg.created_at, None, wrapped)
+                        .map_err(|e| ApiError::Internal(e.to_string()))?;
+                    for env in app.envelopes() {
+                        if let Some(ev) = <Rooms as Decider>::unwrap(&env.event) {
+                            <Rooms as Decider>::evolve(
+                                &mut room_state,
+                                ev,
+                                &EntryMeta {
+                                    seq: env.seq,
+                                    at: env.at,
+                                    by: env.by.clone(),
+                                },
+                            );
                         }
                     }
                 }
-            }
-            if matches!(room, RoomId::Channel { .. }) {
-                let mut participants: Vec<Principal> = Vec::new();
-                if let Ok(from_seat) = SeatName::parse(normalize_seat_token(&msg.from)) {
-                    participants.push(Principal::Seat { seat: from_seat });
+                let existing_seats: BTreeSet<Principal> = room_state
+                    .member_principals()
+                    .filter(|p| matches!(p, Principal::Seat { .. }))
+                    .cloned()
+                    .collect();
+                if !existing_seats.is_empty() && existing_seats != expected_participants {
+                    continue;
                 }
-                for seat in msg.to.iter().chain(msg.cc.iter()) {
-                    let p = Principal::Seat { seat: seat.clone() };
-                    if !participants.contains(&p) {
-                        participants.push(p);
-                    }
-                }
-                for member in participants {
-                    if joined.insert(member.clone()) {
-                        let handle = offline_handle(&member, &mut used_handles);
-                        events.push(Event::Room(RoomEvent::MemberJoined { member, handle }));
+                if existing_seats.is_empty() {
+                    for member in expected_participants {
+                        let join_cmd = RoomCommand::RoomJoin(rex_wave_api::room::RoomJoin {
+                            room: RoomRef::Id { id: room.clone() },
+                            member: Some(member),
+                            handle: None,
+                        });
+                        let join_evs =
+                            <Rooms as Decider>::decide(&room_state, &join_cmd, &sys_ctx)?;
+                        if !join_evs.is_empty() {
+                            let wrapped =
+                                join_evs.into_iter().map(<Rooms as Decider>::wrap).collect();
+                            let app = writer
+                                .append(&sys_by, msg.created_at, None, wrapped)
+                                .map_err(|e| ApiError::Internal(e.to_string()))?;
+                            for env in app.envelopes() {
+                                if let Some(ev) = <Rooms as Decider>::unwrap(&env.event) {
+                                    <Rooms as Decider>::evolve(
+                                        &mut room_state,
+                                        ev,
+                                        &EntryMeta {
+                                            seq: env.seq,
+                                            at: env.at,
+                                            by: env.by.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
 
             let re = msg.in_reply_to.as_deref().and_then(|parent_ref| {
-                let trimmed = parent_ref.trim();
-                Sha256Hex::parse(trimmed.to_ascii_lowercase())
-                    .ok()
-                    .and_then(|sha| seq_by_sha.get(&sha).copied())
-                    .or_else(|| seq_by_id.get(trimmed).copied())
+                resolve_parent_seq_in_maps(parent_ref, &seq_by_sha, &seq_by_id)
             });
-
-            events.push(Event::Room(RoomEvent::Posted {
+            let post_cmd = RoomCommand::RoomPost(RoomPost {
+                room: RoomRef::Id { id: room.clone() },
                 body: format_mail_room_body(msg),
-                mentions: Mentions::default(),
                 re,
                 after: None,
                 labels: mail_room_labels(msg),
                 task: None,
                 idem: Some(idem.clone()),
                 origin: PostOrigin::Direct,
-            }));
-
+            });
+            let desired_author = send_authors
+                .get(&msg.sha256)
+                .cloned()
+                .unwrap_or_else(|| sys_by.clone());
+            let desired_ctx =
+                DecideCtx::for_internal_replay(desired_author.clone(), msg.created_at);
+            let (eff_author, post_evs) =
+                match <Rooms as Decider>::decide(&room_state, &post_cmd, &desired_ctx) {
+                    Ok(evs) => (desired_author, evs),
+                    Err(ApiError::Denied { .. }) => {
+                        let fallback_ctx =
+                            DecideCtx::for_internal_replay(sys_by.clone(), msg.created_at);
+                        (
+                            sys_by.clone(),
+                            <Rooms as Decider>::decide(&room_state, &post_cmd, &fallback_ctx)?,
+                        )
+                    }
+                    Err(e) => return Err(e),
+                };
+            if post_evs.is_empty() {
+                continue;
+            }
+            let wrapped = post_evs.into_iter().map(<Rooms as Decider>::wrap).collect();
             let appended = writer
-                .append(&author, msg.created_at, Some(&idem), events)
+                .append(&eff_author, msg.created_at, Some(&idem), wrapped)
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
-            if let Some(post_env) = appended
-                .envelopes()
-                .iter()
-                .find(|e| matches!(e.event, Event::Room(RoomEvent::Posted { .. })))
-            {
-                seq_by_sha.insert(msg.sha256.clone(), post_env.seq);
-                if !msg.id.is_empty() {
-                    seq_by_id.insert(msg.id.clone(), post_env.seq);
+            for env in appended.envelopes() {
+                if let Some(ev) = <Rooms as Decider>::unwrap(&env.event) {
+                    <Rooms as Decider>::evolve(
+                        &mut room_state,
+                        ev,
+                        &EntryMeta {
+                            seq: env.seq,
+                            at: env.at,
+                            by: env.by.clone(),
+                        },
+                    );
                 }
+                if matches!(env.event, Event::Room(RoomEvent::Posted { .. })) {
+                    room_projected_any = true;
+                    seq_by_sha.insert(msg.sha256.clone(), env.seq);
+                    if !msg.id.is_empty() {
+                        seq_by_id.insert(msg.id.clone(), env.seq);
+                    }
+                }
+            }
+        }
+
+        if room_projected_any {
+            match &room {
+                RoomId::Direct { .. } => dm_rooms += 1,
+                RoomId::Channel { .. } => thread_channels += 1,
             }
         }
     }
 
     Ok((dm_rooms, thread_channels))
-}
-
-fn offline_handle(member: &Principal, used: &mut BTreeSet<String>) -> Handle {
-    let base = match member {
-        Principal::Operator { seat } | Principal::Seat { seat } => seat.as_str().to_owned(),
-        Principal::Worker { role, .. } => role.as_str().to_owned(),
-        Principal::System { .. } => "system".to_owned(),
-    };
-    if used.insert(base.clone())
-        && let Ok(h) = Handle::parse(base.clone())
-    {
-        return h;
-    }
-    let short = &base[..base.len().min(24)];
-    for n in 2u32.. {
-        let cand = format!("{short}_{n}");
-        if used.insert(cand.clone())
-            && let Ok(h) = Handle::parse(cand)
-        {
-            return h;
-        }
-    }
-    unreachable!("u32 handle suffix space exhausted")
 }
 
 fn apply_index_provenance(msg: &mut MailMessage, rec: &MirrorIndexRecord) {
@@ -2624,6 +3127,29 @@ fn apply_index_provenance(msg: &mut MailMessage, rec: &MirrorIndexRecord) {
     );
 }
 
+fn merge_index_record(existing: &mut MirrorIndexRecord, newer: &MirrorIndexRecord) {
+    for seat in &newer.to {
+        if !existing.to.contains(seat) && !existing.cc.contains(seat) {
+            existing.to.push(seat.clone());
+        }
+    }
+    for seat in &newer.cc {
+        if !existing.to.contains(seat) && !existing.cc.contains(seat) {
+            existing.cc.push(seat.clone());
+        }
+    }
+    if existing.send_idem.is_none() && newer.send_idem.is_some() {
+        existing.send_idem = newer.send_idem.clone();
+    }
+    if existing.send_by.is_none() && newer.send_by.is_some() {
+        existing.send_by = newer.send_by.clone();
+    }
+    if !existing.mutated_after_ack && newer.mutated_after_ack {
+        existing.mutated_after_ack = true;
+        existing.prior_ack_sha = newer.prior_ack_sha.clone();
+    }
+}
+
 /// Pre-scanned disk snapshot collected outside `MailBridge`'s writer mutex.
 pub struct DiskReconcileInputs {
     pub disk_acks: Vec<AckRecord>,
@@ -2632,6 +3158,8 @@ pub struct DiskReconcileInputs {
     pub present_blob_shas: HashSet<Sha256Hex>,
     pub disk_working: Vec<DiskMailFile>,
     pub present_working_paths: HashSet<String>,
+    pub current_working_sha_by_path: BTreeMap<String, Sha256Hex>,
+    pub working_box_seats_by_sha: BTreeMap<Sha256Hex, Vec<SeatName>>,
     pub drop_files: Vec<DiskMailFile>,
 }
 
@@ -2641,15 +3169,29 @@ impl DiskReconcileInputs {
         aliases: &AliasMap,
         known_shas: &HashSet<Sha256Hex>,
         export_enabled: bool,
+        drop_quiet_ms: u64,
+        now: UnixMs,
         cache: &mut DiskScanCache,
     ) -> Result<Self, ApiError> {
         let disk_acks = mirror.read_acks(aliases)?;
         let disk_index = mirror.read_mail_index()?;
         let (disk_blobs, present_blob_shas) =
-            scan_object_blobs_cached(mirror.path(), known_shas, cache)?;
-        let (disk_working, present_working_paths) =
-            scan_working_tree_cached(mirror.path(), aliases, known_shas, cache)?;
-        let drop_files = scan_and_claim_drop_dir(mirror.drop_dir(), aliases, export_enabled)?;
+            scan_object_blobs_cached(mirror.path(), known_shas, false, cache)?;
+        let (
+            disk_working,
+            present_working_paths,
+            current_working_sha_by_path,
+            working_box_seats_by_sha,
+        ) = scan_working_tree_cached(mirror.path(), aliases, known_shas, cache)?;
+        let drop_files = scan_and_claim_drop_dir(
+            mirror.drop_dir(),
+            Some(mirror.guard()),
+            aliases,
+            export_enabled,
+            drop_quiet_ms,
+            now,
+            &mut cache.pending_drops,
+        )?;
         Ok(Self {
             disk_acks,
             disk_index,
@@ -2657,6 +3199,8 @@ impl DiskReconcileInputs {
             present_blob_shas,
             disk_working,
             present_working_paths,
+            current_working_sha_by_path,
+            working_box_seats_by_sha,
             drop_files,
         })
     }
@@ -2673,7 +3217,7 @@ pub struct PendingReconcileWork {
     pub wt_to_export: Vec<(PathBuf, Vec<u8>)>,
     pub index_to_export: Vec<MirrorIndexRecord>,
     pub acks_to_export: Vec<CommittedAckRecord>,
-    pub drop_files_to_finish: Vec<(DiskMailFile, MailMessage)>,
+    pub drop_files_to_finish: Vec<(DiskMailFile, MailMessage, Vec<MirrorIndexRecord>)>,
 }
 
 /// Commits all disk ingests into `StreamId::Mail` and computes missing room
@@ -2702,16 +3246,16 @@ pub fn reconcile_commit_phase(
     };
 
     let mut index_by_sha: BTreeMap<Sha256Hex, MirrorIndexRecord> = BTreeMap::new();
-    let mut disk_index_keys: HashSet<(Sha256Hex, Option<IdemKey>)> = HashSet::new();
+    let mut disk_index_keys: HashSet<IndexRowKey> = HashSet::new();
+    let mut disk_idem_bindings: Vec<MirrorIndexRecord> = Vec::new();
     for rec in inputs.disk_index {
-        disk_index_keys.insert((rec.sha256.clone(), rec.send_idem.clone()));
+        disk_index_keys.insert(index_row_key(&rec));
+        if rec.send_idem.is_some() {
+            disk_idem_bindings.push(rec.clone());
+        }
         index_by_sha
             .entry(rec.sha256.clone())
-            .and_modify(|existing| {
-                if existing.send_idem.is_none() && rec.send_idem.is_some() {
-                    *existing = rec.clone();
-                }
-            })
+            .and_modify(|existing| merge_index_record(existing, &rec))
             .or_insert(rec);
     }
 
@@ -2806,7 +3350,16 @@ pub fn reconcile_commit_phase(
         }
     }
 
-    // 2. Ingest unindexed working-tree files from <mirror>.
+    // 2. Ingest unindexed working-tree files from <mirror>, unioning multi-box seats per sha256.
+    let mut working_extra_by_sha: BTreeMap<Sha256Hex, Vec<SeatName>> = BTreeMap::new();
+    for f in &inputs.disk_working {
+        if let Some(ref seat) = f.box_seat {
+            let list = working_extra_by_sha.entry(f.sha256.clone()).or_default();
+            if !list.contains(seat) {
+                list.push(seat.clone());
+            }
+        }
+    }
     for f in &inputs.disk_working {
         if state.messages.contains_key(&f.sha256) {
             continue;
@@ -2822,17 +3375,34 @@ pub fn reconcile_commit_phase(
                 (prior.is_some(), prior)
             }
         };
+        let extra_seats = working_extra_by_sha
+            .get(&f.sha256)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let mut msg = parse_mail_message_from_bytes(
             eff_path,
             &f.raw_bytes,
             f.box_seat.as_ref(),
-            &[],
+            extra_seats,
             f.mtime_ms,
             aliases,
             MailOrigin::Mirror,
         );
         if let Some(r) = idx_rec {
             apply_index_provenance(&mut msg, r);
+            for s in extra_seats {
+                if !msg.to.contains(s) && !msg.cc.contains(s) {
+                    msg.to.push(s.clone());
+                }
+            }
+            msg.room = derive_mail_room(
+                &msg.from,
+                &msg.to,
+                &msg.cc,
+                msg.topic.as_deref(),
+                &msg.subject,
+                &msg.sha256,
+            );
         }
         let send_idem = idx_rec.and_then(|r| r.send_idem.clone());
         let by = idx_rec.and_then(|r| r.send_by.as_ref()).unwrap_or(&sys_by);
@@ -2862,6 +3432,36 @@ pub fn reconcile_commit_phase(
                 state.apply(e);
             }
             publish_batch(&envs, &mut fresh_envelopes);
+        }
+    }
+
+    // 2b. Ensure any new `to-<seat>/` copies in working tree for already-known sha256s add their recipient.
+    for (sha, seats) in &inputs.working_box_seats_by_sha {
+        if let Some(existing) = state.messages.get(sha) {
+            let missing: Vec<SeatName> = seats
+                .iter()
+                .filter(|s| !existing.message.to.contains(s) && !existing.message.cc.contains(s))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                let appended = writer
+                    .append(
+                        &sys_by,
+                        now,
+                        None,
+                        vec![Event::Mail(MailEvent::RecipientsAdded {
+                            sha256: sha.clone(),
+                            to: missing,
+                        })],
+                    )
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                if let Appended::Fresh(envs) = appended {
+                    for e in &envs {
+                        state.apply(e);
+                    }
+                    publish_batch(&envs, &mut fresh_envelopes);
+                }
+            }
         }
     }
 
@@ -2942,19 +3542,84 @@ pub fn reconcile_commit_phase(
         }
     }
 
-    // 4. Ingest files from separate <drop_dir> -> commit to SQLite FIRST.
-    let mut drop_files_to_finish = Vec::new();
+    // 3b. Restore any additional `--id` send bindings recorded in `mail-index.jsonl`.
+    for rec in &disk_idem_bindings {
+        if let Some(ref sidem) = rec.send_idem
+            && !state.by_send_idem.contains_key(sidem)
+            && let Some(existing) = state.messages.get(&rec.sha256).cloned()
+        {
+            let by = rec.send_by.as_ref().unwrap_or(&sys_by);
+            let appended = writer
+                .append(
+                    by,
+                    existing.message.created_at,
+                    Some(sidem),
+                    vec![Event::Mail(MailEvent::MessageCommitted {
+                        message: Box::new(existing.message),
+                        mutated_after_ack: existing.mutated_after_ack,
+                        prior_ack_sha: existing.prior_ack_sha,
+                        send_idem: Some(sidem.clone()),
+                    })],
+                )
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Appended::Fresh(envs) = appended {
+                for e in &envs {
+                    state.apply(e);
+                }
+                publish_batch(&envs, &mut fresh_envelopes);
+            }
+        }
+    }
+
+    // 4. Ingest files from separate <drop_dir> -> commit to SQLite FIRST, preserving
+    //    every `to-<seat>/` box recipient across both same-pass and multi-pass drops!
+    let mut drop_extra_by_sha: BTreeMap<Sha256Hex, Vec<SeatName>> = BTreeMap::new();
+    for f in &inputs.drop_files {
+        if let Some(ref seat) = f.box_seat {
+            let list = drop_extra_by_sha.entry(f.sha256.clone()).or_default();
+            if !list.contains(seat) {
+                list.push(seat.clone());
+            }
+        }
+    }
+    let mut raw_drop_files = Vec::new();
     for f in inputs.drop_files {
-        let msg = if let Some(existing) = state.messages.get(&f.sha256) {
-            existing.message.clone()
+        let msg = if let Some(existing) = state.messages.get(&f.sha256).cloned() {
+            if let Some(ref seat) = f.box_seat
+                && !existing.message.to.contains(seat)
+                && !existing.message.cc.contains(seat)
+            {
+                let appended = writer
+                    .append(
+                        &sys_by,
+                        now,
+                        None,
+                        vec![Event::Mail(MailEvent::RecipientsAdded {
+                            sha256: f.sha256.clone(),
+                            to: vec![seat.clone()],
+                        })],
+                    )
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                if let Appended::Fresh(envs) = appended {
+                    for e in &envs {
+                        state.apply(e);
+                    }
+                    publish_batch(&envs, &mut fresh_envelopes);
+                }
+            }
+            state.messages[&f.sha256].message.clone()
         } else {
             let prior_ack_sha = state.is_edit_after_ack(&f.rel_path, &f.sha256);
             let mutated_after_ack = prior_ack_sha.is_some();
+            let extra_seats = drop_extra_by_sha
+                .get(&f.sha256)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let parsed = parse_mail_message_from_bytes(
                 &f.rel_path,
                 &f.raw_bytes,
                 f.box_seat.as_ref(),
-                &[],
+                extra_seats,
                 f.mtime_ms,
                 aliases,
                 MailOrigin::Drop,
@@ -2986,7 +3651,41 @@ pub fn reconcile_commit_phase(
             parsed
         };
         if export_enabled {
-            drop_files_to_finish.push((f, msg));
+            raw_drop_files.push((f, msg));
+        }
+    }
+    let mut drop_files_to_finish = Vec::with_capacity(raw_drop_files.len());
+    for (f, _initial_msg) in raw_drop_files {
+        let final_entry = &state.messages[&f.sha256];
+        drop_files_to_finish.push((
+            f,
+            final_entry.message.clone(),
+            final_entry.mirror_index_records(),
+        ));
+    }
+
+    // 4b. Track current working-tree path heads (`A -> B -> A` restoration at the same path).
+    for (canon_path, disk_sha) in &inputs.current_working_sha_by_path {
+        if state.messages.contains_key(disk_sha)
+            && state.current_by_path.get(canon_path) != Some(disk_sha)
+        {
+            let appended = writer
+                .append(
+                    &sys_by,
+                    now,
+                    None,
+                    vec![Event::Mail(MailEvent::PathHeadUpdated {
+                        path: PathBuf::from(canon_path),
+                        sha256: disk_sha.clone(),
+                    })],
+                )
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Appended::Fresh(envs) = appended {
+                for e in &envs {
+                    state.apply(e);
+                }
+                publish_batch(&envs, &mut fresh_envelopes);
+            }
         }
     }
 
@@ -2998,9 +3697,9 @@ pub fn reconcile_commit_phase(
         .filter(|e| {
             !e.mutated_after_ack
                 && e.message.room.as_ref().is_some_and(|room| {
-                    !state
-                        .room_post_seqs
-                        .contains_key(&(room.clone(), e.message.sha256.clone()))
+                    let key = (room.clone(), e.message.sha256.clone());
+                    !state.room_post_seqs.contains_key(&key)
+                        && !state.failed_room_projections.contains(&key)
                 })
         })
         .collect();
@@ -3009,7 +3708,11 @@ pub fn reconcile_commit_phase(
     let missing_room_msgs: Vec<(MailMessage, Option<Principal>)> = missing_entries
         .into_iter()
         .map(|e| {
-            let auth = e.send_idem.as_ref().map(|_| e.committed_by.clone());
+            let auth = if e.message.origin == MailOrigin::Send || !e.send_bindings.is_empty() {
+                Some(e.committed_by.clone())
+            } else {
+                None
+            };
             (e.message.clone(), auth)
         })
         .collect();
@@ -3039,9 +3742,10 @@ pub fn reconcile_commit_phase(
                     wt_to_export.push((msg.path.clone(), raw));
                 }
             }
-            let idx_rec = MirrorIndexRecord::from_committed(entry);
-            if !disk_index_keys.contains(&(idx_rec.sha256.clone(), idx_rec.send_idem.clone())) {
-                index_to_export.push(idx_rec);
+            for idx_rec in entry.mirror_index_records() {
+                if !disk_index_keys.contains(&index_row_key(&idx_rec)) {
+                    index_to_export.push(idx_rec);
+                }
             }
         }
         for ack in state.ack_records.values() {
@@ -3082,16 +3786,25 @@ pub fn execute_reconcile_exports(
         mirror.append_index_batch_if_absent(&work.index_to_export)?;
     }
     if !work.acks_to_export.is_empty() {
-        work.report.acks_exported += mirror.append_acks_batch_if_absent(&work.acks_to_export)?;
+        match mirror.append_acks_batch_if_absent(&work.acks_to_export) {
+            Ok(n) => work.report.acks_exported += n,
+            Err(e @ ApiError::Denied { .. }) => return Err(e),
+            Err(e) => {
+                eprintln!("rex-wave mail: acks.jsonl export warning during reconcile: {e}");
+            }
+        }
     }
-    for (drop_file, msg) in &work.drop_files_to_finish {
+    for (drop_file, msg, idx_rows) in &work.drop_files_to_finish {
         if mirror.export_blob_if_absent(&msg.sha256, &drop_file.raw_bytes)? {
             work.report.blobs_exported += 1;
         }
         if mirror.export_working_tree_if_absent(&msg.path, &drop_file.raw_bytes)? {
             work.report.working_tree_exported += 1;
         }
-        if finish_claimed_drop_file(drop_file) {
+        if !idx_rows.is_empty() {
+            mirror.append_index_batch_if_absent(idx_rows)?;
+        }
+        if finish_claimed_drop_file(drop_file, Some(mirror.guard())) {
             work.report.drop_files_consumed += 1;
         }
     }
@@ -3112,23 +3825,38 @@ pub async fn reconcile_mail_store(
 ) -> Result<(MailReconcileReport, Vec<Envelope>), ApiError> {
     let known_shas: HashSet<Sha256Hex> = state.messages.keys().cloned().collect();
     let mut cache = DiskScanCache::default();
-    let inputs =
-        DiskReconcileInputs::collect(mirror, aliases, &known_shas, export_enabled, &mut cache)?;
+    let inputs = DiskReconcileInputs::collect(
+        mirror,
+        aliases,
+        &known_shas,
+        export_enabled,
+        0,
+        now,
+        &mut cache,
+    )?;
     let mut work =
         reconcile_commit_phase(state, writer, inputs, aliases, export_enabled, now, None)?;
     if let Some(rsvc) = room_svc {
-        for (msg, _) in &work.missing_room_msgs {
+        for (msg, auth_by) in &work.missing_room_msgs {
             if let Some(ref room) = msg.room {
                 let parent_seq = msg
                     .in_reply_to
                     .as_deref()
                     .and_then(|p| state.resolve_parent_room_seq(room, p));
+                let caller_ctx = auth_by
+                    .as_ref()
+                    .map(|p| DecideCtx::for_internal_replay(p.clone(), msg.created_at));
                 if let Some(seq) =
-                    project_message_to_room_service(rsvc, msg, parent_seq, None).await
+                    project_message_to_room_service(rsvc, msg, parent_seq, caller_ctx.as_ref())
+                        .await
                 {
                     state
                         .room_post_seqs
                         .insert((room.clone(), msg.sha256.clone()), seq);
+                } else {
+                    state
+                        .failed_room_projections
+                        .insert((room.clone(), msg.sha256.clone()));
                 }
             }
         }
@@ -3193,22 +3921,40 @@ pub fn rebuild_mail_from_mirror(
         &ro.root().join("state").join("mail-index.jsonl"),
         MAX_INDEX_FILE_BYTES,
     ) {
-        Ok(bytes) => parse_mail_index_jsonl(&String::from_utf8_lossy(&bytes)),
+        Ok(bytes) => {
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                SandboxError::Io("corrupt non-UTF-8 content in state/mail-index.jsonl".into())
+            })?;
+            parse_mail_index_jsonl_strict(text)?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(SandboxError::Io(format!("read mail-index.jsonl: {e}"))),
     };
     let mut index_by_sha: BTreeMap<Sha256Hex, MirrorIndexRecord> = BTreeMap::new();
     let mut extra_idem_records: Vec<MirrorIndexRecord> = Vec::new();
+    let mut seen_idem_keys: HashSet<IdemKey> = HashSet::new();
     for rec in index_records {
         match index_by_sha.get_mut(&rec.sha256) {
             Some(existing) => {
-                if existing.send_idem.is_none() && rec.send_idem.is_some() {
-                    *existing = rec;
-                } else if rec.send_idem.is_some() && rec.send_idem != existing.send_idem {
-                    extra_idem_records.push(rec);
+                if let Some(ref sidem) = rec.send_idem
+                    && existing.send_idem.as_ref() != Some(sidem)
+                    && seen_idem_keys.insert(sidem.clone())
+                {
+                    if existing.send_idem.is_none() {
+                        existing.send_idem = Some(sidem.clone());
+                        if existing.send_by.is_none() {
+                            existing.send_by = rec.send_by.clone();
+                        }
+                    } else {
+                        extra_idem_records.push(rec.clone());
+                    }
                 }
+                merge_index_record(existing, &rec);
             }
             None => {
+                if let Some(ref sidem) = rec.send_idem {
+                    seen_idem_keys.insert(sidem.clone());
+                }
                 index_by_sha.insert(rec.sha256.clone(), rec);
             }
         }
@@ -3217,6 +3963,13 @@ pub fn rebuild_mail_from_mirror(
     let working = scan_working_tree_dir(ro.root(), aliases, false)
         .map_err(|e| SandboxError::Io(e.to_string()))?;
     let blobs = scan_object_blobs(ro.root()).map_err(|e| SandboxError::Io(e.to_string()))?;
+
+    let mut on_disk_working_heads: BTreeMap<String, Sha256Hex> = BTreeMap::new();
+    for f in &working {
+        if let Some(norm) = normalize_letter_path(&f.rel_path) {
+            on_disk_working_heads.insert(norm.canonical, f.sha256.clone());
+        }
+    }
 
     // Collect all unique sha256 content blobs from working tree + objects/.
     struct RebuiltCandidate {
@@ -3349,6 +4102,16 @@ pub fn rebuild_mail_from_mirror(
         });
     }
 
+    // Strictly verify that EVERY indexed sha256 in `state/mail-index.jsonl` has
+    // content bytes present in either the working tree or `objects/<sha256>.md`.
+    for indexed_sha in index_by_sha.keys() {
+        if !by_sha.contains_key(indexed_sha) {
+            return Err(SandboxError::Io(format!(
+                "incomplete mirror: missing working-tree and object bytes for indexed sha256 {indexed_sha}"
+            )));
+        }
+    }
+
     let canonical_ack_records: Vec<AckRecord> = resolved_acks
         .iter()
         .enumerate()
@@ -3396,6 +4159,25 @@ pub fn rebuild_mail_from_mirror(
         );
         if let Some(r) = idx_rec {
             apply_index_provenance(&mut msg, r);
+            for s in &cand.extra_recipients {
+                if !msg.to.contains(s) && !msg.cc.contains(s) {
+                    msg.to.push(s.clone());
+                }
+            }
+            if let Some(ref bs) = cand.box_seat
+                && !msg.to.contains(bs)
+                && !msg.cc.contains(bs)
+            {
+                msg.to.push(bs.clone());
+            }
+            msg.room = derive_mail_room(
+                &msg.from,
+                &msg.to,
+                &msg.cc,
+                msg.topic.as_deref(),
+                &msg.subject,
+                &msg.sha256,
+            );
             if let Some(ref author) = r.send_by {
                 send_authors.insert(msg.sha256.clone(), author.clone());
             }
@@ -3431,6 +4213,7 @@ pub fn rebuild_mail_from_mirror(
         part: SystemPart::MailBridge,
     };
 
+    let mut last_committed_by_path: BTreeMap<String, Sha256Hex> = BTreeMap::new();
     let mut messages_rebuilt = 0usize;
     let mut mutated_after_ack_flagged = 0usize;
     let mut non_flagged_for_rooms = Vec::new();
@@ -3459,6 +4242,11 @@ pub fn rebuild_mail_from_mirror(
             if row.mutated_after_ack {
                 mutated_after_ack_flagged += 1;
             }
+            if !row.msg.path.starts_with("objects")
+                && let Some(norm) = normalize_letter_path(&row.msg.path.to_string_lossy())
+            {
+                last_committed_by_path.insert(norm.canonical, row.msg.sha256.clone());
+            }
         }
         if !row.mutated_after_ack {
             non_flagged_for_rooms.push(row.msg.clone());
@@ -3480,6 +4268,28 @@ pub fn rebuild_mail_from_mirror(
                         mutated_after_ack: extra.mutated_after_ack,
                         prior_ack_sha: extra.prior_ack_sha.clone(),
                         send_idem: Some(sidem.clone()),
+                    })],
+                )
+                .map_err(|e| SandboxError::Io(e.to_string()))?;
+            if !msg.path.starts_with("objects")
+                && let Some(norm) = normalize_letter_path(&msg.path.to_string_lossy())
+            {
+                last_committed_by_path.insert(norm.canonical, msg.sha256.clone());
+            }
+        }
+    }
+
+    // Restore exact on-disk working-tree head per path (`A -> B -> A` restoration).
+    for (canon_path, on_disk_sha) in &on_disk_working_heads {
+        if last_committed_by_path.get(canon_path) != Some(on_disk_sha) {
+            mail_writer
+                .append(
+                    &sys_by,
+                    UnixMs(0),
+                    None,
+                    vec![Event::Mail(MailEvent::PathHeadUpdated {
+                        path: PathBuf::from(canon_path),
+                        sha256: on_disk_sha.clone(),
                     })],
                 )
                 .map_err(|e| SandboxError::Io(e.to_string()))?;
@@ -3555,6 +4365,7 @@ pub struct MailMigrateVerifyReport {
     pub rebuilt_thread_channels: usize,
     pub blob_parity_count: usize,
     pub working_tree_parity_count: usize,
+    pub expected_working_tree_count: usize,
     pub fts_sample_query_hits: usize,
     pub db_parity: bool,
     pub ack_parity: bool,
@@ -4007,7 +4818,7 @@ pub fn migrate_verify_interchange(
             "acked_by": seat.as_str(),
             "seat": seat.as_str(),
         });
-        if let Some(n) = note.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        if let Some(n) = note.as_deref().filter(|s| !s.is_empty())
             && let Some(map) = line.as_object_mut()
         {
             map.insert("note".into(), serde_json::Value::String(n.to_owned()));
@@ -4128,6 +4939,7 @@ pub fn migrate_verify_interchange(
         rebuilt_thread_channels: rebuilt.thread_channels_projected,
         blob_parity_count,
         working_tree_parity_count,
+        expected_working_tree_count: expected_working_paths.len(),
         fts_sample_query_hits,
         db_parity,
         ack_parity,

@@ -230,53 +230,122 @@ fn index_mail_envelope(tx: &rusqlite::Transaction<'_>, env: &Envelope) -> Result
     if env.stream != StreamId::Mail {
         return Ok(false);
     }
-    let Event::Mail(MailEvent::MessageCommitted { message, .. }) = &env.event else {
-        return Ok(false);
-    };
-    let from_seat = normalize_fts_seat(&message.from);
-    let mut recips = BTreeSet::new();
-    for s in message.to.iter().chain(message.cc.iter()) {
-        recips.insert(s.as_str().to_owned());
-    }
-    let recipients_padded = if recips.is_empty() {
-        String::new()
-    } else {
-        format!(" {} ", recips.into_iter().collect::<Vec<_>>().join(" "))
-    };
-    let path_str = message.path.to_string_lossy();
-    let inserted = tx.execute(
-        "INSERT OR IGNORE INTO mail_fts_meta(seq, sha256, from_seat, recipients, subject, path, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            env.seq.0 as i64,
-            message.sha256.as_str(),
-            from_seat,
-            recipients_padded,
-            message.subject,
-            path_str.as_ref(),
-            message.created_at.0 as i64,
-        ],
-    )?;
-    if inserted > 0 {
-        let topic_str = message.topic.as_deref().unwrap_or("");
-        tx.execute(
-            "INSERT INTO mail_fts(rowid, sha256, msg_id, from_seat, recipients, subject, topic, body, path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                env.seq.0 as i64,
-                message.sha256.as_str(),
-                message.id,
-                from_seat,
-                recipients_padded,
-                message.subject,
-                topic_str,
-                message.body,
-                path_str.as_ref(),
-            ],
-        )?;
-        Ok(true)
-    } else {
-        Ok(false)
+    match &env.event {
+        Event::Mail(MailEvent::MessageCommitted { message, .. }) => {
+            let from_seat = normalize_fts_seat(&message.from);
+            let mut recips = BTreeSet::new();
+            for s in message.to.iter().chain(message.cc.iter()) {
+                recips.insert(s.as_str().to_owned());
+            }
+            let recipients_padded = if recips.is_empty() {
+                String::new()
+            } else {
+                format!(" {} ", recips.into_iter().collect::<Vec<_>>().join(" "))
+            };
+            let path_str = message.path.to_string_lossy();
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO mail_fts_meta(seq, sha256, from_seat, recipients, subject, path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    env.seq.0 as i64,
+                    message.sha256.as_str(),
+                    from_seat,
+                    recipients_padded,
+                    message.subject,
+                    path_str.as_ref(),
+                    message.created_at.0 as i64,
+                ],
+            )?;
+            if inserted > 0 {
+                let topic_str = message.topic.as_deref().unwrap_or("");
+                tx.execute(
+                    "INSERT INTO mail_fts(rowid, sha256, msg_id, from_seat, recipients, subject, topic, body, path)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        env.seq.0 as i64,
+                        message.sha256.as_str(),
+                        message.id,
+                        from_seat,
+                        recipients_padded,
+                        message.subject,
+                        topic_str,
+                        message.body,
+                        path_str.as_ref(),
+                    ],
+                )?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Event::Mail(MailEvent::RecipientsAdded { sha256, to }) => {
+            let existing: Option<(i64, String, String, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT m.seq, f.msg_id, f.from_seat, m.recipients, f.subject, f.topic, f.body
+                     FROM mail_fts_meta m
+                     JOIN mail_fts f ON f.rowid = m.seq
+                     WHERE m.sha256 = ?1",
+                    params![sha256.as_str()],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((row_seq, msg_id, from_seat, old_recips, subject, topic, body)) = existing
+            else {
+                return Ok(false);
+            };
+            let path_val: String = tx.query_row(
+                "SELECT path FROM mail_fts_meta WHERE seq = ?1",
+                params![row_seq],
+                |r| r.get(0),
+            )?;
+            let mut recips: BTreeSet<String> = old_recips
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let mut changed = false;
+            for seat in to {
+                if recips.insert(seat.as_str().to_owned()) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(false);
+            }
+            let new_padded = format!(" {} ", recips.into_iter().collect::<Vec<_>>().join(" "));
+            tx.execute(
+                "UPDATE mail_fts_meta SET recipients = ?1 WHERE seq = ?2",
+                params![new_padded, row_seq],
+            )?;
+            tx.execute("DELETE FROM mail_fts WHERE rowid = ?1", params![row_seq])?;
+            tx.execute(
+                "INSERT INTO mail_fts(rowid, sha256, msg_id, from_seat, recipients, subject, topic, body, path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row_seq,
+                    sha256.as_str(),
+                    msg_id,
+                    from_seat,
+                    new_padded,
+                    subject,
+                    topic,
+                    body,
+                    path_val,
+                ],
+            )?;
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 

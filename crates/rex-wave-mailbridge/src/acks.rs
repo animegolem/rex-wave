@@ -384,7 +384,6 @@ fn extract_at_ms(obj: &serde_json::Map<String, serde_json::Value>) -> Option<rex
 fn extract_note(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     obj.get("note")
         .and_then(|v| v.as_str())
-        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
 }

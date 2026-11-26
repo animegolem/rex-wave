@@ -3877,6 +3877,29 @@ fn execute_mail_rebuild(from: &Path, journal: &Path, as_json: bool) -> Result<Ex
     Ok(ExitCode::SUCCESS)
 }
 
+fn create_exclusive_cli_temp_dir(prefix: &str) -> Result<PathBuf, CliError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let ts = rex_wave_runtime::now().0;
+    for attempt in 0u32..256 {
+        let cand = base.join(format!("{prefix}-{pid}-{ts}-{attempt}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&cand) {
+            Ok(()) => return Ok(cand),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(CliError::Msg(format!(
+                    "create temporary work directory {}: {e}",
+                    cand.display()
+                )));
+            }
+        }
+    }
+    Err(CliError::Msg(
+        "failed to allocate exclusive temporary work directory".into(),
+    ))
+}
+
 fn execute_mail_migrate_verify(
     interchange: &Path,
     work_dir: Option<&Path>,
@@ -3888,11 +3911,7 @@ fn execute_mail_migrate_verify(
     let (target_work, cleanup_temp) = match work_dir {
         Some(dir) => (dir.to_path_buf(), false),
         None => (
-            std::env::temp_dir().join(format!(
-                "rex-wave-migrate-verify-{}-{}",
-                std::process::id(),
-                rex_wave_runtime::now().0
-            )),
+            create_exclusive_cli_temp_dir("rex-wave-migrate-verify")?,
             true,
         ),
     };
@@ -3922,7 +3941,7 @@ fn execute_mail_migrate_verify(
             report.blob_parity_count,
             report.unique_sha256_count,
             report.working_tree_parity_count,
-            report.unique_sha256_count,
+            report.expected_working_tree_count,
             report.fts_sample_query_hits,
             report.parity_ok,
         );

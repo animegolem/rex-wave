@@ -549,4 +549,16 @@ pub enum MailEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         send_idem: Option<IdemKey>,
     },
+    /// Records additional mailbox-derived recipients discovered for an already-committed
+    /// content-addressed message (e.g. a second `to-<seat>/` copy arriving on a later pass).
+    RecipientsAdded {
+        sha256: Sha256Hex,
+        to: Vec<SeatName>,
+    },
+    /// Records that `path` in the working tree now holds already-committed revision `sha256`
+    /// (e.g. when revision A is restored over revision B at the same path).
+    PathHeadUpdated {
+        path: PathBuf,
+        sha256: Sha256Hex,
+    },
 }

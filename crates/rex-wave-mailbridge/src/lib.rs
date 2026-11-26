@@ -939,6 +939,7 @@ pub struct MailBridge {
     config_watch: Option<tokio::sync::watch::Receiver<rex_wave_api::config::RexConfig>>,
     house: rex_wave_api::presence::HouseProfile,
     drop_dir: Option<PathBuf>,
+    drop_quiet_ms: u64,
     export_enabled: Arc<AtomicBool>,
 }
 
@@ -969,6 +970,7 @@ impl MailBridge {
             config_watch: None,
             house,
             drop_dir: None,
+            drop_quiet_ms: 0,
             export_enabled: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -1012,6 +1014,7 @@ impl MailBridge {
             config_watch: None,
             house,
             drop_dir: None,
+            drop_quiet_ms: 0,
             export_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -1049,6 +1052,13 @@ impl MailBridge {
 
     pub fn with_drop_dir(mut self, drop_dir: Option<PathBuf>) -> Self {
         self.drop_dir = drop_dir;
+        self
+    }
+
+    /// Sets the minimum quiet age (or two-pass `StatSig` stability) required before
+    /// claiming a newly written file in `drop_dir`.
+    pub fn with_drop_quiet_ms(mut self, quiet_ms: u64) -> Self {
+        self.drop_quiet_ms = quiet_ms;
         self
     }
 
@@ -1178,14 +1188,24 @@ impl MailBridge {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let collected = DiskReconcileInputs::collect(
-                &mirror,
-                &aliases,
-                &known_shas,
-                export_enabled,
-                &mut cache,
-            )?;
-            *self.scan_cache.lock().unwrap_or_else(|e| e.into_inner()) = cache;
+            let mirror_scan = mirror.clone();
+            let aliases_scan = aliases.clone();
+            let quiet_ms = self.drop_quiet_ms;
+            let (collected, next_cache) = tokio::task::spawn_blocking(move || {
+                let res = DiskReconcileInputs::collect(
+                    &mirror_scan,
+                    &aliases_scan,
+                    &known_shas,
+                    export_enabled,
+                    quiet_ms,
+                    now,
+                    &mut cache,
+                )?;
+                Ok::<_, ApiError>((res, cache))
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("reconcile scan task panicked: {e}")))??;
+            *self.scan_cache.lock().unwrap_or_else(|e| e.into_inner()) = next_cache;
             collected
         };
 
@@ -1233,13 +1253,26 @@ impl MailBridge {
                             .mail
                             .room_post_seqs
                             .insert((room.clone(), msg.sha256.clone()), seq);
+                    } else {
+                        self.state
+                            .lock()
+                            .await
+                            .mail
+                            .failed_room_projections
+                            .insert((room.clone(), msg.sha256.clone()));
                     }
                 }
             }
         }
 
         if export_enabled {
-            execute_reconcile_exports(&mirror, &mut work)?;
+            let mirror_exp = mirror.clone();
+            work = tokio::task::spawn_blocking(move || {
+                execute_reconcile_exports(&mirror_exp, &mut work)?;
+                Ok::<_, ApiError>(work)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("reconcile export task panicked: {e}")))??;
         }
 
         Ok(work.report)
@@ -1355,11 +1388,12 @@ impl MailBridge {
                     .get(&(r.clone(), existing_msg.sha256.clone()))
                     .copied()
             });
-            let idx_rec = st
+            let idx_recs = st
                 .mail
                 .messages
                 .get(&existing_msg.sha256)
-                .map(MirrorIndexRecord::from_committed);
+                .map(CommittedMailEntry::mirror_index_records)
+                .unwrap_or_default();
             drop(st);
 
             let room_seq = if existing_room_seq.is_some() {
@@ -1391,18 +1425,22 @@ impl MailBridge {
             if self.should_export() {
                 let mirror = self.active_mirror()?;
                 let raw = message_raw_bytes(&existing_msg)?;
-                let res_b = mirror.export_blob_if_absent(&existing_msg.sha256, &raw);
-                let res_w = mirror.export_working_tree_if_absent(&existing_msg.path, &raw);
-                let res_i = match idx_rec {
-                    Some(rec) => mirror.append_index_batch_if_absent(&[rec]).map(|_| true),
-                    None => Ok(true),
-                };
-                match (res_b, res_w, res_i) {
-                    (Ok(_), Ok(_), Ok(_)) => exported = true,
-                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) if req.wait_export => {
-                        return Err(e);
+                let exp_sha = existing_msg.sha256.clone();
+                let exp_path = existing_msg.path.clone();
+                let exp_res = tokio::task::spawn_blocking(move || {
+                    mirror.export_blob_if_absent(&exp_sha, &raw)?;
+                    mirror.export_working_tree_if_absent(&exp_path, &raw)?;
+                    if !idx_recs.is_empty() {
+                        mirror.append_index_batch_if_absent(&idx_recs)?;
                     }
-                    _ => {}
+                    Ok::<_, ApiError>(())
+                })
+                .await
+                .map_err(|e| ApiError::Internal(format!("send export task panicked: {e}")))?;
+                match exp_res {
+                    Ok(()) => exported = true,
+                    Err(e) if req.wait_export => return Err(e),
+                    Err(_) => {}
                 }
             }
             let delivery_notices = delivery_notices_for_seats(
@@ -1498,21 +1536,28 @@ impl MailBridge {
                 .get(&(room.clone(), committed_msg.sha256.clone()))
                 .copied()
         });
-        let idx_rec = MirrorIndexRecord {
-            schema: 1,
-            sha256: committed_msg.sha256.clone(),
-            path: normalize_letter_path(&committed_msg.path.to_string_lossy())
-                .map(|n| n.canonical)
-                .unwrap_or_else(|| committed_msg.path.to_string_lossy().into_owned()),
-            to: committed_msg.to.clone(),
-            cc: committed_msg.cc.clone(),
-            created_at_ms: committed_msg.created_at.0,
-            mutated_after_ack: false,
-            prior_ack_sha: None,
-            origin: committed_msg.origin,
-            send_idem: scoped_idem,
-            send_by: Some(ctx.by().clone()),
-        };
+        let idx_recs = st
+            .mail
+            .messages
+            .get(&committed_msg.sha256)
+            .map(CommittedMailEntry::mirror_index_records)
+            .unwrap_or_else(|| {
+                vec![MirrorIndexRecord {
+                    schema: 1,
+                    sha256: committed_msg.sha256.clone(),
+                    path: normalize_letter_path(&committed_msg.path.to_string_lossy())
+                        .map(|n| n.canonical)
+                        .unwrap_or_else(|| committed_msg.path.to_string_lossy().into_owned()),
+                    to: committed_msg.to.clone(),
+                    cc: committed_msg.cc.clone(),
+                    created_at_ms: committed_msg.created_at.0,
+                    mutated_after_ack: false,
+                    prior_ack_sha: None,
+                    origin: committed_msg.origin,
+                    send_idem: scoped_idem,
+                    send_by: Some(ctx.by().clone()),
+                }]
+            });
         drop(st);
 
         // 2. Project into DM / multi-seat mail thread room.
@@ -1546,15 +1591,20 @@ impl MailBridge {
         if self.should_export() {
             let mirror = self.active_mirror()?;
             let raw = message_raw_bytes(&committed_msg)?;
-            let blob_res = mirror.export_blob_if_absent(&committed_msg.sha256, &raw);
-            let wt_res = mirror.export_working_tree_if_absent(&committed_msg.path, &raw);
-            let idx_res = mirror.append_index_batch_if_absent(&[idx_rec]);
-            match (blob_res, wt_res, idx_res) {
-                (Ok(_), Ok(_), Ok(_)) => exported = true,
-                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) if req.wait_export => {
-                    return Err(e);
-                }
-                _ => {}
+            let exp_sha = committed_msg.sha256.clone();
+            let exp_path = committed_msg.path.clone();
+            let exp_res = tokio::task::spawn_blocking(move || {
+                mirror.export_blob_if_absent(&exp_sha, &raw)?;
+                mirror.export_working_tree_if_absent(&exp_path, &raw)?;
+                mirror.append_index_batch_if_absent(&idx_recs)?;
+                Ok::<_, ApiError>(())
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("send export task panicked: {e}")))?;
+            match exp_res {
+                Ok(()) => exported = true,
+                Err(e) if req.wait_export => return Err(e),
+                Err(_) => {}
             }
         }
 
@@ -1883,7 +1933,7 @@ impl MailBridge {
             )));
         }
 
-        match st
+        let resolved = match st
             .mail
             .resolve_ack_target(req.path.as_deref(), req.sha256.as_ref())
         {
@@ -1891,22 +1941,46 @@ impl MailBridge {
                 raw_path,
                 candidates,
             } => {
-                // Authorize BEFORE disclosing path ambiguity so non-recipients get Denied (HTTP 404).
-                let any_authorized = candidates
-                    .iter()
-                    .any(|c| authorize_dissolved_ack(&ctx, req.seat.as_ref(), c).is_ok());
-                if !any_authorized {
-                    return Err(ApiError::Denied {
-                        principal: ctx.by().to_string(),
-                        action: format!("ack mail {}", raw_path.display()),
-                    });
+                // Filter strictly to candidates visible/authorized for this caller so
+                // unrelated seats' letters neither cause false ambiguity nor leak counts.
+                let mut visible: Vec<CommittedMailEntry> = candidates
+                    .into_iter()
+                    .filter(|c| authorize_dissolved_ack(&ctx, req.seat.as_ref(), c).is_ok())
+                    .collect();
+                match visible.len() {
+                    0 => {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: format!("ack mail {}", raw_path.display()),
+                        });
+                    }
+                    1 => {
+                        let entry = visible.remove(0);
+                        let expected_sha_mismatch = req
+                            .sha256
+                            .as_ref()
+                            .filter(|&w| w != &entry.message.sha256)
+                            .cloned();
+                        AckTargetResolution::Found {
+                            entry,
+                            expected_sha_mismatch,
+                            path_mismatch: None,
+                        }
+                    }
+                    n => {
+                        return Err(ApiError::conflict(format!(
+                            "ambiguous mail path {} matches {} letters; specify full path or exact --sha256",
+                            raw_path.display(),
+                            n
+                        )));
+                    }
                 }
-                return Err(ApiError::conflict(format!(
-                    "ambiguous mail path {} matches {} letters; specify full path or exact --sha256",
-                    raw_path.display(),
-                    candidates.len()
-                )));
             }
+            other => other,
+        };
+
+        match resolved {
+            AckTargetResolution::AmbiguousPath { .. } => unreachable!("filtered above"),
             AckTargetResolution::Found {
                 entry,
                 expected_sha_mismatch,
@@ -1982,9 +2056,30 @@ impl MailBridge {
 
                 let mut exported = false;
                 if self.should_export() {
-                    let mirror = self.active_mirror()?;
-                    mirror.append_acks_batch_if_absent(&[committed_ack])?;
-                    exported = true;
+                    match self.active_mirror() {
+                        Ok(mirror) => {
+                            let exp_res = tokio::task::spawn_blocking(move || {
+                                mirror.append_acks_batch_if_absent(&[committed_ack])
+                            })
+                            .await
+                            .map_err(|e| {
+                                ApiError::Internal(format!("ack export task panicked: {e}"))
+                            })?;
+                            match exp_res {
+                                Ok(_) => exported = true,
+                                Err(e) => {
+                                    eprintln!(
+                                        "rex-wave mail: ack committed to journal; deferring mirror export to reconcile: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "rex-wave mail: ack committed to journal; deferring mirror export to reconcile: {e}"
+                            );
+                        }
+                    }
                 }
 
                 return Ok(MailAcked {
@@ -2123,12 +2218,27 @@ impl MailBridge {
         drop(st);
         self.publish_fresh(&appended);
 
-        let mut exported = false;
-        if self.should_export() {
-            let mirror = MirrorTarget::from_sandbox(&self.root, None);
-            mirror.append_acks_batch_if_absent(&[committed_ack])?;
-            exported = true;
-        }
+        // Always write legacy `to-<seat>/` receipt to the sandbox `state/acks.jsonl`
+        // regardless of `mail.export_enabled` so `project()` and sandbox readers see it.
+        let sandbox_mirror = MirrorTarget::from_sandbox(&self.root, None);
+        let exported = match tokio::task::spawn_blocking(move || {
+            sandbox_mirror.append_acks_batch_if_absent(&[committed_ack])
+        })
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "rex-wave mail: legacy ack committed to journal; sandbox acks.jsonl write deferred: {e}"
+                );
+                false
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "legacy ack export task panicked: {e}"
+                )));
+            }
+        };
         Ok(MailAcked {
             sha256: on_disk_sha,
             path: Some(PathBuf::from(rel_path)),

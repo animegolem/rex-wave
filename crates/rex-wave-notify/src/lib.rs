@@ -387,6 +387,7 @@ pub struct HeraldView {
     pending_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
+    mail_meta_by_sha: BTreeMap<Sha256Hex, (String, PathBuf, bool)>,
     raised_mail_unrung: BTreeMap<SeatName, RaisedMailUnrungState>,
     persisted_inbox_by_id: BTreeMap<(Principal, NotificationId), String>,
     persisted_inbox_dedupes: BTreeSet<(Principal, String)>,
@@ -726,10 +727,23 @@ impl HeraldView {
                     mutated_after_ack,
                     ..
                 } => {
-                    // MailStore.tla EditNeverRingable: post-ack edits and receipt-only
-                    // messages never become ringable or trigger MailUnrung alerts.
-                    if !mutated_after_ack && !message.receipt_only {
+                    let non_ringable = *mutated_after_ack || message.receipt_only;
+                    let sender_norm = message
+                        .from
+                        .trim()
+                        .trim_start_matches('@')
+                        .to_ascii_lowercase();
+                    self.mail_meta_by_sha.insert(
+                        message.sha256.clone(),
+                        (sender_norm.clone(), message.path.clone(), non_ringable),
+                    );
+                    // MailStore.tla EditNeverRingable: post-ack edits, receipt-only messages,
+                    // and sender self-copies never become ringable or trigger MailUnrung alerts.
+                    if !non_ringable {
                         for seat in message.to.iter().chain(message.cc.iter()) {
+                            if seat.as_str() == sender_norm {
+                                continue;
+                            }
                             self.record_incoming_mail(
                                 seat.clone(),
                                 message.sha256.clone(),
@@ -741,6 +755,27 @@ impl HeraldView {
                         }
                     }
                 }
+                mail::MailEvent::RecipientsAdded { sha256, to } => {
+                    if let Some((sender_norm, path, non_ringable)) =
+                        self.mail_meta_by_sha.get(sha256).cloned()
+                        && !non_ringable
+                    {
+                        for seat in to {
+                            if seat.as_str() == sender_norm {
+                                continue;
+                            }
+                            self.record_incoming_mail(
+                                seat.clone(),
+                                sha256.clone(),
+                                path.clone(),
+                                entry.at,
+                                emit_mail_unrung,
+                            );
+                            check_seats.insert(seat.clone());
+                        }
+                    }
+                }
+                mail::MailEvent::PathHeadUpdated { .. } => {}
                 mail::MailEvent::Acked {
                     path,
                     sha256,
@@ -1619,7 +1654,9 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             }
             mail::MailEvent::BellRang { .. }
             | mail::MailEvent::Acked { .. }
-            | mail::MailEvent::MessageCommitted { .. } => {}
+            | mail::MailEvent::MessageCommitted { .. }
+            | mail::MailEvent::RecipientsAdded { .. }
+            | mail::MailEvent::PathHeadUpdated { .. } => {}
         },
 
         _ => {}

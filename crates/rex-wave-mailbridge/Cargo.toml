@@ -11,6 +11,7 @@ publish.workspace = true
 base64.workspace = true
 rex-wave-fs.workspace = true
 rex-wave-api.workspace = true
+rex-wave-rooms.workspace = true
 rex-wave-runtime.workspace = true
 rex-wave-store.workspace = true
 sha2.workspace = true
@@ -21,7 +22,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-rex-wave-rooms.workspace = true
 rex-wave-runtime = { path = "../rex-wave-runtime", features = ["test-support"] }
 tempfile.workspace = true
 

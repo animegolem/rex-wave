@@ -1393,3 +1393,740 @@ async fn council_round2_privacy_scoped_idem_rebuild_edits_extra_recips_crash_and
         "pre-existing journal.sqlite3 in --work-dir must never be touched or deleted"
     );
 }
+
+#[tokio::test]
+async fn round3_council_regressions_all_pass() {
+    use rex_wave_api::read::Read;
+    use rex_wave_api::room::{Body, RoomEnsure, RoomId, RoomLeave, RoomPost, RoomRef, RoomTasks};
+    use rex_wave_api::{Client, IdemKey, Principal, RoleName, Seq, StreamId, WaveSlug, WireReply};
+    use rex_wave_mailbridge::MirrorTarget;
+    use rex_wave_rooms::Rooms;
+    use rex_wave_runtime::{
+        Hub, LocalClient, NoAgentFeed, ReadSide, Registry, Router, SidebarProjection,
+    };
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let protected_victim = tmp.path().join("protected-box");
+    fs::create_dir_all(&protected_victim).unwrap();
+    let drop_dir = tmp.path().join("drop");
+    fs::create_dir_all(drop_dir.join("to-bob")).unwrap();
+    fs::create_dir_all(drop_dir.join("to-carol")).unwrap();
+
+    let protected_inside_drop = drop_dir.join("to-dana");
+    let protection = Protection {
+        roots: vec![protected_victim],
+        names: vec!["to-dana".into()],
+    };
+
+    let mirror_dir = tmp.path().join("mirror");
+    let sandbox = make_sandbox(&mirror_dir, &protection);
+    let db_dir = tmp.path().join("db");
+    fs::create_dir_all(&db_dir).unwrap();
+    let journal_path = db_dir.join("journal.sqlite3");
+    let journal = Journal::open(&journal_path).expect("journal");
+    let hub = Hub::new(256);
+    let room_svc = Registry::<Rooms>::new(journal.clone(), hub.clone());
+
+    let alice = SeatName::parse("alice").unwrap();
+    let bob = SeatName::parse("bob").unwrap();
+    let carol = SeatName::parse("carol").unwrap();
+    let dan = SeatName::parse("dan").unwrap();
+
+    // --- 1. Astra B7 (part 2) + Astra B2 + Astra should B2/S1:
+    //     Keyless send before room_svc attached (crash before RoomPost) + two distinct `--id` keys
+    //     on identical content at the same UnixMs + `refs` containing commas ---
+    let writer0 = journal.claim(StreamId::Mail).unwrap();
+    let crash_bridge =
+        MailBridge::open_with_hub(sandbox.clone(), journal.clone(), writer0, hub.clone())
+            .unwrap()
+            .with_drop_dir(Some(drop_dir.clone()));
+    crash_bridge.set_export_enabled(false);
+
+    // Keyless send by `@alice` before `room_svc` exists: startup repair MUST attribute post to `@alice`, NOT `System(MailBridge)`!
+    let WireReply::MailSend(keyless_parent) = crash_bridge
+        .dispatch(
+            MailCommand::MailSend(MailSend {
+                to: vec![bob.clone()],
+                cc: Vec::new(),
+                subject: "Keyless parent".into(),
+                body: "Sent without --id before crash.".into(),
+                from: None,
+                priority: LetterPriority::Normal,
+                topic: Some("keyless-repair".into()),
+                in_reply_to: None,
+                refs: vec!["RFC, Annex A".into(), "Section 4.2".into()],
+                wait_export: false,
+                idem: None,
+            }),
+            DecideCtx::for_test(
+                Principal::Seat {
+                    seat: alice.clone(),
+                },
+                UnixMs(1_795_600_000_000),
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+
+    // Two distinct `--id` keys (`dup-k1`, `dup-k2`) committing identical bytes in the same millisecond!
+    let fixed_at = UnixMs(1_795_600_001_000);
+    let mut send_req_k1 = MailSend {
+        to: vec![bob.clone()],
+        cc: Vec::new(),
+        subject: "Dual key letter".into(),
+        body: "Same content, two caller keys.".into(),
+        from: None,
+        priority: LetterPriority::Normal,
+        topic: None,
+        in_reply_to: None,
+        refs: vec!["RFC, Annex A".into()],
+        wait_export: false,
+        idem: Some(IdemKey::parse("dup-k1").unwrap()),
+    };
+    let WireReply::MailSend(sent_k1) = crash_bridge
+        .dispatch(
+            MailCommand::MailSend(send_req_k1.clone()),
+            DecideCtx::for_test(
+                Principal::Seat {
+                    seat: alice.clone(),
+                },
+                fixed_at,
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    send_req_k1.idem = Some(IdemKey::parse("dup-k2").unwrap());
+    let WireReply::MailSend(sent_k2) = crash_bridge
+        .dispatch(
+            MailCommand::MailSend(send_req_k1.clone()),
+            DecideCtx::for_test(
+                Principal::Seat {
+                    seat: alice.clone(),
+                },
+                fixed_at,
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(sent_k1.sha256, sent_k2.sha256);
+    drop(crash_bridge);
+
+    // Restart with full Router + `room_svc` and run startup `reconcile()`.
+    let writer = journal.claim(StreamId::Mail).unwrap();
+    let mail_svc = Arc::new(
+        MailBridge::open_with_hub(sandbox.clone(), journal.clone(), writer, hub.clone())
+            .unwrap()
+            .with_room_service(room_svc.clone())
+            .with_drop_dir(Some(drop_dir.clone())),
+    );
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let presence_svc = Presence::default().registry(journal.clone(), hub.clone());
+    let router = Arc::new(Router {
+        room: room_svc,
+        mail: mail_svc.clone(),
+        presence: presence_svc,
+        ..Router::unavailable_with(Arc::new(ReadSide {
+            journal: journal.clone(),
+            hub: hub.clone(),
+            sidebar,
+            agents: Arc::new(NoAgentFeed),
+        }))
+    });
+
+    let alice_c = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: alice.clone(),
+        },
+    );
+    let bob_c = LocalClient::new(router.clone(), Principal::Seat { seat: bob.clone() });
+    let carol_c = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: carol.clone(),
+        },
+    );
+    let dan_c = LocalClient::new(router.clone(), Principal::Seat { seat: dan.clone() });
+    let worker_c = LocalClient::new(
+        router.clone(),
+        Principal::Worker {
+            wave: WaveSlug::parse("w1").unwrap(),
+            role: RoleName::parse("r1").unwrap(),
+        },
+    );
+
+    mail_svc.reconcile().await.unwrap();
+
+    // Verify repaired keyless DM post has `by == Principal::Seat { seat: alice }`!
+    let dm_room = keyless_parent.room.clone().unwrap();
+    let dm_frames = alice_c
+        .call(Read::stream(
+            StreamId::Room {
+                room: dm_room.clone(),
+            },
+            Seq::ORIGIN,
+            None,
+        ))
+        .await
+        .unwrap();
+    let parent_post_env = dm_frames
+        .entries
+        .iter()
+        .find(|env| {
+            matches!(
+                env.event,
+                rex_wave_api::Event::Room(rex_wave_api::room::RoomEvent::Posted { .. })
+            ) && format!("{:?}", env.event).contains(&keyless_parent.sha256.as_str()[..16])
+        })
+        .expect("repaired keyless post in DM");
+    assert_eq!(
+        parent_post_env.by,
+        Principal::Seat {
+            seat: alice.clone()
+        },
+        "startup room repair for keyless MailSend must preserve @alice as author"
+    );
+
+    // Send child referencing 16-hex prefix of `keyless_parent.sha256` (`Astra B7` part 1)!
+    let child_16hex = bob_c
+        .call(MailSend {
+            to: vec![alice.clone()],
+            cc: Vec::new(),
+            subject: "Re: Keyless parent".into(),
+            body: "Reply via 16-hex parent ref.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("keyless-repair".into()),
+            in_reply_to: Some(keyless_parent.sha256.as_str()[..16].to_owned()),
+            refs: Vec::new(),
+            wait_export: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert!(child_16hex.room_seq.is_some());
+
+    // --- 2. Astra B1 + Opus nit 1: Private `#mail-*` membership across RoomEnsure, RoomTasks,
+    //     RoomLeave, and Registry idem replay + self-cc unread suppression ---
+    let chan_sent = alice_c
+        .call(MailSend {
+            to: vec![bob.clone(), carol.clone()],
+            cc: vec![alice.clone()],
+            subject: "Private group thread".into(),
+            body: "Confidential body.".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("sec-review".into()),
+            in_reply_to: None,
+            refs: Vec::new(),
+            wait_export: true,
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let priv_chan = chan_sent.room.clone().expect("private #mail-* channel");
+    assert!(matches!(priv_chan, RoomId::Channel { .. }));
+
+    // Opus nit 1: sender self-cc must NOT count as unread or ringable for `alice`!
+    let alice_chk = alice_c
+        .call(MailCheck {
+            seat: None,
+            include_all: false,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !alice_chk
+            .messages
+            .iter()
+            .any(|m| m.sha256 == chan_sent.sha256),
+        "sender self-cc must not appear as unread for sender"
+    );
+    assert!(
+        !mail_svc
+            .mail_state_snapshot()
+            .await
+            .ringable_for_seat(&alice)
+            .contains(&chan_sent.sha256),
+        "sender self-cc must not be ringable for sender"
+    );
+
+    // Astra B1: non-members (`dan`, `worker`) must be Denied on RoomEnsure (even existing!),
+    // RoomTasks, RoomLeave, AND idempotent replay (`idem = mail:<sha256>`) on BOTH `#mail-*` and DM!
+    let mail_post_idem = IdemKey::parse(format!("mail:{}", chan_sent.sha256)).unwrap();
+    let dm_post_idem = IdemKey::parse(format!("mail:{}", keyless_parent.sha256)).unwrap();
+    for outsider in [&dan_c, &worker_c] {
+        assert!(matches!(
+            outsider
+                .call(RoomEnsure {
+                    room: RoomRef::Id {
+                        id: priv_chan.clone()
+                    },
+                    origin: None,
+                    topic: Some("hijack-topic".into()),
+                })
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+        assert!(matches!(
+            outsider
+                .call(RoomTasks {
+                    room: RoomRef::Id {
+                        id: priv_chan.clone()
+                    },
+                    filter: None,
+                    limit: None,
+                })
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+        assert!(matches!(
+            outsider
+                .call(RoomLeave {
+                    room: RoomRef::Id {
+                        id: priv_chan.clone()
+                    },
+                })
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+        assert!(matches!(
+            outsider
+                .call(RoomPost {
+                    idem: Some(mail_post_idem.clone()),
+                    ..RoomPost::new(
+                        RoomRef::Id {
+                            id: priv_chan.clone()
+                        },
+                        Body::parse("replay-probe").unwrap(),
+                    )
+                })
+                .await,
+            Err(ApiError::Denied { .. })
+        ));
+        assert!(matches!(
+            outsider
+                .call(RoomPost {
+                    idem: Some(dm_post_idem.clone()),
+                    ..RoomPost::new(
+                        RoomRef::Id {
+                            id: dm_room.clone()
+                        },
+                        Body::parse("dm-replay-probe").unwrap(),
+                    )
+                })
+                .await,
+            Err(ApiError::Denied { .. } | ApiError::NotFound { .. })
+        ));
+    }
+
+    // --- 3. Astra B6: Multi-box drop delivery (same-pass AND separate-pass) ---
+    let multi_same = b"---\nid: multi-same-1\nfrom: alice\nto: bob\nsubject: Same pass boxes\n---\n\nCopied to bob and carol.\n";
+    let multi_same_sha = sha256_of(multi_same);
+    fs::write(drop_dir.join("to-bob/multi-same.md"), multi_same).unwrap();
+    fs::write(drop_dir.join("to-carol/multi-same.md"), multi_same).unwrap();
+    let rep_same = mail_svc.reconcile().await.unwrap();
+    assert_eq!(rep_same.drop_files_consumed, 2);
+    let snap_same = mail_svc.mail_state_snapshot().await;
+    assert_eq!(
+        snap_same.messages[&multi_same_sha].message.to,
+        vec![bob.clone(), carol.clone()]
+    );
+
+    // Separate-pass drop: Pass 1 drops in `to-bob`, Pass 2 drops identical bytes in `to-carol`!
+    let multi_sep = b"---\nid: multi-sep-2\nfrom: alice\nto: bob\nsubject: Separate pass boxes\n---\n\nUnique token XYZZYSEP99.\n";
+    let multi_sep_sha = sha256_of(multi_sep);
+    fs::write(drop_dir.join("to-bob/multi-sep.md"), multi_sep).unwrap();
+    mail_svc.reconcile().await.unwrap();
+    assert_eq!(
+        mail_svc.mail_state_snapshot().await.messages[&multi_sep_sha]
+            .message
+            .to,
+        vec![bob.clone()]
+    );
+    fs::write(drop_dir.join("to-carol/multi-sep.md"), multi_sep).unwrap();
+    let rep_sep2 = mail_svc.reconcile().await.unwrap();
+    assert_eq!(rep_sep2.drop_files_consumed, 1);
+    assert_eq!(
+        mail_svc.mail_state_snapshot().await.messages[&multi_sep_sha]
+            .message
+            .to,
+        vec![bob.clone(), carol.clone()],
+        "second-pass drop into to-carol must durably add carol before unlinking"
+    );
+    // Carol must immediately see it in BOTH `mail check` AND `mail search`!
+    let carol_search = carol_c
+        .call(MailSearch {
+            query: "XYZZYSEP99".into(),
+            seat: None,
+            limit: Some(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(carol_search.hits.len(), 1);
+
+    // --- 4. Astra B4 + Opus S2: Drop protected-path refusal & quiet-before-claim ---
+    fs::create_dir_all(&protected_inside_drop).unwrap();
+    fs::write(
+        protected_inside_drop.join("blocked.md"),
+        b"---\nfrom: alice\nto: bob\nsubject: Blocked\n---\n\nProtected!\n",
+    )
+    .unwrap();
+    assert!(
+        matches!(mail_svc.reconcile().await, Err(ApiError::Denied { .. })),
+        "protected subdirectory inside drop_dir must be refused before claiming"
+    );
+    fs::remove_dir_all(&protected_inside_drop).unwrap();
+
+    // Test quiet-before-claim (`Opus S2`): active writer across pass 1 -> pass 2 -> quiet pass 3!
+    let quiet_dir = tmp.path().join("quiet-drop");
+    fs::create_dir_all(quiet_dir.join("to-bob")).unwrap();
+    let quiet_mirror = MirrorTarget::open_verified(
+        &tmp.path().join("quiet-mirror"),
+        Some(&quiet_dir),
+        &protection,
+    )
+    .unwrap();
+    let mut p_drops = std::collections::BTreeMap::new();
+    let slow_file = quiet_dir.join("to-bob/slow.md");
+    fs::write(
+        &slow_file,
+        b"---\nfrom: alice\nto: bob\nsubject: Slow\n---\n\nPart 1",
+    )
+    .unwrap();
+    let now_mtime = UnixMs(
+        fs::metadata(&slow_file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    );
+    let pass1 = rex_wave_mailbridge::scan_and_claim_drop_dir(
+        quiet_mirror.drop_dir(),
+        Some(quiet_mirror.guard()),
+        &AliasMap::empty(),
+        true,
+        10_000,
+        now_mtime,
+        &mut p_drops,
+    )
+    .unwrap();
+    assert!(
+        pass1.is_empty(),
+        "brand-new drop file inside quiet window must wait before claiming"
+    );
+    // Writer finishes writing more bytes before pass 2 -> StatSig changes, so pass 2 ALSO waits!
+    fs::write(
+        &slow_file,
+        b"---\nfrom: alice\nto: bob\nsubject: Slow\n---\n\nPart 1 + Part 2 complete.\n",
+    )
+    .unwrap();
+    let pass2 = rex_wave_mailbridge::scan_and_claim_drop_dir(
+        quiet_mirror.drop_dir(),
+        Some(quiet_mirror.guard()),
+        &AliasMap::empty(),
+        true,
+        10_000,
+        now_mtime,
+        &mut p_drops,
+    )
+    .unwrap();
+    assert!(
+        pass2.is_empty(),
+        "growing drop file must not be claimed mid-write"
+    );
+    // Pass 3 sees identical StatSig as Pass 2 -> claims complete bytes!
+    let pass3 = rex_wave_mailbridge::scan_and_claim_drop_dir(
+        quiet_mirror.drop_dir(),
+        Some(quiet_mirror.guard()),
+        &AliasMap::empty(),
+        true,
+        10_000,
+        now_mtime,
+        &mut p_drops,
+    )
+    .unwrap();
+    assert_eq!(pass3.len(), 1);
+    assert!(String::from_utf8_lossy(&pass3[0].raw_bytes).contains("Part 2 complete."));
+
+    // --- 5. Astra B8/S4 + Astra should B8 + Astra should B2/S1:
+    //     `A -> B -> A` path restoration ACK + caller-scoped ACK ambiguity + whitespace note ---
+    let toggle_path = mirror_dir.join("mail/toggle.md");
+    let rev_a = b"---\nid: toggle-a\nfrom: alice\nto: bob\nsubject: Toggle\n---\n\nBody A.\n";
+    let rev_a_sha = sha256_of(rev_a);
+    let rev_b = b"---\nid: toggle-b\nfrom: alice\nto: bob\nsubject: Toggle\n---\n\nBody B.\n";
+    let rev_b_sha = sha256_of(rev_b);
+
+    fs::write(&toggle_path, rev_a).unwrap();
+    mail_svc.reconcile().await.unwrap();
+    fs::write(&toggle_path, rev_b).unwrap();
+    mail_svc.reconcile().await.unwrap();
+    // Restore A over B at `mail/toggle.md`!
+    fs::write(&toggle_path, rev_a).unwrap();
+    mail_svc.reconcile().await.unwrap();
+
+    // Path-only ACK on `mail/toggle.md` MUST acknowledge `rev_a_sha` (NOT `rev_b_sha`),
+    // and preserve surrounding spaces in `note`!
+    let ack_toggle = bob_c
+        .call(MailAck {
+            path: Some(Path::new("mail/toggle.md").to_path_buf()),
+            sha256: None,
+            seat: None,
+            note: Some("  exact padded note  ".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ack_toggle.sha256, rev_a_sha,
+        "path-only ACK after A -> B -> A must acknowledge current on-disk A, never B"
+    );
+    assert_ne!(ack_toggle.sha256, rev_b_sha);
+
+    // Caller-scoped bare-filename ambiguity: `mail/shared-name.md` (to bob) vs `to-carol/shared-name.md` (to carol)
+    fs::create_dir_all(mirror_dir.join("to-carol")).unwrap();
+    let bob_only = b"---\nid: sn-bob\nfrom: alice\nto: bob\nsubject: For Bob\n---\n\nBob copy.\n";
+    let bob_only_sha = sha256_of(bob_only);
+    let carol_only =
+        b"---\nid: sn-carol\nfrom: alice\nto: carol\nsubject: For Carol\n---\n\nCarol copy.\n";
+    fs::write(mirror_dir.join("mail/shared-name.md"), bob_only).unwrap();
+    fs::write(mirror_dir.join("to-carol/shared-name.md"), carol_only).unwrap();
+    mail_svc.reconcile().await.unwrap();
+
+    // Bob acknowledging bare `shared-name.md` sees ONLY his 1 authorized candidate and succeeds!
+    let bob_ambig_ack = bob_c
+        .call(MailAck {
+            path: Some(Path::new("shared-name.md").to_path_buf()),
+            sha256: None,
+            seat: None,
+            note: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(bob_ambig_ack.sha256, bob_only_sha);
+    // Dan (in neither audience) gets Denied!
+    assert!(matches!(
+        dan_c
+            .call(MailAck {
+                path: Some(Path::new("shared-name.md").to_path_buf()),
+                sha256: None,
+                seat: None,
+                note: None,
+            })
+            .await,
+        Err(ApiError::Denied { .. })
+    ));
+
+    // --- 6. Opus S4: Legacy `to-bob/legacy.md` ack writes `state/acks.jsonl` even when `export_enabled = false` ---
+    mail_svc.set_export_enabled(false);
+    fs::create_dir_all(mirror_dir.join("to-bob")).unwrap();
+    let legacy_bytes =
+        b"---\nid: legacy-1\nfrom: alice\nto: bob\nsubject: Legacy box\n---\n\nUnindexed legacy.\n";
+    let legacy_sha = sha256_of(legacy_bytes);
+    fs::write(mirror_dir.join("to-bob/legacy.md"), legacy_bytes).unwrap();
+    let legacy_acked = bob_c
+        .call(MailAck {
+            path: Some(Path::new("to-bob/legacy.md").to_path_buf()),
+            sha256: None,
+            seat: None,
+            note: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        legacy_acked.exported,
+        "legacy to-<seat>/ ack must still write sandbox state/acks.jsonl when export_enabled is false"
+    );
+    assert!(
+        fs::read_to_string(mirror_dir.join("state/acks.jsonl"))
+            .unwrap()
+            .contains(legacy_sha.as_str())
+    );
+    mail_svc.set_export_enabled(true);
+
+    // --- 7. Opus S1: Live reconcile quarantines corrupt object blob & tolerates bad acks.jsonl line ---
+    let corrupt_blob_path = mirror_dir
+        .join("objects")
+        .join(format!("{}.md", sent_k1.sha256));
+    fs::write(&corrupt_blob_path, b"corrupted-by-git-autocrlf").unwrap();
+    let mut acks_raw = fs::read_to_string(mirror_dir.join("state/acks.jsonl")).unwrap();
+    acks_raw.push_str("<<<<<<< HEAD merge conflict marker\n");
+    fs::write(mirror_dir.join("state/acks.jsonl"), acks_raw).unwrap();
+    fs::write(
+        drop_dir.join("to-bob/after-corrupt.md"),
+        b"---\nid: after-corrupt\nfrom: alice\nto: bob\nsubject: Still works\n---\n\nPoller stays alive!\n",
+    )
+    .unwrap();
+    let resilient_rep = mail_svc
+        .reconcile()
+        .await
+        .expect("live reconcile must quarantine corrupt blob and skip bad ack line");
+    assert_eq!(resilient_rep.drop_files_consumed, 1);
+    assert_eq!(
+        sha256_of(&fs::read(&corrupt_blob_path).unwrap()),
+        sent_k1.sha256,
+        "reconcile must re-export clean committed blob after quarantining corrupt copy"
+    );
+
+    // --- 8. Delete `journal.sqlite3`, run `rebuild_mail_from_mirror`, and verify ALL invariants! ---
+    drop(alice_c);
+    drop(bob_c);
+    drop(carol_c);
+    drop(dan_c);
+    drop(worker_c);
+    drop(router);
+    drop(mail_svc);
+    drop(journal);
+
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = journal_path.as_os_str().to_os_string();
+        p.push(suffix);
+        let _ = fs::remove_file(std::path::PathBuf::from(p));
+    }
+
+    // Astra B5: First verify `rebuild_mail_from_mirror` FAILS CLOSED on an incomplete mirror or corrupt index!
+    let broken_mirror = tmp.path().join("broken-mirror");
+    fs::create_dir_all(broken_mirror.join("state")).unwrap();
+    fs::write(
+        broken_mirror.join("state/mail-index.jsonl"),
+        format!(
+            "{{\"schema\":1,\"sha256\":\"{}\",\"path\":\"mail/missing.md\",\"to\":[\"bob\"],\"created_at_ms\":1000,\"origin\":\"send\"}}\n",
+            sent_k1.sha256
+        ),
+    )
+    .unwrap();
+    let broken_out = tmp.path().join("broken-out");
+    let incomplete_err = rebuild_mail_from_mirror(
+        &broken_mirror,
+        &broken_out.join("broken1.sqlite3"),
+        &AliasMap::empty(),
+        &protection,
+    )
+    .expect_err("rebuild must fail closed when indexed content bytes are missing");
+    assert!(
+        incomplete_err.to_string().contains("incomplete mirror"),
+        "unexpected error: {incomplete_err}"
+    );
+
+    fs::write(broken_mirror.join("state/mail-index.jsonl"), "{not-json\n").unwrap();
+    let corrupt_idx_err = rebuild_mail_from_mirror(
+        &broken_mirror,
+        &broken_out.join("broken2.sqlite3"),
+        &AliasMap::empty(),
+        &protection,
+    )
+    .expect_err("rebuild must fail closed on malformed mail-index.jsonl row");
+    assert!(
+        corrupt_idx_err
+            .to_string()
+            .contains("corrupt row at state/mail-index.jsonl"),
+        "unexpected error: {corrupt_idx_err}"
+    );
+
+    // Now run real `rebuild_mail_from_mirror` on `mirror_dir`!
+    rebuild_mail_from_mirror(&mirror_dir, &journal_path, &AliasMap::empty(), &protection)
+        .expect("lossless rebuild");
+
+    let j_rebuilt = Journal::open(&journal_path).unwrap();
+    let st_rebuilt = MailState::from_journal(&j_rebuilt).unwrap();
+
+    // Check Astra should B2/S1 (`refs` with comma + `note` with surrounding spaces):
+    assert_eq!(
+        st_rebuilt.messages[&keyless_parent.sha256].message.refs,
+        vec!["RFC, Annex A".to_owned(), "Section 4.2".to_owned()]
+    );
+    assert_eq!(
+        st_rebuilt.ack_records[&(bob.clone(), rev_a_sha.clone())]
+            .note
+            .as_deref(),
+        Some("  exact padded note  ")
+    );
+    // Check Astra B8/S4 (`A -> B -> A` current head after rebuild):
+    assert_eq!(
+        st_rebuilt
+            .lookup_target(Some(Path::new("mail/toggle.md")), None)
+            .unwrap()
+            .message
+            .sha256,
+        rev_a_sha
+    );
+    // Check Astra B6 (separate-pass `to-carol` recipient preserved after rebuild):
+    assert_eq!(
+        st_rebuilt.messages[&multi_sep_sha].message.to,
+        vec![bob.clone(), carol.clone()]
+    );
+    // Check Astra B7 (16-hex reply `re` AND keyless `@alice` author preserved after rebuild):
+    let rebuilt_dm_envs = j_rebuilt
+        .read(&StreamId::Room { room: dm_room }, Seq::ORIGIN, 100)
+        .unwrap();
+    let rebuilt_parent_env = rebuilt_dm_envs
+        .iter()
+        .find(|e| {
+            format!("{:?}", e.event).contains(&keyless_parent.sha256.as_str()[..16])
+                && matches!(
+                    e.event,
+                    rex_wave_api::Event::Room(rex_wave_api::room::RoomEvent::Posted { .. })
+                )
+        })
+        .expect("rebuilt parent post");
+    assert_eq!(
+        rebuilt_parent_env.by,
+        Principal::Seat {
+            seat: alice.clone()
+        }
+    );
+    let rebuilt_child_re = rebuilt_dm_envs
+        .iter()
+        .find_map(|e| match &e.event {
+            rex_wave_api::Event::Room(rex_wave_api::room::RoomEvent::Posted {
+                body, re, ..
+            }) if body.as_str().contains(&child_16hex.sha256.as_str()[..16]) => Some(*re),
+            _ => None,
+        })
+        .expect("rebuilt child post");
+    assert_eq!(
+        rebuilt_child_re,
+        Some(rebuilt_parent_env.seq),
+        "16-hex parent reference must resolve to parent room seq after rebuild"
+    );
+
+    // Check Astra B2: BOTH `dup-k1` AND `dup-k2` replay cleanly after rebuild!
+    let w_rebuilt = j_rebuilt.claim(StreamId::Mail).unwrap();
+    let b_rebuilt = MailBridge::open(sandbox, j_rebuilt, w_rebuilt).unwrap();
+    for key_name in ["dup-k1", "dup-k2"] {
+        let mut retry_req = send_req_k1.clone();
+        retry_req.idem = Some(IdemKey::parse(key_name).unwrap());
+        let WireReply::MailSend(replayed) = b_rebuilt
+            .dispatch(
+                MailCommand::MailSend(retry_req),
+                DecideCtx::for_test(
+                    Principal::Seat {
+                        seat: alice.clone(),
+                    },
+                    UnixMs(1_795_699_999_000),
+                ),
+            )
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(
+            replayed.replayed,
+            "key {key_name} must replay after rebuild"
+        );
+        assert_eq!(replayed.sha256, sent_k1.sha256);
+    }
+}

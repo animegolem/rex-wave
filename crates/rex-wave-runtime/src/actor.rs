@@ -349,6 +349,7 @@ impl<D: Decider> StreamActor<D> {
         if let Some(key) = &idem
             && let Some(prior) = self.writer.lookup(key).map_err(store_error)?
         {
+            D::authorize_replay(&self.state, &cmd, ctx)?;
             ensure_dm_idem_author(self.writer.stream(), ctx.by(), &prior)?;
             return Ok(D::reply(&self.state, cmd, &prior));
         }
@@ -373,6 +374,7 @@ impl<D: Decider> StreamActor<D> {
                 Ok(D::reply(&self.state, cmd, &committed))
             }
             Appended::Replayed(prior) => {
+                D::authorize_replay(&self.state, &cmd, ctx)?;
                 ensure_dm_idem_author(self.writer.stream(), ctx.by(), &prior)?;
                 Ok(D::reply(&self.state, cmd, &prior))
             }

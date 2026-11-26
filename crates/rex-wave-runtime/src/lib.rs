@@ -123,6 +123,15 @@ pub trait Decider: Send + Sync + 'static {
     fn address(cmd: &Self::Cmd, ctx: &DecideCtx) -> Result<StreamId, ApiError>;
     /// Idempotency key carried by the command, if any.
     fn idem(cmd: &Self::Cmd) -> Option<IdemKey>;
+    /// Authorize an idempotent replay before [`Registry`] returns a cached
+    /// `IdemKey` reply without invoking [`Self::decide`].
+    fn authorize_replay(
+        _state: &Self::State,
+        _cmd: &Self::Cmd,
+        _ctx: &DecideCtx,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
     /// Policy: validate against current state and emit events. No I/O.
     /// Returning no events is how read-only commands (views) work.
     fn decide(

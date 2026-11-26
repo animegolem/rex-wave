@@ -238,6 +238,307 @@ pub fn lock_exclusive_blocking(file: &File) -> io::Result<()> {
     rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)
 }
 
+fn validate_at_leaf_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name.as_bytes().iter().any(|&b| b == b'/' || b == 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid leaf file name '{name}'"),
+        ));
+    }
+    Ok(())
+}
+
+/// Open the directory at `path` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`)
+/// and return its open handle after verifying `fstat` reports a directory.
+pub fn open_dir_nofollow(path: &Path) -> io::Result<File> {
+    let not_dir = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a real directory", path.display()),
+        )
+    };
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|e| {
+            if is_symlink_refusal(&e) || e.raw_os_error() == Some(libc::ENOTDIR) {
+                not_dir()
+            } else {
+                e
+            }
+        })?;
+    let meta = dir.metadata()?;
+    if !meta.is_dir() {
+        return Err(not_dir());
+    }
+    Ok(dir)
+}
+
+/// Open child directory `name` relative to `dir_fd` (`O_DIRECTORY | O_NOFOLLOW`).
+pub fn open_sub_dir_at(dir_fd: &File, name: &str) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    validate_at_leaf_name(name)?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = openat(dir_fd, name, flags, Mode::empty()).map_err(|e| {
+        if e == rustix::io::Errno::LOOP
+            || e == rustix::io::Errno::MLINK
+            || e == rustix::io::Errno::NOTDIR
+        {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing non-directory or symlink segment '{name}'"),
+            )
+        } else {
+            io::Error::from(e)
+        }
+    })?;
+    let f = File::from(fd);
+    if !f.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{name}' is not a directory"),
+        ));
+    }
+    Ok(f)
+}
+
+/// Open regular file `name` read-only relative to `dir_fd` (`O_NOFOLLOW | O_NONBLOCK`).
+pub fn open_regular_at(dir_fd: &File, name: &str) -> io::Result<(File, Metadata)> {
+    use rustix::fs::{Mode, OFlags, openat};
+    validate_at_leaf_name(name)?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = openat(dir_fd, name, flags, Mode::empty()).map_err(|e| {
+        if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::MLINK {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to follow symlink '{name}'"),
+            )
+        } else {
+            io::Error::from(e)
+        }
+    })?;
+    let f = File::from(fd);
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{name}' is not a regular file"),
+        ));
+    }
+    Ok((f, meta))
+}
+
+/// Open (creating with `mode` when absent) regular file `name` for initial
+/// bounded reading and subsequent appending relative to `dir_fd` (`O_NOFOLLOW`).
+pub fn open_rw_append_at(dir_fd: &File, name: &str, mode: u32) -> io::Result<(File, Metadata)> {
+    use rustix::fs::{Mode, OFlags, openat};
+    validate_at_leaf_name(name)?;
+    #[allow(clippy::unnecessary_cast)]
+    let raw_mode = mode as rustix::fs::RawMode;
+    let flags = OFlags::RDWR
+        | OFlags::APPEND
+        | OFlags::CREATE
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::CLOEXEC;
+    let fd = openat(dir_fd, name, flags, Mode::from_raw_mode(raw_mode)).map_err(|e| {
+        if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::MLINK {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to follow symlink '{name}'"),
+            )
+        } else {
+            io::Error::from(e)
+        }
+    })?;
+    let f = File::from(fd);
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{name}' is not a regular file"),
+        ));
+    }
+    Ok((f, meta))
+}
+
+/// Open (creating with `0600` when absent) advisory lock file `name` relative
+/// to `dir_fd` (`O_NOFOLLOW`).
+pub fn open_lock_at(dir_fd: &File, name: &str) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    validate_at_leaf_name(name)?;
+    #[allow(clippy::unnecessary_cast)]
+    let raw_mode = 0o600 as rustix::fs::RawMode;
+    let flags =
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = openat(dir_fd, name, flags, Mode::from_raw_mode(raw_mode)).map_err(|e| {
+        if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::MLINK {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to follow symlink '{name}'"),
+            )
+        } else {
+            io::Error::from(e)
+        }
+    })?;
+    let f = File::from(fd);
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{name}' is not a regular file"),
+        ));
+    }
+    f.set_permissions(Permissions::from_mode(0o600))?;
+    Ok(f)
+}
+
+/// Create `name` inside `dir_fd` holding `bytes` only if nothing exists there,
+/// using `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` + `linkat` + `unlinkat` on `dir_fd`.
+pub fn write_atomic_if_absent_at(
+    dir_fd: &File,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+    sync_dir: bool,
+) -> io::Result<bool> {
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, statat, unlinkat};
+    validate_at_leaf_name(name)?;
+    match statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => return Ok(false),
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let raw_mode = mode as rustix::fs::RawMode;
+    let tmp_flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let pid = std::process::id();
+    let mut created = None;
+    for _ in 0..MAX_TEMP_ATTEMPTS {
+        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{name}.tmp.{pid}.{nonce}");
+        if tmp_name.len() > 255 {
+            let short_tmp = format!(".rex.tmp.{pid}.{nonce}");
+            match openat(dir_fd, &short_tmp, tmp_flags, Mode::from_raw_mode(raw_mode)) {
+                Ok(fd) => {
+                    created = Some((short_tmp, File::from(fd)));
+                    break;
+                }
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(e) => return Err(io::Error::from(e)),
+            }
+        } else {
+            match openat(dir_fd, &tmp_name, tmp_flags, Mode::from_raw_mode(raw_mode)) {
+                Ok(fd) => {
+                    created = Some((tmp_name, File::from(fd)));
+                    break;
+                }
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(e) => return Err(io::Error::from(e)),
+            }
+        }
+    }
+    let Some((tmp_name, mut tmp_file)) = created else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("no free temp name beside '{name}'"),
+        ));
+    };
+    let private = mode & 0o077 == 0;
+    let filled = (if private {
+        tmp_file.set_permissions(Permissions::from_mode(mode))
+    } else {
+        Ok(())
+    })
+    .and_then(|()| tmp_file.write_all(bytes))
+    .and_then(|()| tmp_file.sync_all());
+    drop(tmp_file);
+    if let Err(e) = filled {
+        let _ = unlinkat(dir_fd, &tmp_name, AtFlags::empty());
+        return Err(e);
+    }
+    let linked = linkat(dir_fd, &tmp_name, dir_fd, name, AtFlags::empty());
+    let _ = unlinkat(dir_fd, &tmp_name, AtFlags::empty());
+    match linked {
+        Ok(()) => {
+            if sync_dir {
+                dir_fd.sync_all()?;
+            }
+            Ok(true)
+        }
+        Err(rustix::io::Errno::EXIST) => Ok(false),
+        Err(e) => Err(io::Error::from(e)),
+    }
+}
+
+/// Atomically claim regular file `name` inside `dir_fd` via `renameat` after
+/// verifying `open_regular_at(dir_fd, name)` matches `expected` `(dev, ino)`.
+pub fn claim_regular_at(
+    dir_fd: &File,
+    name: &str,
+    expected: FileId,
+    claim_prefix: &str,
+) -> io::Result<(String, File, Metadata)> {
+    use rustix::fs::{AtFlags, FileType, renameat, statat};
+    validate_at_leaf_name(name)?;
+    let (_verify_f, verify_meta) = open_regular_at(dir_fd, name)?;
+    if file_id(&verify_meta) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{name}' changed before claim"),
+        ));
+    }
+    let claim_name = format!("{claim_prefix}{name}");
+    validate_at_leaf_name(&claim_name)?;
+    match statat(dir_fd, &claim_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to replace symlink '{claim_name}'"),
+            ));
+        }
+        Ok(_) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    renameat(dir_fd, name, dir_fd, &claim_name).map_err(io::Error::from)?;
+    let (claimed_f, claimed_meta) = open_regular_at(dir_fd, &claim_name)?;
+    Ok((claim_name, claimed_f, claimed_meta))
+}
+
+/// Read `name` inside `dir_fd` (`O_NOFOLLOW`) and return its bytes ONLY if
+/// `(dev, ino)` and `len` match `expected` and `expected_len`. Caller verifies
+/// content hash before invoking [`unlink_regular_at`].
+pub fn read_claimed_at_if_unchanged(
+    dir_fd: &File,
+    name: &str,
+    expected: FileId,
+    expected_len: u64,
+    max_bytes: u64,
+) -> io::Result<Option<Vec<u8>>> {
+    let Ok((file, meta)) = open_regular_at(dir_fd, name) else {
+        return Ok(None);
+    };
+    if file_id(&meta) != expected || meta.len() != expected_len {
+        return Ok(None);
+    }
+    let bytes = read_open_bounded(Path::new(name), file, &meta, max_bytes)?;
+    Ok(Some(bytes))
+}
+
+/// Unlink regular file `name` inside `dir_fd` via `unlinkat`.
+pub fn unlink_regular_at(dir_fd: &File, name: &str) -> io::Result<()> {
+    use rustix::fs::{AtFlags, unlinkat};
+    validate_at_leaf_name(name)?;
+    unlinkat(dir_fd, name, AtFlags::empty()).map_err(io::Error::from)
+}
+
 /// Atomically claim `path` by renaming it to `<parent>/<claim_prefix><orig_name>`
 /// after verifying `path` still refers to regular file `expected` (`O_NOFOLLOW`).
 pub fn claim_regular_sibling(
@@ -1489,6 +1790,69 @@ impl ConfinedDir {
     /// missing ones with `mode`), refusing symlinks; returns its path.
     pub fn ensure_subdir(&self, rel: &RelPath, mode: u32) -> io::Result<PathBuf> {
         self.walk(rel.segments(), Some(mode))
+    }
+
+    /// Descriptor-anchored directory walk beneath `self.root`: opens `self.root`
+    /// with `O_DIRECTORY | O_NOFOLLOW` and steps through `segments` via `openat`
+    /// (`mkdirat` when `create` is `Some`), returning the verified open handle
+    /// without re-traversing any pathname.
+    pub fn open_subdir_fd(&self, segments: &[SafeName], create: Option<u32>) -> io::Result<File> {
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        let mut cur = open_dir_nofollow(&self.root)?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        for seg in segments {
+            let next_fd = match openat(&cur, seg.as_str(), flags, Mode::empty()) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) if create.is_some() => {
+                    let mode = create.expect("checked by guard");
+                    #[allow(clippy::unnecessary_cast)]
+                    let raw_mode = mode as rustix::fs::RawMode;
+                    match mkdirat(&cur, seg.as_str(), Mode::from_raw_mode(raw_mode)) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(e) => return Err(io::Error::from(e)),
+                    }
+                    openat(&cur, seg.as_str(), flags, Mode::empty()).map_err(|e| {
+                        if e == rustix::io::Errno::LOOP
+                            || e == rustix::io::Errno::MLINK
+                            || e == rustix::io::Errno::NOTDIR
+                        {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("refusing symlink or non-directory '{}'", seg.as_str()),
+                            )
+                        } else {
+                            io::Error::from(e)
+                        }
+                    })?
+                }
+                Err(rustix::io::Errno::NOENT) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("segment '{}' does not exist", seg.as_str()),
+                    ));
+                }
+                Err(e)
+                    if e == rustix::io::Errno::LOOP
+                        || e == rustix::io::Errno::MLINK
+                        || e == rustix::io::Errno::NOTDIR =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("refusing symlink or non-directory '{}'", seg.as_str()),
+                    ));
+                }
+                Err(e) => return Err(io::Error::from(e)),
+            };
+            let next_file = File::from(next_fd);
+            if !next_file.metadata()?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("'{}' is not a directory", seg.as_str()),
+                ));
+            }
+            cur = next_file;
+        }
+        Ok(cur)
     }
 }
 
