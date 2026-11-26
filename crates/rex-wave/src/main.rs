@@ -10,6 +10,7 @@ use rex_wave_api::{
         Assign, Assignee, BoardFilter, BoardId, BoardView, CardArchive, CardNo, CardPatch,
         CardUpsert, LaneName, Priority, Title,
     },
+    config::{ConfigGet, ConfigSet, ConfigShow, SETTINGS_FIELDS},
     mail::{LetterPriority, MailPromote},
     notify::InboxList,
     presence::{
@@ -176,6 +177,9 @@ pub enum Cmd {
     /// Run the read-only shadow mail reactor and Gate 2 shadow scorer.
     #[command(subcommand)]
     Mail(MailCmd),
+    /// Inspect or update operator configuration (`~/.config/rex-wave/config.toml`).
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// List ranked inbox notifications.
     Inbox {
         #[arg(long)]
@@ -272,10 +276,10 @@ pub enum WaveCmd {
         worker_writes: Vec<String>,
         #[arg(long = "worker-schema")]
         worker_schemas: Vec<String>,
-        #[arg(long, default_value = "accept-edits")]
-        permission: String,
-        #[arg(long, default_value = "managed-worktree")]
-        workspace: String,
+        #[arg(long)]
+        permission: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Add a worker (`role=provider[/model]`) to a running wave.
     #[command(name = "add-worker", visible_alias = "add")]
@@ -294,10 +298,10 @@ pub enum WaveCmd {
         writes: Vec<PathBuf>,
         #[arg(long = "return-schema")]
         return_schema: Option<String>,
-        #[arg(long, default_value = "accept-edits")]
-        permission: String,
-        #[arg(long, default_value = "managed-worktree")]
-        workspace: String,
+        #[arg(long)]
+        permission: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Approve a worker's pending interaction.
     Approve {
@@ -551,6 +555,27 @@ pub enum TaskCmd {
     },
     /// Archive a Kanban card.
     Archive { board: String, no: u32 },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCmd {
+    /// Show full operator configuration and live runner/courier health.
+    Show,
+    /// Read one dotted configuration key (e.g. `runners.default_runner`).
+    Get { key: String },
+    /// Set one dotted configuration key and persist to `config.toml`.
+    Set {
+        key: String,
+        value: String,
+        #[arg(long = "id", alias = "idem")]
+        idem: Option<String>,
+    },
+    /// Reset/clear one dotted configuration key back to its default.
+    Unset {
+        key: String,
+        #[arg(long = "id", alias = "idem")]
+        idem: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1456,6 +1481,7 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
         Cmd::Wave(wave_cmd) => wave_to_command(wave_cmd),
         Cmd::Tasks(task_cmd) => task_to_command(task_cmd, me),
         Cmd::Presence(pres_cmd) => presence_to_command(pres_cmd, me),
+        Cmd::Config(cfg_cmd) => config_to_command(cfg_cmd),
         Cmd::Daemon(_)
         | Cmd::Tui { .. }
         | Cmd::Mcp { .. }
@@ -1490,8 +1516,8 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             let project = BbProjectId::parse(project.clone())?;
             let goal_raw = read_text_source(goal.as_ref(), goal_file.as_ref(), "goal")?;
             let goal_body = Body::parse(goal_raw.trim_end_matches('\n').to_owned())?;
-            let perm = parse_permission(permission)?;
-            let ws = parse_workspace(workspace)?;
+            let perm = parse_permission(permission.as_deref().unwrap_or("accept-edits"))?;
+            let ws = parse_workspace(workspace.as_deref().unwrap_or("managed-worktree"))?;
 
             let mut parsed_workers = Vec::with_capacity(workers.len());
             for entry in workers {
@@ -1593,6 +1619,11 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                     workers: parsed_workers,
                 },
                 idem: None,
+                config_defaults: rex_wave_api::wave::WaveConfigDefaults {
+                    permission: permission.is_none(),
+                    workspace: workspace.is_none(),
+                    ..Default::default()
+                },
             }))
         }
         WaveCmd::AddWorker {
@@ -1608,8 +1639,8 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             workspace,
         } => {
             let wave = WaveSlug::parse(wave.clone())?;
-            let perm = parse_permission(permission)?;
-            let ws = parse_workspace(workspace)?;
+            let perm = parse_permission(permission.as_deref().unwrap_or("accept-edits"))?;
+            let ws = parse_workspace(workspace.as_deref().unwrap_or("managed-worktree"))?;
             let brief_raw = read_text_source(brief.as_ref(), brief_file.as_ref(), "brief")?;
             let mut spec = parse_worker_spec(worker, brief_raw, perm, ws, account.clone())?;
             spec.output_dir = output_dir.clone();
@@ -1624,6 +1655,11 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             Ok(WireCommand::WaveAddWorker(WaveAddWorker {
                 wave,
                 worker: spec,
+                config_defaults: rex_wave_api::wave::WaveConfigDefaults {
+                    permission: permission.is_none(),
+                    workspace: workspace.is_none(),
+                    ..Default::default()
+                },
             }))
         }
         WaveCmd::Approve {
@@ -2319,6 +2355,23 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
     }
 }
 
+fn config_to_command(cmd: &ConfigCmd) -> Result<WireCommand, ApiError> {
+    match cmd {
+        ConfigCmd::Show => Ok(WireCommand::ConfigShow(ConfigShow {})),
+        ConfigCmd::Get { key } => Ok(WireCommand::ConfigGet(ConfigGet { key: key.clone() })),
+        ConfigCmd::Set { key, value, idem } => Ok(WireCommand::ConfigSet(ConfigSet {
+            key: key.clone(),
+            value: Some(value.clone()),
+            idem: idem.as_deref().map(IdemKey::parse).transpose()?,
+        })),
+        ConfigCmd::Unset { key, idem } => Ok(WireCommand::ConfigSet(ConfigSet {
+            key: key.clone(),
+            value: None,
+            idem: idem.as_deref().map(IdemKey::parse).transpose()?,
+        })),
+    }
+}
+
 fn parse_watch_target(
     target: &str,
     since: u64,
@@ -2328,6 +2381,12 @@ fn parse_watch_target(
         "inbox" => Ok((Interest::MyInbox, Cursor::live())),
         "sidebar" => Ok((Interest::Sidebar, Cursor::live())),
         "everything" => Ok((Interest::Everything, Cursor::live())),
+        "config" => Ok((
+            Interest::Streams {
+                streams: vec![StreamId::Config],
+            },
+            Cursor::default().with(StreamId::Config, Seq(since)),
+        )),
         other => {
             if let Some(rest) = other.strip_prefix("agent:") {
                 let (w, r) = rest
@@ -2570,6 +2629,71 @@ fn print_reply(reply: &WireReply, as_json: bool) {
                 res.record.status,
                 res.live_bindings.len()
             );
+        }
+        WireReply::ConfigShow(snap)
+        | WireReply::ConfigSet(snap)
+        | WireReply::ConfigSyncFile(snap) => {
+            let path = snap
+                .config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(in-memory)".to_owned());
+            let eff = snap
+                .effective_default_runner
+                .map(|r| r.as_str())
+                .unwrap_or("auto");
+            println!(
+                "config (head={}, file={}, effective_default={}):",
+                snap.head.0, path, eff
+            );
+            if !snap.runners_health.is_empty() {
+                let parts: Vec<String> = snap
+                    .runners_health
+                    .iter()
+                    .map(|rh| {
+                        let st = if rh.configured && rh.healthy {
+                            "ok".to_owned()
+                        } else if rh.configured {
+                            rh.detail.clone().unwrap_or_else(|| "degraded".to_owned())
+                        } else {
+                            rh.detail.clone().unwrap_or_else(|| "off".to_owned())
+                        };
+                        format!("{}={st}", rh.runner.display_name())
+                    })
+                    .collect();
+                println!("  runners: {}", parts.join("  "));
+            }
+            if !snap.couriers_health.is_empty() {
+                let parts: Vec<String> = snap
+                    .couriers_health
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}({}/{}/{}{})",
+                            c.name,
+                            c.rung,
+                            c.unknown,
+                            c.refused,
+                            if c.degraded { ",degraded" } else { "" }
+                        )
+                    })
+                    .collect();
+                println!("  couriers: {}", parts.join("  "));
+            }
+            if let Some(ref perr) = snap.persist_error {
+                println!("  persist_error: {perr}");
+            }
+            for spec in SETTINGS_FIELDS {
+                let val = snap.config.get_key(spec.key).ok().flatten();
+                println!("  {} = {}", spec.key, val.as_deref().unwrap_or("(default)"));
+            }
+        }
+        WireReply::ConfigGet(v) => {
+            if let Some(ref val) = v.value {
+                println!("{val}");
+            } else {
+                println!("(default)");
+            }
         }
         WireReply::WaveStart(w) => {
             println!(

@@ -370,6 +370,7 @@ fn principal_mail_address(p: &Principal) -> String {
             SystemPart::MailBridge => "system/mail_bridge".into(),
             SystemPart::WakeBell => "system/wake_bell".into(),
             SystemPart::PresenceMonitor => "system/presence_monitor".into(),
+            SystemPart::ConfigSync => "system/config_sync".into(),
         },
     }
 }

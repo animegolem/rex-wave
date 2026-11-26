@@ -69,6 +69,8 @@ async fn sidebar_org_tree_skips_divider_folds_and_falls_back_on_rebuild() {
     assert_eq!(model.sidebar.cursor, NodeKey::ProjectsHeader);
 
     let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('G'));
+    assert_eq!(model.sidebar.cursor, NodeKey::Settings);
+    let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('k'));
     assert!(matches!(model.sidebar.cursor, NodeKey::Dm(_)));
     let _ = press(&mut model, Pane::Sidebar, KeyCode::Char('g'));
     assert_eq!(model.sidebar.cursor, NodeKey::Inbox);
@@ -1967,4 +1969,261 @@ async fn watch_connection_drives_reconnecting_badge_and_recovers_stage_on_reconn
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn settings_stage_supports_hotkey_cycling_inline_composer_reset_and_live_events() {
+    use rex_wave_api::config::{ConfigEvent, RexConfig, RunnerRoute};
+    use rex_wave_tui::input::{Action, Dir, Pane};
+    use rex_wave_tui::{ComposerTarget, demo::DemoClient};
+
+    let client = DemoClient::new();
+    let overview = match client
+        .call_wire(WireCommand::Sidebar(rex_wave_api::read::Sidebar::default()))
+        .await
+        .unwrap()
+    {
+        WireReply::Sidebar(s) => s,
+        other => panic!("unexpected: {other:?}"),
+    };
+    let mut model = Model::new(client.me().clone(), overview);
+
+    // Press `,` (`Action::OpenSettings`) to jump straight to Settings stage.
+    let open_fx = update(&mut model, Msg::Action(Action::OpenSettings));
+    assert_eq!(model.sidebar.cursor, NodeKey::Settings);
+    assert_eq!(model.focus, Pane::Stage);
+    assert!(
+        open_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(StageTarget::Settings)))
+    );
+    let seq = model.stage_req_seq;
+    let (init_res, _) =
+        rex_wave_tui::load_stage_target(&client, &model.sidebar_snapshot, &StageTarget::Settings)
+            .await;
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(seq),
+            result: init_res.unwrap(),
+        },
+    );
+    assert!(matches!(model.stage, Stage::Settings(_)));
+
+    // Render and verify health badges + couriers + settings rows appear.
+    let mut term = Terminal::new(TestBackend::new(132, 38)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let scr = screen_text(&term);
+    assert!(scr.contains("Settings · Operator Configuration"));
+    assert!(scr.contains("BB"));
+    assert!(scr.contains("T3"));
+    assert!(scr.contains("Native"));
+    assert!(scr.contains("demo-toast"));
+    assert!(scr.contains("runners.default_runner"));
+
+    // Cycle `runners.default_runner` via `l` (`Move(Dir::Right)`) -> `bb`, then `Space` -> `t3`.
+    for act in [Action::Move(Dir::Right), Action::StageSpace] {
+        for eff in update(&mut model, Msg::Action(act)) {
+            if let Effect::Call { tag, cmd } = eff {
+                let res = client.call_wire(cmd).await;
+                let _ = update(&mut model, Msg::Reply { tag, result: res });
+            }
+        }
+    }
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(
+            s.snapshot.config.runners.default_runner,
+            Some(RunnerRoute::T3)
+        );
+    } else {
+        panic!("expected Stage::Settings");
+    }
+
+    // Move to `harnesses.claude.model` (index 6) and open inline composer via Enter.
+    let _ = update(&mut model, Msg::Action(Action::SelectSetting(6)));
+    let _ = update(&mut model, Msg::Action(Action::Open));
+    assert_eq!(model.focus, Pane::Composer);
+    assert_eq!(
+        model.composer_target,
+        Some(ComposerTarget::ConfigKey {
+            key: "harnesses.claude.model".into(),
+        })
+    );
+    let _ = update(
+        &mut model,
+        Msg::Action(Action::Paste("claude-opus-5-5".into())),
+    );
+    for eff in update(&mut model, Msg::Action(Action::Submit)) {
+        if let Effect::Call { tag, cmd } = eff {
+            let res = client.call_wire(cmd).await;
+            let _ = update(&mut model, Msg::Reply { tag, result: res });
+        }
+    }
+    assert_eq!(model.focus, Pane::Stage);
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(
+            s.snapshot.config.get_key("harnesses.claude.model").unwrap(),
+            Some("claude-opus-5-5".into())
+        );
+    }
+
+    // Reopen composer with `i` -> pre-populated with current value; clear and empty-submit -> resets to None.
+    let _ = update(&mut model, Msg::Action(Action::Compose));
+    assert_eq!(model.focus, Pane::Composer);
+    if let Stage::Settings(ref mut s) = model.stage {
+        assert_eq!(s.composer.as_str(), "claude-opus-5-5");
+        let _ = s.composer.take();
+    }
+    for eff in update(&mut model, Msg::Action(Action::Submit)) {
+        if let Effect::Call { tag, cmd } = eff {
+            let res = client.call_wire(cmd).await;
+            let _ = update(&mut model, Msg::Reply { tag, result: res });
+        }
+    }
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(
+            s.snapshot.config.get_key("harnesses.claude.model").unwrap(),
+            None,
+            "empty composer submit on ConfigKey must reset to None"
+        );
+    }
+
+    // Live `Event::Config` frame updates SettingsView immediately.
+    let mut external_cfg = RexConfig::default();
+    external_cfg.mail.export_enabled = true;
+    let live_env = Envelope {
+        stream: StreamId::Config,
+        seq: Seq(42),
+        at: UnixMs(1_700_000_000_000),
+        by: client.me().clone(),
+        event: Event::Config(ConfigEvent::Updated {
+            key: "mail.export_enabled".into(),
+            value: Some("true".into()),
+            config: Box::new(external_cfg),
+        }),
+    };
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Stage,
+            frame: Frame::Committed(live_env),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.snapshot.head, Seq(42));
+        assert!(s.snapshot.config.mail.export_enabled);
+        assert_eq!(
+            s.status_banner.as_deref(),
+            Some("Saved mail.export_enabled = true")
+        );
+    }
+
+    // Stale `Event::Config` (`seq <= head`) and stale `ConfigSet` reply (`head < current`) must be ignored.
+    let mut stale_cfg = RexConfig::default();
+    stale_cfg.runners.default_runner = Some(RunnerRoute::Bb);
+    let stale_env = Envelope {
+        stream: StreamId::Config,
+        seq: Seq(10),
+        at: UnixMs(1_700_000_000_001),
+        by: client.me().clone(),
+        event: Event::Config(ConfigEvent::Updated {
+            key: "runners.default_runner".into(),
+            value: Some("bb".into()),
+            config: Box::new(stale_cfg.clone()),
+        }),
+    };
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Stage,
+            frame: Frame::Committed(stale_env),
+        },
+    );
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Ok(WireReply::ConfigSet(rex_wave_api::config::ConfigSnapshot {
+                head: Seq(10),
+                config: stale_cfg,
+                config_path: None,
+                effective_default_runner: Some(RunnerRoute::Bb),
+                runners_health: Vec::new(),
+                couriers_health: Vec::new(),
+                persist_error: None,
+            })),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.snapshot.head, Seq(42));
+        assert!(s.snapshot.config.mail.export_enabled);
+        assert_eq!(s.snapshot.config.runners.default_runner, None);
+    }
+
+    // Restart-only keys annotate the banner with `(restart required)`.
+    let mut grace_cfg = RexConfig::default();
+    grace_cfg.mail.reconnect_grace_ms = 5000;
+    let grace_env = Envelope {
+        stream: StreamId::Config,
+        seq: Seq(43),
+        at: UnixMs(1_700_000_000_002),
+        by: client.me().clone(),
+        event: Event::Config(ConfigEvent::Updated {
+            key: "mail.reconnect_grace_ms".into(),
+            value: Some("5000".into()),
+            config: Box::new(grace_cfg),
+        }),
+    };
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Stage,
+            frame: Frame::Committed(grace_env),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.snapshot.head, Seq(43));
+        assert_eq!(
+            s.status_banner.as_deref(),
+            Some("Saved mail.reconnect_grace_ms = 5000 (restart required)")
+        );
+    }
+
+    // Failed ConfigKey submission preserves the typed draft and updates status_banner.
+    model.composer_target = Some(ComposerTarget::ConfigKey {
+        key: "mail.mirror_dir".into(),
+    });
+    model.focus = Pane::Composer;
+    if let Stage::Settings(ref mut s) = model.stage {
+        let _ = s.composer.take();
+        s.composer.insert_str("relative/bad/path");
+    }
+    let _ = update(&mut model, Msg::Action(Action::Submit));
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Err(rex_wave_api::ApiError::Invalid(rex_wave_api::InvalidId {
+                what: "mail.mirror_dir".into(),
+                reason: "must be absolute".into(),
+            })),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.composer.as_str(), "relative/bad/path");
+        assert!(
+            s.status_banner
+                .as_deref()
+                .is_some_and(|b| b.starts_with("Error:")),
+            "unexpected status_banner: {:?}",
+            s.status_banner
+        );
+    }
+
+    // `h` (`Move(Dir::Left)`) returns focus to Sidebar.
+    let _ = update(&mut model, Msg::Action(Action::Move(Dir::Left)));
+    assert_eq!(model.focus, Pane::Sidebar);
 }

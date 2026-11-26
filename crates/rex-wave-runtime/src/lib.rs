@@ -30,6 +30,7 @@
 //! `watch` channel.
 
 mod actor;
+mod config;
 mod feed_router;
 mod hub;
 mod reactor;
@@ -38,6 +39,9 @@ mod router;
 mod sidebar;
 
 pub use actor::Registry;
+pub use config::{
+    ConfigDecider, ConfigHook, ConfigService, ConfigState, replay_config_from_journal,
+};
 pub use feed_router::{FeedRouter, ThreadIdResolver, fallback_parked_room_and_since};
 pub use hub::Hub;
 pub use reactor::{Reactor, spawn_reactor};
@@ -67,6 +71,14 @@ pub struct DecideCtx {
 impl DecideCtx {
     pub(crate) fn new(by: Principal, at: UnixMs) -> Self {
         Self { by, at }
+    }
+
+    /// Stamps a daemon-internal system context for internal sync/health hooks.
+    pub fn for_system_part(part: rex_wave_api::SystemPart) -> Self {
+        Self {
+            by: Principal::System { part },
+            at: now(),
+        }
     }
 
     /// A context for driving a decider directly in a test. Compiled out of

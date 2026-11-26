@@ -4,7 +4,10 @@ pub mod router;
 pub mod workspace;
 
 pub use rex_wave_runtime::BoxFut;
-pub use router::{HostRouter, RoutedProvider, route_provider, route_thread};
+pub use router::{
+    HostRouter, RoutedProvider, WaveService, apply_harness_defaults, lookup_pinned_runner,
+    route_provider, route_provider_with_config, route_thread,
+};
 pub use workspace::{
     BbProjectLocation, ProjectWorkspaceLocation, default_bb_data_dir, expand_tilde,
     looks_like_workspace_path, lookup_bb_project_location, normalize_workspace_path_key,
@@ -354,6 +357,9 @@ struct WorkerRecord {
 }
 
 fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool {
+    if let Some((expected_runner, _)) = RunnerKind::strip_provider_prefix(provider.as_str()) {
+        return obs_th.runner_kind() != expected_runner;
+    }
     let is_t3 = obs_th.as_str().starts_with("t3:");
     let prov = provider.as_str();
     (is_t3 && matches!(prov, "pi" | "cursor")) || (!is_t3 && prov == "antigravity")
@@ -362,6 +368,7 @@ fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool 
 #[derive(Clone, Debug, Default)]
 pub struct WaveState {
     spec: Option<WaveSpec>,
+    request_digest: Option<String>,
     room: Option<RoomId>,
     board: Option<BoardId>,
     opener: Option<Principal>,
@@ -465,7 +472,12 @@ impl Decider for Waves {
                     }
                 }
                 if let Some(existing) = &state.spec {
-                    if existing == &c.spec {
+                    let digest_matches = c.config_defaults.request_digest.is_some()
+                        && state.request_digest == c.config_defaults.request_digest;
+                    let legacy_spec_matches = state.request_digest.is_none()
+                        && c.config_defaults.request_digest.is_none()
+                        && existing == &c.spec;
+                    if digest_matches || legacy_spec_matches {
                         return Ok(vec![]);
                     }
                     return Err(ApiError::conflict(format!(
@@ -480,6 +492,7 @@ impl Decider for Waves {
                     spec: c.spec.clone(),
                     room,
                     board,
+                    request_digest: c.config_defaults.request_digest.clone(),
                 });
                 for (w, (output_dir, writes)) in c.spec.workers.iter().zip(resolved_workers) {
                     let mut agent = w.agent.clone().unwrap_or_else(|| c.spec.defaults.clone());
@@ -532,6 +545,7 @@ impl Decider for Waves {
                     .clone()
                     .unwrap_or_else(|| spec.defaults.clone());
                 if matches!(ctx.by(), Principal::Worker { .. })
+                    && !c.config_defaults.account_from_config
                     && let Some(req_acct) = agent.account.as_deref()
                     && Some(req_acct) != spec.defaults.account.as_deref()
                 {
@@ -961,8 +975,14 @@ impl Decider for Waves {
     fn evolve(state: &mut WaveState, event: &WaveEvent, meta: &EntryMeta) {
         state.head = meta.seq;
         match event {
-            WaveEvent::Started { spec, room, board } => {
+            WaveEvent::Started {
+                spec,
+                room,
+                board,
+                request_digest,
+            } => {
                 state.spec = Some(spec.clone());
+                state.request_digest = request_digest.clone();
                 state.room = Some(room.clone());
                 state.board = Some(board.clone());
                 state.opener = Some(meta.by.clone());
@@ -1703,7 +1723,9 @@ impl<H: AgentHost> WaveConductor<H> {
     async fn apply_live<C: Client>(&mut self, env: &Envelope, client: &C) -> Result<(), ApiError> {
         match (&env.stream, &env.event) {
             (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
-                WaveEvent::Started { spec, room, board } => {
+                WaveEvent::Started {
+                    spec, room, board, ..
+                } => {
                     self.ensure_wave_room(client, wave, room, &spec.goal)
                         .await?;
                     self.ensure_project_board(client, board).await?;
@@ -2264,6 +2286,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -2280,6 +2303,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -2294,7 +2318,8 @@ mod tests {
                 op.clone(),
                 WaveCommand::WaveStart(WaveStart {
                     spec: conflicting,
-                    idem: None
+                    idem: None,
+                    config_defaults: Default::default()
                 })
             ),
             Err(ApiError::Conflict { .. })
@@ -2322,6 +2347,7 @@ mod tests {
                             writes: Vec::new(),
                             return_schema: None,
                         },
+                        config_defaults: Default::default(),
                     }),
                 ),
                 Err(ApiError::Denied { .. })
@@ -2360,6 +2386,7 @@ mod tests {
                             writes: Vec::new(),
                             return_schema: None,
                         },
+                        config_defaults: Default::default(),
                     }),
                 ),
                 Err(ApiError::Denied { .. })
@@ -2388,6 +2415,7 @@ mod tests {
                     writes: Vec::new(),
                     return_schema: None,
                 },
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -2512,6 +2540,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -3039,6 +3068,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -3215,6 +3245,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         let wave = WaveSlug::parse("auth-v2").unwrap();
@@ -3307,6 +3338,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -3339,6 +3371,7 @@ mod tests {
                 writes: Vec::new(),
                 return_schema: None,
             },
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -3424,6 +3457,7 @@ mod tests {
         block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         let mut author_briefs = 0;
@@ -3488,6 +3522,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
@@ -3667,6 +3702,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -3840,6 +3876,7 @@ mod tests {
                     writes: Vec::new(),
                     return_schema: None,
                 },
+                config_defaults: Default::default(),
             }),
         )
         .unwrap_err();
@@ -3937,6 +3974,7 @@ mod tests {
                 WaveCommand::WaveStart(WaveStart {
                     spec: bad_wave,
                     idem: None,
+                    config_defaults: Default::default(),
                 }),
             ),
             Err(ApiError::Invalid(_))
@@ -3953,6 +3991,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: overlap,
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap_err();
@@ -3976,6 +4015,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: good.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -3994,6 +4034,7 @@ mod tests {
                     writes: vec![PathBuf::from("./src/auth.rs")],
                     return_schema: None,
                 },
+                config_defaults: Default::default(),
             }),
         )
         .unwrap_err();
@@ -4018,6 +4059,7 @@ mod tests {
                 WaveCommand::WaveStart(WaveStart {
                     spec: bad_schema,
                     idem: None,
+                    config_defaults: Default::default(),
                 }),
             ),
             Err(ApiError::Invalid(_))
@@ -4055,7 +4097,12 @@ mod tests {
             &sys_conductor,
         ))
         .unwrap();
-        block_on(op.call(WaveStart { spec, idem: None })).unwrap();
+        block_on(op.call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        }))
+        .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
         let reqs = host.spawn_requests.lock().unwrap().clone();

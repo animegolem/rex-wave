@@ -5,6 +5,7 @@
 //! [`Cursor`], so a dropped doorbell can never lose data.
 
 use crate::board::{BoardEvent, BoardId};
+use crate::config::ConfigEvent;
 use crate::id::{BbProjectId, Label, Principal, RoleName, Seq, UnixMs, WaveSlug};
 use crate::mail::MailEvent;
 use crate::notify::InboxEvent;
@@ -41,6 +42,8 @@ pub enum StreamId {
     Mail,
     /// Durable seat records and ephemeral live session bindings.
     Presence,
+    /// Operator configuration ledger synced with `~/.config/rex-wave/config.toml`.
+    Config,
 }
 
 /// One committed journal entry.
@@ -65,6 +68,7 @@ pub enum Event {
     Inbox(InboxEvent),
     Mail(MailEvent),
     Presence(PresenceEvent),
+    Config(ConfigEvent),
 }
 
 impl Event {
@@ -79,6 +83,7 @@ impl Event {
                 | (Event::Inbox(_), StreamId::Inbox { .. })
                 | (Event::Mail(_), StreamId::Mail)
                 | (Event::Presence(_), StreamId::Presence)
+                | (Event::Config(_), StreamId::Config)
         )
     }
 }

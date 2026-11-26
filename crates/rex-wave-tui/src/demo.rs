@@ -73,6 +73,8 @@ struct DemoState {
     inbox: InboxPage,
     rooms: BTreeMap<RoomId, Vec<Envelope>>,
     workers: BTreeMap<RoleName, WorkerRecord>,
+    config: rex_wave_api::config::RexConfig,
+    config_head: Seq,
     archived_projects: BTreeSet<BbProjectId>,
     archived_waves: BTreeSet<WaveSlug>,
     archived_rooms: BTreeSet<RoomId>,
@@ -586,6 +588,8 @@ impl DemoClient {
             inbox,
             rooms,
             workers,
+            config: rex_wave_api::config::RexConfig::default(),
+            config_head: Seq::ORIGIN,
             archived_projects: BTreeSet::new(),
             archived_waves: BTreeSet::new(),
             archived_rooms: BTreeSet::new(),
@@ -626,6 +630,50 @@ impl DemoClient {
 }
 
 impl DemoState {
+    fn config_snapshot(&self) -> rex_wave_api::config::ConfigSnapshot {
+        use rex_wave_api::config::{CourierHealthStatus, RunnerHealthStatus, RunnerRoute};
+        rex_wave_api::config::ConfigSnapshot {
+            head: self.config_head,
+            config: self.config.clone(),
+            config_path: Some(std::path::PathBuf::from("~/.config/rex-wave/config.toml")),
+            effective_default_runner: Some(
+                self.config
+                    .runners
+                    .default_runner
+                    .unwrap_or(RunnerRoute::Bb),
+            ),
+            runners_health: vec![
+                RunnerHealthStatus {
+                    runner: RunnerRoute::Bb,
+                    configured: true,
+                    healthy: true,
+                    detail: None,
+                },
+                RunnerHealthStatus {
+                    runner: RunnerRoute::T3,
+                    configured: true,
+                    healthy: true,
+                    detail: None,
+                },
+                RunnerHealthStatus {
+                    runner: RunnerRoute::Native,
+                    configured: false,
+                    healthy: false,
+                    detail: Some("unconfigured".into()),
+                },
+            ],
+            couriers_health: vec![CourierHealthStatus {
+                name: "demo-toast".into(),
+                executable: true,
+                rung: 2,
+                unknown: 0,
+                refused: 0,
+                degraded: false,
+            }],
+            persist_error: None,
+        }
+    }
+
     fn sidebar_snapshot(&self, me: &Principal) -> SidebarTreeSnapshot {
         let mut unread = 0u32;
         let mut blocking = 0u32;
@@ -1104,6 +1152,33 @@ impl Client for DemoClient {
                     let _ = sidebar_tx.send(st.sidebar_snapshot(&me));
                     WireReply::SetArchived(Ack)
                 }
+                WireCommand::ConfigShow(_) => WireReply::ConfigShow(st.config_snapshot()),
+                WireCommand::ConfigGet(c) => {
+                    let canon = rex_wave_api::config::canonicalize_config_key(&c.key)?;
+                    let value = st.config.get_key(canon)?;
+                    WireReply::ConfigGet(rex_wave_api::config::ConfigValueView {
+                        head: st.config_head,
+                        key: canon.to_owned(),
+                        value,
+                    })
+                }
+                WireCommand::ConfigSet(c) => {
+                    let mut next = st.config.clone();
+                    next.set_key(&c.key, c.value.as_deref())?;
+                    if next != st.config {
+                        st.config = next;
+                        st.config_head = st.config_head.next();
+                    }
+                    WireReply::ConfigSet(st.config_snapshot())
+                }
+                WireCommand::ConfigSyncFile(c) => {
+                    c.config.validate()?;
+                    if c.config != st.config {
+                        st.config = c.config;
+                        st.config_head = st.config_head.next();
+                    }
+                    WireReply::ConfigSyncFile(st.config_snapshot())
+                }
             };
             Ok(reply)
         }
@@ -1388,6 +1463,54 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
     retarget_sync(client, &mut model, NodeKey::Room(wave_room)).await?;
     term.draw(|f| view(&model, f, &mut hits, &mut cards))
         .expect("draw");
+
+    retarget_sync(client, &mut model, NodeKey::Settings).await?;
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .expect("draw");
+    {
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("Settings · Operator Configuration")
+                && screen.contains("runners.default_runner"),
+            "Settings stage must render operator configuration fields"
+        );
+    }
+    let cycle_effects = update(&mut model, Msg::Action(Action::StageSpace));
+    for eff in cycle_effects {
+        if let Effect::Call { tag, cmd } = eff {
+            let res = client.call_wire(cmd).await;
+            let _ = update(&mut model, Msg::Reply { tag, result: res });
+        }
+    }
+    if let crate::stage::Stage::Settings(ref s) = model.stage {
+        assert_eq!(
+            s.snapshot.config.runners.default_runner,
+            Some(rex_wave_api::config::RunnerRoute::Bb),
+            "Space on runners.default_runner must cycle auto -> bb"
+        );
+    } else {
+        panic!("expected Stage::Settings after retarget");
+    }
+    let reset_effects = update(&mut model, Msg::Action(Action::Accelerator('x')));
+    for eff in reset_effects {
+        if let Effect::Call { tag, cmd } = eff {
+            let res = client.call_wire(cmd).await;
+            let _ = update(&mut model, Msg::Reply { tag, result: res });
+        }
+    }
+    if let crate::stage::Stage::Settings(ref s) = model.stage {
+        assert_eq!(
+            s.snapshot.config.runners.default_runner, None,
+            "x on runners.default_runner must reset to None"
+        );
+    }
 
     retarget_sync(client, &mut model, NodeKey::Inbox).await?;
     let effects = update(&mut model, Msg::Action(Action::Accelerator('a')));

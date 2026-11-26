@@ -13,6 +13,7 @@
 //! * `TOOLS`, the MCP / BB tool catalog, each entry carrying its JSON Schema.
 
 use crate::board::*;
+use crate::config::*;
 use crate::mail::*;
 use crate::notify::*;
 use crate::presence::*;
@@ -227,6 +228,12 @@ commands! {
         PresenceTransportHealth -> Ack                : "presence_transport_health", System, true,  "Report transport provider health to trip or clear TransportDown status.";
         PresenceList            -> PresenceSnapshot   : "presence_list",             Member, false, "List durable seats and live session bindings.";
         PresenceResolve         -> PresenceResolution : "presence_resolve",          Member, false, "Resolve a seat name, alias, or project to its durable record and live bindings.";
+    }
+    Config(ConfigCommand) {
+        ConfigShow     -> ConfigSnapshot  : "config_show",      Operator, false, "Show current operator configuration and live runner/courier health.";
+        ConfigGet      -> ConfigValueView : "config_get",       Operator, false, "Read one dotted configuration key.";
+        ConfigSet      -> ConfigSnapshot  : "config_set",       Operator, true,  "Set or clear one dotted configuration key (persisted to journal and config.toml).";
+        ConfigSyncFile -> ConfigSnapshot  : "config_sync_file", System,   true,  "Internal startup sync from config.toml into StreamId::Config.";
     }
     Read(ReadCommand) {
         Read       -> Page                : "read",        Member, false, "Page one stream after a seq.";

@@ -7,7 +7,9 @@
 //! `serve_listener_with_hooks` (`StateDirAuthenticator` + RAII `PresenceUnbind`)
 //! with graceful `ctrl_c` shutdown.
 
+use crate::config_file::{TomlConfigHook, daemon_config_file_path, reconcile_startup_config};
 use crate::http::{HttpConfig, bind_http, serve_http_listener};
+use rex_wave_api::config::RunnerRoute;
 use rex_wave_api::presence::{BindingStatus, PresenceList, PresenceUnbind, TransportEndpoint};
 use rex_wave_api::wave::{Observation, WaveEvent};
 use rex_wave_api::*;
@@ -17,8 +19,8 @@ use rex_wave_mailbridge::{BellCourier, MailBridge, Presence, SandboxRoot};
 use rex_wave_notify::{Herald, HeraldHandle, Inbox};
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
-    AgentFeed, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection,
-    ThreadIdResolver, spawn_reactor,
+    AgentFeed, ConfigService, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router,
+    SidebarProjection, ThreadIdResolver, spawn_reactor,
 };
 use rex_wave_store::Journal;
 use rex_wave_t3::{
@@ -52,6 +54,9 @@ pub struct DaemonArgs {
     /// Journal path (default: `<socket_dir>/journal.sqlite3`).
     #[arg(long)]
     pub journal: Option<PathBuf>,
+    /// Operator configuration file path (default: `$XDG_CONFIG_HOME/rex-wave/config.toml`, `<state_dir>/config.toml` under `--socket`, or `~/.config/rex-wave/config.toml`; pass `--config ""` to disable file sync).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Non-production mail sandbox root (must contain `.rex-wave-sandbox`).
     #[arg(long)]
     pub mail_sandbox: PathBuf,
@@ -86,8 +91,8 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub http: Option<SocketAddr>,
     /// `MailUnrung` reconnect grace window in milliseconds (tests shorten it).
-    #[arg(long, default_value_t = rex_wave_notify::RECONNECT_GRACE_MS, hide = true)]
-    pub herald_grace_ms: u64,
+    #[arg(long, hide = true)]
+    pub herald_grace_ms: Option<u64>,
 }
 
 pub fn default_t3_home() -> Option<PathBuf> {
@@ -527,7 +532,7 @@ fn journal_thread_resolver(journal: Journal) -> ThreadIdResolver {
 
 pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(), String> {
     let operator = SeatName::parse(&args.operator).map_err(|e| e.to_string())?;
-    if args.herald_grace_ms == 0 {
+    if args.herald_grace_ms == Some(0) {
         return Err("--herald-grace-ms must be positive".into());
     }
     let house =
@@ -580,6 +585,24 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let journal = Journal::open(&journal_path).map_err(|e| format!("open journal: {e}"))?;
     let hub = Hub::new(4096);
+    let config_path = daemon_config_file_path(
+        args.config.as_deref(),
+        socket_override.is_some(),
+        &state_dir,
+    );
+    let config_hook = TomlConfigHook::new(
+        config_path.clone(),
+        state_dir.clone(),
+        RunnerRoute::from_runner_kind(default_target),
+        matches!(runner_mode, RunnerMode::Bb | RunnerMode::Both),
+        matches!(runner_mode, RunnerMode::T3 | RunnerMode::Both),
+    );
+    let config_svc =
+        ConfigService::with_hook(journal.clone(), hub.clone(), Some(config_hook.clone()))
+            .map_err(|e| format!("init config service: {e}"))?;
+    let reconciled_cfg =
+        reconcile_startup_config(&journal, &config_svc, config_path.as_deref(), &state_dir).await?;
+
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let mail_writer = journal
         .claim(StreamId::Mail)
@@ -610,12 +633,26 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
                     })
                 }),
             )
-            .with_default_runner(default_target),
+            .with_default_runner(default_target)
+            .with_config_watch(config_svc.subscribe())
+            .with_pin_store(state_dir.join("router-pins.json")),
         ),
         RunnerMode::T3 => None,
     };
 
-    let t3_bridge = t3_cfg.map(T3Bridge::new);
+    let t3_bridge = t3_cfg.map(|cfg| T3Bridge::new(cfg.with_config_watch(config_svc.subscribe())));
+    config_hook.bind_runner_liveness(
+        bb_bridge.as_ref().map(|b| {
+            let b = b.clone();
+            Arc::new(move || b.connected()) as _
+        }),
+        t3_bridge.as_ref().map(|t| {
+            let t = t.clone();
+            Arc::new(move || t.connected()) as _
+        }),
+    );
+    let bb_conn_rx = bb_bridge.as_ref().map(|b| b.watch_connected());
+    let t3_conn_rx = t3_bridge.as_ref().map(|t| t.watch_connected());
 
     let mut feed_entries: Vec<(RunnerKind, Arc<dyn AgentFeed>)> = Vec::new();
     if let Some(ref t) = t3_bridge {
@@ -629,9 +666,17 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_thread_resolver(journal_thread_resolver(journal.clone())),
     );
 
+    let presence_svc = presence.registry(journal.clone(), hub.clone());
+    config_hook.bind_presence(presence_svc.clone());
+
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+        wave: rex_wave_waves::WaveService::new(
+            Registry::<Waves>::new(journal.clone(), hub.clone()),
+            default_target,
+            Some(config_svc.subscribe()),
+        )
+        .with_state_dir(state_dir.clone()),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
@@ -640,7 +685,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             mail_writer,
             hub.clone(),
         )),
-        presence: presence.registry(journal.clone(), hub.clone()),
+        presence: presence_svc,
+        config: config_svc.clone(),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -649,11 +695,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         }),
     });
 
-    let default_target = match runner_mode {
-        RunnerMode::T3 => RunnerKind::T3,
-        RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
-    };
     let host_router = HostRouter::new(default_target)
+        .with_config_watch(config_svc.subscribe())
+        .with_pin_store(state_dir.join("router-pins.json"))
         .with_optional_host(
             RunnerKind::Bb,
             bb_bridge.as_ref().map(|b| BbHost(b.clone())),
@@ -668,7 +712,10 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         WaveConductor::new(host_router),
         system(SystemPart::WaveConductor),
     );
-    let herald = Herald::with_grace(Duration::from_millis(args.herald_grace_ms))
+    let effective_herald_grace_ms = args
+        .herald_grace_ms
+        .unwrap_or(reconciled_cfg.mail.reconnect_grace_ms);
+    let herald = Herald::with_grace(Duration::from_millis(effective_herald_grace_ms))
         .with_operator_surface_seat(presence.house().operator_seat.clone());
     let herald_handle = herald.handle();
     let herald_client = system(SystemPart::Herald);
@@ -677,6 +724,43 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
+    let mut bridge_health_tasks = Vec::new();
+    for (transport, label, rx_opt) in [
+        (
+            rex_wave_api::presence::TransportKind::BbThread,
+            "BB",
+            bb_conn_rx,
+        ),
+        (
+            rex_wave_api::presence::TransportKind::T3Thread,
+            "T3 Code",
+            t3_conn_rx,
+        ),
+    ] {
+        if let Some(mut rx) = rx_opt {
+            let mon = system(SystemPart::PresenceMonitor);
+            bridge_health_tasks.push(tokio::spawn(async move {
+                let init_live = *rx.borrow_and_update();
+                let _ = mon
+                    .call(rex_wave_api::presence::PresenceTransportHealth {
+                        transport,
+                        down: !init_live,
+                        detail: (!init_live).then(|| format!("{label} bridge disconnected")),
+                    })
+                    .await;
+                while rx.changed().await.is_ok() {
+                    let live = *rx.borrow_and_update();
+                    let _ = mon
+                        .call(rex_wave_api::presence::PresenceTransportHealth {
+                            transport,
+                            down: !live,
+                            detail: (!live).then(|| format!("{label} bridge disconnected")),
+                        })
+                        .await;
+                }
+            }));
+        }
+    }
     let sink_task = tokio::spawn(rex_wave_mailbridge::serve_wake_bell_sink(
         args.wake_bell,
         system(SystemPart::WakeBell),
@@ -731,6 +815,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     herald_grace_task.abort();
     bell_task.abort();
     presence_disconnect_task.abort();
+    for t in bridge_health_tasks {
+        t.abort();
+    }
     if let Some(t) = bb_task {
         t.abort();
     }
@@ -806,6 +893,7 @@ mod tests {
         let journal = state_dir.join("journal.sqlite3");
         let bad_args = DaemonArgs {
             journal: Some(journal.clone()),
+            config: None,
             mail_sandbox: unmarked_sb,
             bb_url: "ws://127.0.0.1:1/disabled".into(),
             bb_token: String::new(),
@@ -816,7 +904,7 @@ mod tests {
             operator: "ops".into(),
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
-            herald_grace_ms: 100,
+            herald_grace_ms: Some(100),
         };
         assert!(run(bad_args, Some(sock.clone())).await.is_err());
         assert!(!sock.exists(), "failed start must not leave socket file");
@@ -833,6 +921,7 @@ mod tests {
         std::fs::write(valid_sb.join(".rex-wave-sandbox"), b"ok\n").unwrap();
         let second_args = DaemonArgs {
             journal: Some(journal),
+            config: None,
             mail_sandbox: valid_sb,
             bb_url: "ws://127.0.0.1:1/disabled".into(),
             bb_token: String::new(),
@@ -843,7 +932,7 @@ mod tests {
             operator: "intruder".into(),
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
-            herald_grace_ms: 100,
+            herald_grace_ms: Some(100),
         };
         let second_err = run(second_args, Some(sock.clone())).await.unwrap_err();
         assert!(
@@ -882,6 +971,7 @@ mod tests {
         let journal = state_dir.join("journal.sqlite3");
         let args = DaemonArgs {
             journal: Some(journal.clone()),
+            config: None,
             mail_sandbox: sandbox_dir,
             bb_url: "ws://127.0.0.1:1/disabled".into(),
             bb_token: String::new(),
@@ -892,7 +982,7 @@ mod tests {
             operator: "owner".into(),
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
-            herald_grace_ms: 100,
+            herald_grace_ms: Some(100),
         };
         let err = run(args, Some(sock)).await.unwrap_err();
         assert!(

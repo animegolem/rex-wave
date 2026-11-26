@@ -58,6 +58,8 @@ pub enum StageTarget {
         wave: WaveSlug,
         role: RoleName,
     },
+    /// Operator configuration and live runner/courier health (`StreamId::Config`).
+    Settings,
 }
 
 impl StageTarget {
@@ -74,6 +76,9 @@ impl StageTarget {
             StageTarget::Agent { wave, role } => Interest::Agent {
                 wave: wave.clone(),
                 role: role.clone(),
+            },
+            StageTarget::Settings => Interest::Streams {
+                streams: vec![StreamId::Config, StreamId::Presence],
             },
         }
     }

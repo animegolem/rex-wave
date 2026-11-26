@@ -91,6 +91,7 @@ pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
         | StreamId::Board { .. }
         | StreamId::Mail
         | StreamId::Presence => true,
+        StreamId::Config => false,
     };
     if allowed {
         Ok(())

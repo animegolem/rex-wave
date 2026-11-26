@@ -6,6 +6,7 @@
 //! token authentication, and `404 Not Found` visibility masking.
 
 use rex_wave_api::board::{Priority, Title};
+use rex_wave_api::config::{ConfigGet, ConfigSet, ConfigShow};
 use rex_wave_api::http_guard::{is_json_content_type, strip_bearer};
 pub use rex_wave_api::http_guard::{is_loopback_host, is_matching_loopback_origin};
 use rex_wave_api::notify::{InboxAck, InboxList};
@@ -155,6 +156,8 @@ enum Route {
     Inbox,
     InboxAck,
     Presence,
+    ConfigGet,
+    ConfigSet,
     Events,
     RoomMessagesGet { room: String },
     RoomMessagesPost { room: String },
@@ -644,6 +647,10 @@ fn match_route(method: HttpMethod, raw_path: &str) -> Result<Route, HttpError> {
         (HttpMethod::Get, ["v1", "inbox"]) => Ok(Route::Inbox),
         (HttpMethod::Post, ["v1", "inbox", "ack"]) => Ok(Route::InboxAck),
         (HttpMethod::Get, ["v1", "presence"]) => Ok(Route::Presence),
+        (HttpMethod::Get, ["v1", "config"] | ["api", "config"]) => Ok(Route::ConfigGet),
+        (HttpMethod::Post | HttpMethod::Patch, ["v1", "config"] | ["api", "config"]) => {
+            Ok(Route::ConfigSet)
+        }
         (HttpMethod::Get, ["v1", "events"]) => Ok(Route::Events),
         (HttpMethod::Get, ["v1", "rooms", room, "messages"]) => Ok(Route::RoomMessagesGet {
             room: percent_decode_path(room)?,
@@ -975,6 +982,24 @@ struct UpdateTaskPayload {
     idem: Option<IdemKey>,
 }
 
+fn deserialize_explicit_opt_str<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
+}
+
+#[derive(Deserialize)]
+struct SetConfigPayload {
+    key: String,
+    #[serde(default, deserialize_with = "deserialize_explicit_opt_str")]
+    value: Option<Option<String>>,
+    #[serde(default)]
+    unset: bool,
+    #[serde(default, alias = "id")]
+    idem: Option<IdemKey>,
+}
+
 async fn dispatch_json_route(
     route: Route,
     req: &ParsedRequest,
@@ -1086,6 +1111,51 @@ async fn dispatch_json_route(
                 })
                 .await
                 .map_err(|e| mask_err(e, "presence"))?;
+            Ok(("200 OK", to_json_value(&snap)?))
+        }
+        Route::ConfigGet => {
+            if let Some(key) = req.query_param("key") {
+                let view = client
+                    .call(ConfigGet {
+                        key: key.to_owned(),
+                    })
+                    .await
+                    .map_err(|e| mask_err(e, "config"))?;
+                Ok(("200 OK", to_json_value(&view)?))
+            } else {
+                let snap = client
+                    .call(ConfigShow {})
+                    .await
+                    .map_err(|e| mask_err(e, "config"))?;
+                Ok(("200 OK", to_json_value(&snap)?))
+            }
+        }
+        Route::ConfigSet => {
+            rex_wave_api::authorize(Audience::Operator, &principal)
+                .map_err(|e| mask_err(e, "config"))?;
+            let payload: SetConfigPayload = parse_json_body(&req.body)?;
+            let value = if payload.unset {
+                None
+            } else {
+                match payload.value {
+                    Some(v) => v,
+                    None => {
+                        return Err(HttpError::new(
+                            "400 Bad Request",
+                            "invalid",
+                            "missing 'value' field (pass null or \"unset\": true to clear)",
+                        ));
+                    }
+                }
+            };
+            let snap = client
+                .call(ConfigSet {
+                    key: payload.key,
+                    value,
+                    idem: payload.idem,
+                })
+                .await
+                .map_err(|e| mask_err(e, "config"))?;
             Ok(("200 OK", to_json_value(&snap)?))
         }
         Route::RoomMessagesGet { room } => {
@@ -1460,9 +1530,12 @@ fn parse_sse_stream_param(raw: &str) -> Result<StreamId, ApiError> {
     if trimmed == "mail" {
         return Ok(StreamId::Mail);
     }
+    if trimmed == "config" {
+        return Ok(StreamId::Config);
+    }
     Err(ApiError::Invalid(InvalidId {
         what: "stream".into(),
-        reason: "expected StreamId JSON, inbox:<principal>, presence, or mail".into(),
+        reason: "expected StreamId JSON, inbox:<principal>, presence, mail, or config".into(),
     }))
 }
 

@@ -258,6 +258,8 @@ pub struct T3Config {
     pub system_principal: Principal,
     /// Daemon-wide default runner used when verifying unprefixed `Requested` providers.
     pub default_runner: rex_wave_api::RunnerKind,
+    /// Optional live operator configuration receiver for dynamic runner and model overrides.
+    pub config_rx: Option<tokio::sync::watch::Receiver<rex_wave_api::config::RexConfig>>,
     pub default_models: BTreeMap<String, String>,
     pub rpc_timeout: Duration,
     pub connect_timeout: Duration,
@@ -283,6 +285,7 @@ impl T3Config {
                 part: SystemPart::T3Bridge,
             },
             default_runner: rex_wave_api::RunnerKind::T3,
+            config_rx: None,
             default_models: BTreeMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -303,6 +306,7 @@ impl T3Config {
                 part: SystemPart::T3Bridge,
             },
             default_runner: rex_wave_api::RunnerKind::T3,
+            config_rx: None,
             default_models: BTreeMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -313,6 +317,14 @@ impl T3Config {
 
     pub fn with_default_runner(mut self, runner: rex_wave_api::RunnerKind) -> Self {
         self.default_runner = runner;
+        self
+    }
+
+    pub fn with_config_watch(
+        mut self,
+        rx: tokio::sync::watch::Receiver<rex_wave_api::config::RexConfig>,
+    ) -> Self {
+        self.config_rx = Some(rx);
         self
     }
 

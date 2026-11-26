@@ -20,6 +20,10 @@ use rex_wave_api::{
         Assign, BoardEvent, BoardId, BoardSnapshot, BoardView, Card, LaneCards, LaneName, Priority,
         project_board, seat_board,
     },
+    config::{
+        ConfigEvent, ConfigShow, ConfigSnapshot, RunnerHealthStatus, RunnerRoute, SETTINGS_FIELDS,
+        SettingFieldKind, SettingFieldSpec,
+    },
     notify::{InboxEvent, InboxList, InboxPage, Notification, NotifyKind, NotifyState},
     read::{
         AgentEvent, AgentEventKind, ContextCategoryKind, SidebarTreeSnapshot, ThreadContextUsage,
@@ -52,6 +56,7 @@ pub enum StageTarget {
     Kanban { board: Option<BoardId> },
     Room { room: RoomId },
     Agent { wave: WaveSlug, role: RoleName },
+    Settings,
     Summary { key: NodeKey },
 }
 
@@ -77,6 +82,7 @@ impl StageTarget {
                 wave: wave.clone(),
                 role: role.clone(),
             }),
+            StageTarget::Settings => Some(rex_wave_api::StageTarget::Settings),
             StageTarget::Summary { .. } => None,
         }
     }
@@ -100,6 +106,7 @@ pub fn target_for(key: &NodeKey) -> StageTarget {
             wave: wave.clone(),
             role: role.clone(),
         },
+        NodeKey::Settings => StageTarget::Settings,
         other => StageTarget::Summary { key: other.clone() },
     }
 }
@@ -159,6 +166,7 @@ pub fn plan_for(target: &StageTarget, overview: &SidebarTreeSnapshot, me: &Princ
             after: None,
             limit: Some(200),
         })),
+        StageTarget::Settings => Some(WireCommand::ConfigShow(ConfigShow {})),
         StageTarget::Summary { .. } => None,
     };
     Plan { initial, watch }
@@ -169,6 +177,7 @@ pub enum Stage {
     Kanban(KanbanView),
     Room(RoomView),
     Agent(AgentInspector),
+    Settings(SettingsView),
     Summary(NodeKey),
     Loading(StageTarget),
     Error { target: StageTarget, error: String },
@@ -540,6 +549,100 @@ impl AgentInspector {
     }
 }
 
+pub struct SettingsView {
+    pub snapshot: ConfigSnapshot,
+    pub base_default_runner: Option<RunnerRoute>,
+    pub selected: usize,
+    pub composer: Composer,
+    pub pending_draft: Option<String>,
+    pub scroll: ScrollState,
+    pub status_banner: Option<String>,
+    pub layout: RefCell<Vec<ItemSpan>>,
+}
+
+impl SettingsView {
+    pub fn new(snapshot: ConfigSnapshot) -> Self {
+        let base_default_runner = if snapshot.config.runners.default_runner.is_none() {
+            snapshot.effective_default_runner
+        } else {
+            None
+        };
+        let status_banner = snapshot
+            .persist_error
+            .as_ref()
+            .map(|perr| format!("Warning: journal saved, file sync failed: {perr}"));
+        Self {
+            snapshot,
+            base_default_runner,
+            selected: 0,
+            composer: Composer::new(),
+            pending_draft: None,
+            scroll: ScrollState::top(),
+            status_banner,
+            layout: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn update_snapshot(&mut self, snapshot: ConfigSnapshot) {
+        if snapshot.head < self.snapshot.head {
+            return;
+        }
+        if snapshot.config.runners.default_runner.is_none()
+            && snapshot.effective_default_runner.is_some()
+        {
+            self.base_default_runner = snapshot.effective_default_runner;
+        }
+        if let Some(ref perr) = snapshot.persist_error {
+            self.status_banner = Some(format!("Warning: journal saved, file sync failed: {perr}"));
+        }
+        if snapshot.head == self.snapshot.head {
+            self.snapshot.config_path = snapshot.config_path;
+            self.snapshot.effective_default_runner = snapshot.effective_default_runner;
+            self.snapshot.runners_health = snapshot.runners_health;
+            self.snapshot.couriers_health = snapshot.couriers_health;
+            self.snapshot.persist_error = snapshot.persist_error;
+        } else {
+            self.snapshot = snapshot;
+        }
+        self.selected = self.selected.min(SETTINGS_FIELDS.len().saturating_sub(1));
+    }
+
+    pub fn selected_spec(&self) -> Option<&'static SettingFieldSpec> {
+        SETTINGS_FIELDS.get(self.selected)
+    }
+
+    pub fn select_step(&mut self, delta: i8) {
+        if SETTINGS_FIELDS.is_empty() {
+            return;
+        }
+        let next = (self.selected as i64 + i64::from(delta))
+            .clamp(0, SETTINGS_FIELDS.len() as i64 - 1) as usize;
+        self.selected = next;
+        reveal_item(&mut self.scroll, &self.layout, next as u64);
+    }
+
+    pub fn select_index(&mut self, idx: usize) {
+        if SETTINGS_FIELDS.is_empty() {
+            return;
+        }
+        self.selected = idx.min(SETTINGS_FIELDS.len() - 1);
+        reveal_item(&mut self.scroll, &self.layout, self.selected as u64);
+    }
+
+    pub fn select_extreme(&mut self, top: bool) {
+        if SETTINGS_FIELDS.is_empty() {
+            return;
+        }
+        if top {
+            self.selected = 0;
+            self.scroll.to_top();
+        } else {
+            self.selected = SETTINGS_FIELDS.len() - 1;
+            reveal_item(&mut self.scroll, &self.layout, self.selected as u64);
+        }
+    }
+}
+
 pub struct StageRenderCtx<'a> {
     pub overview: &'a SidebarTreeSnapshot,
     pub graphics: GraphicsMode,
@@ -605,6 +708,35 @@ impl Stage {
                     }
                 }
             }
+            (Stage::Settings(view), Frame::Committed(env)) => {
+                if let Event::Config(ev) = &env.event {
+                    if env.seq <= view.snapshot.head {
+                        return;
+                    }
+                    view.snapshot.head = env.seq;
+                    view.snapshot.config = ev.config().clone();
+                    view.snapshot.effective_default_runner = view
+                        .snapshot
+                        .config
+                        .runners
+                        .default_runner
+                        .or(view.base_default_runner);
+                    match ev {
+                        ConfigEvent::Updated { key, value, .. } => {
+                            let shown = value.as_deref().unwrap_or("default");
+                            let suffix = if rex_wave_api::config::is_restart_only_config_key(key) {
+                                " (restart required)"
+                            } else {
+                                ""
+                            };
+                            view.status_banner = Some(format!("Saved {key} = {shown}{suffix}"));
+                        }
+                        ConfigEvent::SyncedFromFile { .. } => {
+                            view.status_banner = Some("Reloaded from config.toml".to_owned());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -634,6 +766,7 @@ impl Stage {
             Stage::Kanban(view) => render_kanban(view, area, buf, hits, &ctx),
             Stage::Room(view) => render_room(view, area, buf, hits, &ctx),
             Stage::Agent(inspector) => render_agent(inspector, area, buf, hits, &ctx),
+            Stage::Settings(view) => render_settings(view, area, buf, hits, &ctx),
             Stage::Summary(key) => render_summary(key, area, buf, &ctx),
             Stage::Loading(target) => render_loading(target, area, buf, &ctx),
             Stage::Error { target, error } => render_error(target, error, area, buf, &ctx),
@@ -739,6 +872,7 @@ pub fn target_label(target: &StageTarget, overview: &SidebarTreeSnapshot) -> Str
         StageTarget::Kanban { board: None } => "Kanban".to_owned(),
         StageTarget::Room { room } => room_label_in(room, overview),
         StageTarget::Agent { wave, role } => format!("@{wave}/{role}"),
+        StageTarget::Settings => "Settings".to_owned(),
         StageTarget::Summary { key } => node_label_in(key, overview),
     }
 }
@@ -764,13 +898,14 @@ fn node_label_in(key: &NodeKey, overview: &SidebarTreeSnapshot) -> String {
     match key {
         NodeKey::Inbox => "Inbox".to_owned(),
         NodeKey::Kanban => "Kanban".to_owned(),
-        NodeKey::Divider => "Overview".to_owned(),
+        NodeKey::Divider | NodeKey::FooterDivider => "Overview".to_owned(),
         NodeKey::ProjectsHeader => "Projects".to_owned(),
         NodeKey::Project(p) => format!("Project {}", project_display_name(overview, p)),
         NodeKey::Room(r) | NodeKey::Dm(r) => room_label_in(r, overview),
         NodeKey::Agent { wave, role } => format!("@{wave}/{role}"),
         NodeKey::ChannelsHeader => "Channels".to_owned(),
         NodeKey::DmsHeader => "Direct Messages".to_owned(),
+        NodeKey::Settings => "Settings".to_owned(),
     }
 }
 
@@ -1889,6 +2024,359 @@ fn agent_feed(inspector: &AgentInspector, width: u16) -> Vec<FeedItem> {
             }
         })
         .collect()
+}
+
+fn render_settings(
+    view: &SettingsView,
+    area: Rect,
+    buf: &mut Buffer,
+    hits: &mut HitMap,
+    ctx: &StageRenderCtx<'_>,
+) {
+    let title = format!(
+        "Settings · Operator Configuration (head #{})",
+        view.snapshot.head.0
+    );
+    let inner = draw_stage_frame(title, area, buf, ctx);
+    if inner.height < 6 || inner.width < 20 {
+        return;
+    }
+
+    let edit_label = view
+        .selected_spec()
+        .map(|s| format!(" {} = ", s.key))
+        .unwrap_or_else(|| " Value = ".to_owned());
+    let composer_h = composer_height(&view.composer, inner.width, ctx.composing, &edit_label);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(2),
+            Constraint::Length(composer_h),
+        ])
+        .split(inner);
+
+    let header_area = chunks[0];
+    let list_area = chunks[1];
+    let composer_area = chunks[2];
+
+    let default_runners: [RunnerHealthStatus; 3] = [
+        RunnerHealthStatus {
+            runner: RunnerRoute::Bb,
+            configured: false,
+            healthy: false,
+            detail: Some("unknown".into()),
+        },
+        RunnerHealthStatus {
+            runner: RunnerRoute::T3,
+            configured: false,
+            healthy: false,
+            detail: Some("unknown".into()),
+        },
+        RunnerHealthStatus {
+            runner: RunnerRoute::Native,
+            configured: false,
+            healthy: false,
+            detail: Some("unconfigured".into()),
+        },
+    ];
+    let health_slice: &[RunnerHealthStatus] = if view.snapshot.runners_health.is_empty() {
+        &default_runners
+    } else {
+        &view.snapshot.runners_health
+    };
+
+    let mut runner_spans: Vec<Span<'static>> = vec![Span::styled(
+        " Runners: ",
+        Style::default().fg(C_DIM).add_modifier(Modifier::BOLD),
+    )];
+    for rh in health_slice {
+        let (sym, color, state_txt) = if rh.configured && rh.healthy {
+            ("●", C_MINT, "ok".to_owned())
+        } else if rh.configured {
+            (
+                "◐",
+                C_AMBER,
+                rh.detail.clone().unwrap_or_else(|| "degraded".to_owned()),
+            )
+        } else {
+            (
+                "○",
+                C_DIM,
+                rh.detail.clone().unwrap_or_else(|| "off".to_owned()),
+            )
+        };
+        runner_spans.push(Span::styled(
+            format!("{sym} {} ", rh.runner.display_name()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        runner_spans.push(Span::styled(
+            format!("({state_txt})  "),
+            Style::default().fg(if rh.configured && !rh.healthy {
+                C_AMBER
+            } else {
+                C_DIM
+            }),
+        ));
+    }
+    if let Some(eff) = view.snapshot.effective_default_runner {
+        runner_spans.push(Span::styled("· effective: ", Style::default().fg(C_DIM)));
+        runner_spans.push(Span::styled(
+            eff.display_name(),
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Paragraph::new(Line::from(runner_spans)).render(
+        Rect::new(header_area.x, header_area.y, header_area.width, 1),
+        buf,
+    );
+
+    let path_str = view
+        .snapshot
+        .config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(in-memory)".to_owned());
+    let mut file_spans = vec![
+        Span::styled(" File: ", Style::default().fg(C_DIM)),
+        Span::styled(
+            truncate_chars(&path_str, header_area.width.saturating_sub(28) as usize),
+            Style::default().fg(C_TEXT),
+        ),
+        Span::styled(
+            format!("  ·  seq #{}", view.snapshot.head.0),
+            Style::default().fg(C_DIM),
+        ),
+    ];
+    if let Some(banner) = &view.status_banner {
+        file_spans.push(Span::styled("  ·  ", Style::default().fg(C_DIM)));
+        file_spans.push(Span::styled(
+            banner.clone(),
+            Style::default().fg(C_MINT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Paragraph::new(Line::from(file_spans)).render(
+        Rect::new(header_area.x, header_area.y + 1, header_area.width, 1),
+        buf,
+    );
+
+    let mut courier_spans = vec![Span::styled(" Couriers: ", Style::default().fg(C_DIM))];
+    if view.snapshot.couriers_health.is_empty() {
+        courier_spans.push(Span::styled(
+            "(none in couriers.d/)",
+            Style::default().fg(C_DIM),
+        ));
+    } else {
+        for (i, c) in view.snapshot.couriers_health.iter().enumerate() {
+            if i > 0 {
+                courier_spans.push(Span::styled("  ", Style::default().fg(C_DIM)));
+            }
+            let (sym, color) = if c.degraded {
+                ("✕", C_ROSE)
+            } else if !c.executable {
+                ("○", C_AMBER)
+            } else {
+                ("●", C_MINT)
+            };
+            courier_spans.push(Span::styled(
+                format!("{sym} {} ", c.name),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            courier_spans.push(Span::styled(
+                format!("({}/{}/{})", c.rung, c.unknown, c.refused),
+                Style::default().fg(C_DIM),
+            ));
+        }
+    }
+    Paragraph::new(Line::from(courier_spans)).render(
+        Rect::new(header_area.x, header_area.y + 2, header_area.width, 1),
+        buf,
+    );
+
+    let sep = "─".repeat(header_area.width as usize);
+    Paragraph::new(Line::from(Span::styled(
+        sep,
+        Style::default().fg(C_PANEL_IDLE),
+    )))
+    .render(
+        Rect::new(header_area.x, header_area.y + 3, header_area.width, 1),
+        buf,
+    );
+
+    let key_w = (list_area.width as usize).saturating_sub(26).clamp(18, 30);
+    let val_w = 18usize.min((list_area.width as usize).saturating_sub(key_w + 6).max(8));
+
+    let mut rows: Vec<(Option<usize>, Line<'static>)> =
+        Vec::with_capacity(SETTINGS_FIELDS.len() + 8);
+    let mut spans: Vec<ItemSpan> = Vec::with_capacity(SETTINGS_FIELDS.len());
+    let mut last_section: Option<&'static str> = None;
+
+    for (idx, spec) in SETTINGS_FIELDS.iter().enumerate() {
+        if last_section != Some(spec.section) {
+            if last_section.is_some() {
+                rows.push((None, Line::from("")));
+            }
+            last_section = Some(spec.section);
+            rows.push((
+                None,
+                Line::from(vec![
+                    Span::styled(" ── ", Style::default().fg(C_PANEL_IDLE)),
+                    Span::styled(
+                        spec.section,
+                        Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" ──", Style::default().fg(C_PANEL_IDLE)),
+                ]),
+            ));
+        }
+
+        let top_line = rows.len().min(u16::MAX as usize) as u16;
+        let reveal_top = if idx == 0 { 0 } else { top_line };
+        spans.push(ItemSpan {
+            key: idx as u64,
+            top: reveal_top,
+            height: 1,
+        });
+
+        let is_sel = idx == view.selected;
+        let bg = if is_sel { SEL_BG } else { Color::Reset };
+        let raw_val = view.snapshot.config.get_key(spec.key).ok().flatten();
+        let (val_display, val_color) = match raw_val {
+            Some(v) => match spec.kind {
+                SettingFieldKind::Bool if v == "true" => (v, C_MINT),
+                SettingFieldKind::Bool => (v, C_DIM),
+                SettingFieldKind::RunnerRoute { .. } => {
+                    let unconfigured = view
+                        .snapshot
+                        .runners_health
+                        .iter()
+                        .any(|rh| rh.runner.as_str() == v && !rh.configured);
+                    if unconfigured {
+                        (format!("{v} (unconfigured)"), C_AMBER)
+                    } else {
+                        (v, C_MINT)
+                    }
+                }
+                _ => (v, Color::White),
+            },
+            None => match spec.kind {
+                SettingFieldKind::RunnerRoute { .. } => {
+                    if spec.key == "runners.default_runner"
+                        && let Some(eff) = view.snapshot.effective_default_runner
+                    {
+                        (format!("auto ({})", eff.as_str()), C_DIM)
+                    } else {
+                        ("auto".to_owned(), C_DIM)
+                    }
+                }
+                SettingFieldKind::Permission | SettingFieldKind::Workspace => {
+                    ("default".to_owned(), C_DIM)
+                }
+                _ => ("(unset)".to_owned(), C_DIM),
+            },
+        };
+
+        let key_col = format!("{:<key_w$}", truncate_chars(spec.key, key_w));
+        let val_col = format!("{:<val_w$}", truncate_chars(&val_display, val_w));
+        let used = 2 + key_w + 2 + val_w + 2;
+        let hint_avail = (list_area.width as usize).saturating_sub(used);
+        let hint_col = if hint_avail >= 4 {
+            format!("  {}", truncate_chars(spec.hint, hint_avail))
+        } else {
+            String::new()
+        };
+
+        let mut line_spans = vec![
+            Span::styled(
+                if is_sel { "▸ " } else { "  " },
+                Style::default()
+                    .fg(C_ACCENT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                key_col,
+                Style::default()
+                    .fg(if is_sel { Color::White } else { C_TEXT })
+                    .bg(bg)
+                    .add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled("  ", Style::default().bg(bg)),
+            Span::styled(
+                val_col,
+                Style::default()
+                    .fg(val_color)
+                    .bg(bg)
+                    .add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(hint_col, Style::default().fg(C_DIM).bg(bg)),
+        ];
+        let rendered_w: usize = line_spans.iter().map(|s| display_width(&s.content)).sum();
+        if rendered_w < list_area.width as usize {
+            line_spans.push(Span::styled(
+                " ".repeat(list_area.width as usize - rendered_w),
+                Style::default().bg(bg),
+            ));
+        }
+
+        rows.push((
+            Some(idx),
+            Line::from(line_spans).style(Style::default().bg(bg)),
+        ));
+    }
+
+    *view.layout.borrow_mut() = spans;
+    let total = rows.len();
+    let start = view.scroll.resolve(total, list_area.height);
+    for (off, (opt_idx, line)) in rows
+        .into_iter()
+        .skip(start)
+        .take(list_area.height as usize)
+        .enumerate()
+    {
+        let row_rect = Rect::new(list_area.x, list_area.y + off as u16, list_area.width, 1);
+        if let Some(index) = opt_idx {
+            hits.push(row_rect, Target::SettingRow { index });
+        }
+        Paragraph::new(line).render(row_rect, buf);
+    }
+
+    let below = total.saturating_sub(start + list_area.height as usize);
+    if below > 0 && list_area.width > 20 {
+        let more = format!(" ↓ {below} more lines ");
+        let w = display_width(&more) as u16;
+        Paragraph::new(Line::from(Span::styled(
+            more,
+            Style::default().fg(Color::Black).bg(C_DIM),
+        )))
+        .render(
+            Rect::new(
+                list_area.right().saturating_sub(w + 1),
+                list_area.bottom() - 1,
+                w,
+                1,
+            ),
+            buf,
+        );
+    }
+
+    render_composer_box(
+        composer_area,
+        buf,
+        hits,
+        ctx,
+        &view.composer,
+        &edit_label,
+        "[j/k] select  [space/l] cycle  [enter/i] edit  [x] reset  [h] sidebar  [?] keys",
+    );
 }
 
 fn render_summary(key: &NodeKey, area: Rect, buf: &mut Buffer, ctx: &StageRenderCtx<'_>) {

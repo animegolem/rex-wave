@@ -459,6 +459,7 @@ pub enum SystemPart {
     MailBridge,
     WakeBell,
     PresenceMonitor,
+    ConfigSync,
 }
 
 impl Principal {

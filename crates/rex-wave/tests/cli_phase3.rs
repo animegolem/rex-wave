@@ -281,6 +281,7 @@ async fn cli_post_reply_read_wait_conflict_and_t3_worker_token_pickup() {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();

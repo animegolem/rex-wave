@@ -4315,6 +4315,8 @@ enum BbIdentityResolution {
 pub struct BbBridge {
     cfg: BridgeConfig,
     default_runner: std::sync::Mutex<RunnerKind>,
+    config_rx: std::sync::Mutex<Option<watch::Receiver<rex_wave_api::config::RexConfig>>>,
+    pin_store: std::sync::Mutex<Option<PathBuf>>,
     data_dir: Option<PathBuf>,
     owner: mpsc::UnboundedSender<OwnerMsg>,
     signal_tx: mpsc::UnboundedSender<InboundSignal>,
@@ -4327,6 +4329,9 @@ pub struct BbBridge {
     fallback_active_waits: std::sync::Mutex<FallbackWaitTable>,
     reconcile_lock: tokio::sync::Mutex<()>,
     mirror_lock: tokio::sync::Mutex<()>,
+    connected: std::sync::atomic::AtomicBool,
+    connected_tx: watch::Sender<bool>,
+    connected_rx: watch::Receiver<bool>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -4353,11 +4358,60 @@ impl BbBridge {
         self
     }
 
+    pub fn with_config_watch(
+        self: Arc<Self>,
+        rx: watch::Receiver<rex_wave_api::config::RexConfig>,
+    ) -> Arc<Self> {
+        *self.config_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+        self
+    }
+
+    pub fn with_pin_store(self: Arc<Self>, path: PathBuf) -> Arc<Self> {
+        *self.pin_store.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        self
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn watch_connected(&self) -> watch::Receiver<bool> {
+        self.connected_rx.clone()
+    }
+
     fn default_runner(&self) -> RunnerKind {
         *self
             .default_runner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn routes_to_bb(&self, provider: &ProviderId) -> bool {
+        let default_runner = self.default_runner();
+        let cfg = self
+            .config_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|rx| rx.borrow().clone());
+        rex_wave_waves::route_provider_with_config(provider, default_runner, cfg.as_ref())
+            .is_ok_and(|routed| routed.target == RunnerKind::Bb)
+    }
+
+    fn routes_to_bb_for_attempt(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        attempt: u32,
+        provider: &ProviderId,
+    ) -> bool {
+        if RunnerKind::strip_provider_prefix(provider.as_str()).is_none()
+            && let Some(ref path) = *self.pin_store.lock().unwrap_or_else(|e| e.into_inner())
+            && let Some(pinned) = rex_wave_waves::lookup_pinned_runner(path, wave, role, attempt)
+        {
+            return pinned == RunnerKind::Bb;
+        }
+        self.routes_to_bb(provider)
     }
 
     fn acquire_terminal_signal_guard(
@@ -4413,10 +4467,13 @@ impl BbBridge {
         code_runner: Option<CodeRunner>,
     ) -> Arc<Self> {
         let (project_names_tx, project_names_rx) = watch::channel(Arc::new(BTreeMap::new()));
+        let (connected_tx, connected_rx) = watch::channel(false);
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<InboundSignal>();
         let bridge = Arc::new(BbBridge {
             cfg,
             default_runner: std::sync::Mutex::new(RunnerKind::Bb),
+            config_rx: std::sync::Mutex::new(None),
+            pin_store: std::sync::Mutex::new(None),
             data_dir,
             owner: BridgeOwner::spawn(),
             signal_tx,
@@ -4429,6 +4486,9 @@ impl BbBridge {
             fallback_active_waits: std::sync::Mutex::new(FallbackWaitTable::default()),
             reconcile_lock: tokio::sync::Mutex::new(()),
             mirror_lock: tokio::sync::Mutex::new(()),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            connected_tx,
+            connected_rx,
             project_names_tx,
             project_names_rx,
         });
@@ -4734,6 +4794,9 @@ impl BbBridge {
             return;
         }
         let Ok(conn_id) = conn_rx.await else { return };
+        self.connected
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.connected_tx.send(true);
 
         // Dedicated reader task keeps frame parsing out of `select!` so partial frames are never dropped.
         let (in_tx, mut in_rx) = mpsc::channel::<ws::WsInbound>(64);
@@ -4780,6 +4843,9 @@ impl BbBridge {
         }
 
         reader_task.abort();
+        self.connected
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.connected_tx.send(false);
         let _ = self.owner.send(OwnerMsg::Disconnected { conn_id });
     }
 
@@ -4942,7 +5008,6 @@ impl BbBridge {
                     .await
                 {
                     Ok(WireReply::WaveView(snap)) => {
-                        let default_runner = self.default_runner();
                         let stamp_tag = format!(":attempt-{attempt}:");
                         let stamp_matches = snap
                             .worker_meta
@@ -4954,8 +5019,7 @@ impl BbBridge {
                         if is_bb_thread_id(thread)
                             && let Some((_, spec, phase)) =
                                 snap.workers.iter().find(|(r, _, _)| r == role)
-                            && rex_wave_waves::route_provider(&spec.provider, default_runner)
-                                .is_ok_and(|routed| routed.target == RunnerKind::Bb)
+                            && self.routes_to_bb(&spec.provider)
                         {
                             match phase {
                                 WorkerPhase::Requested { attempt: cur_a } if *cur_a == attempt => {
@@ -5080,7 +5144,6 @@ impl BbBridge {
             .await
         {
             Ok(WireReply::WaveView(snap)) => {
-                let default_runner = self.default_runner();
                 let stamp_tag = format!(":attempt-{}:", m.attempt);
                 let stamp_matches = snap
                     .worker_meta
@@ -5095,8 +5158,7 @@ impl BbBridge {
                         continue;
                     }
                     let routes_to_bb =
-                        rex_wave_waves::route_provider(&spec.provider, default_runner)
-                            .is_ok_and(|routed| routed.target == RunnerKind::Bb);
+                        self.routes_to_bb_for_attempt(&wave, &role, m.attempt, &spec.provider);
                     match phase {
                         WorkerPhase::Live { thread: t, .. } if t == thread => {
                             matched_live = true;
@@ -8707,16 +8769,13 @@ impl BbBridge {
                 Ok(_) | Err(ApiError::NotFound { .. }) => return Some(false),
                 Err(_) => return None,
             };
-            let default_runner = self.default_runner();
             return Some(snap.workers.iter().any(|(r, spec, phase)| {
                 r == role
                     && match phase {
                         WorkerPhase::Live { thread: t, .. }
                         | WorkerPhase::Retiring { thread: t, .. } => t == thread,
                         WorkerPhase::Requested { attempt } => {
-                            *attempt == expected_attempt
-                                && rex_wave_waves::route_provider(&spec.provider, default_runner)
-                                    .is_ok_and(|routed| routed.target == RunnerKind::Bb)
+                            *attempt == expected_attempt && self.routes_to_bb(&spec.provider)
                         }
                         WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
                     }
@@ -11785,7 +11844,14 @@ mod tests {
             }],
         };
 
-        let started = op.call(WaveStart { spec, idem: None }).await.unwrap();
+        let started = op
+            .call(WaveStart {
+                spec,
+                idem: None,
+                config_defaults: Default::default(),
+            })
+            .await
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -12613,6 +12679,7 @@ mod tests {
                     ],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -13137,7 +13204,13 @@ mod tests {
                 },
             ],
         };
-        op.call(WaveStart { spec, idem: None }).await.unwrap();
+        op.call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
         sys.call(WaveObserve {
             wave: wave.clone(),
             role: ref_role.clone(),
@@ -13373,6 +13446,7 @@ mod tests {
                         }],
                     },
                     idem: None,
+                    config_defaults: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -13837,6 +13911,7 @@ mod tests {
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -14036,6 +14111,7 @@ mod tests {
                     }],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -14674,6 +14750,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15118,6 +15195,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15231,6 +15309,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15429,6 +15508,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15613,6 +15693,7 @@ mod tests {
                     }],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -16079,6 +16160,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -16309,6 +16391,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -16822,6 +16905,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -19366,6 +19450,7 @@ mod tests {
                     ],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -19667,6 +19752,7 @@ mod tests {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -19851,6 +19937,7 @@ mod tests {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();

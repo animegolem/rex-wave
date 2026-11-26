@@ -58,6 +58,7 @@ pub struct Router {
     pub inbox: Arc<dyn Service<InboxCommand>>,
     pub mail: Arc<dyn Service<MailCommand>>,
     pub presence: Arc<dyn Service<PresenceCommand>>,
+    pub config: Arc<dyn Service<ConfigCommand>>,
     pub read: Arc<ReadSide>,
 }
 
@@ -314,6 +315,7 @@ impl Router {
             inbox: Arc::new(Unavailable(Family::Inbox)),
             mail: Arc::new(Unavailable(Family::Mail)),
             presence: Arc::new(Unavailable(Family::Presence)),
+            config: Arc::new(Unavailable(Family::Config)),
             read,
         }
     }
@@ -379,6 +381,7 @@ impl Router {
                 self.mail.dispatch(c, ctx).await
             }
             Routed::Presence(c) => self.presence.dispatch(c, ctx).await,
+            Routed::Config(c) => self.config.dispatch(c, ctx).await,
             Routed::Read(ReadCommand::Wait(mut wait)) => {
                 if wait.timeout_ms != Some(0)
                     && matches!(by, Principal::Worker { .. })

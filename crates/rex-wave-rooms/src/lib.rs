@@ -388,6 +388,7 @@ fn system_slug(part: SystemPart) -> &'static str {
         SystemPart::MailBridge => "mail_bridge",
         SystemPart::WakeBell => "wake_bell",
         SystemPart::PresenceMonitor => "presence_monitor",
+        SystemPart::ConfigSync => "config_sync",
     }
 }
 

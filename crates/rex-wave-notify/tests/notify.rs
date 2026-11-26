@@ -75,6 +75,7 @@ impl Decider for TestWaves {
                     spec: c.spec.clone(),
                     room,
                     board,
+                    request_digest: None,
                 }];
                 for w in &c.spec.workers {
                     events.push(WaveEvent::WorkerRequested {
@@ -504,6 +505,7 @@ async fn herald_raises_mentions_dms_interactions_and_mail_with_embedded_wire_act
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -904,6 +906,7 @@ async fn system_posts_skip_operator_mentions_and_worker_stuck_dedupes_per_role()
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -1164,6 +1167,7 @@ async fn set_archived_and_wave_finished_fold_into_sidebar_and_survive_replay() {
                 workers: vec![],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -1331,6 +1335,7 @@ async fn legacy_per_seq_worker_stuck_cards_do_not_duplicate_on_herald_upgrade_re
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -2588,6 +2593,7 @@ async fn worker_refused_raises_high_salience_inbox_card_and_inbox_reports_trunca
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -3566,6 +3572,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
             output_dir: None,
         },
         idem: None,
+        config_defaults: Default::default(),
     })
     .await
     .unwrap();
@@ -3783,6 +3790,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         inbox: router.inbox.clone(),
         mail: router.mail.clone(),
         presence: router.presence.clone(),
+        config: router.config.clone(),
         read: router.read.clone(),
     });
     let race_worker = LocalClient::new(race_router.clone(), worker_p.clone());
@@ -3878,6 +3886,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         inbox: router.inbox.clone(),
         mail: router.mail.clone(),
         presence: router.presence.clone(),
+        config: router.config.clone(),
         read: router.read.clone(),
     });
     let proj_race_worker = LocalClient::new(proj_race_router, worker_p);
@@ -3969,6 +3978,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
                 output_dir: None,
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();

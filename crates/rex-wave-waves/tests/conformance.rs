@@ -310,8 +310,7 @@ proptest! {
             &op,
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
-                idem: None,
-            }),
+                idem: None, config_defaults: Default::default(), }),
         )
         .expect("WaveStart succeeds");
 
@@ -791,6 +790,7 @@ fn pre_spawn_cross_talk_preserves_target_thread_refusal_over_foreign_error() {
         WaveCommand::WaveStart(WaveStart {
             spec: spec.clone(),
             idem: None,
+            config_defaults: Default::default(),
         }),
     )
     .expect("start");
@@ -1025,6 +1025,7 @@ async fn conductor_retires_late_spawn_and_recovers_faulted_archive_observe() {
     op.call(WaveStart {
         spec: spec.clone(),
         idem: None,
+        config_defaults: Default::default(),
     })
     .await
     .expect("start wave");
@@ -1131,6 +1132,7 @@ async fn conductor_retires_late_spawn_and_recovers_faulted_archive_observe() {
             writes: Vec::new(),
             return_schema: None,
         },
+        config_defaults: Default::default(),
     })
     .await
     .expect("spawn reviewer");
@@ -1269,6 +1271,7 @@ fn pre_spawn_candidate_failures_and_metadata_isolate_per_thread() {
         WaveCommand::WaveStart(WaveStart {
             spec: spec.clone(),
             idem: None,
+            config_defaults: Default::default(),
         }),
     )
     .expect("start");
@@ -1480,6 +1483,7 @@ fn pre_spawn_candidate_failures_and_metadata_isolate_per_thread() {
                 writes: Vec::new(),
                 return_schema: None,
             },
+            config_defaults: Default::default(),
         }),
     )
     .expect("spawn late-unbound");
@@ -1630,6 +1634,7 @@ async fn router_worker_wait_parking_fences_stale_thread_sessions() {
         .call(WaveStart {
             spec: spec.clone(),
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .expect("start");
@@ -1976,6 +1981,7 @@ fn unbound_fencing_covers_post_completion_refusals_retired_archives_and_pre_spaw
         WaveCommand::WaveStart(WaveStart {
             spec: spec.clone(),
             idem: None,
+            config_defaults: Default::default(),
         }),
     )
     .expect("start");
@@ -2173,6 +2179,7 @@ fn unbound_fencing_covers_post_completion_refusals_retired_archives_and_pre_spaw
                 writes: Vec::new(),
                 return_schema: None,
             },
+            config_defaults: Default::default(),
         }),
     )
     .expect("add scout");

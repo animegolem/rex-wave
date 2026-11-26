@@ -33,6 +33,7 @@ use ratatui::{
 };
 use rex_wave_api::{
     board::{BoardEnsure, BoardId, CardPatch, CardUpsert, LaneName, Title, project_board},
+    config::ConfigSet,
     mail::{LetterPriority, MailPromote},
     notify::{InboxAck, InboxMarkRead, NotifyKind, NotifyState},
     read::{Page, SidebarTreeSnapshot},
@@ -43,8 +44,8 @@ use rex_wave_api::{
 use sidebar::{NodeKey, Sidebar};
 use stage::{
     AgentInspector, HOVER_DEBOUNCE, INBOX_CARD_HEIGHT, INBOX_CARD_STRIDE, InboxView, KanbanView,
-    RoomView, Stage, StageRenderCtx, StageTarget, find_blocked_worker_for_room, plan_for,
-    target_for,
+    RoomView, SettingsView, Stage, StageRenderCtx, StageTarget, find_blocked_worker_for_room,
+    plan_for, target_for,
 };
 use std::{
     cell::Cell,
@@ -68,6 +69,7 @@ pub enum ComposerTarget {
     Room { room: RoomId },
     Agent { wave: WaveSlug, role: RoleName },
     NewTask { board: BoardId, lane: LaneName },
+    ConfigKey { key: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -170,6 +172,7 @@ pub enum Msg {
         result: Result<WireReply, ApiError>,
     },
     HoverSettled(NodeKey),
+    SettingsPoll,
     Resize {
         cols: u16,
         rows: u16,
@@ -323,6 +326,16 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 retarget_if_changed(model, target, &mut effects);
             }
         }
+        Msg::SettingsPoll => {
+            if matches!(model.stage, Stage::Settings(_))
+                && model.connection == ConnectionState::Connected
+            {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
+                });
+            }
+        }
         Msg::Frame {
             watch: WatchSlot::Tree,
             frame: Frame::Sidebar(snap),
@@ -340,6 +353,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             frame,
         } => {
             mark_connected(model, &mut effects, true, false);
+            let mut should_refresh_settings = false;
             match frame {
                 Frame::StageFocused { generation, .. } => {
                     if generation >= model.active_generation {
@@ -351,14 +365,44 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                     if generation >= model.active_generation {
                         model.active_generation = generation;
                         model.has_focused_watch = true;
+                        if matches!(model.stage, Stage::Settings(_))
+                            && let Frame::Committed(ref env) = *inner
+                            && matches!(
+                                &env.event,
+                                Event::Config(_)
+                                    | Event::Presence(
+                                        presence::PresenceEvent::TransportHealthChanged { .. }
+                                    )
+                            )
+                        {
+                            should_refresh_settings = true;
+                        }
                         model.stage.apply(&inner);
                         sync_agent_ctx_from_stage(model);
                     }
                 }
                 other => {
+                    if matches!(model.stage, Stage::Settings(_))
+                        && let Frame::Committed(ref env) = other
+                        && matches!(
+                            &env.event,
+                            Event::Config(_)
+                                | Event::Presence(
+                                    presence::PresenceEvent::TransportHealthChanged { .. }
+                                )
+                        )
+                    {
+                        should_refresh_settings = true;
+                    }
                     model.stage.apply(&other);
                     sync_agent_ctx_from_stage(model);
                 }
+            }
+            if should_refresh_settings {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
+                });
             }
         }
         Msg::Frame { .. } => {
@@ -454,7 +498,7 @@ fn close_overlay(model: &mut Model) {
 }
 
 fn open_composer(model: &mut Model) {
-    match &model.stage {
+    match &mut model.stage {
         Stage::Room(r) => {
             model.composer_target = Some(ComposerTarget::Room {
                 room: r.room.clone(),
@@ -481,7 +525,40 @@ fn open_composer(model: &mut Model) {
             });
             model.focus = Pane::Composer;
         }
+        Stage::Settings(s) => {
+            if let Some(spec) = s.selected_spec() {
+                let current = s.snapshot.config.get_key(spec.key).ok().flatten();
+                let _ = s.composer.take();
+                if let Some(val) = current {
+                    s.composer.insert_str(&val);
+                }
+                model.composer_target = Some(ComposerTarget::ConfigKey {
+                    key: spec.key.to_owned(),
+                });
+                model.focus = Pane::Composer;
+            }
+        }
         _ => {}
+    }
+}
+
+fn cycle_selected_setting(s: &SettingsView, effects: &mut Vec<Effect>) -> bool {
+    let Some(spec) = s.selected_spec() else {
+        return false;
+    };
+    match s.snapshot.config.next_cycled_value(spec.key) {
+        Ok(Some(next_val)) => {
+            effects.push(Effect::Call {
+                tag: ReplyTag::UserCommand,
+                cmd: WireCommand::ConfigSet(ConfigSet {
+                    key: spec.key.to_owned(),
+                    value: next_val,
+                    idem: None,
+                }),
+            });
+            true
+        }
+        _ => false,
     }
 }
 
@@ -606,6 +683,20 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
             retarget_if_changed(model, StageTarget::Kanban { board }, effects);
             model.focus = Pane::Stage;
         }
+        Action::OpenSettings => {
+            model.overlay = None;
+            model.composer_target = None;
+            model.sidebar.cursor = NodeKey::Settings;
+            model.sidebar.hover = None;
+            retarget_if_changed(model, StageTarget::Settings, effects);
+            model.focus = Pane::Stage;
+        }
+        Action::SelectSetting(index) => {
+            if let Stage::Settings(s) = &mut model.stage {
+                s.select_index(index);
+                model.focus = Pane::Stage;
+            }
+        }
         Action::Hover(key) => {
             if model.sidebar.hover.as_ref() != Some(&key) {
                 model.sidebar.hover = Some(key.clone());
@@ -664,6 +755,7 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                     &mut model.focus,
                     &mut model.sidebar_hidden,
                     vp,
+                    effects,
                 );
             }
         },
@@ -772,6 +864,9 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
                     }
                 }
                 Stage::Agent(a) => a.scroll.by_pages(1),
+                Stage::Settings(s) => {
+                    let _ = cycle_selected_setting(s, effects);
+                }
                 other => page_stage(other, 1, vp),
             }
         }
@@ -807,6 +902,13 @@ fn handle_action(model: &mut Model, action: Action, effects: &mut Vec<Effect>) {
             if model.focus == Pane::Overlay {
                 close_overlay(model);
             } else if model.focus == Pane::Composer {
+                if matches!(
+                    model.composer_target,
+                    Some(ComposerTarget::ConfigKey { .. })
+                ) && let Some(buf) = active_composer_mut(&mut model.stage)
+                {
+                    let _ = buf.take();
+                }
                 model.composer_target = None;
                 model.focus = Pane::Stage;
             } else {
@@ -925,6 +1027,11 @@ fn handle_stage_open(model: &mut Model, effects: &mut Vec<Effect>) {
             open_composer(model);
         }
         Stage::Kanban(_) => open_composer(model),
+        Stage::Settings(s) => {
+            if !cycle_selected_setting(s, effects) {
+                open_composer(model);
+            }
+        }
         Stage::Inbox(inbox) => {
             let items = inbox.visible_items();
             let chosen = items
@@ -1070,6 +1177,25 @@ fn handle_accelerator(model: &mut Model, key_ch: char, effects: &mut Vec<Effect>
                 });
             }
         }
+        Stage::Settings(s) => {
+            if key_ch == 'x'
+                && let Some(spec) = s.selected_spec()
+            {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::UserCommand,
+                    cmd: WireCommand::ConfigSet(ConfigSet {
+                        key: spec.key.to_owned(),
+                        value: None,
+                        idem: None,
+                    }),
+                });
+            } else if key_ch == 'r' {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -1104,11 +1230,27 @@ fn submit_composer(model: &mut Model, effects: &mut Vec<Effect>) {
         .unwrap_or_default();
     model.focus = Pane::Stage;
     let trimmed = raw.trim();
+    if let ComposerTarget::ConfigKey { key } = target {
+        if let Stage::Settings(s) = &mut model.stage {
+            s.pending_draft = (!trimmed.is_empty()).then(|| raw.clone());
+        }
+        let value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        effects.push(Effect::Call {
+            tag: ReplyTag::UserCommand,
+            cmd: WireCommand::ConfigSet(ConfigSet {
+                key,
+                value,
+                idem: None,
+            }),
+        });
+        return;
+    }
     if trimmed.is_empty() {
         return;
     }
 
     match target {
+        ComposerTarget::ConfigKey { .. } => unreachable!("handled above"),
         ComposerTarget::Room { room } => match Body::parse(trimmed.to_owned()) {
             Ok(body) => effects.push(Effect::Call {
                 tag: ReplyTag::UserCommand,
@@ -1185,6 +1327,18 @@ fn handle_reply(
             };
         }
         (ReplyTag::StageInitial(_), Err(_)) => {}
+        (ReplyTag::UserCommand, Err(err)) => {
+            let msg = err.to_string();
+            if let Stage::Settings(existing) = &mut model.stage {
+                existing.status_banner = Some(format!("Error: {msg}"));
+                if let Some(draft) = existing.pending_draft.take()
+                    && existing.composer.as_str().is_empty()
+                {
+                    existing.composer.insert_str(&draft);
+                }
+            }
+            model.last_error = Some(msg);
+        }
         (_, Err(err)) => {
             model.last_error = Some(err.to_string());
         }
@@ -1209,6 +1363,15 @@ fn handle_reply(
             if let Stage::Room(r) = &mut model.stage {
                 r.status_banner = Some(format!("Banked {}", letter.path.display()));
                 r.selection = None;
+            }
+        }
+        (ReplyTag::UserCommand, Ok(WireReply::ConfigSet(snap))) => {
+            if let Stage::Settings(existing) = &mut model.stage {
+                existing.pending_draft = None;
+                existing.update_snapshot(snap);
+                if existing.status_banner.is_none() {
+                    existing.status_banner = Some("Saved".to_owned());
+                }
             }
         }
         (ReplyTag::UserCommand, Ok(reply)) => {
@@ -1291,6 +1454,15 @@ fn apply_stage_snapshot(model: &mut Model, reply: WireReply) {
                 sync_agent_ctx_from_stage(model);
             }
         }
+        WireReply::ConfigShow(snap) | WireReply::ConfigSet(snap)
+            if matches!(model.active_target, StageTarget::Settings) =>
+        {
+            if let Stage::Settings(existing) = &mut model.stage {
+                existing.update_snapshot(snap);
+            } else {
+                model.stage = Stage::Settings(SettingsView::new(snap));
+            }
+        }
         _ => {}
     }
 }
@@ -1334,6 +1506,7 @@ fn active_composer_mut(stage: &mut Stage) -> Option<&mut Composer> {
         Stage::Room(r) => Some(&mut r.composer),
         Stage::Agent(a) => Some(&mut a.composer),
         Stage::Kanban(k) => Some(&mut k.composer),
+        Stage::Settings(s) => Some(&mut s.composer),
         _ => None,
     }
 }
@@ -1360,6 +1533,7 @@ fn select_in_stage(stage: &mut Stage, delta: i8, inbox_vp_rows: u16) {
         }
         Stage::Room(r) => r.select_step(delta),
         Stage::Agent(a) => a.select_step(delta),
+        Stage::Settings(s) => s.select_step(delta),
         _ => {}
     }
 }
@@ -1379,6 +1553,7 @@ fn page_stage(stage: &mut Stage, dir: i8, inbox_vp_rows: u16) {
         }
         Stage::Room(r) => r.scroll.by_pages(i32::from(dir)),
         Stage::Agent(a) => a.scroll.by_pages(i32::from(dir)),
+        Stage::Settings(s) => s.select_step(if dir > 0 { 8 } else { -8 }),
         _ => {}
     }
 }
@@ -1389,6 +1564,7 @@ fn move_in_stage(
     focus: &mut Pane,
     sidebar_hidden: &mut bool,
     inbox_vp_rows: u16,
+    effects: &mut Vec<Effect>,
 ) {
     let focus_sidebar = |focus: &mut Pane, sidebar_hidden: &mut bool| {
         *sidebar_hidden = false;
@@ -1445,6 +1621,14 @@ fn move_in_stage(
             Dir::Left => focus_sidebar(focus, sidebar_hidden),
             Dir::Right => {}
         },
+        Stage::Settings(s) => match dir {
+            Dir::Down => s.select_step(1),
+            Dir::Up => s.select_step(-1),
+            Dir::Left => focus_sidebar(focus, sidebar_hidden),
+            Dir::Right => {
+                let _ = cycle_selected_setting(s, effects);
+            }
+        },
         Stage::Summary(_) | Stage::Loading(_) | Stage::Error { .. } => {
             if dir == Dir::Left {
                 focus_sidebar(focus, sidebar_hidden);
@@ -1464,6 +1648,7 @@ fn scroll_stage(stage: &mut Stage, lines: i16) {
         }
         Stage::Room(v) => v.scroll.by(i32::from(lines)),
         Stage::Agent(v) => v.scroll.by(i32::from(lines)),
+        Stage::Settings(v) => v.scroll.by(i32::from(lines)),
         _ => {}
     }
 }
@@ -1500,6 +1685,7 @@ fn scroll_stage_extreme(stage: &mut Stage, top: bool, inbox_vp_rows: u16) {
             v.cursor.1 = if top { 0 } else { usize::MAX };
             v.clamp_cursor();
         }
+        Stage::Settings(v) => v.select_extreme(top),
         _ => {}
     }
 }
@@ -1928,6 +2114,7 @@ async fn run_loop<C: Client + Clone + 'static>(
     let mut opening_tree_watch = false;
     let mut stage_watch: Option<FrameStream> = None;
     let mut hover_deadline: Option<(tokio::time::Instant, NodeKey)> = None;
+    let mut settings_poll_deadline: Option<tokio::time::Instant> = None;
 
     stage_loader.retarget(
         model.stage_req_seq,
@@ -1956,6 +2143,17 @@ async fn run_loop<C: Client + Clone + 'static>(
             break;
         }
 
+        let in_settings = matches!(model.stage, Stage::Settings(_))
+            && model.connection == ConnectionState::Connected;
+        if in_settings {
+            if settings_poll_deadline.is_none() {
+                settings_poll_deadline =
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+        } else {
+            settings_poll_deadline = None;
+        }
+
         let incoming: Option<Msg> = tokio::select! {
             biased;
             m = poll_connection(&mut conn_rx) => Some(m),
@@ -1977,6 +2175,7 @@ async fn run_loop<C: Client + Clone + 'static>(
             m = poll_watch_slot(&mut tree_watch, WatchSlot::Tree) => Some(m),
             m = poll_watch_slot(&mut stage_watch, WatchSlot::Stage) => Some(m),
             key = wait_hover(&mut hover_deadline) => Some(Msg::HoverSettled(key)),
+            () = wait_settings_poll(&mut settings_poll_deadline) => Some(Msg::SettingsPoll),
         };
 
         if let Some(msg) = incoming {
@@ -2078,6 +2277,16 @@ async fn wait_hover(hover: &mut Option<(tokio::time::Instant, NodeKey)>) -> Node
             tokio::time::sleep_until(deadline).await;
             *hover = None;
             k
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_settings_poll(deadline: &mut Option<tokio::time::Instant>) {
+    match *deadline {
+        Some(target) => {
+            tokio::time::sleep_until(target).await;
+            *deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
         }
         None => std::future::pending().await,
     }

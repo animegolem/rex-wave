@@ -1,6 +1,7 @@
 //! Library exports for `rex-wave` daemon composition, loopback HTTP/SSE server,
 //! and shared room/principal boundary parsers.
 
+pub mod config_file;
 pub mod daemon;
 pub mod http;
 
