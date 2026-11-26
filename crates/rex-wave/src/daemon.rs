@@ -9,6 +9,7 @@
 
 use crate::config_file::{TomlConfigHook, daemon_config_file_path, reconcile_startup_config};
 use crate::http::{HttpConfig, bind_http, serve_http_listener};
+use rex_wave_acp::{AcpBridge, AcpConfig, AcpFeed, AcpHost};
 use rex_wave_api::config::RunnerRoute;
 use rex_wave_api::presence::{BindingStatus, PresenceList, PresenceUnbind, TransportEndpoint};
 use rex_wave_api::wave::{Observation, WaveEvent};
@@ -47,6 +48,7 @@ pub enum RunnerMode {
     Bb,
     T3,
     Both,
+    Acp,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -66,8 +68,9 @@ pub struct DaemonArgs {
     /// BB plugin bridge bearer token.
     #[arg(long, env = "REX_WAVE_BB_TOKEN", default_value = "")]
     pub bb_token: String,
-    /// Worker host runner backend (`bb`, `t3`, or `both`). Defaults to `both`
+    /// Worker host runner backend (`bb`, `t3`, `both`, or `acp`). Defaults to `both`
     /// when T3 is configured or a local T3 runtime exists, otherwise `bb`.
+    /// Native ACP (`acp:antigravity`, `acp:opencode`) is always registered alongside.
     #[arg(long, value_enum)]
     pub runner: Option<RunnerMode>,
     /// T3 Code base directory (default: `~/.t3`).
@@ -561,13 +564,14 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let runner_mode = resolve_runner_mode(&args);
     let default_target = match runner_mode {
         RunnerMode::T3 => RunnerKind::T3,
+        RunnerMode::Acp => RunnerKind::Acp,
         RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
     };
     let t3_cfg = match runner_mode {
         RunnerMode::T3 | RunnerMode::Both => {
             Some(build_t3_config(&args, &state_dir)?.with_default_runner(default_target))
         }
-        RunnerMode::Bb => None,
+        RunnerMode::Bb | RunnerMode::Acp => None,
     };
 
     let http_listener = match args.http {
@@ -637,10 +641,17 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_config_watch(config_svc.subscribe())
             .with_pin_store(state_dir.join("router-pins.json")),
         ),
-        RunnerMode::T3 => None,
+        RunnerMode::T3 | RunnerMode::Acp => None,
     };
 
     let t3_bridge = t3_cfg.map(|cfg| T3Bridge::new(cfg.with_config_watch(config_svc.subscribe())));
+    let acp_bridge = AcpBridge::new(
+        AcpConfig::from_env()
+            .with_state_dir(state_dir.clone())
+            .with_socket_path(sock_path.clone())
+            .with_default_runner(default_target)
+            .with_config_watch(config_svc.subscribe()),
+    );
     config_hook.bind_runner_liveness(
         bb_bridge.as_ref().map(|b| {
             let b = b.clone();
@@ -655,6 +666,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let t3_conn_rx = t3_bridge.as_ref().map(|t| t.watch_connected());
 
     let mut feed_entries: Vec<(RunnerKind, Arc<dyn AgentFeed>)> = Vec::new();
+    feed_entries.push((RunnerKind::Acp, Arc::new(AcpFeed(acp_bridge.clone()))));
     if let Some(ref t) = t3_bridge {
         feed_entries.push((RunnerKind::T3, Arc::new(T3Feed(t.clone()))));
     }
@@ -669,14 +681,16 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let presence_svc = presence.registry(journal.clone(), hub.clone());
     config_hook.bind_presence(presence_svc.clone());
 
+    let wave_svc = rex_wave_waves::WaveService::new(
+        Registry::<Waves>::new(journal.clone(), hub.clone()),
+        default_target,
+        Some(config_svc.subscribe()),
+    )
+    .with_state_dir(state_dir.clone());
+
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: rex_wave_waves::WaveService::new(
-            Registry::<Waves>::new(journal.clone(), hub.clone()),
-            default_target,
-            Some(config_svc.subscribe()),
-        )
-        .with_state_dir(state_dir.clone()),
+        wave: wave_svc.clone(),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
@@ -695,17 +709,23 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         }),
     });
 
-    let host_router = HostRouter::new(default_target)
-        .with_config_watch(config_svc.subscribe())
-        .with_pin_store(state_dir.join("router-pins.json"))
-        .with_optional_host(
-            RunnerKind::Bb,
-            bb_bridge.as_ref().map(|b| BbHost(b.clone())),
-        )
-        .with_optional_host(
-            RunnerKind::T3,
-            t3_bridge.as_ref().map(|t| T3Host(t.clone())),
-        );
+    acp_bridge.attach_backend(router.clone());
+
+    let host_router = Arc::new(
+        HostRouter::new(default_target)
+            .with_config_watch(config_svc.subscribe())
+            .with_pin_store(state_dir.join("router-pins.json"))
+            .with_host(RunnerKind::Acp, AcpHost(acp_bridge.clone()))
+            .with_optional_host(
+                RunnerKind::Bb,
+                bb_bridge.as_ref().map(|b| BbHost(b.clone())),
+            )
+            .with_optional_host(
+                RunnerKind::T3,
+                t3_bridge.as_ref().map(|t| T3Host(t.clone())),
+            ),
+    );
+    wave_svc.bind_host(host_router.clone());
 
     let system = |part| LocalClient::new(router.clone(), Principal::System { part });
     let conductor_task = spawn_reactor(
@@ -724,6 +744,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
+    let acp_task = tokio::spawn(acp_bridge.clone().run(router.clone()));
     let mut bridge_health_tasks = Vec::new();
     for (transport, label, rx_opt) in [
         (
@@ -801,6 +822,24 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         })
     });
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("sigterm listener: {e}"))?;
+
+    #[cfg(unix)]
+    let serve_result = tokio::select! {
+        res = serve_listener_with_hooks(listener, router, auth, hooks) => {
+            res.map_err(|e| format!("uds serve: {e}"))
+        }
+        sig = tokio::signal::ctrl_c() => {
+            sig.map_err(|e| format!("ctrl_c listener: {e}"))
+        }
+        _ = sigterm.recv() => {
+            Ok(())
+        }
+    };
+
+    #[cfg(not(unix))]
     let serve_result = tokio::select! {
         res = serve_listener_with_hooks(listener, router, auth, hooks) => {
             res.map_err(|e| format!("uds serve: {e}"))
@@ -824,6 +863,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     if let Some(t) = t3_task {
         t.abort();
     }
+    acp_task.abort();
+    acp_bridge.shutdown_all().await;
     if let Some(t) = http_task {
         t.abort();
     }

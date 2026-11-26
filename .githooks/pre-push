@@ -36,4 +36,9 @@ if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
 	exit 1
 fi
 
+# Git hooks run with GIT_DIR pointing at the active repo/worktree; clear
+# repository-local env overrides before running hermetic tests that invoke git.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars)
+
 exec "$ROOT/check" --git-rev "$HEAD_SHA"

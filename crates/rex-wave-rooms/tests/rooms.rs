@@ -1355,7 +1355,7 @@ async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_n
             room: room.clone(),
             task: task_a.seq,
             epoch: winner_receipt.epoch,
-            ttl_ms: Some(40),
+            ttl_ms: Some(60_000),
         })
         .await
         .unwrap();
@@ -1398,6 +1398,15 @@ async fn task_lifecycle_claim_race_ttl_takeover_fencing_unmet_needs_cycles_and_n
         }
     ));
 
+    winner_client
+        .call(TaskHeartbeat {
+            room: room.clone(),
+            task: task_a.seq,
+            epoch: winner_receipt.epoch,
+            ttl_ms: Some(40),
+        })
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
     let takeover = loser_client
         .call(TaskClaim {

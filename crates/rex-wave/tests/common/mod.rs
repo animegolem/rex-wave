@@ -16,8 +16,11 @@ pub const MAX_TEST_DIR_LEN: usize = 64;
 /// impersonate a seat/worker.
 pub const SCRUBBED_ENV: &[&str] = &[
     "T3CODE_THREAD_ID",
+    "REX_WAVE_SOCKET",
     "REX_WAVE_WORKER_THREAD_ID",
     "REX_WAVE_TOKEN",
+    "REX_WAVE_ACP_AGY_BIN",
+    "REX_WAVE_ACP_OPENCODE_BIN",
     "REX_WAVE_T3_HOME",
     "REX_WAVE_T3_URL",
     "REX_WAVE_T3_TOKEN",

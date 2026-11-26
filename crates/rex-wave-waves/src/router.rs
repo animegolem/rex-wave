@@ -117,9 +117,16 @@ pub fn route_provider_with_config(
     }
 
     if raw.eq_ignore_ascii_case("antigravity") || raw.eq_ignore_ascii_case("agy") {
+        let target = match cfg.and_then(|c| c.runners.default_runner) {
+            Some(rex_wave_api::config::RunnerRoute::Native) => RunnerKind::Acp,
+            Some(rex_wave_api::config::RunnerRoute::T3)
+            | Some(rex_wave_api::config::RunnerRoute::Bb) => RunnerKind::T3,
+            None if default_runner == RunnerKind::Acp => RunnerKind::Acp,
+            None => RunnerKind::T3,
+        };
         return Ok(RoutedProvider {
-            target: RunnerKind::T3,
-            provider: normalize_provider_for_target(raw, RunnerKind::T3)?,
+            target,
+            provider: normalize_provider_for_target(raw, target)?,
         });
     }
 
@@ -225,6 +232,7 @@ pub struct WaveService {
     inner: Arc<dyn Service<WaveCommand>>,
     default_runner: RunnerKind,
     config_rx: Option<watch::Receiver<RexConfig>>,
+    host: std::sync::OnceLock<Arc<dyn AgentHost>>,
 }
 
 impl WaveService {
@@ -237,11 +245,16 @@ impl WaveService {
             inner,
             default_runner,
             config_rx,
+            host: std::sync::OnceLock::new(),
         })
     }
 
     pub fn with_state_dir(self: Arc<Self>, _state_dir: PathBuf) -> Arc<Self> {
         self
+    }
+
+    pub fn bind_host(&self, host: Arc<dyn AgentHost>) {
+        let _ = self.host.set(host);
     }
 }
 
@@ -342,6 +355,68 @@ impl Service<WaveCommand> for WaveService {
                         )?;
                         wa.config_defaults.account_from_config = applied_acct;
                         wa.worker.agent = Some(agent);
+                    }
+                }
+                WaveCommand::WaveResolve(wr) => {
+                    if let Some(host) = self.host.get() {
+                        let snap = match self
+                            .inner
+                            .dispatch(
+                                WaveCommand::WaveView(WaveView {
+                                    wave: wr.wave.clone(),
+                                }),
+                                ctx.clone(),
+                            )
+                            .await?
+                        {
+                            WireReply::WaveView(s) => s,
+                            other => {
+                                return Err(ApiError::Internal(format!(
+                                    "unexpected WaveView reply: {other:?}"
+                                )));
+                            }
+                        };
+                        let (_, _, phase) = snap
+                            .workers
+                            .iter()
+                            .find(|(r, _, _)| r == &wr.role)
+                            .ok_or_else(|| ApiError::NotFound {
+                                what: format!("worker @{}/{}", wr.wave, wr.role),
+                            })?;
+                        match phase {
+                            rex_wave_api::wave::WorkerPhase::Live {
+                                thread,
+                                activity: rex_wave_api::wave::Activity::Blocked { interaction },
+                            } => {
+                                if interaction.id != wr.interaction {
+                                    return Err(ApiError::conflict(format!(
+                                        "worker @{}/{} is blocked on {}, not {}",
+                                        wr.wave, wr.role, interaction.id, wr.interaction
+                                    )));
+                                }
+                                match host
+                                    .validate_resolve(thread, &wr.interaction, &wr.resolution)
+                                    .await
+                                {
+                                    Ok(()) => {}
+                                    Err(HostError::Rejected(reason)) => {
+                                        return Err(ApiError::Invalid(InvalidId {
+                                            what: "resolution".into(),
+                                            reason,
+                                        }));
+                                    }
+                                    Err(HostError::Unreachable(msg)) => {
+                                        return Err(ApiError::Transport(msg));
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(ApiError::conflict(format!(
+                                    "worker @{}/{} has no pending interaction ({other:?})",
+                                    wr.wave, wr.role
+                                )));
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -587,6 +662,30 @@ impl AgentHost for HostRouter {
         Box::pin(async move {
             match self.hosts.get(&target) {
                 Some(host) => host.resolve(&thread, &interaction, &resolution).await,
+                None => Err(HostError::Unreachable(format!(
+                    "{} host is not configured",
+                    target.display_name()
+                ))),
+            }
+        })
+    }
+
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        let target = route_thread(thread);
+        let thread = thread.clone();
+        let interaction = interaction.clone();
+        let resolution = resolution.clone();
+        Box::pin(async move {
+            match self.hosts.get(&target) {
+                Some(host) => {
+                    host.validate_resolve(&thread, &interaction, &resolution)
+                        .await
+                }
                 None => Err(HostError::Unreachable(format!(
                     "{} host is not configured",
                     target.display_name()

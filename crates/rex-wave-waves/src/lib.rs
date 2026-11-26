@@ -357,12 +357,18 @@ struct WorkerRecord {
 }
 
 fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool {
-    if let Some((expected_runner, _)) = RunnerKind::strip_provider_prefix(provider.as_str()) {
-        return obs_th.runner_kind() != expected_runner;
+    let prov = provider.as_str().trim();
+    let kind = obs_th.runner_kind();
+    if let Some((expected, _)) = RunnerKind::strip_provider_prefix(prov) {
+        return kind != expected;
     }
-    let is_t3 = obs_th.as_str().starts_with("t3:");
-    let prov = provider.as_str();
-    (is_t3 && matches!(prov, "pi" | "cursor")) || (!is_t3 && prov == "antigravity")
+    if prov.eq_ignore_ascii_case("antigravity") || prov.eq_ignore_ascii_case("agy") {
+        return !matches!(kind, RunnerKind::T3 | RunnerKind::Acp);
+    }
+    if prov.eq_ignore_ascii_case("pi") || prov.eq_ignore_ascii_case("cursor") {
+        return kind != RunnerKind::Bb;
+    }
+    false
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1338,6 +1344,16 @@ pub trait AgentHost: Send + Sync + 'static {
         interaction: &HostInteractionId,
         resolution: &InteractionResolution,
     ) -> BoxFut<'_, Result<(), HostError>>;
+    /// Pre-commit check allowing a host to reject unsupported interaction
+    /// resolutions synchronously before `WaveEvent::InteractionResolved` is journaled.
+    fn validate_resolve(
+        &self,
+        _thread: &HostThreadId,
+        _interaction: &HostInteractionId,
+        _resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        Box::pin(async { Ok(()) })
+    }
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>>;
     /// Probe whether a previously-`Live` host thread still exists after a reboot
     /// or reconnect. Returning `Ok(Some(obs))` submits a corrective `WaveObserve`
@@ -1374,6 +1390,15 @@ impl<H: AgentHost + ?Sized> AgentHost for Arc<H> {
         (**self).resolve(thread, interaction, resolution)
     }
 
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).validate_resolve(thread, interaction, resolution)
+    }
+
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
         (**self).retire(thread)
     }
@@ -1407,6 +1432,15 @@ impl<H: AgentHost + ?Sized> AgentHost for Box<H> {
         resolution: &InteractionResolution,
     ) -> BoxFut<'_, Result<(), HostError>> {
         (**self).resolve(thread, interaction, resolution)
+    }
+
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).validate_resolve(thread, interaction, resolution)
     }
 
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
