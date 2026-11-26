@@ -467,10 +467,35 @@ impl AgentInspector {
         }
     }
 
+    fn coalesces_assistant_deltas(&self) -> bool {
+        self.page.thread.runner_kind() == rex_wave_api::RunnerKind::Acp
+    }
+
+    /// Returns events with consecutive ACP `agent_message_chunk` items coalesced
+    /// for display while keeping `self.page.events` immutable and preserving
+    /// discrete BB / T3 `AssistantText` snapshots unchanged.
+    pub fn display_events(&self) -> std::borrow::Cow<'_, [AgentEvent]> {
+        if !self.coalesces_assistant_deltas() {
+            return std::borrow::Cow::Borrowed(&self.page.events);
+        }
+        let mut out: Vec<AgentEvent> = Vec::with_capacity(self.page.events.len());
+        for ev in &self.page.events {
+            if let AgentEventKind::AssistantText { text } = &ev.kind
+                && let Some(last) = out.last_mut()
+                && let AgentEventKind::AssistantText { text: prev } = &mut last.kind
+            {
+                prev.push_str(text);
+                last.at = ev.at;
+                continue;
+            }
+            out.push(ev.clone());
+        }
+        std::borrow::Cow::Owned(out)
+    }
+
     /// The worker's most recent assistant output, pinned and highlighted in the log.
     pub fn latest_text_seq(&self) -> Option<BbSeq> {
-        self.page
-            .events
+        self.display_events()
             .iter()
             .rev()
             .find(|e| matches!(e.kind, AgentEventKind::AssistantText { .. }))
@@ -479,8 +504,7 @@ impl AgentInspector {
 
     pub fn select_step(&mut self, delta: i8) {
         let seqs: Vec<BbSeq> = self
-            .page
-            .events
+            .display_events()
             .iter()
             .filter(|e| is_readable_event(e))
             .map(|e| e.seq)
@@ -495,7 +519,7 @@ impl AgentInspector {
     /// Markdown for the whole turn holding `seq`: everything after the previous
     /// `TurnEnded` up to the next one.
     pub fn turn_pager(&self, seq: BbSeq) -> Option<(String, String)> {
-        let events = &self.page.events;
+        let events = self.display_events();
         let idx = events.iter().position(|e| e.seq == seq)?;
         let start = events[..idx]
             .iter()
@@ -506,40 +530,22 @@ impl AgentInspector {
             .position(|e| matches!(e.kind, AgentEventKind::TurnEnded))
             .map_or(events.len(), |p| idx + p);
         let mut body = String::new();
-        let mut idx_ev = start;
-        while idx_ev < end {
-            let ev = &events[idx_ev];
+        for ev in &events[start..end] {
             match &ev.kind {
                 AgentEventKind::UserMessage { text } => {
                     body.push_str(&format!("## User · #{}\n\n{text}\n\n", ev.seq.0));
-                    idx_ev += 1;
                 }
                 AgentEventKind::AssistantText { text } => {
-                    let mut merged = text.clone();
-                    let head_seq = ev.seq.0;
-                    idx_ev += 1;
-                    while idx_ev < end {
-                        if let AgentEventKind::AssistantText { text: more } = &events[idx_ev].kind {
-                            merged.push_str(more);
-                            idx_ev += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    body.push_str(&format!("## Assistant · #{head_seq}\n\n{merged}\n\n"));
+                    body.push_str(&format!("## Assistant · #{}\n\n{text}\n\n", ev.seq.0));
                 }
                 AgentEventKind::ToolCall { name, summary } => {
                     body.push_str(&format!("- **call** `{name}` {summary}\n"));
-                    idx_ev += 1;
                 }
                 AgentEventKind::ToolResult { name, ok, summary } => {
                     let tag = if *ok { "ok" } else { "error" };
                     body.push_str(&format!("- **{tag}** `{name}` {summary}\n"));
-                    idx_ev += 1;
                 }
-                _ => {
-                    idx_ev += 1;
-                }
+                _ => {}
             }
         }
         Some((
@@ -720,19 +726,7 @@ impl Stage {
                         AgentEventKind::TurnEnded => inspector.page.activity = Activity::Idle,
                         _ => {}
                     }
-                    if let AgentEventKind::AssistantText { text } = &event.kind
-                        && let Some(last) = inspector.page.events.last_mut()
-                        && event.seq > last.seq
-                        && let AgentEventKind::AssistantText { text: prev } = &mut last.kind
-                    {
-                        let old_seq = last.seq;
-                        prev.push_str(text);
-                        last.seq = event.seq;
-                        last.at = event.at;
-                        if inspector.focused == Some(old_seq) {
-                            inspector.focused = Some(event.seq);
-                        }
-                    } else if !inspector.page.events.iter().any(|e| e.seq == event.seq) {
+                    if !inspector.page.events.iter().any(|e| e.seq == event.seq) {
                         inspector.page.events.push(event.clone());
                         inspector.page.events.sort_by_key(|e| e.seq);
                     }
@@ -2026,8 +2020,7 @@ fn agent_feed(inspector: &AgentInspector, width: u16) -> Vec<FeedItem> {
     let latest = inspector.latest_text_seq();
     let content_w = width.saturating_sub(1);
     inspector
-        .page
-        .events
+        .display_events()
         .iter()
         .map(|ev| {
             let focused = inspector.focused == Some(ev.seq);

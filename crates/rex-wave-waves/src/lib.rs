@@ -1344,6 +1344,16 @@ pub trait AgentHost: Send + Sync + 'static {
         interaction: &HostInteractionId,
         resolution: &InteractionResolution,
     ) -> BoxFut<'_, Result<(), HostError>>;
+    /// Pre-commit check allowing a host to reject unsupported interaction
+    /// resolutions synchronously before `WaveEvent::InteractionResolved` is journaled.
+    fn validate_resolve(
+        &self,
+        _thread: &HostThreadId,
+        _interaction: &HostInteractionId,
+        _resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        Box::pin(async { Ok(()) })
+    }
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>>;
     /// Probe whether a previously-`Live` host thread still exists after a reboot
     /// or reconnect. Returning `Ok(Some(obs))` submits a corrective `WaveObserve`
@@ -1380,6 +1390,15 @@ impl<H: AgentHost + ?Sized> AgentHost for Arc<H> {
         (**self).resolve(thread, interaction, resolution)
     }
 
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).validate_resolve(thread, interaction, resolution)
+    }
+
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
         (**self).retire(thread)
     }
@@ -1413,6 +1432,15 @@ impl<H: AgentHost + ?Sized> AgentHost for Box<H> {
         resolution: &InteractionResolution,
     ) -> BoxFut<'_, Result<(), HostError>> {
         (**self).resolve(thread, interaction, resolution)
+    }
+
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        (**self).validate_resolve(thread, interaction, resolution)
     }
 
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {

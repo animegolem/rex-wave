@@ -71,9 +71,9 @@ pub async fn resolve_acp_workspace(
                     rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
                 return Ok((resolved, title));
             }
-            if wt_path.exists() {
+            if rex_wave_fs::entry_exists(&wt_path) {
                 return Err(HostError::Rejected(format!(
-                    "managed worktree path {} already exists and is not a git worktree of {}",
+                    "managed worktree path {} already exists and is not an independent git worktree of {}",
                     wt_path.display(),
                     project_root.display()
                 )));
@@ -151,15 +151,25 @@ async fn git_rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
 }
 
 async fn is_registered_worktree_for(project_root: &Path, wt_path: &Path) -> bool {
-    if !wt_path.is_dir() || !wt_path.join(".git").exists() {
+    if rex_wave_fs::entry_kind(wt_path).ok() != Some(rex_wave_fs::EntryKind::Dir) {
+        return false;
+    }
+    if rex_wave_fs::entry_kind(&wt_path.join(".git")).ok() != Some(rex_wave_fs::EntryKind::File) {
+        return false;
+    }
+    let Ok(canon_proj) = rex_wave_fs::canonicalize_existing_prefix(project_root) else {
+        return false;
+    };
+    let Ok(canon_wt) = rex_wave_fs::canonicalize_existing_prefix(wt_path) else {
+        return false;
+    };
+    if canon_wt == canon_proj {
         return false;
     }
     let Some(wt_top) = git_rev_parse_path(wt_path, "--show-toplevel").await else {
         return false;
     };
-    let expected_wt = rex_wave_fs::canonicalize_existing_prefix(wt_path)
-        .unwrap_or_else(|_| wt_path.to_path_buf());
-    if wt_top != expected_wt {
+    if wt_top != canon_wt {
         return false;
     }
     let Some(proj_common) = git_rev_parse_path(project_root, "--git-common-dir").await else {
@@ -168,5 +178,30 @@ async fn is_registered_worktree_for(project_root: &Path, wt_path: &Path) -> bool
     let Some(wt_common) = git_rev_parse_path(wt_path, "--git-common-dir").await else {
         return false;
     };
-    proj_common == wt_common
+    if proj_common != wt_common {
+        return false;
+    }
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .any(|registered| {
+            let reg_path = Path::new(registered.trim());
+            let Ok(canon_reg) = rex_wave_fs::canonicalize_existing_prefix(reg_path) else {
+                return false;
+            };
+            canon_reg != canon_proj && canon_reg == canon_wt
+        })
 }

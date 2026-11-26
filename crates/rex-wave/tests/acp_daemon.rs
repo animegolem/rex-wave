@@ -288,6 +288,88 @@ fn daemon_runner_acp_spawns_authenticates_worker_and_retires() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Spawn a second worker and terminate daemon via SIGTERM -> worker token & socket must clean up.
+    let add_w = rex_wave_at(&sock)
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "wave",
+            "add-worker",
+            "acp-e2e",
+            "watcher=antigravity",
+            "--workspace",
+            "project-default",
+            "--brief",
+            "stay idle until sigterm",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add_w.status.success(),
+        "add-worker failed: {}",
+        String::from_utf8_lossy(&add_w.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = rex_wave_at(&sock)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "--json",
+                "wave",
+                "status",
+                "acp-e2e",
+            ])
+            .output()
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
+        let workers = json["value"]["workers"].as_array().unwrap();
+        if workers.iter().any(|w| {
+            w[0] == "watcher" && w[2]["phase"] == "live" && w[2]["activity"]["activity"] == "idle"
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for watcher Idle; status={json}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let tokens_dir = dir.0.join("worker-tokens");
+    assert!(
+        std::fs::read_dir(&tokens_dir)
+            .map(|mut rd| rd.next().is_some())
+            .unwrap_or(false),
+        "expected live worker token file before SIGTERM"
+    );
+
+    let mut daemon = _daemon;
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &daemon.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill_status.success());
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = daemon.0.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "daemon did not exit on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "daemon SIGTERM exit status={status}");
+    let remaining_tokens = std::fs::read_dir(&tokens_dir)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(
+        remaining_tokens, 0,
+        "SIGTERM must unlink all ACP worker tokens"
+    );
 }
 
 #[test]
@@ -300,9 +382,11 @@ fn daemon_bb_mode_still_routes_explicit_acp_opencode_workers() {
     std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::write(sandbox.join(".rex-wave-sandbox"), b"ok\n").unwrap();
 
-    let mock_bin = dir.0.join("mock-opencode.py");
-    std::fs::write(&mock_bin, DAEMON_MOCK_ACP).unwrap();
-    std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let real_mock_bin = dir.0.join("mock-opencode-real.py");
+    std::fs::write(&real_mock_bin, DAEMON_MOCK_ACP).unwrap();
+    std::fs::set_permissions(&real_mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mock_bin = dir.0.join("mock-opencode-link");
+    std::os::unix::fs::symlink(&real_mock_bin, &mock_bin).unwrap();
 
     let project_str = project_dir.to_string_lossy().into_owned();
 
@@ -381,4 +465,25 @@ fn daemon_bb_mode_still_routes_explicit_acp_opencode_workers() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // Verify native ACP runner health follows symlinks (`mock-opencode-link` -> `mock-opencode-real.py`).
+    let cfg_show = rex_wave_at(&sock)
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "--json",
+            "config",
+            "show",
+        ])
+        .output()
+        .unwrap();
+    assert!(cfg_show.status.success());
+    let cfg_json: serde_json::Value = serde_json::from_slice(&cfg_show.stdout).unwrap();
+    let runners_health = cfg_json["value"]["runners_health"].as_array().unwrap();
+    let native_h = runners_health
+        .iter()
+        .find(|r| r["runner"] == "native")
+        .expect("native runner health entry");
+    assert_eq!(native_h["configured"], true);
+    assert_eq!(native_h["healthy"], true);
 }

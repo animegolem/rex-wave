@@ -681,14 +681,16 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let presence_svc = presence.registry(journal.clone(), hub.clone());
     config_hook.bind_presence(presence_svc.clone());
 
+    let wave_svc = rex_wave_waves::WaveService::new(
+        Registry::<Waves>::new(journal.clone(), hub.clone()),
+        default_target,
+        Some(config_svc.subscribe()),
+    )
+    .with_state_dir(state_dir.clone());
+
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: rex_wave_waves::WaveService::new(
-            Registry::<Waves>::new(journal.clone(), hub.clone()),
-            default_target,
-            Some(config_svc.subscribe()),
-        )
-        .with_state_dir(state_dir.clone()),
+        wave: wave_svc.clone(),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
@@ -709,18 +711,21 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     acp_bridge.attach_backend(router.clone());
 
-    let host_router = HostRouter::new(default_target)
-        .with_config_watch(config_svc.subscribe())
-        .with_pin_store(state_dir.join("router-pins.json"))
-        .with_host(RunnerKind::Acp, AcpHost(acp_bridge.clone()))
-        .with_optional_host(
-            RunnerKind::Bb,
-            bb_bridge.as_ref().map(|b| BbHost(b.clone())),
-        )
-        .with_optional_host(
-            RunnerKind::T3,
-            t3_bridge.as_ref().map(|t| T3Host(t.clone())),
-        );
+    let host_router = Arc::new(
+        HostRouter::new(default_target)
+            .with_config_watch(config_svc.subscribe())
+            .with_pin_store(state_dir.join("router-pins.json"))
+            .with_host(RunnerKind::Acp, AcpHost(acp_bridge.clone()))
+            .with_optional_host(
+                RunnerKind::Bb,
+                bb_bridge.as_ref().map(|b| BbHost(b.clone())),
+            )
+            .with_optional_host(
+                RunnerKind::T3,
+                t3_bridge.as_ref().map(|t| T3Host(t.clone())),
+            ),
+    );
+    wave_svc.bind_host(host_router.clone());
 
     let system = |part| LocalClient::new(router.clone(), Principal::System { part });
     let conductor_task = spawn_reactor(
@@ -817,6 +822,24 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         })
     });
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("sigterm listener: {e}"))?;
+
+    #[cfg(unix)]
+    let serve_result = tokio::select! {
+        res = serve_listener_with_hooks(listener, router, auth, hooks) => {
+            res.map_err(|e| format!("uds serve: {e}"))
+        }
+        sig = tokio::signal::ctrl_c() => {
+            sig.map_err(|e| format!("ctrl_c listener: {e}"))
+        }
+        _ = sigterm.recv() => {
+            Ok(())
+        }
+    };
+
+    #[cfg(not(unix))]
     let serve_result = tokio::select! {
         res = serve_listener_with_hooks(listener, router, auth, hooks) => {
             res.map_err(|e| format!("uds serve: {e}"))

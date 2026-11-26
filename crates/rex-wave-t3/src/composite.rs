@@ -117,6 +117,15 @@ impl<B: AgentHost, T: AgentHost> AgentHost for CompositeHost<B, T> {
         self.inner.resolve(thread, interaction, resolution)
     }
 
+    fn validate_resolve(
+        &self,
+        thread: &BbThreadId,
+        interaction: &BbInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        self.inner.validate_resolve(thread, interaction, resolution)
+    }
+
     fn retire(&self, thread: &BbThreadId) -> BoxFut<'_, Result<(), HostError>> {
         self.inner.retire(thread)
     }

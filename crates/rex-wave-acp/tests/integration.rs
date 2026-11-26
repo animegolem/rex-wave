@@ -203,7 +203,6 @@ for raw in sys.stdin:
                     "toolCall": {"toolCallId": f"tc-{prompt_count}", "title": f"Action {prompt_count}", "kind": "edit"},
                     "options": [
                         {"optionId": "opt_once", "name": "Allow once", "kind": "allow_once"},
-                        {"optionId": "opt_session", "name": "Allow session", "kind": "allow_session"},
                         {"optionId": "opt_always", "name": "Allow always", "kind": "allow_always"},
                         {"optionId": "opt_reject", "name": "Reject", "kind": "reject_once"},
                     ],
@@ -371,9 +370,15 @@ fn build_test_stack(
         Arc::new(AcpFeed(bridge.clone())) as Arc<dyn AgentFeed>,
     )]));
 
+    let wave_svc = rex_wave_waves::WaveService::new(
+        Registry::<Waves>::new(journal.clone(), hub.clone()),
+        RunnerKind::Acp,
+        None,
+    );
+
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+        wave: wave_svc.clone(),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<rex_wave_notify::Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(rex_wave_runtime::Unavailable(Family::Mail)),
@@ -388,8 +393,10 @@ fn build_test_stack(
     });
 
     bridge.attach_backend(router.clone());
-    let host_router =
-        HostRouter::new(RunnerKind::Acp).with_host(RunnerKind::Acp, AcpHost(bridge.clone()));
+    let host_router = Arc::new(
+        HostRouter::new(RunnerKind::Acp).with_host(RunnerKind::Acp, AcpHost(bridge.clone())),
+    );
+    wave_svc.bind_host(host_router.clone());
     let conductor = spawn_reactor(
         WaveConductor::new(host_router),
         LocalClient::new(
@@ -1021,7 +1028,7 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
     .await
     .unwrap();
 
-    // Turn 1: AllowForSession.
+    // Turn 1: AllowForSession is rejected synchronously BEFORE committing, leaving interaction open for AllowOnce!
     let b1 = wait_for_phase(&op, &wave, &r_perm, Duration::from_secs(10), |p| {
         matches!(
             p,
@@ -1039,11 +1046,26 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
         } => interaction.id,
         other => panic!("unexpected {other:?}"),
     };
+    let rejected_session = op
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: r_perm.clone(),
+            interaction: id1.clone(),
+            resolution: InteractionResolution::AllowForSession {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(rejected_session, ApiError::Invalid(_)),
+        "expected synchronous Invalid error on unsupported AllowForSession, got {rejected_session:?}"
+    );
     op.call(WaveResolve {
         wave: wave.clone(),
         role: r_perm.clone(),
         interaction: id1,
-        resolution: InteractionResolution::AllowForSession {
+        resolution: InteractionResolution::AllowOnce {
             granted_permissions: None,
         },
     })
@@ -1142,7 +1164,7 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
         } if error.contains("fatal backend panic")
     ));
 
-    // Verify AllowForSession -> opt_session and Deny -> opt_reject.
+    // Verify AllowOnce -> opt_once (after rejected AllowForSession) and Deny -> opt_reject.
     let raw_log = std::fs::read_to_string(&log_path).unwrap();
     let entries: Vec<serde_json::Value> = raw_log
         .lines()
@@ -1154,7 +1176,7 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
         .unwrap();
     assert_eq!(
         reply1["reply"]["result"]["outcome"],
-        serde_json::json!({"outcome": "selected", "optionId": "opt_session"})
+        serde_json::json!({"outcome": "selected", "optionId": "opt_once"})
     );
     let reply2 = entries
         .iter()
@@ -1343,15 +1365,32 @@ for raw in sys.stdin:
     .await;
 
     let page = bridge.page(&wave, &role, None, 0).await.unwrap();
-    let assistant_events: Vec<&String> = page
+    let assistant_chunks: Vec<(HostSeq, &str)> = page
         .events
         .iter()
         .filter_map(|e| match &e.kind {
-            AgentEventKind::AssistantText { text } => Some(text),
+            AgentEventKind::AssistantText { text } => Some((e.seq, text.as_str())),
             _ => None,
         })
         .collect();
-    assert_eq!(assistant_events, vec![&"model=fast-m ok".to_owned()]);
+    assert_eq!(
+        assistant_chunks.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+        vec!["model=", "fast-m", " ok"]
+    );
+    // Cursor paging after the first chunk must return strictly the unseen tail chunks without duplicating `"model="`.
+    let page_after = bridge
+        .page(&wave, &role, Some(assistant_chunks[0].0), 0)
+        .await
+        .unwrap();
+    let tail_chunks: Vec<&str> = page_after
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::AssistantText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tail_chunks, vec!["fast-m", " ok"]);
     let user_events = page
         .events
         .iter()
@@ -1394,6 +1433,85 @@ for raw in sys.stdin:
         bad_model_err,
         rex_wave_waves::HostError::Rejected(_)
     ));
+
+    // Symlink alias at `.worktrees/rex-wave-...` pointing to main repo is rejected by ManagedWorktree.
+    let git_repo = init_temp_git_repo(tmp.path());
+    std::fs::create_dir_all(git_repo.join(".worktrees")).unwrap();
+    std::os::unix::fs::symlink(&git_repo, git_repo.join(".worktrees/rex-wave-w-symlink-r1"))
+        .unwrap();
+    let symlink_err = host
+        .spawn(rex_wave_waves::SpawnRequest {
+            wave: WaveSlug::parse("w-symlink").unwrap(),
+            role: RoleName::parse("r1").unwrap(),
+            attempt: 1,
+            project: ProjectId::parse(git_repo.to_string_lossy().into_owned()).unwrap(),
+            agent: AgentSpec {
+                provider: ProviderId::parse("opencode").unwrap(),
+                model: None,
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Auto,
+                workspace: Workspace::ManagedWorktree {
+                    base: BaseBranch::Default,
+                },
+            },
+            room: dummy_room.clone(),
+            prompt: Body::parse("hi").unwrap(),
+            title: "symlink".into(),
+            run_stamp: "w-symlink:r1:attempt-1:at-1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        symlink_err,
+        rex_wave_waves::HostError::Rejected(_)
+    ));
+
+    // Concurrent spawn + retire stress loop verifies lock ordering cannot deadlock.
+    let mut stress_tasks = Vec::new();
+    for idx in 1..=8u32 {
+        let h = AcpHost(bridge.clone());
+        let p = project.clone();
+        let rm = dummy_room.clone();
+        stress_tasks.push(tokio::spawn(async move {
+            let tid = h
+                .spawn(rex_wave_waves::SpawnRequest {
+                    wave: WaveSlug::parse(format!("w-stress-{idx}")).unwrap(),
+                    role: RoleName::parse("r1").unwrap(),
+                    attempt: 1,
+                    project: p,
+                    agent: AgentSpec {
+                        provider: ProviderId::parse("opencode").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::Auto,
+                        workspace: Workspace::ProjectDefault,
+                    },
+                    room: rm,
+                    prompt: Body::parse("stress").unwrap(),
+                    title: "stress".into(),
+                    run_stamp: format!("w-stress-{idx}:r1:attempt-1:at-1"),
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                })
+                .await
+                .unwrap();
+            h.retire(&tid).await.unwrap();
+        }));
+    }
+    for t in stress_tasks {
+        tokio::time::timeout(Duration::from_secs(10), t)
+            .await
+            .expect("concurrent spawn/retire did not deadlock")
+            .unwrap();
+    }
 
     // Aborting an in-flight `initialize` spawn kills the child group and removes its token.
     let host_bg = AcpHost(bridge.clone());

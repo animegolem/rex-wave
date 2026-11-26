@@ -404,6 +404,66 @@ pub fn model_is_listed_in_models_obj(result: &Value, requested: &str) -> bool {
     })
 }
 
+pub fn validate_selected_config_model(
+    reply: &Value,
+    config_id: &str,
+    requested: &str,
+) -> Result<ModelId, HostError> {
+    let observed = reply
+        .get("configOptions")
+        .or_else(|| reply.get("config_options"))
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter().find(|item| {
+                item.get("id")
+                    .or_else(|| item.get("configId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.trim() == config_id)
+            })
+        })
+        .and_then(|item| {
+            item.get("currentValue")
+                .or_else(|| item.get("current_value"))
+                .or_else(|| item.get("value"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| extract_model_config_option(reply).and_then(|o| o.current_value));
+
+    if observed.as_deref() != Some(requested) {
+        return Err(HostError::Rejected(format!(
+            "ACP provider did not honor requested model '{requested}' in session/set_config_option reply (currentValue={observed:?})"
+        )));
+    }
+    ModelId::parse(requested).map_err(|e| HostError::Rejected(e.to_string()))
+}
+
+pub fn validate_selected_models_obj(reply: &Value, requested: &str) -> Result<ModelId, HostError> {
+    if let Some(actual) = extract_session_model(reply) {
+        if actual.as_str() != requested {
+            return Err(HostError::Rejected(format!(
+                "ACP provider did not honor requested model '{requested}' in session/set_model reply (currentModelId='{}')",
+                actual.as_str()
+            )));
+        }
+        return Ok(actual);
+    }
+    ModelId::parse(requested).map_err(|e| HostError::Rejected(e.to_string()))
+}
+
+pub fn is_cancellation_jsonrpc_error(err: Option<&Value>, formatted_msg: &str) -> bool {
+    if is_refusal_error_text(formatted_msg) {
+        return false;
+    }
+    if err.and_then(jsonrpc_error_code) == Some(-32800) {
+        return true;
+    }
+    let low = formatted_msg.to_ascii_lowercase();
+    low.contains("cancel") || low.contains("aborted") || low.contains("interrupted")
+}
+
 pub fn format_jsonrpc_error(err: &Value) -> String {
     let msg = err
         .get("message")
@@ -582,13 +642,10 @@ pub fn select_permission_response(
             granted_permissions,
         } => {
             reject_custom_granted_permissions(granted_permissions.as_ref())?;
-            let option_id = find_exact_kind("allow_session").ok_or_else(|| {
-                HostError::Rejected(
-                    "ACP permission request did not offer a session-scoped allow_session option (allow_always exceeds session lifetime)"
-                        .into(),
-                )
-            })?;
-            Ok(permission_selected_response(req.rpc_id.clone(), &option_id))
+            Err(HostError::Rejected(
+                "ACP v1 permission options have no session-scoped grant (allow_always exceeds session lifetime); retry with allow_once"
+                    .into(),
+            ))
         }
         InteractionResolution::Deny => match find_exact_kind("reject_once") {
             Some(option_id) => Ok(permission_selected_response(req.rpc_id.clone(), &option_id)),
@@ -1196,7 +1253,6 @@ mod tests {
             },
             "options": [
                 { "optionId": "opt_once", "name": "Allow once", "kind": "allow_once" },
-                { "optionId": "opt_session", "name": "Allow session", "kind": "allow_session" },
                 { "optionId": "opt_always", "name": "Allow always", "kind": "allow_always" },
                 { "optionId": "opt_reject", "name": "Reject", "kind": "reject_once" }
             ]
@@ -1218,16 +1274,14 @@ mod tests {
             json!({ "outcome": "selected", "optionId": "opt_once" })
         );
 
-        let allow_session = select_permission_response(
-            &parsed,
-            &InteractionResolution::AllowForSession {
-                granted_permissions: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            allow_session["result"]["outcome"],
-            json!({ "outcome": "selected", "optionId": "opt_session" })
+        assert!(
+            select_permission_response(
+                &parsed,
+                &InteractionResolution::AllowForSession {
+                    granted_permissions: None,
+                },
+            )
+            .is_err()
         );
 
         // If only allow_always is offered, neither AllowOnce nor AllowForSession may widen scope.

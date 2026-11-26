@@ -9,12 +9,13 @@ use crate::protocol::{
     InboundMessage, ParsedPermissionRequest, PromptOutcome, classify_process_exit,
     classify_prompt_response, deterministic_thread_id, extract_model_config_option,
     extract_session_id, extract_session_model, format_jsonrpc_error, initialize_request,
-    is_acp_thread_id, mcp_server_entry, method_not_found_response, model_is_listed_in_models_obj,
-    normalize_session_update, parse_acp_thread_id, parse_inbound_line, parse_permission_request,
-    permission_cancelled_response, rpc_id_matches, select_permission_response,
-    session_cancel_notification, session_new_request, session_prompt_request,
-    session_set_config_option_request, session_set_model_request, session_supports_models,
-    validate_initialize_result,
+    is_acp_thread_id, is_cancellation_jsonrpc_error, mcp_server_entry, method_not_found_response,
+    model_is_listed_in_models_obj, normalize_session_update, parse_acp_thread_id,
+    parse_inbound_line, parse_permission_request, permission_cancelled_response, rpc_id_matches,
+    select_permission_response, session_cancel_notification, session_new_request,
+    session_prompt_request, session_set_config_option_request, session_set_model_request,
+    session_supports_models, validate_initialize_result, validate_selected_config_model,
+    validate_selected_models_obj,
 };
 use crate::workspace::resolve_acp_workspace;
 use rex_wave_api::Command as _;
@@ -37,13 +38,13 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-const MAX_FEED_EVENTS: usize = 4_096;
+const MAX_FEED_EVENTS: usize = 16_384;
 const MAX_ARCHIVED_FEED_EVENTS: usize = 256;
 const MAX_ARCHIVED_SESSIONS: usize = 256;
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -303,21 +304,7 @@ impl SessionFeed {
         if let AgentEventKind::Usage { ref usage } = kind {
             guard.usage = Some(usage.clone());
         }
-        let live_ev = AgentEvent {
-            seq,
-            at,
-            kind: kind.clone(),
-        };
-        if let AgentEventKind::AssistantText { ref text } = kind
-            && let Some(last) = guard.events.back_mut()
-            && let AgentEventKind::AssistantText { text: ref mut prev } = last.kind
-        {
-            prev.push_str(text);
-            last.seq = seq;
-            last.at = at;
-            let _ = self.tx.send(live_ev.clone());
-            return live_ev;
-        }
+        let live_ev = AgentEvent { seq, at, kind };
         if guard.events.len() >= MAX_FEED_EVENTS {
             guard.events.pop_front();
         }
@@ -506,12 +493,40 @@ struct SessionEntry {
     wave: WaveSlug,
     role: RoleName,
     attempt: u32,
-    pgid: Option<u32>,
+    pgid: Mutex<Option<u32>>,
+    parked_snapshot: Mutex<Option<ParsedPermissionRequest>>,
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     feed: Arc<SessionFeed>,
     alive: AtomicBool,
     archived: AtomicBool,
     retire_lock: tokio::sync::Mutex<()>,
+}
+
+impl SessionEntry {
+    fn take_pgid(&self) -> Option<u32> {
+        self.pgid.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn set_parked_snapshot(&self, parked: Option<ParsedPermissionRequest>) {
+        *self
+            .parked_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = parked;
+    }
+
+    fn get_parked_snapshot(&self) -> Option<ParsedPermissionRequest> {
+        self.parked_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    by_id: HashMap<HostThreadId, Arc<SessionEntry>>,
+    order: VecDeque<HostThreadId>,
+    by_role: HashMap<(WaveSlug, RoleName), HostThreadId>,
 }
 
 struct SessionActor {
@@ -529,7 +544,6 @@ struct SessionActor {
     next_rpc_id: u64,
     next_perm_seq: u64,
     active_prompt_id: Option<u64>,
-    active_prompt_text: Option<String>,
     cancel_requested_for_active: bool,
     queued_prompts: VecDeque<String>,
     parked_permission: Option<ParsedPermissionRequest>,
@@ -592,7 +606,6 @@ impl SessionActor {
             .map_err(|e| HostError::Unreachable(format!("write ACP session/prompt: {e}")))?;
 
         self.active_prompt_id = Some(rpc_id);
-        self.active_prompt_text = Some(text.clone());
         self.cancel_requested_for_active = false;
         self.entry
             .feed
@@ -609,6 +622,7 @@ impl SessionActor {
     async fn send_cancel_active(&mut self, observe_unblocked: bool) {
         let mut had_parked = false;
         if let Some(parked) = self.parked_permission.take() {
+            self.entry.set_parked_snapshot(None);
             had_parked = true;
             if let Some(ref mut stdin) = self.stdin {
                 let cancel_resp = permission_cancelled_response(parked.rpc_id);
@@ -694,7 +708,6 @@ impl SessionActor {
     async fn handle_oversized_frame(&mut self) {
         let msg = format!("ACP child emitted frame exceeding {MAX_LINE_BYTES} byte limit");
         if self.active_prompt_id.take().is_some() {
-            self.active_prompt_text = None;
             self.entry.feed.push_event(AgentEventKind::Other {
                 bb_type: format!("error: {msg}"),
             });
@@ -749,19 +762,31 @@ impl SessionActor {
         interaction: HostInteractionId,
         resolution: InteractionResolution,
     ) -> Result<(), HostError> {
-        let Some(ref parked) = self.parked_permission else {
+        let Some(parked_clone) = self.parked_permission.clone() else {
             return Err(HostError::Rejected(format!(
                 "ACP worker {} has no pending permission interaction",
                 self.thread
             )));
         };
-        if parked.interaction.id != interaction {
+        if parked_clone.interaction.id != interaction {
             return Err(HostError::Rejected(format!(
                 "ACP worker {} is blocked on {}, not {interaction}",
-                self.thread, parked.interaction.id
+                self.thread, parked_clone.interaction.id
             )));
         }
-        let response = select_permission_response(parked, &resolution)?;
+        let response = match select_permission_response(&parked_clone, &resolution) {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.entry.feed.push_event(AgentEventKind::Other {
+                    bb_type: format!("permission_resolution_rejected: {err}"),
+                });
+                self.observe_activity(Activity::Blocked {
+                    interaction: parked_clone.interaction,
+                })
+                .await;
+                return Err(err);
+            }
+        };
         let Some(ref mut stdin) = self.stdin else {
             return Err(HostError::Rejected("ACP worker stdin is closed".into()));
         };
@@ -770,6 +795,7 @@ impl SessionActor {
             .map_err(|e| HostError::Unreachable(format!("write ACP permission reply: {e}")))?;
 
         self.parked_permission = None;
+        self.entry.set_parked_snapshot(None);
         self.observe_activity(Activity::Working).await;
         Ok(())
     }
@@ -784,8 +810,7 @@ impl SessionActor {
                     && let Some(kind) = normalize_session_update(&params, &mut self.tool_names)
                 {
                     if matches!(kind, AgentEventKind::UserMessage { .. })
-                        && (self.active_prompt_id.is_some()
-                            || self.active_prompt_text.as_deref().is_some())
+                        && self.active_prompt_id.is_some()
                     {
                         return;
                     }
@@ -813,6 +838,7 @@ impl SessionActor {
                         self.next_perm_seq = self.next_perm_seq.saturating_add(1);
                         let parsed = parse_permission_request(id, &params, self.next_perm_seq);
                         let interaction = parsed.interaction.clone();
+                        self.entry.set_parked_snapshot(Some(parsed.clone()));
                         self.parked_permission = Some(parsed);
                         self.entry.feed.push_event(AgentEventKind::Other {
                             bb_type: format!("permission_request: {}", interaction.summary),
@@ -830,14 +856,33 @@ impl SessionActor {
                     && rpc_id_matches(&id, active_id)
                 {
                     self.active_prompt_id = None;
-                    self.active_prompt_text = None;
                     let was_cancelled =
                         std::mem::replace(&mut self.cancel_requested_for_active, false);
                     self.parked_permission = None;
-                    let outcome = if was_cancelled {
-                        PromptOutcome::Cancelled
+                    self.entry.set_parked_snapshot(None);
+                    let raw_outcome = classify_prompt_response(result.as_ref(), error.as_ref());
+                    let outcome = if !was_cancelled {
+                        raw_outcome
                     } else {
-                        classify_prompt_response(result.as_ref(), error.as_ref())
+                        match raw_outcome {
+                            PromptOutcome::Refused { .. } => raw_outcome,
+                            PromptOutcome::Idle { .. } | PromptOutcome::Cancelled => {
+                                PromptOutcome::Cancelled
+                            }
+                            PromptOutcome::Errored {
+                                error: err_msg,
+                                usage,
+                            } => {
+                                if is_cancellation_jsonrpc_error(error.as_ref(), &err_msg) {
+                                    PromptOutcome::Cancelled
+                                } else {
+                                    PromptOutcome::Errored {
+                                        error: err_msg,
+                                        usage,
+                                    }
+                                }
+                            }
+                        }
                     };
                     match outcome {
                         PromptOutcome::Idle { usage, stop_reason } => {
@@ -925,19 +970,15 @@ impl SessionActor {
             .lock()
             .map(|g| g.text())
             .unwrap_or_default();
+        self.parked_permission = None;
+        self.entry.set_parked_snapshot(None);
         self.entry.alive.store(false, Ordering::Release);
         self.stdin.take();
         self.bridge.unlink_worker_token(&self.thread);
-        terminate_and_reap_process_group(
-            &mut self.child,
-            self.entry.pgid,
-            self.bridge.cfg.retire_grace,
-        )
-        .await;
-        self.bridge.unregister_active_process(&self.thread);
+        let pgid = self.bridge.claim_pgid(&self.thread, Some(&self.entry));
+        terminate_and_reap_process_group(&mut self.child, pgid, self.bridge.cfg.retire_grace).await;
         let activity = classify_process_exit(status, &tail);
         if self.active_prompt_id.take().is_some() {
-            self.active_prompt_text = None;
             self.entry.feed.push_event(AgentEventKind::TurnEnded);
         }
         self.drain_queued_prompts_as_cancelled("unexpected_eof");
@@ -948,16 +989,13 @@ impl SessionActor {
     }
 
     async fn cleanup_after_unexpected_exit(&mut self) {
+        self.parked_permission = None;
+        self.entry.set_parked_snapshot(None);
         self.entry.alive.store(false, Ordering::Release);
         self.stdin.take();
         self.bridge.unlink_worker_token(&self.thread);
-        terminate_and_reap_process_group(
-            &mut self.child,
-            self.entry.pgid,
-            self.bridge.cfg.retire_grace,
-        )
-        .await;
-        self.bridge.unregister_active_process(&self.thread);
+        let pgid = self.bridge.claim_pgid(&self.thread, Some(&self.entry));
+        terminate_and_reap_process_group(&mut self.child, pgid, self.bridge.cfg.retire_grace).await;
         self.entry.feed.mark_closed();
         self.reader_handle.abort();
         self.stderr_handle.abort();
@@ -968,21 +1006,16 @@ impl SessionActor {
         self.bridge.unlink_worker_token(&self.thread);
         self.send_cancel_active(false).await;
         self.stdin.take();
-        terminate_and_reap_process_group(
-            &mut self.child,
-            self.entry.pgid,
-            self.bridge.cfg.retire_grace,
-        )
-        .await;
-        self.bridge.unregister_active_process(&self.thread);
+        let pgid = self.bridge.claim_pgid(&self.thread, Some(&self.entry));
+        terminate_and_reap_process_group(&mut self.child, pgid, self.bridge.cfg.retire_grace).await;
         self.entry.alive.store(false, Ordering::Release);
-        self.entry.archived.store(true, Ordering::Release);
+        let first_archive = !self.entry.archived.swap(true, Ordering::AcqRel);
         self.entry.feed.mark_closed();
         self.reader_handle.abort();
         self.stderr_handle.abort();
         self.bridge.evict_excess_archived_sessions();
 
-        if emit_archived {
+        if emit_archived && first_archive {
             self.bridge
                 .call_wave_observe(
                     self.entry.wave.clone(),
@@ -1004,11 +1037,14 @@ struct HandshakeCleanupGuard<'a> {
 impl Drop for HandshakeCleanupGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            if let Some(g) = self.pgid {
+            let pgid = self
+                .bridge
+                .take_active_process(&self.thread)
+                .or_else(|| self.pgid.take());
+            if let Some(g) = pgid {
                 kill_process_group_now(g);
             }
             self.bridge.unlink_worker_token(&self.thread);
-            self.bridge.unregister_active_process(&self.thread);
         }
     }
 }
@@ -1018,9 +1054,7 @@ impl Drop for HandshakeCleanupGuard<'_> {
 pub struct AcpBridge {
     cfg: AcpConfig,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
-    sessions: RwLock<HashMap<HostThreadId, Arc<SessionEntry>>>,
-    session_order: Mutex<VecDeque<HostThreadId>>,
-    sessions_by_role: RwLock<HashMap<(WaveSlug, RoleName), HostThreadId>>,
+    registry: Mutex<SessionRegistry>,
     spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
     active_processes: Mutex<HashMap<HostThreadId, Option<u32>>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<ProjectId, String>>>,
@@ -1029,23 +1063,27 @@ pub struct AcpBridge {
 
 impl Drop for AcpBridge {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.active_processes.lock() {
-            for (tid, pgid_opt) in active.drain() {
-                if let Some(pgid) = pgid_opt {
-                    kill_process_group_now(pgid);
-                }
-                self.unlink_worker_token(&tid);
-            }
-        }
-        if let Ok(guard) = self.sessions.read() {
-            for (tid, entry) in guard.iter() {
-                if entry.alive.load(Ordering::Acquire)
-                    && let Some(pgid) = entry.pgid
-                {
-                    kill_process_group_now(pgid);
+        let mut active_map: HashMap<HostThreadId, Option<u32>> = self
+            .active_processes
+            .lock()
+            .map(|mut g| g.drain().collect())
+            .unwrap_or_default();
+        if let Ok(reg) = self.registry.lock() {
+            for (tid, entry) in &reg.by_id {
+                let pgid = entry
+                    .take_pgid()
+                    .or_else(|| active_map.remove(tid).flatten());
+                if let Some(g) = pgid {
+                    kill_process_group_now(g);
                 }
                 self.unlink_worker_token(tid);
             }
+        }
+        for (tid, pgid_opt) in active_map {
+            if let Some(g) = pgid_opt {
+                kill_process_group_now(g);
+            }
+            self.unlink_worker_token(&tid);
         }
     }
 }
@@ -1056,9 +1094,7 @@ impl AcpBridge {
         Arc::new(Self {
             cfg,
             backend: OnceLock::new(),
-            sessions: RwLock::new(HashMap::new()),
-            session_order: Mutex::new(VecDeque::new()),
-            sessions_by_role: RwLock::new(HashMap::new()),
+            registry: Mutex::new(SessionRegistry::default()),
             spawn_locks: Mutex::new(HashMap::new()),
             active_processes: Mutex::new(HashMap::new()),
             project_names_tx,
@@ -1096,8 +1132,8 @@ impl AcpBridge {
     /// Gracefully retires and reaps every ACP worker process group and token.
     pub async fn shutdown_all(&self) {
         let session_tids: Vec<HostThreadId> = {
-            let guard = self.sessions.read().unwrap_or_else(|e| e.into_inner());
-            guard
+            let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.by_id
                 .iter()
                 .filter(|(_, entry)| !entry.archived.load(Ordering::Acquire))
                 .map(|(tid, _)| tid.clone())
@@ -1117,10 +1153,15 @@ impl AcpBridge {
         };
         for (tid, pgid_opt) in leftover {
             self.unlink_worker_token(&tid);
-            if let Some(pgid) = pgid_opt {
-                kill_process_group_now(pgid);
+            let entry = self.get_session(&tid);
+            let pgid = entry
+                .as_deref()
+                .and_then(SessionEntry::take_pgid)
+                .or(pgid_opt);
+            if let Some(g) = pgid {
+                kill_process_group_now(g);
                 let deadline = std::time::Instant::now() + Duration::from_millis(300);
-                while process_group_alive(pgid) && std::time::Instant::now() < deadline {
+                while process_group_alive(g) && std::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
@@ -1134,49 +1175,57 @@ impl AcpBridge {
             .insert(thread.clone(), pgid);
     }
 
-    fn unregister_active_process(&self, thread: &HostThreadId) {
+    fn take_active_process(&self, thread: &HostThreadId) -> Option<u32> {
         self.active_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(thread);
+            .remove(thread)
+            .flatten()
+    }
+
+    fn claim_pgid(&self, thread: &HostThreadId, entry: Option<&SessionEntry>) -> Option<u32> {
+        let from_entry = entry.and_then(SessionEntry::take_pgid);
+        let from_active = self.take_active_process(thread);
+        from_entry.or(from_active)
     }
 
     fn evict_excess_archived_sessions(&self) {
-        let mut order = self.session_order.lock().unwrap_or_else(|e| e.into_inner());
-        let mut by_id = self.sessions.write().unwrap_or_else(|e| e.into_inner());
-        let mut archived_count = by_id
-            .values()
-            .filter(|e| e.archived.load(Ordering::Acquire))
-            .count();
-        if archived_count <= MAX_ARCHIVED_SESSIONS {
-            return;
-        }
-        let mut retained_order = VecDeque::with_capacity(order.len());
-        while let Some(tid) = order.pop_front() {
-            if archived_count > MAX_ARCHIVED_SESSIONS
-                && by_id
-                    .get(&tid)
-                    .is_some_and(|e| e.archived.load(Ordering::Acquire))
-            {
-                let in_use_by_role = self
-                    .sessions_by_role
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .any(|cur| cur == &tid);
-                if !in_use_by_role {
-                    by_id.remove(&tid);
-                    self.spawn_locks
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&tid);
+        let mut evicted_tids = Vec::new();
+        {
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let mut archived_count = reg
+                .by_id
+                .values()
+                .filter(|e| e.archived.load(Ordering::Acquire))
+                .count();
+            if archived_count <= MAX_ARCHIVED_SESSIONS {
+                return;
+            }
+            let mut retained_order = VecDeque::with_capacity(reg.order.len());
+            while let Some(tid) = reg.order.pop_front() {
+                if archived_count > MAX_ARCHIVED_SESSIONS
+                    && let Some(entry) = reg.by_id.get(&tid)
+                    && entry.archived.load(Ordering::Acquire)
+                {
+                    let role_key = (entry.wave.clone(), entry.role.clone());
+                    if reg.by_role.get(&role_key) == Some(&tid) {
+                        reg.by_role.remove(&role_key);
+                    }
+                    reg.by_id.remove(&tid);
+                    evicted_tids.push(tid);
                     archived_count -= 1;
                     continue;
                 }
+                retained_order.push_back(tid);
             }
-            retained_order.push_back(tid);
+            reg.order = retained_order;
         }
-        *order = retained_order;
+        if !evicted_tids.is_empty() {
+            let mut locks = self.spawn_locks.lock().unwrap_or_else(|e| e.into_inner());
+            for tid in evicted_tids {
+                locks.remove(&tid);
+            }
+        }
     }
 
     fn upsert_project_name(&self, project: &ProjectId, title: &str) {
@@ -1424,8 +1473,11 @@ impl AcpBridge {
                         .await?
                         {
                             Ok(val) => {
-                                actual_model = extract_session_model(&val)
-                                    .or_else(|| Some(requested_model.clone()));
+                                actual_model = Some(validate_selected_config_model(
+                                    &val,
+                                    &cfg_opt.config_id,
+                                    req_str,
+                                )?);
                             }
                             Err(err) => {
                                 return Err(HostError::Rejected(format!(
@@ -1461,8 +1513,7 @@ impl AcpBridge {
                         .await?
                         {
                             Ok(val) => {
-                                actual_model = extract_session_model(&val)
-                                    .or_else(|| Some(requested_model.clone()));
+                                actual_model = Some(validate_selected_models_obj(&val, req_str)?);
                             }
                             Err(err) => {
                                 return Err(HostError::Rejected(format!(
@@ -1473,7 +1524,7 @@ impl AcpBridge {
                         }
                     } else {
                         return Err(HostError::Rejected(format!(
-                            "ACP provider does not support selecting requested model '{req_str}'"
+                            "ACP provider does not support selecting requested model '{req_str}' (check worker model or harnesses.<provider>.model in config.toml)"
                         )));
                     }
                 }
@@ -1486,55 +1537,18 @@ impl AcpBridge {
         let (session_id, actual_model, next_rpc_id) = match handshake_res {
             Ok(tuple) => tuple,
             Err(err) => {
-                hs_guard.armed = false;
                 drop(stdin);
-                terminate_and_reap_process_group(&mut child, pgid, self.cfg.retire_grace).await;
+                let reap_pgid = self.take_active_process(&thread).or(pgid);
+                hs_guard.pgid = reap_pgid;
+                terminate_and_reap_process_group(&mut child, reap_pgid, self.cfg.retire_grace)
+                    .await;
                 reader_handle.abort();
                 stderr_handle.abort();
                 self.unlink_worker_token(&thread);
-                self.unregister_active_process(&thread);
+                hs_guard.armed = false;
                 return Err(err);
             }
         };
-
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let feed = Arc::new(SessionFeed::new(thread.clone()));
-        let entry = Arc::new(SessionEntry {
-            wave: req.wave.clone(),
-            role: req.role.clone(),
-            attempt: req.attempt,
-            pgid,
-            cmd_tx,
-            feed,
-            alive: AtomicBool::new(true),
-            archived: AtomicBool::new(false),
-            retire_lock: tokio::sync::Mutex::new(()),
-        });
-
-        {
-            let mut by_id = self.sessions.write().unwrap_or_else(|e| e.into_inner());
-            if !by_id.contains_key(&thread) {
-                self.session_order
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back(thread.clone());
-            }
-            by_id.insert(thread.clone(), entry.clone());
-        }
-        hs_guard.armed = false;
-        {
-            let mut by_role = self
-                .sessions_by_role
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let should_replace = by_role
-                .get(&(req.wave.clone(), req.role.clone()))
-                .and_then(parse_acp_thread_id)
-                .is_none_or(|(_, _, prev_attempt)| prev_attempt <= req.attempt);
-            if should_replace {
-                by_role.insert((req.wave.clone(), req.role.clone()), thread.clone());
-            }
-        }
 
         if let Some(model) = actual_model {
             self.call_wave_observe(
@@ -1548,6 +1562,39 @@ impl AcpBridge {
                 ),
             )
             .await;
+        }
+
+        // Synchronous, non-yielding handoff from `hs_guard` to the live `SessionActor`.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let feed = Arc::new(SessionFeed::new(thread.clone()));
+        let entry = Arc::new(SessionEntry {
+            wave: req.wave.clone(),
+            role: req.role.clone(),
+            attempt: req.attempt,
+            pgid: Mutex::new(pgid),
+            parked_snapshot: Mutex::new(None),
+            cmd_tx,
+            feed,
+            alive: AtomicBool::new(true),
+            archived: AtomicBool::new(false),
+            retire_lock: tokio::sync::Mutex::new(()),
+        });
+
+        {
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            if !reg.by_id.contains_key(&thread) {
+                reg.order.push_back(thread.clone());
+            }
+            reg.by_id.insert(thread.clone(), entry.clone());
+            let should_replace = reg
+                .by_role
+                .get(&(req.wave.clone(), req.role.clone()))
+                .and_then(parse_acp_thread_id)
+                .is_none_or(|(_, _, prev_attempt)| prev_attempt <= req.attempt);
+            if should_replace {
+                reg.by_role
+                    .insert((req.wave.clone(), req.role.clone()), thread.clone());
+            }
         }
 
         let actor = SessionActor {
@@ -1565,7 +1612,6 @@ impl AcpBridge {
             next_rpc_id,
             next_perm_seq: 0,
             active_prompt_id: None,
-            active_prompt_text: None,
             cancel_requested_for_active: false,
             queued_prompts: VecDeque::new(),
             parked_permission: None,
@@ -1576,26 +1622,24 @@ impl AcpBridge {
         };
         let prompt = req.prompt.as_str().to_owned();
         tokio::spawn(actor.run(prompt));
+        hs_guard.armed = false;
 
         Ok(thread)
     }
 
     fn get_session(&self, thread: &HostThreadId) -> Option<Arc<SessionEntry>> {
-        self.sessions
-            .read()
+        self.registry
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .by_id
             .get(thread)
             .cloned()
     }
 
     fn get_session_by_role(&self, wave: &WaveSlug, role: &RoleName) -> Option<Arc<SessionEntry>> {
-        let tid = self
-            .sessions_by_role
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(wave.clone(), role.clone()))
-            .cloned()?;
-        self.get_session(&tid)
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let tid = reg.by_role.get(&(wave.clone(), role.clone()))?;
+        reg.by_id.get(tid).cloned()
     }
 
     async fn tell_worker_thread(
@@ -1618,6 +1662,35 @@ impl AcpBridge {
             .map_err(|_| HostError::Rejected(format!("ACP worker {thread} already exited")))?;
         rx.await
             .map_err(|_| HostError::Rejected(format!("ACP worker {thread} actor stopped")))?
+    }
+
+    fn validate_worker_interaction(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> Result<(), HostError> {
+        let entry = self
+            .get_session(thread)
+            .ok_or_else(|| HostError::Rejected(format!("unknown ACP worker thread {thread}")))?;
+        if !entry.alive.load(Ordering::Acquire) {
+            return Err(HostError::Rejected(format!(
+                "ACP worker {thread} already exited"
+            )));
+        }
+        let Some(parked) = entry.get_parked_snapshot() else {
+            return Err(HostError::Rejected(format!(
+                "ACP worker {thread} has no pending permission interaction"
+            )));
+        };
+        if &parked.interaction.id != interaction {
+            return Err(HostError::Rejected(format!(
+                "ACP worker {thread} is blocked on {}, not {interaction}",
+                parked.interaction.id
+            )));
+        }
+        let _ = select_permission_response(&parked, resolution)?;
+        Ok(())
     }
 
     async fn resolve_worker_interaction(
@@ -1668,7 +1741,7 @@ impl AcpBridge {
         }
 
         let (tx, rx) = oneshot::channel();
-        let wait_deadline = self.cfg.retire_grace + Duration::from_millis(500);
+        let wait_deadline = self.cfg.retire_grace + Duration::from_millis(1500);
         if entry.cmd_tx.send(SessionCmd::Retire { reply: tx }).is_ok()
             && matches!(
                 tokio::time::timeout(wait_deadline, rx).await,
@@ -1678,15 +1751,15 @@ impl AcpBridge {
             return Ok(());
         }
 
-        // Actor already exited or is wedged writing to stdin; force-reap the group independently.
-        if let Some(pgid) = entry.pgid {
+        // Actor already exited or is wedged writing to stdin; force-reap the group once independently.
+        if let Some(pgid) = self.claim_pgid(thread, Some(&entry)) {
             kill_process_group_now(pgid);
             let deadline = std::time::Instant::now() + Duration::from_millis(300);
             while process_group_alive(pgid) && std::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
-        self.unregister_active_process(thread);
+        entry.set_parked_snapshot(None);
         entry.alive.store(false, Ordering::Release);
         if !entry.archived.swap(true, Ordering::AcqRel) {
             entry.feed.mark_closed();
@@ -1780,6 +1853,18 @@ impl AgentHost for AcpHost {
                 .resolve_worker_interaction(&thread, &interaction, &resolution)
                 .await
         })
+    }
+
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        let res = self
+            .0
+            .validate_worker_interaction(thread, interaction, resolution);
+        Box::pin(async move { res })
     }
 
     fn retire(&self, thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {

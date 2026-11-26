@@ -562,10 +562,9 @@ fn save_sync_marker(state_dir: &Path, seq: Seq, sha256: &str) -> Result<(), Stri
     save_sync_marker_opt(state_dir, seq, Some(sha256))
 }
 
-/// Scans `couriers.d/` without following symlinks to report discovered courier adapters.
 fn is_executable_file_path(path: &Path) -> bool {
-    rex_wave_fs::open_regular_nofollow(path)
-        .map(|(_f, m)| (m.permissions().mode() & 0o111) != 0)
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
         .unwrap_or(false)
 }
 
@@ -585,7 +584,7 @@ fn is_program_resolvable(raw: &str) -> bool {
 }
 
 fn native_acp_runner_health(cfg: &RexConfig) -> RunnerHealthStatus {
-    let agy_bin = cfg
+    let explicit_agy = cfg
         .harnesses
         .agy
         .binary
@@ -598,9 +597,8 @@ fn native_acp_runner_health(cfg: &RexConfig) -> RunnerHealthStatus {
                 .ok()
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "agy".to_owned());
-    let opencode_bin = cfg
+        });
+    let explicit_oc = cfg
         .harnesses
         .opencode
         .binary
@@ -613,26 +611,31 @@ fn native_acp_runner_health(cfg: &RexConfig) -> RunnerHealthStatus {
                 .ok()
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "opencode".to_owned());
+        });
+    let has_explicit = explicit_agy.is_some() || explicit_oc.is_some();
+    let agy_bin = explicit_agy.unwrap_or_else(|| "agy".to_owned());
+    let opencode_bin = explicit_oc.unwrap_or_else(|| "opencode".to_owned());
 
     let agy_ok = is_program_resolvable(&agy_bin);
     let oc_ok = is_program_resolvable(&opencode_bin);
     let healthy = agy_ok || oc_ok;
-    let detail = match (agy_ok, oc_ok) {
-        (true, true) => Some("ACP ready (agy, opencode)".into()),
-        (true, false) => Some("ACP ready (agy; opencode not found)".into()),
-        (false, true) => Some("ACP ready (opencode; agy not found)".into()),
-        (false, false) => Some("no agy or opencode executable found".into()),
+    let configured = has_explicit || healthy;
+    let detail = match (agy_ok, oc_ok, has_explicit) {
+        (true, true, _) => Some("ACP ready (agy, opencode)".into()),
+        (true, false, _) => Some("ACP ready (agy; opencode not found)".into()),
+        (false, true, _) => Some("ACP ready (opencode; agy not found)".into()),
+        (false, false, true) => Some("configured ACP binary is not executable".into()),
+        (false, false, false) => Some("no agy or opencode executable found".into()),
     };
     RunnerHealthStatus {
         runner: RunnerRoute::Native,
-        configured: healthy,
+        configured,
         healthy,
         detail,
     }
 }
 
+/// Scans `couriers.d/` without following symlinks to report discovered courier adapters.
 pub fn scan_couriers_dir(dir: &Path) -> Vec<CourierHealthStatus> {
     if rex_wave_fs::entry_kind(dir).ok() != Some(EntryKind::Dir) {
         return Vec::new();
