@@ -296,6 +296,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -593,6 +594,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -958,6 +960,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -1241,6 +1244,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -1510,6 +1514,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -1807,6 +1812,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -2116,6 +2122,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -2408,6 +2415,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -2743,6 +2751,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -3081,6 +3090,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -4252,6 +4262,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -4487,6 +4498,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -4912,6 +4924,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -5439,6 +5452,12 @@
         "liveness": {
           "$ref": "#/$defs/LivenessMode"
         },
+        "machine_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mail_horizon_at": {
           "anyOf": [
             {
@@ -5449,6 +5468,11 @@
             }
           ],
           "description": "Optional explicit mail-horizon watermark override (`--mail-horizon <ms>`).\nWhen omitted on a seat's first live bind, the daemon stamps `ctx.at` automatically."
+        },
+        "require_canary": {
+          "default": false,
+          "description": "When `true`, the binding starts in [`BindingStatus::PendingCanary`] with a\nserver-minted canary token and is not eligible for normal mail delivery\nuntil confirmed via [`PresenceConfirmCanary`].",
+          "type": "boolean"
         },
         "seat": {
           "description": "seat",
@@ -5477,6 +5501,34 @@
       "type": "object"
     },
     "name": "presence_bind"
+  },
+  {
+    "description": "Confirm a pending canary token from inside the claimed session to promote the binding to Live.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Confirm a pending canary token from inside the claimed session to promote a\n[`BindingStatus::PendingCanary`] binding to [`BindingStatus::Live`].",
+      "properties": {
+        "incarnation_id": {
+          "description": "incarnation id",
+          "type": "string"
+        },
+        "seat": {
+          "description": "seat",
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seat",
+        "incarnation_id",
+        "token"
+      ],
+      "title": "PresenceConfirmCanary",
+      "type": "object"
+    },
+    "name": "presence_confirm_canary"
   },
   {
     "description": "Renew the TTL lease on an active seat binding.",
@@ -6044,6 +6096,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"
@@ -6821,6 +6874,7 @@
             "bb_bridge",
             "t3_bridge",
             "mail_bridge",
+            "courier_hub",
             "wake_bell",
             "presence_monitor",
             "config_sync"

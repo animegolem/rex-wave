@@ -788,11 +788,14 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
                     seat: bind.seat,
                     incarnation_id: IncarnationId::parse("inc-1").unwrap(),
                     epoch: 1,
+                    machine_id: bind.machine_id,
                     lane: bind.lane,
                     endpoint: bind.endpoint,
                     liveness: bind.liveness,
                     bound_at: ctx.at(),
                     expires_at: None,
+                    canary_token: None,
+                    canary_verified: false,
                     status: BindingStatus::Live,
                 }))
             })
@@ -852,6 +855,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
         .call(PresenceBind {
             seat: SeatName::parse("sam").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 0,
@@ -861,6 +865,7 @@ async fn uds_stamps_server_conn_id_onto_uds_session_presence_bind_and_saves_prin
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         })

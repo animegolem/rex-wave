@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Reference couriers.d/ adapter for macOS desktop notifications (`TransportEndpoint::OperatorToast`).
+
+Strictly body-blind: renders seat name, letter count, and first subject only.
+Passes all untrusted text through AppleScript `on run argv` arguments (never
+interpolated into shell or AppleScript source).
+
+Protocol:
+  - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
+  - Writes one JSON reply object on stdout:
+      {"outcome": "rung" | "deferred" | "refused" | "unknown", ...}
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+
+
+APPLESCRIPT = (
+    "on run argv\n"
+    "  display notification (item 2 of argv) with title (item 1 of argv)\n"
+    "end run\n"
+)
+
+
+def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
+    payload: dict[str, object] = {"outcome": outcome}
+    if reason:
+        payload["reason"] = reason
+    if detail:
+        payload["detail"] = detail
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def main() -> int:
+    try:
+        claim = json.load(sys.stdin)
+    except Exception as err:
+        return emit("unknown", "invalid-claim", str(err))
+
+    if claim.get("schema") != 1:
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
+
+    endpoint = claim.get("endpoint") or {}
+    if endpoint.get("transport") != "operator_toast":
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected operator_toast, got {endpoint.get('transport')}",
+        )
+
+    seat = str(claim.get("seat") or "unknown")
+    incarnation = str(claim.get("incarnation_id") or "unknown")
+    canary = claim.get("canary_token")
+    if canary:
+        title = f"rex-wave canary (@{seat})"
+        body = f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
+    else:
+        refs = claim.get("referents") or []
+        first_subject = str(refs[0].get("subject", "New mail")) if refs else "New mail"
+        title = f"rex-wave mail (@{seat})"
+        body = f"{len(refs)} letter(s): {first_subject}"[:180]
+
+    if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
+        return emit("rung", detail="dry-run")
+
+    if platform.system() != "Darwin":
+        return emit("unknown", "unsupported-platform", f"requires macOS (got {platform.system()})")
+
+    osascript = shutil.which("osascript")
+    if not osascript:
+        return emit("unknown", "osascript-missing", "osascript binary not found")
+
+    try:
+        proc = subprocess.run(
+            [osascript, "-e", APPLESCRIPT, "--", title, body],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return emit("unknown", "timeout", "osascript timed out")
+    except OSError as err:
+        return emit("unknown", "spawn-failed", str(err))
+
+    if proc.returncode == 0:
+        return emit("rung")
+    return emit("unknown", f"exit-{proc.returncode}", (proc.stderr or proc.stdout or "").strip()[:240])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

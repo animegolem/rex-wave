@@ -162,6 +162,14 @@ fn catch_up(journal: &Journal, world: &mut World) -> bool {
 }
 
 #[derive(Clone, Default)]
+struct SidebarCourierState {
+    consecutive_unknown: u32,
+    seat_consecutive_unknown: BTreeMap<rex_wave_api::SeatName, u32>,
+    degraded_seats: BTreeSet<rex_wave_api::SeatName>,
+    degraded: bool,
+}
+
+#[derive(Clone, Default)]
 pub(crate) struct World {
     rooms: BTreeMap<RoomId, Arc<RoomEntry>>,
     waves: BTreeMap<WaveSlug, Arc<WaveEntry>>,
@@ -170,6 +178,8 @@ pub(crate) struct World {
     archived_projects: BTreeSet<BbProjectId>,
     archived_waves: BTreeSet<WaveSlug>,
     archived_rooms: BTreeSet<RoomId>,
+    mail_failed_deliveries: u32,
+    courier_states: BTreeMap<String, SidebarCourierState>,
     cursor: Cursor,
 }
 
@@ -398,6 +408,55 @@ impl World {
                     },
                 }
             }
+            (StreamId::Mail, Event::Mail(ev)) => match ev {
+                rex_wave_api::mail::MailEvent::RingAttempted {
+                    courier,
+                    seat,
+                    outcome,
+                    degraded_threshold,
+                    ..
+                } => {
+                    let threshold = degraded_threshold.unwrap_or(3).max(1);
+                    let st = self.courier_states.entry(courier.clone()).or_default();
+                    match outcome {
+                        rex_wave_api::mail::CourierOutcome::Rung => {
+                            st.consecutive_unknown = 0;
+                            st.seat_consecutive_unknown.insert(seat.clone(), 0);
+                            st.degraded_seats.remove(seat);
+                            st.degraded = !st.degraded_seats.is_empty();
+                        }
+                        rex_wave_api::mail::CourierOutcome::Unknown => {
+                            st.consecutive_unknown = st.consecutive_unknown.saturating_add(1);
+                            let seat_streak =
+                                st.seat_consecutive_unknown.entry(seat.clone()).or_insert(0);
+                            *seat_streak = seat_streak.saturating_add(1);
+                            if *seat_streak >= threshold {
+                                st.degraded_seats.insert(seat.clone());
+                            }
+                            if st.consecutive_unknown >= threshold || !st.degraded_seats.is_empty()
+                            {
+                                st.degraded = true;
+                            }
+                        }
+                        rex_wave_api::mail::CourierOutcome::Deferred
+                        | rex_wave_api::mail::CourierOutcome::Refused => {}
+                    }
+                }
+                rex_wave_api::mail::MailEvent::DeliveryFailed {
+                    kind,
+                    courier,
+                    seat,
+                    ..
+                } => {
+                    self.mail_failed_deliveries = self.mail_failed_deliveries.saturating_add(1);
+                    if *kind == rex_wave_api::mail::DeliveryFailureKind::AdapterDegraded {
+                        let st = self.courier_states.entry(courier.clone()).or_default();
+                        st.degraded_seats.insert(seat.clone());
+                        st.degraded = true;
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         true
@@ -592,6 +651,14 @@ impl World {
             channels,
             direct_messages,
             osc7501,
+            mail_health: MailHealthBadge {
+                failed_deliveries: self.mail_failed_deliveries,
+                degraded_couriers: self
+                    .courier_states
+                    .values()
+                    .filter(|st| st.degraded)
+                    .count() as u32,
+            },
             cursor: self.cursor.clone(),
         }
     }

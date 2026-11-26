@@ -85,6 +85,7 @@ impl Decider for ConfigDecider {
             runners_health: Vec::new(),
             couriers_health: Vec::new(),
             persist_error: None,
+            mail_failures: Vec::new(),
         };
         match cmd {
             ConfigCommand::ConfigShow(_) => WireReply::ConfigShow(mk_snapshot()),

@@ -394,6 +394,7 @@ fn system_slug(part: SystemPart) -> &'static str {
         SystemPart::BbBridge => "bb_bridge",
         SystemPart::T3Bridge => "t3_bridge",
         SystemPart::MailBridge => "mail_bridge",
+        SystemPart::CourierHub => "courier_hub",
         SystemPart::WakeBell => "wake_bell",
         SystemPart::PresenceMonitor => "presence_monitor",
         SystemPart::ConfigSync => "config_sync",

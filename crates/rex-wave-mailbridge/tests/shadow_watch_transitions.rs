@@ -112,6 +112,7 @@ fn alpha_live_beta_offline() -> PresenceState {
         PresenceCommand::PresenceBind(PresenceBind {
             seat: seat("alpha"),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 7,
@@ -121,6 +122,7 @@ fn alpha_live_beta_offline() -> PresenceState {
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             // Letters in these fixtures carry `id:` ms values above zero.
             mail_horizon_at: Some(UnixMs(0)),
             idem: None,

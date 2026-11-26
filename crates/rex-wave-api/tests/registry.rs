@@ -619,11 +619,14 @@ fn presence_family_provenance_bindings_and_notify_kinds_round_trip() {
             seat: eve.clone(),
             incarnation_id: IncarnationId::parse(format!("inc-{idx}")).unwrap(),
             epoch: idx as u64 + 1,
+            machine_id: Some("node-a".into()),
             lane: None,
             endpoint: ep,
             liveness: LivenessMode::ProcessAndLease,
             bound_at: UnixMs(1_795_261_554_000),
             expires_at: Some(UnixMs(1_795_262_154_000)),
+            canary_token: None,
+            canary_verified: false,
             status: BindingStatus::Live,
         };
         let ev = Event::Presence(PresenceEvent::Bound {

@@ -671,6 +671,7 @@ impl DemoState {
                 degraded: false,
             }],
             persist_error: None,
+            mail_failures: Vec::new(),
         }
     }
 
@@ -764,6 +765,7 @@ impl DemoState {
                 },
             ],
             osc7501,
+            mail_health: rex_wave_api::read::MailHealthBadge::default(),
             cursor: Cursor::live(),
         }
     }
@@ -995,6 +997,7 @@ impl Client for DemoClient {
                 WireCommand::PresenceClaim(_)
                 | WireCommand::PresenceSetStatus(_)
                 | WireCommand::PresenceBind(_)
+                | WireCommand::PresenceConfirmCanary(_)
                 | WireCommand::PresenceHeartbeat(_)
                 | WireCommand::PresenceUnbind(_)
                 | WireCommand::PresenceExpire(_)
@@ -1137,6 +1140,15 @@ impl Client for DemoClient {
                     exported: false,
                 }),
                 WireCommand::MailWakeBell(_) => WireReply::MailWakeBell(Ack),
+                WireCommand::MailRecordRing(_) => {
+                    WireReply::MailRecordRing(rex_wave_api::mail::MailRingRecorded {
+                        consecutive_unknown: 0,
+                        degraded: false,
+                        degraded_newly_triggered: false,
+                        eligible_sha256s: Vec::new(),
+                        committed_failures: Vec::new(),
+                    })
+                }
                 WireCommand::MailSend(_)
                 | WireCommand::MailCheck(_)
                 | WireCommand::MailSearch(_)
@@ -1602,6 +1614,31 @@ pub async fn run_self_test<C: Client>(client: &C) -> io::Result<SelfTestMetrics>
     let warm_p95_us = layout_us[190] + diff_us[190];
 
     model.graphics = GraphicsMode::CellsOnly;
+    // Verify passive mail_health badge renders on ⚙ Settings without mutating Inbox/OSC 7501.
+    let mut passive_overview = model.sidebar_snapshot.clone();
+    let orig_inbox = passive_overview.inbox;
+    let orig_osc = passive_overview.osc7501.clone();
+    passive_overview.mail_health = rex_wave_api::read::MailHealthBadge {
+        failed_deliveries: 1,
+        degraded_couriers: 1,
+    };
+    let mut passive_sidebar = crate::sidebar::Sidebar::new(&passive_overview);
+    passive_sidebar.rebuild(&passive_overview);
+    let settings_node = passive_sidebar
+        .roots
+        .iter()
+        .find(|n| n.key == NodeKey::Settings)
+        .expect("settings node exists");
+    assert_eq!(settings_node.badge, Some(2));
+    assert!(
+        settings_node
+            .tag
+            .as_deref()
+            .is_some_and(|t| t.contains("1 mail") && t.contains("1 deg"))
+    );
+    assert_eq!(passive_overview.inbox, orig_inbox);
+    assert_eq!(passive_overview.osc7501, orig_osc);
+
     let preview_key = NodeKey::Room(RoomId::Channel {
         scope: RoomScope::Project {
             project: BbProjectId::parse("p_123").expect("project"),

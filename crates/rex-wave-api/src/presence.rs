@@ -418,6 +418,7 @@ pub enum LivenessMode {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum BindingStatus {
+    PendingCanary,
     Live,
     TransportDown,
     Expired,
@@ -431,12 +432,18 @@ pub struct SeatBinding {
     pub incarnation_id: IncarnationId,
     pub epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
     pub endpoint: TransportEndpoint,
     pub liveness: LivenessMode,
     pub bound_at: UnixMs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_token: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub canary_verified: bool,
     pub status: BindingStatus,
 }
 
@@ -490,6 +497,8 @@ pub struct PresenceBind {
     pub seat: SeatName,
     #[serde(default)]
     pub incarnation_id: Option<IncarnationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     #[serde(default)]
     pub lane: Option<String>,
     pub endpoint: TransportEndpoint,
@@ -500,12 +509,26 @@ pub struct PresenceBind {
     pub takeover: bool,
     #[serde(default)]
     pub allow_fork: bool,
+    /// When `true`, the binding starts in [`BindingStatus::PendingCanary`] with a
+    /// server-minted canary token and is not eligible for normal mail delivery
+    /// until confirmed via [`PresenceConfirmCanary`].
+    #[serde(default)]
+    pub require_canary: bool,
     /// Optional explicit mail-horizon watermark override (`--mail-horizon <ms>`).
     /// When omitted on a seat's first live bind, the daemon stamps `ctx.at` automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mail_horizon_at: Option<UnixMs>,
     #[serde(default, alias = "id")]
     pub idem: Option<IdemKey>,
+}
+
+/// Confirm a pending canary token from inside the claimed session to promote a
+/// [`BindingStatus::PendingCanary`] binding to [`BindingStatus::Live`].
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PresenceConfirmCanary {
+    pub seat: SeatName,
+    pub incarnation_id: IncarnationId,
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -534,6 +557,8 @@ pub struct PresenceExpire {
     pub expected_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_if_pending_canary: bool,
     pub reason: String,
 }
 
@@ -603,6 +628,11 @@ pub enum PresenceEvent {
         binding: SeatBinding,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         superseded: Vec<IncarnationId>,
+    },
+    CanaryConfirmed {
+        seat: SeatName,
+        incarnation_id: IncarnationId,
+        epoch: u64,
     },
     Heartbeated {
         seat: SeatName,

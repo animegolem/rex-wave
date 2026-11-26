@@ -342,10 +342,17 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         } => {
             mark_connected(model, &mut effects, false, false);
             let prev = model.sidebar.cursor.clone();
+            let mail_health_changed = model.sidebar_snapshot.mail_health != snap.mail_health;
             model.sidebar_snapshot = *snap;
             model.sidebar.rebuild(&model.sidebar_snapshot);
             if model.sidebar.cursor != prev {
                 effects.push(Effect::DebounceHover(model.sidebar.cursor.clone()));
+            }
+            if mail_health_changed && matches!(model.active_target, StageTarget::Settings) {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
+                });
             }
         }
         Msg::Frame {

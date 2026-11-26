@@ -7,6 +7,7 @@
 //! structurally read-only shadow reactor ([`shadow`]), and Gate 2 scorer ([`score`]).
 
 pub mod acks;
+pub mod couriers;
 pub mod dissolved;
 pub mod frontmatter;
 pub mod presence;
@@ -17,31 +18,42 @@ pub use acks::{
     AckIndex, AckRecord, AcksParseReport, AliasMap, NormalizedLetterPath, SkippedAckLine,
     letter_paths_match, normalize_letter_path, normalize_seat_token, parse_acks_jsonl,
 };
+pub use couriers::{
+    COURIER_CLAIM_SCHEMA, COURIER_HUB_SENDER_ADDRESS, CourierHub, CourierHubConfig,
+    CourierHubHandle, CourierReply, DEFAULT_COURIER_TIMEOUT_MS, DEFAULT_DEFER_BACKOFF_MS,
+    DEFAULT_DEGRADED_THRESHOLD, DEFAULT_MAX_DEFER_TRIES, DEFAULT_MAX_REFERENTS_PER_RING,
+    DeliveryClaim, DeliveryReferent, DiscoveredCourier, MAX_COURIER_STDOUT_BYTES,
+    MachineMailSyncState, RouteClaim, RouteSyncTable, RouteWithdrawal, discover_couriers_dir,
+    effective_couriers_dir_for, invoke_courier_script, parse_courier_stdout, resolve_adapter_name,
+    resolve_courier_executable,
+};
 pub use dissolved::{
-    AckTargetResolution, CommittedAckRecord, CommittedMailEntry, DiskMailFile, DiskReconcileInputs,
-    DiskScanCache, MailMigrateVerifyReport, MailRebuildReport, MailState, MirrorIndexRecord,
-    MirrorTarget, PendingReconcileWork, delivery_notices_for_seats, derive_mail_room,
-    execute_reconcile_exports, finish_claimed_drop_file, format_mail_room_body, has_emacs_lock,
-    is_emacs_lock_or_autosave, mail_room_labels, mail_snippet, message_raw_bytes,
+    AckTargetResolution, CommittedAckRecord, CommittedMailEntry, CourierCounterState,
+    DEFAULT_COURIER_DEGRADED_THRESHOLD, DiskMailFile, DiskReconcileInputs, DiskScanCache,
+    MailMigrateVerifyReport, MailRebuildReport, MailState, MirrorIndexRecord, MirrorTarget,
+    PendingReconcileWork, RoomProjectionOutcome, SendBinding, delivery_notices_for_seats,
+    derive_mail_room, execute_reconcile_exports, finish_claimed_drop_file, format_mail_room_body,
+    has_emacs_lock, is_emacs_lock_or_autosave, mail_room_labels, mail_snippet, message_raw_bytes,
     migrate_verify_interchange, parse_mail_index_jsonl, parse_mail_message_from_bytes,
-    project_message_to_room_service, project_messages_to_journal_rooms,
-    project_messages_to_journal_rooms_with_authors, rebuild_mail_from_mirror,
-    reconcile_commit_phase, reconcile_mail_store, scan_and_claim_drop_dir, scan_object_blobs,
-    scan_object_blobs_cached, scan_working_tree_cached, scan_working_tree_dir,
-    synthesize_mail_message,
+    project_message_to_room_service, project_message_to_room_service_checked,
+    project_messages_to_journal_rooms, project_messages_to_journal_rooms_with_authors,
+    rebuild_mail_from_mirror, reconcile_commit_phase, reconcile_mail_store,
+    scan_and_claim_drop_dir, scan_object_blobs, scan_object_blobs_cached, scan_working_tree_cached,
+    scan_working_tree_dir, synthesize_mail_message,
 };
 pub use frontmatter::{
     FrontmatterDoc, FrontmatterEntry, RecipientCandidate, parse_recipient_list, unquote_yaml,
     yaml_quote, yaml_quote_if_needed, yaml_quote_inline,
 };
 pub use presence::{
-    ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DeliveryStatus, HOUSE_PROFILE_MAX_BYTES,
-    IncarnationAffinity, Presence, PresenceState, SeedInterchangePlan, current_process_start,
-    format_delivery_status, house_profile_path_from, is_process_alive, load_claude_session_file,
-    load_claude_session_file_from, load_house_profile, load_house_profile_from,
-    normalize_proc_start, parse_claude_session_json, proc_start_matches, query_process_start,
-    seed_records_from_interchange_with_options, seed_records_from_interchange_with_profile,
-    select_binding_for_delivery, sender_delivery_notice, try_query_process_start,
+    ClaudeSessionFile, DEFAULT_LEASE_TTL_MS, DEFAULT_MACHINE_ID, DeliveryStatus,
+    HOUSE_PROFILE_MAX_BYTES, IncarnationAffinity, Presence, PresenceState, SeedInterchangePlan,
+    current_process_start, default_machine_id, format_delivery_status, house_profile_path_from,
+    is_process_alive, load_claude_session_file, load_claude_session_file_from, load_house_profile,
+    load_house_profile_from, normalize_proc_start, parse_claude_session_json, proc_start_matches,
+    query_process_start, sanitize_machine_id, seed_records_from_interchange_with_options,
+    seed_records_from_interchange_with_profile, select_binding_for_delivery,
+    select_binding_for_delivery_on_machine, sender_delivery_notice, try_query_process_start,
 };
 pub use score::{
     FixtureCoverageReport, GATE1_CASE_IDS, GATE1_CASE_TESTS, MailwatchComparisonReport,
@@ -382,6 +394,7 @@ fn principal_mail_address(p: &Principal) -> String {
             SystemPart::BbBridge => "system/bb_bridge".into(),
             SystemPart::T3Bridge => "system/t3_bridge".into(),
             SystemPart::MailBridge => "system/mail_bridge".into(),
+            SystemPart::CourierHub => "system/courier_hub".into(),
             SystemPart::WakeBell => "system/wake_bell".into(),
             SystemPart::PresenceMonitor => "system/presence_monitor".into(),
             SystemPart::ConfigSync => "system/config_sync".into(),
@@ -1071,6 +1084,23 @@ impl MailBridge {
         self.state.lock().await.mail.clone()
     }
 
+    /// Returns live courier health counters (merged with discovered executables)
+    /// and recent loud delivery failures for `ConfigSnapshot` / `⚙ Settings`.
+    pub async fn courier_health_and_failures(
+        &self,
+        discovered: &[(String, bool)],
+        failure_limit: usize,
+    ) -> (
+        Vec<rex_wave_api::config::CourierHealthStatus>,
+        Vec<MailDeliveryFailure>,
+    ) {
+        let st = self.state.lock().await;
+        (
+            st.mail.courier_health_list(discovered),
+            st.mail.recent_failures(failure_limit),
+        )
+    }
+
     fn should_export(&self) -> bool {
         if !self.export_enabled.load(Ordering::Acquire) {
             return false;
@@ -1302,6 +1332,12 @@ impl MailBridge {
                 seat.as_str().to_owned()
             }
             Principal::Operator { seat } => req.from.as_ref().unwrap_or(seat).as_str().to_owned(),
+            Principal::System {
+                part: SystemPart::CourierHub,
+            } => req.from.as_ref().map_or_else(
+                || couriers::COURIER_HUB_SENDER_ADDRESS.to_owned(),
+                |s| s.as_str().to_owned(),
+            ),
             Principal::System { .. } => req
                 .from
                 .as_ref()
@@ -1564,10 +1600,22 @@ impl MailBridge {
             });
         drop(st);
 
-        // 2. Project into DM / multi-seat mail thread room.
+        // 2. Project into DM / multi-seat mail thread room (skipping system
+        // courier failure notices targeting an operator seat).
+        let skip_system_operator_projection = *ctx.by()
+            == (Principal::System {
+                part: SystemPart::CourierHub,
+            })
+            && committed_msg.from == couriers::COURIER_HUB_SENDER_ADDRESS
+            && committed_msg
+                .to
+                .iter()
+                .chain(committed_msg.cc.iter())
+                .any(|s| self.house.is_operator_seat(s.as_str()));
         let room_seq = if existing_room_seq.is_some() {
             existing_room_seq
-        } else if let Some(ref rsvc) = self.room_svc
+        } else if !skip_system_operator_projection
+            && let Some(ref rsvc) = self.room_svc
             && let Some(ref room) = committed_msg.room
         {
             let seq = project_message_to_room_service(
@@ -1769,6 +1817,388 @@ impl MailBridge {
             });
         }
         self.reconcile().await
+    }
+
+    async fn record_ring(
+        &self,
+        req: MailRecordRing,
+        ctx: DecideCtx,
+    ) -> Result<MailRingRecorded, ApiError> {
+        if !matches!(
+            ctx.by(),
+            Principal::System {
+                part: SystemPart::CourierHub,
+            }
+        ) {
+            return Err(ApiError::Denied {
+                principal: ctx.by().to_string(),
+                action: "record courier ring (restricted to system/courier_hub)".into(),
+            });
+        }
+        let courier = req.courier.trim().to_owned();
+        if courier.is_empty() || courier.len() > 64 || courier.chars().any(char::is_control) {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "courier".into(),
+                reason: "must be 1..=64 printable characters".into(),
+            }));
+        }
+        let machine_id = req.machine_id.trim().to_owned();
+        if machine_id.is_empty()
+            || machine_id.len() > 64
+            || machine_id.chars().any(char::is_control)
+        {
+            return Err(ApiError::Invalid(InvalidId {
+                what: "machine_id".into(),
+                reason: "must be 1..=64 printable characters".into(),
+            }));
+        }
+        let dispatch_id = match req.dispatch_id.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > 128
+                    || trimmed.chars().any(char::is_control)
+                {
+                    return Err(ApiError::Invalid(InvalidId {
+                        what: "dispatch_id".into(),
+                        reason: "must be 1..=128 printable characters".into(),
+                    }));
+                }
+                Some(trimmed.to_owned())
+            }
+            None => None,
+        };
+
+        if req.phase == mail::RingRecordPhase::Reconciled {
+            let Some(failure_seq) = req.reconciled_failure_seq else {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: "reconciled_failure_seq".into(),
+                    reason: "required when phase is reconciled".into(),
+                }));
+            };
+            let mut st = self.state.lock().await;
+            if !st.mail.unreconciled_failures.contains_key(&failure_seq) {
+                let cur = st
+                    .mail
+                    .courier_stats
+                    .get(&courier)
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok(MailRingRecorded {
+                    consecutive_unknown: cur.consecutive_unknown,
+                    degraded: cur.degraded,
+                    degraded_newly_triggered: false,
+                    eligible_sha256s: Vec::new(),
+                    committed_failures: Vec::new(),
+                });
+            }
+            let events = vec![Event::Mail(MailEvent::DeliveryFailureReconciled {
+                failure_seq,
+            })];
+            let appended = st
+                .writer
+                .append(ctx.by(), ctx.at(), None, events)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Appended::Fresh(envs) = &appended {
+                for env in envs {
+                    st.mail.apply(env);
+                }
+            }
+            let cur = st
+                .mail
+                .courier_stats
+                .get(&courier)
+                .cloned()
+                .unwrap_or_default();
+            drop(st);
+            self.publish_fresh(&appended);
+            return Ok(MailRingRecorded {
+                consecutive_unknown: cur.consecutive_unknown,
+                degraded: cur.degraded,
+                degraded_newly_triggered: false,
+                eligible_sha256s: Vec::new(),
+                committed_failures: Vec::new(),
+            });
+        }
+
+        if req.phase == mail::RingRecordPhase::Begin {
+            let Some(did) = dispatch_id else {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: "dispatch_id".into(),
+                    reason: "required when phase is begin".into(),
+                }));
+            };
+            let mut st = self.state.lock().await;
+            let eligible_sha256s = if req.is_canary {
+                Vec::new()
+            } else {
+                let ringable = st.mail.ringable_for_seat(&req.seat);
+                let mut seen = BTreeSet::new();
+                let mut out = Vec::new();
+                for sha in &req.sha256s {
+                    if !seen.insert(sha.clone()) {
+                        continue;
+                    }
+                    let is_system_notice = st.mail.messages.get(sha).is_some_and(|entry| {
+                        entry.committed_by
+                            == (Principal::System {
+                                part: SystemPart::CourierHub,
+                            })
+                            && entry.message.from == couriers::COURIER_HUB_SENDER_ADDRESS
+                    });
+                    if ringable.contains(sha)
+                        && !is_system_notice
+                        && !st.mail.rung_keys.contains(&(req.seat.clone(), sha.clone()))
+                        && !st.mail.is_failed_for_binding(
+                            &req.seat,
+                            req.incarnation_id.as_ref(),
+                            req.expected_epoch,
+                            sha,
+                        )
+                        && !st.mail.has_inflight_for(&req.seat, sha)
+                    {
+                        out.push(sha.clone());
+                    }
+                }
+                if out.is_empty() {
+                    let cur = st
+                        .mail
+                        .courier_stats
+                        .get(&courier)
+                        .cloned()
+                        .unwrap_or_default();
+                    return Ok(MailRingRecorded {
+                        consecutive_unknown: cur.consecutive_unknown,
+                        degraded: cur.degraded,
+                        degraded_newly_triggered: false,
+                        eligible_sha256s: Vec::new(),
+                        committed_failures: Vec::new(),
+                    });
+                }
+                out
+            };
+
+            let events = vec![Event::Mail(MailEvent::RingDispatched {
+                dispatch_id: did,
+                courier: courier.clone(),
+                seat: req.seat,
+                machine_id,
+                incarnation_id: req.incarnation_id,
+                expected_epoch: req.expected_epoch,
+                sha256s: eligible_sha256s.clone(),
+                is_canary: req.is_canary,
+            })];
+            let appended = st
+                .writer
+                .append(ctx.by(), ctx.at(), None, events)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Appended::Fresh(envs) = &appended {
+                for env in envs {
+                    st.mail.apply(env);
+                }
+            }
+            let cur = st
+                .mail
+                .courier_stats
+                .get(&courier)
+                .cloned()
+                .unwrap_or_default();
+            drop(st);
+            self.publish_fresh(&appended);
+            return Ok(MailRingRecorded {
+                consecutive_unknown: cur.consecutive_unknown,
+                degraded: cur.degraded,
+                degraded_newly_triggered: false,
+                eligible_sha256s,
+                committed_failures: Vec::new(),
+            });
+        }
+
+        let clean_reason = req.reason.as_deref().and_then(|s| {
+            let cleaned: String = s
+                .trim()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(128)
+                .collect();
+            let t = cleaned.trim();
+            (!t.is_empty()).then(|| t.to_owned())
+        });
+        let clean_detail = req.detail.as_deref().and_then(|s| {
+            let cleaned: String = s
+                .trim()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(512)
+                .collect();
+            let t = cleaned.trim();
+            (!t.is_empty()).then(|| t.to_owned())
+        });
+        let threshold = req
+            .degraded_threshold
+            .unwrap_or(DEFAULT_COURIER_DEGRADED_THRESHOLD)
+            .max(1);
+
+        let mut st = self.state.lock().await;
+        let prev = st
+            .mail
+            .courier_stats
+            .get(&courier)
+            .cloned()
+            .unwrap_or_default();
+        let prev_seat_streak = prev
+            .seat_consecutive_unknown
+            .get(&req.seat)
+            .copied()
+            .unwrap_or(0);
+        let is_route_pending =
+            !req.is_canary && req.incarnation_id.is_none() && courier == "route-pending";
+        let (next_unknown_streak, next_seat_streak) = if is_route_pending {
+            (prev.consecutive_unknown, prev_seat_streak)
+        } else {
+            match req.outcome {
+                CourierOutcome::Unknown => (
+                    prev.consecutive_unknown.saturating_add(1),
+                    prev_seat_streak.saturating_add(1),
+                ),
+                CourierOutcome::Rung => (0, 0),
+                CourierOutcome::Deferred | CourierOutcome::Refused => {
+                    (prev.consecutive_unknown, prev_seat_streak)
+                }
+            }
+        };
+        let newly_courier_degraded = !prev.degraded && next_unknown_streak >= threshold;
+        let newly_seat_degraded =
+            !prev.degraded_seats.contains(&req.seat) && next_seat_streak >= threshold;
+        let degraded_newly_triggered = !is_route_pending
+            && req.outcome == CourierOutcome::Unknown
+            && (newly_courier_degraded || newly_seat_degraded);
+
+        let mut events = vec![Event::Mail(MailEvent::RingAttempted {
+            dispatch_id,
+            courier: courier.clone(),
+            seat: req.seat.clone(),
+            machine_id,
+            incarnation_id: req.incarnation_id.clone(),
+            sha256s: req.sha256s.clone(),
+            is_canary: req.is_canary,
+            pre_spawn: req.pre_spawn,
+            outcome: req.outcome,
+            reason: clean_reason.clone(),
+            detail: clean_detail.clone(),
+            degraded_threshold: Some(threshold),
+        })];
+
+        if let Some(kind) = req.failure_kind {
+            let fail_reason = clean_reason
+                .clone()
+                .unwrap_or_else(|| kind.as_str().to_owned());
+            if !req.failure_groups.is_empty() {
+                for grp in &req.failure_groups {
+                    events.push(Event::Mail(MailEvent::DeliveryFailed {
+                        kind,
+                        courier: courier.clone(),
+                        seat: req.seat.clone(),
+                        incarnation_id: req.incarnation_id.clone(),
+                        expected_epoch: req.expected_epoch,
+                        is_canary: req.is_canary,
+                        sha256s: grp.sha256s.clone(),
+                        sender_seat: grp.sender_seat.clone(),
+                        hub_owner_seat: req.hub_owner_seat.clone(),
+                        reason: fail_reason.clone(),
+                        detail: clean_detail.clone(),
+                    }));
+                }
+            } else {
+                events.push(Event::Mail(MailEvent::DeliveryFailed {
+                    kind,
+                    courier: courier.clone(),
+                    seat: req.seat.clone(),
+                    incarnation_id: req.incarnation_id.clone(),
+                    expected_epoch: req.expected_epoch,
+                    is_canary: req.is_canary,
+                    sha256s: req.sha256s.clone(),
+                    sender_seat: req.sender_seat.clone(),
+                    hub_owner_seat: req.hub_owner_seat.clone(),
+                    reason: fail_reason,
+                    detail: clean_detail.clone(),
+                }));
+            }
+        }
+        if degraded_newly_triggered
+            && req.failure_kind != Some(DeliveryFailureKind::AdapterDegraded)
+        {
+            events.push(Event::Mail(MailEvent::DeliveryFailed {
+                kind: DeliveryFailureKind::AdapterDegraded,
+                courier: courier.clone(),
+                seat: req.seat.clone(),
+                incarnation_id: req.incarnation_id.clone(),
+                expected_epoch: req.expected_epoch,
+                is_canary: false,
+                sha256s: req.sha256s.clone(),
+                sender_seat: None,
+                hub_owner_seat: req.hub_owner_seat.clone(),
+                reason: clean_reason.unwrap_or_else(|| "consecutive-unknown".to_owned()),
+                detail: clean_detail,
+            }));
+        }
+
+        let appended = st
+            .writer
+            .append(ctx.by(), ctx.at(), None, events)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let mut committed_failures = Vec::new();
+        if let Appended::Fresh(envs) = &appended {
+            for env in envs {
+                st.mail.apply(env);
+                if let Event::Mail(MailEvent::DeliveryFailed {
+                    kind,
+                    courier,
+                    seat,
+                    incarnation_id,
+                    expected_epoch,
+                    is_canary,
+                    sha256s,
+                    sender_seat,
+                    hub_owner_seat,
+                    reason,
+                    detail,
+                }) = &env.event
+                {
+                    committed_failures.push(mail::MailDeliveryFailure {
+                        seq: env.seq,
+                        at: env.at,
+                        kind: *kind,
+                        courier: courier.clone(),
+                        seat: seat.clone(),
+                        incarnation_id: incarnation_id.clone(),
+                        expected_epoch: *expected_epoch,
+                        is_canary: *is_canary,
+                        sha256s: sha256s.clone(),
+                        sender_seat: sender_seat.clone(),
+                        hub_owner_seat: hub_owner_seat.clone(),
+                        reason: reason.clone(),
+                        detail: detail.clone(),
+                    });
+                }
+            }
+        }
+        let after = st
+            .mail
+            .courier_stats
+            .get(&courier)
+            .cloned()
+            .unwrap_or_default();
+        drop(st);
+        self.publish_fresh(&appended);
+
+        Ok(MailRingRecorded {
+            consecutive_unknown: after.consecutive_unknown,
+            degraded: after.degraded,
+            degraded_newly_triggered,
+            eligible_sha256s: req.sha256s,
+            committed_failures,
+        })
     }
 
     async fn promote(&self, req: MailPromote, ctx: DecideCtx) -> Result<LetterRef, ApiError> {
@@ -2425,6 +2855,9 @@ impl Service<MailCommand> for MailBridge {
                 MailCommand::MailReconcile(req) => Ok(WireReply::MailReconcile(
                     self.reconcile_cmd(req, ctx).await?,
                 )),
+                MailCommand::MailRecordRing(req) => {
+                    Ok(WireReply::MailRecordRing(self.record_ring(req, ctx).await?))
+                }
             }
         })
     }

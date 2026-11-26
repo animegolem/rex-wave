@@ -339,6 +339,182 @@ impl ProtectedRootsGuard {
         Ok(canon)
     }
 
+    /// Descriptor-anchored counterpart to [`Self::verify_dir`]: walks from `/`
+    /// component-by-component via `openat(O_DIRECTORY | O_NOFOLLOW)`, resolves
+    /// intermediate ancestor symlinks safely via `readlinkat` while refusing a
+    /// symlink on the final target directory, verifies both path and `(dev, ino)`
+    /// against protected roots at every step, and returns the held directory
+    /// handle `(File, real_path)` so callers never reopen by pathname.
+    pub fn open_verified_dir(&self, path: &Path) -> Result<(std::fs::File, PathBuf), SandboxError> {
+        use rustix::fs::{Mode, OFlags, fstat, openat, readlinkat};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| SandboxError::Io(e.to_string()))?
+                .join(path)
+        };
+        let lex = lexical_normalize(&abs_path)?;
+        if matches!(entry_kind(&abs_path), Ok(EntryKind::Symlink))
+            || matches!(entry_kind(&lex), Ok(EntryKind::Symlink))
+        {
+            return Err(SandboxError::Io(format!(
+                "refusing symlink directory {}",
+                path.display()
+            )));
+        }
+        let _ = self.verify_dir(&abs_path)?;
+
+        let mut forbidden_inodes = BTreeSet::new();
+        for prod in &self.roots {
+            if let Ok(m) = std::fs::metadata(prod) {
+                forbidden_inodes.insert((m.dev(), m.ino()));
+            }
+        }
+        let mut home_inodes = BTreeSet::new();
+        for home in &self.homes {
+            if let Ok(m) = std::fs::metadata(home) {
+                home_inodes.insert((m.dev(), m.ino()));
+            }
+        }
+
+        let open_root = || -> Result<rustix::fd::OwnedFd, SandboxError> {
+            let f = std::fs::File::open("/").map_err(|e| SandboxError::Io(e.to_string()))?;
+            Ok(f.into())
+        };
+        let check_step =
+            |fd: &rustix::fd::OwnedFd, cur: &Path, is_final: bool| -> Result<(), SandboxError> {
+                let st = fstat(fd).map_err(|e| SandboxError::Io(e.to_string()))?;
+                let id = (st.st_dev as u64, st.st_ino as u64);
+                if forbidden_inodes.contains(&id) {
+                    return Err(SandboxError::Production(path.to_path_buf()));
+                }
+                if is_final && (cur.parent().is_none() || home_inodes.contains(&id)) {
+                    return Err(SandboxError::Production(path.to_path_buf()));
+                }
+                if cur
+                    .components()
+                    .any(|c| self.names.iter().any(|name| c.as_os_str() == name.as_str()))
+                {
+                    return Err(SandboxError::Production(path.to_path_buf()));
+                }
+                for prod in &self.roots {
+                    if cur.starts_with(prod) || (is_final && prod.starts_with(cur)) {
+                        return Err(SandboxError::Production(path.to_path_buf()));
+                    }
+                }
+                if is_final {
+                    self.check(cur, path)?;
+                }
+                Ok(())
+            };
+
+        let mut dir_fd = open_root()?;
+        let mut cur_path = PathBuf::from("/");
+        let mut ancestors: Vec<(rustix::fd::OwnedFd, PathBuf)> = Vec::new();
+        let mut pending: Vec<(std::ffi::OsString, bool)> = abs_path
+            .components()
+            .rev()
+            .map(|c| (c.as_os_str().to_owned(), false))
+            .collect();
+        let mut hops = 0usize;
+        let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+
+        while let Some((seg, from_symlink)) = pending.pop() {
+            match Path::new(&seg).components().next() {
+                Some(Component::Prefix(_) | Component::RootDir | Component::CurDir) | None => {
+                    continue;
+                }
+                Some(Component::ParentDir) => {
+                    if let Some((prev_fd, prev_path)) = ancestors.pop() {
+                        dir_fd = prev_fd;
+                        cur_path = prev_path;
+                    }
+                    check_step(&dir_fd, &cur_path, pending.is_empty())?;
+                    continue;
+                }
+                Some(Component::Normal(_)) => {}
+            }
+
+            let is_final_target = pending.is_empty() && !from_symlink;
+            let next_fd = match openat(&dir_fd, &seg, dir_flags, Mode::empty()) {
+                Ok(fd) => fd,
+                Err(e)
+                    if !is_final_target
+                        && (e == rustix::io::Errno::LOOP
+                            || e == rustix::io::Errno::MLINK
+                            || e == rustix::io::Errno::NOTDIR) =>
+                {
+                    let target = match readlinkat(&dir_fd, &seg, Vec::new()) {
+                        Ok(cstr) => {
+                            use std::os::unix::ffi::OsStringExt as _;
+                            PathBuf::from(std::ffi::OsString::from_vec(cstr.into_bytes()))
+                        }
+                        Err(_) => {
+                            return Err(SandboxError::Io(format!(
+                                "{} is not a directory",
+                                cur_path.join(&seg).display()
+                            )));
+                        }
+                    };
+                    hops += 1;
+                    if hops > MAX_LINK_HOPS {
+                        return Err(SandboxError::Config(format!(
+                            "cannot resolve `{}`: too many symlinks",
+                            path.display()
+                        )));
+                    }
+                    if target.is_absolute() {
+                        ancestors.clear();
+                        dir_fd = open_root()?;
+                        cur_path = PathBuf::from("/");
+                    }
+                    for comp in target.components().rev() {
+                        pending.push((comp.as_os_str().to_owned(), true));
+                    }
+                    continue;
+                }
+                Err(e)
+                    if e == rustix::io::Errno::LOOP
+                        || e == rustix::io::Errno::MLINK
+                        || e == rustix::io::Errno::NOTDIR =>
+                {
+                    return Err(SandboxError::Io(format!(
+                        "refusing symlink or non-directory {}",
+                        cur_path.join(&seg).display()
+                    )));
+                }
+                Err(e) => {
+                    return Err(SandboxError::Io(format!(
+                        "open {}: {e}",
+                        cur_path.join(&seg).display()
+                    )));
+                }
+            };
+
+            let next_path = cur_path.join(&seg);
+            check_step(&next_fd, &next_path, pending.is_empty())?;
+            let prev_fd = std::mem::replace(&mut dir_fd, next_fd);
+            let prev_path = std::mem::replace(&mut cur_path, next_path);
+            ancestors.push((prev_fd, prev_path));
+        }
+
+        check_step(&dir_fd, &cur_path, true)?;
+        let file = std::fs::File::from(dir_fd);
+        let meta = file
+            .metadata()
+            .map_err(|e| SandboxError::Io(e.to_string()))?;
+        if !meta.is_dir() {
+            return Err(SandboxError::Io(format!(
+                "{} is not a directory",
+                cur_path.display()
+            )));
+        }
+        Ok((file, cur_path))
+    }
+
     /// Place `raw` (absolute, or relative to `root`) strictly beneath the
     /// real directory `root`, refusing `..`, any symlink on the way, and
     /// protected locations. Returns `(path, slash-joined relative path,

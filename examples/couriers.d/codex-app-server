@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Reference couriers.d/ adapter for Codex `app-server` threads.
+
+Speaks Codex `app-server` JSON-RPC 2.0 (`initialize` -> `initialized` -> `turn/start`
+with `{"threadId": <codex-thread-id>, "input": [...]}`) over RFC 6455 WebSocket on
+either an `AF_UNIX` listener (`codex app-server --listen unix://<path>`) or a TCP
+`ws://host:port` listener (`CODEX_APP_SERVER_SOCKET` or `CODEX_APP_SERVER_URL`).
+
+Thread ID resolution:
+  1. `endpoint.client` suffix `codex:<thread_id>` or `codex-app-server:<thread_id>`.
+  2. `CODEX_THREAD_ID` environment override.
+
+Protocol:
+  - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
+    Letter bodies are never included.
+  - Writes one JSON reply object on stdout:
+      {"outcome": "rung" | "deferred" | "refused" | "unknown", ...}
+"""
+
+from __future__ import annotations
+
+import base64
+import errno
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import urllib.parse
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_WS_PAYLOAD_BYTES = 4 * 1024 * 1024
+
+
+def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
+    payload: dict[str, object] = {"outcome": outcome}
+    if reason:
+        payload["reason"] = reason
+    if detail:
+        payload["detail"] = detail
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def format_nudge(claim: dict) -> str:
+    seat = claim.get("seat", "unknown")
+    incarnation = claim.get("incarnation_id", "unknown")
+    canary = claim.get("canary_token")
+    if canary:
+        return (
+            f"[rex-wave canary] Confirm session for @{seat} ({incarnation}):\n"
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
+        )
+    refs = claim.get("referents") or []
+    lines = [f"[rex-wave mail] {len(refs)} letter(s) waiting for @{seat}:"]
+    for ref in refs[:8]:
+        sha16 = str(ref.get("sha256", ""))[:16]
+        lines.append(
+            f"- {sha16} from @{ref.get('from', 'unknown')}: {ref.get('subject', '(no subject)')}"
+        )
+    lines.append(f"Run `rex-wave mail check --seat {seat}`.")
+    return "\n".join(lines)
+
+
+def extract_codex_thread_id(endpoint: dict) -> str:
+    client = str(endpoint.get("client") or "").strip()
+    for prefix in ("codex-app-server:", "codex:"):
+        if client.lower().startswith(prefix):
+            tid = client[len(prefix) :].strip()
+            if tid:
+                return tid
+    return os.environ.get("CODEX_THREAD_ID", "").strip()
+
+
+class WsConnection:
+    """Minimal stdlib RFC 6455 WebSocket client over AF_UNIX or TCP sockets."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buf = bytearray()
+
+    def _read_exact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(4096, n - len(self.buf)))
+            if not chunk:
+                raise EOFError("codex app-server closed WebSocket connection")
+            self.buf.extend(chunk)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def handshake(self, host_header: str, path: str, bearer_token: str) -> tuple[int, str]:
+        raw_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        expected_accept = base64.b64encode(
+            hashlib.sha1((raw_key + WS_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        lines = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host_header}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {raw_key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if bearer_token:
+            lines.append(f"Authorization: Bearer {bearer_token}")
+        req_bytes = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+        self.sock.sendall(req_bytes)
+
+        while b"\r\n\r\n" not in self.buf:
+            if len(self.buf) > 65536:
+                raise ValueError("oversized HTTP response header during WebSocket upgrade")
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise EOFError("codex app-server closed connection before HTTP upgrade reply")
+            self.buf.extend(chunk)
+
+        idx = self.buf.index(b"\r\n\r\n")
+        raw_hdr = bytes(self.buf[:idx]).decode("latin-1", errors="replace")
+        del self.buf[: idx + 4]
+
+        hdr_lines = raw_hdr.split("\r\n")
+        status_line = hdr_lines[0] if hdr_lines else ""
+        parts = status_line.split(" ", 2)
+        status_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        headers: dict[str, str] = {}
+        for hline in hdr_lines[1:]:
+            if ":" in hline:
+                k, v = hline.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        if status_code != 101:
+            return status_code, status_line
+        if headers.get("sec-websocket-accept") != expected_accept:
+            raise ValueError("invalid Sec-WebSocket-Accept from codex app-server")
+        return 101, status_line
+
+    def send_frame(self, opcode: int, payload: bytes) -> None:
+        mask = os.urandom(4)
+        n = len(payload)
+        b0 = 0x80 | (opcode & 0x0F)
+        if n < 126:
+            hdr = bytes([b0, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([b0, 0x80 | 126]) + struct.pack("!H", n)
+        else:
+            hdr = bytes([b0, 0x80 | 127]) + struct.pack("!Q", n)
+        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        self.sock.sendall(hdr + mask + masked)
+
+    def send_text(self, text: str) -> None:
+        self.send_frame(0x1, text.encode("utf-8"))
+
+    def recv_text(self) -> str:
+        fragments: list[bytes] = []
+        while True:
+            b0, b1 = self._read_exact(2)
+            fin = bool(b0 & 0x80)
+            opcode = b0 & 0x0F
+            masked = bool(b1 & 0x80)
+            length = b1 & 0x7F
+            if length == 126:
+                (length,) = struct.unpack("!H", self._read_exact(2))
+            elif length == 127:
+                (length,) = struct.unpack("!Q", self._read_exact(8))
+            if length > MAX_WS_PAYLOAD_BYTES:
+                raise ValueError(f"WebSocket frame {length} exceeds cap")
+            mask_key = self._read_exact(4) if masked else b""
+            payload = self._read_exact(length)
+            if masked:
+                payload = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+
+            if opcode == 0x9:
+                self.send_frame(0xA, payload[:125])
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode == 0x8:
+                raise EOFError("codex app-server sent WebSocket Close frame")
+            if opcode in (0x1, 0x2, 0x0):
+                fragments.append(payload)
+                if fin:
+                    return b"".join(fragments).decode("utf-8")
+                continue
+            raise ValueError(f"unsupported WebSocket opcode {opcode}")
+
+    def close(self) -> None:
+        try:
+            self.send_frame(0x8, b"")
+        except Exception:
+            pass
+        self.sock.close()
+
+
+def read_rpc_response(ws: WsConnection, target_id: int) -> dict:
+    while True:
+        raw = ws.recv_text()
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            msg = json.loads(stripped)
+            if isinstance(msg, dict) and msg.get("id") == target_id:
+                return msg
+
+
+def connect_endpoint(target: str, timeout: float) -> tuple[socket.socket, str, str]:
+    if target.startswith("ws://"):
+        parsed = urllib.parse.urlparse(target)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        return sock, f"{host}:{port}", path
+
+    clean_path = target[len("unix://") :] if target.startswith("unix://") else target
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(clean_path)
+    return sock, "localhost", "/"
+
+
+def send_jsonrpc_ws(target: str, thread_id: str, prompt: str, timeout: float) -> int:
+    bearer = os.environ.get("CODEX_WS_TOKEN", "").strip()
+    ws: WsConnection | None = None
+    dispatched_turn = False
+    try:
+        raw_sock, host_hdr, path = connect_endpoint(target, timeout)
+        ws = WsConnection(raw_sock)
+        status_code, status_line = ws.handshake(host_hdr, path, bearer)
+        if status_code != 101:
+            if status_code in (429, 503):
+                return emit("deferred", f"ws-http-{status_code}", status_line[:240])
+            return emit("unknown", f"ws-http-{status_code or 'bad'}", status_line[:240])
+
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "rex-wave-courier", "version": "0.1.0"},
+                "capabilities": {},
+            },
+        }
+        ws.send_text(json.dumps(init_req, separators=(",", ":")))
+        init_resp = read_rpc_response(ws, 1)
+        if "error" in init_resp:
+            return emit("unknown", "rpc-init-failed", json.dumps(init_resp["error"])[:240])
+
+        notif = {"jsonrpc": "2.0", "method": "initialized", "params": {}}
+        ws.send_text(json.dumps(notif, separators=(",", ":")))
+
+        turn_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+        }
+        ws.send_text(json.dumps(turn_req, separators=(",", ":")))
+        dispatched_turn = True
+        turn_resp = read_rpc_response(ws, 2)
+        if "error" not in turn_resp:
+            return emit("rung")
+        err_obj = turn_resp.get("error") or {}
+        err_msg = str(err_obj.get("message") or err_obj)
+        lower = err_msg.lower()
+        if "thread" in lower and any(
+            kw in lower
+            for kw in (
+                "not found",
+                "unknown",
+                "no such",
+                "archived",
+                "deleted",
+                "invalid thread id",
+            )
+        ):
+            return emit("refused", "address-gone", err_msg[:240])
+        if "busy" in lower or "active turn" in lower or "in progress" in lower:
+            return emit("deferred", "turn-active", err_msg[:240])
+        return emit("unknown", "rpc-error", err_msg[:240])
+    except TimeoutError:
+        if dispatched_turn:
+            return emit("unknown", "timeout", "codex turn/start timed out after dispatch")
+        return emit("deferred", "connect-timeout", "codex app-server handshake timed out")
+    except EOFError as err:
+        if dispatched_turn:
+            return emit("unknown", "eof-after-dispatch", str(err))
+        return emit("deferred", "server-closed", str(err))
+    except OSError as err:
+        if dispatched_turn:
+            return emit("unknown", "socket-io-after-dispatch", str(err))
+        if err.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.EAGAIN, errno.EWOULDBLOCK):
+            return emit("deferred", "server-unreachable", str(err))
+        return emit("unknown", "socket-error", str(err))
+    except ValueError as err:
+        return emit("unknown", "invalid-rpc-frame", str(err))
+    finally:
+        if ws is not None:
+            ws.close()
+
+
+def main() -> int:
+    try:
+        claim = json.load(sys.stdin)
+    except Exception as err:
+        return emit("unknown", "invalid-claim", str(err))
+
+    if claim.get("schema") != 1:
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
+
+    endpoint = claim.get("endpoint") or {}
+    if endpoint.get("transport") != "uds_session":
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected uds_session, got {endpoint.get('transport')}",
+        )
+
+    if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
+        return emit("rung", detail="dry-run")
+
+    thread_id = extract_codex_thread_id(endpoint)
+    if not thread_id:
+        return emit(
+            "unknown",
+            "missing-codex-thread-id",
+            "set client='codex:<thread_id>' or CODEX_THREAD_ID",
+        )
+
+    target = (
+        os.environ.get("CODEX_APP_SERVER_SOCKET", "").strip()
+        or os.environ.get("CODEX_APP_SERVER_URL", "").strip()
+    )
+    if not target:
+        return emit(
+            "unknown",
+            "missing-app-server-socket",
+            "set CODEX_APP_SERVER_SOCKET (unix://...) or CODEX_APP_SERVER_URL (ws://...)",
+        )
+
+    timeout = float(os.environ.get("CODEX_APP_SERVER_TIMEOUT_SECS", "6"))
+    return send_jsonrpc_ws(target, thread_id, format_nudge(claim), timeout)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

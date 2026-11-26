@@ -115,8 +115,95 @@ Opens `<ro-dir>` strictly read-only, imports all letters and `state/acks.jsonl` 
 Configuration keys (in `config.toml` or `rex-wave config set`):
 
 - `mail.export_enabled` (`true` | `false`): toggle mirror export without affecting SQLite commits.
+- `mail.require_canary` (`true` | `false`): require canary confirmation for push-courier Presence binds by default.
 - `mail.mirror_dir`: optional mirror root override (checked against `protected-roots`).
 - `mail.drop_dir`: optional external drop folder scanned for hand-dropped `.md` files and consumed into `<mirror>` + SQLite after durable commit.
+- `mail.couriers_dir`: optional directory containing executable output adapters (defaults to `<config_dir>/couriers.d/`).
+- `mail.hub_owner_seat`: seat notified loudly on courier refusals, give-ups, and `AdapterDegraded` events (default `postmaster`).
+- `mail.defer_backoff_ms`: base retry backoff in milliseconds for `"deferred"` rings (default `30000`, per-step cap `300000`).
+- `mail.max_defer_tries`: maximum retry attempts before loud `give_up` escalation (default `8`).
+
+## Executable `couriers.d/` Adapters (`specs/mail/MailMachines.tla`)
+
+`rex-wave daemon` runs the `CourierHub` reactor to push body-blind wake notifications to seats bound on the local machine (`OneMachineRings`).
+
+### Adapter Discovery & Isolation
+
+- Adapters live as regular executable (`0755`) files directly inside `mail.couriers_dir` (or `<config_dir>/couriers.d/`).
+- Every adapter is verified via descriptor-anchored `O_DIRECTORY | O_NOFOLLOW` + `protected-roots` traversal and staged from the verified open file descriptor into a private `0700` directory under `/tmp/.rex-exec-*` before spawning (symlinks and directories are rejected). Note that `$0` / `__file__` inside a running adapter points to the staged `/tmp/.rex-exec-*` path rather than `couriers.d/`; the original verified path is passed in `REX_WAVE_COURIER_ORIGIN`.
+- Each invocation spawns in its own process group (`process_group(0)`), enforces a router timeout (`10 s` default) covering both process exit and pipe drain, and reaps the entire process group with `SIGTERM` followed by `SIGKILL` on timeout.
+- Endpoint mapping:
+  - `TransportEndpoint::T3Thread` -> `couriers.d/t3-thread`
+  - `TransportEndpoint::ClaudeSession` -> `couriers.d/claude-session`
+  - `TransportEndpoint::BbThread` -> `couriers.d/bb-thread`
+  - `TransportEndpoint::OperatorToast` -> `couriers.d/macos-toast`
+  - `TransportEndpoint::UdsSession { client: "codex-app-server" | "codex" }` -> `couriers.d/codex-app-server`
+  - `TransportEndpoint::SelfWatcher` (`own_knocker`) -> none (ages unacked mail without invoking external push couriers)
+
+Executable reference scripts are shipped in `examples/couriers.d/`: `t3-thread`, `claude-session`, `codex-app-server`, `bb-thread`, and `macos-toast`.
+
+### Body-Blind Wire Protocol
+
+`CourierHub` writes one JSON `DeliveryClaim` object to adapter `stdin` (never raw letter bodies):
+
+```json
+{
+  "schema": 1,
+  "seat": "bob",
+  "machine_id": "workstation-a",
+  "incarnation_id": "inc-bob-1",
+  "endpoint": { "transport": "t3_thread", "thread_id": "thr-42" },
+  "referents": [
+    {
+      "sha256": "...",
+      "id": "1795261554000-alice-to-bob-a1b2c3d4",
+      "from": "alice",
+      "subject": "Design sign-off",
+      "path": "mail/1795261554000-alice-to-bob-a1b2c3d4.md",
+      "priority": "normal",
+      "created_at_ms": 1795261554000
+    }
+  ],
+  "canary_token": null
+}
+```
+
+The adapter writes one JSON outcome object to `stdout`:
+
+```json
+{ "outcome": "rung" | "deferred" | "refused" | "unknown", "reason": "optional", "detail": "optional" }
+```
+
+- **`rung`:** Marks each `(seat, sha256)` rung in `StreamId::Mail` (`NoDoubleRing`) and resets the adapter's consecutive-unknown counter for that seat to `0`.
+- **`unknown` (including non-zero exit, malformed stdout, timeout, or interrupted pre-dispatch claim on daemon restart):** Counts as rung on `(seat, sha256)` so an ambiguous post-spawn delivery is **never** double-rung (pre-spawn setup failures before a child process starts record `unknown` toward adapter health without consuming the letter's push eligibility). After `K = 3` consecutive `unknown` outcomes, the courier is marked `degraded = true` and `AdapterDegraded` is escalated to `mail.hub_owner_seat` (`DegradedLoud`).
+- **`deferred`:** Retried with exponential backoff (`mail.defer_backoff_ms`, default `30 s`, capped at `5 m` per step) up to `mail.max_defer_tries` (`8` default, persisted in `StreamId::Mail`) before loud `give_up` escalation.
+- **`refused` (first occurrence, e.g. `reason: "address-gone"` or `"name-shared"`):** Immediately expires the dead binding (`BindingStatus::Expired`) with **zero retries** on that incarnation, records `MailEvent::DeliveryFailed`, and escalates loudly to `mail.hub_owner_seat` and the original sender seat (visible in `rex-wave mail check` for the sender and in `rex-wave config show`). Unacked letters remain eligible if the seat later binds a new live session incarnation.
+
+### Operator Attention Rule & Passive TUI Indicator
+
+Courier refusals (`address-gone`), `give_up` failures, and `AdapterDegraded` alerts **never** ring, toast, or raise unread/blocking inbox cards on the human `Operator` principal. Instead:
+
+- Failure notices and `NotifyKind::MailDeliveryFailed` inbox entries go exclusively to `mail.hub_owner_seat` and the original sender seat, reconciled idempotently from durable `MailEvent::DeliveryFailed` entries across daemon restarts.
+- `rex-wave tui` displays a passive, non-interrupting clickable indicator on `⚙ Settings` (`SidebarTreeSnapshot.mail_health`) without affecting `InboxBadge` or `OSC 7501`. Clicking `⚙ Settings` (or pressing `,`) opens the Settings view displaying live courier counters and the `Mail Delivery Failures` log.
+
+## Canary-Gated Routes (`specs/mail/MailHub.tla`)
+
+Sessions can self-claim a route behind a canary confirmation gate (either per bind with `--require-canary` or daemon-wide for all push-courier endpoints via `mail.require_canary = true` in `config.toml`) so normal mail never rings an unverified or forked destination (`RightSeat`, `NoFalseGiveUp`):
+
+```sh
+# 1. Bind in pending_canary state (mints a 128-bit canary token, redacted from Presence replies/reads):
+rex-wave presence bind --seat bob --t3-thread thr-42 --require-canary
+
+# 2. CourierHub dispatches a body-blind canary DeliveryClaim (referents: [], canary_token: "rwc_...")
+#    to the candidate endpoint; normal mail waits until confirmation.
+
+# 3. Confirm from inside the claimed session (distinct from global --token auth) to promote PendingCanary -> Live:
+rex-wave presence confirm-canary --seat bob --incarnation <incarnation-id> --canary <canary-token>
+```
+
+## Multi-Machine Ownership (`OneMachineRings`)
+
+Each daemon resolves and persists `<state_dir>/machine-id` (`--machine-id` / `REX_WAVE_MACHINE_ID` override, seeded from the host short name on first boot so transient DHCP hostname changes across restarts do not orphan local bindings). `CourierHub` enforces `OneMachineRings` directly across hubs sharing the same `Presence` and `Mail` journal by resolving one deterministic global winning route across all machines and lanes first and ringing locally only when that winner belongs to the local `machine_id`. For multi-store deployments running separate journals, `MachineMailSyncState` and `RouteSyncTable` provide the commutative, associative, idempotent CRDT replica-merge primitives (total `(claimed_at, epoch, machine_id, incarnation_id, confirmed)` ordering with per-incarnation withdrawal tombstones alongside union sync on content-addressed messages and ACKs); independent stores must synchronize `MachineMailSyncState` before local dispatch to maintain single-owner delivery across separate journals.
 
 ## Loopback HTTP API (`rex-wave daemon --http 127.0.0.1:<port>`)
 

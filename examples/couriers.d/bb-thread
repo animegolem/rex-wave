@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Reference couriers.d/ adapter for BB threads (`TransportEndpoint::BbThread`).
+
+Protocol:
+  - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
+    Letter bodies are never included.
+  - Writes one JSON reply object on stdout:
+      {"outcome": "rung" | "deferred" | "refused" | "unknown", ...}
+
+Environment overrides:
+  - BB_URL             Base BB API origin (default: http://127.0.0.1:38886).
+  - BB_TOKEN           Optional bearer token for BB API.
+  - BB_TIMEOUT_SECS    HTTP timeout in seconds (default: 6).
+  - REX_WAVE_COURIER_DRY_RUN=1  Validate payload and emit {"outcome":"rung"}.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
+    payload: dict[str, object] = {"outcome": outcome}
+    if reason:
+        payload["reason"] = reason
+    if detail:
+        payload["detail"] = detail
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def format_nudge(claim: dict) -> str:
+    seat = claim.get("seat", "unknown")
+    incarnation = claim.get("incarnation_id", "unknown")
+    canary = claim.get("canary_token")
+    if canary:
+        return (
+            f"[rex-wave canary] Confirm thread route for @{seat} ({incarnation}):\n"
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
+        )
+    refs = claim.get("referents") or []
+    lines = [f"[rex-wave mail] {len(refs)} letter(s) waiting for @{seat}:"]
+    for ref in refs[:8]:
+        sha16 = str(ref.get("sha256", ""))[:16]
+        lines.append(
+            f"- {sha16} from @{ref.get('from', 'unknown')}: {ref.get('subject', '(no subject)')} ({ref.get('path', '')})"
+        )
+    lines.append(f"Run `rex-wave mail check --seat {seat}`.")
+    return "\n".join(lines)
+
+
+def is_confirmed_bb_thread_gone(err_code: int, raw_body: str) -> bool:
+    if err_code not in (404, 410):
+        return False
+    lower = raw_body.lower()
+    return "thread" in lower and any(
+        kw in lower
+        for kw in ("not_found", "not found", "archived", "deleted", "gone", "does not exist")
+    )
+
+
+def main() -> int:
+    try:
+        claim = json.load(sys.stdin)
+    except Exception as err:
+        return emit("unknown", "invalid-claim", str(err))
+
+    if claim.get("schema") != 1:
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
+
+    endpoint = claim.get("endpoint") or {}
+    if endpoint.get("transport") != "bb_thread":
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected bb_thread, got {endpoint.get('transport')}",
+        )
+
+    thread_id = str(endpoint.get("thread_id") or "").strip()
+    if not thread_id:
+        return emit("refused", "address-gone", "missing thread_id")
+
+    if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
+        return emit("rung", detail="dry-run")
+
+    base_url = os.environ.get("BB_URL", "http://127.0.0.1:38886").rstrip("/")
+    token = os.environ.get("BB_TOKEN", "").strip()
+    timeout = float(os.environ.get("BB_TIMEOUT_SECS", "6"))
+
+    # BB server-contract `/api/v1/threads/:id/send` (`SendMessageRequest`):
+    body = json.dumps(
+        {
+            "input": [{"type": "text", "text": format_nudge(claim)}],
+            "mode": "auto",
+        }
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    encoded_tid = urllib.parse.quote(thread_id, safe="")
+    url = f"{base_url}/api/v1/threads/{encoded_tid}/send"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                return emit("rung")
+            return emit("unknown", f"http-{resp.status}")
+    except urllib.error.HTTPError as err:
+        raw_err = err.read().decode("utf-8", errors="replace").strip()
+        detail = raw_err[:240]
+        if is_confirmed_bb_thread_gone(err.code, raw_err):
+            return emit("refused", "address-gone", detail or f"bb thread {thread_id} not found")
+        if err.code in (409, 429, 503):
+            return emit("deferred", f"http-{err.code}", detail or "bb thread busy")
+        return emit("unknown", f"http-{err.code}", detail or str(err))
+    except urllib.error.URLError as err:
+        return emit("deferred", "bb-offline", str(err.reason))
+    except TimeoutError:
+        return emit("unknown", "timeout", "bb HTTP request timed out")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

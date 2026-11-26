@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Reference couriers.d/ adapter for T3 Code threads (`TransportEndpoint::T3Thread`).
+
+Protocol:
+  - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
+    Letter bodies are never included in the claim.
+  - Writes one JSON reply object on stdout:
+      {"outcome": "rung" | "deferred" | "refused" | "unknown",
+       "reason": "<optional short code>",
+       "detail": "<optional human diagnostic>"}
+
+Environment overrides:
+  - T3_BIN           Path to `t3` CLI (default: t3).
+  - T3_BASE_DIR      Optional `--base-dir` (`T3CODE_HOME`) passed to `t3 thread send`.
+  - T3_URL           Optional HTTP bridge origin accepting POST `{base_url}/api/v1/threads/{id}/send`.
+  - T3_TOKEN         Bearer token when `T3_URL` is configured.
+  - T3_TIMEOUT_SECS  Per-request CLI/HTTP timeout in seconds (default: 6).
+  - REX_WAVE_COURIER_DRY_RUN=1  Validate payload and emit {"outcome":"rung"}.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
+    payload: dict[str, object] = {"outcome": outcome}
+    if reason:
+        payload["reason"] = reason
+    if detail:
+        payload["detail"] = detail
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def format_nudge(claim: dict) -> str:
+    seat = claim.get("seat", "unknown")
+    incarnation = claim.get("incarnation_id", "unknown")
+    canary = claim.get("canary_token")
+    if canary:
+        return (
+            f"[rex-wave canary] Confirm session route for @{seat} ({incarnation}):\n"
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --canary {canary}"
+        )
+    refs = claim.get("referents") or []
+    lines = [f"[rex-wave mail] {len(refs)} unacked letter(s) waiting for @{seat}:"]
+    for ref in refs[:8]:
+        sha16 = str(ref.get("sha256", ""))[:16]
+        sender = ref.get("from", "unknown")
+        subject = ref.get("subject", "(no subject)")
+        path = ref.get("path", "")
+        lines.append(f"- {sha16} from @{sender}: {subject} ({path})")
+    if len(refs) > 8:
+        lines.append(f"... and {len(refs) - 8} more")
+    lines.append(f"Run `rex-wave mail check --seat {seat}` to inspect and ack.")
+    return "\n".join(lines)
+
+
+def is_confirmed_thread_gone(detail: str) -> bool:
+    lower = detail.lower()
+    return "thread" in lower and any(
+        kw in lower for kw in ("not found", "archived", "deleted", "gone", "does not exist")
+    )
+
+
+def send_via_http(base_url: str, token: str, thread_id: str, message: str, timeout: float) -> int:
+    encoded_tid = urllib.parse.quote(thread_id, safe="")
+    url = f"{base_url.rstrip('/')}/api/v1/threads/{encoded_tid}/send"
+    body = json.dumps({"message": message, "mode": "auto"}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                return emit("rung")
+            return emit("unknown", f"http-{resp.status}", f"unexpected status {resp.status}")
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace").strip()[:240]
+        if err.code in (404, 410) and is_confirmed_thread_gone(detail):
+            return emit("refused", "address-gone", detail)
+        if err.code in (409, 429, 503):
+            return emit("deferred", f"http-{err.code}", detail or "thread busy")
+        return emit("unknown", f"http-{err.code}", detail or str(err))
+    except urllib.error.URLError as err:
+        return emit("deferred", "transport-unreachable", str(err.reason))
+    except TimeoutError:
+        return emit("unknown", "timeout", "t3 HTTP request timed out after dispatch")
+
+
+def send_via_cli(t3_bin: str, base_dir: str, thread_id: str, message: str, timeout: float) -> int:
+    if thread_id.startswith("-"):
+        return emit("refused", "address-gone", f"invalid thread_id '{thread_id}'")
+    resolved = shutil.which(t3_bin)
+    if not resolved:
+        return emit("unknown", "cli-missing", f"'{t3_bin}' executable not found")
+    argv = [resolved, "thread", "send", "--json"]
+    if base_dir:
+        argv.extend(["--base-dir", base_dir])
+    # `t3 thread send [flags] <thread> <message>` accepts `-` to read message from stdin,
+    # keeping multi-line nudges and canary tokens out of process argv (`ps`).
+    argv.extend(["--", thread_id, "-"])
+    try:
+        proc = subprocess.run(
+            argv,
+            input=message,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return emit("unknown", "timeout", "t3 CLI timed out")
+    except OSError as err:
+        return emit("deferred", "spawn-failed", str(err))
+    if proc.returncode == 0:
+        return emit("rung")
+    combined = (proc.stderr or proc.stdout or "").strip()
+    lower = combined.lower()
+    if is_confirmed_thread_gone(combined):
+        return emit("refused", "address-gone", combined[:240] or f"thread {thread_id} gone")
+    if (
+        "busy" in lower
+        or "locked" in lower
+        or "connection refused" in lower
+        or "econnrefused" in lower
+        or "unavailable" in lower
+    ):
+        return emit("deferred", "busy", combined[:240])
+    return emit("unknown", f"exit-{proc.returncode}", combined[:240])
+
+
+def main() -> int:
+    try:
+        claim = json.load(sys.stdin)
+    except Exception as err:
+        return emit("unknown", "invalid-claim", str(err))
+
+    if claim.get("schema") != 1:
+        return emit("unknown", "unsupported-schema", f"schema={claim.get('schema')}")
+
+    endpoint = claim.get("endpoint") or {}
+    if endpoint.get("transport") != "t3_thread":
+        return emit(
+            "unknown",
+            "wrong-transport",
+            f"expected t3_thread, got {endpoint.get('transport')}",
+        )
+
+    thread_id = str(endpoint.get("thread_id") or "").strip()
+    if not thread_id:
+        return emit("refused", "address-gone", "missing thread_id")
+
+    if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
+        return emit("rung", detail="dry-run")
+
+    message = format_nudge(claim)
+    timeout = float(os.environ.get("T3_TIMEOUT_SECS", "6"))
+    base_url = os.environ.get("T3_URL", "").strip()
+    token = os.environ.get("T3_TOKEN", "").strip()
+    if base_url:
+        return send_via_http(base_url, token, thread_id, message, timeout)
+
+    t3_bin = os.environ.get("T3_BIN", "t3")
+    base_dir = os.environ.get("T3_BASE_DIR", "").strip()
+    return send_via_cli(t3_bin, base_dir, thread_id, message, timeout)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

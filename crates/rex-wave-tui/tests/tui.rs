@@ -2154,6 +2154,7 @@ async fn settings_stage_supports_hotkey_cycling_inline_composer_reset_and_live_e
                 runners_health: Vec::new(),
                 couriers_health: Vec::new(),
                 persist_error: None,
+                mail_failures: Vec::new(),
             })),
         },
     );
@@ -2226,4 +2227,129 @@ async fn settings_stage_supports_hotkey_cycling_inline_composer_reset_and_live_e
     // `h` (`Move(Dir::Left)`) returns focus to Sidebar.
     let _ = update(&mut model, Msg::Action(Action::Move(Dir::Left)));
     assert_eq!(model.focus, Pane::Sidebar);
+}
+
+#[tokio::test]
+async fn passive_clickable_mail_failure_badge_opens_settings_without_interrupting_operator() {
+    use rex_wave_api::IncarnationId;
+    use rex_wave_api::config::{ConfigSnapshot, CourierHealthStatus, RexConfig};
+    use rex_wave_api::mail::{DeliveryFailureKind, MailDeliveryFailure};
+    use rex_wave_api::read::MailHealthBadge;
+    use rex_wave_tui::demo::DemoClient;
+    use rex_wave_tui::input::{Action, Target};
+
+    let client = DemoClient::new();
+    let mut overview = match client
+        .call_wire(WireCommand::Sidebar(rex_wave_api::read::Sidebar::default()))
+        .await
+        .unwrap()
+    {
+        WireReply::Sidebar(s) => s,
+        other => panic!("unexpected: {other:?}"),
+    };
+    let inbox_before = overview.inbox;
+    let osc_before = overview.osc7501.clone();
+    overview.mail_health = MailHealthBadge {
+        failed_deliveries: 2,
+        degraded_couriers: 1,
+    };
+
+    let mut model = Model::new(client.me().clone(), overview.clone());
+    assert_eq!(model.sidebar_snapshot.inbox, inbox_before);
+    assert_eq!(model.sidebar_snapshot.osc7501, osc_before);
+
+    let mut term = Terminal::new(TestBackend::new(132, 38)).unwrap();
+    let mut hits = FrameHitMap::default();
+    let mut cards = Vec::new();
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let scr_before = screen_text(&term);
+    assert!(
+        scr_before.contains("Settings")
+            && scr_before.contains("2 mail")
+            && scr_before.contains("1 deg"),
+        "Settings row must render passive mail failure + degraded badge:\n{scr_before}"
+    );
+
+    // Clicking the passive Settings row retargets directly to StageTarget::Settings.
+    let settings_row_hit =
+        (0..38u16).find(|&r| matches!(hits.hit(4, r), Some(Target::Node(NodeKey::Settings))));
+    assert!(
+        settings_row_hit.is_some(),
+        "Settings row must be clickable in FrameHitMap"
+    );
+    let click_fx = update(&mut model, Msg::Action(Action::Activate(NodeKey::Settings)));
+    assert!(
+        click_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Retarget(StageTarget::Settings)))
+    );
+
+    let seq = model.stage_req_seq;
+    let snap_with_failures = ConfigSnapshot {
+        head: Seq(7),
+        config: RexConfig::default(),
+        config_path: None,
+        effective_default_runner: None,
+        runners_health: Vec::new(),
+        couriers_health: vec![CourierHealthStatus {
+            name: "t3-thread".into(),
+            executable: true,
+            rung: 0,
+            unknown: 3,
+            refused: 1,
+            degraded: true,
+        }],
+        persist_error: None,
+        mail_failures: vec![
+            MailDeliveryFailure {
+                seq: Seq(5),
+                at: UnixMs(1_795_261_554_000),
+                kind: DeliveryFailureKind::Refused,
+                courier: "t3-thread".into(),
+                seat: SeatName::parse("bob").unwrap(),
+                incarnation_id: Some(IncarnationId::parse("inc-bob-1").unwrap()),
+                expected_epoch: Some(1),
+                is_canary: false,
+                sha256s: vec![],
+                sender_seat: Some(SeatName::parse("alice").unwrap()),
+                hub_owner_seat: SeatName::parse("postmaster").unwrap(),
+                reason: "address-gone".into(),
+                detail: Some("thread archived".into()),
+            },
+            MailDeliveryFailure {
+                seq: Seq(6),
+                at: UnixMs(1_795_261_555_000),
+                kind: DeliveryFailureKind::AdapterDegraded,
+                courier: "t3-thread".into(),
+                seat: SeatName::parse("bob").unwrap(),
+                incarnation_id: None,
+                expected_epoch: None,
+                is_canary: false,
+                sha256s: vec![],
+                sender_seat: None,
+                hub_owner_seat: SeatName::parse("postmaster").unwrap(),
+                reason: "consecutive-unknown".into(),
+                detail: None,
+            },
+        ],
+    };
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::StageInitial(seq),
+            result: Ok(WireReply::ConfigShow(snap_with_failures)),
+        },
+    );
+
+    term.draw(|f| view(&model, f, &mut hits, &mut cards))
+        .unwrap();
+    let scr_after = screen_text(&term);
+    assert!(
+        scr_after.contains("Mail Delivery Failures (2)"),
+        "Settings stage must display Mail Delivery Failures section:\n{scr_after}"
+    );
+    assert!(scr_after.contains("address-gone"));
+    assert!(scr_after.contains("adapter_degraded"));
+    assert!(scr_after.contains("owner=@postmaster"));
 }

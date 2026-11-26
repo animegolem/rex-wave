@@ -114,12 +114,7 @@ pub fn default_config_file_path(explicit: Option<&Path>) -> Option<PathBuf> {
 }
 
 pub fn effective_couriers_dir(cfg: &RexConfig, config_path: Option<&Path>) -> Option<PathBuf> {
-    if let Some(ref d) = cfg.mail.couriers_dir {
-        return Some(rex_wave_waves::expand_tilde(&d.to_string_lossy()));
-    }
-    config_path
-        .and_then(Path::parent)
-        .map(|p| p.join("couriers.d"))
+    rex_wave_mailbridge::effective_couriers_dir_for(cfg, config_path, None)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -202,11 +197,17 @@ struct StrictMailToml {
     #[serde(default)]
     export_enabled: Option<bool>,
     #[serde(default)]
+    require_canary: Option<bool>,
+    #[serde(default)]
     couriers_dir: Option<PathBuf>,
     #[serde(default)]
     hub_owner_seat: Option<SeatName>,
     #[serde(default)]
     reconnect_grace_ms: Option<u64>,
+    #[serde(default)]
+    defer_backoff_ms: Option<u64>,
+    #[serde(default)]
+    max_defer_tries: Option<u32>,
     #[serde(default)]
     toast_cmd: Option<String>,
 }
@@ -253,12 +254,21 @@ pub fn parse_config_toml(raw: &str) -> Result<RexConfig, String> {
         if let Some(b) = m.export_enabled {
             cfg.mail.export_enabled = b;
         }
+        if let Some(b) = m.require_canary {
+            cfg.mail.require_canary = b;
+        }
         cfg.mail.couriers_dir = m.couriers_dir;
         if let Some(s) = m.hub_owner_seat {
             cfg.mail.hub_owner_seat = s;
         }
         if let Some(ms) = m.reconnect_grace_ms {
             cfg.mail.reconnect_grace_ms = ms;
+        }
+        if let Some(ms) = m.defer_backoff_ms {
+            cfg.mail.defer_backoff_ms = ms;
+        }
+        if let Some(n) = m.max_defer_tries {
+            cfg.mail.max_defer_tries = n;
         }
         cfg.mail.toast_cmd = m.toast_cmd;
     }
@@ -434,6 +444,9 @@ pub fn render_config_toml_preserving_comments(
         let mail = ensure_subtable(doc.as_table_mut(), "mail");
         mail.set_implicit(false);
         set_bool_preserving_decor(mail, "export_enabled", cfg.mail.export_enabled);
+        if cfg.mail.require_canary || mail.contains_key("require_canary") {
+            set_bool_preserving_decor(mail, "require_canary", cfg.mail.require_canary);
+        }
         set_or_remove_str(
             mail,
             "mirror_dir",
@@ -459,6 +472,16 @@ pub fn render_config_toml_preserving_comments(
             "reconnect_grace_ms",
             cfg.mail.reconnect_grace_ms as i64,
         );
+        if cfg.mail.defer_backoff_ms != rex_wave_api::config::DEFAULT_MAIL_DEFER_BACKOFF_MS
+            || mail.contains_key("defer_backoff_ms")
+        {
+            set_i64_preserving_decor(mail, "defer_backoff_ms", cfg.mail.defer_backoff_ms as i64);
+        }
+        if cfg.mail.max_defer_tries != rex_wave_api::config::DEFAULT_MAIL_MAX_DEFER_TRIES
+            || mail.contains_key("max_defer_tries")
+        {
+            set_i64_preserving_decor(mail, "max_defer_tries", i64::from(cfg.mail.max_defer_tries));
+        }
         set_or_remove_str(mail, "toast_cmd", cfg.mail.toast_cmd.as_deref());
     }
 
@@ -724,6 +747,7 @@ pub struct TomlConfigHook {
     bb_live: OnceLock<LivenessProbe>,
     t3_live: OnceLock<LivenessProbe>,
     presence_svc: OnceLock<Arc<dyn Service<PresenceCommand>>>,
+    mail_bridge: OnceLock<Arc<rex_wave_mailbridge::MailBridge>>,
 }
 
 impl TomlConfigHook {
@@ -745,6 +769,7 @@ impl TomlConfigHook {
             bb_live: OnceLock::new(),
             t3_live: OnceLock::new(),
             presence_svc: OnceLock::new(),
+            mail_bridge: OnceLock::new(),
         })
     }
 
@@ -763,6 +788,10 @@ impl TomlConfigHook {
         if let Some(p) = t3_live {
             let _ = self.t3_live.set(p);
         }
+    }
+
+    pub fn bind_mail_bridge(&self, mail: Arc<rex_wave_mailbridge::MailBridge>) {
+        let _ = self.mail_bridge.set(mail);
     }
 
     pub fn config_path(&self) -> Option<&Path> {
@@ -987,8 +1016,23 @@ impl ConfigHook for TomlConfigHook {
                 native_acp_runner_health(&snap.config),
             ];
 
-            if let Some(cdir) = effective_couriers_dir(&snap.config, self.config_path.as_deref()) {
-                snap.couriers_health = scan_couriers_dir(&cdir);
+            let discovered_health =
+                match effective_couriers_dir(&snap.config, self.config_path.as_deref()) {
+                    Some(cdir) => scan_couriers_dir(&cdir),
+                    None => Vec::new(),
+                };
+            if let Some(mail) = self.mail_bridge.get() {
+                let discovered_pairs: Vec<(String, bool)> = discovered_health
+                    .iter()
+                    .map(|c| (c.name.clone(), c.executable))
+                    .collect();
+                let (merged_health, failures) = mail
+                    .courier_health_and_failures(&discovered_pairs, 50)
+                    .await;
+                snap.couriers_health = merged_health;
+                snap.mail_failures = failures;
+            } else {
+                snap.couriers_health = discovered_health;
             }
         })
     }
