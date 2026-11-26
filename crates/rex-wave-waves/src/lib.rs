@@ -362,10 +362,10 @@ fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool 
     if let Some((expected, _)) = RunnerKind::strip_provider_prefix(prov) {
         return kind != expected;
     }
-    if prov.eq_ignore_ascii_case("antigravity") {
-        return kind != RunnerKind::T3;
+    if prov.eq_ignore_ascii_case("antigravity") || prov.eq_ignore_ascii_case("agy") {
+        return !matches!(kind, RunnerKind::T3 | RunnerKind::Acp);
     }
-    if matches!(prov, "pi" | "cursor") {
+    if prov.eq_ignore_ascii_case("pi") || prov.eq_ignore_ascii_case("cursor") {
         return kind != RunnerKind::Bb;
     }
     false

@@ -117,9 +117,16 @@ pub fn route_provider_with_config(
     }
 
     if raw.eq_ignore_ascii_case("antigravity") || raw.eq_ignore_ascii_case("agy") {
+        let target = match cfg.and_then(|c| c.runners.default_runner) {
+            Some(rex_wave_api::config::RunnerRoute::Native) => RunnerKind::Acp,
+            Some(rex_wave_api::config::RunnerRoute::T3)
+            | Some(rex_wave_api::config::RunnerRoute::Bb) => RunnerKind::T3,
+            None if default_runner == RunnerKind::Acp => RunnerKind::Acp,
+            None => RunnerKind::T3,
+        };
         return Ok(RoutedProvider {
-            target: RunnerKind::T3,
-            provider: normalize_provider_for_target(raw, RunnerKind::T3)?,
+            target,
+            provider: normalize_provider_for_target(raw, target)?,
         });
     }
 

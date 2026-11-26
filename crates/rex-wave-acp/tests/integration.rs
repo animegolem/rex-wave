@@ -72,6 +72,9 @@ log_event({
         "REX_WAVE_TOKEN": os.environ.get("REX_WAVE_TOKEN"),
         "REX_WAVE_WORKER_THREAD_ID": os.environ.get("REX_WAVE_WORKER_THREAD_ID"),
         "T3CODE_THREAD_ID": os.environ.get("T3CODE_THREAD_ID"),
+        "REX_WAVE_BB_TOKEN": os.environ.get("REX_WAVE_BB_TOKEN"),
+        "REX_WAVE_T3_TOKEN": os.environ.get("REX_WAVE_T3_TOKEN"),
+        "REX_WAVE_OPERATOR": os.environ.get("REX_WAVE_OPERATOR"),
     },
 })
 
@@ -200,7 +203,8 @@ for raw in sys.stdin:
                     "toolCall": {"toolCallId": f"tc-{prompt_count}", "title": f"Action {prompt_count}", "kind": "edit"},
                     "options": [
                         {"optionId": "opt_once", "name": "Allow once", "kind": "allow_once"},
-                        {"optionId": "opt_session", "name": "Allow always", "kind": "allow_always"},
+                        {"optionId": "opt_session", "name": "Allow session", "kind": "allow_session"},
+                        {"optionId": "opt_always", "name": "Allow always", "kind": "allow_always"},
                         {"optionId": "opt_reject", "name": "Reject", "kind": "reject_once"},
                     ],
                 },
@@ -1161,6 +1165,14 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
         serde_json::json!({"outcome": "selected", "optionId": "opt_reject"})
     );
 
+    // Unexpected EOF (`r_crash`) must have already revoked its worker token file.
+    let crash_tok =
+        worker_token_path(&tmp.path().join("state"), "acp:w-variants:crash:a1").unwrap();
+    assert!(
+        !crash_tok.exists(),
+        "unexpected EOF must revoke worker token immediately"
+    );
+
     // Fresh bridge simulating daemon restart reports lost ACP process via check_live.
     let restarted = AcpHost(AcpBridge::new(AcpConfig::with_env_overrides(None, None)));
     let lost_tid = HostThreadId::parse("acp:w-variants:perm:a1").unwrap();
@@ -1172,6 +1184,272 @@ async fn acp_permission_allow_for_session_and_deny_plus_error_and_check_live() {
             ..
         }) if error.contains("restart")
     ));
+
+    bridge.shutdown_all().await;
+    conductor.abort();
+}
+
+#[tokio::test]
+async fn config_options_model_selection_handshake_abort_and_chunk_coalescing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let state_dir = tmp.path().join("state");
+
+    // 1. Provider advertising models only via ACP `configOptions` honors `session/set_config_option`
+    //    and coalesces streamed `agent_message_chunk`s while suppressing echoed `user_message_chunk`.
+    let cfg_opt_script = tmp.path().join("cfg-opt-acp.py");
+    std::fs::write(
+        &cfg_opt_script,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+
+selected_model = "default-m"
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    m = msg.get("method")
+    mid = msg.get("id")
+    if m == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif m == "session/new":
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "sessionId": "s-cfg",
+                "configOptions": [{
+                    "id": "model",
+                    "category": "model",
+                    "currentValue": "default-m",
+                    "options": [
+                        {"value": "default-m", "name": "Default"},
+                        {"value": "fast-m", "name": "Fast"}
+                    ]
+                }]
+            }
+        })
+    elif m == "session/set_config_option":
+        assert msg["params"]["configId"] == "model"
+        selected_model = msg["params"]["value"]
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "configOptions": [{
+                    "id": "model",
+                    "category": "model",
+                    "currentValue": selected_model,
+                    "options": [
+                        {"value": "default-m", "name": "Default"},
+                        {"value": "fast-m", "name": "Fast"}
+                    ]
+                }]
+            }
+        })
+    elif m == "session/prompt":
+        prompt_text = msg["params"]["prompt"][0]["text"]
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "s-cfg",
+            "update": {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": prompt_text}}
+        }})
+        for part in ["model=", selected_model, " ok"]:
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "s-cfg",
+                "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": part}}
+            }})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cfg_opt_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 2. Slow initialize script to verify aborting `spawn` cleans up child pgid and worker token.
+    let pid_file = tmp.path().join("hang-init.pid");
+    let hang_script = tmp.path().join("hang-init.py");
+    std::fs::write(
+        &hang_script,
+        format!(
+            "#!/usr/bin/env python3\nimport os, time\nwith open({:?}, 'w') as f:\n    f.write(str(os.getpgrp()))\ntime.sleep(60)\n",
+            pid_file.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hang_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cfg = AcpConfig::with_env_overrides(None, None)
+        .with_provider("opencode", AcpProviderSpec::new(&cfg_opt_script, ["acp"]))
+        .with_provider("hang", AcpProviderSpec::new(&hang_script, ["acp"]))
+        .with_state_dir(state_dir.clone())
+        .with_retire_grace(Duration::from_millis(200));
+
+    let (router, bridge, conductor) = build_test_stack(tmp.path(), cfg);
+    let op = LocalClient::new(
+        router.clone(),
+        Principal::Operator {
+            seat: SeatName::parse("owner").unwrap(),
+        },
+    );
+
+    let wave = WaveSlug::parse("w-cfgopt").unwrap();
+    let role = RoleName::parse("coder").unwrap();
+    let project = ProjectId::parse(ws.to_string_lossy().into_owned()).unwrap();
+
+    op.call(WaveStart {
+        spec: WaveSpec {
+            slug: wave.clone(),
+            project: project.clone(),
+            goal: Body::parse("Test configOptions model + coalescing").unwrap(),
+            defaults: AgentSpec {
+                provider: ProviderId::parse("acp:opencode").unwrap(),
+                model: Some(ModelId::parse("fast-m").unwrap()),
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Auto,
+                workspace: Workspace::ProjectDefault,
+            },
+            output_dir: None,
+            workers: vec![WorkerSpec {
+                role: role.clone(),
+                brief: Body::parse("echo check").unwrap(),
+                agent: None,
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            }],
+        },
+        idem: None,
+        config_defaults: Default::default(),
+    })
+    .await
+    .unwrap();
+
+    wait_for_phase(&op, &wave, &role, Duration::from_secs(10), |p| {
+        matches!(
+            p,
+            WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            }
+        )
+    })
+    .await;
+
+    let page = bridge.page(&wave, &role, None, 0).await.unwrap();
+    let assistant_events: Vec<&String> = page
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::AssistantText { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_events, vec![&"model=fast-m ok".to_owned()]);
+    let user_events = page
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, AgentEventKind::UserMessage { .. }))
+        .count();
+    assert_eq!(
+        user_events, 1,
+        "echoed user_message_chunk must not duplicate UserMessage"
+    );
+
+    // Unadvertised model in `configOptions` is rejected before prompting.
+    let host = AcpHost(bridge.clone());
+    let dummy_room = rex_wave_waves::wave_room(&wave, &project);
+    let bad_model_err = host
+        .spawn(rex_wave_waves::SpawnRequest {
+            wave: WaveSlug::parse("w-badm").unwrap(),
+            role: RoleName::parse("r1").unwrap(),
+            attempt: 1,
+            project: project.clone(),
+            agent: AgentSpec {
+                provider: ProviderId::parse("opencode").unwrap(),
+                model: Some(ModelId::parse("nonexistent-m").unwrap()),
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Auto,
+                workspace: Workspace::ProjectDefault,
+            },
+            room: dummy_room.clone(),
+            prompt: Body::parse("hi").unwrap(),
+            title: "badm".into(),
+            run_stamp: "w-badm:r1:attempt-1:at-1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        bad_model_err,
+        rex_wave_waves::HostError::Rejected(_)
+    ));
+
+    // Aborting an in-flight `initialize` spawn kills the child group and removes its token.
+    let host_bg = AcpHost(bridge.clone());
+    let proj_bg = project.clone();
+    let spawn_task = tokio::spawn(async move {
+        host_bg
+            .spawn(rex_wave_waves::SpawnRequest {
+                wave: WaveSlug::parse("w-abort").unwrap(),
+                role: RoleName::parse("r1").unwrap(),
+                attempt: 1,
+                project: proj_bg,
+                agent: AgentSpec {
+                    provider: ProviderId::parse("hang").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Auto,
+                    workspace: Workspace::ProjectDefault,
+                },
+                room: dummy_room,
+                prompt: Body::parse("hi").unwrap(),
+                title: "abort".into(),
+                run_stamp: "w-abort:r1:attempt-1:at-1".into(),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            })
+            .await
+    });
+    let wait_pid = Instant::now() + Duration::from_secs(5);
+    let pgid: u32 = loop {
+        if let Ok(s) = std::fs::read_to_string(&pid_file)
+            && let Ok(n) = s.trim().parse::<u32>()
+        {
+            break n;
+        }
+        assert!(Instant::now() < wait_pid, "hang-init never wrote pgid");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    spawn_task.abort();
+    let _ = spawn_task.await;
+
+    let abort_tok = worker_token_path(&state_dir, "acp:w-abort:r1:a1").unwrap();
+    let reap_deadline = Instant::now() + Duration::from_secs(3);
+    while rex_wave_acp::process::process_group_alive(pgid) && Instant::now() < reap_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !rex_wave_acp::process::process_group_alive(pgid),
+        "aborted initialize child group must be killed"
+    );
+    assert!(
+        !abort_tok.exists(),
+        "aborted initialize worker token must be unlinked"
+    );
 
     bridge.shutdown_all().await;
     conductor.abort();

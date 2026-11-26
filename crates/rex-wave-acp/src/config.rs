@@ -111,14 +111,11 @@ impl AcpConfig {
         let mut providers = BTreeMap::new();
 
         // `agy acp` is the verified ACP stdio subcommand (`--acp` is rejected by `agy`).
-        let mut agy_spec = match agy_bin {
-            Some(bin) => AcpProviderSpec::new(bin, ["acp"]),
-            None => AcpProviderSpec::new("agy", ["acp"])
-                .with_full_permission_arg("--dangerously-skip-permissions"),
-        };
-        if agy_spec.program.as_os_str().is_empty() {
-            agy_spec.program = PathBuf::from("agy");
-        }
+        let agy_program = agy_bin
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("agy"));
+        let agy_spec = AcpProviderSpec::new(agy_program, ["acp"])
+            .with_full_permission_arg("--dangerously-skip-permissions");
         providers.insert("antigravity".to_owned(), agy_spec);
 
         let opencode_program = opencode_bin
@@ -219,7 +216,11 @@ impl AcpConfig {
                 .map(expand_tilde)
         });
         if let Some(override_bin) = cfg_bin {
-            return Ok((override_bin, spec.args.clone(), spec.env.clone()));
+            return Ok((
+                override_bin,
+                spec.effective_args(permission),
+                spec.env.clone(),
+            ));
         }
         Ok((
             spec.program.clone(),
@@ -272,7 +273,7 @@ mod tests {
             .resolve_provider("antigravity", PermissionMode::Full)
             .unwrap();
         assert_eq!(p1, PathBuf::from("/opt/bin/custom-agy"));
-        assert_eq!(a1, vec!["acp"]);
+        assert_eq!(a1, vec!["acp", "--dangerously-skip-permissions"]);
 
         let (p2, a2, _) = overridden
             .resolve_provider("opencode", PermissionMode::AcceptEdits)
@@ -295,7 +296,7 @@ mod tests {
             .resolve_provider("agy", PermissionMode::Full)
             .unwrap();
         assert_eq!(wp1, PathBuf::from("/custom/config-agy"));
-        assert_eq!(wa1, vec!["acp"]);
+        assert_eq!(wa1, vec!["acp", "--dangerously-skip-permissions"]);
         let (wp2, _, _) = watched
             .resolve_provider("opencode", PermissionMode::AcceptEdits)
             .unwrap();

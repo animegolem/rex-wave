@@ -46,6 +46,10 @@ for raw in sys.stdin:
             "result": {"sessionId": session_id},
         })
     elif method == "session/prompt":
+        # Verify daemon-only secrets were scrubbed while scoped worker token is present.
+        assert os.environ.get("REX_WAVE_BB_TOKEN") is None, "daemon BB token leaked to child"
+        assert os.environ.get("REX_WAVE_T3_TOKEN") is None, "daemon T3 token leaked to child"
+        assert os.environ.get("REX_WAVE_OPERATOR") is None, "daemon operator leaked to child"
         # Post back to the wave room using inherited REX_WAVE_SOCKET + REX_WAVE_TOKEN.
         project = os.environ["MOCK_PROJECT_ID"]
         res = subprocess.run(
@@ -122,6 +126,9 @@ fn daemon_runner_acp_spawns_authenticates_worker_and_retires() {
             "127.0.0.1:0",
         ])
         .env("REX_WAVE_ACP_AGY_BIN", &mock_bin)
+        .env("REX_WAVE_BB_TOKEN", "secret-bb-bridge-token")
+        .env("REX_WAVE_T3_TOKEN", "secret-t3-bridge-token")
+        .env("REX_WAVE_OPERATOR", "ops")
         .env("MOCK_REX_WAVE_BIN", env!("CARGO_BIN_EXE_rex-wave"))
         .env("MOCK_PROJECT_ID", &project_str)
         .stdin(Stdio::null())
@@ -144,7 +151,7 @@ fn daemon_runner_acp_spawns_authenticates_worker_and_retires() {
             "--goal",
             "Verify daemon ACP wiring",
             "--worker",
-            "author=acp:antigravity",
+            "author=antigravity",
             "--workspace",
             "project-default",
         ])

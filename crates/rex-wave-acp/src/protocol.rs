@@ -118,6 +118,24 @@ pub fn session_set_model_request(id: u64, session_id: &str, model_id: &str) -> V
     })
 }
 
+pub fn session_set_config_option_request(
+    id: u64,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": session_id,
+            "configId": config_id,
+            "value": value,
+        },
+    })
+}
+
 pub fn session_prompt_request(id: u64, session_id: &str, text: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -235,6 +253,31 @@ pub fn rpc_id_matches(id: &Value, expected: u64) -> bool {
             .is_some_and(|n| n == expected)
 }
 
+pub fn validate_initialize_result(result: &Value) -> Result<(), HostError> {
+    let Some(obj) = result.as_object() else {
+        return Err(HostError::Rejected(
+            "ACP initialize reply must be a JSON object".into(),
+        ));
+    };
+    let Some(ver) = obj
+        .get("protocolVersion")
+        .or_else(|| obj.get("protocol_version"))
+    else {
+        return Err(HostError::Rejected(
+            "ACP initialize reply missing protocolVersion".into(),
+        ));
+    };
+    let parsed_ver = ver
+        .as_u64()
+        .or_else(|| ver.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+    if parsed_ver != Some(ACP_PROTOCOL_VERSION) {
+        return Err(HostError::Rejected(format!(
+            "unsupported ACP protocolVersion {ver}; expected {ACP_PROTOCOL_VERSION}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn extract_session_id(result: &Value) -> Result<String, HostError> {
     result
         .get("sessionId")
@@ -244,6 +287,78 @@ pub fn extract_session_id(result: &Value) -> Result<String, HostError> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| HostError::Rejected("ACP session/new reply missing sessionId".into()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpModelConfigOption {
+    pub config_id: String,
+    pub current_value: Option<String>,
+    pub allowed_values: Vec<String>,
+}
+
+pub fn extract_model_config_option(result: &Value) -> Option<AcpModelConfigOption> {
+    let arr = result
+        .get("configOptions")
+        .or_else(|| result.get("config_options"))
+        .and_then(Value::as_array)?;
+    for item in arr {
+        let category = item
+            .get("category")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase());
+        let id = item
+            .get("id")
+            .or_else(|| item.get("configId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let is_model = category.as_deref() == Some("model")
+            || id.is_some_and(|i| i.eq_ignore_ascii_case("model"));
+        if !is_model {
+            continue;
+        }
+        let config_id = id?.to_owned();
+        let current_value = item
+            .get("currentValue")
+            .or_else(|| item.get("current_value"))
+            .or_else(|| item.get("value"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let mut allowed_values = Vec::new();
+        if let Some(opts) = item.get("options").and_then(Value::as_array) {
+            for opt in opts {
+                if let Some(v) = opt
+                    .get("value")
+                    .or_else(|| opt.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    allowed_values.push(v.to_owned());
+                } else if let Some(group_opts) = opt.get("options").and_then(Value::as_array) {
+                    for gopt in group_opts {
+                        if let Some(v) = gopt
+                            .get("value")
+                            .or_else(|| gopt.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            allowed_values.push(v.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        return Some(AcpModelConfigOption {
+            config_id,
+            current_value,
+            allowed_values,
+        });
+    }
+    None
 }
 
 pub fn extract_session_model(result: &Value) -> Option<ModelId> {
@@ -256,12 +371,37 @@ pub fn extract_session_model(result: &Value) -> Option<ModelId> {
         })
         .or_else(|| result.get("model").and_then(Value::as_str))
         .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| extract_model_config_option(result).and_then(|o| o.current_value))?;
     ModelId::parse(raw).ok()
 }
 
 pub fn session_supports_models(result: &Value) -> bool {
     result.get("models").is_some_and(Value::is_object)
+}
+
+pub fn model_is_listed_in_models_obj(result: &Value, requested: &str) -> bool {
+    let Some(avail) = result
+        .get("models")
+        .and_then(|m| {
+            m.get("availableModels")
+                .or_else(|| m.get("available_models"))
+        })
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    if avail.is_empty() {
+        return true;
+    }
+    avail.iter().any(|m| {
+        m.get("modelId")
+            .or_else(|| m.get("model_id"))
+            .or_else(|| m.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.trim() == requested)
+    })
 }
 
 pub fn format_jsonrpc_error(err: &Value) -> String {
@@ -402,43 +542,58 @@ pub fn parse_permission_request(
     }
 }
 
+fn reject_custom_granted_permissions(
+    granted: Option<&rex_wave_api::wave::GrantedPermissions>,
+) -> Result<(), HostError> {
+    if let Some(g) = granted
+        && (g.file_system.is_some() || g.network.is_some())
+    {
+        return Err(HostError::Rejected(
+            "ACP permission options cannot represent custom granted_permissions".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn select_permission_response(
     req: &ParsedPermissionRequest,
     resolution: &InteractionResolution,
 ) -> Result<Value, HostError> {
-    let pick = |preferred_kinds: &[&str], fallback_needle: &str| -> Option<String> {
-        for want in preferred_kinds {
-            if let Some(opt) = req.options.iter().find(|o| o.kind == *want) {
-                return Some(opt.option_id.clone());
-            }
-        }
+    let find_exact_kind = |want: &str| -> Option<String> {
         req.options
             .iter()
-            .find(|o| {
-                o.kind.contains(fallback_needle)
-                    || o.option_id.to_ascii_lowercase().contains(fallback_needle)
-                    || o.name.to_ascii_lowercase().contains(fallback_needle)
-            })
+            .find(|o| o.kind == want)
             .map(|o| o.option_id.clone())
     };
 
     match resolution {
-        InteractionResolution::AllowOnce { .. } => {
-            let option_id = pick(&["allow_once", "allow_always"], "allow")
-                .unwrap_or_else(|| "allow_once".to_owned());
+        InteractionResolution::AllowOnce {
+            granted_permissions,
+        } => {
+            reject_custom_granted_permissions(granted_permissions.as_ref())?;
+            let option_id = find_exact_kind("allow_once").ok_or_else(|| {
+                HostError::Rejected(
+                    "ACP permission request did not offer an allow_once option".into(),
+                )
+            })?;
             Ok(permission_selected_response(req.rpc_id.clone(), &option_id))
         }
-        InteractionResolution::AllowForSession { .. } => {
-            let option_id = pick(&["allow_always", "allow_once"], "allow")
-                .unwrap_or_else(|| "allow_always".to_owned());
+        InteractionResolution::AllowForSession {
+            granted_permissions,
+        } => {
+            reject_custom_granted_permissions(granted_permissions.as_ref())?;
+            let option_id = find_exact_kind("allow_session").ok_or_else(|| {
+                HostError::Rejected(
+                    "ACP permission request did not offer a session-scoped allow_session option (allow_always exceeds session lifetime)"
+                        .into(),
+                )
+            })?;
             Ok(permission_selected_response(req.rpc_id.clone(), &option_id))
         }
-        InteractionResolution::Deny => {
-            match pick(&["reject_once", "reject_always"], "reject").or_else(|| pick(&[], "deny")) {
-                Some(option_id) => Ok(permission_selected_response(req.rpc_id.clone(), &option_id)),
-                None => Ok(permission_cancelled_response(req.rpc_id.clone())),
-            }
-        }
+        InteractionResolution::Deny => match find_exact_kind("reject_once") {
+            Some(option_id) => Ok(permission_selected_response(req.rpc_id.clone(), &option_id)),
+            None => Ok(permission_cancelled_response(req.rpc_id.clone())),
+        },
         InteractionResolution::UserAnswer { .. }
         | InteractionResolution::RequestAnswer { .. }
         | InteractionResolution::PluginSubmitted { .. } => Err(HostError::Rejected(
@@ -786,6 +941,7 @@ pub fn normalize_session_update(
 pub enum PromptOutcome {
     Idle {
         usage: Option<ThreadContextUsage>,
+        stop_reason: String,
     },
     Cancelled,
     Refused {
@@ -858,8 +1014,11 @@ pub fn classify_prompt_response(result: Option<&Value>, error: Option<&Value>) -
         };
     }
 
-    let Some(res) = result else {
-        return PromptOutcome::Idle { usage: None };
+    let Some(res) = result.filter(|v| v.is_object()) else {
+        return PromptOutcome::Errored {
+            error: "malformed ACP session/prompt response: expected result object".into(),
+            usage: None,
+        };
     };
     let usage = parse_acp_usage(res).or_else(|| res.get("_meta").and_then(parse_acp_usage));
 
@@ -872,38 +1031,46 @@ pub fn classify_prompt_response(result: Option<&Value>, error: Option<&Value>) -
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    if let Some(sr) = stop_reason {
-        let low = sr.to_ascii_lowercase();
-        if is_refusal_stop_reason(sr) {
-            let reason = extract_refusal_from_value(res).unwrap_or_else(|| sr.to_owned());
-            return PromptOutcome::Refused { reason, usage };
-        }
-        if matches!(low.as_str(), "cancelled" | "canceled") {
-            return PromptOutcome::Cancelled;
-        }
-        if matches!(low.as_str(), "error" | "failed") {
-            let detail = res
-                .get("error")
-                .or_else(|| res.get("message"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("ACP prompt failed")
-                .to_owned();
-            if is_refusal_error_text(&detail) {
-                return PromptOutcome::Refused {
-                    reason: detail,
-                    usage,
-                };
-            }
-            return PromptOutcome::Errored {
-                error: detail,
+    let Some(sr) = stop_reason else {
+        return PromptOutcome::Errored {
+            error: "malformed ACP session/prompt response: missing stopReason".into(),
+            usage,
+        };
+    };
+
+    let low = sr.to_ascii_lowercase();
+    if is_refusal_stop_reason(sr) {
+        let reason = extract_refusal_from_value(res).unwrap_or_else(|| sr.to_owned());
+        return PromptOutcome::Refused { reason, usage };
+    }
+    if matches!(low.as_str(), "cancelled" | "canceled") {
+        return PromptOutcome::Cancelled;
+    }
+    if matches!(low.as_str(), "error" | "failed") {
+        let detail = res
+            .get("error")
+            .or_else(|| res.get("message"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ACP prompt failed")
+            .to_owned();
+        if is_refusal_error_text(&detail) {
+            return PromptOutcome::Refused {
+                reason: detail,
                 usage,
             };
         }
+        return PromptOutcome::Errored {
+            error: detail,
+            usage,
+        };
     }
 
-    PromptOutcome::Idle { usage }
+    PromptOutcome::Idle {
+        usage,
+        stop_reason: sr.to_owned(),
+    }
 }
 
 pub fn classify_process_exit(status: Option<ExitStatus>, stderr_tail: &str) -> Activity {
@@ -1029,6 +1196,7 @@ mod tests {
             },
             "options": [
                 { "optionId": "opt_once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "opt_session", "name": "Allow session", "kind": "allow_session" },
                 { "optionId": "opt_always", "name": "Allow always", "kind": "allow_always" },
                 { "optionId": "opt_reject", "name": "Reject", "kind": "reject_once" }
             ]
@@ -1059,7 +1227,52 @@ mod tests {
         .unwrap();
         assert_eq!(
             allow_session["result"]["outcome"],
-            json!({ "outcome": "selected", "optionId": "opt_always" })
+            json!({ "outcome": "selected", "optionId": "opt_session" })
+        );
+
+        // If only allow_always is offered, neither AllowOnce nor AllowForSession may widen scope.
+        let always_only = parse_permission_request(
+            json!(10),
+            &json!({
+                "sessionId": "s1",
+                "options": [
+                    { "optionId": "opt_always", "name": "Allow always", "kind": "allow_always" }
+                ]
+            }),
+            2,
+        );
+        assert!(
+            select_permission_response(
+                &always_only,
+                &InteractionResolution::AllowOnce {
+                    granted_permissions: None
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            select_permission_response(
+                &always_only,
+                &InteractionResolution::AllowForSession {
+                    granted_permissions: None
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            select_permission_response(
+                &parsed,
+                &InteractionResolution::AllowOnce {
+                    granted_permissions: Some(rex_wave_api::wave::GrantedPermissions {
+                        file_system: Some(rex_wave_api::wave::FileSystemGrant {
+                            read: vec!["/etc".into()],
+                            write: Vec::new(),
+                        }),
+                        network: None,
+                    })
+                }
+            )
+            .is_err()
         );
 
         let deny = select_permission_response(&parsed, &InteractionResolution::Deny).unwrap();
@@ -1073,8 +1286,15 @@ mod tests {
     fn classifies_refusal_error_cancelled_and_idle() {
         assert_eq!(
             classify_prompt_response(Some(&json!({ "stopReason": "end_turn" })), None),
-            PromptOutcome::Idle { usage: None }
+            PromptOutcome::Idle {
+                usage: None,
+                stop_reason: "end_turn".into()
+            }
         );
+        assert!(matches!(
+            classify_prompt_response(None, None),
+            PromptOutcome::Errored { .. }
+        ));
         assert_eq!(
             classify_prompt_response(Some(&json!({ "stopReason": "cancelled" })), None),
             PromptOutcome::Cancelled

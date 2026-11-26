@@ -7,12 +7,14 @@ use crate::process::{
 };
 use crate::protocol::{
     InboundMessage, ParsedPermissionRequest, PromptOutcome, classify_process_exit,
-    classify_prompt_response, deterministic_thread_id, extract_session_id, extract_session_model,
-    format_jsonrpc_error, initialize_request, is_acp_thread_id, jsonrpc_error_code,
-    mcp_server_entry, method_not_found_response, normalize_session_update, parse_acp_thread_id,
-    parse_inbound_line, parse_permission_request, permission_cancelled_response, rpc_id_matches,
-    select_permission_response, session_cancel_notification, session_new_request,
-    session_prompt_request, session_set_model_request, session_supports_models,
+    classify_prompt_response, deterministic_thread_id, extract_model_config_option,
+    extract_session_id, extract_session_model, format_jsonrpc_error, initialize_request,
+    is_acp_thread_id, mcp_server_entry, method_not_found_response, model_is_listed_in_models_obj,
+    normalize_session_update, parse_acp_thread_id, parse_inbound_line, parse_permission_request,
+    permission_cancelled_response, rpc_id_matches, select_permission_response,
+    session_cancel_notification, session_new_request, session_prompt_request,
+    session_set_config_option_request, session_set_model_request, session_supports_models,
+    validate_initialize_result,
 };
 use crate::workspace::resolve_acp_workspace;
 use rex_wave_api::Command as _;
@@ -42,11 +44,36 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const MAX_FEED_EVENTS: usize = 4_096;
+const MAX_ARCHIVED_FEED_EVENTS: usize = 256;
+const MAX_ARCHIVED_SESSIONS: usize = 256;
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 const READER_CHANNEL_CAP: usize = 512;
 const FEED_BROADCAST_CAP: usize = 256;
 const RETIRE_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const PROMPT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Daemon-scoped credentials and harness ambient variables scrubbed from worker children.
+pub const SCRUBBED_DAEMON_ENV: &[&str] = &[
+    "REX_WAVE_BB_TOKEN",
+    "REX_WAVE_T3_TOKEN",
+    "REX_WAVE_T3_URL",
+    "REX_WAVE_T3_HOME",
+    "REX_WAVE_OPERATOR",
+    "REX_WAVE_TOKEN",
+    "REX_WAVE_SOCKET",
+    "REX_WAVE_WORKER_THREAD_ID",
+    "REX_WAVE_INTERCHANGE_DIR",
+    "REX_WAVE_LIVE_INTERCHANGE_TEST_DIR",
+    T3_WORKER_THREAD_ENV,
+    "T3CODE_CLI_PATH",
+    "T3CODE_DESKTOP_HOST_SCOPE",
+    "T3_ACP_MCP_NODE",
+    "T3_ACP_MCP_ENDPOINT",
+    "T3_ACP_MCP_ENTRYPOINT",
+    "T3_ACP_MCP_AUTHORIZATION",
+    "CLAUDE_PID",
+];
 
 trait ErasedBackend: Send + Sync {
     fn call_as(&self, me: Principal, cmd: WireCommand) -> BoxFut<'_, Result<WireReply, ApiError>>;
@@ -80,7 +107,25 @@ impl StderrTail {
 
 enum ReaderMsg {
     Line(String),
+    OversizedLine,
     Eof,
+}
+
+async fn drain_until_newline_bounded<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) {
+    loop {
+        let Ok(buf) = reader.fill_buf().await else {
+            break;
+        };
+        if buf.is_empty() {
+            break;
+        }
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            break;
+        }
+        let len = buf.len();
+        reader.consume(len);
+    }
 }
 
 fn spawn_stdout_reader(
@@ -100,9 +145,10 @@ fn spawn_stdout_reader(
                 }
                 Ok(_) => {
                     if !line_buf.ends_with(b"\n") && line_buf.len() >= MAX_LINE_BYTES {
-                        // Drain remainder of oversized line so framing stays aligned on '\n'.
-                        let mut discard = Vec::new();
-                        let _ = reader.read_until(b'\n', &mut discard).await;
+                        drain_until_newline_bounded(&mut reader).await;
+                        if tx.send(ReaderMsg::OversizedLine).await.is_err() {
+                            break;
+                        }
                         continue;
                     }
                     let line = String::from_utf8_lossy(&line_buf).into_owned();
@@ -149,6 +195,16 @@ async fn write_json_line(stdin: &mut ChildStdin, payload: &Value) -> io::Result<
     stdin.flush().await
 }
 
+async fn write_json_line_bounded(
+    stdin: &mut ChildStdin,
+    payload: &Value,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, write_json_line(stdin, payload))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ACP stdin write timed out"))?
+}
+
 async fn wait_for_rpc_response(
     stdin: &mut ChildStdin,
     reader_rx: &mut mpsc::Receiver<ReaderMsg>,
@@ -170,10 +226,15 @@ async fn wait_for_rpc_response(
                     }
                     Some(InboundMessage::Request { id, method, .. }) => {
                         let reply = method_not_found_response(id, &method);
-                        let _ = write_json_line(stdin, &reply).await;
+                        let _ = write_json_line_bounded(stdin, &reply, RETIRE_WRITE_TIMEOUT).await;
                     }
                     _ => {}
                 },
+                ReaderMsg::OversizedLine => {
+                    return Err(HostError::Rejected(format!(
+                        "ACP child emitted frame exceeding {MAX_LINE_BYTES} byte limit during request {expected_id}"
+                    )));
+                }
                 ReaderMsg::Eof => {
                     let tail = stderr_tail.lock().map(|g| g.text()).unwrap_or_default();
                     let suffix = if tail.trim().is_empty() {
@@ -242,13 +303,35 @@ impl SessionFeed {
         if let AgentEventKind::Usage { ref usage } = kind {
             guard.usage = Some(usage.clone());
         }
-        let ev = AgentEvent { seq, at, kind };
+        let live_ev = AgentEvent {
+            seq,
+            at,
+            kind: kind.clone(),
+        };
+        if let AgentEventKind::AssistantText { ref text } = kind
+            && let Some(last) = guard.events.back_mut()
+            && let AgentEventKind::AssistantText { text: ref mut prev } = last.kind
+        {
+            prev.push_str(text);
+            last.seq = seq;
+            last.at = at;
+            let _ = self.tx.send(live_ev.clone());
+            return live_ev;
+        }
         if guard.events.len() >= MAX_FEED_EVENTS {
             guard.events.pop_front();
         }
-        guard.events.push_back(ev.clone());
-        let _ = self.tx.send(ev.clone());
-        ev
+        guard.events.push_back(live_ev.clone());
+        let _ = self.tx.send(live_ev.clone());
+        live_ev
+    }
+
+    fn current_activity(&self) -> Activity {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .activity
+            .clone()
     }
 
     fn set_activity(&self, activity: Activity) {
@@ -270,6 +353,9 @@ impl SessionFeed {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.closed = true;
         guard.pending = None;
+        while guard.events.len() > MAX_ARCHIVED_FEED_EVENTS {
+            guard.events.pop_front();
+        }
         drop(guard);
         let _ = self.closed_tx.send(true);
     }
@@ -443,6 +529,7 @@ struct SessionActor {
     next_rpc_id: u64,
     next_perm_seq: u64,
     active_prompt_id: Option<u64>,
+    active_prompt_text: Option<String>,
     cancel_requested_for_active: bool,
     queued_prompts: VecDeque<String>,
     parked_permission: Option<ParsedPermissionRequest>,
@@ -500,11 +587,12 @@ impl SessionActor {
         let rpc_id = self.next_rpc_id;
         self.next_rpc_id = self.next_rpc_id.saturating_add(1);
         let req = session_prompt_request(rpc_id, &self.session_id, &text);
-        write_json_line(stdin, &req)
+        write_json_line_bounded(stdin, &req, PROMPT_WRITE_TIMEOUT)
             .await
             .map_err(|e| HostError::Unreachable(format!("write ACP session/prompt: {e}")))?;
 
         self.active_prompt_id = Some(rpc_id);
+        self.active_prompt_text = Some(text.clone());
         self.cancel_requested_for_active = false;
         self.entry
             .feed
@@ -518,22 +606,33 @@ impl SessionActor {
         Ok(())
     }
 
-    async fn send_cancel_active(&mut self) {
-        if let Some(parked) = self.parked_permission.take()
-            && let Some(ref mut stdin) = self.stdin
-        {
-            let cancel_resp = permission_cancelled_response(parked.rpc_id);
-            let _ =
-                tokio::time::timeout(RETIRE_WRITE_TIMEOUT, write_json_line(stdin, &cancel_resp))
-                    .await;
+    async fn send_cancel_active(&mut self, observe_unblocked: bool) {
+        let mut had_parked = false;
+        if let Some(parked) = self.parked_permission.take() {
+            had_parked = true;
+            if let Some(ref mut stdin) = self.stdin {
+                let cancel_resp = permission_cancelled_response(parked.rpc_id);
+                let _ = write_json_line_bounded(stdin, &cancel_resp, RETIRE_WRITE_TIMEOUT).await;
+            }
         }
         if !self.cancel_requested_for_active
             && let Some(ref mut stdin) = self.stdin
         {
             self.cancel_requested_for_active = true;
             let cancel = session_cancel_notification(&self.session_id);
-            let _ =
-                tokio::time::timeout(RETIRE_WRITE_TIMEOUT, write_json_line(stdin, &cancel)).await;
+            let _ = write_json_line_bounded(stdin, &cancel, RETIRE_WRITE_TIMEOUT).await;
+        }
+        if had_parked && observe_unblocked {
+            self.observe_activity(Activity::Working).await;
+        }
+    }
+
+    fn drain_queued_prompts_as_cancelled(&mut self, why: &str) {
+        while let Some(queued) = self.queued_prompts.pop_front() {
+            let preview = truncate_with_notice(queued.trim(), 160);
+            self.entry.feed.push_event(AgentEventKind::Other {
+                bb_type: format!("cancelled_queued_prompt ({why}): {preview}"),
+            });
         }
     }
 
@@ -576,6 +675,10 @@ impl SessionActor {
                         Some(ReaderMsg::Line(line)) => {
                             self.handle_inbound_line(&line).await;
                         }
+                        Some(ReaderMsg::OversizedLine) => {
+                            self.handle_oversized_frame().await;
+                            break;
+                        }
                         Some(ReaderMsg::Eof) | None => {
                             if !self.retiring {
                                 self.handle_unexpected_eof().await;
@@ -586,6 +689,21 @@ impl SessionActor {
                 }
             }
         }
+    }
+
+    async fn handle_oversized_frame(&mut self) {
+        let msg = format!("ACP child emitted frame exceeding {MAX_LINE_BYTES} byte limit");
+        if self.active_prompt_id.take().is_some() {
+            self.active_prompt_text = None;
+            self.entry.feed.push_event(AgentEventKind::Other {
+                bb_type: format!("error: {msg}"),
+            });
+            self.entry.feed.push_event(AgentEventKind::TurnEnded);
+        }
+        self.drain_queued_prompts_as_cancelled("oversized_frame");
+        self.observe_activity(Activity::Errored { error: msg })
+            .await;
+        self.cleanup_after_unexpected_exit().await;
     }
 
     async fn handle_tell(
@@ -615,7 +733,7 @@ impl SessionActor {
                 self.thread
             ))),
             SteerDeliveryMode::Steer | SteerDeliveryMode::SteerIfActive => {
-                self.send_cancel_active().await;
+                self.send_cancel_active(true).await;
                 self.queued_prompts.push_back(body);
                 Ok(())
             }
@@ -647,7 +765,7 @@ impl SessionActor {
         let Some(ref mut stdin) = self.stdin else {
             return Err(HostError::Rejected("ACP worker stdin is closed".into()));
         };
-        write_json_line(stdin, &response)
+        write_json_line_bounded(stdin, &response, PROMPT_WRITE_TIMEOUT)
             .await
             .map_err(|e| HostError::Unreachable(format!("write ACP permission reply: {e}")))?;
 
@@ -665,6 +783,12 @@ impl SessionActor {
                 if method == "session/update"
                     && let Some(kind) = normalize_session_update(&params, &mut self.tool_names)
                 {
+                    if matches!(kind, AgentEventKind::UserMessage { .. })
+                        && (self.active_prompt_id.is_some()
+                            || self.active_prompt_text.as_deref().is_some())
+                    {
+                        return;
+                    }
                     self.entry.feed.push_event(kind);
                 }
             }
@@ -673,14 +797,18 @@ impl SessionActor {
                     if self.cancel_requested_for_active || self.active_prompt_id.is_none() {
                         if let Some(ref mut stdin) = self.stdin {
                             let cancel_resp = permission_cancelled_response(id);
-                            let _ = write_json_line(stdin, &cancel_resp).await;
+                            let _ =
+                                write_json_line_bounded(stdin, &cancel_resp, RETIRE_WRITE_TIMEOUT)
+                                    .await;
                         }
                     } else {
                         if let Some(prev) = self.parked_permission.take()
                             && let Some(ref mut stdin) = self.stdin
                         {
                             let cancel_resp = permission_cancelled_response(prev.rpc_id);
-                            let _ = write_json_line(stdin, &cancel_resp).await;
+                            let _ =
+                                write_json_line_bounded(stdin, &cancel_resp, RETIRE_WRITE_TIMEOUT)
+                                    .await;
                         }
                         self.next_perm_seq = self.next_perm_seq.saturating_add(1);
                         let parsed = parse_permission_request(id, &params, self.next_perm_seq);
@@ -694,7 +822,7 @@ impl SessionActor {
                     }
                 } else if let Some(ref mut stdin) = self.stdin {
                     let reply = method_not_found_response(id, &method);
-                    let _ = write_json_line(stdin, &reply).await;
+                    let _ = write_json_line_bounded(stdin, &reply, RETIRE_WRITE_TIMEOUT).await;
                 }
             }
             InboundMessage::Response { id, result, error } => {
@@ -702,19 +830,32 @@ impl SessionActor {
                     && rpc_id_matches(&id, active_id)
                 {
                     self.active_prompt_id = None;
-                    self.cancel_requested_for_active = false;
+                    self.active_prompt_text = None;
+                    let was_cancelled =
+                        std::mem::replace(&mut self.cancel_requested_for_active, false);
                     self.parked_permission = None;
-                    let outcome = classify_prompt_response(result.as_ref(), error.as_ref());
+                    let outcome = if was_cancelled {
+                        PromptOutcome::Cancelled
+                    } else {
+                        classify_prompt_response(result.as_ref(), error.as_ref())
+                    };
                     match outcome {
-                        PromptOutcome::Idle { usage } => {
+                        PromptOutcome::Idle { usage, stop_reason } => {
                             if let Some(u) = usage {
                                 self.entry
                                     .feed
                                     .push_event(AgentEventKind::Usage { usage: u });
                             }
+                            let low_sr = stop_reason.to_ascii_lowercase();
+                            if matches!(low_sr.as_str(), "max_tokens" | "max_turn_requests") {
+                                self.entry.feed.push_event(AgentEventKind::Other {
+                                    bb_type: format!("stop_reason: {stop_reason}"),
+                                });
+                            }
                             self.entry.feed.push_event(AgentEventKind::TurnEnded);
                             if let Some(next_prompt) = self.queued_prompts.pop_front() {
                                 if let Err(err) = self.dispatch_prompt(next_prompt, true).await {
+                                    self.drain_queued_prompts_as_cancelled("dispatch_failed");
                                     self.observe_activity(Activity::Errored {
                                         error: err.to_string(),
                                     })
@@ -728,6 +869,7 @@ impl SessionActor {
                             self.entry.feed.push_event(AgentEventKind::TurnEnded);
                             if let Some(next_prompt) = self.queued_prompts.pop_front() {
                                 if let Err(err) = self.dispatch_prompt(next_prompt, true).await {
+                                    self.drain_queued_prompts_as_cancelled("dispatch_failed");
                                     self.observe_activity(Activity::Errored {
                                         error: err.to_string(),
                                     })
@@ -746,8 +888,8 @@ impl SessionActor {
                             self.entry.feed.push_event(AgentEventKind::Other {
                                 bb_type: format!("refusal: {reason}"),
                             });
+                            self.drain_queued_prompts_as_cancelled("turn_refused");
                             self.entry.feed.push_event(AgentEventKind::TurnEnded);
-                            self.queued_prompts.clear();
                             self.observe_activity(Activity::Refused { reason }).await;
                         }
                         PromptOutcome::Errored {
@@ -762,8 +904,8 @@ impl SessionActor {
                             self.entry.feed.push_event(AgentEventKind::Other {
                                 bb_type: format!("error: {err_msg}"),
                             });
+                            self.drain_queued_prompts_as_cancelled("turn_errored");
                             self.entry.feed.push_event(AgentEventKind::TurnEnded);
-                            self.queued_prompts.clear();
                             self.observe_activity(Activity::Errored { error: err_msg })
                                 .await;
                         }
@@ -785,10 +927,20 @@ impl SessionActor {
             .unwrap_or_default();
         self.entry.alive.store(false, Ordering::Release);
         self.stdin.take();
+        self.bridge.unlink_worker_token(&self.thread);
+        terminate_and_reap_process_group(
+            &mut self.child,
+            self.entry.pgid,
+            self.bridge.cfg.retire_grace,
+        )
+        .await;
+        self.bridge.unregister_active_process(&self.thread);
         let activity = classify_process_exit(status, &tail);
         if self.active_prompt_id.take().is_some() {
+            self.active_prompt_text = None;
             self.entry.feed.push_event(AgentEventKind::TurnEnded);
         }
+        self.drain_queued_prompts_as_cancelled("unexpected_eof");
         self.observe_activity(activity).await;
         self.entry.feed.mark_closed();
         self.reader_handle.abort();
@@ -798,12 +950,14 @@ impl SessionActor {
     async fn cleanup_after_unexpected_exit(&mut self) {
         self.entry.alive.store(false, Ordering::Release);
         self.stdin.take();
+        self.bridge.unlink_worker_token(&self.thread);
         terminate_and_reap_process_group(
             &mut self.child,
             self.entry.pgid,
             self.bridge.cfg.retire_grace,
         )
         .await;
+        self.bridge.unregister_active_process(&self.thread);
         self.entry.feed.mark_closed();
         self.reader_handle.abort();
         self.stderr_handle.abort();
@@ -812,7 +966,7 @@ impl SessionActor {
     async fn perform_retire(&mut self, emit_archived: bool) {
         self.retiring = true;
         self.bridge.unlink_worker_token(&self.thread);
-        self.send_cancel_active().await;
+        self.send_cancel_active(false).await;
         self.stdin.take();
         terminate_and_reap_process_group(
             &mut self.child,
@@ -820,11 +974,13 @@ impl SessionActor {
             self.bridge.cfg.retire_grace,
         )
         .await;
+        self.bridge.unregister_active_process(&self.thread);
         self.entry.alive.store(false, Ordering::Release);
         self.entry.archived.store(true, Ordering::Release);
         self.entry.feed.mark_closed();
         self.reader_handle.abort();
         self.stderr_handle.abort();
+        self.bridge.evict_excess_archived_sessions();
 
         if emit_archived {
             self.bridge
@@ -838,27 +994,57 @@ impl SessionActor {
     }
 }
 
+struct HandshakeCleanupGuard<'a> {
+    bridge: &'a AcpBridge,
+    thread: HostThreadId,
+    pgid: Option<u32>,
+    armed: bool,
+}
+
+impl Drop for HandshakeCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(g) = self.pgid {
+                kill_process_group_now(g);
+            }
+            self.bridge.unlink_worker_token(&self.thread);
+            self.bridge.unregister_active_process(&self.thread);
+        }
+    }
+}
+
 /// Core native ACP bridge owning spawned child process groups, JSON-RPC 2.0
 /// sessions, and per-worker live event feeds.
 pub struct AcpBridge {
     cfg: AcpConfig,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     sessions: RwLock<HashMap<HostThreadId, Arc<SessionEntry>>>,
+    session_order: Mutex<VecDeque<HostThreadId>>,
     sessions_by_role: RwLock<HashMap<(WaveSlug, RoleName), HostThreadId>>,
     spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
+    active_processes: Mutex<HashMap<HostThreadId, Option<u32>>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<ProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<ProjectId, String>>>,
 }
 
 impl Drop for AcpBridge {
     fn drop(&mut self) {
+        if let Ok(mut active) = self.active_processes.lock() {
+            for (tid, pgid_opt) in active.drain() {
+                if let Some(pgid) = pgid_opt {
+                    kill_process_group_now(pgid);
+                }
+                self.unlink_worker_token(&tid);
+            }
+        }
         if let Ok(guard) = self.sessions.read() {
-            for entry in guard.values() {
+            for (tid, entry) in guard.iter() {
                 if entry.alive.load(Ordering::Acquire)
                     && let Some(pgid) = entry.pgid
                 {
                     kill_process_group_now(pgid);
                 }
+                self.unlink_worker_token(tid);
             }
         }
     }
@@ -871,8 +1057,10 @@ impl AcpBridge {
             cfg,
             backend: OnceLock::new(),
             sessions: RwLock::new(HashMap::new()),
+            session_order: Mutex::new(VecDeque::new()),
             sessions_by_role: RwLock::new(HashMap::new()),
             spawn_locks: Mutex::new(HashMap::new()),
+            active_processes: Mutex::new(HashMap::new()),
             project_names_tx,
             project_names_rx,
         })
@@ -905,19 +1093,90 @@ impl AcpBridge {
         self.shutdown_all().await;
     }
 
-    /// Gracefully retires and reaps every still-active ACP worker process group.
+    /// Gracefully retires and reaps every ACP worker process group and token.
     pub async fn shutdown_all(&self) {
-        let active: Vec<HostThreadId> = {
+        let session_tids: Vec<HostThreadId> = {
             let guard = self.sessions.read().unwrap_or_else(|e| e.into_inner());
             guard
                 .iter()
-                .filter(|(_, entry)| entry.alive.load(Ordering::Acquire))
+                .filter(|(_, entry)| !entry.archived.load(Ordering::Acquire))
                 .map(|(tid, _)| tid.clone())
                 .collect()
         };
-        for tid in active {
-            let _ = self.retire_worker_thread(&tid).await;
+        let futs = session_tids
+            .iter()
+            .map(|tid| self.retire_worker_thread(tid));
+        let _ = futures_util::future::join_all(futs).await;
+
+        let leftover: Vec<(HostThreadId, Option<u32>)> = {
+            let mut active = self
+                .active_processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            active.drain().collect()
+        };
+        for (tid, pgid_opt) in leftover {
+            self.unlink_worker_token(&tid);
+            if let Some(pgid) = pgid_opt {
+                kill_process_group_now(pgid);
+                let deadline = std::time::Instant::now() + Duration::from_millis(300);
+                while process_group_alive(pgid) && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
         }
+    }
+
+    fn register_active_process(&self, thread: &HostThreadId, pgid: Option<u32>) {
+        self.active_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread.clone(), pgid);
+    }
+
+    fn unregister_active_process(&self, thread: &HostThreadId) {
+        self.active_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(thread);
+    }
+
+    fn evict_excess_archived_sessions(&self) {
+        let mut order = self.session_order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_id = self.sessions.write().unwrap_or_else(|e| e.into_inner());
+        let mut archived_count = by_id
+            .values()
+            .filter(|e| e.archived.load(Ordering::Acquire))
+            .count();
+        if archived_count <= MAX_ARCHIVED_SESSIONS {
+            return;
+        }
+        let mut retained_order = VecDeque::with_capacity(order.len());
+        while let Some(tid) = order.pop_front() {
+            if archived_count > MAX_ARCHIVED_SESSIONS
+                && by_id
+                    .get(&tid)
+                    .is_some_and(|e| e.archived.load(Ordering::Acquire))
+            {
+                let in_use_by_role = self
+                    .sessions_by_role
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .any(|cur| cur == &tid);
+                if !in_use_by_role {
+                    by_id.remove(&tid);
+                    self.spawn_locks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tid);
+                    archived_count -= 1;
+                    continue;
+                }
+            }
+            retained_order.push_back(tid);
+        }
+        *order = retained_order;
     }
 
     fn upsert_project_name(&self, project: &ProjectId, title: &str) {
@@ -1000,15 +1259,25 @@ impl AcpBridge {
             None
         };
 
+        self.register_active_process(&thread, None);
+        let mut hs_guard = HandshakeCleanupGuard {
+            bridge: self,
+            thread: thread.clone(),
+            pgid: None,
+            armed: true,
+        };
+
         let mut cmd = Command::new(&program);
         cmd.args(&args)
             .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0)
-            .env_remove(T3_WORKER_THREAD_ENV)
-            .env("BELL_GUARD", "1")
+            .process_group(0);
+        for var in SCRUBBED_DAEMON_ENV {
+            cmd.env_remove(var);
+        }
+        cmd.env("BELL_GUARD", "1")
             .env(WORKER_THREAD_ENV, thread.as_str());
 
         if let Some(ref sock) = self.cfg.socket_path {
@@ -1024,11 +1293,6 @@ impl AcpBridge {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                if let Some(ref prov) = provisioned
-                    && prov.created
-                {
-                    self.unlink_worker_token(&thread);
-                }
                 return Err(HostError::Rejected(format!(
                     "failed to spawn ACP provider '{}': {e}",
                     program.display()
@@ -1037,24 +1301,20 @@ impl AcpBridge {
         };
 
         let pgid = child.id();
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            if let Some(g) = pgid {
-                kill_process_group_now(g);
-            }
-            HostError::Rejected("ACP child missing piped stdin".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            if let Some(g) = pgid {
-                kill_process_group_now(g);
-            }
-            HostError::Rejected("ACP child missing piped stdout".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            if let Some(g) = pgid {
-                kill_process_group_now(g);
-            }
-            HostError::Rejected("ACP child missing piped stderr".into())
-        })?;
+        hs_guard.pgid = pgid;
+        self.register_active_process(&thread, pgid);
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HostError::Rejected("ACP child missing piped stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HostError::Rejected("ACP child missing piped stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| HostError::Rejected("ACP child missing piped stderr".into()))?;
 
         let (mut reader_rx, reader_handle) = spawn_stdout_reader(stdout);
         let (stderr_tail, stderr_handle) = spawn_stderr_drainer(stderr);
@@ -1064,7 +1324,7 @@ impl AcpBridge {
 
             let init_id = next_id;
             next_id += 1;
-            write_json_line(&mut stdin, &initialize_request(init_id))
+            write_json_line_bounded(&mut stdin, &initialize_request(init_id), PROMPT_WRITE_TIMEOUT)
                 .await
                 .map_err(|e| HostError::Unreachable(format!("write ACP initialize: {e}")))?;
             match wait_for_rpc_response(
@@ -1076,7 +1336,7 @@ impl AcpBridge {
             )
             .await?
             {
-                Ok(_) => {}
+                Ok(init_val) => validate_initialize_result(&init_val)?,
                 Err(err) => {
                     return Err(HostError::Rejected(format!(
                         "ACP initialize rejected: {}",
@@ -1097,9 +1357,13 @@ impl AcpBridge {
 
             let new_id = next_id;
             next_id += 1;
-            write_json_line(&mut stdin, &session_new_request(new_id, &cwd, mcp_servers))
-                .await
-                .map_err(|e| HostError::Unreachable(format!("write ACP session/new: {e}")))?;
+            write_json_line_bounded(
+                &mut stdin,
+                &session_new_request(new_id, &cwd, mcp_servers),
+                PROMPT_WRITE_TIMEOUT,
+            )
+            .await
+            .map_err(|e| HostError::Unreachable(format!("write ACP session/new: {e}")))?;
             let new_reply = match wait_for_rpc_response(
                 &mut stdin,
                 &mut reader_rx,
@@ -1121,38 +1385,97 @@ impl AcpBridge {
             let session_id = extract_session_id(&new_reply)?;
             let mut actual_model = extract_session_model(&new_reply);
 
-            if let Some(ref requested_model) = req.agent.model
-                && session_supports_models(&new_reply)
-            {
-                let set_id = next_id;
-                next_id += 1;
-                write_json_line(
-                    &mut stdin,
-                    &session_set_model_request(set_id, &session_id, requested_model.as_str()),
-                )
-                .await
-                .map_err(|e| HostError::Unreachable(format!("write ACP session/set_model: {e}")))?;
-                match wait_for_rpc_response(
-                    &mut stdin,
-                    &mut reader_rx,
-                    set_id,
-                    self.cfg.handshake_timeout,
-                    &stderr_tail,
-                )
-                .await
-                {
-                    Ok(Ok(val)) => {
-                        actual_model =
-                            extract_session_model(&val).or_else(|| Some(requested_model.clone()));
-                    }
-                    Ok(Err(err)) if jsonrpc_error_code(&err) == Some(-32601) => {}
-                    Ok(Err(err)) => {
+            if let Some(ref requested_model) = req.agent.model {
+                let req_str = requested_model.as_str();
+                if actual_model.as_ref().map(ModelId::as_str) != Some(req_str) {
+                    if let Some(cfg_opt) = extract_model_config_option(&new_reply) {
+                        if !cfg_opt.allowed_values.is_empty()
+                            && !cfg_opt.allowed_values.iter().any(|v| v == req_str)
+                        {
+                            return Err(HostError::Rejected(format!(
+                                "ACP provider does not advertise requested model '{req_str}' in configOptions"
+                            )));
+                        }
+                        let set_id = next_id;
+                        next_id += 1;
+                        write_json_line_bounded(
+                            &mut stdin,
+                            &session_set_config_option_request(
+                                set_id,
+                                &session_id,
+                                &cfg_opt.config_id,
+                                req_str,
+                            ),
+                            PROMPT_WRITE_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|e| {
+                            HostError::Unreachable(format!(
+                                "write ACP session/set_config_option: {e}"
+                            ))
+                        })?;
+                        match wait_for_rpc_response(
+                            &mut stdin,
+                            &mut reader_rx,
+                            set_id,
+                            self.cfg.handshake_timeout,
+                            &stderr_tail,
+                        )
+                        .await?
+                        {
+                            Ok(val) => {
+                                actual_model = extract_session_model(&val)
+                                    .or_else(|| Some(requested_model.clone()));
+                            }
+                            Err(err) => {
+                                return Err(HostError::Rejected(format!(
+                                    "ACP session/set_config_option rejected: {}",
+                                    format_jsonrpc_error(&err)
+                                )));
+                            }
+                        }
+                    } else if session_supports_models(&new_reply) {
+                        if !model_is_listed_in_models_obj(&new_reply, req_str) {
+                            return Err(HostError::Rejected(format!(
+                                "ACP provider does not advertise requested model '{req_str}' in availableModels"
+                            )));
+                        }
+                        let set_id = next_id;
+                        next_id += 1;
+                        write_json_line_bounded(
+                            &mut stdin,
+                            &session_set_model_request(set_id, &session_id, req_str),
+                            PROMPT_WRITE_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|e| {
+                            HostError::Unreachable(format!("write ACP session/set_model: {e}"))
+                        })?;
+                        match wait_for_rpc_response(
+                            &mut stdin,
+                            &mut reader_rx,
+                            set_id,
+                            self.cfg.handshake_timeout,
+                            &stderr_tail,
+                        )
+                        .await?
+                        {
+                            Ok(val) => {
+                                actual_model = extract_session_model(&val)
+                                    .or_else(|| Some(requested_model.clone()));
+                            }
+                            Err(err) => {
+                                return Err(HostError::Rejected(format!(
+                                    "ACP session/set_model rejected: {}",
+                                    format_jsonrpc_error(&err)
+                                )));
+                            }
+                        }
+                    } else {
                         return Err(HostError::Rejected(format!(
-                            "ACP session/set_model rejected: {}",
-                            format_jsonrpc_error(&err)
+                            "ACP provider does not support selecting requested model '{req_str}'"
                         )));
                     }
-                    Err(e) => return Err(e),
                 }
             }
 
@@ -1163,15 +1486,13 @@ impl AcpBridge {
         let (session_id, actual_model, next_rpc_id) = match handshake_res {
             Ok(tuple) => tuple,
             Err(err) => {
+                hs_guard.armed = false;
                 drop(stdin);
                 terminate_and_reap_process_group(&mut child, pgid, self.cfg.retire_grace).await;
                 reader_handle.abort();
                 stderr_handle.abort();
-                if let Some(ref prov) = provisioned
-                    && prov.created
-                {
-                    self.unlink_worker_token(&thread);
-                }
+                self.unlink_worker_token(&thread);
+                self.unregister_active_process(&thread);
                 return Err(err);
             }
         };
@@ -1192,8 +1513,15 @@ impl AcpBridge {
 
         {
             let mut by_id = self.sessions.write().unwrap_or_else(|e| e.into_inner());
+            if !by_id.contains_key(&thread) {
+                self.session_order
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(thread.clone());
+            }
             by_id.insert(thread.clone(), entry.clone());
         }
+        hs_guard.armed = false;
         {
             let mut by_role = self
                 .sessions_by_role
@@ -1237,6 +1565,7 @@ impl AcpBridge {
             next_rpc_id,
             next_perm_seq: 0,
             active_prompt_id: None,
+            active_prompt_text: None,
             cancel_requested_for_active: false,
             queued_prompts: VecDeque::new(),
             parked_permission: None,
@@ -1339,12 +1668,17 @@ impl AcpBridge {
         }
 
         let (tx, rx) = oneshot::channel();
-        if entry.cmd_tx.send(SessionCmd::Retire { reply: tx }).is_ok() {
-            let _ = rx.await;
+        let wait_deadline = self.cfg.retire_grace + Duration::from_millis(500);
+        if entry.cmd_tx.send(SessionCmd::Retire { reply: tx }).is_ok()
+            && matches!(
+                tokio::time::timeout(wait_deadline, rx).await,
+                Ok(Ok(Ok(())))
+            )
+        {
             return Ok(());
         }
 
-        // Actor already exited unexpectedly; ensure group is killed and Archived emitted.
+        // Actor already exited or is wedged writing to stdin; force-reap the group independently.
         if let Some(pgid) = entry.pgid {
             kill_process_group_now(pgid);
             let deadline = std::time::Instant::now() + Duration::from_millis(300);
@@ -1352,15 +1686,18 @@ impl AcpBridge {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
+        self.unregister_active_process(thread);
         entry.alive.store(false, Ordering::Release);
-        entry.archived.store(true, Ordering::Release);
-        entry.feed.mark_closed();
-        self.call_wave_observe(
-            entry.wave.clone(),
-            entry.role.clone(),
-            Observation::archived_for(thread.clone(), Some(entry.attempt)),
-        )
-        .await;
+        if !entry.archived.swap(true, Ordering::AcqRel) {
+            entry.feed.mark_closed();
+            self.evict_excess_archived_sessions();
+            self.call_wave_observe(
+                entry.wave.clone(),
+                entry.role.clone(),
+                Observation::archived_for(thread.clone(), Some(entry.attempt)),
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1372,6 +1709,7 @@ impl AcpBridge {
             return Ok(None);
         }
         let Some(entry) = self.get_session(thread) else {
+            self.unlink_worker_token(thread);
             return Ok(Some(Observation::activity_with_bounds(
                 Activity::Errored {
                     error: "ACP worker process lost after daemon restart".into(),
@@ -1385,6 +1723,20 @@ impl AcpBridge {
             return Ok(Some(Observation::archived_for(
                 thread.clone(),
                 Some(entry.attempt),
+            )));
+        }
+        if !entry.alive.load(Ordering::Acquire) {
+            let terminal = match entry.feed.current_activity() {
+                ref act @ (Activity::Refused { .. } | Activity::Errored { .. }) => act.clone(),
+                _ => Activity::Errored {
+                    error: "ACP worker process exited".into(),
+                },
+            };
+            return Ok(Some(Observation::activity_with_bounds(
+                terminal,
+                thread.clone(),
+                None,
+                Vec::new(),
             )));
         }
         Ok(None)

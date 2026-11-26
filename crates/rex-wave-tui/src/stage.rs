@@ -506,22 +506,40 @@ impl AgentInspector {
             .position(|e| matches!(e.kind, AgentEventKind::TurnEnded))
             .map_or(events.len(), |p| idx + p);
         let mut body = String::new();
-        for ev in &events[start..end] {
+        let mut idx_ev = start;
+        while idx_ev < end {
+            let ev = &events[idx_ev];
             match &ev.kind {
                 AgentEventKind::UserMessage { text } => {
                     body.push_str(&format!("## User · #{}\n\n{text}\n\n", ev.seq.0));
+                    idx_ev += 1;
                 }
                 AgentEventKind::AssistantText { text } => {
-                    body.push_str(&format!("## Assistant · #{}\n\n{text}\n\n", ev.seq.0));
+                    let mut merged = text.clone();
+                    let head_seq = ev.seq.0;
+                    idx_ev += 1;
+                    while idx_ev < end {
+                        if let AgentEventKind::AssistantText { text: more } = &events[idx_ev].kind {
+                            merged.push_str(more);
+                            idx_ev += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    body.push_str(&format!("## Assistant · #{head_seq}\n\n{merged}\n\n"));
                 }
                 AgentEventKind::ToolCall { name, summary } => {
                     body.push_str(&format!("- **call** `{name}` {summary}\n"));
+                    idx_ev += 1;
                 }
                 AgentEventKind::ToolResult { name, ok, summary } => {
                     let tag = if *ok { "ok" } else { "error" };
                     body.push_str(&format!("- **{tag}** `{name}` {summary}\n"));
+                    idx_ev += 1;
                 }
-                _ => {}
+                _ => {
+                    idx_ev += 1;
+                }
             }
         }
         Some((
@@ -702,7 +720,19 @@ impl Stage {
                         AgentEventKind::TurnEnded => inspector.page.activity = Activity::Idle,
                         _ => {}
                     }
-                    if !inspector.page.events.iter().any(|e| e.seq == event.seq) {
+                    if let AgentEventKind::AssistantText { text } = &event.kind
+                        && let Some(last) = inspector.page.events.last_mut()
+                        && event.seq > last.seq
+                        && let AgentEventKind::AssistantText { text: prev } = &mut last.kind
+                    {
+                        let old_seq = last.seq;
+                        prev.push_str(text);
+                        last.seq = event.seq;
+                        last.at = event.at;
+                        if inspector.focused == Some(old_seq) {
+                            inspector.focused = Some(event.seq);
+                        }
+                    } else if !inspector.page.events.iter().any(|e| e.seq == event.seq) {
                         inspector.page.events.push(event.clone());
                         inspector.page.events.sort_by_key(|e| e.seq);
                     }

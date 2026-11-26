@@ -66,10 +66,17 @@ pub async fn resolve_acp_workspace(
                 ))
             })?;
             let wt_path = worktrees_dir.join(format!("rex-wave-{wave}-{role}"));
-            if wt_path.is_dir() && is_git_work_tree(&wt_path).await {
+            if is_registered_worktree_for(&project_root, &wt_path).await {
                 let resolved =
                     rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
                 return Ok((resolved, title));
+            }
+            if wt_path.exists() {
+                return Err(HostError::Rejected(format!(
+                    "managed worktree path {} already exists and is not a git worktree of {}",
+                    wt_path.display(),
+                    project_root.display()
+                )));
             }
             let base_ref = match base {
                 BaseBranch::Default => "HEAD",
@@ -121,4 +128,45 @@ async fn is_git_work_tree(dir: &Path) -> bool {
         return false;
     };
     out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+}
+
+async fn git_rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", flag])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(&raw);
+    let joined = if p.is_absolute() { p } else { dir.join(p) };
+    Some(rex_wave_fs::canonicalize_existing_prefix(&joined).unwrap_or(joined))
+}
+
+async fn is_registered_worktree_for(project_root: &Path, wt_path: &Path) -> bool {
+    if !wt_path.is_dir() || !wt_path.join(".git").exists() {
+        return false;
+    }
+    let Some(wt_top) = git_rev_parse_path(wt_path, "--show-toplevel").await else {
+        return false;
+    };
+    let expected_wt = rex_wave_fs::canonicalize_existing_prefix(wt_path)
+        .unwrap_or_else(|_| wt_path.to_path_buf());
+    if wt_top != expected_wt {
+        return false;
+    }
+    let Some(proj_common) = git_rev_parse_path(project_root, "--git-common-dir").await else {
+        return false;
+    };
+    let Some(wt_common) = git_rev_parse_path(wt_path, "--git-common-dir").await else {
+        return false;
+    };
+    proj_common == wt_common
 }
