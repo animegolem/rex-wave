@@ -94,6 +94,8 @@ pub enum Action {
     Edit(EditOp),
     Promote,
     OpenProjectBoard,
+    OpenSettings,
+    SelectSetting(usize),
     CycleGraphics,
     ToggleHelp,
     SidebarWidth(i16),
@@ -127,6 +129,9 @@ pub enum Target {
     },
     Message {
         seq: u64,
+    },
+    SettingRow {
+        index: usize,
     },
     PromoteButton,
     Composer,
@@ -221,6 +226,9 @@ pub static KEYMAP: &[Binding] = &[
     bind(Char('q'), N, NAV, "q", "Global", "quit", |_| Action::Quit),
     bind(Char('?'), N, NAV, "?", "Global", "toggle this help", |_| {
         Action::ToggleHelp
+    }),
+    bind(Char(','), N, NAV, ",", "Global", "open settings", |_| {
+        Action::OpenSettings
     }),
     bind(
         Tab,
@@ -875,6 +883,9 @@ pub fn mouse_action(ev: MouseEvent, hits: &HitMap) -> Option<Action> {
         (MouseEventKind::Down(MouseButton::Left), Some(Target::Message { seq })) => {
             Some(Action::SelectMessage(*seq))
         }
+        (MouseEventKind::Down(MouseButton::Left), Some(Target::SettingRow { index })) => {
+            Some(Action::SelectSetting(*index))
+        }
         (MouseEventKind::Down(MouseButton::Left), Some(Target::PromoteButton)) => {
             Some(Action::Promote)
         }
@@ -1046,6 +1057,14 @@ mod tests {
             Some(Action::ToggleShowArchived)
         );
         assert_eq!(act(Char('A'), S, Pane::Overlay), None);
+    }
+
+    #[test]
+    fn settings_hotkey_is_bound_in_nav_and_not_overlay() {
+        assert_eq!(act(Char(','), N, Pane::Sidebar), Some(Action::OpenSettings));
+        assert_eq!(act(Char(','), N, Pane::Stage), Some(Action::OpenSettings));
+        assert_eq!(act(Char(','), N, Pane::Overlay), None);
+        assert_eq!(act(Char(','), N, Pane::Composer), Some(Action::Input(',')));
     }
 
     #[test]

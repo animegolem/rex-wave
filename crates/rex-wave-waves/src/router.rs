@@ -2,11 +2,13 @@
 //! (`Bb`, `T3`, `Acp`, `Claude`, `Codex`) over `Arc<dyn AgentHost>`.
 
 use crate::{AgentHost, BoxFut, HostError, SpawnRequest};
+use rex_wave_api::config::{HarnessProvider, RexConfig};
 use rex_wave_api::room::Body;
-use rex_wave_api::wave::{InteractionResolution, Observation, SteerDeliveryMode};
+use rex_wave_api::wave::{AgentSpec, InteractionResolution, Observation, SteerDeliveryMode};
 use rex_wave_api::{HostInteractionId, HostThreadId, ProviderId, RunnerKind};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutedProvider {
@@ -14,14 +16,60 @@ pub struct RoutedProvider {
     pub provider: ProviderId,
 }
 
-/// Resolves which runner owns `provider` and strips any explicit `<runner>:` prefix.
-///
-/// Bare `antigravity` routes to `RunnerKind::T3` regardless of `default_runner`,
-/// and `bb:antigravity` is rejected outright. Explicit `acp:antigravity` routes
-/// to `RunnerKind::Acp` for native ACP launches.
+fn normalize_provider_for_target(raw: &str, target: RunnerKind) -> Result<ProviderId, HostError> {
+    let norm = raw.trim();
+    let lower = norm.to_ascii_lowercase();
+    let mapped = match target {
+        RunnerKind::T3 => match lower.as_str() {
+            "agy" | "antigravity" => "antigravity",
+            "claude" | "claude-code" => "claudeAgent",
+            "open-code" => "opencode",
+            _ => norm,
+        },
+        RunnerKind::Bb => match lower.as_str() {
+            "claude" | "claudeagent" => "claude-code",
+            _ => norm,
+        },
+        RunnerKind::Acp | RunnerKind::Claude | RunnerKind::Codex => match lower.as_str() {
+            "agy" => "antigravity",
+            _ => norm,
+        },
+    };
+    ProviderId::parse(mapped).map_err(|e| HostError::Rejected(e.to_string()))
+}
+
+/// Applies per-provider model, reasoning, and billing-account defaults from `cfg`
+/// when a `SpawnRequest`'s `AgentSpec` left them unset.
+pub fn apply_harness_defaults(agent: &mut AgentSpec, cfg: &RexConfig) {
+    let Some(prof) = cfg.harnesses.for_provider_id(&agent.provider) else {
+        return;
+    };
+    if agent.model.is_none() {
+        agent.model = prof.model.clone();
+    }
+    if agent.reasoning.is_none() {
+        agent.reasoning = prof.reasoning.clone();
+    }
+    if agent.account.is_none() {
+        agent.account = prof.account.clone();
+    }
+}
+
+/// Resolves which runner owns `provider` without operator config overrides.
 pub fn route_provider(
     provider: &ProviderId,
     default_runner: RunnerKind,
+) -> Result<RoutedProvider, HostError> {
+    route_provider_with_config(provider, default_runner, None)
+}
+
+/// Resolves which runner owns `provider`, honoring explicit `<runner>:` prefixes first,
+/// then per-provider `[runners]` overrides, then `antigravity` -> `T3`, then
+/// `runners.default_runner`, and finally `default_runner`.
+pub fn route_provider_with_config(
+    provider: &ProviderId,
+    default_runner: RunnerKind,
+    cfg: Option<&RexConfig>,
 ) -> Result<RoutedProvider, HostError> {
     let raw = provider.as_str().trim();
     if let Some((target, clean)) = RunnerKind::strip_provider_prefix(raw) {
@@ -31,7 +79,9 @@ pub fn route_provider(
                 target.as_str()
             )));
         }
-        if target == RunnerKind::Bb && clean.eq_ignore_ascii_case("antigravity") {
+        if target == RunnerKind::Bb
+            && (clean.eq_ignore_ascii_case("antigravity") || clean.eq_ignore_ascii_case("agy"))
+        {
             return Err(HostError::Rejected(
                 "provider 'antigravity' must route through T3 Code or ACP, never BB".into(),
             ));
@@ -43,17 +93,39 @@ pub fn route_provider(
         });
     }
 
-    if raw.eq_ignore_ascii_case("antigravity") {
-        let parsed = ProviderId::parse(raw).map_err(|e| HostError::Rejected(e.to_string()))?;
+    if let Some(c) = cfg
+        && let Some(slot) = HarnessProvider::parse_slot(raw)
+        && let Some(route) = c.runners.override_for(slot)
+    {
+        let target = route
+            .resolve_for_provider(raw)
+            .map_err(HostError::Rejected)?;
+        return Ok(RoutedProvider {
+            target,
+            provider: normalize_provider_for_target(raw, target)?,
+        });
+    }
+
+    if raw.eq_ignore_ascii_case("antigravity") || raw.eq_ignore_ascii_case("agy") {
         return Ok(RoutedProvider {
             target: RunnerKind::T3,
-            provider: parsed,
+            provider: normalize_provider_for_target(raw, RunnerKind::T3)?,
+        });
+    }
+
+    if let Some(route) = cfg.and_then(|c| c.runners.default_runner) {
+        let target = route
+            .resolve_for_provider(raw)
+            .map_err(HostError::Rejected)?;
+        return Ok(RoutedProvider {
+            target,
+            provider: normalize_provider_for_target(raw, target)?,
         });
     }
 
     Ok(RoutedProvider {
         target: default_runner,
-        provider: provider.clone(),
+        provider: normalize_provider_for_target(raw, default_runner)?,
     })
 }
 
@@ -66,6 +138,7 @@ pub fn route_thread(thread: &HostThreadId) -> RunnerKind {
 pub struct HostRouter {
     hosts: BTreeMap<RunnerKind, Arc<dyn AgentHost>>,
     default_runner: RunnerKind,
+    config_rx: Option<watch::Receiver<RexConfig>>,
 }
 
 impl HostRouter {
@@ -73,6 +146,7 @@ impl HostRouter {
         HostRouter {
             hosts: BTreeMap::new(),
             default_runner,
+            config_rx: None,
         }
     }
 
@@ -83,7 +157,13 @@ impl HostRouter {
         HostRouter {
             hosts: entries.into_iter().collect(),
             default_runner,
+            config_rx: None,
         }
+    }
+
+    pub fn with_config_watch(mut self, rx: watch::Receiver<RexConfig>) -> Self {
+        self.config_rx = Some(rx);
+        self
     }
 
     pub fn with_host<H: AgentHost>(mut self, kind: RunnerKind, host: H) -> Self {
@@ -109,7 +189,12 @@ impl HostRouter {
 
 impl AgentHost for HostRouter {
     fn spawn(&self, mut req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
-        let routed = route_provider(&req.agent.provider, self.default_runner);
+        let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+        if let Some(ref c) = cfg {
+            apply_harness_defaults(&mut req.agent, c);
+        }
+        let routed =
+            route_provider_with_config(&req.agent.provider, self.default_runner, cfg.as_ref());
         Box::pin(async move {
             let routed = routed?;
             let is_bare_antigravity = routed.target == RunnerKind::T3
@@ -339,5 +424,150 @@ mod tests {
         assert!(events.contains(&format!("retire:acp:{t_acp}")));
         assert!(events.contains(&format!("retire:claude:{t_cl}")));
         assert!(events.contains(&format!("retire:codex:{t_cx}")));
+    }
+
+    #[tokio::test]
+    async fn host_router_applies_live_config_routes_and_harness_defaults() {
+        use rex_wave_api::ModelId;
+        use rex_wave_api::config::RunnerRoute;
+
+        struct CaptureHost {
+            kind: RunnerKind,
+            captured: Arc<Mutex<Vec<(RunnerKind, AgentSpec)>>>,
+        }
+
+        impl AgentHost for CaptureHost {
+            fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
+                let prefix = self.kind.thread_prefix().unwrap_or("th_bb_");
+                let tid =
+                    HostThreadId::parse(format!("{prefix}{}:{}", req.wave, req.role)).unwrap();
+                self.captured.lock().unwrap().push((self.kind, req.agent));
+                Box::pin(async move { Ok(tid) })
+            }
+
+            fn tell(
+                &self,
+                _thread: &HostThreadId,
+                _body: &Body,
+                _mode: SteerDeliveryMode,
+            ) -> BoxFut<'_, Result<(), HostError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn resolve(
+                &self,
+                _thread: &HostThreadId,
+                _interaction: &HostInteractionId,
+                _resolution: &InteractionResolution,
+            ) -> BoxFut<'_, Result<(), HostError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn retire(&self, _thread: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (cfg_tx, cfg_rx) = watch::channel(RexConfig::default());
+        let mut router = HostRouter::new(RunnerKind::Bb).with_config_watch(cfg_rx);
+        for kind in [
+            RunnerKind::Bb,
+            RunnerKind::T3,
+            RunnerKind::Acp,
+            RunnerKind::Claude,
+            RunnerKind::Codex,
+        ] {
+            router = router.with_host(
+                kind,
+                CaptureHost {
+                    kind,
+                    captured: captured.clone(),
+                },
+            );
+        }
+
+        let wave = WaveSlug::parse("w-cfg").unwrap();
+        let proj = ProjectId::parse("/workspace/demo").unwrap();
+        let mk = |role: &str, prov: &str, model: Option<&str>| SpawnRequest {
+            wave: wave.clone(),
+            role: RoleName::parse(role).unwrap(),
+            attempt: 1,
+            project: proj.clone(),
+            agent: AgentSpec {
+                provider: ProviderId::parse(prov).unwrap(),
+                model: model.map(|m| ModelId::parse(m).unwrap()),
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Full,
+                workspace: Workspace::ProjectDefault,
+            },
+            room: wave_room(&wave, &proj),
+            prompt: Body::parse("go").unwrap(),
+            title: "[w-cfg] @r".into(),
+            run_stamp: "w-cfg:r:a1".into(),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        };
+
+        // Before config updates, codex follows daemon default (Bb) with no harness defaults.
+        let t0 = router.spawn(mk("r0", "codex", None)).await.unwrap();
+        assert_eq!(t0.runner_kind(), RunnerKind::Bb);
+
+        // Live-update config via watch channel without restarting the router.
+        let mut next_cfg = RexConfig::default();
+        next_cfg.runners.default_runner = Some(RunnerRoute::T3);
+        next_cfg.runners.claude = Some(RunnerRoute::Native);
+        next_cfg.harnesses.claude.model = Some(ModelId::parse("claude-opus-5-5").unwrap());
+        next_cfg.harnesses.claude.reasoning = Some("max".into());
+        next_cfg.harnesses.claude.account = Some("team-a".into());
+        next_cfg.harnesses.codex.model = Some(ModelId::parse("gpt-6.2-codex").unwrap());
+        next_cfg.harnesses.codex.reasoning = Some("xhigh".into());
+        next_cfg.harnesses.codex.account = Some("team-b".into());
+        cfg_tx.send_replace(next_cfg);
+
+        // Per-provider route override + harness defaults fill unset model/reasoning/account.
+        let t1 = router.spawn(mk("r1", "claude", None)).await.unwrap();
+        assert_eq!(t1.runner_kind(), RunnerKind::Claude);
+
+        // Global default_runner routes codex -> T3 while keeping explicit model override.
+        let t2 = router
+            .spawn(mk("r2", "codex", Some("explicit-model")))
+            .await
+            .unwrap();
+        assert_eq!(t2.runner_kind(), RunnerKind::T3);
+
+        // Explicit runner prefix still overrides config.
+        let t3 = router.spawn(mk("r3", "bb:codex", None)).await.unwrap();
+        assert_eq!(t3.runner_kind(), RunnerKind::Bb);
+
+        let log = captured.lock().unwrap();
+        assert_eq!(log.len(), 4);
+        assert_eq!(log[0].0, RunnerKind::Bb);
+        assert_eq!(log[0].1.model, None);
+
+        assert_eq!(log[1].0, RunnerKind::Claude);
+        assert_eq!(
+            log[1].1.model.as_ref().map(ModelId::as_str),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(log[1].1.reasoning.as_deref(), Some("max"));
+        assert_eq!(log[1].1.account.as_deref(), Some("team-a"));
+
+        assert_eq!(log[2].0, RunnerKind::T3);
+        assert_eq!(
+            log[2].1.model.as_ref().map(ModelId::as_str),
+            Some("explicit-model")
+        );
+        assert_eq!(log[2].1.reasoning.as_deref(), Some("xhigh"));
+        assert_eq!(log[2].1.account.as_deref(), Some("team-b"));
+
+        assert_eq!(log[3].0, RunnerKind::Bb);
+        assert_eq!(
+            log[3].1.model.as_ref().map(ModelId::as_str),
+            Some("gpt-6.2-codex")
+        );
     }
 }

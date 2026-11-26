@@ -38,6 +38,12 @@ pub enum NodeKey {
     ChannelsHeader,
     DmsHeader,
     Dm(RoomId),
+    FooterDivider,
+    Settings,
+}
+
+fn is_divider(key: &NodeKey) -> bool {
+    matches!(key, NodeKey::Divider | NodeKey::FooterDivider)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,7 +214,7 @@ impl Sidebar {
     pub fn move_cursor(&mut self, delta: i32) {
         let focusable: Vec<NodeKey> = flatten(&self.roots, &self.folds)
             .into_iter()
-            .filter(|r| r.key != NodeKey::Divider)
+            .filter(|r| !is_divider(&r.key))
             .map(|r| r.key)
             .collect();
         if focusable.is_empty() {
@@ -225,7 +231,7 @@ impl Sidebar {
     pub fn move_top(&mut self) {
         if let Some(first) = flatten(&self.roots, &self.folds)
             .into_iter()
-            .find(|r| r.key != NodeKey::Divider)
+            .find(|r| !is_divider(&r.key))
         {
             self.cursor = first.key;
             self.scroll = 0;
@@ -235,7 +241,7 @@ impl Sidebar {
     pub fn move_bottom(&mut self) {
         if let Some(last) = flatten(&self.roots, &self.folds)
             .into_iter()
-            .rfind(|r| r.key != NodeKey::Divider)
+            .rfind(|r| !is_divider(&r.key))
         {
             self.cursor = last.key;
         }
@@ -342,7 +348,7 @@ impl Sidebar {
             let y = inner.y + offset as u16;
             let row_rect = Rect::new(inner.x, y, inner.width, 1);
 
-            if row.key == NodeKey::Divider {
+            if is_divider(&row.key) {
                 let rule = "─".repeat(inner.width as usize);
                 Paragraph::new(Line::from(Span::styled(
                     rule,
@@ -430,7 +436,12 @@ impl Sidebar {
                 } else {
                     Modifier::DIM
                 }
-            } else if is_cursor || is_section || matches!(row.key, NodeKey::Inbox | NodeKey::Kanban)
+            } else if is_cursor
+                || is_section
+                || matches!(
+                    row.key,
+                    NodeKey::Inbox | NodeKey::Kanban | NodeKey::Settings
+                )
             {
                 Modifier::BOLD
             } else {
@@ -738,6 +749,26 @@ pub fn build_with_ctx(
         children: dm_children,
     };
 
+    let footer_divider = SidebarNode {
+        key: NodeKey::FooterDivider,
+        label: String::new(),
+        badge: None,
+        glyph: None,
+        tag: None,
+        archived: false,
+        children: Vec::new(),
+    };
+
+    let settings = SidebarNode {
+        key: NodeKey::Settings,
+        label: "⚙ Settings".to_owned(),
+        badge: None,
+        glyph: None,
+        tag: None,
+        archived: false,
+        children: Vec::new(),
+    };
+
     vec![
         inbox,
         kanban,
@@ -745,6 +776,8 @@ pub fn build_with_ctx(
         projects_header,
         channels_header,
         dms_header,
+        footer_divider,
+        settings,
     ]
 }
 

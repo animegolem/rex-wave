@@ -81,7 +81,8 @@ async fn all_cli_verbs_round_trip_over_real_unix_socket() {
         board: Arc::new(DemoForwardService(demo.clone(), std::marker::PhantomData)),
         inbox: Arc::new(DemoForwardService(demo.clone(), std::marker::PhantomData)),
         mail: Arc::new(DemoForwardService(demo.clone(), std::marker::PhantomData)),
-        presence: Arc::new(DemoForwardService(demo, std::marker::PhantomData)),
+        presence: Arc::new(DemoForwardService(demo.clone(), std::marker::PhantomData)),
+        config: Arc::new(DemoForwardService(demo, std::marker::PhantomData)),
         read: Arc::new(ReadSide {
             journal,
             hub,

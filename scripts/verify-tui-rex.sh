@@ -1053,6 +1053,7 @@ wait "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
 wait_screen_contains "○ reconnecting" "Top-chrome badge transitions live to reconnecting on daemon drop"
 rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" shift+g
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" k
 wait_screen_contains "Stage Error" "Stage enters error state when retargeted during daemon outage"
 wait_screen_contains "reconnecting to daemon" "Stage error surfaces reconnecting transport cause"
 record_step "daemon-reconnecting"
@@ -1062,6 +1063,30 @@ wait_screen_contains "● connected" "Top-chrome badge transitions back to conne
 wait_screen_contains "DM batch #1 from @sam" "StageLoader automatically recovers Direct Message stage with zero keypresses"
 wait_screen_contains "All 32 alpha shards reported nominal p99." "Wrapped second line in recovered Direct Message stage"
 record_step "daemon-reconnected"
+
+printf '==> Journey 7b: Interactive Settings stage [,] + cycle runners.default_runner + config.toml sync\n'
+rex send -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" ','
+wait_screen_contains "Settings · Operator Configuration" "Settings stage opened via comma hotkey"
+wait_screen_contains "runners.default_runner" "Settings stage displays runners.default_runner"
+record_step "settings-initial"
+
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space
+sleep 0.15
+rex send-key -s "$REX_VERIFY_SESSION" -b "$REX_VERIFY_BLOCK" space
+CFG_DEADLINE=$(( $(now_ms) + 5000 ))
+CFG_DEFAULT=""
+while (( $(now_ms) < CFG_DEADLINE )); do
+	CFG_DEFAULT="$("$REX_WAVE_BIN" --socket "$SOCK" --json config show | jq -r '.value.config.runners.default_runner // empty')"
+	if [[ "$CFG_DEFAULT" == "t3" ]]; then
+		break
+	fi
+	sleep 0.08
+done
+[[ "$CFG_DEFAULT" == "t3" ]] || fail "expected runners.default_runner=t3 after cycling twice in Settings, got '$CFG_DEFAULT'"
+"$REX_WAVE_BIN" --socket "$SOCK" --json config show > "$EVIDENCE_DIR/config-show.json"
+[[ -s "$CONFIG_DIR/rex-wave/config.toml" ]] || fail "expected $CONFIG_DIR/rex-wave/config.toml to be written by Settings update"
+assert_contains "$(cat "$CONFIG_DIR/rex-wave/config.toml")" 'default_runner = "t3"' "config.toml synced with cycled default_runner"
+record_step "settings-cycled"
 
 printf '==> Journey 8: Clean TUI quit [q] and OSC 7501 clear\n'
 

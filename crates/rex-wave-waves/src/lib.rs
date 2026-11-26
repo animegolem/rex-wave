@@ -4,7 +4,10 @@ pub mod router;
 pub mod workspace;
 
 pub use rex_wave_runtime::BoxFut;
-pub use router::{HostRouter, RoutedProvider, route_provider, route_thread};
+pub use router::{
+    HostRouter, RoutedProvider, apply_harness_defaults, route_provider, route_provider_with_config,
+    route_thread,
+};
 pub use workspace::{
     BbProjectLocation, ProjectWorkspaceLocation, default_bb_data_dir, expand_tilde,
     looks_like_workspace_path, lookup_bb_project_location, normalize_workspace_path_key,

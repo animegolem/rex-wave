@@ -840,6 +840,12 @@ impl T3Bridge {
         &self.cfg
     }
 
+    fn routes_to_t3(&self, provider: &ProviderId) -> bool {
+        let cfg = self.cfg.config_rx.as_ref().map(|rx| rx.borrow().clone());
+        rex_wave_waves::route_provider_with_config(provider, self.cfg.default_runner, cfg.as_ref())
+            .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3)
+    }
+
     pub fn rpc(&self) -> &T3RpcClient {
         &self.rpc
     }
@@ -1311,9 +1317,7 @@ impl T3Bridge {
                     if r != &role {
                         continue;
                     }
-                    let routes_to_t3 =
-                        rex_wave_waves::route_provider(&spec.provider, self.cfg.default_runner)
-                            .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3);
+                    let routes_to_t3 = self.routes_to_t3(&spec.provider);
                     match phase {
                         WorkerPhase::Live { thread: t, .. } if t == thread => {
                             matched_live = true;
@@ -1426,12 +1430,7 @@ impl T3Bridge {
                         WorkerPhase::Live { thread: t, .. }
                         | WorkerPhase::Retiring { thread: t, .. } => t == thread,
                         WorkerPhase::Requested { attempt } => {
-                            *attempt == expected_attempt
-                                && rex_wave_waves::route_provider(
-                                    &spec.provider,
-                                    self.cfg.default_runner,
-                                )
-                                .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3)
+                            *attempt == expected_attempt && self.routes_to_t3(&spec.provider)
                         }
                         WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
                     }
@@ -3638,6 +3637,12 @@ impl T3Bridge {
         explicit: Option<&ModelId>,
     ) -> Result<String, HostError> {
         if let Some(m) = explicit {
+            return Ok(m.as_str().to_owned());
+        }
+        if let Some(ref rx) = self.cfg.config_rx
+            && let Some(slot) = rex_wave_api::config::HarnessProvider::parse_slot(provider_instance)
+            && let Some(ref m) = rx.borrow().harnesses.profile(slot).model
+        {
             return Ok(m.as_str().to_owned());
         }
         if let Some(def) = self.cfg.default_models.get(provider_instance) {

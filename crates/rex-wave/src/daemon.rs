@@ -7,7 +7,9 @@
 //! `serve_listener_with_hooks` (`StateDirAuthenticator` + RAII `PresenceUnbind`)
 //! with graceful `ctrl_c` shutdown.
 
+use crate::config_file::{TomlConfigHook, daemon_config_file_path, reconcile_startup_config};
 use crate::http::{HttpConfig, bind_http, serve_http_listener};
+use rex_wave_api::config::RunnerRoute;
 use rex_wave_api::presence::{BindingStatus, PresenceList, PresenceUnbind, TransportEndpoint};
 use rex_wave_api::wave::{Observation, WaveEvent};
 use rex_wave_api::*;
@@ -17,8 +19,8 @@ use rex_wave_mailbridge::{BellCourier, MailBridge, Presence, SandboxRoot};
 use rex_wave_notify::{Herald, HeraldHandle, Inbox};
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
-    AgentFeed, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection,
-    ThreadIdResolver, spawn_reactor,
+    AgentFeed, ConfigService, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router,
+    SidebarProjection, ThreadIdResolver, spawn_reactor,
 };
 use rex_wave_store::Journal;
 use rex_wave_t3::{
@@ -52,6 +54,9 @@ pub struct DaemonArgs {
     /// Journal path (default: `<socket_dir>/journal.sqlite3`).
     #[arg(long)]
     pub journal: Option<PathBuf>,
+    /// Operator configuration file path (default: `$XDG_CONFIG_HOME/rex-wave/config.toml`, `<state_dir>/config.toml` under `--socket`, or `~/.config/rex-wave/config.toml`; pass `--config ""` to disable file sync).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Non-production mail sandbox root (must contain `.rex-wave-sandbox`).
     #[arg(long)]
     pub mail_sandbox: PathBuf,
@@ -580,6 +585,24 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let journal = Journal::open(&journal_path).map_err(|e| format!("open journal: {e}"))?;
     let hub = Hub::new(4096);
+    let config_path = daemon_config_file_path(
+        args.config.as_deref(),
+        socket_override.is_some(),
+        &state_dir,
+    );
+    let config_hook = TomlConfigHook::new(
+        config_path.clone(),
+        state_dir.clone(),
+        RunnerRoute::from_runner_kind(default_target),
+        matches!(runner_mode, RunnerMode::Bb | RunnerMode::Both),
+        matches!(runner_mode, RunnerMode::T3 | RunnerMode::Both),
+    );
+    let config_svc =
+        ConfigService::with_hook(journal.clone(), hub.clone(), Some(config_hook.clone()))
+            .map_err(|e| format!("init config service: {e}"))?;
+    let reconciled_cfg =
+        reconcile_startup_config(&journal, &config_svc, config_path.as_deref(), &state_dir).await?;
+
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let mail_writer = journal
         .claim(StreamId::Mail)
@@ -610,12 +633,13 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
                     })
                 }),
             )
-            .with_default_runner(default_target),
+            .with_default_runner(default_target)
+            .with_config_watch(config_svc.subscribe()),
         ),
         RunnerMode::T3 => None,
     };
 
-    let t3_bridge = t3_cfg.map(T3Bridge::new);
+    let t3_bridge = t3_cfg.map(|cfg| T3Bridge::new(cfg.with_config_watch(config_svc.subscribe())));
 
     let mut feed_entries: Vec<(RunnerKind, Arc<dyn AgentFeed>)> = Vec::new();
     if let Some(ref t) = t3_bridge {
@@ -629,6 +653,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_thread_resolver(journal_thread_resolver(journal.clone())),
     );
 
+    let presence_svc = presence.registry(journal.clone(), hub.clone());
+    config_hook.bind_presence(presence_svc.clone());
+
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
         wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
@@ -640,7 +667,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             mail_writer,
             hub.clone(),
         )),
-        presence: presence.registry(journal.clone(), hub.clone()),
+        presence: presence_svc,
+        config: config_svc.clone(),
         read: Arc::new(ReadSide {
             journal,
             hub,
@@ -649,11 +677,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         }),
     });
 
-    let default_target = match runner_mode {
-        RunnerMode::T3 => RunnerKind::T3,
-        RunnerMode::Bb | RunnerMode::Both => RunnerKind::Bb,
-    };
     let host_router = HostRouter::new(default_target)
+        .with_config_watch(config_svc.subscribe())
         .with_optional_host(
             RunnerKind::Bb,
             bb_bridge.as_ref().map(|b| BbHost(b.clone())),
@@ -668,7 +693,12 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         WaveConductor::new(host_router),
         system(SystemPart::WaveConductor),
     );
-    let herald = Herald::with_grace(Duration::from_millis(args.herald_grace_ms))
+    let effective_herald_grace_ms = if args.herald_grace_ms == rex_wave_notify::RECONNECT_GRACE_MS {
+        reconciled_cfg.mail.reconnect_grace_ms
+    } else {
+        args.herald_grace_ms
+    };
+    let herald = Herald::with_grace(Duration::from_millis(effective_herald_grace_ms))
         .with_operator_surface_seat(presence.house().operator_seat.clone());
     let herald_handle = herald.handle();
     let herald_client = system(SystemPart::Herald);
@@ -806,6 +836,7 @@ mod tests {
         let journal = state_dir.join("journal.sqlite3");
         let bad_args = DaemonArgs {
             journal: Some(journal.clone()),
+            config: None,
             mail_sandbox: unmarked_sb,
             bb_url: "ws://127.0.0.1:1/disabled".into(),
             bb_token: String::new(),
@@ -833,6 +864,7 @@ mod tests {
         std::fs::write(valid_sb.join(".rex-wave-sandbox"), b"ok\n").unwrap();
         let second_args = DaemonArgs {
             journal: Some(journal),
+            config: None,
             mail_sandbox: valid_sb,
             bb_url: "ws://127.0.0.1:1/disabled".into(),
             bb_token: String::new(),
@@ -882,6 +914,7 @@ mod tests {
         let journal = state_dir.join("journal.sqlite3");
         let args = DaemonArgs {
             journal: Some(journal.clone()),
+            config: None,
             mail_sandbox: sandbox_dir,
             bb_url: "ws://127.0.0.1:1/disabled".into(),
             bb_token: String::new(),

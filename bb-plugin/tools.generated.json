@@ -277,7 +277,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -573,7 +574,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         },
@@ -937,7 +939,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -1219,7 +1222,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -1487,7 +1491,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -1783,7 +1788,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -2091,7 +2097,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -2382,7 +2389,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         },
@@ -2716,7 +2724,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         },
@@ -3053,7 +3062,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         },
@@ -4218,7 +4228,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -4452,7 +4463,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -4711,7 +4723,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         },
@@ -5817,6 +5830,19 @@
                 "stream"
               ],
               "type": "object"
+            },
+            {
+              "description": "Operator configuration ledger synced with `~/.config/rex-wave/config.toml`.",
+              "properties": {
+                "stream": {
+                  "const": "config",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -5829,7 +5855,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }
@@ -6469,6 +6496,19 @@
                 "role"
               ],
               "type": "object"
+            },
+            {
+              "description": "Operator configuration and live runner/courier health (`StreamId::Config`).",
+              "properties": {
+                "target": {
+                  "const": "settings",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -6567,6 +6607,19 @@
                 "stream"
               ],
               "type": "object"
+            },
+            {
+              "description": "Operator configuration ledger synced with `~/.config/rex-wave/config.toml`.",
+              "properties": {
+                "stream": {
+                  "const": "config",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "stream"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -6579,7 +6632,8 @@
             "t3_bridge",
             "mail_bridge",
             "wake_bell",
-            "presence_monitor"
+            "presence_monitor",
+            "config_sync"
           ],
           "type": "string"
         }

@@ -3783,6 +3783,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         inbox: router.inbox.clone(),
         mail: router.mail.clone(),
         presence: router.presence.clone(),
+        config: router.config.clone(),
         read: router.read.clone(),
     });
     let race_worker = LocalClient::new(race_router.clone(), worker_p.clone());
@@ -3878,6 +3879,7 @@ async fn wait_cursor_redacts_private_streams_and_worker_parked_tracks_resolved_s
         inbox: router.inbox.clone(),
         mail: router.mail.clone(),
         presence: router.presence.clone(),
+        config: router.config.clone(),
         read: router.read.clone(),
     });
     let proj_race_worker = LocalClient::new(proj_race_router, worker_p);

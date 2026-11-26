@@ -4315,6 +4315,7 @@ enum BbIdentityResolution {
 pub struct BbBridge {
     cfg: BridgeConfig,
     default_runner: std::sync::Mutex<RunnerKind>,
+    config_rx: std::sync::Mutex<Option<watch::Receiver<rex_wave_api::config::RexConfig>>>,
     data_dir: Option<PathBuf>,
     owner: mpsc::UnboundedSender<OwnerMsg>,
     signal_tx: mpsc::UnboundedSender<InboundSignal>,
@@ -4353,11 +4354,31 @@ impl BbBridge {
         self
     }
 
+    pub fn with_config_watch(
+        self: Arc<Self>,
+        rx: watch::Receiver<rex_wave_api::config::RexConfig>,
+    ) -> Arc<Self> {
+        *self.config_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+        self
+    }
+
     fn default_runner(&self) -> RunnerKind {
         *self
             .default_runner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn routes_to_bb(&self, provider: &ProviderId) -> bool {
+        let default_runner = self.default_runner();
+        let cfg = self
+            .config_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|rx| rx.borrow().clone());
+        rex_wave_waves::route_provider_with_config(provider, default_runner, cfg.as_ref())
+            .is_ok_and(|routed| routed.target == RunnerKind::Bb)
     }
 
     fn acquire_terminal_signal_guard(
@@ -4417,6 +4438,7 @@ impl BbBridge {
         let bridge = Arc::new(BbBridge {
             cfg,
             default_runner: std::sync::Mutex::new(RunnerKind::Bb),
+            config_rx: std::sync::Mutex::new(None),
             data_dir,
             owner: BridgeOwner::spawn(),
             signal_tx,
@@ -4942,7 +4964,6 @@ impl BbBridge {
                     .await
                 {
                     Ok(WireReply::WaveView(snap)) => {
-                        let default_runner = self.default_runner();
                         let stamp_tag = format!(":attempt-{attempt}:");
                         let stamp_matches = snap
                             .worker_meta
@@ -4954,8 +4975,7 @@ impl BbBridge {
                         if is_bb_thread_id(thread)
                             && let Some((_, spec, phase)) =
                                 snap.workers.iter().find(|(r, _, _)| r == role)
-                            && rex_wave_waves::route_provider(&spec.provider, default_runner)
-                                .is_ok_and(|routed| routed.target == RunnerKind::Bb)
+                            && self.routes_to_bb(&spec.provider)
                         {
                             match phase {
                                 WorkerPhase::Requested { attempt: cur_a } if *cur_a == attempt => {
@@ -5080,7 +5100,6 @@ impl BbBridge {
             .await
         {
             Ok(WireReply::WaveView(snap)) => {
-                let default_runner = self.default_runner();
                 let stamp_tag = format!(":attempt-{}:", m.attempt);
                 let stamp_matches = snap
                     .worker_meta
@@ -5094,9 +5113,7 @@ impl BbBridge {
                     if r != &role {
                         continue;
                     }
-                    let routes_to_bb =
-                        rex_wave_waves::route_provider(&spec.provider, default_runner)
-                            .is_ok_and(|routed| routed.target == RunnerKind::Bb);
+                    let routes_to_bb = self.routes_to_bb(&spec.provider);
                     match phase {
                         WorkerPhase::Live { thread: t, .. } if t == thread => {
                             matched_live = true;
@@ -8707,16 +8724,13 @@ impl BbBridge {
                 Ok(_) | Err(ApiError::NotFound { .. }) => return Some(false),
                 Err(_) => return None,
             };
-            let default_runner = self.default_runner();
             return Some(snap.workers.iter().any(|(r, spec, phase)| {
                 r == role
                     && match phase {
                         WorkerPhase::Live { thread: t, .. }
                         | WorkerPhase::Retiring { thread: t, .. } => t == thread,
                         WorkerPhase::Requested { attempt } => {
-                            *attempt == expected_attempt
-                                && rex_wave_waves::route_provider(&spec.provider, default_runner)
-                                    .is_ok_and(|routed| routed.target == RunnerKind::Bb)
+                            *attempt == expected_attempt && self.routes_to_bb(&spec.provider)
                         }
                         WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
                     }
