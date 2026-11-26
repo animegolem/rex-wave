@@ -172,7 +172,7 @@ impl WorkerPhase {
                     thread: live_thread,
                     activity: cur_activity,
                 },
-                Observation::TurnsSuppressed { thread, keys },
+                Observation::TurnsSuppressed { thread, keys, .. },
             ) if live_thread == thread => {
                 if let Some(outcome) = failure_activity_from_suppression_keys(keys) {
                     let next_activity = match (cur_activity, outcome) {
@@ -197,7 +197,7 @@ impl WorkerPhase {
                     errored,
                     refused,
                 },
-                Observation::TurnsSuppressed { thread, keys },
+                Observation::TurnsSuppressed { thread, keys, .. },
             ) if live_thread == thread => match failure_activity_from_suppression_keys(keys) {
                 Some(Activity::Refused { reason }) => WorkerPhase::Retiring {
                     thread: live_thread.clone(),
@@ -245,11 +245,26 @@ impl WorkerPhase {
                 && (obs_thread.is_none() || obs_attempt.is_some()) =>
             {
                 WorkerPhase::Retired {
-                    thread: None,
+                    thread: obs_thread.clone(),
                     errored: None,
                     refused: None,
                 }
             }
+            (
+                WorkerPhase::Retired {
+                    thread: None,
+                    errored,
+                    refused,
+                },
+                Observation::Archived {
+                    thread: Some(obs_thread),
+                    attempt: Some(_),
+                },
+            ) => WorkerPhase::Retired {
+                thread: Some(obs_thread.clone()),
+                errored: errored.clone(),
+                refused: refused.clone(),
+            },
             (phase, _) => phase.clone(),
         }
     }
@@ -364,40 +379,150 @@ pub fn failure_activity_from_suppression_keys(keys: &[String]) -> Option<Activit
 
 /// Shared per-worker unsettled terminal failure/refusal tracker used by both
 /// `Waves` and `SidebarProjection` so live, retiring, and archived phases stay
-/// identical even when an intermediate `Working` turn precedes retirement or archive.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// identical even when an intermediate `Working` turn precedes retirement or archive,
+/// or when pre-spawn `TurnsSuppressed` keys arrive across multiple threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsettledFailure {
-    thread: Option<BbThreadId>,
-    failure: Option<Activity>,
+    attempt: u32,
+    active_thread: Option<BbThreadId>,
+    failures_by_thread: BTreeMap<BbThreadId, Activity>,
+    failure_seq_by_thread: BTreeMap<BbThreadId, u64>,
+    seq_by_thread: BTreeMap<BbThreadId, u64>,
+    last_activity_seq: u64,
+    last_idle_seq: u64,
+}
+
+impl Default for UnsettledFailure {
+    fn default() -> Self {
+        Self::for_attempt(1)
+    }
 }
 
 impl UnsettledFailure {
-    pub fn activity(&self) -> Option<&Activity> {
-        self.failure.as_ref()
+    pub fn for_attempt(attempt: u32) -> Self {
+        Self {
+            attempt: attempt.max(1),
+            active_thread: None,
+            failures_by_thread: BTreeMap::new(),
+            failure_seq_by_thread: BTreeMap::new(),
+            seq_by_thread: BTreeMap::new(),
+            last_activity_seq: 0,
+            last_idle_seq: 0,
+        }
     }
 
-    fn fold_keys(&mut self, keys: &[String]) {
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn activity(&self) -> Option<&Activity> {
+        self.active_thread
+            .as_ref()
+            .and_then(|t| self.failures_by_thread.get(t))
+    }
+
+    pub fn activity_for(&self, thread: &BbThreadId) -> Option<&Activity> {
+        self.failures_by_thread.get(thread)
+    }
+
+    /// Returns any unresolved failure/refusal blocking ordinary `WaveFinish(Completed)`
+    /// in `phase`. While `Requested` or `Retired { thread: None }`, any candidate
+    /// thread failure recorded for this attempt defers completion until `Spawned`
+    /// or `Archived` identifies the actual worker thread.
+    pub fn blocker_for_phase(&self, phase: &WorkerPhase) -> Option<&Activity> {
+        match phase {
+            WorkerPhase::Requested { .. } | WorkerPhase::Retired { thread: None, .. } => {
+                let mut first_err: Option<&Activity> = None;
+                for act in self.failures_by_thread.values() {
+                    match act {
+                        Activity::Refused { .. } => return Some(act),
+                        Activity::Errored { .. } if first_err.is_none() => {
+                            first_err = Some(act);
+                        }
+                        _ => {}
+                    }
+                }
+                first_err
+            }
+            WorkerPhase::Live { thread, .. }
+            | WorkerPhase::Retiring { thread, .. }
+            | WorkerPhase::Retired {
+                thread: Some(thread),
+                ..
+            } => self.failures_by_thread.get(thread),
+            WorkerPhase::Failed { .. } => None,
+        }
+    }
+
+    fn fold_keys_for_thread(
+        &mut self,
+        thread: &BbThreadId,
+        keys: &[String],
+        clean_seq: Option<u64>,
+    ) {
+        let prev_fseq = self.failure_seq_by_thread.get(thread).copied().unwrap_or(0);
+        let stale_outcome_seq = clean_seq.is_some_and(|s| s <= prev_fseq);
         for key in keys {
             if let Some(rest) = key.strip_prefix("fp:")
                 && let Some((_, reason)) = rest.split_once(':')
             {
-                self.failure = Some(Activity::Refused {
-                    reason: reason.to_owned(),
-                });
+                let existing_refused = matches!(
+                    self.failures_by_thread.get(thread),
+                    Some(Activity::Refused { .. })
+                );
+                if !(existing_refused && stale_outcome_seq) {
+                    self.failures_by_thread.insert(
+                        thread.clone(),
+                        Activity::Refused {
+                            reason: reason.to_owned(),
+                        },
+                    );
+                    if let Some(s) = clean_seq {
+                        let slot = self
+                            .failure_seq_by_thread
+                            .entry(thread.clone())
+                            .or_insert(0);
+                        *slot = (*slot).max(s);
+                    }
+                }
             } else if let Some(rest) = key.strip_prefix("fe:")
                 && let Some((_, error)) = rest.split_once(':')
             {
-                if !matches!(self.failure, Some(Activity::Refused { .. })) {
-                    self.failure = Some(Activity::Errored {
-                        error: error.to_owned(),
-                    });
+                let cur = self.failures_by_thread.get(thread);
+                let blocked_by_refusal = matches!(cur, Some(Activity::Refused { .. }));
+                let blocked_by_newer_err =
+                    matches!(cur, Some(Activity::Errored { .. })) && stale_outcome_seq;
+                if !blocked_by_refusal && !blocked_by_newer_err {
+                    self.failures_by_thread.insert(
+                        thread.clone(),
+                        Activity::Errored {
+                            error: error.to_owned(),
+                        },
+                    );
+                    if let Some(s) = clean_seq {
+                        let slot = self
+                            .failure_seq_by_thread
+                            .entry(thread.clone())
+                            .or_insert(0);
+                        *slot = (*slot).max(s);
+                    }
                 }
             } else if (key.starts_with("ft:") || key.starts_with("fail_ticket:"))
-                && self.failure.is_none()
+                && !self.failures_by_thread.contains_key(thread)
             {
-                self.failure = Some(Activity::Errored {
-                    error: "turn failed".into(),
-                });
+                self.failures_by_thread.insert(
+                    thread.clone(),
+                    Activity::Errored {
+                        error: "turn failed".into(),
+                    },
+                );
+                if let Some(s) = clean_seq {
+                    let slot = self
+                        .failure_seq_by_thread
+                        .entry(thread.clone())
+                        .or_insert(0);
+                    *slot = (*slot).max(s);
+                }
             }
         }
     }
@@ -405,36 +530,113 @@ impl UnsettledFailure {
     pub fn observe(&mut self, phase: &WorkerPhase, obs: &Observation) -> WorkerPhase {
         match obs {
             Observation::Spawned { attempt, thread } => {
-                if matches!(phase, WorkerPhase::Requested { attempt: a } if a == attempt)
-                    && self.thread.as_ref() != Some(thread)
+                if matches!(phase, WorkerPhase::Requested { attempt: a } if a == attempt) {
+                    self.attempt = *attempt;
+                    self.active_thread = Some(thread.clone());
+                    self.last_activity_seq = self.seq_by_thread.get(thread).copied().unwrap_or(0);
+                    self.last_idle_seq = 0;
+                    self.seq_by_thread.clear();
+                    let init_activity = self
+                        .failures_by_thread
+                        .get(thread)
+                        .cloned()
+                        .unwrap_or(Activity::Working);
+                    return WorkerPhase::Live {
+                        thread: thread.clone(),
+                        activity: init_activity,
+                    };
+                } else if let WorkerPhase::Retired {
+                    thread: None,
+                    errored,
+                    refused,
+                } = phase
+                    && *attempt == self.attempt
                 {
-                    self.thread = Some(thread.clone());
-                    self.failure = None;
+                    self.active_thread = Some(thread.clone());
+                    self.last_activity_seq = self.seq_by_thread.get(thread).copied().unwrap_or(0);
+                    self.last_idle_seq = 0;
+                    self.seq_by_thread.clear();
+                    let mut eff_err = errored.clone();
+                    let mut eff_ref = refused.clone();
+                    match self.failures_by_thread.get(thread) {
+                        Some(Activity::Refused { reason }) if eff_ref.is_none() => {
+                            eff_ref = Some(reason.clone());
+                            eff_err = None;
+                        }
+                        Some(Activity::Errored { error })
+                            if eff_ref.is_none() && eff_err.is_none() =>
+                        {
+                            eff_err = Some(error.clone());
+                        }
+                        _ => {}
+                    }
+                    return WorkerPhase::Retiring {
+                        thread: thread.clone(),
+                        errored: eff_err,
+                        refused: eff_ref,
+                    };
                 }
             }
             Observation::SpawnFailed { attempt, .. } => {
                 if matches!(phase, WorkerPhase::Requested { attempt: a } if a == attempt) {
-                    self.failure = None;
+                    self.active_thread = None;
+                    self.failures_by_thread.clear();
+                    self.failure_seq_by_thread.clear();
+                    self.seq_by_thread.clear();
+                    self.last_activity_seq = 0;
+                    self.last_idle_seq = 0;
                 }
             }
-            Observation::TurnsSuppressed { thread, keys } => {
+            Observation::TurnsSuppressed {
+                thread,
+                host_seq,
+                keys,
+            } => {
                 let matches_thread = match phase {
                     WorkerPhase::Live { thread: t, .. }
                     | WorkerPhase::Retiring { thread: t, .. } => t == thread,
-                    WorkerPhase::Requested { .. } => true,
-                    WorkerPhase::Retired { .. } | WorkerPhase::Failed { .. } => false,
+                    WorkerPhase::Requested { .. } | WorkerPhase::Retired { thread: None, .. } => {
+                        true
+                    }
+                    WorkerPhase::Retired {
+                        thread: Some(_), ..
+                    }
+                    | WorkerPhase::Failed { .. } => false,
                 };
                 if matches_thread {
-                    if self.thread.as_ref() != Some(thread) {
-                        self.thread = Some(thread.clone());
-                        self.failure = None;
+                    let unbound_phase = matches!(
+                        phase,
+                        WorkerPhase::Requested { .. } | WorkerPhase::Retired { thread: None, .. }
+                    );
+                    if !unbound_phase {
+                        self.active_thread = Some(thread.clone());
                     }
-                    self.fold_keys(keys);
+                    let clean_seq = host_seq.filter(|&s| s > 0);
+                    if !unbound_phase && clean_seq.is_some_and(|s| s <= self.last_idle_seq) {
+                        return phase.clone();
+                    }
+                    let stale_for_live = matches!(phase, WorkerPhase::Live { .. })
+                        && clean_seq.is_some_and(|s| s <= self.last_activity_seq);
+                    self.fold_keys_for_thread(thread, keys, clean_seq);
+                    if failure_activity_from_suppression_keys(keys).is_some()
+                        && let Some(s) = clean_seq
+                    {
+                        if unbound_phase {
+                            let slot = self.seq_by_thread.entry(thread.clone()).or_insert(0);
+                            *slot = (*slot).max(s);
+                        } else if matches!(phase, WorkerPhase::Live { .. }) && !stale_for_live {
+                            self.last_activity_seq = self.last_activity_seq.max(s);
+                        }
+                    }
+                    if stale_for_live {
+                        return phase.clone();
+                    }
                 }
             }
             Observation::Activity {
                 activity,
                 thread,
+                host_seq,
                 suppress_keys,
                 ..
             } => {
@@ -445,35 +647,105 @@ impl UnsettledFailure {
                     if thread.as_ref().is_some_and(|t| t != live_th) {
                         return phase.clone();
                     }
-                    if self.thread.as_ref() != Some(live_th) {
-                        self.thread = Some(live_th.clone());
-                        self.failure = None;
+                    let clean_seq = host_seq.filter(|&s| s > 0);
+                    if clean_seq.is_some_and(|s| s <= self.last_activity_seq) {
+                        return phase.clone();
                     }
-                    self.fold_keys(suppress_keys);
+                    if let Some(s) = clean_seq {
+                        self.last_activity_seq = s;
+                        if matches!(activity, Activity::Idle) {
+                            self.last_idle_seq = self.last_idle_seq.max(s);
+                        }
+                    }
+                    self.active_thread = Some(live_th.clone());
+                    self.fold_keys_for_thread(live_th, suppress_keys, clean_seq);
                     match activity {
                         Activity::Idle => {
-                            self.failure = None;
+                            self.failures_by_thread.remove(live_th);
+                            self.failure_seq_by_thread.remove(live_th);
                         }
                         Activity::Refused { .. } => {
-                            self.failure = Some(activity.clone());
+                            self.failures_by_thread
+                                .insert(live_th.clone(), activity.clone());
+                            if let Some(s) = clean_seq {
+                                let slot = self
+                                    .failure_seq_by_thread
+                                    .entry(live_th.clone())
+                                    .or_insert(0);
+                                *slot = (*slot).max(s);
+                            }
                         }
                         Activity::Errored { .. } => {
-                            if !matches!(self.failure, Some(Activity::Refused { .. })) {
-                                self.failure = Some(activity.clone());
+                            if !matches!(
+                                self.failures_by_thread.get(live_th),
+                                Some(Activity::Refused { .. })
+                            ) {
+                                self.failures_by_thread
+                                    .insert(live_th.clone(), activity.clone());
+                                if let Some(s) = clean_seq {
+                                    let slot = self
+                                        .failure_seq_by_thread
+                                        .entry(live_th.clone())
+                                        .or_insert(0);
+                                    *slot = (*slot).max(s);
+                                }
                             }
                         }
                         Activity::Working | Activity::Parked { .. } | Activity::Blocked { .. } => {}
                     }
                 }
             }
-            Observation::RuntimeMeta { .. } | Observation::Archived { .. } => {}
+            Observation::Archived {
+                thread: obs_thread,
+                attempt: obs_attempt,
+            } => {
+                if let WorkerPhase::Retired {
+                    thread: None,
+                    errored,
+                    refused,
+                } = phase
+                {
+                    let Some(obs_th) = obs_thread.as_ref() else {
+                        return phase.clone();
+                    };
+                    if obs_attempt != &Some(self.attempt) {
+                        return phase.clone();
+                    }
+                    self.active_thread = Some(obs_th.clone());
+                    self.last_activity_seq = self.seq_by_thread.get(obs_th).copied().unwrap_or(0);
+                    self.seq_by_thread.clear();
+                    let mut eff_err = errored.clone();
+                    let mut eff_ref = refused.clone();
+                    match self.failures_by_thread.get(obs_th) {
+                        Some(Activity::Refused { reason }) if eff_ref.is_none() => {
+                            eff_ref = Some(reason.clone());
+                            eff_err = None;
+                        }
+                        Some(Activity::Errored { error })
+                            if eff_ref.is_none() && eff_err.is_none() =>
+                        {
+                            eff_err = Some(error.clone());
+                        }
+                        _ => {}
+                    }
+                    return WorkerPhase::Retired {
+                        thread: Some(obs_th.clone()),
+                        errored: eff_err,
+                        refused: eff_ref,
+                    };
+                }
+            }
+            Observation::RuntimeMeta { .. } => {}
         }
         let mut next = phase.observe(obs);
+        if let WorkerPhase::Requested { attempt } = &next {
+            self.attempt = *attempt;
+        }
         if let WorkerPhase::Live {
             ref thread,
             activity: Activity::Errored { .. },
         } = next
-            && let Some(Activity::Refused { ref reason }) = self.failure
+            && let Some(Activity::Refused { reason }) = self.failures_by_thread.get(thread)
         {
             next = WorkerPhase::Live {
                 thread: thread.clone(),
@@ -482,14 +754,23 @@ impl UnsettledFailure {
                 },
             };
         }
-        if matches!(obs, Observation::Archived { .. })
+        if let Observation::Archived {
+            thread: obs_thread, ..
+        } = obs
             && let WorkerPhase::Retired {
+                thread: ref ret_thread,
                 ref mut errored,
                 ref mut refused,
-                ..
             } = next
         {
-            match &self.failure {
+            if let Some(t) = obs_thread.as_ref().or(ret_thread.as_ref()) {
+                self.active_thread = Some(t.clone());
+            }
+            let recorded = match obs_thread.as_ref().or(ret_thread.as_ref()) {
+                Some(t) => self.failures_by_thread.get(t),
+                None => self.activity(),
+            };
+            match recorded {
                 Some(Activity::Refused { reason }) if refused.is_none() => {
                     *refused = Some(reason.clone());
                     *errored = None;
@@ -506,12 +787,16 @@ impl UnsettledFailure {
     pub fn retiring(&self, phase: &WorkerPhase) -> WorkerPhase {
         let mut next = phase.retiring();
         if let WorkerPhase::Retiring {
+            ref thread,
             ref mut errored,
             ref mut refused,
-            ..
         } = next
         {
-            match &self.failure {
+            let recorded = self
+                .failures_by_thread
+                .get(thread)
+                .or_else(|| self.activity());
+            match recorded {
                 Some(Activity::Refused { reason }) if refused.is_none() => {
                     *refused = Some(reason.clone());
                     *errored = None;
@@ -710,6 +995,8 @@ pub enum Observation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread: Option<BbThreadId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         settled_seq: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         suppress_keys: Vec<String>,
@@ -719,9 +1006,15 @@ pub enum Observation {
         actual_model: Option<ModelId>,
         #[serde(default)]
         actual_account: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<BbThreadId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
     },
     TurnsSuppressed {
         thread: BbThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_seq: Option<u64>,
         #[serde(default)]
         keys: Vec<String>,
     },
@@ -752,6 +1045,7 @@ impl Observation {
         Observation::Activity {
             activity,
             thread: None,
+            host_seq: None,
             settled_seq: None,
             suppress_keys: Vec::new(),
         }
@@ -763,13 +1057,83 @@ impl Observation {
         settled_seq: Option<u64>,
         suppress_keys: Vec<String>,
     ) -> Self {
+        Self::activity_with_seq_and_bounds(activity, thread, None, settled_seq, suppress_keys)
+    }
+
+    pub fn activity_with_seq_and_bounds(
+        activity: Activity,
+        thread: BbThreadId,
+        host_seq: Option<u64>,
+        settled_seq: Option<u64>,
+        suppress_keys: Vec<String>,
+    ) -> Self {
         Observation::Activity {
             activity,
             thread: Some(thread),
+            host_seq: host_seq.filter(|&s| s > 0),
             settled_seq: settled_seq.filter(|&s| s > 0),
             suppress_keys,
         }
     }
+
+    pub fn runtime_meta(
+        actual_model: Option<ModelId>,
+        actual_account: Option<String>,
+        thread: Option<BbThreadId>,
+        attempt: Option<u32>,
+    ) -> Self {
+        Observation::RuntimeMeta {
+            actual_model,
+            actual_account,
+            thread,
+            attempt,
+        }
+    }
+
+    pub fn turns_suppressed(thread: BbThreadId, keys: Vec<String>) -> Self {
+        Self::turns_suppressed_with_seq(thread, None, keys)
+    }
+
+    pub fn turns_suppressed_with_seq(
+        thread: BbThreadId,
+        host_seq: Option<u64>,
+        keys: Vec<String>,
+    ) -> Self {
+        Observation::TurnsSuppressed {
+            thread,
+            host_seq: host_seq.filter(|&s| s > 0),
+            keys,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WaveObserved {
+    #[serde(default = "default_true")]
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed: Option<Observation>,
+}
+
+impl Default for WaveObserved {
+    fn default() -> Self {
+        Self::APPLIED
+    }
+}
+
+impl WaveObserved {
+    pub const APPLIED: Self = Self {
+        applied: true,
+        committed: None,
+    };
+    pub const NOOP: Self = Self {
+        applied: false,
+        committed: None,
+    };
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

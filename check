@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-Usage: ./check [--lint-only] [--skip-clippy] [--git-rev <rev>] [-h|--help]
+Usage: ./check [--lint-only] [--skip-clippy] [--with-tlc] [--git-rev <rev>] [-h|--help]
 
 Runs the deterministic hermetic commit and CI verification pipeline:
   Stage 1 (parallel): cargo fmt, repo hygiene lints, bb-plugin tsc + node --test
@@ -13,6 +13,7 @@ Runs the deterministic hermetic commit and CI verification pipeline:
 Flags:
   --lint-only       Run Stage 1 + cargo clippy only, then exit 0.
   --skip-clippy     Skip cargo clippy in Stage 2 (used when lint job already ran).
+  --with-tlc        Also run ./scripts/model-check.sh (44 TLC formal checks across specs/).
   --git-rev <rev>   Scan exact Git tree <rev> objects in Stage 1 repo hygiene.
   -h, --help        Show this help message.
 EOF
@@ -20,6 +21,7 @@ EOF
 
 LINT_ONLY=0
 SKIP_CLIPPY=0
+WITH_TLC=0
 GIT_REV=""
 
 while [[ $# -gt 0 ]]; do
@@ -30,6 +32,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--skip-clippy)
 		SKIP_CLIPPY=1
+		shift
+		;;
+	--with-tlc)
+		WITH_TLC=1
 		shift
 		;;
 	--git-rev)
@@ -976,6 +982,10 @@ if [[ "$SKIP_CLIPPY" -eq 0 ]]; then
 fi
 
 if [[ "$LINT_ONLY" -eq 1 ]]; then
+	if [[ "$WITH_TLC" -eq 1 ]]; then
+		printf '\n==> Stage 2b: TLC formal model checks\n'
+		"$ROOT/scripts/model-check.sh"
+	fi
 	printf '\ncheck: lint-only gates passed (%s).\n' "$(elapsed_since_start)"
 	exit 0
 fi
@@ -1221,5 +1231,10 @@ print("  slowest 3 test binaries:")
 for r in slowest:
     print("    {:.2f}s  {} ({} passed)".format(r["dt"], r["label"], r["passed"]))
 PY
+
+if [[ "$WITH_TLC" -eq 1 ]]; then
+	printf '\n==> Stage 4: TLC formal model checks\n'
+	"$ROOT/scripts/model-check.sh"
+fi
 
 printf '\ncheck: all gates passed (%s).\n' "$(elapsed_since_start)"

@@ -1019,7 +1019,9 @@ impl Client for DemoClient {
                 WireCommand::WaveAddWorker(_) => WireReply::WaveAddWorker(Ack),
                 WireCommand::WaveRetireWorker(_) => WireReply::WaveRetireWorker(Ack),
                 WireCommand::WaveFinish(_) => WireReply::WaveFinish(Ack),
-                WireCommand::WaveObserve(_) => WireReply::WaveObserve(Ack),
+                WireCommand::WaveObserve(_) => {
+                    WireReply::WaveObserve(rex_wave_api::wave::WaveObserved::APPLIED)
+                }
                 WireCommand::WaveView(wv) => WireReply::WaveView(WaveSnapshot {
                     spec: WaveSpec {
                         slug: wv.wave,

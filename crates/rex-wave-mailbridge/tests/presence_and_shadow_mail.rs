@@ -575,7 +575,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         panic!("expected PresenceBind reply");
     };
     assert_eq!(b_clear.incarnation_id, b1.incarnation_id);
-    assert_eq!(b_clear.epoch, 1);
+    assert_eq!(b_clear.epoch, 2);
     assert!(matches!(
         &b_clear.endpoint,
         TransportEndpoint::ClaudeSession { session_id, .. } if session_id == "sess-after-clear-2"
@@ -652,7 +652,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
     let WireReply::PresenceBind(b_resumed) = resume_reply else {
         panic!("expected PresenceBind reply");
     };
-    assert_eq!(b_resumed.epoch, 2);
+    assert_eq!(b_resumed.epoch, 3);
     assert_ne!(b_resumed.incarnation_id, b1.incarnation_id);
 
     // 5) With `takeover: true`, a live process supersedes the active binding and bumps epoch.
@@ -691,7 +691,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
     let WireReply::PresenceBind(b_takeover) = takeover_reply else {
         panic!("expected PresenceBind reply");
     };
-    assert_eq!(b_takeover.epoch, 3);
+    assert_eq!(b_takeover.epoch, 4);
     let carol_bindings = state.bindings_for(&SeatName::parse("carol").unwrap());
     assert_eq!(
         carol_bindings
@@ -1227,6 +1227,8 @@ fn gate1_case_06_a_transport_dies() {
             PresenceCommand::PresenceExpire(PresenceExpire {
                 seat: quinn.clone(),
                 incarnation_id: IncarnationId::parse("inc-quinn").unwrap(),
+                expected_epoch: None,
+                lease_expires_at: None,
                 reason: "single thread EOF".into(),
             }),
             |_, _| true,
@@ -2652,6 +2654,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
         PresenceCommand::PresenceUnbind(PresenceUnbind {
             seat: carol.clone(),
             incarnation_id: IncarnationId::parse("inc-2").unwrap(),
+            expected_epoch: None,
             reason: Some("closed".into()),
         }),
         |_, _| true,

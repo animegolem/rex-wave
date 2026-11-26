@@ -54,10 +54,15 @@ function turnFailureStopReason(ev: TurnFailed): string | undefined {
 
 export default async function rexWaveBridge(bb: BbPluginApi) {
   let daemon: Socket | null = null;
+  let signalCounter = Date.now() * 1000;
   const toolCalls = new Map<string, (r: { ok: boolean; text: string }) => void>();
   const watched = new Map<string, number | null>();
 
   const up = (msg: Up) => daemon?.send(JSON.stringify(msg));
+  const nextSignalSeq = () => {
+    signalCounter += 1;
+    return signalCounter;
+  };
 
   async function waveMetaOf(thread: Pick<Thread, "id" | "originPluginId">): Promise<WaveMeta | null> {
     if (thread.originPluginId !== bb.pluginId) return null;
@@ -240,6 +245,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
   const forward =
     (signal: Extract<Up, { t: "thread" }>["signal"]) =>
     async (p: { thread: Thread; error?: string | null }) => {
+      const sequence = nextSignalSeq();
       const meta = await waveMetaOf(p.thread);
       if (!meta) return;
       if (signal === "created") await bb.storage.kv.set(metaKey(meta), p.thread.id);
@@ -250,6 +256,7 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
         project_id: p.thread.projectId,
         meta,
         error: p.error ?? null,
+        sequence,
       });
     };
 
@@ -261,9 +268,15 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
   bb.events.on("thread.deleted", forward("archived"));
 
   bb.events.on("turn.failed", async (ev) => {
+    const sequence = nextSignalSeq();
     const resolved = await waveMetaByThreadId(ev.threadId);
     if (!resolved) return;
     const stopReason = turnFailureStopReason(ev);
+    const extra = ev as {
+      turnId?: string | null;
+      requestId?: string | null;
+      inputAccepted?: boolean | null;
+    };
     up({
       t: "thread",
       signal: "failed",
@@ -271,14 +284,19 @@ export default async function rexWaveBridge(bb: BbPluginApi) {
       project_id: resolved.thread.projectId,
       meta: resolved.meta,
       error: formatTurnFailure(ev),
+      sequence,
+      ...(typeof extra.turnId === "string" ? { turn_id: extra.turnId } : {}),
+      ...(typeof extra.requestId === "string" ? { request_id: extra.requestId } : {}),
+      ...(typeof extra.inputAccepted === "boolean" ? { input_accepted: extra.inputAccepted } : {}),
       ...(stopReason ? { stop_reason: stopReason } : {}),
     });
   });
 
   bb.events.on("interaction.pending", async ({ thread, interaction }) => {
+    const sequence = nextSignalSeq();
     const meta = await waveMetaOf(thread);
     if (meta) {
-      up({ t: "interaction", thread_id: thread.id, meta, interaction });
+      up({ t: "interaction", thread_id: thread.id, meta, interaction, sequence });
     }
   });
 

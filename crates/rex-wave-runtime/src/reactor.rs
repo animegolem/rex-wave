@@ -14,6 +14,14 @@ pub trait Reactor: Send + 'static {
         frame: Frame,
         client: &LocalClient,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    fn poll_delay(&self) -> Option<Duration> {
+        None
+    }
+
+    fn poll(&mut self, _client: &LocalClient) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Run a reactor from `Cursor::default()` (full replay = level-triggered
@@ -32,9 +40,19 @@ pub fn spawn_reactor<R: Reactor>(
                     continue;
                 }
             };
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(frame) => {
+            loop {
+                let maybe_delay = reactor.poll_delay();
+                let next_event = tokio::select! {
+                    item = stream.next() => Some(item),
+                    () = async {
+                        match maybe_delay {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending().await,
+                        }
+                    } => None,
+                };
+                match next_event {
+                    Some(Some(Ok(frame))) => {
                         let next_cursor = match &frame {
                             Frame::Committed(env) => Some((env.stream.clone(), env.seq)),
                             Frame::CaughtUp { cursor: c } => {
@@ -49,7 +67,10 @@ pub fn spawn_reactor<R: Reactor>(
                             cursor.advance(&s, seq);
                         }
                     }
-                    Err(_) => break,
+                    Some(Some(Err(_))) | Some(None) => break,
+                    None => {
+                        let _ = reactor.poll(&client).await;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

@@ -388,6 +388,8 @@ pub struct HeraldView {
     unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
     raised_mail_unrung: BTreeMap<SeatName, RaisedMailUnrungState>,
+    persisted_inbox_by_id: BTreeMap<(Principal, NotificationId), String>,
+    persisted_inbox_dedupes: BTreeSet<(Principal, String)>,
     mail_unrung_emits: Vec<(SeatName, u32, UnixMs)>,
     transport_emits: Vec<(presence::TransportKind, bool, Option<String>)>,
 }
@@ -735,7 +737,17 @@ impl HeraldView {
                 mail::MailEvent::BellRang { .. } => {}
             },
             (StreamId::Inbox { owner }, Event::Inbox(ev)) => match ev {
-                InboxEvent::Raised { draft, .. } | InboxEvent::Updated { draft, .. } => {
+                InboxEvent::Raised { id, draft, .. } | InboxEvent::Updated { id, draft, .. } => {
+                    if let Some(old_dedupe) = self
+                        .persisted_inbox_by_id
+                        .insert((owner.clone(), *id), draft.dedupe.clone())
+                        && old_dedupe != draft.dedupe
+                    {
+                        self.persisted_inbox_dedupes
+                            .remove(&(owner.clone(), old_dedupe));
+                    }
+                    self.persisted_inbox_dedupes
+                        .insert((owner.clone(), draft.dedupe.clone()));
                     if let NotifyKind::MailUnrung {
                         seat,
                         unread_count,
@@ -1190,6 +1202,11 @@ impl HeraldView {
         }
         let seat = SeatName::parse(trimmed).ok()?;
         self.principals_for_seat(&seat).into_iter().next()
+    }
+
+    fn has_persisted_inbox_card(&self, owner: &Principal, dedupe: &str) -> bool {
+        self.persisted_inbox_dedupes
+            .contains(&(owner.clone(), dedupe.to_owned()))
     }
 }
 
@@ -2118,34 +2135,94 @@ impl Decider for Inbox {
     }
 }
 
+fn is_resolved_only_draft(draft: &NotificationDraft) -> bool {
+    (matches!(draft.kind, NotifyKind::Interaction { .. }) && draft.actions.is_empty())
+        || matches!(
+            &draft.kind,
+            NotifyKind::MailUnrung {
+                unread_count: 0,
+                ..
+            }
+        )
+        || matches!(
+            &draft.kind,
+            NotifyKind::TransportDown { detail, .. }
+                | NotifyKind::OrgConflict { detail, .. }
+                if detail.is_empty()
+        )
+}
+
 #[derive(Default)]
 struct ReplayBuffer {
-    items: std::collections::VecDeque<(Principal, NotificationDraft)>,
+    items: std::collections::VecDeque<(Principal, NotificationDraft, Option<NotificationDraft>)>,
     index: BTreeMap<(Principal, String), usize>,
     popped: usize,
 }
 
 impl ReplayBuffer {
-    fn upsert(&mut self, to: Principal, draft: NotificationDraft) {
+    fn upsert(&mut self, to: Principal, draft: NotificationDraft, has_persisted_card: bool) {
         let key = (to.clone(), draft.dedupe.clone());
         if let Some(&abs_idx) = self.index.get(&key)
             && let Some(rel_idx) = abs_idx.checked_sub(self.popped)
             && let Some(slot) = self.items.get_mut(rel_idx)
         {
+            if matches!(draft.kind, NotifyKind::Interaction { .. }) {
+                if is_resolved_only_draft(&slot.1) || slot.2.is_some() {
+                    return;
+                }
+                if is_resolved_only_draft(&draft) {
+                    slot.2 = Some(draft);
+                } else {
+                    slot.1 = draft;
+                }
+                return;
+            }
+            let is_status_kind = matches!(
+                draft.kind,
+                NotifyKind::MailUnrung { .. }
+                    | NotifyKind::TransportDown { .. }
+                    | NotifyKind::OrgConflict { .. }
+            );
+            if is_status_kind {
+                if is_resolved_only_draft(&draft) {
+                    if has_persisted_card || is_resolved_only_draft(&slot.1) {
+                        slot.1 = draft;
+                        slot.2 = None;
+                    } else {
+                        slot.2 = Some(draft);
+                    }
+                } else {
+                    slot.1 = draft;
+                    slot.2 = None;
+                }
+                return;
+            }
             slot.1 = draft;
+            slot.2 = None;
+            return;
+        }
+        if !has_persisted_card && is_resolved_only_draft(&draft) {
             return;
         }
         let abs_idx = self.popped + self.items.len();
         self.index.insert(key, abs_idx);
-        self.items.push_back((to, draft));
+        self.items.push_back((to, draft, None));
     }
 
     fn peek(&self) -> Option<(Principal, NotificationDraft)> {
-        self.items.front().cloned()
+        self.items
+            .front()
+            .map(|(to, draft, _)| (to.clone(), draft.clone()))
     }
 
     fn pop_committed(&mut self) {
-        if let Some((to, draft)) = self.items.pop_front() {
+        if let Some(front) = self.items.front_mut()
+            && let Some(res) = front.2.take()
+        {
+            front.1 = res;
+            return;
+        }
+        if let Some((to, draft, _)) = self.items.pop_front() {
             let key = (to, draft.dedupe);
             if self.index.get(&key) == Some(&self.popped) {
                 self.index.remove(&key);
@@ -2349,30 +2426,43 @@ impl Reactor for Herald {
                     self.grace_signal.notify();
                     flush_replay = true;
                 } else {
-                    let drafts = {
+                    let drafts: Vec<(Principal, NotificationDraft, bool)> = {
                         let mut view = self.view.lock().expect("herald view lock");
                         view.observe_replay(&env);
                         classify(&env, &view)
+                            .into_iter()
+                            .map(|(to, draft)| {
+                                let has_persisted =
+                                    view.has_persisted_inbox_card(&to, &draft.dedupe);
+                                (to, draft, has_persisted)
+                            })
+                            .collect()
                     };
                     let mut buf = self.replay.lock().expect("herald replay buffer");
-                    for (to, draft) in drafts {
-                        buf.upsert(to, draft);
+                    for (to, draft, has_persisted) in drafts {
+                        buf.upsert(to, draft, has_persisted);
                     }
                 }
             }
             Frame::CaughtUp { .. } => {
                 self.caught_up = true;
-                let due = {
+                let due: Vec<(Principal, NotificationDraft, bool)> = {
                     let mut view = self.view.lock().expect("herald view lock");
                     view.reconcile_unrung_after_replay();
                     let now = view.latest_at;
                     view.due_mail_unrung(now)
+                        .into_iter()
+                        .map(|(to, draft)| {
+                            let has_persisted = view.has_persisted_inbox_card(&to, &draft.dedupe);
+                            (to, draft, has_persisted)
+                        })
+                        .collect()
                 };
                 self.grace_signal.notify();
                 if !due.is_empty() {
                     let mut buf = self.replay.lock().expect("herald replay buffer");
-                    for (to, draft) in due {
-                        buf.upsert(to, draft);
+                    for (to, draft, has_persisted) in due {
+                        buf.upsert(to, draft, has_persisted);
                     }
                 }
                 flush_replay = true;

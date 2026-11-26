@@ -261,10 +261,11 @@ async fn handle_connection(
         return write_error_response(&mut write_half, &err).await;
     }
 
-    let principal = match authenticate_request(&req.headers, auth.as_ref(), &operator) {
-        Ok(p) => p,
-        Err(err) => return write_error_response(&mut write_half, &err).await,
-    };
+    let (principal, worker_thread) =
+        match authenticate_request(&req.headers, auth.as_ref(), &operator) {
+            Ok(pair) => pair,
+            Err(err) => return write_error_response(&mut write_half, &err).await,
+        };
 
     let route = match match_route(req.method, &req.path) {
         Ok(r) => r,
@@ -287,11 +288,11 @@ async fn handle_connection(
     let result = if is_blocking_wait {
         tokio::select! {
             biased;
-            res = dispatch_json_route(route, &req, router, principal) => res,
+            res = dispatch_json_route(route, &req, router, principal, worker_thread) => res,
             () = wait_for_client_eof(&mut reader) => return Ok(()),
         }
     } else {
-        dispatch_json_route(route, &req, router, principal).await
+        dispatch_json_route(route, &req, router, principal, worker_thread).await
     };
 
     match result {
@@ -598,11 +599,14 @@ fn authenticate_request(
     headers: &RequestHeaders,
     auth: &dyn Authenticator,
     operator: &SeatName,
-) -> Result<Principal, HttpError> {
+) -> Result<(Principal, Option<BbThreadId>), HttpError> {
     let Some(raw_auth) = headers.authorization.as_deref() else {
-        return Ok(Principal::Operator {
-            seat: operator.clone(),
-        });
+        return Ok((
+            Principal::Operator {
+                seat: operator.clone(),
+            },
+            None,
+        ));
     };
     let Some(token) = strip_bearer(raw_auth) else {
         return Err(HttpError::new(
@@ -611,7 +615,7 @@ fn authenticate_request(
             "Authorization header must use Bearer <token>",
         ));
     };
-    auth.authenticate(
+    auth.authenticate_session(
         None,
         &Credential::Token {
             token: token.to_owned(),
@@ -976,8 +980,9 @@ async fn dispatch_json_route(
     req: &ParsedRequest,
     router: Arc<Router>,
     principal: Principal,
+    worker_thread: Option<BbThreadId>,
 ) -> Result<(&'static str, Value), HttpError> {
-    let client = LocalClient::new(router.clone(), principal.clone());
+    let client = LocalClient::with_worker_thread(router.clone(), principal.clone(), worker_thread);
 
     match route {
         Route::Health => Ok((

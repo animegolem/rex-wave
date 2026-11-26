@@ -1,0 +1,3 @@
+---- MODULE MCPresenceLeases ----
+EXTENDS PresenceLeases
+====

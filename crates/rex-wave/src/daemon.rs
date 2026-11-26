@@ -428,6 +428,7 @@ async fn unbind_uds_sessions(monitor: &LocalClient, scope: UdsUnbindScope<'_>) {
                 .call(PresenceUnbind {
                     seat: binding.seat.clone(),
                     incarnation_id: binding.incarnation_id.clone(),
+                    expected_epoch: Some(binding.epoch),
                     reason: Some(reason),
                 })
                 .await

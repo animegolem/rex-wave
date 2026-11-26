@@ -12,8 +12,11 @@ rex-wave-api.workspace = true
 rex-wave-runtime.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
+rex-wave-mailbridge.workspace = true
 rex-wave-rooms.workspace = true
 rex-wave-store.workspace = true
+rex-wave-waves.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

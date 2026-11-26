@@ -228,7 +228,7 @@ impl World {
                             (
                                 agent.clone(),
                                 WorkerPhase::Requested { attempt: *attempt },
-                                UnsettledFailure::default(),
+                                UnsettledFailure::for_attempt(*attempt),
                             ),
                         );
                     }

@@ -19,8 +19,10 @@ tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 rex-wave-rooms.workspace = true
 rex-wave-runtime = { path = "../rex-wave-runtime", features = ["test-support"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

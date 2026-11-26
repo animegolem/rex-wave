@@ -151,7 +151,9 @@ impl Decider for TestWaves {
                 },
                 board: board::project_board(&c.spec.project),
             }),
-            WaveCommand::WaveObserve(_) => WireReply::WaveObserve(Ack),
+            WaveCommand::WaveObserve(_) => {
+                WireReply::WaveObserve(rex_wave_api::wave::WaveObserved::APPLIED)
+            }
             WaveCommand::WaveResolve(_) => WireReply::WaveResolve(Ack),
             WaveCommand::WaveRetireWorker(_) => WireReply::WaveRetireWorker(Ack),
             WaveCommand::WaveFinish(_) => WireReply::WaveFinish(Ack),
