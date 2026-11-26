@@ -1362,7 +1362,9 @@ impl Service<WaveCommand> for RecordingWaves {
                         .lock()
                         .unwrap()
                         .push((obs.wave, obs.role, obs.observation));
-                    Ok(WireReply::WaveObserve(Ack))
+                    Ok(WireReply::WaveObserve(
+                        rex_wave_api::wave::WaveObserved::APPLIED,
+                    ))
                 }
                 WaveCommand::WaveView(v) => {
                     let act = activity.lock().unwrap().clone();

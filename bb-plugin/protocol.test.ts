@@ -285,7 +285,15 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
   }
   assert.ok(
     sentUp.some(
-      (m) => m.t === "thread" && m.signal === "failed" && m.error === "rate-limit (too_many_requests)",
+      (m) =>
+        m.t === "thread" &&
+        m.signal === "failed" &&
+        m.error === "rate-limit (too_many_requests)" &&
+        m.turn_id === "turn_1" &&
+        m.request_id === "req_1" &&
+        m.input_accepted === false &&
+        typeof m.sequence === "number" &&
+        m.sequence > 0,
     ),
   );
 
@@ -365,6 +373,17 @@ test("rexWaveBridge enforces stop-settle-before-archive, afterSeq watch reconcil
   });
   assert.ok(configuredWithProv.instructions?.includes("run_stamp="));
   assert.ok(configuredWithProv.instructions?.includes("output_dir="));
+
+  for (const fn of listeners.get("interaction.pending") ?? []) {
+    await fn({
+      thread: threadRecords.get("th_spawned_1"),
+      interaction: { id: "int_seq_check", payload: { kind: "approval", reason: "Approve" } },
+    });
+  }
+  const intMsg = sentUp.find(
+    (m): m is Extract<Up, { t: "interaction" }> => m.t === "interaction" && m.thread_id === "th_spawned_1",
+  );
+  assert.ok(intMsg && typeof intMsg.sequence === "number" && intMsg.sequence > 0);
 
   for (const fn of listeners.get("thread.deleted") ?? []) {
     await fn({ thread: threadRecords.get("th_spawned_1") });

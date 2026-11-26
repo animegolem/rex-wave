@@ -586,7 +586,9 @@ impl Decider for TestWaves {
             WaveCommand::WaveTell(_) => WireReply::WaveTell(Ack),
             WaveCommand::WaveResolve(_) => WireReply::WaveResolve(Ack),
             WaveCommand::WaveFinish(_) => WireReply::WaveFinish(Ack),
-            WaveCommand::WaveObserve(_) => WireReply::WaveObserve(Ack),
+            WaveCommand::WaveObserve(_) => {
+                WireReply::WaveObserve(rex_wave_api::wave::WaveObserved::APPLIED)
+            }
         }
     }
 

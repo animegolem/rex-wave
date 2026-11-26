@@ -1344,6 +1344,8 @@ impl PresenceState {
                     out.push(PresenceExpire {
                         seat: seat.clone(),
                         incarnation_id: b.incarnation_id.clone(),
+                        expected_epoch: Some(b.epoch),
+                        lease_expires_at: Some(exp),
                         reason: format!("lease expired at {}", exp.0),
                     });
                     continue;
@@ -1354,6 +1356,8 @@ impl PresenceState {
                     out.push(PresenceExpire {
                         seat: seat.clone(),
                         incarnation_id: b.incarnation_id.clone(),
+                        expected_epoch: Some(b.epoch),
+                        lease_expires_at: None,
                         reason: format!("process pid={pid} no longer matches proc_start"),
                     });
                 }
@@ -1611,7 +1615,7 @@ impl Presence {
             PresenceCommand::PresenceBind(c) => Self::decide_bind(state, c, ctx, is_proc_alive),
             PresenceCommand::PresenceHeartbeat(c) => Self::decide_heartbeat(state, c, ctx),
             PresenceCommand::PresenceUnbind(c) => Self::decide_unbind(state, c, ctx),
-            PresenceCommand::PresenceExpire(c) => Self::decide_expire(state, c),
+            PresenceCommand::PresenceExpire(c) => Self::decide_expire(state, c, ctx),
             PresenceCommand::PresenceTransportHealth(c) => Self::decide_transport_health(state, c),
             PresenceCommand::PresenceList(_) => Ok(vec![]),
             PresenceCommand::PresenceResolve(q) => {
@@ -2028,7 +2032,7 @@ impl Presence {
         };
 
         let mut superseded: Vec<IncarnationId> = Vec::new();
-        let mut refresh_target: Option<(IncarnationId, u64)> = None;
+        let mut refresh_target: Option<(IncarnationId, u64, bool)> = None;
 
         if let Some(existing_bindings) = state.bindings.get(&c.seat) {
             for b in existing_bindings.values() {
@@ -2054,7 +2058,8 @@ impl Presence {
                     .is_some_and(|id| id == &b.incarnation_id);
                 if same_proc || same_incarnation {
                     if c.incarnation_id.is_none() || same_incarnation {
-                        refresh_target = Some((b.incarnation_id.clone(), b.epoch));
+                        let same_endpoint = b.endpoint == c.endpoint;
+                        refresh_target = Some((b.incarnation_id.clone(), b.epoch, same_endpoint));
                     } else {
                         superseded.push(b.incarnation_id.clone());
                     }
@@ -2090,16 +2095,22 @@ impl Presence {
             }
         }
 
-        let (incarnation_id, epoch) = if let Some((existing_id, existing_epoch)) = refresh_target {
-            (existing_id, existing_epoch)
-        } else {
-            let next_epoch = state.next_epoch(&c.seat);
-            let id = match &c.incarnation_id {
-                Some(explicit) => explicit.clone(),
-                None => IncarnationId::parse(format!("inc-{}-{next_epoch}", c.seat))?,
+        let (incarnation_id, epoch) =
+            if let Some((existing_id, existing_epoch, same_endpoint)) = refresh_target {
+                let epoch = if same_endpoint {
+                    existing_epoch
+                } else {
+                    state.next_epoch(&c.seat)
+                };
+                (existing_id, epoch)
+            } else {
+                let next_epoch = state.next_epoch(&c.seat);
+                let id = match &c.incarnation_id {
+                    Some(explicit) => explicit.clone(),
+                    None => IncarnationId::parse(format!("inc-{}-{next_epoch}", c.seat))?,
+                };
+                (id, next_epoch)
             };
-            (id, next_epoch)
-        };
 
         let status = if state.down_transports.contains(&c.endpoint.kind()) {
             BindingStatus::TransportDown
@@ -2243,6 +2254,11 @@ impl Presence {
         ) {
             return Ok(vec![]);
         }
+        if let Some(expected) = c.expected_epoch
+            && binding.epoch != expected
+        {
+            return Ok(vec![]);
+        }
         Ok(vec![PresenceEvent::Unbound {
             seat: c.seat.clone(),
             incarnation_id: c.incarnation_id.clone(),
@@ -2254,6 +2270,7 @@ impl Presence {
     fn decide_expire(
         state: &PresenceState,
         c: &PresenceExpire,
+        ctx: &DecideCtx,
     ) -> Result<Vec<PresenceEvent>, ApiError> {
         let Some(binding) = state
             .bindings
@@ -2266,6 +2283,16 @@ impl Presence {
             binding.status,
             BindingStatus::Unbound | BindingStatus::Expired
         ) {
+            return Ok(vec![]);
+        }
+        if let Some(expected) = c.expected_epoch
+            && binding.epoch != expected
+        {
+            return Ok(vec![]);
+        }
+        if let Some(expected_exp) = c.lease_expires_at
+            && (binding.expires_at != Some(expected_exp) || expected_exp > ctx.at())
+        {
             return Ok(vec![]);
         }
         Ok(vec![PresenceEvent::Unbound {

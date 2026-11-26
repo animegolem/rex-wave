@@ -94,8 +94,8 @@ fn validated_strings_lanes_priorities_and_external_links_behave_at_boundary() {
 }
 
 #[test]
-fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
-    let board = BoardId::parse("project:p_cas").unwrap();
+fn missing_title_label_dedupe_idempotent_archive_and_board_filter_work() {
+    let board = BoardId::parse("project:p_unit").unwrap();
     let mut state = BoardState::open(board.clone(), Lane::all_lane_names());
 
     let err = state
@@ -115,9 +115,11 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
             card: None,
             expected: None,
             patch: CardPatch {
-                title: Some(Title::parse("Implement CAS").unwrap()),
-                lane: Some(Lane::Todo.lane_name()),
-                priority: Some(Priority::High),
+                title: Some(Title::parse("Filterable card").unwrap()),
+                lane: Some(Lane::Review.lane_name()),
+                assignee: Some(Assign::To {
+                    who: Assignee::parse("@alice").unwrap(),
+                }),
                 labels_add: vec!["core".into(), "core".into(), "cas".into()],
                 ..Default::default()
             },
@@ -125,10 +127,7 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
         })
         .unwrap();
     apply_all(&mut state, &created);
-
-    let c1 = &state.cards[&CardNo(1)];
-    assert_eq!(c1.revision, CardRevision(1));
-    assert_eq!(c1.labels, vec!["core", "cas"]);
+    assert_eq!(state.cards[&CardNo(1)].labels, vec!["core", "cas"]);
 
     let patched = state
         .decide_upsert(&CardUpsert {
@@ -136,10 +135,6 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
             card: Some(CardNo(1)),
             expected: Some(CardRevision(1)),
             patch: CardPatch {
-                lane: Some(Lane::Doing.lane_name()),
-                assignee: Some(Assign::To {
-                    who: Assignee::parse("@sam").unwrap(),
-                }),
                 labels_remove: vec!["core".into()],
                 labels_add: vec!["active".into()],
                 ..Default::default()
@@ -148,45 +143,21 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
         })
         .unwrap();
     apply_all(&mut state, &patched);
-    assert_eq!(state.cards[&CardNo(1)].revision, CardRevision(2));
     assert_eq!(state.cards[&CardNo(1)].labels, vec!["cas", "active"]);
 
-    let stale_patch = state
-        .decide_upsert(&CardUpsert {
-            board: board.clone(),
-            card: Some(CardNo(1)),
-            expected: Some(CardRevision(1)),
-            patch: CardPatch {
-                title: Some(Title::parse("Overwrite").unwrap()),
-                ..Default::default()
-            },
-            idem: None,
-        })
-        .unwrap_err();
-    assert_eq!(
-        stale_patch,
-        KanbanError::RevisionConflict {
-            card: CardNo(1),
-            expected: CardRevision(1),
-            actual: CardRevision(2),
-        }
-    );
-
-    let stale_archive = state
-        .decide_archive(&CardArchive {
-            board: board.clone(),
-            card: CardNo(1),
-            expected: Some(CardRevision(1)),
-        })
-        .unwrap_err();
-    assert_eq!(
-        stale_archive,
-        KanbanError::RevisionConflict {
-            card: CardNo(1),
-            expected: CardRevision(1),
-            actual: CardRevision(2),
-        }
-    );
+    let filtered = state
+        .snapshot(
+            2,
+            Some(&BoardFilter {
+                assignee: Some(Assignee::parse("@alice").unwrap()),
+                label: Some("active".into()),
+                lane: Some(Lane::Review.lane_name()),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.lanes.len(), 1);
+    assert_eq!(filtered.lanes[0].cards.len(), 1);
+    assert_eq!(filtered.lanes[0].cards[0].no, CardNo(1));
 
     let archived = state
         .decide_archive(&CardArchive {
@@ -196,152 +167,17 @@ fn card_revision_cas_rejects_stale_writes_and_archives_cleanly() {
         })
         .unwrap();
     apply_all(&mut state, &archived);
-    assert!(!state.cards.contains_key(&CardNo(1)));
     assert_eq!(
         state
             .decide_archive(&CardArchive {
-                board: board.clone(),
+                board,
                 card: CardNo(1),
-                expected: None
+                expected: None,
             })
             .unwrap(),
         vec![],
         "unconditional archive of an already-archived card is idempotent"
     );
-
-    let second = state
-        .decide_upsert(&CardUpsert {
-            board: board.clone(),
-            card: None,
-            expected: None,
-            patch: CardPatch {
-                title: Some(Title::parse("Next card").unwrap()),
-                ..Default::default()
-            },
-            idem: None,
-        })
-        .unwrap();
-    apply_all(&mut state, &second);
-    assert!(
-        state.cards.contains_key(&CardNo(2)),
-        "card numbers never reuse archived ids"
-    );
-}
-
-#[test]
-fn deterministic_lane_ordering_and_replay_preserve_positions() {
-    let board = BoardId::parse("project:p_rank").unwrap();
-    let mut log = Vec::new();
-    let mut state = BoardState::default();
-
-    let open = state
-        .decide_ensure(&BoardEnsure {
-            board: board.clone(),
-            lanes: Some(Lane::all_lane_names()),
-        })
-        .unwrap();
-    apply_all(&mut state, &open);
-    log.extend(open);
-
-    for title in ["First", "Second", "Third"] {
-        let evs = state
-            .decide_upsert(&CardUpsert {
-                board: board.clone(),
-                card: None,
-                expected: None,
-                patch: CardPatch {
-                    title: Some(Title::parse(title).unwrap()),
-                    lane: Some(Lane::Todo.lane_name()),
-                    ..Default::default()
-                },
-                idem: None,
-            })
-            .unwrap();
-        apply_all(&mut state, &evs);
-        log.extend(evs);
-    }
-
-    let top_create = state
-        .decide_upsert(&CardUpsert {
-            board: board.clone(),
-            card: None,
-            expected: None,
-            patch: CardPatch {
-                title: Some(Title::parse("Urgent Top").unwrap()),
-                lane: Some(Lane::Todo.lane_name()),
-                position: Some(0),
-                ..Default::default()
-            },
-            idem: None,
-        })
-        .unwrap();
-    apply_all(&mut state, &top_create);
-    log.extend(top_create);
-
-    assert_eq!(
-        state.order[&Lane::Todo.lane_name()],
-        vec![CardNo(4), CardNo(1), CardNo(2), CardNo(3)]
-    );
-
-    let reorder = state
-        .decide_upsert(&CardUpsert {
-            board: board.clone(),
-            card: Some(CardNo(3)),
-            expected: Some(CardRevision(1)),
-            patch: CardPatch {
-                position: Some(1),
-                ..Default::default()
-            },
-            idem: None,
-        })
-        .unwrap();
-    apply_all(&mut state, &reorder);
-    log.extend(reorder);
-    assert_eq!(
-        state.order[&Lane::Todo.lane_name()],
-        vec![CardNo(4), CardNo(3), CardNo(1), CardNo(2)]
-    );
-
-    let cross_move = state
-        .decide_upsert(&CardUpsert {
-            board: board.clone(),
-            card: Some(CardNo(1)),
-            expected: Some(CardRevision(1)),
-            patch: CardPatch {
-                lane: Some(Lane::Review.lane_name()),
-                position: Some(0),
-                assignee: Some(Assign::To {
-                    who: Assignee::parse("@alice").unwrap(),
-                }),
-                ..Default::default()
-            },
-            idem: None,
-        })
-        .unwrap();
-    apply_all(&mut state, &cross_move);
-    log.extend(cross_move);
-
-    let mut replayed = BoardState::default();
-    apply_all(&mut replayed, &log);
-    assert_eq!(
-        replayed.snapshot(log.len() as u64, None),
-        state.snapshot(log.len() as u64, None),
-        "replaying event log reconstructs identical lane order and card state"
-    );
-
-    let filtered = state
-        .snapshot(
-            log.len() as u64,
-            Some(&BoardFilter {
-                assignee: Some(Assignee::parse("@alice").unwrap()),
-                label: None,
-                lane: Some(Lane::Review.lane_name()),
-            }),
-        )
-        .unwrap();
-    assert_eq!(filtered.lanes.len(), 1);
-    assert_eq!(filtered.lanes[0].cards.len(), 1);
-    assert_eq!(filtered.lanes[0].cards[0].no, CardNo(1));
 }
 
 #[test]

@@ -45,8 +45,18 @@ export type Up =
       stop_reason?: string | null;
       model?: string | null;
       account?: string | null;
+      sequence?: number | null;
+      turn_id?: string | null;
+      request_id?: string | null;
+      input_accepted?: boolean | null;
     }
-  | { t: "interaction"; thread_id: string; meta?: WaveMeta | null; interaction: unknown }
+  | {
+      t: "interaction";
+      thread_id: string;
+      meta?: WaveMeta | null;
+      interaction: unknown;
+      sequence?: number | null;
+    }
   | { t: "thread_events"; thread_id: string; sequence: number }
   | {
       t: "tool_call";

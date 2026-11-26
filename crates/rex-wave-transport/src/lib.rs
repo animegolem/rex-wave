@@ -274,6 +274,14 @@ pub trait Authenticator: Send + Sync + 'static {
         peer_uid: Option<u32>,
         credential: &Credential,
     ) -> Result<Principal, ApiError>;
+
+    fn authenticate_session(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<(Principal, Option<BbThreadId>), ApiError> {
+        self.authenticate(peer_uid, credential).map(|p| (p, None))
+    }
 }
 
 /// Standard authenticator: `PeerUid` succeeds when the peer's Unix uid equals
@@ -488,6 +496,7 @@ fn verify_legacy_worker_thread_token(
 pub struct PrincipalTokenTable {
     tokens: BTreeMap<String, Principal>,
     legacy_thread_ids: BTreeMap<String, String>,
+    worker_thread_ids: BTreeMap<String, BbThreadId>,
     skipped_file_tokens: std::collections::BTreeSet<String>,
 }
 
@@ -541,6 +550,9 @@ impl PrincipalTokenTable {
         let token = token.into();
         let tid = thread_id.into();
         self.insert(token.clone(), Principal::Worker { wave, role })?;
+        if let Ok(parsed_tid) = BbThreadId::parse(tid.clone()) {
+            self.worker_thread_ids.insert(token.clone(), parsed_tid);
+        }
         self.legacy_thread_ids.insert(token, tid);
         Ok(())
     }
@@ -564,7 +576,10 @@ impl PrincipalTokenTable {
         for (token, principal) in other.tokens {
             self.insert(token.clone(), principal)?;
             if let Some(tid) = other.legacy_thread_ids.get(&token) {
-                self.legacy_thread_ids.insert(token, tid.clone());
+                self.legacy_thread_ids.insert(token.clone(), tid.clone());
+            }
+            if let Some(wtid) = other.worker_thread_ids.get(&token) {
+                self.worker_thread_ids.insert(token, wtid.clone());
             }
         }
         self.skipped_file_tokens.extend(other.skipped_file_tokens);
@@ -589,6 +604,16 @@ impl PrincipalTokenTable {
             }
         }
         matched
+    }
+
+    pub fn worker_thread_id(&self, candidate: &str) -> Option<BbThreadId> {
+        let mut matched: Option<&BbThreadId> = None;
+        for (stored, tid) in &self.worker_thread_ids {
+            if constant_time_eq(stored.as_bytes(), candidate.as_bytes()) {
+                matched = Some(tid);
+            }
+        }
+        matched.cloned()
     }
 
     pub fn allows_worker_token_reuse(
@@ -629,6 +654,9 @@ impl PrincipalTokenTable {
         let legacy = &self.legacy_thread_ids;
         self.tokens
             .retain(|tok, existing| existing != principal || legacy.contains_key(tok));
+        let remaining = &self.tokens;
+        self.worker_thread_ids
+            .retain(|tok, _| remaining.contains_key(tok));
     }
 
     /// Atomically persists the table to `tokens.json` with mode `0600`.
@@ -677,6 +705,9 @@ impl PrincipalTokenTable {
                     continue;
                 }
                 table.insert(token.clone(), principal)?;
+                if let Ok(parsed_tid) = BbThreadId::parse(tid.clone()) {
+                    table.worker_thread_ids.insert(token.clone(), parsed_tid);
+                }
                 table.legacy_thread_ids.insert(token, tid);
             } else {
                 table.insert(token, principal)?;
@@ -729,8 +760,16 @@ impl PrincipalTokenTable {
                 );
                 continue;
             }
+            let tok = file.token.clone();
             if let Err(e) = table.insert(file.token, file.principal) {
                 daemon_log!("skipping {label}: {e}");
+                continue;
+            }
+            if let Some(fname_str) = path.file_name().and_then(|s| s.to_str())
+                && is_safe_worker_token_id(fname_str)
+                && let Ok(tid) = BbThreadId::parse(fname_str)
+            {
+                table.worker_thread_ids.insert(tok, tid);
             }
         }
         Ok(table)
@@ -798,6 +837,21 @@ impl Authenticator for PrincipalAuthenticator {
             },
         }
     }
+
+    fn authenticate_session(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<(Principal, Option<BbThreadId>), ApiError> {
+        let principal = self.authenticate(peer_uid, credential)?;
+        let worker_thread = match (&principal, credential) {
+            (Principal::Worker { .. }, Credential::Token { token }) => {
+                self.tokens.worker_thread_id(token)
+            }
+            _ => None,
+        };
+        Ok((principal, worker_thread))
+    }
 }
 
 /// Reloading authenticator reading both `<state_dir>/tokens.json` and
@@ -826,6 +880,15 @@ impl Authenticator for StateDirAuthenticator {
         peer_uid: Option<u32>,
         credential: &Credential,
     ) -> Result<Principal, ApiError> {
+        self.authenticate_session(peer_uid, credential)
+            .map(|(p, _)| p)
+    }
+
+    fn authenticate_session(
+        &self,
+        peer_uid: Option<u32>,
+        credential: &Credential,
+    ) -> Result<(Principal, Option<BbThreadId>), ApiError> {
         let tokens = match credential {
             Credential::PeerUid => PrincipalTokenTable::new(),
             Credential::Token { .. } => PrincipalTokenTable::load_state_dir(
@@ -839,7 +902,7 @@ impl Authenticator for StateDirAuthenticator {
             daemon_uid: self.daemon_uid,
             tokens,
         };
-        auth.authenticate(peer_uid, credential)
+        auth.authenticate_session(peer_uid, credential)
     }
 }
 
@@ -1659,18 +1722,22 @@ async fn handle_conn(
         daemon_log!("conn #{conn}: closed without hello");
         return Ok(());
     };
-    let welcome = auth.authenticate(peer_uid, &credential);
+    let welcome_session = auth.authenticate_session(peer_uid, &credential);
+    let welcome = welcome_session
+        .as_ref()
+        .map(|(p, _)| p.clone())
+        .map_err(Clone::clone);
     write_server_frame(
         &mut writer,
         conn,
         &wire::ServerFrame::Welcome {
-            result: welcome.clone(),
+            result: welcome,
             daemon: env!("CARGO_PKG_VERSION").into(),
         },
     )
     .await?;
-    let me = match welcome {
-        Ok(me) => me,
+    let (me, worker_thread) = match welcome_session {
+        Ok(pair) => pair,
         Err(e) => {
             daemon_log!("conn #{conn}: refused {client}: {e}");
             return Ok(());
@@ -1684,7 +1751,7 @@ async fn handle_conn(
         hooks,
     };
 
-    let session = Session::new(me.clone());
+    let session = Session::with_worker_thread(me.clone(), worker_thread);
     let (out_tx, mut out_rx) = mpsc::channel::<wire::ServerFrame>(WATCH_BUFFER * 2);
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
@@ -1716,11 +1783,11 @@ async fn handle_conn(
                     disconnect_guard.hooks.on_uds_presence_bind(conn);
                 }
                 let router = router.clone();
-                let by = session.me().clone();
+                let session = session.clone();
                 let out_tx = out_tx.clone();
                 let name = cmd.meta().name;
                 in_flight_calls.spawn(async move {
-                    let result = router.dispatch(&by, cmd).await;
+                    let result = router.dispatch_session(&session, cmd).await;
                     if let Err(e) = &result
                         && worth_logging(e)
                     {

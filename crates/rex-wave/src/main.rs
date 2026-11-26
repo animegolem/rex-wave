@@ -2300,6 +2300,7 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
         } => Ok(WireCommand::PresenceUnbind(PresenceUnbind {
             seat: resolve_seat_arg(seat.as_ref(), me)?,
             incarnation_id: IncarnationId::parse(incarnation.clone())?,
+            expected_epoch: None,
             reason: reason.clone(),
         })),
         PresenceCmd::List {
@@ -3580,6 +3581,7 @@ async fn execute_presence_hold(
                     .call(PresenceUnbind {
                         seat: seat_name,
                         incarnation_id: binding.incarnation_id,
+                        expected_epoch: Some(binding.epoch),
                         reason: Some("hold interrupted".into()),
                     })
                     .await;

@@ -25,6 +25,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
       - uses: actions/cache@v4
         with:
           path: |
@@ -32,11 +36,14 @@ jobs:
             ~/.cargo/git
             target
             ~/.cache/rex-wave/bb-plugin
+            ~/.cache/rex-wave/tlaplus
           key: lint-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bb-plugin/package.json', 'bb-plugin/package-lock.json') }}
           restore-keys: |
             lint-${{ runner.os }}-
-      - name: Run lint-only gate
-        run: ./check --lint-only
+      - name: Run lint-only and TLC formal model gates
+        env:
+          REX_WAVE_FETCH_TLA: "1"
+        run: ./check --lint-only --with-tlc
 
   test:
     name: Test (${{ matrix.os }})

@@ -628,10 +628,12 @@ async fn cli_wave_honesty_enforces_one_writer_refusals_finish_gate_account_misma
     sys.call(WaveObserve {
         wave: wave.clone(),
         role: auditor.clone(),
-        observation: Observation::RuntimeMeta {
-            actual_model: Some(ModelId::parse("claude-opus-5-5-actual").unwrap()),
-            actual_account: Some("personal-acct".into()),
-        },
+        observation: Observation::runtime_meta(
+            Some(ModelId::parse("claude-opus-5-5-actual").unwrap()),
+            Some("personal-acct".into()),
+            None,
+            None,
+        ),
     })
     .await
     .unwrap();

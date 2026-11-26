@@ -13,19 +13,29 @@ use tokio::sync::watch;
 #[derive(Clone)]
 pub struct Session {
     me: Principal,
+    worker_thread: Option<BbThreadId>,
     stage: Arc<watch::Sender<FocusGeneration>>,
 }
 
 impl Session {
     pub fn new(me: Principal) -> Self {
+        Self::with_worker_thread(me, None)
+    }
+
+    pub fn with_worker_thread(me: Principal, worker_thread: Option<BbThreadId>) -> Self {
         Session {
             me,
+            worker_thread,
             stage: Arc::new(watch::channel(FocusGeneration::default()).0),
         }
     }
 
     pub fn me(&self) -> &Principal {
         &self.me
+    }
+
+    pub fn worker_thread(&self) -> Option<&BbThreadId> {
+        self.worker_thread.as_ref()
     }
 
     /// Claim the stage slot: every older stage watch on this session ends.
@@ -53,7 +63,7 @@ pub struct Router {
 
 pub use rex_wave_api::authorize;
 
-type ActiveWaitKey = (usize, WaveSlug, RoleName);
+type ActiveWaitKey = (usize, WaveSlug, RoleName, Option<BbThreadId>);
 
 /// Upper bound applied when a `Principal::Worker` issues a `Wait` with
 /// `timeout_ms: None` so an abandoned call cannot leave a worker `Parked` forever.
@@ -149,11 +159,37 @@ fn system_ctx() -> DecideCtx {
     )
 }
 
+async fn resolve_live_worker_thread(
+    wave_svc: &Arc<dyn Service<WaveCommand>>,
+    wave: &WaveSlug,
+    role: &RoleName,
+) -> Option<BbThreadId> {
+    match wave_svc
+        .dispatch(
+            WaveCommand::WaveView(WaveView { wave: wave.clone() }),
+            system_ctx(),
+        )
+        .await
+    {
+        Ok(WireReply::WaveView(snap)) => snap.workers.into_iter().find_map(|(r, _, phase)| {
+            if &r == role
+                && let WorkerPhase::Live { thread, .. } = phase
+            {
+                Some(thread)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
 async fn restore_worker_working(
     key: &ActiveWaitKey,
     wave_svc: &Arc<dyn Service<WaveCommand>>,
     wave: &WaveSlug,
     role: &RoleName,
+    worker_thread: Option<&BbThreadId>,
 ) {
     if has_active_wait(key) {
         return;
@@ -170,20 +206,26 @@ async fn restore_worker_working(
                 && matches!(
                     phase,
                     WorkerPhase::Live {
+                        thread,
                         activity: Activity::Parked { .. },
-                        ..
-                    }
+                    } if worker_thread.is_none_or(|wt| wt == thread)
                 )
         }),
         _ => false,
     };
     if still_parked && !has_active_wait(key) {
+        let observation = match worker_thread {
+            Some(wt) => {
+                Observation::activity_with_bounds(Activity::Working, wt.clone(), None, Vec::new())
+            }
+            None => Observation::activity(Activity::Working),
+        };
         let _ = wave_svc
             .dispatch(
                 WaveCommand::WaveObserve(WaveObserve {
                     wave: wave.clone(),
                     role: role.clone(),
-                    observation: Observation::activity(Activity::Working),
+                    observation,
                 }),
                 system_ctx(),
             )
@@ -196,15 +238,22 @@ struct WorkerWaitGuard {
     wave_svc: Arc<dyn Service<WaveCommand>>,
     wave: WaveSlug,
     role: RoleName,
+    worker_thread: Option<BbThreadId>,
     completed: bool,
 }
 
 impl WorkerWaitGuard {
-    fn enter(wave_svc: Arc<dyn Service<WaveCommand>>, wave: WaveSlug, role: RoleName) -> Self {
+    fn enter(
+        wave_svc: Arc<dyn Service<WaveCommand>>,
+        wave: WaveSlug,
+        role: RoleName,
+        worker_thread: Option<BbThreadId>,
+    ) -> Self {
         let key = (
             Arc::as_ptr(&wave_svc).cast::<()>() as usize,
             wave.clone(),
             role.clone(),
+            worker_thread.clone(),
         );
         increment_active_wait(&key);
         WorkerWaitGuard {
@@ -212,6 +261,7 @@ impl WorkerWaitGuard {
             wave_svc,
             wave,
             role,
+            worker_thread,
             completed: false,
         }
     }
@@ -219,7 +269,14 @@ impl WorkerWaitGuard {
     async fn finish(mut self) {
         self.completed = true;
         if decrement_active_wait(&self.key) == 0 {
-            restore_worker_working(&self.key, &self.wave_svc, &self.wave, &self.role).await;
+            restore_worker_working(
+                &self.key,
+                &self.wave_svc,
+                &self.wave,
+                &self.role,
+                self.worker_thread.as_ref(),
+            )
+            .await;
         }
     }
 }
@@ -236,8 +293,9 @@ impl Drop for WorkerWaitGuard {
             let wave_svc = self.wave_svc.clone();
             let wave = self.wave.clone();
             let role = self.role.clone();
+            let worker_thread = self.worker_thread.clone();
             handle.spawn(async move {
-                restore_worker_working(&key, &wave_svc, &wave, &role).await;
+                restore_worker_working(&key, &wave_svc, &wave, &role, worker_thread.as_ref()).await;
             });
         }
     }
@@ -261,6 +319,24 @@ impl Router {
     }
 
     pub async fn dispatch(&self, by: &Principal, cmd: WireCommand) -> Result<WireReply, ApiError> {
+        self.dispatch_inner(by, None, cmd).await
+    }
+
+    pub async fn dispatch_session(
+        &self,
+        session: &Session,
+        cmd: WireCommand,
+    ) -> Result<WireReply, ApiError> {
+        self.dispatch_inner(session.me(), session.worker_thread(), cmd)
+            .await
+    }
+
+    async fn dispatch_inner(
+        &self,
+        by: &Principal,
+        worker_thread: Option<&BbThreadId>,
+        cmd: WireCommand,
+    ) -> Result<WireReply, ApiError> {
         authorize(cmd.meta().audience, by)?;
         let ctx = DecideCtx::new(by.clone(), now());
         match cmd.route() {
@@ -315,23 +391,37 @@ impl Router {
                     && let Principal::Worker { wave, role } = by
                 {
                     let (room, since) = prepared.parked_scope();
-                    let guard =
-                        WorkerWaitGuard::enter(self.wave.clone(), wave.clone(), role.clone());
-                    let _ = self
-                        .wave
-                        .dispatch(
-                            WaveCommand::WaveObserve(WaveObserve {
-                                wave: wave.clone(),
-                                role: role.clone(),
-                                observation: Observation::activity(Activity::Parked {
-                                    room,
-                                    since,
+                    let effective_thread = match worker_thread {
+                        Some(wt) => Some(wt.clone()),
+                        None => resolve_live_worker_thread(&self.wave, wave, role).await,
+                    };
+                    if let Some(wt) = effective_thread {
+                        let guard = WorkerWaitGuard::enter(
+                            self.wave.clone(),
+                            wave.clone(),
+                            role.clone(),
+                            Some(wt.clone()),
+                        );
+                        let _ = self
+                            .wave
+                            .dispatch(
+                                WaveCommand::WaveObserve(WaveObserve {
+                                    wave: wave.clone(),
+                                    role: role.clone(),
+                                    observation: Observation::activity_with_bounds(
+                                        Activity::Parked { room, since },
+                                        wt,
+                                        None,
+                                        Vec::new(),
+                                    ),
                                 }),
-                            }),
-                            system_ctx(),
-                        )
-                        .await;
-                    Some(guard)
+                                system_ctx(),
+                            )
+                            .await;
+                        Some(guard)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -412,6 +502,17 @@ impl LocalClient {
             session: Session::new(me),
         }
     }
+
+    pub fn with_worker_thread(
+        router: Arc<Router>,
+        me: Principal,
+        worker_thread: Option<BbThreadId>,
+    ) -> Self {
+        LocalClient {
+            router,
+            session: Session::with_worker_thread(me, worker_thread),
+        }
+    }
 }
 
 impl Client for LocalClient {
@@ -422,7 +523,7 @@ impl Client for LocalClient {
         &self,
         cmd: WireCommand,
     ) -> impl Future<Output = Result<WireReply, ApiError>> + Send {
-        self.router.dispatch(self.session.me(), cmd)
+        self.router.dispatch_session(&self.session, cmd)
     }
     fn watch(
         &self,
@@ -439,6 +540,9 @@ impl Client for LocalClient {
 pub trait BridgeBackend: Send + Sync + 'static {
     type C: Client + Clone + 'static;
     fn client(&self, me: Principal) -> Self::C;
+    fn worker_client(&self, me: Principal, _thread: Option<BbThreadId>) -> Self::C {
+        self.client(me)
+    }
     fn handles_worker_wait_parking(&self) -> bool {
         false
     }
@@ -455,6 +559,9 @@ impl BridgeBackend for Arc<Router> {
     type C = LocalClient;
     fn client(&self, me: Principal) -> LocalClient {
         LocalClient::new(self.clone(), me)
+    }
+    fn worker_client(&self, me: Principal, thread: Option<BbThreadId>) -> LocalClient {
+        LocalClient::with_worker_thread(self.clone(), me, thread)
     }
     fn handles_worker_wait_parking(&self) -> bool {
         true

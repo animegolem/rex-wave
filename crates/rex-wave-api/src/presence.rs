@@ -520,6 +520,8 @@ pub struct PresenceHeartbeat {
 pub struct PresenceUnbind {
     pub seat: SeatName,
     pub incarnation_id: IncarnationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_epoch: Option<u64>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -528,6 +530,10 @@ pub struct PresenceUnbind {
 pub struct PresenceExpire {
     pub seat: SeatName,
     pub incarnation_id: IncarnationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<UnixMs>,
     pub reason: String,
 }
 

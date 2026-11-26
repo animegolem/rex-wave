@@ -53,12 +53,21 @@ impl<B: BridgeBackend> ErasedBackend for B {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct PreSpawnT3Suppressions {
+    settled_turn_keys: BTreeSet<String>,
+    suppressed_turn_keys: BTreeSet<String>,
+    unsaved_suppressed_keys: BTreeSet<String>,
+    hydrated_suppressions: bool,
+}
+
 #[derive(Clone, Debug)]
 struct TrackedWorker {
     attempt: u32,
     thread: Option<BbThreadId>,
-    suppressed_thread: Option<BbThreadId>,
+    pre_spawn_by_thread: BTreeMap<BbThreadId, PreSpawnT3Suppressions>,
     foreign_bound: bool,
+    retiring_or_terminal: bool,
     live: bool,
     activity: Activity,
     pending_interaction: Option<PendingInteraction>,
@@ -77,12 +86,12 @@ impl TrackedWorker {
             Activity::Blocked { interaction } => Some(interaction.clone()),
             _ => None,
         };
-        let suppressed_thread = thread.clone();
         TrackedWorker {
             attempt,
             thread,
-            suppressed_thread,
+            pre_spawn_by_thread: BTreeMap::new(),
             foreign_bound: false,
+            retiring_or_terminal: false,
             live,
             activity,
             pending_interaction,
@@ -99,11 +108,33 @@ impl TrackedWorker {
     fn reset_for_new_thread(&mut self) {
         self.shell_epoch = self.shell_epoch.wrapping_add(1);
         self.mirror_room_watermark = Seq::ORIGIN;
+        self.pre_spawn_by_thread.clear();
         self.settled_turn_keys.clear();
         self.suppressed_turn_keys.clear();
         self.unsaved_suppressed_keys.clear();
         self.claimed_direct_posts.clear();
         self.hydrated_suppressions = false;
+    }
+
+    fn promote_or_bind_thread(&mut self, thread: &BbThreadId) {
+        if self.thread.as_ref() == Some(thread) {
+            self.pre_spawn_by_thread.clear();
+            return;
+        }
+        if self.thread.is_none()
+            && let Some(pre) = self.pre_spawn_by_thread.remove(thread)
+        {
+            self.shell_epoch = self.shell_epoch.wrapping_add(1);
+            self.mirror_room_watermark = Seq::ORIGIN;
+            self.settled_turn_keys = pre.settled_turn_keys;
+            self.suppressed_turn_keys = pre.suppressed_turn_keys;
+            self.unsaved_suppressed_keys = pre.unsaved_suppressed_keys;
+            self.claimed_direct_posts.clear();
+            self.hydrated_suppressions = pre.hydrated_suppressions;
+            self.pre_spawn_by_thread.clear();
+            return;
+        }
+        self.reset_for_new_thread();
     }
 }
 
@@ -138,6 +169,14 @@ enum ShellUpdateDisposition {
     Processed,
     TerminalArchived,
     RetryNeeded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum T3IdentityResolution {
+    Resolved(WaveSlug, RoleName, u32, bool),
+    LateSpawnOnRetired(WaveSlug, RoleName, u32),
+    NotWorker,
+    TransientError,
 }
 
 type LiveWorkerRow = (WaveSlug, RoleName, BbThreadId, Activity, u64);
@@ -271,16 +310,13 @@ impl StateOwner {
                             Activity::Working,
                         )
                     });
-                    if rec.thread.as_ref() != Some(&thread)
-                        && rec.suppressed_thread.as_ref() != Some(&thread)
-                    {
-                        rec.reset_for_new_thread();
-                    }
+                    let was_retiring = rec.retiring_or_terminal && rec.attempt == attempt;
+                    rec.promote_or_bind_thread(&thread);
                     rec.attempt = attempt;
-                    rec.thread = Some(thread.clone());
-                    rec.suppressed_thread = Some(thread);
+                    rec.thread = Some(thread);
                     rec.foreign_bound = false;
-                    rec.live = true;
+                    rec.retiring_or_terminal = was_retiring;
+                    rec.live = !was_retiring;
                 }
                 StateMsg::FoldWave { wave, event } => {
                     self.fold_wave(wave, event);
@@ -384,13 +420,16 @@ impl StateOwner {
                     reply,
                 } => {
                     let status = match self.workers_by_role.get(&(wave, role)) {
-                        Some(rec)
-                            if !rec.foreign_bound
-                                && (rec.thread.as_ref() == Some(&thread)
-                                    || (rec.thread.is_none()
-                                        && rec.suppressed_thread.as_ref() == Some(&thread))) =>
-                        {
-                            rec.hydrated_suppressions
+                        Some(rec) if !rec.foreign_bound => {
+                            if rec.thread.as_ref() == Some(&thread) {
+                                rec.hydrated_suppressions
+                            } else if rec.thread.is_none() {
+                                rec.pre_spawn_by_thread
+                                    .get(&thread)
+                                    .is_some_and(|pre| pre.hydrated_suppressions)
+                            } else {
+                                false
+                            }
                         }
                         _ => false,
                     };
@@ -403,13 +442,17 @@ impl StateOwner {
                     reply,
                 } => {
                     let keys = match self.workers_by_role.get(&(wave, role)) {
-                        Some(rec)
-                            if !rec.foreign_bound
-                                && (rec.thread.as_ref() == Some(&thread)
-                                    || (rec.thread.is_none()
-                                        && rec.suppressed_thread.as_ref() == Some(&thread))) =>
-                        {
-                            rec.suppressed_turn_keys.clone()
+                        Some(rec) if !rec.foreign_bound => {
+                            if rec.thread.as_ref() == Some(&thread) {
+                                rec.suppressed_turn_keys.clone()
+                            } else if rec.thread.is_none() {
+                                rec.pre_spawn_by_thread
+                                    .get(&thread)
+                                    .map(|pre| pre.suppressed_turn_keys.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                BTreeSet::new()
+                            }
                         }
                         _ => BTreeSet::new(),
                     };
@@ -427,30 +470,25 @@ impl StateOwner {
                             .contains_key(&(wave.clone(), role.clone()))
                     {
                         let attempt = parse_t3_thread_id(&thread).map_or(1, |(_, _, a)| a);
-                        let mut empty =
+                        let empty =
                             TrackedWorker::new_empty(attempt, None, false, Activity::Working);
-                        empty.suppressed_thread = Some(thread.clone());
                         self.workers_by_role
                             .insert((wave.clone(), role.clone()), empty);
                     }
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && !rec.foreign_bound
                     {
-                        let matches_thread = if let Some(ref cur_th) = rec.thread {
-                            cur_th == &thread
-                        } else if is_t3_thread_id(&thread) {
-                            if rec.suppressed_thread.as_ref() != Some(&thread) {
-                                rec.reset_for_new_thread();
-                                rec.suppressed_thread = Some(thread);
-                            }
-                            true
-                        } else {
-                            false
-                        };
-                        if matches_thread {
+                        if rec.thread.as_ref() == Some(&thread) {
                             for k in turn_keys {
                                 if !k.is_empty() && !rec.suppressed_turn_keys.contains(&k) {
                                     rec.unsaved_suppressed_keys.insert(k);
+                                }
+                            }
+                        } else if rec.thread.is_none() && is_t3_thread_id(&thread) {
+                            let pre = rec.pre_spawn_by_thread.entry(thread).or_default();
+                            for k in turn_keys {
+                                if !k.is_empty() && !pre.suppressed_turn_keys.contains(&k) {
+                                    pre.unsaved_suppressed_keys.insert(k);
                                 }
                             }
                         }
@@ -463,13 +501,19 @@ impl StateOwner {
                     reply,
                 } => {
                     let pending = match self.workers_by_role.get(&(wave, role)) {
-                        Some(rec)
-                            if !rec.foreign_bound
-                                && (rec.thread.as_ref() == Some(&thread)
-                                    || (rec.thread.is_none()
-                                        && rec.suppressed_thread.as_ref() == Some(&thread))) =>
-                        {
-                            rec.unsaved_suppressed_keys.iter().cloned().collect()
+                        Some(rec) if !rec.foreign_bound => {
+                            if rec.thread.as_ref() == Some(&thread) {
+                                rec.unsaved_suppressed_keys.iter().cloned().collect()
+                            } else if rec.thread.is_none() {
+                                rec.pre_spawn_by_thread
+                                    .get(&thread)
+                                    .map(|pre| {
+                                        pre.unsaved_suppressed_keys.iter().cloned().collect()
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            }
                         }
                         _ => Vec::new(),
                     };
@@ -487,27 +531,15 @@ impl StateOwner {
                             .contains_key(&(wave.clone(), role.clone()))
                     {
                         let attempt = parse_t3_thread_id(&thread).map_or(1, |(_, _, a)| a);
-                        let mut empty =
+                        let empty =
                             TrackedWorker::new_empty(attempt, None, false, Activity::Working);
-                        empty.suppressed_thread = Some(thread.clone());
                         self.workers_by_role
                             .insert((wave.clone(), role.clone()), empty);
                     }
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && !rec.foreign_bound
                     {
-                        let matches_thread = if let Some(ref cur_th) = rec.thread {
-                            cur_th == &thread
-                        } else if is_t3_thread_id(&thread) {
-                            if rec.suppressed_thread.as_ref() != Some(&thread) {
-                                rec.reset_for_new_thread();
-                                rec.suppressed_thread = Some(thread);
-                            }
-                            true
-                        } else {
-                            false
-                        };
-                        if matches_thread {
+                        if rec.thread.as_ref() == Some(&thread) {
                             for k in turn_keys {
                                 if !k.is_empty() {
                                     rec.unsaved_suppressed_keys.remove(&k);
@@ -516,6 +548,16 @@ impl StateOwner {
                                 }
                             }
                             rec.hydrated_suppressions = true;
+                        } else if rec.thread.is_none() && is_t3_thread_id(&thread) {
+                            let pre = rec.pre_spawn_by_thread.entry(thread).or_default();
+                            for k in turn_keys {
+                                if !k.is_empty() {
+                                    pre.unsaved_suppressed_keys.remove(&k);
+                                    pre.suppressed_turn_keys.insert(k.clone());
+                                    pre.settled_turn_keys.insert(k);
+                                }
+                            }
+                            pre.hydrated_suppressions = true;
                         }
                     }
                 }
@@ -562,8 +604,8 @@ impl StateOwner {
                         }
                         rec.attempt = attempt;
                         rec.thread = None;
-                        rec.suppressed_thread = None;
                         rec.foreign_bound = true;
+                        rec.retiring_or_terminal = false;
                         rec.live = false;
                         rec.pending_interaction = None;
                         rec.reset_for_new_thread();
@@ -593,16 +635,13 @@ impl StateOwner {
                             Activity::Working,
                         )
                     });
-                    if rec.thread.as_ref() != Some(&thread)
-                        && rec.suppressed_thread.as_ref() != Some(&thread)
-                    {
-                        rec.reset_for_new_thread();
-                    }
+                    let was_retiring = rec.retiring_or_terminal && rec.attempt == attempt;
+                    rec.promote_or_bind_thread(&thread);
                     rec.attempt = attempt;
-                    rec.thread = Some(thread.clone());
-                    rec.suppressed_thread = Some(thread);
+                    rec.thread = Some(thread);
                     rec.foreign_bound = false;
-                    rec.live = true;
+                    rec.retiring_or_terminal = was_retiring;
+                    rec.live = !was_retiring;
                     rec.activity = Activity::Working;
                     rec.pending_interaction = None;
                 }
@@ -654,6 +693,7 @@ impl StateOwner {
                         }
                         rec.live = false;
                         rec.foreign_bound = true;
+                        rec.retiring_or_terminal = true;
                         rec.pending_interaction = None;
                         if let Some(th) = rec.thread.take() {
                             self.role_by_thread.remove(&th);
@@ -664,29 +704,33 @@ impl StateOwner {
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
                         rec.live = false;
                         rec.foreign_bound = true;
+                        rec.retiring_or_terminal = true;
                     }
                 }
                 Observation::RuntimeMeta { .. } => {}
-                Observation::TurnsSuppressed { thread, keys } => {
+                Observation::TurnsSuppressed { thread, keys, .. } => {
                     if !is_t3_thread_id(&thread) {
                         return;
                     }
                     if let Some(rec) = self.workers_by_role.get_mut(&(wave, role))
                         && !rec.foreign_bound
                     {
-                        if let Some(ref cur_th) = rec.thread {
-                            if cur_th != &thread {
-                                return;
+                        if rec.thread.as_ref() == Some(&thread) {
+                            for k in keys {
+                                if !k.is_empty() {
+                                    rec.unsaved_suppressed_keys.remove(&k);
+                                    rec.suppressed_turn_keys.insert(k.clone());
+                                    rec.settled_turn_keys.insert(k);
+                                }
                             }
-                        } else if rec.suppressed_thread.as_ref() != Some(&thread) {
-                            rec.reset_for_new_thread();
-                            rec.suppressed_thread = Some(thread);
-                        }
-                        for k in keys {
-                            if !k.is_empty() {
-                                rec.unsaved_suppressed_keys.remove(&k);
-                                rec.suppressed_turn_keys.insert(k.clone());
-                                rec.settled_turn_keys.insert(k);
+                        } else if rec.thread.is_none() {
+                            let pre = rec.pre_spawn_by_thread.entry(thread).or_default();
+                            for k in keys {
+                                if !k.is_empty() {
+                                    pre.unsaved_suppressed_keys.remove(&k);
+                                    pre.suppressed_turn_keys.insert(k.clone());
+                                    pre.settled_turn_keys.insert(k);
+                                }
                             }
                         }
                     }
@@ -695,6 +739,7 @@ impl StateOwner {
             WaveEvent::WorkerRetiring { role, .. } => {
                 if let Some(rec) = self.workers_by_role.get_mut(&(wave, role)) {
                     rec.live = false;
+                    rec.retiring_or_terminal = true;
                 }
             }
             WaveEvent::Finished { .. } => {
@@ -702,6 +747,7 @@ impl StateOwner {
                     if w == &wave {
                         rec.live = false;
                         rec.foreign_bound = true;
+                        rec.retiring_or_terminal = true;
                     }
                 }
             }
@@ -1197,13 +1243,16 @@ impl T3Bridge {
                                 tokio::task::yield_now().await;
                                 continue;
                             }
+                            let backoff_ms = (15u64
+                                .saturating_mul(1u64 << retry_attempt.saturating_sub(2).min(6)))
+                            .min(1_000);
                             tokio::select! {
                                 changed = thread_shutdown.changed() => {
                                     if changed.is_err() || *thread_shutdown.borrow() {
                                         break true;
                                     }
                                 }
-                                () = tokio::time::sleep(std::time::Duration::from_millis(15)) => {}
+                                () = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
                             }
                         }
                     }
@@ -1221,65 +1270,85 @@ impl T3Bridge {
         &self,
         thread: &BbThreadId,
     ) -> Option<(WaveSlug, RoleName, u32, bool)> {
+        match self.resolve_worker_identity_checked(thread).await {
+            T3IdentityResolution::Resolved(wave, role, attempt, retiring) => {
+                Some((wave, role, attempt, retiring))
+            }
+            T3IdentityResolution::LateSpawnOnRetired(..)
+            | T3IdentityResolution::NotWorker
+            | T3IdentityResolution::TransientError => None,
+        }
+    }
+
+    async fn resolve_worker_identity_checked(&self, thread: &BbThreadId) -> T3IdentityResolution {
         let (tx, rx) = oneshot::channel();
         let _ = self.state.send(StateMsg::LookupByThread {
             thread: thread.clone(),
             reply: tx,
         });
         if let Ok(Some((wave, role, attempt))) = rx.await {
-            return Some((wave, role, attempt, false));
+            return T3IdentityResolution::Resolved(wave, role, attempt, false);
         }
 
-        let (wave, role, attempt) = parse_t3_thread_id(thread)?;
-        let backend = self.backend.get()?;
-        if let Ok(WireReply::WaveView(snap)) = backend
+        let Some((wave, role, attempt)) = parse_t3_thread_id(thread) else {
+            return T3IdentityResolution::NotWorker;
+        };
+        let Some(backend) = self.backend.get() else {
+            return T3IdentityResolution::NotWorker;
+        };
+        match backend
             .call_as(
                 self.cfg.system_principal.clone(),
                 WaveView { wave: wave.clone() }.into_wire(),
             )
             .await
         {
-            let mut matched_live = false;
-            let mut matched_retiring = false;
-            for (r, spec, phase) in &snap.workers {
-                if r != &role {
-                    continue;
+            Ok(WireReply::WaveView(snap)) => {
+                let mut matched_live = false;
+                let mut matched_retiring = false;
+                let mut matched_late_retired = false;
+                for (r, spec, phase) in &snap.workers {
+                    if r != &role {
+                        continue;
+                    }
+                    let routes_to_t3 =
+                        rex_wave_waves::route_provider(&spec.provider, self.cfg.default_runner)
+                            .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3);
+                    match phase {
+                        WorkerPhase::Live { thread: t, .. } if t == thread => {
+                            matched_live = true;
+                        }
+                        WorkerPhase::Requested { attempt: a } if *a == attempt && routes_to_t3 => {
+                            matched_live = true;
+                        }
+                        WorkerPhase::Retiring { thread: t, .. } if t == thread => {
+                            matched_retiring = true;
+                        }
+                        WorkerPhase::Retired { thread: None, .. } if routes_to_t3 => {
+                            matched_late_retired = true;
+                        }
+                        _ => {}
+                    }
                 }
-                match phase {
-                    WorkerPhase::Live { thread: t, .. } if t == thread => {
-                        matched_live = true;
-                    }
-                    WorkerPhase::Requested { attempt: a }
-                        if *a == attempt
-                            && rex_wave_waves::route_provider(
-                                &spec.provider,
-                                self.cfg.default_runner,
-                            )
-                            .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3) =>
-                    {
-                        matched_live = true;
-                    }
-                    WorkerPhase::Retiring { thread: t, .. } if t == thread => {
-                        matched_retiring = true;
-                    }
-                    _ => {}
+                if matched_late_retired && !matched_live && !matched_retiring {
+                    return T3IdentityResolution::LateSpawnOnRetired(wave, role, attempt);
                 }
+                if !matched_live && !matched_retiring {
+                    return T3IdentityResolution::NotWorker;
+                }
+                if matched_live {
+                    let _ = self.state.send(StateMsg::BindThread {
+                        wave: wave.clone(),
+                        role: role.clone(),
+                        attempt,
+                        thread: thread.clone(),
+                    });
+                }
+                T3IdentityResolution::Resolved(wave, role, attempt, !matched_live)
             }
-            if !matched_live && !matched_retiring {
-                return None;
-            }
-            if matched_live {
-                let _ = self.state.send(StateMsg::BindThread {
-                    wave: wave.clone(),
-                    role: role.clone(),
-                    attempt,
-                    thread: thread.clone(),
-                });
-            }
-            return Some((wave, role, attempt, !matched_live));
+            Ok(_) | Err(ApiError::NotFound { .. }) => T3IdentityResolution::NotWorker,
+            Err(_) => T3IdentityResolution::TransientError,
         }
-
-        None
     }
 
     async fn try_wave_observe(
@@ -1300,9 +1369,20 @@ impl T3Bridge {
                     .into_wire(),
                 )
                 .await;
-            if !matches!(res, Ok(WireReply::WaveObserve(_))) {
+            let Ok(WireReply::WaveObserve(ack)) = res else {
                 return false;
+            };
+            if ack.applied {
+                let folded = ack.committed.unwrap_or(observation);
+                self.observe_wave_event(
+                    wave,
+                    WaveEvent::WorkerObserved {
+                        role,
+                        observation: folded,
+                    },
+                );
             }
+            return true;
         }
         self.observe_wave_event(wave, WaveEvent::WorkerObserved { role, observation });
         true
@@ -1329,14 +1409,16 @@ impl T3Bridge {
             return Some(false);
         }
         if let Some(backend) = self.backend.get() {
-            let Ok(WireReply::WaveView(snap)) = backend
+            let snap = match backend
                 .call_as(
                     self.cfg.system_principal.clone(),
                     WaveView { wave: wave.clone() }.into_wire(),
                 )
                 .await
-            else {
-                return None;
+            {
+                Ok(WireReply::WaveView(snap)) => snap,
+                Ok(_) | Err(ApiError::NotFound { .. }) => return Some(false),
+                Err(_) => return None,
             };
             return Some(snap.workers.iter().any(|(r, spec, phase)| {
                 r == role
@@ -1378,30 +1460,34 @@ impl T3Bridge {
     }
 
     async fn process_thread_removed(&self, thread: &BbThreadId) -> bool {
-        if let Some((wave, role, attempt, _)) = self.resolve_worker_identity(thread).await {
-            let _ = self.state.send(StateMsg::BumpShellEpoch {
-                wave: wave.clone(),
-                role: role.clone(),
-                thread: thread.clone(),
-            });
-            match self
-                .can_archive_worker_for_thread(&wave, &role, thread, attempt)
-                .await
-            {
-                Some(true) => {
-                    if !self
-                        .try_wave_observe(
-                            wave,
-                            role,
-                            Observation::archived_for(thread.clone(), Some(attempt)),
-                        )
-                        .await
-                    {
-                        return false;
+        match self.resolve_worker_identity_checked(thread).await {
+            T3IdentityResolution::TransientError => return false,
+            T3IdentityResolution::NotWorker | T3IdentityResolution::LateSpawnOnRetired(..) => {}
+            T3IdentityResolution::Resolved(wave, role, attempt, _) => {
+                let _ = self.state.send(StateMsg::BumpShellEpoch {
+                    wave: wave.clone(),
+                    role: role.clone(),
+                    thread: thread.clone(),
+                });
+                match self
+                    .can_archive_worker_for_thread(&wave, &role, thread, attempt)
+                    .await
+                {
+                    Some(true) => {
+                        if !self
+                            .try_wave_observe(
+                                wave,
+                                role,
+                                Observation::archived_for(thread.clone(), Some(attempt)),
+                            )
+                            .await
+                        {
+                            return false;
+                        }
                     }
+                    Some(false) => {}
+                    None => return false,
                 }
-                Some(false) => {}
-                None => return false,
             }
         }
         self.unlink_worker_token(thread);
@@ -1431,6 +1517,8 @@ impl T3Bridge {
         &self,
         wave: &WaveSlug,
         role: &RoleName,
+        thread: &BbThreadId,
+        attempt: u32,
         actual_model: Option<ModelId>,
         actual_account: Option<String>,
     ) {
@@ -1440,10 +1528,12 @@ impl T3Bridge {
         self.call_wave_observe(
             wave.clone(),
             role.clone(),
-            Observation::RuntimeMeta {
+            Observation::runtime_meta(
                 actual_model,
                 actual_account,
-            },
+                Some(thread.clone()),
+                Some(attempt),
+            ),
         )
         .await;
     }
@@ -1458,10 +1548,29 @@ impl T3Bridge {
         let Some(obs) = derive_shell_observation(shell, location) else {
             return ShellUpdateDisposition::Processed;
         };
-        let Some((wave, role, attempt, retiring)) = self.resolve_worker_identity(thread).await
-        else {
-            return ShellUpdateDisposition::Processed;
-        };
+        let (wave, role, attempt, retiring) =
+            match self.resolve_worker_identity_checked(thread).await {
+                T3IdentityResolution::Resolved(w, r, a, ret) => (w, r, a, ret),
+                T3IdentityResolution::LateSpawnOnRetired(w, r, a) => {
+                    if !matches!(obs, ShellObservation::Archived)
+                        && !self
+                            .try_wave_observe(
+                                w,
+                                r,
+                                Observation::Spawned {
+                                    attempt: a,
+                                    thread: thread.clone(),
+                                },
+                            )
+                            .await
+                    {
+                        return ShellUpdateDisposition::RetryNeeded;
+                    }
+                    return ShellUpdateDisposition::Processed;
+                }
+                T3IdentityResolution::NotWorker => return ShellUpdateDisposition::Processed,
+                T3IdentityResolution::TransientError => return ShellUpdateDisposition::RetryNeeded,
+            };
         let _ = self.state.send(StateMsg::BumpShellEpoch {
             wave: wave.clone(),
             role: role.clone(),
@@ -1563,6 +1672,8 @@ impl T3Bridge {
                 self.observe_runtime_meta_if_present(
                     &wave,
                     &role,
+                    thread,
+                    attempt,
                     proj_model.or(shell_model),
                     proj_account.or(shell_account),
                 )
@@ -1612,8 +1723,15 @@ impl T3Bridge {
                 {
                     return ShellUpdateDisposition::RetryNeeded;
                 }
-                self.observe_runtime_meta_if_present(&wave, &role, shell_model, shell_account)
-                    .await;
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    thread,
+                    attempt,
+                    shell_model,
+                    shell_account,
+                )
+                .await;
                 if !self
                     .try_wave_observe(
                         wave,
@@ -1653,6 +1771,8 @@ impl T3Bridge {
                 self.observe_runtime_meta_if_present(
                     &wave,
                     &role,
+                    thread,
+                    attempt,
                     proj_model.or(shell_model),
                     proj_account.or(shell_account),
                 )
@@ -1712,6 +1832,8 @@ impl T3Bridge {
                 self.observe_runtime_meta_if_present(
                     &wave,
                     &role,
+                    thread,
+                    attempt,
                     proj_model.or(shell_model),
                     proj_account.or(shell_account),
                 )
@@ -1771,6 +1893,8 @@ impl T3Bridge {
                 self.observe_runtime_meta_if_present(
                     &wave,
                     &role,
+                    thread,
+                    attempt,
                     proj_model.or(shell_model),
                     proj_account.or(shell_account),
                 )
@@ -1907,10 +2031,7 @@ impl T3Bridge {
             .try_wave_observe(
                 wave.clone(),
                 role.clone(),
-                Observation::TurnsSuppressed {
-                    thread: thread.clone(),
-                    keys: keys.clone(),
-                },
+                Observation::turns_suppressed(thread.clone(), keys.clone()),
             )
             .await
         {
@@ -2309,8 +2430,8 @@ impl T3Bridge {
         let sys = self.cfg.system_principal.clone();
         let mut cursor = Seq::ORIGIN;
         let mut spawned_thread: Option<BbThreadId> = None;
-        let mut suppressed_thread: Option<BbThreadId> = None;
-        let mut keys: Vec<String> = Vec::new();
+        let mut pre_spawn_keys: BTreeMap<BbThreadId, Vec<String>> = BTreeMap::new();
+        let mut bound_keys: Vec<String> = Vec::new();
         let mut reached_end = false;
         loop {
             let Ok(WireReply::Read(page)) = backend
@@ -2337,17 +2458,21 @@ impl T3Bridge {
                     match ev {
                         WaveEvent::WorkerRequested { role: r, .. } if r == role => {
                             spawned_thread = None;
-                            suppressed_thread = None;
-                            keys.clear();
+                            pre_spawn_keys.clear();
+                            bound_keys.clear();
                         }
                         WaveEvent::WorkerObserved {
                             role: r,
                             observation: Observation::Spawned { thread: th, .. },
                         } if r == role => {
-                            spawned_thread = Some(th.clone());
-                            if suppressed_thread.as_ref() != Some(th) {
-                                suppressed_thread = Some(th.clone());
-                                keys.clear();
+                            if spawned_thread.as_ref() != Some(th) {
+                                bound_keys = if spawned_thread.is_none() {
+                                    pre_spawn_keys.remove(th).unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                };
+                                pre_spawn_keys.clear();
+                                spawned_thread = Some(th.clone());
                             }
                         }
                         WaveEvent::WorkerObserved {
@@ -2356,6 +2481,7 @@ impl T3Bridge {
                                 Observation::TurnsSuppressed {
                                     thread: th,
                                     keys: ks,
+                                    ..
                                 },
                         } if r == role => {
                             if !is_t3_thread_id(th) {
@@ -2365,13 +2491,17 @@ impl T3Bridge {
                                 if sp != th {
                                     continue;
                                 }
-                            } else if suppressed_thread.as_ref() != Some(th) {
-                                suppressed_thread = Some(th.clone());
-                                keys.clear();
-                            }
-                            for k in ks {
-                                if !k.is_empty() {
-                                    keys.push(k.clone());
+                                for k in ks {
+                                    if !k.is_empty() {
+                                        bound_keys.push(k.clone());
+                                    }
+                                }
+                            } else {
+                                let entry = pre_spawn_keys.entry(th.clone()).or_default();
+                                for k in ks {
+                                    if !k.is_empty() {
+                                        entry.push(k.clone());
+                                    }
                                 }
                             }
                         }
@@ -2385,11 +2515,10 @@ impl T3Bridge {
             }
         }
         if reached_end {
-            let effective_thread = spawned_thread.as_ref().or(suppressed_thread.as_ref());
-            let matching = if effective_thread == Some(thread) {
-                keys
+            let matching = if let Some(ref sp) = spawned_thread {
+                if sp == thread { bound_keys } else { Vec::new() }
             } else {
-                Vec::new()
+                pre_spawn_keys.remove(thread).unwrap_or_default()
             };
             let _ = self.state.send(StateMsg::ApplyHydratedSuppressions {
                 wave: wave.clone(),
@@ -3035,10 +3164,7 @@ impl T3Bridge {
                             .try_wave_observe(
                                 wave.clone(),
                                 role.clone(),
-                                Observation::TurnsSuppressed {
-                                    thread: thread.clone(),
-                                    keys: turn_keys.clone(),
-                                },
+                                Observation::turns_suppressed(thread.clone(), turn_keys.clone()),
                             )
                             .await
                     {
@@ -3366,12 +3492,14 @@ impl T3Bridge {
                                 let scoped = match obs {
                                     Observation::Activity {
                                         activity,
+                                        host_seq,
                                         settled_seq,
                                         suppress_keys,
                                         ..
                                     } => Observation::Activity {
                                         activity,
                                         thread: Some(thread.clone()),
+                                        host_seq,
                                         settled_seq,
                                         suppress_keys,
                                     },
@@ -3416,10 +3544,18 @@ impl T3Bridge {
                 continue;
             }
 
+            let worker_attempt = parse_t3_thread_id(&thread).map(|(_, _, a)| a).unwrap_or(1);
             if let Some(pending) = active_pending_interaction(proj) {
                 let (proj_model, proj_account) = extract_runtime_meta_from_value(proj);
-                self.observe_runtime_meta_if_present(&wave, &role, proj_model, proj_account)
-                    .await;
+                self.observe_runtime_meta_if_present(
+                    &wave,
+                    &role,
+                    &thread,
+                    worker_attempt,
+                    proj_model,
+                    proj_account,
+                )
+                .await;
                 if self
                     .mirror_turns_from_projection(
                         &wave,
@@ -3450,8 +3586,15 @@ impl T3Bridge {
             }
 
             let (proj_model, proj_account) = extract_runtime_meta_from_value(proj);
-            self.observe_runtime_meta_if_present(&wave, &role, proj_model, proj_account)
-                .await;
+            self.observe_runtime_meta_if_present(
+                &wave,
+                &role,
+                &thread,
+                worker_attempt,
+                proj_model,
+                proj_account,
+            )
+            .await;
             let derived = derive_activity_from_projection(proj);
             if matches!(
                 tracked_activity,
@@ -3573,8 +3716,15 @@ impl T3Bridge {
             attempt: req.attempt,
             thread: returned.clone(),
         });
-        self.observe_runtime_meta_if_present(&req.wave, &req.role, reply_model, reply_account)
-            .await;
+        self.observe_runtime_meta_if_present(
+            &req.wave,
+            &req.role,
+            &returned,
+            req.attempt,
+            reply_model,
+            reply_account,
+        )
+        .await;
         Ok(returned)
     }
 
@@ -3621,12 +3771,14 @@ impl T3Bridge {
                 let obs = classify_t3_missing_or_archived(&msg).map(|o| match o {
                     Observation::Activity {
                         activity,
+                        host_seq,
                         settled_seq,
                         suppress_keys,
                         ..
                     } => Observation::Activity {
                         activity,
                         thread: Some(thread.clone()),
+                        host_seq,
                         settled_seq,
                         suppress_keys,
                     },
@@ -4379,10 +4531,17 @@ mod tests {
                         WireCommand::WaveObserve(c) => {
                             let mut snap = self.snap.lock().unwrap();
                             let phase = &mut snap.workers[0].2;
-                            if let Ok(next) = rex_wave_waves::worker_step(phase, &c.observation) {
+                            let mut applied = false;
+                            if let Ok(next) = rex_wave_waves::worker_step(phase, &c.observation)
+                                && *phase != next
+                            {
                                 *phase = next;
+                                applied = true;
                             }
-                            Ok(WireReply::WaveObserve(Ack))
+                            Ok(WireReply::WaveObserve(rex_wave_api::wave::WaveObserved {
+                                applied,
+                                committed: applied.then_some(c.observation),
+                            }))
                         }
                         _ => unreachable!(),
                     }
@@ -4486,10 +4645,17 @@ mod tests {
                         WireCommand::WaveObserve(c) => {
                             let mut snap = self.snap.lock().unwrap();
                             let phase = &mut snap.workers[0].2;
-                            if let Ok(next) = rex_wave_waves::worker_step(phase, &c.observation) {
+                            let mut applied = false;
+                            if let Ok(next) = rex_wave_waves::worker_step(phase, &c.observation)
+                                && *phase != next
+                            {
                                 *phase = next;
+                                applied = true;
                             }
-                            Ok(WireReply::WaveObserve(Ack))
+                            Ok(WireReply::WaveObserve(rex_wave_api::wave::WaveObserved {
+                                applied,
+                                committed: applied.then_some(c.observation),
+                            }))
                         }
                         _ => unreachable!(),
                     }
@@ -4643,5 +4809,124 @@ mod tests {
             Some(false)
         );
         assert!(bridge.process_thread_removed(&stale_t3).await);
+    }
+
+    #[tokio::test]
+    async fn late_spawn_on_retired_t3_worker_retries_failed_observe_until_committed() {
+        use rex_wave_api::wave::{
+            AgentSpec, PermissionMode, WaveSnapshot, WaveSpec, WaveStatus, Workspace,
+        };
+
+        struct LateSpawnBackend {
+            snap: Arc<std::sync::Mutex<WaveSnapshot>>,
+            fail_observe_once: std::sync::atomic::AtomicBool,
+        }
+
+        impl ErasedBackend for LateSpawnBackend {
+            fn call_as(
+                &self,
+                _me: Principal,
+                cmd: WireCommand,
+            ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+                Box::pin(async move {
+                    match cmd {
+                        WireCommand::WaveView(_) => {
+                            Ok(WireReply::WaveView(self.snap.lock().unwrap().clone()))
+                        }
+                        WireCommand::WaveObserve(c) => {
+                            if self.fail_observe_once.swap(false, Ordering::SeqCst) {
+                                return Err(ApiError::Internal("transient observe fault".into()));
+                            }
+                            let mut snap = self.snap.lock().unwrap();
+                            let phase = &mut snap.workers[0].2;
+                            let mut applied = false;
+                            if let Ok(next) = rex_wave_waves::worker_step(phase, &c.observation)
+                                && *phase != next
+                            {
+                                *phase = next;
+                                applied = true;
+                            }
+                            Ok(WireReply::WaveObserve(rex_wave_api::wave::WaveObserved {
+                                applied,
+                                committed: applied.then_some(c.observation),
+                            }))
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+            }
+        }
+
+        let wave = WaveSlug::parse("w-late").unwrap();
+        let role = RoleName::parse("worker").unwrap();
+        let t3 = BbThreadId::parse("t3:w-late:worker:a1").unwrap();
+        let agent = AgentSpec {
+            provider: ProviderId::parse("antigravity").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::Full,
+            workspace: Workspace::ProjectDefault,
+        };
+        let snap = Arc::new(std::sync::Mutex::new(WaveSnapshot {
+            spec: WaveSpec {
+                slug: wave.clone(),
+                project: BbProjectId::parse("proj_a").unwrap(),
+                goal: Body::parse("work").unwrap(),
+                workers: Vec::new(),
+                defaults: agent.clone(),
+                output_dir: None,
+            },
+            status: WaveStatus::Running,
+            counts: Default::default(),
+            worker_meta: Default::default(),
+            workers: vec![(
+                role.clone(),
+                agent,
+                WorkerPhase::Retired {
+                    thread: None,
+                    errored: None,
+                    refused: None,
+                },
+            )],
+        }));
+
+        let mut cfg = T3Config::explicit("ws://127.0.0.1:9/ws", "tok").unwrap();
+        cfg.state_dir = None;
+        let bridge = T3Bridge::new(cfg);
+        assert!(
+            bridge
+                .backend
+                .set(Arc::new(LateSpawnBackend {
+                    snap: snap.clone(),
+                    fail_observe_once: true.into(),
+                }))
+                .is_ok()
+        );
+
+        let shell = serde_json::json!({ "status": "running" });
+        let mut attempt_state = ShellActionAttemptState::default();
+        assert_eq!(
+            bridge
+                .process_thread_shell_update(&t3, None, &shell, &mut attempt_state)
+                .await,
+            ShellUpdateDisposition::RetryNeeded,
+            "failed WaveObserve(Spawned) on LateSpawnOnRetired must request retry"
+        );
+        assert_eq!(
+            bridge
+                .process_thread_shell_update(&t3, None, &shell, &mut attempt_state)
+                .await,
+            ShellUpdateDisposition::Processed
+        );
+        assert_eq!(
+            snap.lock().unwrap().workers[0].2,
+            WorkerPhase::Retiring {
+                thread: t3,
+                errored: None,
+                refused: None,
+            }
+        );
     }
 }

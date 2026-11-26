@@ -196,7 +196,7 @@ commands! {
         WaveTell         -> Ack         : "wave_tell",          Member,   true,  "Send to one worker's BB thread with a BB delivery mode (auto, start, steer, steer-if-active, queue-if-active).";
         WaveResolve      -> Ack         : "wave_resolve",       Operator, true,  "Answer a worker's pending BB interaction (approval, question, plugin request).";
         WaveFinish       -> Ack         : "wave_finish",        Member,   true,  "Close a wave with an outcome; retires remaining workers.";
-        WaveObserve      -> Ack         : "wave_observe",       System,   true,  "BB bridge reports a worker observation (spawned, activity, interaction).";
+        WaveObserve      -> WaveObserved: "wave_observe",       System,   true,  "BB bridge reports a worker observation (spawned, activity, interaction).";
         WaveView         -> WaveSnapshot: "wave_view",          Member,   false, "Current wave roster and worker phases.";
     }
     Board(BoardCommand) {
