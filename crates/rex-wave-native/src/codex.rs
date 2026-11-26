@@ -761,6 +761,8 @@ impl CodexBridge {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env_remove("T3CODE_THREAD_ID")
+            .env("BELL_GUARD", "1")
             .env(WORKER_THREAD_ENV, thread.as_str());
 
         if let Some(ref sock) = self.cfg.socket_path {
@@ -1109,9 +1111,21 @@ impl CodexBridge {
         // Emit Working before turn/start so a fast turn/completed strictly follows it in host_seq.
         worker.emit_activity(Activity::Working, false);
 
-        let turn_res = worker
+        let turn_res = match worker
             .rpc_call("turn/start", Value::Object(params), self.cfg.rpc_timeout)
-            .await?;
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                worker.emit_activity(
+                    Activity::Errored {
+                        error: err.to_string(),
+                    },
+                    false,
+                );
+                return Err(err);
+            }
+        };
 
         if let Some(turn_id) = turn_res
             .get("turn")

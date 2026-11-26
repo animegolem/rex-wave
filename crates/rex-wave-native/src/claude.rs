@@ -693,6 +693,8 @@ impl ClaudeBridge {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env_remove("T3CODE_THREAD_ID")
+            .env("BELL_GUARD", "1")
             .env(WORKER_THREAD_ENV, worker.thread.as_str());
 
         if let Some(ref sock) = self.cfg.socket_path {
@@ -911,17 +913,22 @@ impl ClaudeBridge {
         }
 
         if !sent {
-            let session_id = worker
+            let session_id = match worker
                 .session_id
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
-                .ok_or_else(|| {
-                    worker.turn_in_flight.store(false, Ordering::Release);
-                    HostError::Unreachable(format!(
+            {
+                Some(sid) => sid,
+                None => {
+                    let msg = format!(
                         "Claude thread {thread} exited before reporting session_id; cannot resume"
-                    ))
-                })?;
+                    );
+                    worker.turn_in_flight.store(false, Ordering::Release);
+                    worker.emit_activity(Activity::Errored { error: msg.clone() }, false);
+                    return Err(HostError::Unreachable(msg));
+                }
+            };
 
             // Reap any stale child handle before spawning the resumed session.
             if let Some(mut old_live) = worker.live_child.lock().await.take() {
@@ -936,7 +943,19 @@ impl ClaudeBridge {
             }
 
             let (mut new_live, new_stdin) =
-                self.spawn_process_for_worker(&worker, Some(&session_id))?;
+                match self.spawn_process_for_worker(&worker, Some(&session_id)) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        worker.turn_in_flight.store(false, Ordering::Release);
+                        worker.emit_activity(
+                            Activity::Errored {
+                                error: err.to_string(),
+                            },
+                            false,
+                        );
+                        return Err(err);
+                    }
+                };
             let generation = new_live.generation;
             {
                 let mut child_guard = worker.live_child.lock().await;
@@ -957,7 +976,9 @@ impl ClaudeBridge {
                 *child_guard = Some(new_live);
             }
             if let Err(err) = write_stdin_line(&new_stdin, prompt_line).await {
+                let msg = format!("write resumed prompt to Claude stdin: {err}");
                 worker.turn_in_flight.store(false, Ordering::Release);
+                worker.emit_activity(Activity::Errored { error: msg.clone() }, false);
                 drop(new_stdin);
                 worker
                     .stdin_tx
@@ -967,9 +988,7 @@ impl ClaudeBridge {
                 if let Some(mut live) = worker.live_child.lock().await.take() {
                     terminate_process_group(&mut live, self.cfg.retire_grace).await;
                 }
-                return Err(HostError::Unreachable(format!(
-                    "write resumed prompt to Claude stdin: {err}"
-                )));
+                return Err(HostError::Unreachable(msg));
             }
         }
 
