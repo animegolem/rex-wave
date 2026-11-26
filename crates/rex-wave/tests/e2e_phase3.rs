@@ -1056,12 +1056,14 @@ async fn e2e_phase3_tasks_org_sync_http_sse_claude_presence_and_shadow_mail() {
             &format!(":REX_REV: {bumped_rev}"),
         )
         .replace("Stale Emacs edit", "Resolved via watch mode");
-    std::fs::write(&org_file, &resolved_org).unwrap();
+    rex_wave_fs::write_atomic_path(&org_file, resolved_org.as_bytes(), 0o600, false).unwrap();
     let synced_line = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
             let line = stdout_rx.recv().await.expect("watch stdout line");
             let val: Value = serde_json::from_str(&line).unwrap();
-            if val["outcome"] == "synced" {
+            if val["outcome"] == "synced"
+                && val["updated"].as_array().is_some_and(|u| !u.is_empty())
+            {
                 break val;
             }
         }

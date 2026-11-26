@@ -2363,7 +2363,7 @@ elif "RESUME_RACE" in text1 and not resumed:
     os.close(1)
     with open(eof_marker, "w") as f:
         f.write("closed\n")
-    time.sleep(0.18)
+    time.sleep(0.45)
     sys.exit(0)
 elif resumed and "s_rrace" in sys.argv[1:]:
     assert "resumed second turn" in text1
@@ -2578,6 +2578,16 @@ for raw in sys.stdin:
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(eof_marker.exists());
+    h.wait_wave(&w_rrace, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
 
     let rrace_tid = HostThreadId::parse("claude:r3-rrace:author:a1").unwrap();
     let claude_host = ClaudeHost(h.claude.clone());
@@ -2601,8 +2611,7 @@ for raw in sys.stdin:
     })
     .await;
 
-    // Wait past the old process's 180ms sleep and prove `in_flight` stayed owned by generation 2!
-    tokio::time::sleep(Duration::from_millis(220)).await;
+    tokio::time::sleep(Duration::from_millis(520)).await;
     let third_start = claude_host
         .tell(
             &rrace_tid,
