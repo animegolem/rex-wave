@@ -608,6 +608,7 @@ pub struct TomlConfigHook {
     bb_configured: bool,
     t3_configured: bool,
     last_exported_sha: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    validated_disk_sha: Arc<std::sync::Mutex<Option<Option<String>>>>,
     bb_live: OnceLock<LivenessProbe>,
     t3_live: OnceLock<LivenessProbe>,
     presence_svc: OnceLock<Arc<dyn Service<PresenceCommand>>>,
@@ -628,6 +629,7 @@ impl TomlConfigHook {
             bb_configured,
             t3_configured,
             last_exported_sha: Arc::new(std::sync::Mutex::new(None)),
+            validated_disk_sha: Arc::new(std::sync::Mutex::new(None)),
             bb_live: OnceLock::new(),
             t3_live: OnceLock::new(),
             presence_svc: OnceLock::new(),
@@ -668,6 +670,7 @@ impl ConfigHook for TomlConfigHook {
         let path_opt = self.config_path.clone();
         let state_dir = self.state_dir.clone();
         let last_exported_sha = self.last_exported_sha.clone();
+        let validated_disk_sha = self.validated_disk_sha.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let protection = load_protected_roots().map_err(|e| ApiError::Denied {
@@ -683,7 +686,7 @@ impl ConfigHook for TomlConfigHook {
                         .clone()
                         .or_else(|| load_sync_marker(&state_dir).map(|m| m.sha256));
 
-                    let existing = match rex_wave_fs::read_regular_bounded(
+                    let (existing, observed_disk_sha) = match rex_wave_fs::read_regular_bounded(
                         path,
                         CONFIG_FILE_MAX_BYTES,
                     ) {
@@ -703,9 +706,9 @@ impl ConfigHook for TomlConfigHook {
                                     )));
                                 }
                             }
-                            std::str::from_utf8(&b).ok().map(str::to_owned)
+                            (std::str::from_utf8(&b).ok().map(str::to_owned), Some(disk_sha))
                         }
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => (None, None),
                         Err(e) => {
                             return Err(ApiError::Invalid(InvalidId {
                                 what: "config.toml".into(),
@@ -736,6 +739,10 @@ impl ConfigHook for TomlConfigHook {
                             "rendered config.toml round-trip mismatch".into(),
                         ));
                     }
+                    *validated_disk_sha.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(observed_disk_sha);
+                } else {
+                    *validated_disk_sha.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 Ok::<(), ApiError>(())
             })
@@ -749,9 +756,41 @@ impl ConfigHook for TomlConfigHook {
         let path_opt = self.config_path.clone();
         let state_dir = self.state_dir.clone();
         let last_exported_sha = self.last_exported_sha.clone();
+        let validated_disk_sha = self.validated_disk_sha.clone();
         Box::pin(async move {
             if let Some(path) = path_opt {
                 tokio::task::spawn_blocking(move || {
+                    let validated_opt = validated_disk_sha
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    if let Some(expected_at_validate) = validated_opt {
+                        let cur_disk =
+                            match rex_wave_fs::read_regular_bounded(&path, CONFIG_FILE_MAX_BYTES) {
+                                Ok(b) => Some(b),
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                                Err(e) => {
+                                    return Err(ApiError::Internal(format!(
+                                        "stat existing {} before export: {e}",
+                                        path.display()
+                                    )));
+                                }
+                            };
+                        let cur_sha = cur_disk.as_deref().map(sha256_hex);
+                        if cur_sha != expected_at_validate {
+                            let matches_target = cur_disk
+                                .as_deref()
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .and_then(|s| parse_config_toml(s).ok())
+                                .is_some_and(|d| d == cfg);
+                            if !matches_target {
+                                return Err(ApiError::conflict(format!(
+                                    "{} was modified externally during commit; preserved external file",
+                                    path.display()
+                                )));
+                            }
+                        }
+                    }
                     let sha = write_config_toml_atomic(&path, &cfg).map_err(ApiError::Internal)?;
                     *last_exported_sha.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(Some(sha.clone()));

@@ -204,6 +204,7 @@ proptest! {
                     },
                     room: general.clone(),
                     board: board.clone(),
+                    request_digest: None,
                 }),
                 10,
             );

@@ -4316,6 +4316,7 @@ pub struct BbBridge {
     cfg: BridgeConfig,
     default_runner: std::sync::Mutex<RunnerKind>,
     config_rx: std::sync::Mutex<Option<watch::Receiver<rex_wave_api::config::RexConfig>>>,
+    pin_store: std::sync::Mutex<Option<PathBuf>>,
     data_dir: Option<PathBuf>,
     owner: mpsc::UnboundedSender<OwnerMsg>,
     signal_tx: mpsc::UnboundedSender<InboundSignal>,
@@ -4365,6 +4366,11 @@ impl BbBridge {
         self
     }
 
+    pub fn with_pin_store(self: Arc<Self>, path: PathBuf) -> Arc<Self> {
+        *self.pin_store.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        self
+    }
+
     pub fn connected(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -4390,6 +4396,22 @@ impl BbBridge {
             .map(|rx| rx.borrow().clone());
         rex_wave_waves::route_provider_with_config(provider, default_runner, cfg.as_ref())
             .is_ok_and(|routed| routed.target == RunnerKind::Bb)
+    }
+
+    fn routes_to_bb_for_attempt(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        attempt: u32,
+        provider: &ProviderId,
+    ) -> bool {
+        if RunnerKind::strip_provider_prefix(provider.as_str()).is_none()
+            && let Some(ref path) = *self.pin_store.lock().unwrap_or_else(|e| e.into_inner())
+            && let Some(pinned) = rex_wave_waves::lookup_pinned_runner(path, wave, role, attempt)
+        {
+            return pinned == RunnerKind::Bb;
+        }
+        self.routes_to_bb(provider)
     }
 
     fn acquire_terminal_signal_guard(
@@ -4451,6 +4473,7 @@ impl BbBridge {
             cfg,
             default_runner: std::sync::Mutex::new(RunnerKind::Bb),
             config_rx: std::sync::Mutex::new(None),
+            pin_store: std::sync::Mutex::new(None),
             data_dir,
             owner: BridgeOwner::spawn(),
             signal_tx,
@@ -5134,7 +5157,8 @@ impl BbBridge {
                     if r != &role {
                         continue;
                     }
-                    let routes_to_bb = self.routes_to_bb(&spec.provider);
+                    let routes_to_bb =
+                        self.routes_to_bb_for_attempt(&wave, &role, m.attempt, &spec.provider);
                     match phase {
                         WorkerPhase::Live { thread: t, .. } if t == thread => {
                             matched_live = true;

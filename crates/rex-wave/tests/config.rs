@@ -1221,9 +1221,23 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
         })
         .await
         .unwrap();
-    let ws_cmd2: rex_wave_api::wave::WaveStart = serde_json::from_value(ws_json).unwrap();
+    let ws_cmd2: rex_wave_api::wave::WaveStart = serde_json::from_value(ws_json.clone()).unwrap();
     let retry_started = op_client.call(ws_cmd2).await.unwrap();
     assert_eq!(retry_started.wave.as_str(), "w-masks");
+
+    // Repeating with an explicit workspace mask change (`managed_worktree` vs omitted) MUST return `Conflict`!
+    let mut ws_diff_mask = ws_json;
+    ws_diff_mask["spec"]["defaults"]["workspace"] = serde_json::json!({
+        "workspace": "managed_worktree",
+        "base": { "kind": "default" }
+    });
+    let ws_cmd_conflict: rex_wave_api::wave::WaveStart =
+        serde_json::from_value(ws_diff_mask).unwrap();
+    let conflict_err = op_client.call(ws_cmd_conflict).await.unwrap_err();
+    assert!(
+        matches!(conflict_err, ApiError::Conflict { .. }),
+        "changing workspace omission mask must conflict: {conflict_err:?}"
+    );
 
     let masks_view = op_client
         .call(rex_wave_api::wave::WaveView {
@@ -1252,6 +1266,66 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
         .find(|(r, _, _)| r.as_str() == "coder")
         .unwrap();
     assert_eq!(coder_spec.account, None);
+
+    // Explicit wave-wide paying account (`defaults.account = "team-wave"`) beats harness accounts
+    // across providers on BOTH `WaveStart` AND `WaveAddWorker`.
+    let paying_json = serde_json::json!({
+        "spec": {
+            "slug": "w-paying",
+            "project": "p1",
+            "goal": "explicit wave paying account",
+            "defaults": {
+                "provider": "codex",
+                "account": "team-wave"
+            },
+            "workers": [
+                {
+                    "role": "lead",
+                    "brief": "default codex worker"
+                },
+                {
+                    "role": "claude-sub",
+                    "brief": "cross-provider worker on WaveStart",
+                    "agent": {
+                        "provider": "claude"
+                    }
+                }
+            ]
+        }
+    });
+    let paying_start: rex_wave_api::wave::WaveStart = serde_json::from_value(paying_json).unwrap();
+    op_client.call(paying_start).await.unwrap();
+    let add_cross: rex_wave_api::wave::WaveAddWorker = serde_json::from_value(serde_json::json!({
+        "wave": "w-paying",
+        "worker": {
+            "role": "reviewer",
+            "brief": "cross-provider worker on WaveAddWorker",
+            "agent": {
+                "provider": "claude"
+            }
+        }
+    }))
+    .unwrap();
+    op_client.call(add_cross).await.unwrap();
+
+    let paying_view = op_client
+        .call(rex_wave_api::wave::WaveView {
+            wave: WaveSlug::parse("w-paying").unwrap(),
+        })
+        .await
+        .unwrap();
+    for role_str in ["lead", "claude-sub", "reviewer"] {
+        let (_, spec, _) = paying_view
+            .workers
+            .iter()
+            .find(|(r, _, _)| r.as_str() == role_str)
+            .unwrap();
+        assert_eq!(
+            spec.account.as_deref(),
+            Some("team-wave"),
+            "worker @{role_str} must inherit explicit wave paying account"
+        );
+    }
 
     uds_task.abort();
     http_task.abort();

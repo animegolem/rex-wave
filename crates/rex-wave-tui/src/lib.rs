@@ -2114,6 +2114,7 @@ async fn run_loop<C: Client + Clone + 'static>(
     let mut opening_tree_watch = false;
     let mut stage_watch: Option<FrameStream> = None;
     let mut hover_deadline: Option<(tokio::time::Instant, NodeKey)> = None;
+    let mut settings_poll_deadline: Option<tokio::time::Instant> = None;
 
     stage_loader.retarget(
         model.stage_req_seq,
@@ -2142,6 +2143,17 @@ async fn run_loop<C: Client + Clone + 'static>(
             break;
         }
 
+        let in_settings = matches!(model.stage, Stage::Settings(_))
+            && model.connection == ConnectionState::Connected;
+        if in_settings {
+            if settings_poll_deadline.is_none() {
+                settings_poll_deadline =
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+        } else {
+            settings_poll_deadline = None;
+        }
+
         let incoming: Option<Msg> = tokio::select! {
             biased;
             m = poll_connection(&mut conn_rx) => Some(m),
@@ -2163,7 +2175,7 @@ async fn run_loop<C: Client + Clone + 'static>(
             m = poll_watch_slot(&mut tree_watch, WatchSlot::Tree) => Some(m),
             m = poll_watch_slot(&mut stage_watch, WatchSlot::Stage) => Some(m),
             key = wait_hover(&mut hover_deadline) => Some(Msg::HoverSettled(key)),
-            () = wait_settings_poll(matches!(model.stage, Stage::Settings(_)) && model.connection == ConnectionState::Connected) => Some(Msg::SettingsPoll),
+            () = wait_settings_poll(&mut settings_poll_deadline) => Some(Msg::SettingsPoll),
         };
 
         if let Some(msg) = incoming {
@@ -2270,10 +2282,12 @@ async fn wait_hover(hover: &mut Option<(tokio::time::Instant, NodeKey)>) -> Node
     }
 }
 
-async fn wait_settings_poll(enabled: bool) {
-    if enabled {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    } else {
-        std::future::pending().await
+async fn wait_settings_poll(deadline: &mut Option<tokio::time::Instant>) {
+    match *deadline {
+        Some(target) => {
+            tokio::time::sleep_until(target).await;
+            *deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+        }
+        None => std::future::pending().await,
     }
 }

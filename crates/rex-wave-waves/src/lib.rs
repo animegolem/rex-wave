@@ -5,8 +5,8 @@ pub mod workspace;
 
 pub use rex_wave_runtime::BoxFut;
 pub use router::{
-    HostRouter, RoutedProvider, WaveService, apply_harness_defaults, route_provider,
-    route_provider_with_config, route_thread,
+    HostRouter, RoutedProvider, WaveService, apply_harness_defaults, lookup_pinned_runner,
+    route_provider, route_provider_with_config, route_thread,
 };
 pub use workspace::{
     BbProjectLocation, ProjectWorkspaceLocation, default_bb_data_dir, expand_tilde,
@@ -368,6 +368,7 @@ fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool 
 #[derive(Clone, Debug, Default)]
 pub struct WaveState {
     spec: Option<WaveSpec>,
+    request_digest: Option<String>,
     room: Option<RoomId>,
     board: Option<BoardId>,
     opener: Option<Principal>,
@@ -406,20 +407,6 @@ impl WaveState {
                 action: format!("{action} in wave {wave}"),
             })
         }
-    }
-}
-
-fn shares_provider_slot(a: &ProviderId, b: &ProviderId) -> bool {
-    let clean_a = rex_wave_api::RunnerKind::strip_provider_prefix(a.as_str())
-        .map_or(a.as_str(), |(_, rest)| rest);
-    let clean_b = rex_wave_api::RunnerKind::strip_provider_prefix(b.as_str())
-        .map_or(b.as_str(), |(_, rest)| rest);
-    match (
-        rex_wave_api::config::HarnessProvider::parse_slot(clean_a),
-        rex_wave_api::config::HarnessProvider::parse_slot(clean_b),
-    ) {
-        (Some(sa), Some(sb)) => sa == sb,
-        _ => clean_a.eq_ignore_ascii_case(clean_b),
     }
 }
 
@@ -485,7 +472,12 @@ impl Decider for Waves {
                     }
                 }
                 if let Some(existing) = &state.spec {
-                    if existing == &c.spec {
+                    let digest_matches = c.config_defaults.request_digest.is_some()
+                        && state.request_digest == c.config_defaults.request_digest;
+                    let legacy_spec_matches = state.request_digest.is_none()
+                        && c.config_defaults.request_digest.is_none()
+                        && existing == &c.spec;
+                    if digest_matches || legacy_spec_matches {
                         return Ok(vec![]);
                     }
                     return Err(ApiError::conflict(format!(
@@ -500,12 +492,11 @@ impl Decider for Waves {
                     spec: c.spec.clone(),
                     room,
                     board,
+                    request_digest: c.config_defaults.request_digest.clone(),
                 });
                 for (w, (output_dir, writes)) in c.spec.workers.iter().zip(resolved_workers) {
                     let mut agent = w.agent.clone().unwrap_or_else(|| c.spec.defaults.clone());
-                    if agent.account.is_none()
-                        && shares_provider_slot(&agent.provider, &c.spec.defaults.provider)
-                    {
+                    if agent.account.is_none() {
                         agent.account = c.spec.defaults.account.clone();
                     }
                     events.push(WaveEvent::WorkerRequested {
@@ -563,9 +554,7 @@ impl Decider for Waves {
                         action: format!("override wave paying account in wave {}", c.wave),
                     });
                 }
-                if agent.account.is_none()
-                    && shares_provider_slot(&agent.provider, &spec.defaults.provider)
-                {
+                if agent.account.is_none() {
                     agent.account = spec.defaults.account.clone();
                 }
                 Ok(vec![WaveEvent::WorkerRequested {
@@ -986,8 +975,14 @@ impl Decider for Waves {
     fn evolve(state: &mut WaveState, event: &WaveEvent, meta: &EntryMeta) {
         state.head = meta.seq;
         match event {
-            WaveEvent::Started { spec, room, board } => {
+            WaveEvent::Started {
+                spec,
+                room,
+                board,
+                request_digest,
+            } => {
                 state.spec = Some(spec.clone());
+                state.request_digest = request_digest.clone();
                 state.room = Some(room.clone());
                 state.board = Some(board.clone());
                 state.opener = Some(meta.by.clone());
@@ -1728,7 +1723,9 @@ impl<H: AgentHost> WaveConductor<H> {
     async fn apply_live<C: Client>(&mut self, env: &Envelope, client: &C) -> Result<(), ApiError> {
         match (&env.stream, &env.event) {
             (StreamId::Wave { wave }, Event::Wave(ev)) => match ev {
-                WaveEvent::Started { spec, room, board } => {
+                WaveEvent::Started {
+                    spec, room, board, ..
+                } => {
                     self.ensure_wave_room(client, wave, room, &spec.goal)
                         .await?;
                     self.ensure_project_board(client, board).await?;

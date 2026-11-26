@@ -75,6 +75,7 @@ impl Decider for TestWaves {
                     spec: c.spec.clone(),
                     room,
                     board,
+                    request_digest: None,
                 }];
                 for w in &c.spec.workers {
                     events.push(WaveEvent::WorkerRequested {

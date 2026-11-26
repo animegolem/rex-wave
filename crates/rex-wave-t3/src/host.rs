@@ -799,6 +799,50 @@ enum ThreadShellAction {
     Removed,
 }
 
+#[derive(Default)]
+struct PinnedModelStore {
+    order: std::collections::VecDeque<(WaveSlug, RoleName, u32)>,
+    entries: HashMap<(WaveSlug, RoleName, u32), String>,
+}
+
+fn load_t3_model_pins(state_dir: &std::path::Path) -> PinnedModelStore {
+    let path = state_dir.join("t3-model-pins.json");
+    let Ok(bytes) = rex_wave_fs::read_regular_bounded(&path, 2 * 1024 * 1024) else {
+        return PinnedModelStore::default();
+    };
+    let Ok(rows) = serde_json::from_slice::<Vec<(WaveSlug, RoleName, u32, String)>>(&bytes) else {
+        return PinnedModelStore::default();
+    };
+    let mut store = PinnedModelStore::default();
+    for (w, r, a, model) in rows {
+        let key = (w, r, a);
+        if !store.entries.contains_key(&key) {
+            store.order.push_back(key.clone());
+        }
+        store.entries.insert(key, model);
+    }
+    store
+}
+
+fn save_t3_model_pins(
+    state_dir: &std::path::Path,
+    store: &PinnedModelStore,
+) -> std::io::Result<()> {
+    let path = state_dir.join("t3-model-pins.json");
+    let rows: Vec<(WaveSlug, RoleName, u32, String)> = store
+        .order
+        .iter()
+        .filter_map(|k| {
+            store
+                .entries
+                .get(k)
+                .map(|m| (k.0.clone(), k.1.clone(), k.2, m.clone()))
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&rows).map_err(std::io::Error::other)?;
+    rex_wave_fs::write_atomic_path(&path, &bytes, 0o600, false)
+}
+
 /// Core bridge to a T3 Code 0.1.11 server. Exposes [`T3Host`] (`AgentHost`) and
 /// [`T3Feed`] (`AgentFeed`), plus implements `AgentFeed` directly.
 pub struct T3Bridge {
@@ -809,7 +853,7 @@ pub struct T3Bridge {
     token_minter: Option<WorkerTokenMinter>,
     mirror_lock: tokio::sync::Mutex<()>,
     cmd_nonce: AtomicU64,
-    pinned_models: std::sync::Mutex<HashMap<(WaveSlug, RoleName, u32), String>>,
+    pinned_models: std::sync::Mutex<PinnedModelStore>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -821,6 +865,11 @@ impl T3Bridge {
 
     pub fn with_token_minter(cfg: T3Config, token_minter: Option<WorkerTokenMinter>) -> Arc<Self> {
         let rpc = T3RpcClient::new(cfg.clone());
+        let loaded_pins = cfg
+            .state_dir
+            .as_deref()
+            .map(load_t3_model_pins)
+            .unwrap_or_default();
         let (project_names_tx, project_names_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let bridge = Arc::new(T3Bridge {
             cfg,
@@ -830,7 +879,7 @@ impl T3Bridge {
             token_minter,
             mirror_lock: tokio::sync::Mutex::new(()),
             cmd_nonce: AtomicU64::new(1),
-            pinned_models: std::sync::Mutex::new(HashMap::new()),
+            pinned_models: std::sync::Mutex::new(loaded_pins),
             project_names_tx,
             project_names_rx,
         });
@@ -846,6 +895,27 @@ impl T3Bridge {
         let cfg = self.cfg.config_rx.as_ref().map(|rx| rx.borrow().clone());
         rex_wave_waves::route_provider_with_config(provider, self.cfg.default_runner, cfg.as_ref())
             .is_ok_and(|routed| routed.target == rex_wave_api::RunnerKind::T3)
+    }
+
+    fn routes_to_t3_for_attempt(
+        &self,
+        wave: &WaveSlug,
+        role: &RoleName,
+        attempt: u32,
+        provider: &ProviderId,
+    ) -> bool {
+        if rex_wave_api::RunnerKind::strip_provider_prefix(provider.as_str()).is_none()
+            && let Some(ref dir) = self.cfg.state_dir
+            && let Some(pinned) = rex_wave_waves::lookup_pinned_runner(
+                &dir.join("router-pins.json"),
+                wave,
+                role,
+                attempt,
+            )
+        {
+            return pinned == rex_wave_api::RunnerKind::T3;
+        }
+        self.routes_to_t3(provider)
     }
 
     pub fn rpc(&self) -> &T3RpcClient {
@@ -1319,7 +1389,8 @@ impl T3Bridge {
                     if r != &role {
                         continue;
                     }
-                    let routes_to_t3 = self.routes_to_t3(&spec.provider);
+                    let routes_to_t3 =
+                        self.routes_to_t3_for_attempt(&wave, &role, attempt, &spec.provider);
                     match phase {
                         WorkerPhase::Live { thread: t, .. } if t == thread => {
                             matched_live = true;
@@ -3646,6 +3717,7 @@ impl T3Bridge {
             .pinned_models
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .get(attempt_key)
             .cloned()
         {
@@ -3667,13 +3739,29 @@ impl T3Bridge {
             })?
         };
         let mut pinned = self.pinned_models.lock().unwrap_or_else(|e| e.into_inner());
-        if pinned.len() >= 1024
-            && !pinned.contains_key(attempt_key)
-            && let Some(first_key) = pinned.keys().next().cloned()
-        {
-            pinned.remove(&first_key);
+        if let Some(existing) = pinned.entries.get(attempt_key).cloned() {
+            return Ok(existing);
         }
-        pinned.insert(attempt_key.clone(), resolved.clone());
+        let mut evicted: Option<((WaveSlug, RoleName, u32), String)> = None;
+        if pinned.entries.len() >= 1024
+            && let Some(oldest) = pinned.order.pop_front()
+            && let Some(val) = pinned.entries.remove(&oldest)
+        {
+            evicted = Some((oldest, val));
+        }
+        pinned.order.push_back(attempt_key.clone());
+        pinned.entries.insert(attempt_key.clone(), resolved.clone());
+        if let Some(ref state_dir) = self.cfg.state_dir
+            && let Err(e) = save_t3_model_pins(state_dir, &pinned)
+        {
+            pinned.entries.remove(attempt_key);
+            pinned.order.pop_back();
+            if let Some((old_k, old_v)) = evicted {
+                pinned.order.push_front(old_k.clone());
+                pinned.entries.insert(old_k, old_v);
+            }
+            return Err(HostError::Unreachable(format!("persist T3 model pin: {e}")));
+        }
         Ok(resolved)
     }
 

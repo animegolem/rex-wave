@@ -1159,6 +1159,8 @@ pub struct WaveConfigDefaults {
     pub workspace: bool,
     #[serde(skip)]
     pub account_from_config: bool,
+    #[serde(skip)]
+    pub request_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_masks: Vec<(bool, bool)>,
 }
@@ -1206,6 +1208,7 @@ impl<'de> Deserialize<'de> for WaveStart {
         let mut h: Helper =
             serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
         h.config_defaults.account_from_config = false;
+        h.config_defaults.request_digest = None;
         if !has_explicit_mask {
             let defaults_val = raw.get("spec").and_then(|s| s.get("defaults"));
             let (omitted_perm, omitted_ws) = detect_json_omissions(defaults_val);
@@ -1264,6 +1267,7 @@ impl<'de> Deserialize<'de> for WaveAddWorker {
         let mut h: Helper =
             serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
         h.config_defaults.account_from_config = false;
+        h.config_defaults.request_digest = None;
         h.config_defaults.worker_masks.clear();
         if !has_explicit_mask
             && let Some(agent_val) = raw.get("worker").and_then(|w| w.get("agent"))
@@ -1438,6 +1442,8 @@ pub enum WaveEvent {
         spec: WaveSpec,
         room: RoomId,
         board: BoardId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_digest: Option<String>,
     },
     WorkerRequested {
         role: RoleName,

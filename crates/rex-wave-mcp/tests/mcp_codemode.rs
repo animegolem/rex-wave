@@ -549,6 +549,7 @@ impl Decider for TestWaves {
                     spec: start.spec.clone(),
                     room,
                     board,
+                    request_digest: None,
                 }])
             }
             WaveCommand::WaveObserve(obs) => Ok(vec![WaveEvent::WorkerObserved {
@@ -560,7 +561,10 @@ impl Decider for TestWaves {
     }
 
     fn evolve(state: &mut Self::State, event: &Self::Event, _meta: &EntryMeta) {
-        if let WaveEvent::Started { spec, room, board } = event {
+        if let WaveEvent::Started {
+            spec, room, board, ..
+        } = event
+        {
             state.spec = Some(spec.clone());
             state.room = Some(room.clone());
             state.board = Some(board.clone());

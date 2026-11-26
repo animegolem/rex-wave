@@ -5,15 +5,17 @@ use crate::{AgentHost, BoxFut, HostError, SpawnRequest};
 use rex_wave_api::config::{HarnessProvider, RexConfig, WorkspaceStrategy};
 use rex_wave_api::room::Body;
 use rex_wave_api::wave::{
-    AgentSpec, BaseBranch, InteractionResolution, Observation, SteerDeliveryMode, WaveSpec,
-    Workspace,
+    AgentSpec, BaseBranch, InteractionResolution, Observation, SteerDeliveryMode, WaveStart,
+    WaveView, Workspace,
 };
 use rex_wave_api::{
     ApiError, HostInteractionId, HostThreadId, InvalidId, ProviderId, RoleName, RunnerKind,
     WaveCommand, WaveSlug, WireReply,
 };
 use rex_wave_runtime::{DecideCtx, Service};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -194,33 +196,26 @@ pub fn resolve_agent_spec_for_wave(
     Ok((routed.target, account_applied))
 }
 
-fn provider_slot_of(provider: &ProviderId) -> Option<HarnessProvider> {
-    let clean = RunnerKind::strip_provider_prefix(provider.as_str())
-        .map_or_else(|| provider.as_str(), |(_, rest)| rest);
-    HarnessProvider::parse_slot(clean)
-}
-
-fn load_wave_request_specs(path: &Path) -> BTreeMap<WaveSlug, (String, WaveSpec)> {
-    let Ok(bytes) = rex_wave_fs::read_regular_bounded(path, 4 * 1024 * 1024) else {
-        return BTreeMap::new();
-    };
-    let Ok(entries) = serde_json::from_slice::<Vec<(WaveSlug, String, WaveSpec)>>(&bytes) else {
-        return BTreeMap::new();
-    };
-    entries
-        .into_iter()
-        .map(|(w, raw_json, resolved_spec)| (w, (raw_json, resolved_spec)))
-        .collect()
-}
-
-fn save_wave_request_specs(path: &Path, map: &BTreeMap<WaveSlug, (String, WaveSpec)>) {
-    let entries: Vec<(WaveSlug, String, WaveSpec)> = map
-        .iter()
-        .map(|(w, (raw_json, resolved_spec))| (w.clone(), raw_json.clone(), resolved_spec.clone()))
+fn compute_wave_start_digest(ws: &WaveStart) -> String {
+    let defaults_mask = (ws.config_defaults.permission, ws.config_defaults.workspace);
+    let effective_worker_masks: Vec<(bool, bool)> = (0..ws.spec.workers.len())
+        .map(|idx| {
+            ws.config_defaults
+                .worker_masks
+                .get(idx)
+                .copied()
+                .unwrap_or(defaults_mask)
+        })
         .collect();
-    if let Ok(bytes) = serde_json::to_vec(&entries) {
-        let _ = rex_wave_fs::write_atomic_path(path, &bytes, 0o600, false);
+    let bytes =
+        serde_json::to_vec(&(&ws.spec, defaults_mask, &effective_worker_masks)).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
     }
+    out
 }
 
 /// Service wrapper around `Registry<Waves>` that resolves runner routes and
@@ -230,8 +225,6 @@ pub struct WaveService {
     inner: Arc<dyn Service<WaveCommand>>,
     default_runner: RunnerKind,
     config_rx: Option<watch::Receiver<RexConfig>>,
-    spec_store_path: Option<PathBuf>,
-    requested_specs: Arc<Mutex<BTreeMap<WaveSlug, (String, WaveSpec)>>>,
 }
 
 impl WaveService {
@@ -244,21 +237,11 @@ impl WaveService {
             inner,
             default_runner,
             config_rx,
-            spec_store_path: None,
-            requested_specs: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
-    pub fn with_state_dir(self: Arc<Self>, state_dir: PathBuf) -> Arc<Self> {
-        let spec_path = state_dir.join("wave-request-specs.json");
-        let loaded = load_wave_request_specs(&spec_path);
-        Arc::new(Self {
-            inner: self.inner.clone(),
-            default_runner: self.default_runner,
-            config_rx: self.config_rx.clone(),
-            spec_store_path: Some(spec_path),
-            requested_specs: Arc::new(Mutex::new(loaded)),
-        })
+    pub fn with_state_dir(self: Arc<Self>, _state_dir: PathBuf) -> Arc<Self> {
+        self
     }
 }
 
@@ -269,36 +252,23 @@ impl Service<WaveCommand> for WaveService {
         ctx: DecideCtx,
     ) -> BoxFut<'_, Result<WireReply, ApiError>> {
         let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
-        let mut record_started: Option<(WaveSlug, String, WaveSpec)> = None;
-        let prep_res: Result<(), ApiError> = (|| {
+        let default_runner = self.default_runner;
+        Box::pin(async move {
             match &mut cmd {
                 WaveCommand::WaveStart(ws) => {
                     ws.config_defaults.account_from_config = false;
-                    let raw_json = serde_json::to_string(&ws.spec).unwrap_or_default();
-                    if let Some((prev_raw, prev_resolved)) = self
-                        .requested_specs
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&ws.spec.slug)
-                        .cloned()
-                        && prev_raw == raw_json
-                    {
-                        ws.spec = prev_resolved;
-                        return Ok(());
-                    }
-
+                    ws.config_defaults.request_digest = Some(compute_wave_start_digest(ws));
                     let defaults_mask =
                         (ws.config_defaults.permission, ws.config_defaults.workspace);
                     let caller_defaults_had_account = ws.spec.defaults.account.is_some();
-                    let defaults_slot = provider_slot_of(&ws.spec.defaults.provider);
                     let _ = resolve_agent_spec_for_wave(
                         &mut ws.spec.defaults,
-                        self.default_runner,
+                        default_runner,
                         cfg.as_ref(),
                         defaults_mask,
-                        true,
+                        false,
                     )?;
-                    let default_acct = ws.spec.defaults.account.clone();
+                    let explicit_wave_acct = ws.spec.defaults.account.clone();
                     for (idx, w) in ws.spec.workers.iter_mut().enumerate() {
                         if let Some(mut agent) = w.agent.take() {
                             let w_mask = ws
@@ -307,66 +277,76 @@ impl Service<WaveCommand> for WaveService {
                                 .get(idx)
                                 .copied()
                                 .unwrap_or(defaults_mask);
-                            let worker_slot = provider_slot_of(&agent.provider);
+                            let worker_had_account = agent.account.is_some();
                             let _ = resolve_agent_spec_for_wave(
                                 &mut agent,
-                                self.default_runner,
+                                default_runner,
                                 cfg.as_ref(),
                                 w_mask,
-                                true,
+                                !caller_defaults_had_account && !worker_had_account,
                             )?;
-                            if agent.account.is_none()
-                                && (caller_defaults_had_account
-                                    || (defaults_slot.is_some() && defaults_slot == worker_slot))
-                            {
-                                agent.account = default_acct.clone();
+                            if agent.account.is_none() && caller_defaults_had_account {
+                                agent.account = explicit_wave_acct.clone();
                             }
                             w.agent = Some(agent);
                         } else {
-                            w.agent = Some(ws.spec.defaults.clone());
+                            let mut agent = ws.spec.defaults.clone();
+                            let _ = resolve_agent_spec_for_wave(
+                                &mut agent,
+                                default_runner,
+                                cfg.as_ref(),
+                                (false, false),
+                                !caller_defaults_had_account,
+                            )?;
+                            w.agent = Some(agent);
                         }
                     }
-                    record_started = Some((ws.spec.slug.clone(), raw_json, ws.spec.clone()));
                 }
                 WaveCommand::WaveAddWorker(wa) => {
                     wa.config_defaults.account_from_config = false;
+                    wa.config_defaults.request_digest = None;
+                    let existing_defaults = match self
+                        .inner
+                        .dispatch(
+                            WaveCommand::WaveView(WaveView {
+                                wave: wa.wave.clone(),
+                            }),
+                            ctx.clone(),
+                        )
+                        .await
+                    {
+                        Ok(WireReply::WaveView(snap)) => Some(snap.spec.defaults),
+                        _ => None,
+                    };
+                    let wave_has_paying_account = existing_defaults
+                        .as_ref()
+                        .is_some_and(|d| d.account.is_some());
                     if let Some(ref mut agent) = wa.worker.agent {
                         let caller_had_account = agent.account.is_some();
                         let mask = (wa.config_defaults.permission, wa.config_defaults.workspace);
                         let (_, applied_acct) = resolve_agent_spec_for_wave(
                             agent,
-                            self.default_runner,
+                            default_runner,
                             cfg.as_ref(),
                             mask,
-                            !caller_had_account,
+                            !caller_had_account && !wave_has_paying_account,
                         )?;
                         wa.config_defaults.account_from_config = applied_acct;
+                    } else if let Some(mut agent) = existing_defaults {
+                        let (_, applied_acct) = resolve_agent_spec_for_wave(
+                            &mut agent,
+                            default_runner,
+                            cfg.as_ref(),
+                            (false, false),
+                            !wave_has_paying_account,
+                        )?;
+                        wa.config_defaults.account_from_config = applied_acct;
+                        wa.worker.agent = Some(agent);
                     }
                 }
                 _ => {}
             }
-            Ok(())
-        })();
-        let requested_specs = self.requested_specs.clone();
-        let spec_store_path = self.spec_store_path.clone();
-        Box::pin(async move {
-            prep_res?;
-            let reply = self.inner.dispatch(cmd, ctx).await?;
-            if let Some((slug, raw_json, resolved_spec)) = record_started {
-                let mut map = requested_specs.lock().unwrap_or_else(|e| e.into_inner());
-                if !map.contains_key(&slug) {
-                    if map.len() >= 2048
-                        && let Some(first) = map.keys().next().cloned()
-                    {
-                        map.remove(&first);
-                    }
-                    map.insert(slug, (raw_json, resolved_spec));
-                    if let Some(ref path) = spec_store_path {
-                        save_wave_request_specs(path, &map);
-                    }
-                }
-            }
-            Ok(reply)
+            self.inner.dispatch(cmd, ctx).await
         })
     }
 }
@@ -375,27 +355,57 @@ type PinnedAttemptKey = (WaveSlug, RoleName, u32);
 
 type PinnedRouterRow = (WaveSlug, RoleName, u32, RunnerKind, AgentSpec);
 
-fn load_router_pins(path: &Path) -> BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)> {
-    let Ok(bytes) = rex_wave_fs::read_regular_bounded(path, 2 * 1024 * 1024) else {
-        return BTreeMap::new();
-    };
-    let Ok(entries) = serde_json::from_slice::<Vec<PinnedRouterRow>>(&bytes) else {
-        return BTreeMap::new();
-    };
-    entries
-        .into_iter()
-        .map(|(w, r, a, runner, agent)| ((w, r, a), (runner, agent)))
-        .collect()
+#[derive(Default)]
+struct PinnedRouterStore {
+    order: VecDeque<PinnedAttemptKey>,
+    entries: BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)>,
 }
 
-fn save_router_pins(path: &Path, map: &BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)>) {
-    let entries: Vec<PinnedRouterRow> = map
-        .iter()
-        .map(|((w, r, a), (runner, agent))| (w.clone(), r.clone(), *a, *runner, agent.clone()))
-        .collect();
-    if let Ok(bytes) = serde_json::to_vec(&entries) {
-        let _ = rex_wave_fs::write_atomic_path(path, &bytes, 0o600, false);
+fn load_router_pins(path: &Path) -> PinnedRouterStore {
+    let Ok(bytes) = rex_wave_fs::read_regular_bounded(path, 2 * 1024 * 1024) else {
+        return PinnedRouterStore::default();
+    };
+    let Ok(rows) = serde_json::from_slice::<Vec<PinnedRouterRow>>(&bytes) else {
+        return PinnedRouterStore::default();
+    };
+    let mut store = PinnedRouterStore::default();
+    for (w, r, a, runner, agent) in rows {
+        let key = (w, r, a);
+        if !store.entries.contains_key(&key) {
+            store.order.push_back(key.clone());
+        }
+        store.entries.insert(key, (runner, agent));
     }
+    store
+}
+
+fn save_router_pins(path: &Path, store: &PinnedRouterStore) -> io::Result<()> {
+    let rows: Vec<PinnedRouterRow> = store
+        .order
+        .iter()
+        .filter_map(|k| {
+            store
+                .entries
+                .get(k)
+                .map(|(runner, agent)| (k.0.clone(), k.1.clone(), k.2, *runner, agent.clone()))
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&rows).map_err(io::Error::other)?;
+    rex_wave_fs::write_atomic_path(path, &bytes, 0o600, false)
+}
+
+/// Looks up a persisted runner pin for a legacy bare-provider worker attempt.
+pub fn lookup_pinned_runner(
+    path: &Path,
+    wave: &WaveSlug,
+    role: &RoleName,
+    attempt: u32,
+) -> Option<RunnerKind> {
+    let store = load_router_pins(path);
+    store
+        .entries
+        .get(&(wave.clone(), role.clone(), attempt))
+        .map(|(r, _)| *r)
 }
 
 /// N-way `AgentHost` multiplexer backed by `Arc<dyn AgentHost>` slots per [`RunnerKind`].
@@ -405,7 +415,7 @@ pub struct HostRouter {
     default_runner: RunnerKind,
     config_rx: Option<watch::Receiver<RexConfig>>,
     pin_store: Option<PathBuf>,
-    pinned_attempts: Arc<Mutex<BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)>>>,
+    pinned_attempts: Arc<Mutex<PinnedRouterStore>>,
 }
 
 impl HostRouter {
@@ -415,7 +425,7 @@ impl HostRouter {
             default_runner,
             config_rx: None,
             pin_store: None,
-            pinned_attempts: Arc::new(Mutex::new(BTreeMap::new())),
+            pinned_attempts: Arc::new(Mutex::new(PinnedRouterStore::default())),
         }
     }
 
@@ -428,7 +438,7 @@ impl HostRouter {
             default_runner,
             config_rx: None,
             pin_store: None,
-            pinned_attempts: Arc::new(Mutex::new(BTreeMap::new())),
+            pinned_attempts: Arc::new(Mutex::new(PinnedRouterStore::default())),
         }
     }
 
@@ -481,7 +491,7 @@ impl AgentHost for HostRouter {
                     .pinned_attempts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if let Some(existing) = pinned.get(&key).cloned() {
+                if let Some(existing) = pinned.entries.get(&key).cloned() {
                     Ok(existing)
                 } else {
                     let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
@@ -494,14 +504,28 @@ impl AgentHost for HostRouter {
                         Ok(routed) => {
                             effective_agent.provider = routed.provider;
                             let pair = (routed.target, effective_agent);
-                            if pinned.len() >= 1024
-                                && let Some(first) = pinned.keys().next().cloned()
+                            let mut evicted: Option<(PinnedAttemptKey, (RunnerKind, AgentSpec))> =
+                                None;
+                            if pinned.entries.len() >= 1024
+                                && let Some(oldest) = pinned.order.pop_front()
+                                && let Some(val) = pinned.entries.remove(&oldest)
                             {
-                                pinned.remove(&first);
+                                evicted = Some((oldest, val));
                             }
-                            pinned.insert(key, pair.clone());
-                            if let Some(ref path) = self.pin_store {
-                                save_router_pins(path, &pinned);
+                            pinned.order.push_back(key.clone());
+                            pinned.entries.insert(key.clone(), pair.clone());
+                            if let Some(ref path) = self.pin_store
+                                && let Err(e) = save_router_pins(path, &pinned)
+                            {
+                                pinned.entries.remove(&key);
+                                pinned.order.pop_back();
+                                if let Some((old_k, old_v)) = evicted {
+                                    pinned.order.push_front(old_k.clone());
+                                    pinned.entries.insert(old_k, old_v);
+                                }
+                                return Box::pin(async move {
+                                    Err(HostError::Unreachable(format!("persist router pin: {e}")))
+                                });
                             }
                             Ok(pair)
                         }
