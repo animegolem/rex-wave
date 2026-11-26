@@ -74,6 +74,14 @@ pub const SCRUBBED_DAEMON_ENV: &[&str] = &[
     "T3_ACP_MCP_ENTRYPOINT",
     "T3_ACP_MCP_AUTHORIZATION",
     "CLAUDE_PID",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
 ];
 
 trait ErasedBackend: Send + Sync {
@@ -223,7 +231,12 @@ async fn wait_for_rpc_response(
                         if let Some(err) = error {
                             return Ok(Err(err));
                         }
-                        return Ok(Ok(result.unwrap_or(Value::Null)));
+                        let Some(res) = result else {
+                            return Err(HostError::Rejected(format!(
+                                "malformed ACP JSON-RPC response for request {expected_id}: missing result and error"
+                            )));
+                        };
+                        return Ok(Ok(res));
                     }
                     Some(InboundMessage::Request { id, method, .. }) => {
                         let reply = method_not_found_response(id, &method);
@@ -489,11 +502,29 @@ enum SessionCmd {
     },
 }
 
+type PgidSlot = Arc<Mutex<Option<u32>>>;
+
+fn take_pgid_slot(slot: &PgidSlot) -> Option<u32> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+struct KillPgidOnDrop {
+    pgid: Option<u32>,
+}
+
+impl Drop for KillPgidOnDrop {
+    fn drop(&mut self) {
+        if let Some(g) = self.pgid.take() {
+            kill_process_group_now(g);
+        }
+    }
+}
+
 struct SessionEntry {
     wave: WaveSlug,
     role: RoleName,
     attempt: u32,
-    pgid: Mutex<Option<u32>>,
+    pgid_slot: PgidSlot,
     parked_snapshot: Mutex<Option<ParsedPermissionRequest>>,
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     feed: Arc<SessionFeed>,
@@ -504,7 +535,7 @@ struct SessionEntry {
 
 impl SessionEntry {
     fn take_pgid(&self) -> Option<u32> {
-        self.pgid.lock().unwrap_or_else(|e| e.into_inner()).take()
+        take_pgid_slot(&self.pgid_slot)
     }
 
     fn set_parked_snapshot(&self, parked: Option<ParsedPermissionRequest>) {
@@ -1030,18 +1061,15 @@ impl SessionActor {
 struct HandshakeCleanupGuard<'a> {
     bridge: &'a AcpBridge,
     thread: HostThreadId,
-    pgid: Option<u32>,
+    pgid_slot: PgidSlot,
     armed: bool,
 }
 
 impl Drop for HandshakeCleanupGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let pgid = self
-                .bridge
-                .take_active_process(&self.thread)
-                .or_else(|| self.pgid.take());
-            if let Some(g) = pgid {
+            self.bridge.unregister_active_process(&self.thread);
+            if let Some(g) = take_pgid_slot(&self.pgid_slot) {
                 kill_process_group_now(g);
             }
             self.bridge.unlink_worker_token(&self.thread);
@@ -1056,34 +1084,28 @@ pub struct AcpBridge {
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     registry: Mutex<SessionRegistry>,
     spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
-    active_processes: Mutex<HashMap<HostThreadId, Option<u32>>>,
+    active_processes: Mutex<HashMap<HostThreadId, PgidSlot>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<ProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<ProjectId, String>>>,
 }
 
 impl Drop for AcpBridge {
     fn drop(&mut self) {
-        let mut active_map: HashMap<HostThreadId, Option<u32>> = self
-            .active_processes
-            .lock()
-            .map(|mut g| g.drain().collect())
-            .unwrap_or_default();
+        if let Ok(mut active) = self.active_processes.lock() {
+            for (tid, slot) in active.drain() {
+                if let Some(g) = take_pgid_slot(&slot) {
+                    kill_process_group_now(g);
+                }
+                self.unlink_worker_token(&tid);
+            }
+        }
         if let Ok(reg) = self.registry.lock() {
             for (tid, entry) in &reg.by_id {
-                let pgid = entry
-                    .take_pgid()
-                    .or_else(|| active_map.remove(tid).flatten());
-                if let Some(g) = pgid {
+                if let Some(g) = entry.take_pgid() {
                     kill_process_group_now(g);
                 }
                 self.unlink_worker_token(tid);
             }
-        }
-        for (tid, pgid_opt) in active_map {
-            if let Some(g) = pgid_opt {
-                kill_process_group_now(g);
-            }
-            self.unlink_worker_token(&tid);
         }
     }
 }
@@ -1144,21 +1166,16 @@ impl AcpBridge {
             .map(|tid| self.retire_worker_thread(tid));
         let _ = futures_util::future::join_all(futs).await;
 
-        let leftover: Vec<(HostThreadId, Option<u32>)> = {
+        let leftover: Vec<(HostThreadId, PgidSlot)> = {
             let mut active = self
                 .active_processes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             active.drain().collect()
         };
-        for (tid, pgid_opt) in leftover {
+        for (tid, slot) in leftover {
             self.unlink_worker_token(&tid);
-            let entry = self.get_session(&tid);
-            let pgid = entry
-                .as_deref()
-                .and_then(SessionEntry::take_pgid)
-                .or(pgid_opt);
-            if let Some(g) = pgid {
+            if let Some(g) = take_pgid_slot(&slot) {
                 kill_process_group_now(g);
                 let deadline = std::time::Instant::now() + Duration::from_millis(300);
                 while process_group_alive(g) && std::time::Instant::now() < deadline {
@@ -1168,25 +1185,23 @@ impl AcpBridge {
         }
     }
 
-    fn register_active_process(&self, thread: &HostThreadId, pgid: Option<u32>) {
+    fn register_active_process(&self, thread: &HostThreadId, slot: PgidSlot) {
         self.active_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(thread.clone(), pgid);
+            .insert(thread.clone(), slot);
     }
 
-    fn take_active_process(&self, thread: &HostThreadId) -> Option<u32> {
+    fn unregister_active_process(&self, thread: &HostThreadId) {
         self.active_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(thread)
-            .flatten()
+            .remove(thread);
     }
 
     fn claim_pgid(&self, thread: &HostThreadId, entry: Option<&SessionEntry>) -> Option<u32> {
-        let from_entry = entry.and_then(SessionEntry::take_pgid);
-        let from_active = self.take_active_process(thread);
-        from_entry.or(from_active)
+        self.unregister_active_process(thread);
+        entry.and_then(SessionEntry::take_pgid)
     }
 
     fn evict_excess_archived_sessions(&self) {
@@ -1308,11 +1323,12 @@ impl AcpBridge {
             None
         };
 
-        self.register_active_process(&thread, None);
+        let pgid_slot: PgidSlot = Arc::new(Mutex::new(None));
+        self.register_active_process(&thread, pgid_slot.clone());
         let mut hs_guard = HandshakeCleanupGuard {
             bridge: self,
             thread: thread.clone(),
-            pgid: None,
+            pgid_slot: pgid_slot.clone(),
             armed: true,
         };
 
@@ -1349,9 +1365,7 @@ impl AcpBridge {
             }
         };
 
-        let pgid = child.id();
-        hs_guard.pgid = pgid;
-        self.register_active_process(&thread, pgid);
+        *pgid_slot.lock().unwrap_or_else(|e| e.into_inner()) = child.id();
         let mut stdin = child
             .stdin
             .take()
@@ -1538,12 +1552,14 @@ impl AcpBridge {
             Ok(tuple) => tuple,
             Err(err) => {
                 drop(stdin);
-                let reap_pgid = self.take_active_process(&thread).or(pgid);
-                hs_guard.pgid = reap_pgid;
+                let reap_pgid = take_pgid_slot(&pgid_slot);
+                let mut kill_guard = KillPgidOnDrop { pgid: reap_pgid };
                 terminate_and_reap_process_group(&mut child, reap_pgid, self.cfg.retire_grace)
                     .await;
+                kill_guard.pgid = None;
                 reader_handle.abort();
                 stderr_handle.abort();
+                self.unregister_active_process(&thread);
                 self.unlink_worker_token(&thread);
                 hs_guard.armed = false;
                 return Err(err);
@@ -1571,7 +1587,7 @@ impl AcpBridge {
             wave: req.wave.clone(),
             role: req.role.clone(),
             attempt: req.attempt,
-            pgid: Mutex::new(pgid),
+            pgid_slot,
             parked_snapshot: Mutex::new(None),
             cmd_tx,
             feed,

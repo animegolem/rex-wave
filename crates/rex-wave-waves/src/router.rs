@@ -358,8 +358,8 @@ impl Service<WaveCommand> for WaveService {
                     }
                 }
                 WaveCommand::WaveResolve(wr) => {
-                    if let Some(host) = self.host.get()
-                        && let Ok(WireReply::WaveView(snap)) = self
+                    if let Some(host) = self.host.get() {
+                        let snap = match self
                             .inner
                             .dispatch(
                                 WaveCommand::WaveView(WaveView {
@@ -367,28 +367,54 @@ impl Service<WaveCommand> for WaveService {
                                 }),
                                 ctx.clone(),
                             )
-                            .await
-                        && let Some((
-                            _,
-                            _,
-                            rex_wave_api::wave::WorkerPhase::Live { thread, activity },
-                        )) = snap.workers.iter().find(|(r, _, _)| r == &wr.role)
-                        && let rex_wave_api::wave::Activity::Blocked { interaction } = activity
-                        && interaction.id == wr.interaction
-                    {
-                        match host
-                            .validate_resolve(thread, &wr.interaction, &wr.resolution)
-                            .await
+                            .await?
                         {
-                            Ok(()) => {}
-                            Err(HostError::Rejected(reason)) => {
-                                return Err(ApiError::Invalid(InvalidId {
-                                    what: "resolution".into(),
-                                    reason,
-                                }));
+                            WireReply::WaveView(s) => s,
+                            other => {
+                                return Err(ApiError::Internal(format!(
+                                    "unexpected WaveView reply: {other:?}"
+                                )));
                             }
-                            Err(HostError::Unreachable(msg)) => {
-                                return Err(ApiError::Transport(msg));
+                        };
+                        let (_, _, phase) = snap
+                            .workers
+                            .iter()
+                            .find(|(r, _, _)| r == &wr.role)
+                            .ok_or_else(|| ApiError::NotFound {
+                                what: format!("worker @{}/{}", wr.wave, wr.role),
+                            })?;
+                        match phase {
+                            rex_wave_api::wave::WorkerPhase::Live {
+                                thread,
+                                activity: rex_wave_api::wave::Activity::Blocked { interaction },
+                            } => {
+                                if interaction.id != wr.interaction {
+                                    return Err(ApiError::conflict(format!(
+                                        "worker @{}/{} is blocked on {}, not {}",
+                                        wr.wave, wr.role, interaction.id, wr.interaction
+                                    )));
+                                }
+                                match host
+                                    .validate_resolve(thread, &wr.interaction, &wr.resolution)
+                                    .await
+                                {
+                                    Ok(()) => {}
+                                    Err(HostError::Rejected(reason)) => {
+                                        return Err(ApiError::Invalid(InvalidId {
+                                            what: "resolution".into(),
+                                            reason,
+                                        }));
+                                    }
+                                    Err(HostError::Unreachable(msg)) => {
+                                        return Err(ApiError::Transport(msg));
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(ApiError::conflict(format!(
+                                    "worker @{}/{} has no pending interaction ({other:?})",
+                                    wr.wave, wr.role
+                                )));
                             }
                         }
                     }

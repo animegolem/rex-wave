@@ -9,6 +9,26 @@ use tokio::process::Command;
 
 static WORKTREE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
+const SCRUBBED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+];
+
+fn git_in(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    for key in SCRUBBED_GIT_ENV {
+        cmd.env_remove(key);
+    }
+    cmd.arg("-C").arg(dir);
+    cmd
+}
+
 /// Resolves the working directory for a wave worker (`ProjectDefault`,
 /// `ExistingPath`, or `ManagedWorktree`). When `workspace` is `ManagedWorktree`
 /// and the project root is a git work tree, provisions (or reuses) an isolated
@@ -93,9 +113,7 @@ pub async fn resolve_acp_workspace(
                     trimmed
                 }
             };
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&project_root)
+            let out = git_in(&project_root)
                 .args(["worktree", "add", "--detach"])
                 .arg(&wt_path)
                 .arg(base_ref)
@@ -118,9 +136,7 @@ pub async fn resolve_acp_workspace(
 }
 
 async fn is_git_work_tree(dir: &Path) -> bool {
-    let Ok(out) = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let Ok(out) = git_in(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .await
@@ -131,13 +147,7 @@ async fn is_git_work_tree(dir: &Path) -> bool {
 }
 
 async fn git_rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", flag])
-        .output()
-        .await
-        .ok()?;
+    let out = git_in(dir).args(["rev-parse", flag]).output().await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -181,9 +191,7 @@ async fn is_registered_worktree_for(project_root: &Path, wt_path: &Path) -> bool
     if proj_common != wt_common {
         return false;
     }
-    let Ok(out) = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let Ok(out) = git_in(project_root)
         .args(["worktree", "list", "--porcelain"])
         .output()
         .await

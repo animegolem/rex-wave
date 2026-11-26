@@ -2017,10 +2017,14 @@ fn render_agent(
 
 fn agent_feed(inspector: &AgentInspector, width: u16) -> Vec<FeedItem> {
     let pal = palette();
-    let latest = inspector.latest_text_seq();
+    let display = inspector.display_events();
+    let latest = display
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind, AgentEventKind::AssistantText { .. }))
+        .map(|e| e.seq);
     let content_w = width.saturating_sub(1);
-    inspector
-        .display_events()
+    display
         .iter()
         .map(|ev| {
             let focused = inspector.focused == Some(ev.seq);

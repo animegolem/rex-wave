@@ -333,7 +333,20 @@ fn init_temp_git_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("demo-repo");
     std::fs::create_dir_all(&repo).unwrap();
     let run_git = |args: &[&str]| {
-        let out = StdCommand::new("git")
+        let mut cmd = StdCommand::new("git");
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            cmd.env_remove(key);
+        }
+        let out = cmd
             .arg("-C")
             .arg(&repo)
             .args(args)

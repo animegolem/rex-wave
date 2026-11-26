@@ -429,18 +429,22 @@ pub fn validate_selected_config_model(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
-        })
-        .or_else(|| extract_model_config_option(reply).and_then(|o| o.current_value));
+        });
 
     if observed.as_deref() != Some(requested) {
         return Err(HostError::Rejected(format!(
-            "ACP provider did not honor requested model '{requested}' in session/set_config_option reply (currentValue={observed:?})"
+            "ACP provider did not honor requested model '{requested}' for configId '{config_id}' in session/set_config_option reply (currentValue={observed:?})"
         )));
     }
     ModelId::parse(requested).map_err(|e| HostError::Rejected(e.to_string()))
 }
 
 pub fn validate_selected_models_obj(reply: &Value, requested: &str) -> Result<ModelId, HostError> {
+    if !reply.is_object() {
+        return Err(HostError::Rejected(
+            "ACP session/set_model reply must be a JSON object".into(),
+        ));
+    }
     if let Some(actual) = extract_session_model(reply) {
         if actual.as_str() != requested {
             return Err(HostError::Rejected(format!(
@@ -460,8 +464,20 @@ pub fn is_cancellation_jsonrpc_error(err: Option<&Value>, formatted_msg: &str) -
     if err.and_then(jsonrpc_error_code) == Some(-32800) {
         return true;
     }
-    let low = formatted_msg.to_ascii_lowercase();
-    low.contains("cancel") || low.contains("aborted") || low.contains("interrupted")
+    let low = formatted_msg.trim().to_ascii_lowercase();
+    matches!(
+        low.as_str(),
+        "cancelled"
+            | "canceled"
+            | "request cancelled"
+            | "request canceled"
+            | "prompt cancelled"
+            | "prompt canceled"
+            | "turn cancelled"
+            | "turn canceled"
+            | "session cancelled"
+            | "session canceled"
+    )
 }
 
 pub fn format_jsonrpc_error(err: &Value) -> String {
@@ -1374,5 +1390,42 @@ mod tests {
             ),
             PromptOutcome::Errored { ref error, .. } if error == "upstream timeout"
         ));
+
+        // Strict cancellation JSON-RPC error classification does not swallow ordinary DB/network errors.
+        assert!(!is_cancellation_jsonrpc_error(
+            Some(&json!({ "code": -32603, "message": "upstream database connection interrupted" })),
+            "upstream database connection interrupted"
+        ));
+        assert!(is_cancellation_jsonrpc_error(
+            Some(&json!({ "code": -32800, "message": "Server error" })),
+            "Server error"
+        ));
+        assert!(is_cancellation_jsonrpc_error(
+            Some(&json!({ "code": -32000, "message": "Request cancelled" })),
+            "Request cancelled"
+        ));
+
+        // Model reply validators require exact configId and object envelope.
+        assert!(
+            validate_selected_config_model(
+                &json!({
+                    "configOptions": [{
+                        "id": "secondary-model",
+                        "category": "model",
+                        "currentValue": "chosen"
+                    }]
+                }),
+                "worker-model",
+                "chosen"
+            )
+            .is_err()
+        );
+        assert!(validate_selected_models_obj(&Value::Null, "chosen").is_err());
+        assert_eq!(
+            validate_selected_models_obj(&json!({}), "chosen")
+                .unwrap()
+                .as_str(),
+            "chosen"
+        );
     }
 }
