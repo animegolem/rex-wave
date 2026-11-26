@@ -108,7 +108,7 @@ async fn ensure_managed_worktree(
     ensure_real_dir(&wave_dir, "wave worktrees directory")?;
 
     let wt_path = wave_dir.join(req.role.as_str());
-    if is_registered_worktree_for(project_root, &wt_path, &req.wave, &req.role).await {
+    if verify_or_heal_worktree_for(project_root, &wt_path, &req.wave, &req.role).await {
         let resolved = rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
         return Ok(resolved);
     }
@@ -222,7 +222,7 @@ async fn git_rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     Some(rex_wave_fs::canonicalize_existing_prefix(&joined).unwrap_or(joined))
 }
 
-async fn is_registered_worktree_for(
+async fn verify_or_heal_worktree_for(
     project_root: &Path,
     wt_path: &Path,
     wave: &WaveSlug,
@@ -261,17 +261,6 @@ async fn is_registered_worktree_for(
     let Some(wt_git_dir) = git_rev_parse_path(wt_path, "--git-dir").await else {
         return false;
     };
-    let Ok(marker_bytes) =
-        rex_wave_fs::read_regular_bounded(&wt_git_dir.join(OWNER_MARKER_FILE), 4096)
-    else {
-        return false;
-    };
-    let Ok(marker) = serde_json::from_slice::<WorktreeOwnerMarker>(&marker_bytes) else {
-        return false;
-    };
-    if marker.wave != wave.as_str() || marker.role != role.as_str() {
-        return false;
-    }
     let Ok(out) = git_in(project_root)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -283,7 +272,7 @@ async fn is_registered_worktree_for(
         return false;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
+    let registered_in_repo = stdout
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .any(|registered| {
@@ -292,5 +281,32 @@ async fn is_registered_worktree_for(
                 return false;
             };
             canon_reg != canon_proj && canon_reg == canon_wt
-        })
+        });
+    if !registered_in_repo {
+        return false;
+    }
+
+    let marker_path = wt_git_dir.join(OWNER_MARKER_FILE);
+    if rex_wave_fs::entry_exists(&marker_path) {
+        let Ok(marker_bytes) = rex_wave_fs::read_regular_bounded(&marker_path, 4096) else {
+            return false;
+        };
+        let Ok(marker) = serde_json::from_slice::<WorktreeOwnerMarker>(&marker_bytes) else {
+            return false;
+        };
+        return marker.wave == wave.as_str() && marker.role == role.as_str();
+    }
+
+    // Recover from an interrupted prior attempt that finished `git worktree add` at our
+    // verified injective `<project>/.worktrees/rex-wave/<wave>/<role>` path before writing
+    // `rex-wave-owner.json`.
+    let expected_wt = canon_proj
+        .join(".worktrees")
+        .join("rex-wave")
+        .join(wave.as_str())
+        .join(role.as_str());
+    if canon_wt != expected_wt {
+        return false;
+    }
+    write_owner_marker(wt_path, wave, role).await.is_ok()
 }

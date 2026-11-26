@@ -2315,3 +2315,721 @@ for raw in sys.stdin:
     h.claude.shutdown().await;
     h.codex.shutdown().await;
 }
+
+#[tokio::test]
+async fn round3_steer_interrupt_resume_fencing_broken_pipe_approval_and_partial_worktree() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let eof_marker = script_dir.path().join("resume_race_stdout_closed");
+
+    // Claude mock covering all Round 2 findings:
+    // 1) Steer interrupt -> emits `result { subtype: "error_during_execution", is_error: True }`
+    //    and then receives the steered prompt cleanly without marking worker Errored!
+    // 2) Resume `in_flight` race (`RESUME_RACE`): old process closes stdout after `result` and sleeps
+    //    before exit so old reader lingers in `child.wait()`; resumed process blocks on `resumed_hold`
+    //    so test can prove feed stays Working/Blocked and a third `Start` is rejected!
+    // 3) Crash mid-approval (`stale_perm`) without `result`, then `--resume` emits `fresh_perm`!
+    // 4) Broken pipe on approval (`broken_perm`): closes stdin immediately after `control_request`!
+    // 5) QueueIfActive cancelled prompt recording when active turn errors!
+    let claude_script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, sys, time
+
+eof_marker = {eof_marker:?}
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+resumed = "--resume" in sys.argv[1:]
+line1 = sys.stdin.readline()
+msg1 = json.loads(line1)
+text1 = msg1["message"]["content"][0]["text"]
+
+if "STEER_CASE" in text1:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_steer"}})
+    emit({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "Working turn 1"}}]}}}})
+    intr = json.loads(sys.stdin.readline())
+    assert intr["type"] == "control_request"
+    assert intr["request"]["subtype"] == "interrupt"
+    emit({{"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": "s_steer"}})
+    msg2 = json.loads(sys.stdin.readline())
+    assert "steered replacement" in msg2["message"]["content"][0]["text"]
+    emit({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "Completed steered turn"}}]}}}})
+    emit({{"type": "result", "subtype": "success", "is_error": False, "session_id": "s_steer"}})
+elif "RESUME_RACE" in text1 and not resumed:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_rrace"}})
+    emit({{"type": "result", "subtype": "success", "is_error": False, "session_id": "s_rrace"}})
+    os.close(0)
+    os.close(1)
+    with open(eof_marker, "w") as f:
+        f.write("closed\n")
+    time.sleep(0.18)
+    sys.exit(0)
+elif resumed and "s_rrace" in sys.argv[1:]:
+    assert "resumed second turn" in text1
+    emit({{"type": "system", "subtype": "init", "session_id": "s_rrace"}})
+    emit({{
+        "type": "control_request",
+        "request_id": "resumed_hold",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo hold"}}}}
+    }})
+    ctrl = json.loads(sys.stdin.readline())
+    assert ctrl["response"]["request_id"] == "resumed_hold"
+    emit({{"type": "result", "subtype": "success", "is_error": False, "session_id": "s_rrace"}})
+elif "CRASH_APPROVAL" in text1 and not resumed:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_crash_perm"}})
+    emit({{
+        "type": "control_request",
+        "request_id": "stale_perm",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo stale"}}}}
+    }})
+    sys.exit(1)
+elif resumed and "s_crash_perm" in sys.argv[1:]:
+    assert "recover after crash" in text1
+    emit({{"type": "system", "subtype": "init", "session_id": "s_crash_perm"}})
+    emit({{
+        "type": "control_request",
+        "request_id": "fresh_perm",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo fresh"}}}}
+    }})
+    ctrl = json.loads(sys.stdin.readline())
+    assert ctrl["response"]["request_id"] == "fresh_perm"
+    emit({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "Recovered fresh approval"}}]}}}})
+    emit({{"type": "result", "subtype": "success", "is_error": False, "session_id": "s_crash_perm"}})
+elif "BROKEN_PIPE" in text1:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_bpipe"}})
+    emit({{
+        "type": "control_request",
+        "request_id": "broken_perm",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo bp"}}}}
+    }})
+    os.close(0)
+    time.sleep(30)
+elif "QUEUE_ERR" in text1:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_qerr"}})
+    emit({{
+        "type": "control_request",
+        "request_id": "qerr_gate",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo gate"}}}}
+    }})
+    _ = json.loads(sys.stdin.readline())
+    emit({{"type": "result", "subtype": "error_during_execution", "is_error": True, "error": "boom"}})
+"#,
+        eof_marker = eof_marker.to_string_lossy()
+    );
+
+    let codex_script = r#"#!/usr/bin/env python3
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    m = msg.get("method")
+    rid = msg.get("id")
+    if m == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif m == "account/read":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"account": {"type": "apiKey"}, "requiresOpenaiAuth": False}})
+    elif m == "thread/start":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": "cx_r3"}, "model": "gpt-6.1-sol"}})
+    elif m == "turn/start":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": "t1", "status": "inProgress"}}})
+        send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "cx_r3", "turn": {"id": "t1", "status": "inProgress"}}})
+        send({
+            "jsonrpc": "2.0",
+            "id": 501,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "cx_r3", "turnId": "t1", "itemId": "cmd_amend", "command": "cargo test"}
+        })
+    elif m is None and rid == 501:
+        send({
+            "jsonrpc": "2.0",
+            "id": 502,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "cx_r3",
+                "turnId": "t1",
+                "itemId": "perm_sub",
+                "cwd": "/tmp",
+                "startedAtMs": 1,
+                "permissions": {"network": {"enabled": False}, "fileSystem": {"read": ["/tmp/ok"]}}
+            }
+        })
+    elif m is None and rid == 502:
+        send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "cx_r3", "turn": {"id": "t1", "status": "completed"}}})
+"#;
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-cl-r3", &claude_script);
+    let codex_bin = write_executable_script(script_dir.path(), "mock-cx-r3", codex_script);
+    let h = TestHarness::new(claude_bin, codex_bin).await;
+
+    // 1. Opus Blocker: Claude Steer interrupt -> error_during_execution -> dispatches steered prompt cleanly!
+    let w_steer = WaveSlug::parse("r3-steer").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_steer.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify Claude Steer interrupt recovery").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("STEER_CASE").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    h.wait_page(&w_steer, &role, |p| {
+        p.events.iter().any(|e| {
+            matches!(&e.kind, AgentEventKind::AssistantText { text } if text == "Working turn 1")
+        })
+    })
+    .await;
+
+    h.operator
+        .call(WaveTell {
+            wave: w_steer.clone(),
+            role: role.clone(),
+            body: Body::parse("steered replacement").unwrap(),
+            mode: SteerDeliveryMode::SteerIfActive,
+        })
+        .await
+        .unwrap();
+
+    h.wait_page(&w_steer, &role, |p| {
+        p.events.iter().any(|e| {
+            matches!(&e.kind, AgentEventKind::AssistantText { text } if text == "Completed steered turn")
+        })
+    })
+    .await;
+
+    let steer_snap = h
+        .wait_wave(&w_steer, |s| {
+            matches!(
+                worker_phase(s, &role),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Idle,
+                    ..
+                })
+            )
+        })
+        .await;
+    assert_eq!(steer_snap.counts.errored, 0);
+
+    // 2. Astra Blocker #1: Resume `in_flight` ownership transfer prevents duplicate Start while resumed turn runs!
+    let w_rrace = WaveSlug::parse("r3-rrace").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_rrace.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify resume in_flight fencing").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("RESUME_RACE").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let eof_deadline = Instant::now() + Duration::from_secs(5);
+    while !eof_marker.exists() && Instant::now() < eof_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(eof_marker.exists());
+
+    let rrace_tid = HostThreadId::parse("claude:r3-rrace:author:a1").unwrap();
+    let claude_host = ClaudeHost(h.claude.clone());
+    claude_host
+        .tell(
+            &rrace_tid,
+            &Body::parse("resumed second turn").unwrap(),
+            SteerDeliveryMode::Start,
+        )
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_rrace, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "resumed_hold"
+        )
+    })
+    .await;
+
+    // Wait past the old process's 180ms sleep and prove `in_flight` stayed owned by generation 2!
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    let third_start = claude_host
+        .tell(
+            &rrace_tid,
+            &Body::parse("illegal overlapping start").unwrap(),
+            SteerDeliveryMode::Start,
+        )
+        .await;
+    assert!(
+        third_start.is_err(),
+        "concurrent Start must fail while resumed turn is active"
+    );
+
+    h.operator
+        .call(WaveResolve {
+            wave: w_rrace.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("resumed_hold").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_rrace, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // 3. Astra Blocker #2: Crashed Claude process clears `stale_perm` so `--resume` surfaces `fresh_perm`!
+    let w_crash = WaveSlug::parse("r3-crash-perm").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_crash.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify stale approval cleared on crash").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("CRASH_APPROVAL").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_crash, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Errored { .. },
+                ..
+            })
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveTell {
+            wave: w_crash.clone(),
+            role: role.clone(),
+            body: Body::parse("recover after crash").unwrap(),
+            mode: SteerDeliveryMode::Auto,
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_crash, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "fresh_perm"
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveResolve {
+            wave: w_crash.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("fresh_perm").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_crash, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // 4. Astra Blocker #3: Broken pipe during approval delivery transitions worker to terminal Errored (never Working).
+    let w_bp = WaveSlug::parse("r3-bpipe").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_bp.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify broken pipe approval delivery").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("BROKEN_PIPE").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_bp, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "broken_perm"
+        )
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.operator
+        .call(WaveResolve {
+            wave: w_bp.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("broken_perm").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_bp, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Errored { .. },
+                ..
+            })
+        )
+    })
+    .await;
+    let bp_page = h
+        .router
+        .read
+        .agents
+        .page(&w_bp, &role, None, 50)
+        .await
+        .unwrap();
+    assert!(matches!(bp_page.activity, Activity::Errored { .. }));
+
+    // 5. Astra Blocker #4: Codex pre-commit validation rejects null execpolicy amendment & widened raw permissions.
+    let w_cx = WaveSlug::parse("r3-cx-val").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_cx.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify Codex RequestAnswer schema and subset checks").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("codex").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("check approvals").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_cx, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "cmd_amend"
+        )
+    })
+    .await;
+
+    let bad_amend = h
+        .operator
+        .call(WaveResolve {
+            wave: w_cx.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("cmd_amend").unwrap(),
+            resolution: InteractionResolution::RequestAnswer {
+                value: serde_json::json!({"decision": {"acceptWithExecpolicyAmendment": null}}),
+            },
+        })
+        .await;
+    assert!(bad_amend.is_err());
+
+    h.operator
+        .call(WaveResolve {
+            wave: w_cx.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("cmd_amend").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_cx, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "perm_sub"
+        )
+    })
+    .await;
+
+    let bad_raw_perm = h
+        .operator
+        .call(WaveResolve {
+            wave: w_cx.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("perm_sub").unwrap(),
+            resolution: InteractionResolution::RequestAnswer {
+                value: serde_json::json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"}),
+            },
+        })
+        .await;
+    assert!(bad_raw_perm.is_err());
+
+    h.operator
+        .call(WaveResolve {
+            wave: w_cx.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("perm_sub").unwrap(),
+            resolution: InteractionResolution::RequestAnswer {
+                value: serde_json::json!({"permissions": {"fileSystem": {"read": ["/tmp/ok"]}}, "scope": "turn"}),
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_cx, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // 6. Astra Should #5 & #6: Partial registered git worktree without marker heals on retry,
+    //    and queued prompt cancelled on turn error records `cancelled_queued_prompt`.
+    let partial_wt = h.project_dir.join(".worktrees/rex-wave/r3-partial/author");
+    std::fs::create_dir_all(partial_wt.parent().unwrap()).unwrap();
+    let mut wt_cmd = StdCommand::new("git");
+    for k in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        wt_cmd.env_remove(k);
+    }
+    let wt_out = wt_cmd
+        .arg("-C")
+        .arg(&h.project_dir)
+        .args(["worktree", "add", "-b", "rex-wave/r3-partial/author"])
+        .arg(&partial_wt)
+        .arg("HEAD")
+        .output()
+        .unwrap();
+    assert!(wt_out.status.success());
+
+    let w_pwt = WaveSlug::parse("r3-partial").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_pwt.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify partial worktree healing and cancelled queue log")
+                    .unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ManagedWorktree {
+                        base: BaseBranch::Default,
+                    },
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: role.clone(),
+                    brief: Body::parse("QUEUE_ERR").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_pwt, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "qerr_gate"
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveTell {
+            wave: w_pwt.clone(),
+            role: role.clone(),
+            body: Body::parse("must record cancellation").unwrap(),
+            mode: SteerDeliveryMode::QueueIfActive,
+        })
+        .await
+        .unwrap();
+
+    h.operator
+        .call(WaveResolve {
+            wave: w_pwt.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("qerr_gate").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_pwt, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Errored { .. },
+                ..
+            })
+        )
+    })
+    .await;
+
+    let qerr_page = h
+        .wait_page(&w_pwt, &role, |p| {
+            p.events.iter().any(|e| {
+                matches!(&e.kind, AgentEventKind::Other { bb_type } if bb_type.contains("cancelled_queued_prompt (turn_errored): must record cancellation"))
+            })
+        })
+        .await;
+    assert!(matches!(qerr_page.activity, Activity::Errored { .. }));
+
+    h.claude.shutdown().await;
+    h.codex.shutdown().await;
+}

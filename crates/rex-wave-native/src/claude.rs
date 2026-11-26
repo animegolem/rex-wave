@@ -732,6 +732,7 @@ fn extract_tool_result_summary(content: Option<&Value>) -> String {
 
 #[derive(Clone)]
 struct PendingClaudeControl {
+    generation: u64,
     interaction: PendingInteraction,
     orig_input: Value,
     permission_suggestions: Option<Value>,
@@ -739,7 +740,28 @@ struct PendingClaudeControl {
 
 struct ClaudeTurnQueue {
     in_flight: bool,
+    in_flight_generation: u64,
+    dispatching: bool,
+    interrupt_pending: bool,
+    unstarted_prompt: Option<String>,
     queued: VecDeque<String>,
+}
+
+fn push_cancelled_claude_prompts(
+    log_lock: &Mutex<ThreadEventLog>,
+    cancelled: Vec<String>,
+    why: &str,
+) {
+    if cancelled.is_empty() {
+        return;
+    }
+    let mut log = log_lock.lock().unwrap_or_else(|e| e.into_inner());
+    for queued in cancelled {
+        let preview = truncate_summary(queued.trim(), 160);
+        log.push_event(AgentEventKind::Other {
+            bb_type: format!("cancelled_queued_prompt ({why}): {preview}"),
+        });
+    }
 }
 
 struct ClaudeWorkerState {
@@ -922,6 +944,7 @@ impl ClaudeBridge {
         &self,
         worker: &Arc<ClaudeWorkerState>,
         resume_session_id: Option<&str>,
+        generation: u64,
     ) -> Result<(LiveChild, PgidSlot, mpsc::UnboundedSender<StdinLine>), HostError> {
         let args = build_claude_args(&self.cfg, &worker.req, resume_session_id);
         let mut cmd = Command::new(self.cfg.effective_bin());
@@ -943,7 +966,6 @@ impl ClaudeBridge {
 
         let (mut child, pgid) = spawn_in_process_group(&mut cmd)?;
         let pgid_slot = new_pgid_slot(pgid);
-        let generation = worker.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let stdin_opt = child.stdin.take();
         let stdout_opt = child.stdout.take();
         let stderr_opt = child.stderr.take();
@@ -1032,9 +1054,13 @@ impl ClaudeBridge {
             unresumable_dead: AtomicBool::new(false),
             turn_queue: Mutex::new(ClaudeTurnQueue {
                 in_flight: true,
+                in_flight_generation: 1,
+                dispatching: false,
+                interrupt_pending: false,
+                unstarted_prompt: None,
                 queued: VecDeque::new(),
             }),
-            generation: AtomicU64::new(0),
+            generation: AtomicU64::new(1),
             interrupt_seq: AtomicU64::new(0),
             session_id: Mutex::new(None),
             last_model: Mutex::new(None),
@@ -1046,7 +1072,8 @@ impl ClaudeBridge {
             turn_lock: tokio::sync::Mutex::new(()),
         });
 
-        let (mut live, pgid_slot, stdin_tx) = match self.spawn_process_for_worker(&worker, None) {
+        let (mut live, pgid_slot, stdin_tx) = match self.spawn_process_for_worker(&worker, None, 1)
+        {
             Ok(triple) => triple,
             Err(err) => {
                 revoke_native_worker_token(self.cfg.state_dir.as_deref(), &thread);
@@ -1121,6 +1148,48 @@ impl ClaudeBridge {
         &self,
         worker: &Arc<ClaudeWorkerState>,
         prompt_text: &str,
+        record_user_event: bool,
+    ) -> Result<(), HostError> {
+        let thread = &worker.thread;
+        if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
+            let cancelled = {
+                let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                tq.in_flight = false;
+                tq.dispatching = false;
+                tq.interrupt_pending = false;
+                tq.unstarted_prompt = None;
+                tq.queued.drain(..).collect::<Vec<_>>()
+            };
+            push_cancelled_claude_prompts(&worker.log, cancelled, "retired");
+            return Err(HostError::Rejected(format!(
+                "Claude thread {thread} is retired"
+            )));
+        }
+
+        {
+            let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+            tq.in_flight = true;
+            tq.dispatching = true;
+        }
+
+        let res = self
+            .dispatch_prompt_inner(worker, prompt_text, record_user_event)
+            .await;
+
+        worker
+            .turn_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dispatching = false;
+
+        res
+    }
+
+    async fn dispatch_prompt_inner(
+        &self,
+        worker: &Arc<ClaudeWorkerState>,
+        prompt_text: &str,
+        record_user_event: bool,
     ) -> Result<(), HostError> {
         let thread = &worker.thread;
         let prompt_line = encode_claude_user_turn(prompt_text);
@@ -1129,7 +1198,7 @@ impl ClaudeBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|(_, tx)| tx.clone());
+            .cloned();
 
         if existing_stdin.is_none()
             && worker
@@ -1138,17 +1207,20 @@ impl ClaudeBridge {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_none()
         {
-            worker
-                .turn_queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .in_flight = false;
+            let cancelled = {
+                let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                tq.in_flight = false;
+                tq.interrupt_pending = false;
+                tq.unstarted_prompt = None;
+                tq.queued.drain(..).collect::<Vec<_>>()
+            };
+            push_cancelled_claude_prompts(&worker.log, cancelled, "session_unavailable");
             return Err(HostError::Unreachable(format!(
                 "Claude thread {thread} exited before reporting session_id; cannot resume"
             )));
         }
 
-        {
+        if record_user_event {
             let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
             log.push_event(AgentEventKind::UserMessage {
                 text: prompt_text.to_owned(),
@@ -1158,15 +1230,52 @@ impl ClaudeBridge {
         worker.emit_activity(Activity::Working, false);
 
         let mut sent = false;
-        if let Some(tx) = existing_stdin
-            && write_stdin_line(&tx, prompt_line.clone(), "Claude")
+        if let Some((cur_gen, tx)) = existing_stdin {
+            {
+                let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                tq.in_flight = true;
+                tq.in_flight_generation = cur_gen;
+                tq.interrupt_pending = false;
+                tq.unstarted_prompt = Some(prompt_text.to_owned());
+            }
+            if write_stdin_line(&tx, prompt_line.clone(), "Claude")
                 .await
                 .is_ok()
-        {
-            sent = true;
+            {
+                let still_open = worker
+                    .stdin_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|(g, _)| *g == cur_gen);
+                if still_open {
+                    sent = true;
+                }
+            }
         }
 
         if !sent {
+            // Fence generation and transfer turn ownership BEFORE awaiting old-process teardown so
+            // the exiting process's stdout reader cannot clear `in_flight` or emit a stale `Idle`.
+            let next_gen = worker.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            {
+                let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                tq.in_flight = true;
+                tq.in_flight_generation = next_gen;
+                tq.interrupt_pending = false;
+                tq.unstarted_prompt = None;
+            }
+            worker
+                .pending_controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            worker
+                .stdin_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+
             let session_id = match worker
                 .session_id
                 .lock()
@@ -1178,11 +1287,12 @@ impl ClaudeBridge {
                     let msg = format!(
                         "Claude thread {thread} exited before reporting session_id; cannot resume"
                     );
-                    worker
-                        .turn_queue
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .in_flight = false;
+                    let cancelled = {
+                        let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        tq.in_flight = false;
+                        tq.queued.drain(..).collect::<Vec<_>>()
+                    };
+                    push_cancelled_claude_prompts(&worker.log, cancelled, "session_unavailable");
                     worker.emit_activity(Activity::Errored { error: msg.clone() }, false);
                     return Err(HostError::Unreachable(msg));
                 }
@@ -1193,25 +1303,28 @@ impl ClaudeBridge {
             }
 
             if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
-                worker
-                    .turn_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .in_flight = false;
+                let cancelled = {
+                    let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    tq.in_flight = false;
+                    tq.queued.drain(..).collect::<Vec<_>>()
+                };
+                push_cancelled_claude_prompts(&worker.log, cancelled, "retired");
                 return Err(HostError::Rejected(format!(
                     "Claude thread {thread} is retired"
                 )));
             }
 
             let (mut new_live, _pgid_slot, new_stdin) =
-                match self.spawn_process_for_worker(worker, Some(&session_id)) {
+                match self.spawn_process_for_worker(worker, Some(&session_id), next_gen) {
                     Ok(triple) => triple,
                     Err(err) => {
-                        worker
-                            .turn_queue
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .in_flight = false;
+                        let cancelled = {
+                            let mut tq =
+                                worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                            tq.in_flight = false;
+                            tq.queued.drain(..).collect::<Vec<_>>()
+                        };
+                        push_cancelled_claude_prompts(&worker.log, cancelled, "respawn_failed");
                         worker.emit_activity(
                             Activity::Errored {
                                 error: err.to_string(),
@@ -1221,7 +1334,6 @@ impl ClaudeBridge {
                         return Err(err);
                     }
                 };
-            let generation = new_live.generation;
             {
                 let mut child_guard = worker.live_child.lock().await;
                 if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire)
@@ -1229,28 +1341,30 @@ impl ClaudeBridge {
                     drop(child_guard);
                     drop(new_stdin);
                     terminate_process_group(&mut new_live, self.cfg.retire_grace).await;
-                    worker
-                        .turn_queue
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .in_flight = false;
+                    let cancelled = {
+                        let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        tq.in_flight = false;
+                        tq.queued.drain(..).collect::<Vec<_>>()
+                    };
+                    push_cancelled_claude_prompts(&worker.log, cancelled, "retired");
                     return Err(HostError::Rejected(format!(
                         "Claude thread {thread} retired during respawn"
                     )));
                 }
                 {
                     let mut slot = worker.stdin_tx.lock().unwrap_or_else(|e| e.into_inner());
-                    *slot = Some((generation, new_stdin.clone()));
+                    *slot = Some((next_gen, new_stdin.clone()));
                 }
                 *child_guard = Some(new_live);
             }
             if let Err(err) = write_stdin_line(&new_stdin, prompt_line, "Claude").await {
                 let msg = format!("write resumed prompt to Claude stdin: {err}");
-                worker
-                    .turn_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .in_flight = false;
+                let cancelled = {
+                    let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    tq.in_flight = false;
+                    tq.queued.drain(..).collect::<Vec<_>>()
+                };
+                push_cancelled_claude_prompts(&worker.log, cancelled, "stdin_error");
                 worker.emit_activity(Activity::Errored { error: msg.clone() }, false);
                 drop(new_stdin);
                 worker
@@ -1288,6 +1402,7 @@ impl ClaudeBridge {
             )));
         }
 
+        let cur_gen = worker.generation.load(Ordering::Acquire);
         let send_interrupt = {
             let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
             if tq.in_flight {
@@ -1302,12 +1417,16 @@ impl ClaudeBridge {
                         return Ok(());
                     }
                     SteerDeliveryMode::Steer | SteerDeliveryMode::SteerIfActive => {
+                        tq.interrupt_pending = true;
                         tq.queued.push_back(body.as_str().to_owned());
                         true
                     }
                 }
             } else {
                 tq.in_flight = true;
+                tq.in_flight_generation = cur_gen;
+                tq.interrupt_pending = false;
+                tq.unstarted_prompt = None;
                 false
             }
         };
@@ -1326,7 +1445,7 @@ impl ClaudeBridge {
             return Ok(());
         }
 
-        self.dispatch_prompt_now(&worker, body.as_str()).await
+        self.dispatch_prompt_now(&worker, body.as_str(), true).await
     }
 
     fn validate_resolve_worker(
@@ -1359,11 +1478,13 @@ impl ClaudeBridge {
             )));
         }
 
+        let cur_gen = worker.generation.load(Ordering::Acquire);
         let response_line = {
-            let controls = worker
+            let mut controls = worker
                 .pending_controls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            controls.retain(|c| c.generation == cur_gen);
             let Some(front) = controls.front() else {
                 return Err(HostError::Rejected(format!(
                     "no pending Claude control_request on {thread}"
@@ -1405,21 +1526,23 @@ impl ClaudeBridge {
             )));
         }
 
-        let stdin_tx = worker
+        let (stdin_gen, stdin_tx) = worker
             .stdin_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|(_, tx)| tx.clone())
+            .cloned()
             .ok_or_else(|| {
                 HostError::Unreachable(format!("Claude thread {thread} stdin is closed"))
             })?;
 
-        let (response_line, next_blocked) = {
+        let cur_gen = worker.generation.load(Ordering::Acquire);
+        let response_line = {
             let mut controls = worker
                 .pending_controls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            controls.retain(|c| c.generation == cur_gen);
             let Some(front) = controls.front() else {
                 return Err(HostError::Rejected(format!(
                     "no pending Claude control_request on {thread}"
@@ -1431,35 +1554,87 @@ impl ClaudeBridge {
                     front.interaction.id
                 )));
             }
-            let encoded = encode_claude_control_response(
+            encode_claude_control_response(
                 interaction.as_str(),
                 resolution,
                 &front.orig_input,
                 front.permission_suggestions.as_ref(),
-            )?;
-            controls.pop_front();
-            let next = controls.front().map(|p| p.interaction.clone());
-            (encoded, next)
+            )?
         };
 
-        // Emit next Blocked or Working before unblocking the child so subsequent observations strictly follow it.
-        match next_blocked {
-            Some(next_interaction) => {
-                worker.emit_activity(
-                    Activity::Blocked {
-                        interaction: next_interaction,
-                    },
-                    false,
-                );
+        if let Err(err) = write_stdin_line(&stdin_tx, response_line, "Claude").await {
+            let msg = format!("write Claude control_response for {interaction}: {err}");
+            {
+                let mut slot = worker.stdin_tx.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref().is_some_and(|(g, _)| *g == stdin_gen) {
+                    *slot = None;
+                }
             }
-            None => {
-                worker.emit_activity(Activity::Working, false);
+            worker
+                .pending_controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|c| c.generation != stdin_gen);
+            let cancelled = {
+                let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if tq.in_flight_generation == stdin_gen {
+                    tq.in_flight = false;
+                    tq.interrupt_pending = false;
+                    tq.unstarted_prompt = None;
+                }
+                tq.queued.drain(..).collect::<Vec<_>>()
+            };
+            push_cancelled_claude_prompts(&worker.log, cancelled, "approval_delivery_failed");
+            if !worker.retiring.load(Ordering::Acquire) {
+                worker.emit_activity(Activity::Errored { error: msg.clone() }, true);
+                if let Some(mut live) = worker.live_child.lock().await.take() {
+                    terminate_process_group(&mut live, self.cfg.retire_grace).await;
+                }
             }
+            return Err(HostError::Unreachable(msg));
         }
 
-        write_stdin_line(&stdin_tx, response_line, "Claude")
-            .await
-            .map_err(|e| HostError::Unreachable(format!("write Claude control_response: {e}")))?;
+        let (popped, next_blocked) = {
+            let mut controls = worker
+                .pending_controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            controls.retain(|c| c.generation == cur_gen);
+            if controls
+                .front()
+                .is_some_and(|f| &f.interaction.id == interaction && f.generation == stdin_gen)
+            {
+                controls.pop_front();
+                (true, controls.front().map(|p| p.interaction.clone()))
+            } else {
+                (false, None)
+            }
+        };
+
+        if popped {
+            match next_blocked {
+                Some(next_interaction) => {
+                    worker.emit_activity(
+                        Activity::Blocked {
+                            interaction: next_interaction,
+                        },
+                        false,
+                    );
+                }
+                None => {
+                    let still_blocked_on_this = {
+                        let log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
+                        matches!(
+                            &log.activity,
+                            Activity::Blocked { interaction: cur } if &cur.id == interaction
+                        )
+                    };
+                    if still_blocked_on_this {
+                        worker.emit_activity(Activity::Working, false);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1482,11 +1657,14 @@ impl ClaudeBridge {
         };
 
         worker.retiring.store(true, Ordering::Release);
-        {
+        let cancelled = {
             let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
             tq.in_flight = false;
-            tq.queued.clear();
-        }
+            tq.interrupt_pending = false;
+            tq.unstarted_prompt = None;
+            tq.queued.drain(..).collect::<Vec<_>>()
+        };
+        push_cancelled_claude_prompts(&worker.log, cancelled, "retired");
         worker
             .pending_controls
             .lock()
@@ -1681,6 +1859,12 @@ async fn run_claude_stdout_reader(
         }
     };
 
+    worker
+        .pending_controls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|c| c.generation != generation);
+
     if worker.retiring.load(Ordering::Acquire)
         || worker.generation.load(Ordering::Acquire) != generation
     {
@@ -1697,27 +1881,64 @@ async fn run_claude_stdout_reader(
         revoke_native_worker_token(worker.state_dir.as_deref(), &worker.thread);
     }
 
-    let (mid_turn, next_queued) = {
+    let (owns_state, mid_turn, resume_target, cancelled_prompts) = {
         let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
-        let was_in_flight = tq.in_flight;
-        if exit_status.is_some_and(|s| s.success()) && can_resume && !tq.queued.is_empty() {
-            let next = tq.queued.pop_front();
-            tq.in_flight = next.is_some();
-            (was_in_flight, next)
+        if tq.dispatching
+            || worker.generation.load(Ordering::Acquire) != generation
+            || (tq.in_flight && tq.in_flight_generation != generation)
+        {
+            (false, false, None, Vec::new())
         } else {
-            tq.in_flight = false;
-            tq.queued.clear();
-            (was_in_flight, None)
+            let was_in_flight = tq.in_flight;
+            let unstarted = tq.unstarted_prompt.take();
+            tq.interrupt_pending = false;
+            if exit_status.is_some_and(|s| s.success()) && can_resume {
+                if let Some(p) = unstarted {
+                    let next_gen = worker.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    tq.in_flight = true;
+                    tq.in_flight_generation = next_gen;
+                    (true, was_in_flight, Some((p, false)), Vec::new())
+                } else if let Some(next) = tq.queued.pop_front() {
+                    let next_gen = worker.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    tq.in_flight = true;
+                    tq.in_flight_generation = next_gen;
+                    (true, was_in_flight, Some((next, true)), Vec::new())
+                } else {
+                    tq.in_flight = false;
+                    (true, was_in_flight, None, Vec::new())
+                }
+            } else {
+                tq.in_flight = false;
+                let drained = tq.queued.drain(..).collect::<Vec<_>>();
+                (true, was_in_flight, None, drained)
+            }
         }
     };
 
-    if let Some(next_prompt) = next_queued
+    if !owns_state {
+        return;
+    }
+
+    if !cancelled_prompts.is_empty() {
+        push_cancelled_claude_prompts(&worker.log, cancelled_prompts, "process_exit");
+    }
+
+    {
+        let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
+        log.pending = None;
+    }
+
+    if let Some((next_prompt, record_user_event)) = resume_target
         && let Some(bridge) = weak_bridge.upgrade()
     {
         let w = worker.clone();
         tokio::spawn(async move {
             let _guard = w.turn_lock.lock().await;
-            let _ = bridge.dispatch_prompt_now(&w, &next_prompt).await;
+            if !w.retiring.load(Ordering::Acquire) && !w.retired.load(Ordering::Acquire) {
+                let _ = bridge
+                    .dispatch_prompt_now(&w, &next_prompt, record_user_event)
+                    .await;
+            }
         });
         return;
     }
@@ -1770,6 +1991,13 @@ fn handle_claude_line(
 ) {
     if worker.generation.load(Ordering::Acquire) != generation {
         return;
+    }
+
+    {
+        let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if tq.in_flight_generation == generation {
+            tq.unstarted_prompt = None;
+        }
     }
 
     if let Some(sid) = val
@@ -2017,8 +2245,10 @@ fn handle_claude_line(
                     .pending_controls
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                controls.retain(|c| c.generation == generation);
                 let was_empty = controls.is_empty();
                 controls.push_back(PendingClaudeControl {
+                    generation,
                     interaction: interaction.clone(),
                     orig_input,
                     permission_suggestions: suggestions,
@@ -2040,7 +2270,7 @@ fn handle_claude_line(
                 .pending_controls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clear();
+                .retain(|c| c.generation != generation);
 
             let had_model = worker
                 .last_model
@@ -2071,25 +2301,59 @@ fn handle_claude_line(
                 log.push_event(AgentEventKind::TurnEnded);
             }
 
-            let activity = classify_claude_result(val, prior_refusal.as_deref());
+            let raw_activity = classify_claude_result(val, prior_refusal.as_deref());
             *prior_refusal = None;
+            let result_subtype = val.get("subtype").and_then(Value::as_str).unwrap_or("");
 
-            let next_queued = {
+            let (owns_turn, effective_activity, next_queued, cancelled_prompts) = {
                 let mut tq = worker.turn_queue.lock().unwrap_or_else(|e| e.into_inner());
-                if !worker.retiring.load(Ordering::Acquire)
-                    && matches!(activity, Activity::Idle)
-                    && let Some(next) = tq.queued.pop_front()
+                if worker.generation.load(Ordering::Acquire) != generation
+                    || (tq.in_flight && tq.in_flight_generation != generation)
                 {
-                    tq.in_flight = true;
-                    Some(next)
+                    (false, raw_activity, None, Vec::new())
                 } else {
-                    tq.in_flight = false;
-                    if !matches!(activity, Activity::Idle) {
-                        tq.queued.clear();
+                    tq.unstarted_prompt = None;
+                    let was_interrupted = std::mem::replace(&mut tq.interrupt_pending, false);
+                    let activity = if was_interrupted
+                        && result_subtype == "error_during_execution"
+                        && !matches!(raw_activity, Activity::Refused { .. })
+                    {
+                        Activity::Idle
+                    } else {
+                        raw_activity
+                    };
+
+                    if !worker.retiring.load(Ordering::Acquire)
+                        && matches!(activity, Activity::Idle)
+                        && let Some(next) = tq.queued.pop_front()
+                    {
+                        tq.in_flight = true;
+                        tq.in_flight_generation = generation;
+                        (true, activity, Some(next), Vec::new())
+                    } else {
+                        tq.in_flight = false;
+                        let cancelled = if !matches!(activity, Activity::Idle) {
+                            tq.queued.drain(..).collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        (true, activity, None, cancelled)
                     }
-                    None
                 }
             };
+
+            if !owns_turn {
+                return;
+            }
+
+            if !cancelled_prompts.is_empty() {
+                let why = match &effective_activity {
+                    Activity::Refused { .. } => "turn_refused",
+                    Activity::Errored { .. } => "turn_errored",
+                    _ => "turn_ended",
+                };
+                push_cancelled_claude_prompts(&worker.log, cancelled_prompts, why);
+            }
 
             if let Some(next_prompt) = next_queued
                 && let Some(bridge) = weak_bridge.upgrade()
@@ -2097,12 +2361,14 @@ fn handle_claude_line(
                 let w = worker.clone();
                 tokio::spawn(async move {
                     let _guard = w.turn_lock.lock().await;
-                    let _ = bridge.dispatch_prompt_now(&w, &next_prompt).await;
+                    if !w.retiring.load(Ordering::Acquire) && !w.retired.load(Ordering::Acquire) {
+                        let _ = bridge.dispatch_prompt_now(&w, &next_prompt, true).await;
+                    }
                 });
                 return;
             }
 
-            worker.emit_activity(activity, true);
+            worker.emit_activity(effective_activity, true);
         }
         _ => {}
     }

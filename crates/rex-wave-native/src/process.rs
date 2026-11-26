@@ -92,14 +92,23 @@ impl Drop for LiveChild {
 }
 
 fn classify_spawn_io_error(err: io::Error) -> HostError {
-    match err.kind() {
-        io::ErrorKind::WouldBlock
-        | io::ErrorKind::Interrupted
-        | io::ErrorKind::TimedOut
-        | io::ErrorKind::OutOfMemory => {
-            HostError::Unreachable(format!("spawn native worker process: {err}"))
-        }
-        _ => HostError::Rejected(format!("spawn native worker process: {err}")),
+    let permanent_os = matches!(
+        err.raw_os_error(),
+        Some(libc_code)
+            if libc_code == rustix::io::Errno::NOENT.raw_os_error()
+                || libc_code == rustix::io::Errno::ACCESS.raw_os_error()
+                || libc_code == rustix::io::Errno::NOTDIR.raw_os_error()
+                || libc_code == rustix::io::Errno::NOEXEC.raw_os_error()
+    );
+    if permanent_os
+        || matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+        )
+    {
+        HostError::Rejected(format!("spawn native worker process: {err}"))
+    } else {
+        HostError::Unreachable(format!("spawn native worker process: {err}"))
     }
 }
 

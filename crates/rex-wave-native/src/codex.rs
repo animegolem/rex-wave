@@ -569,7 +569,292 @@ fn validate_codex_grant_subset(
     Ok(())
 }
 
-fn validate_codex_request_answer(method: &str, value: &Value) -> Result<Value, HostError> {
+fn validate_codex_fs_path_entry(path_val: &Value) -> Result<Option<String>, HostError> {
+    let Some(pobj) = path_val.as_object() else {
+        return Err(HostError::Rejected(
+            "Codex fileSystem.entries[].path must be a JSON object".into(),
+        ));
+    };
+    match pobj.get("type").and_then(Value::as_str) {
+        Some("path") => {
+            let Some(p) = pobj.get("path").and_then(Value::as_str) else {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem path entry requires string field 'path'".into(),
+                ));
+            };
+            Ok(Some(p.to_owned()))
+        }
+        Some("glob_pattern") => {
+            if !pobj.get("pattern").is_some_and(Value::is_string) {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem glob_pattern entry requires string field 'pattern'".into(),
+                ));
+            }
+            Ok(None)
+        }
+        Some("special") => {
+            let Some(vobj) = pobj.get("value").and_then(Value::as_object) else {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem special entry requires object field 'value'".into(),
+                ));
+            };
+            let kind = vobj.get("kind").and_then(Value::as_str).unwrap_or("");
+            if !matches!(
+                kind,
+                "root" | "minimal" | "project_roots" | "tmpdir" | "slash_tmp" | "unknown"
+            ) {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem special entry has invalid 'kind'".into(),
+                ));
+            }
+            if kind == "unknown" && !vobj.get("path").is_some_and(Value::is_string) {
+                return Err(HostError::Rejected(
+                    "Codex fileSystem unknown special entry requires string 'path'".into(),
+                ));
+            }
+            Ok(None)
+        }
+        _ => Err(HostError::Rejected(
+            "Codex fileSystem.entries[].path requires 'type' in path|glob_pattern|special".into(),
+        )),
+    }
+}
+
+fn validate_codex_raw_permissions_profile(
+    perms_obj: &Map<String, Value>,
+    requested_permissions: Option<&Value>,
+) -> Result<(), HostError> {
+    for k in perms_obj.keys() {
+        if !matches!(k.as_str(), "fileSystem" | "network") {
+            return Err(HostError::Rejected(format!(
+                "unknown field '{k}' in Codex GrantedPermissionProfile"
+            )));
+        }
+    }
+
+    let mut granted_net_enabled = false;
+    if let Some(net_val) = perms_obj.get("network")
+        && !net_val.is_null()
+    {
+        let Some(net_obj) = net_val.as_object() else {
+            return Err(HostError::Rejected(
+                "Codex permissions.network must be an object or null".into(),
+            ));
+        };
+        for k in net_obj.keys() {
+            if k != "enabled" {
+                return Err(HostError::Rejected(format!(
+                    "unknown field '{k}' in Codex permissions.network"
+                )));
+            }
+        }
+        if let Some(en) = net_obj.get("enabled")
+            && !en.is_null()
+        {
+            let Some(b) = en.as_bool() else {
+                return Err(HostError::Rejected(
+                    "Codex permissions.network.enabled must be a boolean or null".into(),
+                ));
+            };
+            granted_net_enabled = b;
+        }
+    }
+
+    let mut granted_read_paths: Vec<String> = Vec::new();
+    let mut granted_write_paths: Vec<String> = Vec::new();
+    let mut granted_structured_entries: Vec<(String, Value)> = Vec::new();
+    let mut granted_glob_depth: Option<u64> = None;
+
+    if let Some(fs_val) = perms_obj.get("fileSystem")
+        && !fs_val.is_null()
+    {
+        let Some(fs_obj) = fs_val.as_object() else {
+            return Err(HostError::Rejected(
+                "Codex permissions.fileSystem must be an object or null".into(),
+            ));
+        };
+        for k in fs_obj.keys() {
+            if !matches!(
+                k.as_str(),
+                "read" | "write" | "entries" | "globScanMaxDepth"
+            ) {
+                return Err(HostError::Rejected(format!(
+                    "unknown field '{k}' in Codex permissions.fileSystem"
+                )));
+            }
+        }
+        if let Some(depth_val) = fs_obj.get("globScanMaxDepth")
+            && !depth_val.is_null()
+        {
+            let Some(d) = depth_val.as_u64().filter(|&n| n >= 1) else {
+                return Err(HostError::Rejected(
+                    "Codex permissions.fileSystem.globScanMaxDepth must be an integer >= 1".into(),
+                ));
+            };
+            granted_glob_depth = Some(d);
+        }
+        for (key, target) in [
+            ("read", &mut granted_read_paths),
+            ("write", &mut granted_write_paths),
+        ] {
+            if let Some(arr_val) = fs_obj.get(key)
+                && !arr_val.is_null()
+            {
+                let Some(arr) = arr_val.as_array() else {
+                    return Err(HostError::Rejected(format!(
+                        "Codex permissions.fileSystem.{key} must be a string array or null"
+                    )));
+                };
+                for item in arr {
+                    let Some(s) = item.as_str() else {
+                        return Err(HostError::Rejected(format!(
+                            "Codex permissions.fileSystem.{key} entries must be strings"
+                        )));
+                    };
+                    target.push(s.to_owned());
+                }
+            }
+        }
+        if let Some(entries_val) = fs_obj.get("entries")
+            && !entries_val.is_null()
+        {
+            let Some(entries) = entries_val.as_array() else {
+                return Err(HostError::Rejected(
+                    "Codex permissions.fileSystem.entries must be an array or null".into(),
+                ));
+            };
+            for entry in entries {
+                let Some(eobj) = entry.as_object() else {
+                    return Err(HostError::Rejected(
+                        "Codex permissions.fileSystem.entries items must be objects".into(),
+                    ));
+                };
+                let Some(access) = eobj.get("access").and_then(Value::as_str) else {
+                    return Err(HostError::Rejected(
+                        "Codex permissions.fileSystem.entries item requires string 'access'".into(),
+                    ));
+                };
+                if !matches!(access, "read" | "write" | "deny") {
+                    return Err(HostError::Rejected(
+                        "Codex permissions.fileSystem.entries access must be read|write|deny"
+                            .into(),
+                    ));
+                }
+                let Some(path_val) = eobj.get("path") else {
+                    return Err(HostError::Rejected(
+                        "Codex permissions.fileSystem.entries item requires 'path'".into(),
+                    ));
+                };
+                let maybe_lit = validate_codex_fs_path_entry(path_val)?;
+                match (access, maybe_lit) {
+                    ("read", Some(p)) => granted_read_paths.push(p),
+                    ("write", Some(p)) => granted_write_paths.push(p),
+                    ("deny", _) => {}
+                    (_, None) => {
+                        granted_structured_entries.push((access.to_owned(), path_val.clone()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let has_any_grant = granted_net_enabled
+        || !granted_read_paths.is_empty()
+        || !granted_write_paths.is_empty()
+        || !granted_structured_entries.is_empty()
+        || granted_glob_depth.is_some();
+
+    if !has_any_grant {
+        return Ok(());
+    }
+
+    let Some(req_obj) = requested_permissions.and_then(Value::as_object) else {
+        return Err(HostError::Rejected(
+            "Codex RequestAnswer grants permissions when no permission profile was requested"
+                .into(),
+        ));
+    };
+
+    if granted_net_enabled {
+        let req_net = req_obj
+            .get("network")
+            .and_then(Value::as_object)
+            .and_then(|n| n.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !req_net {
+            return Err(HostError::Rejected(
+                "Codex RequestAnswer enables network access that was not requested".into(),
+            ));
+        }
+    }
+
+    if !granted_read_paths.is_empty()
+        || !granted_write_paths.is_empty()
+        || !granted_structured_entries.is_empty()
+        || granted_glob_depth.is_some()
+    {
+        let Some(req_fs) = req_obj.get("fileSystem").and_then(Value::as_object) else {
+            return Err(HostError::Rejected(
+                "Codex RequestAnswer grants fileSystem permissions when none were requested".into(),
+            ));
+        };
+        if let Some(depth) = granted_glob_depth {
+            let req_depth = req_fs.get("globScanMaxDepth").and_then(Value::as_u64);
+            if req_depth.is_none_or(|rd| depth > rd) {
+                return Err(HostError::Rejected(
+                    "Codex RequestAnswer globScanMaxDepth exceeds requested depth".into(),
+                ));
+            }
+        }
+        let offered_read = collect_offered_fs_paths(req_fs, "read");
+        let offered_write = collect_offered_fs_paths(req_fs, "write");
+        for r in &granted_read_paths {
+            if !offered_read.contains(r) && !offered_write.contains(r) {
+                return Err(HostError::Rejected(format!(
+                    "Codex RequestAnswer read path '{r}' was not requested"
+                )));
+            }
+        }
+        for w in &granted_write_paths {
+            if !offered_write.contains(w) {
+                return Err(HostError::Rejected(format!(
+                    "Codex RequestAnswer write path '{w}' was not requested"
+                )));
+            }
+        }
+        if !granted_structured_entries.is_empty() {
+            let req_entries = req_fs
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (acc, pval) in &granted_structured_entries {
+                let covered = req_entries.iter().any(|re| {
+                    let racc = re.get("access").and_then(Value::as_str).unwrap_or("");
+                    let acc_ok = (acc == "read" && matches!(racc, "read" | "write" | "readWrite"))
+                        || (acc == "write" && matches!(racc, "write" | "readWrite"));
+                    acc_ok && re.get("path") == Some(pval)
+                });
+                if !covered {
+                    return Err(HostError::Rejected(
+                        "Codex RequestAnswer structured fileSystem entry was not requested".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_codex_request_answer(
+    method: &str,
+    value: &Value,
+    requested_permissions: Option<&Value>,
+    question_ids: Option<&HashSet<String>>,
+) -> Result<Value, HostError> {
     let Some(obj) = value.as_object() else {
         return Err(HostError::Rejected(format!(
             "Codex {method} RequestAnswer must be a JSON object"
@@ -577,19 +862,50 @@ fn validate_codex_request_answer(method: &str, value: &Value) -> Result<Value, H
     };
     match method {
         "item/commandExecution/requestApproval" => {
-            let Some(dec) = obj.get("decision") else {
+            if obj.len() != 1 || !obj.contains_key("decision") {
                 return Err(HostError::Rejected(
-                    "Codex item/commandExecution/requestApproval RequestAnswer requires 'decision'"
+                    "Codex item/commandExecution/requestApproval RequestAnswer must contain only 'decision'"
                         .into(),
                 ));
+            }
+            let dec = &obj["decision"];
+            let valid = if let Some(s) = dec.as_str() {
+                matches!(s, "accept" | "acceptForSession" | "decline" | "cancel")
+            } else if let Some(d) = dec.as_object() {
+                if d.len() != 1 {
+                    false
+                } else if let Some(amend) = d.get("acceptWithExecpolicyAmendment") {
+                    amend.as_object().is_some_and(|inner| {
+                        inner.len() == 1
+                            && inner
+                                .get("execpolicy_amendment")
+                                .and_then(Value::as_array)
+                                .is_some_and(|arr| arr.iter().all(Value::is_string))
+                    })
+                } else if let Some(net) = d.get("applyNetworkPolicyAmendment") {
+                    net.as_object().is_some_and(|inner| {
+                        inner.len() == 1
+                            && inner
+                                .get("network_policy_amendment")
+                                .and_then(Value::as_object)
+                                .is_some_and(|npa| {
+                                    npa.len() == 2
+                                        && npa
+                                            .get("action")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|a| matches!(a, "allow" | "deny"))
+                                        && npa
+                                            .get("host")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|h| !h.trim().is_empty())
+                                })
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
             };
-            let valid = dec
-                .as_str()
-                .is_some_and(|s| matches!(s, "accept" | "acceptForSession" | "decline" | "cancel"))
-                || dec.as_object().is_some_and(|d| {
-                    d.contains_key("acceptWithExecpolicyAmendment")
-                        || d.contains_key("applyNetworkPolicyAmendment")
-                });
             if !valid {
                 return Err(HostError::Rejected(
                     "invalid 'decision' in Codex item/commandExecution/requestApproval RequestAnswer"
@@ -599,25 +915,35 @@ fn validate_codex_request_answer(method: &str, value: &Value) -> Result<Value, H
             Ok(value.clone())
         }
         "item/fileChange/requestApproval" => {
-            let valid = obj
-                .get("decision")
-                .and_then(Value::as_str)
-                .is_some_and(|s| matches!(s, "accept" | "acceptForSession" | "decline" | "cancel"));
+            let valid = obj.len() == 1
+                && obj
+                    .get("decision")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| {
+                        matches!(s, "accept" | "acceptForSession" | "decline" | "cancel")
+                    });
             if !valid {
                 return Err(HostError::Rejected(
-                    "Codex item/fileChange/requestApproval RequestAnswer requires 'decision' in accept|acceptForSession|decline|cancel"
+                    "Codex item/fileChange/requestApproval RequestAnswer requires only 'decision' in accept|acceptForSession|decline|cancel"
                         .into(),
                 ));
             }
             Ok(value.clone())
         }
         "item/permissions/requestApproval" => {
-            if !obj.get("permissions").is_some_and(Value::is_object) {
+            for k in obj.keys() {
+                if !matches!(k.as_str(), "permissions" | "scope" | "strictAutoReview") {
+                    return Err(HostError::Rejected(format!(
+                        "unknown field '{k}' in Codex PermissionsRequestApprovalResponse"
+                    )));
+                }
+            }
+            let Some(perms_obj) = obj.get("permissions").and_then(Value::as_object) else {
                 return Err(HostError::Rejected(
                     "Codex item/permissions/requestApproval RequestAnswer requires object field 'permissions'"
                         .into(),
                 ));
-            }
+            };
             if let Some(scope) = obj.get("scope")
                 && !scope
                     .as_str()
@@ -628,23 +954,49 @@ fn validate_codex_request_answer(method: &str, value: &Value) -> Result<Value, H
                         .into(),
                 ));
             }
+            if let Some(strict) = obj.get("strictAutoReview")
+                && !strict.is_null()
+                && !strict.is_boolean()
+            {
+                return Err(HostError::Rejected(
+                    "Codex item/permissions/requestApproval RequestAnswer 'strictAutoReview' must be boolean or null"
+                        .into(),
+                ));
+            }
+            validate_codex_raw_permissions_subset_or_profile(perms_obj, requested_permissions)?;
             Ok(value.clone())
         }
         "item/tool/requestUserInput" => {
+            if obj.len() != 1 || !obj.contains_key("answers") {
+                return Err(HostError::Rejected(
+                    "Codex item/tool/requestUserInput RequestAnswer must contain only 'answers'"
+                        .into(),
+                ));
+            }
             let Some(answers) = obj.get("answers").and_then(Value::as_object) else {
                 return Err(HostError::Rejected(
                     "Codex item/tool/requestUserInput RequestAnswer requires object field 'answers'"
                         .into(),
                 ));
             };
-            for v in answers.values() {
-                let valid = v
-                    .get("answers")
-                    .and_then(Value::as_array)
-                    .is_some_and(|arr| arr.iter().all(Value::is_string));
+            for (qid, v) in answers {
+                if let Some(allowed_qids) = question_ids
+                    && !allowed_qids.contains(qid)
+                {
+                    return Err(HostError::Rejected(format!(
+                        "unknown question id '{qid}' in Codex item/tool/requestUserInput RequestAnswer"
+                    )));
+                }
+                let valid = v.as_object().is_some_and(|eobj| {
+                    eobj.len() == 1
+                        && eobj
+                            .get("answers")
+                            .and_then(Value::as_array)
+                            .is_some_and(|arr| arr.iter().all(Value::is_string))
+                });
                 if !valid {
                     return Err(HostError::Rejected(
-                        "Codex item/tool/requestUserInput RequestAnswer entries must have string array 'answers'"
+                        "Codex item/tool/requestUserInput RequestAnswer entries must be {\"answers\": [string, ...]}"
                             .into(),
                     ));
                 }
@@ -657,17 +1009,33 @@ fn validate_codex_request_answer(method: &str, value: &Value) -> Result<Value, H
     }
 }
 
+fn validate_codex_raw_permissions_subset_or_profile(
+    perms_obj: &Map<String, Value>,
+    requested_permissions: Option<&Value>,
+) -> Result<(), HostError> {
+    validate_codex_raw_permissions_profile(perms_obj, requested_permissions)
+}
+
 pub fn encode_codex_approval_result(
     method: &str,
     resolution: &InteractionResolution,
 ) -> Result<Value, HostError> {
-    encode_codex_approval_result_with_request(method, resolution, None)
+    encode_codex_approval_result_full(method, resolution, None, None)
 }
 
 pub fn encode_codex_approval_result_with_request(
     method: &str,
     resolution: &InteractionResolution,
     requested_permissions: Option<&Value>,
+) -> Result<Value, HostError> {
+    encode_codex_approval_result_full(method, resolution, requested_permissions, None)
+}
+
+fn encode_codex_approval_result_full(
+    method: &str,
+    resolution: &InteractionResolution,
+    requested_permissions: Option<&Value>,
+    question_ids: Option<&HashSet<String>>,
 ) -> Result<Value, HostError> {
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
@@ -686,7 +1054,7 @@ pub fn encode_codex_approval_result_with_request(
                 }
                 InteractionResolution::Deny => Ok(json!({ "decision": "decline" })),
                 InteractionResolution::RequestAnswer { value } => {
-                    validate_codex_request_answer(method, value)
+                    validate_codex_request_answer(method, value, requested_permissions, question_ids)
                 }
                 _ => Err(HostError::Rejected(format!(
                     "Codex {method} supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
@@ -742,7 +1110,7 @@ pub fn encode_codex_approval_result_with_request(
             }
             InteractionResolution::Deny => Ok(json!({ "permissions": {} })),
             InteractionResolution::RequestAnswer { value } => {
-                validate_codex_request_answer(method, value)
+                validate_codex_request_answer(method, value, requested_permissions, question_ids)
             }
             _ => Err(HostError::Rejected(
                 "Codex item/permissions/requestApproval supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
@@ -753,6 +1121,13 @@ pub fn encode_codex_approval_result_with_request(
             InteractionResolution::UserAnswer { answers } => {
                 let mut map = Map::new();
                 for (qid, ans) in answers {
+                    if let Some(allowed_qids) = question_ids
+                        && !allowed_qids.contains(qid)
+                    {
+                        return Err(HostError::Rejected(format!(
+                            "unknown question id '{qid}' in Codex item/tool/requestUserInput UserAnswer"
+                        )));
+                    }
                     let mut list = ans.selected.clone();
                     if let Some(ft) = ans
                         .free_text
@@ -767,7 +1142,7 @@ pub fn encode_codex_approval_result_with_request(
                 Ok(json!({ "answers": Value::Object(map) }))
             }
             InteractionResolution::RequestAnswer { value } => {
-                validate_codex_request_answer(method, value)
+                validate_codex_request_answer(method, value, requested_permissions, question_ids)
             }
             _ => Err(HostError::Rejected(
                 "Codex item/tool/requestUserInput requires UserAnswer or RequestAnswer".into(),
@@ -850,6 +1225,24 @@ struct PendingCodexApproval {
     rpc_id: Value,
     method: String,
     requested_permissions: Option<Value>,
+    question_ids: Option<HashSet<String>>,
+}
+
+fn push_cancelled_codex_prompts(
+    log_lock: &Mutex<ThreadEventLog>,
+    cancelled: Vec<String>,
+    why: &str,
+) {
+    if cancelled.is_empty() {
+        return;
+    }
+    let mut log = log_lock.lock().unwrap_or_else(|e| e.into_inner());
+    for queued in cancelled {
+        let preview = truncate_summary(queued.trim(), 160);
+        log.push_event(AgentEventKind::Other {
+            bb_type: format!("cancelled_queued_prompt ({why}): {preview}"),
+        });
+    }
 }
 
 /// Wire-ordered per-worker turn state updated synchronously from the stdout reader
@@ -1309,12 +1702,13 @@ impl CodexBridge {
 
         worker.rpc_notify("initialized", json!({})).await?;
 
-        // Probe account identity via `account/read`; non-fatal when unimplemented or API-key backed.
+        // Probe account identity via `account/read` with a short bounded timeout so builds
+        // that omit or ignore `account/read` never stall handshake.
         let actual_account = worker
             .rpc_call(
                 "account/read",
                 json!({ "refreshToken": false }),
-                self.cfg.rpc_timeout,
+                self.cfg.rpc_timeout.min(Duration::from_secs(2)),
             )
             .await
             .ok()
@@ -1433,6 +1827,20 @@ impl CodexBridge {
         codex_tid: String,
         prompt_text: &str,
     ) -> Result<(), HostError> {
+        if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
+            let cancelled = {
+                let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+                ts.in_flight = false;
+                ts.active_turn_id = None;
+                ts.queued_turns.drain(..).collect::<Vec<_>>()
+            };
+            push_cancelled_codex_prompts(&worker.log, cancelled, "retired");
+            return Err(HostError::Rejected(format!(
+                "Codex thread {} is retired",
+                worker.thread
+            )));
+        }
+
         let mut params = Map::new();
         params.insert("threadId".into(), Value::String(codex_tid));
         params.insert(
@@ -1458,24 +1866,30 @@ impl CodexBridge {
             .rpc_call("turn/start", Value::Object(params), self.cfg.rpc_timeout)
             .await
         {
-            {
+            let cancelled = {
                 let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
                 ts.in_flight = false;
                 ts.active_turn_id = None;
-                ts.queued_turns.clear();
+                ts.queued_turns.drain(..).collect::<Vec<_>>()
+            };
+            push_cancelled_codex_prompts(&worker.log, cancelled, "turn_start_failed");
+            if !worker.retiring.load(Ordering::Acquire) {
+                worker.emit_activity(
+                    Activity::Errored {
+                        error: err.to_string(),
+                    },
+                    false,
+                );
             }
-            worker.emit_activity(
-                Activity::Errored {
-                    error: err.to_string(),
-                },
-                false,
-            );
             return Err(err);
         }
 
         Ok(())
     }
 
+    /// Delivers a prompt to `thread`. Note that Codex `app-server` provides native in-turn
+    /// steering via `turn/steer`, so both `Steer` and `SteerIfActive` dispatch `turn/steer`
+    /// into the running turn rather than aborting it via `turn/interrupt`.
     async fn tell_worker(
         &self,
         thread: &HostThreadId,
@@ -1626,10 +2040,11 @@ impl CodexBridge {
                     front.interaction.id
                 )));
             }
-            let encoded = encode_codex_approval_result_with_request(
+            let encoded = encode_codex_approval_result_full(
                 &front.method,
                 resolution,
                 front.requested_permissions.as_ref(),
+                front.question_ids.as_ref(),
             )?;
             (front.rpc_id.clone(), encoded)
         };
@@ -1667,8 +2082,8 @@ impl CodexBridge {
             )));
         }
 
-        let (rpc_id, result, next_blocked) = {
-            let mut approvals = worker
+        let (rpc_id, result) = {
+            let approvals = worker
                 .pending_approvals
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -1683,32 +2098,86 @@ impl CodexBridge {
                     front.interaction.id
                 )));
             }
-            let encoded = encode_codex_approval_result_with_request(
+            let encoded = encode_codex_approval_result_full(
                 &front.method,
                 resolution,
                 front.requested_permissions.as_ref(),
+                front.question_ids.as_ref(),
             )?;
-            let rpc_id = front.rpc_id.clone();
-            approvals.pop_front();
-            let next = approvals.front().map(|p| p.interaction.clone());
-            (rpc_id, encoded, next)
+            (front.rpc_id.clone(), encoded)
         };
 
-        // Emit next Blocked or Working before sending approval response so turn/completed strictly follows it.
-        match next_blocked {
-            Some(next_interaction) => {
-                worker.emit_activity(
-                    Activity::Blocked {
-                        interaction: next_interaction,
-                    },
-                    false,
-                );
+        if let Err(err) = worker.rpc_respond(rpc_id.clone(), result).await {
+            let msg = format!("deliver Codex approval {interaction}: {err}");
+            worker.process_dead.store(true, Ordering::Release);
+            worker
+                .stdin_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            worker
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            worker.fail_all_pending_rpc("Codex stdin broken during approval delivery");
+            let cancelled = {
+                let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+                ts.in_flight = false;
+                ts.active_turn_id = None;
+                ts.queued_turns.drain(..).collect::<Vec<_>>()
+            };
+            push_cancelled_codex_prompts(&worker.log, cancelled, "approval_delivery_failed");
+            revoke_native_worker_token(worker.state_dir.as_deref(), &worker.thread);
+            if !worker.retiring.load(Ordering::Acquire) {
+                worker.emit_activity(Activity::Errored { error: msg.clone() }, true);
+                if let Some(mut live) = worker.live_child.lock().await.take() {
+                    terminate_process_group(&mut live, self.cfg.retire_grace).await;
+                }
             }
-            None => {
-                worker.emit_activity(Activity::Working, false);
+            return Err(HostError::Unreachable(msg));
+        }
+
+        let (popped, next_blocked) = {
+            let mut approvals = worker
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if approvals
+                .front()
+                .is_some_and(|f| &f.interaction.id == interaction && f.rpc_id == rpc_id)
+            {
+                approvals.pop_front();
+                (true, approvals.front().map(|p| p.interaction.clone()))
+            } else {
+                (false, None)
+            }
+        };
+
+        if popped {
+            match next_blocked {
+                Some(next_interaction) => {
+                    worker.emit_activity(
+                        Activity::Blocked {
+                            interaction: next_interaction,
+                        },
+                        false,
+                    );
+                }
+                None => {
+                    let still_blocked_on_this = {
+                        let log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
+                        matches!(
+                            &log.activity,
+                            Activity::Blocked { interaction: cur } if &cur.id == interaction
+                        )
+                    };
+                    if still_blocked_on_this {
+                        worker.emit_activity(Activity::Working, false);
+                    }
+                }
             }
         }
-        worker.rpc_respond(rpc_id, result).await?;
         Ok(())
     }
 
@@ -1736,12 +2205,13 @@ impl CodexBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let turn_id = {
+        let (turn_id, cancelled) = {
             let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
             ts.in_flight = false;
-            ts.queued_turns.clear();
-            ts.active_turn_id.take()
+            let drained = ts.queued_turns.drain(..).collect::<Vec<_>>();
+            (ts.active_turn_id.take(), drained)
         };
+        push_cancelled_codex_prompts(&worker.log, cancelled, "retired");
 
         if let (Some(ctid), Some(tid)) = (codex_tid, turn_id) {
             let _ = worker
@@ -1926,14 +2396,21 @@ async fn run_codex_stdout_reader(
         return;
     }
 
-    let had_in_flight_or_queued = {
+    worker
+        .pending_approvals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    let (had_in_flight_or_queued, cancelled_prompts) = {
         let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
         let active = ts.in_flight || ts.active_turn_id.is_some() || !ts.queued_turns.is_empty();
         ts.in_flight = false;
         ts.active_turn_id = None;
-        ts.queued_turns.clear();
-        active
+        let drained = ts.queued_turns.drain(..).collect::<Vec<_>>();
+        (active, drained)
     };
+    push_cancelled_codex_prompts(&worker.log, cancelled_prompts, "process_exit");
 
     let already_terminal = {
         let log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
@@ -2061,6 +2538,12 @@ fn handle_codex_message(
             let requested_permissions = (method == "item/permissions/requestApproval")
                 .then(|| params.get("permissions").cloned())
                 .flatten();
+            let question_ids = match &interaction.kind {
+                InteractionKind::Question { questions } => {
+                    Some(questions.iter().map(|q| q.id.clone()).collect())
+                }
+                _ => None,
+            };
             let publish_now = {
                 let mut approvals = worker
                     .pending_approvals
@@ -2072,6 +2555,7 @@ fn handle_codex_message(
                     rpc_id,
                     method: method.to_owned(),
                     requested_permissions,
+                    question_ids,
                 });
                 was_empty
             };
@@ -2262,7 +2746,7 @@ fn handle_codex_message(
             }
             let activity = classify_codex_turn(params, prior_err.as_ref());
 
-            let next_queued = {
+            let (next_queued, cancelled_prompts) = {
                 let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref tid) = completed_tid {
                     ts.completed_turns.insert(tid.clone());
@@ -2277,15 +2761,26 @@ fn handle_codex_message(
                     && let Some(next) = ts.queued_turns.pop_front()
                 {
                     ts.in_flight = true;
-                    Some(next)
+                    (Some(next), Vec::new())
                 } else {
                     ts.in_flight = false;
-                    if !matches!(activity, Activity::Idle) {
-                        ts.queued_turns.clear();
-                    }
-                    None
+                    let drained = if !matches!(activity, Activity::Idle) {
+                        ts.queued_turns.drain(..).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    (None, drained)
                 }
             };
+
+            if !cancelled_prompts.is_empty() {
+                let why = match &activity {
+                    Activity::Refused { .. } => "turn_refused",
+                    Activity::Errored { .. } => "turn_errored",
+                    _ => "turn_ended",
+                };
+                push_cancelled_codex_prompts(&worker.log, cancelled_prompts, why);
+            }
 
             if let Some(next_prompt) = next_queued
                 && let Some(bridge) = weak_bridge.upgrade()
@@ -2298,9 +2793,11 @@ fn handle_codex_message(
                 let w = worker.clone();
                 tokio::spawn(async move {
                     let _guard = w.turn_lock.lock().await;
-                    let _ = bridge
-                        .start_codex_turn_now(&w, codex_tid, &next_prompt)
-                        .await;
+                    if !w.retiring.load(Ordering::Acquire) && !w.retired.load(Ordering::Acquire) {
+                        let _ = bridge
+                            .start_codex_turn_now(&w, codex_tid, &next_prompt)
+                            .await;
+                    }
                 });
                 return;
             }
@@ -2619,6 +3116,37 @@ mod tests {
             )
             .is_err(),
             "empty RequestAnswer object must be rejected"
+        );
+        assert!(
+            encode_codex_approval_result(
+                "item/commandExecution/requestApproval",
+                &InteractionResolution::RequestAnswer {
+                    value: json!({"decision": {"acceptWithExecpolicyAmendment": null}})
+                },
+            )
+            .is_err(),
+            "null acceptWithExecpolicyAmendment payload must be rejected"
+        );
+        assert!(
+            encode_codex_approval_result(
+                "item/commandExecution/requestApproval",
+                &InteractionResolution::RequestAnswer {
+                    value: json!({"decision": {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["cargo", "test"]}}})
+                },
+            )
+            .is_ok(),
+            "valid acceptWithExecpolicyAmendment string array must pass"
+        );
+        assert!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::RequestAnswer {
+                    value: json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"})
+                },
+                Some(&json!({"network": {"enabled": false}})),
+            )
+            .is_err(),
+            "raw RequestAnswer granting unrequested network must be rejected"
         );
         assert_eq!(
             encode_codex_approval_result(
