@@ -24,6 +24,7 @@ rex-wave-mailbridge.workspace = true
 rex-wave-bb.workspace = true
 rex-wave-t3.workspace = true
 rex-wave-acp.workspace = true
+rex-wave-native.workspace = true
 rex-wave-transport.workspace = true
 rex-wave-mcp.workspace = true
 rex-wave-tui.workspace = true

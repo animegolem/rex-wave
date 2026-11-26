@@ -1,0 +1,1668 @@
+use futures_util::StreamExt;
+use rex_wave_api::read::{AgentEventKind, ThreadPageView};
+use rex_wave_api::room::Body;
+use rex_wave_api::wave::{
+    Activity, AgentSpec, BaseBranch, InteractionKind, InteractionResolution, PermissionMode,
+    SteerDeliveryMode, WaveFinish, WaveOutcome, WaveResolve, WaveRetireWorker, WaveSnapshot,
+    WaveSpec, WaveStart, WaveTell, WaveView, WorkerPhase, WorkerSpec, Workspace,
+};
+use rex_wave_api::{
+    Client, Frame, HostSeq, HostThreadId, ModelId, Principal, ProjectId, ProviderId, RoleName,
+    RunnerKind, SeatName, SystemPart, WaveSlug,
+};
+use rex_wave_board::Board;
+use rex_wave_mailbridge::{MailBridge, Presence, SandboxRoot};
+use rex_wave_native::{
+    ClaudeBridge, ClaudeFeed, ClaudeHost, ClaudeRunnerConfig, CodexBridge, CodexFeed, CodexHost,
+    CodexRunnerConfig,
+};
+use rex_wave_notify::Inbox;
+use rex_wave_rooms::Rooms;
+use rex_wave_runtime::{
+    AgentFeed, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection,
+    ThreadIdResolver, spawn_reactor,
+};
+use rex_wave_store::Journal;
+use rex_wave_transport::read_worker_token_file;
+use rex_wave_waves::{AgentHost, HostRouter, WaveConductor, Waves};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+struct TestHarness {
+    _tmp: tempfile::TempDir,
+    project_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_path: PathBuf,
+    claude: Arc<ClaudeBridge>,
+    codex: Arc<CodexBridge>,
+    router: Arc<Router>,
+    operator: LocalClient,
+    _conductor: tokio::task::JoinHandle<()>,
+}
+
+impl TestHarness {
+    async fn new(claude_bin: PathBuf, codex_bin: PathBuf) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        init_git_repo(&project_dir);
+
+        let state_dir = tmp.path().join("state");
+        rex_wave_fs::create_missing_private_dir(&state_dir).unwrap();
+        let socket_path = state_dir.join("daemon.sock");
+        let journal_path = state_dir.join("journal.sqlite3");
+
+        let sandbox_dir = tmp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        rex_wave_fs::write_atomic_path(
+            &sandbox_dir.join(".rex-wave-sandbox"),
+            b"ok\n",
+            0o600,
+            false,
+        )
+        .unwrap();
+        let sandbox = SandboxRoot::verify(&sandbox_dir).unwrap();
+
+        let journal = Journal::open(&journal_path).unwrap();
+        let hub = Hub::new(1024);
+        let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+        let mail_writer = journal.claim(rex_wave_api::StreamId::Mail).unwrap();
+
+        let claude = ClaudeBridge::new(
+            ClaudeRunnerConfig::from_env()
+                .with_bin(claude_bin)
+                .with_state_dir(&state_dir)
+                .with_socket_path(&socket_path)
+                .with_rex_wave_bin("/usr/local/bin/rex-wave-mock")
+                .with_bb_data_dir(None)
+                .with_retire_grace(Duration::from_millis(250)),
+        );
+        let codex = CodexBridge::new(
+            CodexRunnerConfig::from_env()
+                .with_bin(codex_bin)
+                .with_state_dir(&state_dir)
+                .with_socket_path(&socket_path)
+                .with_bb_data_dir(None)
+                .with_retire_grace(Duration::from_millis(250))
+                .with_rpc_timeout(Duration::from_secs(10)),
+        );
+
+        let thread_resolver: ThreadIdResolver = {
+            let journal = journal.clone();
+            Arc::new(move |wave: &WaveSlug, role: &RoleName| {
+                let journal = journal.clone();
+                let stream = rex_wave_api::StreamId::Wave { wave: wave.clone() };
+                let role = role.clone();
+                Box::pin(async move {
+                    let mut after = rex_wave_api::Seq::ORIGIN;
+                    let mut latest = None;
+                    while let Ok(page) = journal.read(&stream, after, 512) {
+                        if page.is_empty() {
+                            break;
+                        }
+                        for env in page {
+                            after = env.seq;
+                            if let rex_wave_api::Event::Wave(
+                                rex_wave_api::wave::WaveEvent::WorkerObserved {
+                                    role: r,
+                                    observation:
+                                        rex_wave_api::wave::Observation::Spawned { thread, .. },
+                                },
+                            ) = env.event
+                                && r == role
+                            {
+                                latest = Some(thread);
+                            }
+                        }
+                    }
+                    latest
+                })
+            })
+        };
+
+        let feed: Arc<dyn AgentFeed> = Arc::new(
+            FeedRouter::new([
+                (
+                    RunnerKind::Claude,
+                    Arc::new(ClaudeFeed(claude.clone())) as Arc<dyn AgentFeed>,
+                ),
+                (
+                    RunnerKind::Codex,
+                    Arc::new(CodexFeed(codex.clone())) as Arc<dyn AgentFeed>,
+                ),
+            ])
+            .with_thread_resolver(thread_resolver),
+        );
+
+        let router = Arc::new(Router {
+            room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+            wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+            board: Registry::<Board>::new(journal.clone(), hub.clone()),
+            inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
+            mail: Arc::new(MailBridge::with_hub(
+                sandbox,
+                journal.clone(),
+                mail_writer,
+                hub.clone(),
+            )),
+            presence: Presence::new().registry(journal.clone(), hub.clone()),
+            read: Arc::new(ReadSide {
+                journal,
+                hub,
+                sidebar,
+                agents: feed,
+            }),
+        });
+
+        claude.attach_router(router.clone());
+        codex.attach_router(router.clone());
+
+        let host_router = HostRouter::new(RunnerKind::Claude)
+            .with_host(RunnerKind::Claude, ClaudeHost(claude.clone()))
+            .with_host(RunnerKind::Codex, CodexHost(codex.clone()));
+
+        let conductor = spawn_reactor(
+            WaveConductor::new(host_router),
+            LocalClient::new(
+                router.clone(),
+                Principal::System {
+                    part: SystemPart::WaveConductor,
+                },
+            ),
+        );
+
+        let operator = LocalClient::new(
+            router.clone(),
+            Principal::Operator {
+                seat: SeatName::parse("owner").unwrap(),
+            },
+        );
+
+        Self {
+            _tmp: tmp,
+            project_dir,
+            state_dir,
+            socket_path,
+            claude,
+            codex,
+            router,
+            operator,
+            _conductor: conductor,
+        }
+    }
+
+    async fn wait_wave<F>(&self, wave: &WaveSlug, pred: F) -> WaveSnapshot
+    where
+        F: Fn(&WaveSnapshot) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = None;
+        while Instant::now() < deadline {
+            if let Ok(snap) = self.operator.call(WaveView { wave: wave.clone() }).await {
+                if pred(&snap) {
+                    return snap;
+                }
+                last = Some(snap);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for wave {wave} state; last={last:?}");
+    }
+
+    async fn wait_page<F>(&self, wave: &WaveSlug, role: &RoleName, pred: F) -> ThreadPageView
+    where
+        F: Fn(&ThreadPageView) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = None;
+        while Instant::now() < deadline {
+            if let Ok(page) = self.router.read.agents.page(wave, role, None, 200).await {
+                if pred(&page) {
+                    return page;
+                }
+                last = Some(page);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for feed page @{wave}/{role}; last={last:?}");
+    }
+}
+
+fn init_git_repo(dir: &Path) {
+    let run = |args: &[&str]| {
+        let out = StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test Bot"]);
+    rex_wave_fs::write_atomic_path(&dir.join("README.md"), b"demo\n", 0o644, false).unwrap();
+    run(&["add", "README.md"]);
+    run(&["commit", "-q", "-m", "initial"]);
+}
+
+fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    rex_wave_fs::write_atomic_path(&path, body.as_bytes(), 0o755, false).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+fn process_alive(pid: i32) -> bool {
+    let Some(p) = rustix::process::Pid::from_raw(pid) else {
+        return false;
+    };
+    !matches!(
+        rustix::process::test_kill_process(p),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+fn worker_phase<'a>(snap: &'a WaveSnapshot, role: &RoleName) -> Option<&'a WorkerPhase> {
+    snap.workers
+        .iter()
+        .find(|(r, _, _)| r == role)
+        .map(|(_, _, p)| p)
+}
+
+fn wait_for_pid_file(path: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(text) = rex_wave_fs::read_regular_string(path, 4096)
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for pid file {}", path.display());
+}
+
+#[tokio::test]
+async fn claude_end_to_end_streaming_approval_tell_resume_and_retire() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let args_log = script_dir.path().join("claude_args.jsonl");
+    let pid_file = script_dir.path().join("grandchild.pid");
+    let first_exited = script_dir.path().join("first_exited");
+
+    let claude_script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+
+args_log = {args_log:?}
+pid_file = {pid_file:?}
+first_exited = {first_exited:?}
+
+with open(args_log, "a") as f:
+    f.write(json.dumps({{
+        "argv": sys.argv[1:],
+        "cwd": os.getcwd(),
+        "thread_id": os.environ.get("REX_WAVE_WORKER_THREAD_ID"),
+        "token": os.environ.get("REX_WAVE_TOKEN"),
+        "socket": os.environ.get("REX_WAVE_SOCKET"),
+    }}) + "\n")
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+resumed = "--resume" in sys.argv[1:]
+
+if not resumed:
+    first_line = sys.stdin.readline()
+    msg1 = json.loads(first_line)
+    assert msg1["type"] == "user"
+
+    emit({{
+        "type": "system",
+        "subtype": "init",
+        "session_id": "sess_cl_001",
+        "model": "claude-opus-5-5",
+        "account": "acct-primary"
+    }})
+    emit({{
+        "type": "assistant",
+        "message": {{
+            "model": "claude-opus-5-5",
+            "content": [
+                {{"type": "text", "text": "Starting work"}},
+                {{"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {{"command": "ls -la"}}}}
+            ]
+        }}
+    }})
+    emit({{
+        "type": "control_request",
+        "request_id": "perm_1",
+        "request": {{
+            "subtype": "can_use_tool",
+            "tool_name": "Bash",
+            "input": {{"command": "ls -la"}},
+            "decision_reason": "List workspace files"
+        }}
+    }})
+
+    ctrl_line = sys.stdin.readline()
+    ctrl = json.loads(ctrl_line)
+    assert ctrl["type"] == "control_response"
+    inner = ctrl["response"]["response"]
+    assert inner["behavior"] == "allow"
+    assert inner["updatedInput"] == {{"command": "ls -la"}}
+
+    emit({{
+        "type": "user",
+        "message": {{
+            "role": "user",
+            "content": [
+                {{"type": "tool_result", "tool_use_id": "tu_1", "content": "README.md", "is_error": False}}
+            ]
+        }}
+    }})
+    emit({{
+        "type": "assistant",
+        "message": {{"content": [{{"type": "text", "text": "Listed workspace"}}]}}
+    }})
+    emit({{
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "session_id": "sess_cl_001",
+        "total_cost_usd": 0.042,
+        "usage": {{"input_tokens": 1200, "cache_read_input_tokens": 300, "output_tokens": 250}},
+        "modelUsage": {{"claude-opus-5-5": {{"contextWindow": 200000, "costUSD": 0.042}}}}
+    }})
+
+    second_line = sys.stdin.readline()
+    msg2 = json.loads(second_line)
+    assert "live followup" in msg2["message"]["content"][0]["text"]
+    emit({{
+        "type": "assistant",
+        "message": {{"content": [{{"type": "text", "text": "Handled live followup"}}]}}
+    }})
+    emit({{
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "session_id": "sess_cl_001",
+        "total_cost_usd": 0.055,
+        "usage": {{"input_tokens": 1400, "output_tokens": 300}},
+        "modelUsage": {{"claude-opus-5-5": {{"contextWindow": 200000, "costUSD": 0.055}}}}
+    }})
+    with open(first_exited, "w") as f:
+        f.write("done\n")
+    sys.exit(0)
+else:
+    # Spawn a grandchild ignoring SIGTERM to verify process-group SIGKILL reaping.
+    gc = subprocess.Popen(
+        [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"]
+    )
+    with open(pid_file, "w") as f:
+        f.write(str(gc.pid) + "\n")
+
+    line = sys.stdin.readline()
+    msg = json.loads(line)
+    assert "after clean exit" in msg["message"]["content"][0]["text"]
+    emit({{
+        "type": "system",
+        "subtype": "init",
+        "session_id": "sess_cl_001",
+        "model": "claude-opus-5-5"
+    }})
+    emit({{
+        "type": "assistant",
+        "message": {{"content": [{{"type": "text", "text": "Resumed cleanly"}}]}}
+    }})
+    emit({{
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "session_id": "sess_cl_001",
+        "usage": {{"input_tokens": 1500, "output_tokens": 320}},
+        "modelUsage": {{"claude-opus-5-5": {{"contextWindow": 200000}}}}
+    }})
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True:
+        time.sleep(1)
+"#,
+        args_log = args_log.to_string_lossy(),
+        pid_file = pid_file.to_string_lossy(),
+        first_exited = first_exited.to_string_lossy(),
+    );
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-claude", &claude_script);
+    let noop_codex =
+        write_executable_script(script_dir.path(), "mock-codex", "#!/bin/sh\nexit 1\n");
+    let h = TestHarness::new(claude_bin, noop_codex).await;
+
+    let wave = WaveSlug::parse("w-claude").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    let spec = WaveSpec {
+        slug: wave.clone(),
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        goal: Body::parse("Verify native Claude stream-json runner").unwrap(),
+        defaults: AgentSpec {
+            provider: ProviderId::parse("claude:claude-code").unwrap(),
+            model: Some(ModelId::parse("claude-opus-5-5").unwrap()),
+            account: Some("acct-primary".into()),
+            reasoning: Some("high".into()),
+            service_tier: None,
+            permission: PermissionMode::AcceptEdits,
+            workspace: Workspace::ManagedWorktree {
+                base: BaseBranch::Default,
+            },
+        },
+        output_dir: None,
+        workers: vec![WorkerSpec {
+            role: role.clone(),
+            brief: Body::parse("Inspect repo and report").unwrap(),
+            agent: None,
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        }],
+    };
+
+    h.operator
+        .call(WaveStart { spec, idem: None })
+        .await
+        .unwrap();
+
+    // Wait until blocked on control_request `perm_1`.
+    let blocked_snap = h
+        .wait_wave(&wave, |snap| {
+            matches!(
+                worker_phase(snap, &role),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Blocked { interaction },
+                    ..
+                }) if interaction.id.as_str() == "perm_1"
+                    && matches!(interaction.kind, InteractionKind::Permission)
+            )
+        })
+        .await;
+
+    let expected_tid = HostThreadId::parse("claude:w-claude:author:a1").unwrap();
+    assert!(matches!(
+        worker_phase(&blocked_snap, &role),
+        Some(WorkerPhase::Live { thread, .. }) if thread == &expected_tid
+    ));
+
+    let meta = blocked_snap.worker_meta.get(&role).unwrap();
+    assert_eq!(
+        meta.actual_model.as_ref().map(ModelId::as_str),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(meta.actual_account.as_deref(), Some("acct-primary"));
+
+    // Verify mode-0600 worker token file exists.
+    let token = read_worker_token_file(&h.state_dir, expected_tid.as_str())
+        .unwrap()
+        .expect("worker token file must be provisioned on spawn");
+    assert!(token.starts_with("rw_w_"));
+
+    // Open live AgentFeed stream and verify streaming backlog + live delivery.
+    let mut live_stream = h.router.read.agents.live(&wave, &role).await.unwrap();
+    let mut saw_start_text = false;
+    let mut saw_tool_call = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!saw_start_text || !saw_tool_call) && Instant::now() < deadline {
+        if let Ok(Some(Ok(Frame::Agent { event, .. }))) =
+            tokio::time::timeout(Duration::from_secs(1), live_stream.next()).await
+        {
+            match event.kind {
+                AgentEventKind::AssistantText { ref text } if text == "Starting work" => {
+                    saw_start_text = true;
+                }
+                AgentEventKind::ToolCall { ref name, .. } if name == "Bash" => {
+                    saw_tool_call = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_start_text && saw_tool_call);
+
+    // Resolve the permission prompt.
+    h.operator
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("perm_1").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Wait for turn completion -> Activity::Idle and check usage + tool result.
+    h.wait_wave(&wave, |snap| {
+        matches!(
+            worker_phase(snap, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    let page = h
+        .wait_page(&wave, &role, |p| {
+            p.usage.as_ref().is_some_and(|u| u.used_tokens == 1750)
+                && p.events.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        AgentEventKind::ToolResult { name, ok: true, summary }
+                            if name == "Bash" && summary.contains("README.md")
+                    )
+                })
+        })
+        .await;
+    let usage = page.usage.unwrap();
+    assert_eq!(usage.model_context_window, 200_000);
+    assert_eq!(usage.cost_usd, Some(0.042));
+
+    // Tell #1 over live stdin.
+    h.operator
+        .call(WaveTell {
+            wave: wave.clone(),
+            role: role.clone(),
+            body: Body::parse("live followup").unwrap(),
+            mode: SteerDeliveryMode::Auto,
+        })
+        .await
+        .unwrap();
+
+    h.wait_page(&wave, &role, |p| {
+        p.events.iter().any(|e| {
+            matches!(&e.kind, AgentEventKind::AssistantText { text } if text == "Handled live followup")
+        })
+    })
+    .await;
+
+    // Wait until the first Claude process exits cleanly so tell #2 must respawn with --resume.
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while !first_exited.exists() && Instant::now() < exit_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        first_exited.exists(),
+        "first mock process should exit cleanly"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    h.operator
+        .call(WaveTell {
+            wave: wave.clone(),
+            role: role.clone(),
+            body: Body::parse("after clean exit").unwrap(),
+            mode: SteerDeliveryMode::Auto,
+        })
+        .await
+        .unwrap();
+
+    h.wait_page(&wave, &role, |p| {
+        p.events.iter().any(|e| {
+            matches!(&e.kind, AgentEventKind::AssistantText { text } if text == "Resumed cleanly")
+        })
+    })
+    .await;
+
+    h.wait_wave(&wave, |snap| {
+        matches!(
+            worker_phase(snap, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    let grandchild_pid = wait_for_pid_file(&pid_file);
+    assert!(
+        process_alive(grandchild_pid),
+        "grandchild must be alive before retire"
+    );
+
+    // Retire worker -> revokes token, SIGTERM -> grace -> SIGKILL process group, emits Archived.
+    h.operator
+        .call(WaveRetireWorker {
+            wave: wave.clone(),
+            role: role.clone(),
+            reason: Some("done".into()),
+        })
+        .await
+        .unwrap();
+
+    let retired_snap = h
+        .wait_wave(&wave, |snap| {
+            matches!(
+                worker_phase(snap, &role),
+                Some(WorkerPhase::Retired {
+                    thread: Some(t),
+                    errored: None,
+                    refused: None,
+                }) if t == &expected_tid
+            )
+        })
+        .await;
+    assert_eq!(retired_snap.counts.retired_clean, 1);
+
+    assert_eq!(
+        read_worker_token_file(&h.state_dir, expected_tid.as_str()).unwrap(),
+        None,
+        "worker token file must be unlinked on retire"
+    );
+
+    let reap_deadline = Instant::now() + Duration::from_secs(3);
+    while process_alive(grandchild_pid) && Instant::now() < reap_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !process_alive(grandchild_pid),
+        "SIGTERM-ignoring grandchild must be reaped via process-group SIGKILL"
+    );
+
+    // Inspect recorded CLI invocations (initial + resumed).
+    let raw_log = rex_wave_fs::read_regular_string(&args_log, 64 * 1024).unwrap();
+    let invocations: Vec<serde_json::Value> = raw_log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(invocations.len(), 2);
+
+    let first_argv: Vec<&str> = invocations[0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(first_argv.contains(&"-p"));
+    assert!(first_argv.contains(&"--input-format"));
+    assert!(first_argv.contains(&"stream-json"));
+    assert!(first_argv.contains(&"--output-format"));
+    assert!(first_argv.contains(&"--verbose"));
+    assert!(first_argv.contains(&"--model"));
+    assert!(first_argv.contains(&"claude-opus-5-5"));
+    assert!(first_argv.contains(&"--effort"));
+    assert!(first_argv.contains(&"high"));
+    assert!(first_argv.contains(&"--permission-mode"));
+    assert!(first_argv.contains(&"acceptEdits"));
+    assert!(first_argv.contains(&"--permission-prompt-tool"));
+    assert!(first_argv.contains(&"stdio"));
+    assert!(first_argv.contains(&"--mcp-config"));
+    assert_eq!(
+        invocations[0]["thread_id"].as_str(),
+        Some(expected_tid.as_str())
+    );
+    assert_eq!(invocations[0]["token"].as_str(), Some(token.as_str()));
+    assert_eq!(
+        invocations[0]["socket"].as_str(),
+        Some(h.socket_path.to_string_lossy().as_ref())
+    );
+    let expected_wt_suffix = ".worktrees/rex-wave-w-claude-author";
+    assert!(
+        invocations[0]["cwd"]
+            .as_str()
+            .unwrap()
+            .ends_with(expected_wt_suffix),
+        "unexpected worktree cwd: {}",
+        invocations[0]["cwd"]
+    );
+
+    let second_argv: Vec<&str> = invocations[1]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let resume_idx = second_argv
+        .iter()
+        .position(|a| *a == "--resume")
+        .expect("resumed invocation must pass --resume");
+    assert_eq!(second_argv.get(resume_idx + 1), Some(&"sess_cl_001"));
+
+    h.claude.shutdown().await;
+}
+
+#[tokio::test]
+async fn claude_refusal_error_deny_and_full_permission_mode() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let args_log = script_dir.path().join("claude_full_args.jsonl");
+
+    let claude_script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+
+with open({args_log:?}, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+line = sys.stdin.readline()
+msg = json.loads(line)
+text = msg["message"]["content"][0]["text"]
+
+if "REFUSE_ME" in text:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_ref"}})
+    emit({{"type": "control_request", "request_id": "deny_1", "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "bad"}}}}}})
+    ctrl = json.loads(sys.stdin.readline())
+    assert ctrl["response"]["response"]["behavior"] == "deny"
+    emit({{"type": "result", "subtype": "error_during_execution", "stop_reason": "refusal", "is_error": True, "result": "Request declined by safety policy"}})
+elif "ERROR_ME" in text:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_err"}})
+    emit({{"type": "result", "subtype": "error_during_execution", "is_error": True, "error": "upstream timeout"}})
+"#,
+        args_log = args_log.to_string_lossy(),
+    );
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-claude-err", &claude_script);
+    let noop_codex =
+        write_executable_script(script_dir.path(), "mock-codex", "#!/bin/sh\nexit 1\n");
+    let h = TestHarness::new(claude_bin, noop_codex).await;
+
+    let wave = WaveSlug::parse("w-cl-cls").unwrap();
+    let r_ref = RoleName::parse("refuser").unwrap();
+    let r_err = RoleName::parse("errorer").unwrap();
+    let spec = WaveSpec {
+        slug: wave.clone(),
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        goal: Body::parse("Verify Claude refusal and error classification").unwrap(),
+        defaults: AgentSpec {
+            provider: ProviderId::parse("claude:claude-code").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::AcceptEdits,
+            workspace: Workspace::ProjectDefault,
+        },
+        output_dir: None,
+        workers: vec![
+            WorkerSpec {
+                role: r_ref.clone(),
+                brief: Body::parse("REFUSE_ME").unwrap(),
+                agent: None,
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            },
+            WorkerSpec {
+                role: r_err.clone(),
+                brief: Body::parse("ERROR_ME").unwrap(),
+                agent: Some(AgentSpec {
+                    provider: ProviderId::parse("claude:claude-code").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                }),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            },
+        ],
+    };
+
+    h.operator
+        .call(WaveStart { spec, idem: None })
+        .await
+        .unwrap();
+
+    // Wait for deny_1 permission prompt, then Deny it.
+    h.wait_wave(&wave, |snap| {
+        matches!(
+            worker_phase(snap, &r_ref),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "deny_1"
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: r_ref.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("deny_1").unwrap(),
+            resolution: InteractionResolution::Deny,
+        })
+        .await
+        .unwrap();
+
+    let snap = h
+        .wait_wave(&wave, |s| {
+            matches!(
+                worker_phase(s, &r_ref),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Refused { .. },
+                    ..
+                })
+            ) && matches!(
+                worker_phase(s, &r_err),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Errored { .. },
+                    ..
+                })
+            )
+        })
+        .await;
+    assert_eq!(snap.counts.refused, 1);
+    assert_eq!(snap.counts.errored, 1);
+
+    // WaveFinish(Completed) without allow_incomplete must reject both refused and errored workers.
+    let finish_err = h
+        .operator
+        .call(WaveFinish {
+            wave: wave.clone(),
+            outcome: WaveOutcome::Completed {
+                summary: Body::parse("done").unwrap(),
+            },
+            allow_incomplete: false,
+        })
+        .await
+        .unwrap_err();
+    let msg = finish_err.to_string();
+    assert!(msg.contains("@refuser"), "unexpected err: {msg}");
+    assert!(msg.contains("@errorer"), "unexpected err: {msg}");
+
+    // Verify PermissionMode::Full passed bypassPermissions and omitted --permission-prompt-tool.
+    let raw_args = rex_wave_fs::read_regular_string(&args_log, 64 * 1024).unwrap();
+    let full_argv_line = raw_args
+        .lines()
+        .find(|l| l.contains("bypassPermissions"))
+        .expect("Full permission worker must pass bypassPermissions");
+    assert!(!full_argv_line.contains("--permission-prompt-tool"));
+
+    h.claude.shutdown().await;
+}
+
+#[tokio::test]
+async fn codex_end_to_end_streaming_approvals_steer_usage_and_retire() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let rpc_log = script_dir.path().join("codex_rpc.jsonl");
+    let pid_file = script_dir.path().join("codex_grandchild.pid");
+
+    let codex_script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+
+rpc_log = {rpc_log:?}
+pid_file = {pid_file:?}
+
+assert len(sys.argv) >= 2 and sys.argv[1] == "app-server", f"bad argv: {{sys.argv}}"
+
+def log_event(obj):
+    with open(rpc_log, "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+log_event({{
+    "kind": "boot",
+    "cwd": os.getcwd(),
+    "thread_id": os.environ.get("REX_WAVE_WORKER_THREAD_ID"),
+    "token": os.environ.get("REX_WAVE_TOKEN"),
+    "socket": os.environ.get("REX_WAVE_SOCKET"),
+}})
+
+# Spawn a SIGTERM-ignoring grandchild to verify process-group SIGKILL reaping.
+gc = subprocess.Popen(
+    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"]
+)
+with open(pid_file, "w") as f:
+    f.write(str(gc.pid) + "\n")
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+turn_count = 0
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    log_event(msg)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {{}}
+
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": req_id, "result": {{"userAgent": "mock-codex", "account": "acct-codex"}}}})
+    elif method == "initialized":
+        pass
+    elif method == "thread/start":
+        assert params.get("approvalPolicy") == "on-request"
+        assert params.get("sandbox") == "workspace-write"
+        assert params.get("model") == "gpt-6.1-sol"
+        send({{
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {{
+                "thread": {{"id": "cx_th_1"}},
+                "model": "gpt-6.1-sol",
+                "account": "acct-codex",
+                "cwd": params.get("cwd"),
+                "approvalPolicy": "on-request",
+                "sandbox": "workspace-write"
+            }}
+        }})
+    elif method == "turn/start":
+        turn_count += 1
+        tid = f"turn_{{turn_count}}"
+        assert params.get("threadId") == "cx_th_1"
+        assert params["input"][0]["type"] == "text"
+        send({{"jsonrpc": "2.0", "id": req_id, "result": {{"turn": {{"id": tid, "status": "inProgress"}}}}}})
+        send({{"jsonrpc": "2.0", "method": "turn/started", "params": {{"threadId": "cx_th_1", "turn": {{"id": tid, "status": "inProgress"}}}}}})
+
+        if turn_count == 1:
+            assert params.get("effort") == "xhigh"
+            send({{
+                "jsonrpc": "2.0",
+                "method": "item/started",
+                "params": {{
+                    "threadId": "cx_th_1",
+                    "turnId": tid,
+                    "startedAtMs": 1000,
+                    "item": {{"type": "commandExecution", "id": "cmd_1", "command": "cargo test", "status": "inProgress"}}
+                }}
+            }})
+            send({{
+                "jsonrpc": "2.0",
+                "id": 901,
+                "method": "item/commandExecution/requestApproval",
+                "params": {{
+                    "threadId": "cx_th_1",
+                    "turnId": tid,
+                    "itemId": "cmd_1",
+                    "command": "cargo test",
+                    "reason": "Run workspace tests",
+                    "startedAtMs": 1001
+                }}
+            }})
+    elif method is None and req_id == 901:
+        assert msg["result"]["decision"] == "accept"
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {{
+                "threadId": "cx_th_1",
+                "turnId": "turn_1",
+                "completedAtMs": 1005,
+                "item": {{"type": "commandExecution", "id": "cmd_1", "command": "cargo test", "status": "completed", "exitCode": 0, "aggregatedOutput": "all green"}}
+            }}
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "id": 902,
+            "method": "item/fileChange/requestApproval",
+            "params": {{
+                "threadId": "cx_th_1",
+                "turnId": "turn_1",
+                "itemId": "fc_1",
+                "reason": "Patch src/lib.rs",
+                "startedAtMs": 1006
+            }}
+        }})
+    elif method is None and req_id == 902:
+        assert msg["result"]["decision"] == "acceptForSession"
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/started",
+            "params": {{
+                "threadId": "cx_th_1",
+                "turnId": "turn_1",
+                "startedAtMs": 1007,
+                "item": {{"type": "fileChange", "id": "fc_1", "changes": [{{"path": "src/lib.rs"}}], "status": "inProgress"}}
+            }}
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {{
+                "threadId": "cx_th_1",
+                "turnId": "turn_1",
+                "completedAtMs": 1008,
+                "item": {{"type": "fileChange", "id": "fc_1", "changes": [{{"path": "src/lib.rs"}}], "status": "completed"}}
+            }}
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/agentMessage/delta",
+            "params": {{"threadId": "cx_th_1", "turnId": "turn_1", "itemId": "am_1", "delta": "Hello "}}
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/agentMessage/delta",
+            "params": {{"threadId": "cx_th_1", "turnId": "turn_1", "itemId": "am_1", "delta": "world"}}
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {{
+                "threadId": "cx_th_1",
+                "turnId": "turn_1",
+                "completedAtMs": 1009,
+                "item": {{"type": "agentMessage", "id": "am_1", "text": "Hello world"}}
+            }}
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "thread/tokenUsage/updated",
+            "params": {{
+                "threadId": "cx_th_1",
+                "turnId": "turn_1",
+                "tokenUsage": {{
+                    "modelContextWindow": 256000,
+                    "total": {{
+                        "inputTokens": 1000,
+                        "cachedInputTokens": 200,
+                        "outputTokens": 300,
+                        "reasoningOutputTokens": 100,
+                        "totalTokens": 1600
+                    }},
+                    "last": {{
+                        "inputTokens": 1000,
+                        "cachedInputTokens": 200,
+                        "outputTokens": 300,
+                        "reasoningOutputTokens": 100,
+                        "totalTokens": 1600
+                    }}
+                }}
+            }}
+        }})
+    elif method == "turn/steer":
+        assert params.get("expectedTurnId") == "turn_1"
+        assert "pivot now" in params["input"][0]["text"]
+        send({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"threadId": "cx_th_1", "turn": {{"id": "turn_1", "status": "completed"}}}}
+        }})
+    elif method == "turn/interrupt":
+        send({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}})
+        # Keep running ignoring SIGTERM so retire exercises bounded grace + SIGKILL.
+        while True:
+            time.sleep(1)
+"#,
+        rpc_log = rpc_log.to_string_lossy(),
+        pid_file = pid_file.to_string_lossy(),
+    );
+
+    let noop_claude =
+        write_executable_script(script_dir.path(), "mock-claude", "#!/bin/sh\nexit 1\n");
+    let codex_bin = write_executable_script(script_dir.path(), "mock-codex", &codex_script);
+    let h = TestHarness::new(noop_claude, codex_bin).await;
+
+    let wave = WaveSlug::parse("w-codex").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    let spec = WaveSpec {
+        slug: wave.clone(),
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        goal: Body::parse("Verify native Codex app-server runner").unwrap(),
+        defaults: AgentSpec {
+            provider: ProviderId::parse("codex:codex").unwrap(),
+            model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+            account: Some("acct-codex".into()),
+            reasoning: Some("xhigh".into()),
+            service_tier: None,
+            permission: PermissionMode::AcceptEdits,
+            workspace: Workspace::ManagedWorktree {
+                base: BaseBranch::Default,
+            },
+        },
+        output_dir: None,
+        workers: vec![WorkerSpec {
+            role: role.clone(),
+            brief: Body::parse("Run tests and patch lib").unwrap(),
+            agent: None,
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        }],
+    };
+
+    h.operator
+        .call(WaveStart { spec, idem: None })
+        .await
+        .unwrap();
+
+    // 1. Wait for commandExecution approval prompt.
+    let blocked1 = h
+        .wait_wave(&wave, |snap| {
+            matches!(
+                worker_phase(snap, &role),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Blocked { interaction },
+                    ..
+                }) if interaction.id.as_str() == "cmd_1"
+            )
+        })
+        .await;
+
+    let expected_tid = HostThreadId::parse("codex:w-codex:author:a1").unwrap();
+    assert!(matches!(
+        worker_phase(&blocked1, &role),
+        Some(WorkerPhase::Live { thread, .. }) if thread == &expected_tid
+    ));
+    let meta = blocked1.worker_meta.get(&role).unwrap();
+    assert_eq!(
+        meta.actual_model.as_ref().map(ModelId::as_str),
+        Some("gpt-6.1-sol")
+    );
+    assert_eq!(meta.actual_account.as_deref(), Some("acct-codex"));
+
+    let token = read_worker_token_file(&h.state_dir, expected_tid.as_str())
+        .unwrap()
+        .expect("Codex worker token file must exist");
+    assert!(token.starts_with("rw_w_"));
+
+    // Resolve command approval (AllowOnce -> "accept").
+    h.operator
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("cmd_1").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    // 2. Wait for fileChange approval prompt and resolve with AllowForSession -> "acceptForSession".
+    h.wait_wave(&wave, |snap| {
+        matches!(
+            worker_phase(snap, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "fc_1"
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("fc_1").unwrap(),
+            resolution: InteractionResolution::AllowForSession {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Wait for streaming deltas + token usage while turn_1 is still active.
+    let mid_page = h
+        .wait_page(&wave, &role, |p| {
+            p.usage.as_ref().is_some_and(|u| u.used_tokens == 1600)
+        })
+        .await;
+    assert_eq!(
+        mid_page.usage.as_ref().unwrap().model_context_window,
+        256_000
+    );
+    let assistant_texts: Vec<&str> = mid_page
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::AssistantText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_texts,
+        vec!["Hello ", "world"],
+        "deltas stream without duplicate item/completed text"
+    );
+
+    // 3. Tell with Steer while turn_1 is active -> exercises turn/steer.
+    h.operator
+        .call(WaveTell {
+            wave: wave.clone(),
+            role: role.clone(),
+            body: Body::parse("pivot now").unwrap(),
+            mode: SteerDeliveryMode::Steer,
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&wave, |snap| {
+        matches!(
+            worker_phase(snap, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // 4. Tell while idle -> exercises turn/start (turn_2).
+    h.operator
+        .call(WaveTell {
+            wave: wave.clone(),
+            role: role.clone(),
+            body: Body::parse("second turn").unwrap(),
+            mode: SteerDeliveryMode::Auto,
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&wave, |snap| {
+        matches!(
+            worker_phase(snap, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Working,
+                ..
+            })
+        )
+    })
+    .await;
+
+    let grandchild_pid = wait_for_pid_file(&pid_file);
+    assert!(process_alive(grandchild_pid));
+
+    // 5. Retire -> revokes token, sends turn/interrupt, reaps process group (including grandchild), emits Archived.
+    h.operator
+        .call(WaveRetireWorker {
+            wave: wave.clone(),
+            role: role.clone(),
+            reason: Some("complete".into()),
+        })
+        .await
+        .unwrap();
+
+    let retired = h
+        .wait_wave(&wave, |snap| {
+            matches!(
+                worker_phase(snap, &role),
+                Some(WorkerPhase::Retired {
+                    thread: Some(t),
+                    errored: None,
+                    refused: None,
+                }) if t == &expected_tid
+            )
+        })
+        .await;
+    assert_eq!(retired.counts.retired_clean, 1);
+
+    assert_eq!(
+        read_worker_token_file(&h.state_dir, expected_tid.as_str()).unwrap(),
+        None,
+        "Codex worker token must be unlinked on retire"
+    );
+
+    let reap_deadline = Instant::now() + Duration::from_secs(3);
+    while process_alive(grandchild_pid) && Instant::now() < reap_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !process_alive(grandchild_pid),
+        "Codex SIGTERM-ignoring grandchild must be reaped via process-group SIGKILL"
+    );
+
+    // Verify RPC sequence including initialize, initialized, thread/start, turn/start, turn/steer, turn/interrupt.
+    let raw_rpc = rex_wave_fs::read_regular_string(&rpc_log, 128 * 1024).unwrap();
+    let entries: Vec<serde_json::Value> = raw_rpc
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        entries[0]["cwd"]
+            .as_str()
+            .unwrap()
+            .ends_with(".worktrees/rex-wave-w-codex-author")
+    );
+    assert_eq!(entries[0]["token"].as_str(), Some(token.as_str()));
+    assert_eq!(
+        entries[0]["socket"].as_str(),
+        Some(h.socket_path.to_string_lossy().as_ref())
+    );
+    let methods: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("method").and_then(|v| v.as_str()))
+        .collect();
+    assert!(methods.contains(&"initialize"));
+    assert!(methods.contains(&"initialized"));
+    assert!(methods.contains(&"thread/start"));
+    assert!(methods.contains(&"turn/start"));
+    assert!(methods.contains(&"turn/steer"));
+    assert!(methods.contains(&"turn/interrupt"));
+
+    // Verify after= cursor paging on CodexFeed.
+    let full_page = h
+        .router
+        .read
+        .agents
+        .page(&wave, &role, None, 200)
+        .await
+        .unwrap();
+    assert!(full_page.events.len() >= 4);
+    let tail_page = h
+        .router
+        .read
+        .agents
+        .page(&wave, &role, Some(HostSeq(2)), 200)
+        .await
+        .unwrap();
+    assert!(tail_page.events.iter().all(|e| e.seq > HostSeq(2)));
+
+    h.codex.shutdown().await;
+}
+
+#[tokio::test]
+async fn codex_refusal_error_classification_and_mixed_runner_wave() {
+    let script_dir = tempfile::tempdir().unwrap();
+
+    let claude_script = r#"#!/usr/bin/env python3
+import json, sys
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+_ = json.loads(sys.stdin.readline())
+emit({"type": "system", "subtype": "init", "session_id": "s_mix"})
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Claude ready"}]}})
+emit({"type": "result", "subtype": "success", "is_error": False, "session_id": "s_mix"})
+"#;
+
+    let codex_script = r#"#!/usr/bin/env python3
+import json, sys
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    m = msg.get("method")
+    rid = msg.get("id")
+    p = msg.get("params") or {}
+    if m == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif m == "thread/start":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": "cx_mix"}, "model": "gpt-6.1-sol"}})
+    elif m == "turn/start":
+        text = p["input"][0]["text"]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": "t1", "status": "inProgress"}}})
+        if "TRIGGER_REFUSAL" in text:
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "cx_mix",
+                    "turn": {
+                        "id": "t1",
+                        "status": "failed",
+                        "error": {"message": "Blocked by safety rule", "codexErrorInfo": "cyberPolicy"}
+                    }
+                }
+            })
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "cx_mix",
+                    "turn": {
+                        "id": "t1",
+                        "status": "failed",
+                        "error": {"message": "Upstream server failure", "codexErrorInfo": "internalServerError"}
+                    }
+                }
+            })
+"#;
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-claude-mix", claude_script);
+    let codex_bin = write_executable_script(script_dir.path(), "mock-codex-mix", codex_script);
+    let h = TestHarness::new(claude_bin, codex_bin).await;
+
+    let wave = WaveSlug::parse("w-mix").unwrap();
+    let r_cl = RoleName::parse("cl-worker").unwrap();
+    let r_cx_ref = RoleName::parse("cx-refused").unwrap();
+    let r_cx_err = RoleName::parse("cx-errored").unwrap();
+
+    let spec = WaveSpec {
+        slug: wave.clone(),
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        goal: Body::parse("Verify mixed Claude + Codex wave routing and classification").unwrap(),
+        defaults: AgentSpec {
+            provider: ProviderId::parse("claude:claude-code").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::Full,
+            workspace: Workspace::ProjectDefault,
+        },
+        output_dir: None,
+        workers: vec![
+            WorkerSpec {
+                role: r_cl.clone(),
+                brief: Body::parse("Say hello").unwrap(),
+                agent: None,
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            },
+            WorkerSpec {
+                role: r_cx_ref.clone(),
+                brief: Body::parse("TRIGGER_REFUSAL").unwrap(),
+                agent: Some(AgentSpec {
+                    provider: ProviderId::parse("codex:codex").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                }),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            },
+            WorkerSpec {
+                role: r_cx_err.clone(),
+                brief: Body::parse("TRIGGER_ERROR").unwrap(),
+                agent: Some(AgentSpec {
+                    provider: ProviderId::parse("codex:codex").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                }),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            },
+        ],
+    };
+
+    h.operator
+        .call(WaveStart { spec, idem: None })
+        .await
+        .unwrap();
+
+    let snap = h
+        .wait_wave(&wave, |s| {
+            matches!(
+                worker_phase(s, &r_cl),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Idle,
+                    ..
+                })
+            ) && matches!(
+                worker_phase(s, &r_cx_ref),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Refused { .. },
+                    ..
+                })
+            ) && matches!(
+                worker_phase(s, &r_cx_err),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Errored { .. },
+                    ..
+                })
+            )
+        })
+        .await;
+
+    assert_eq!(snap.counts.idle, 1);
+    assert_eq!(snap.counts.refused, 1);
+    assert_eq!(snap.counts.errored, 1);
+
+    // FeedRouter routes both Claude and Codex pages transparently.
+    let cl_page = h
+        .router
+        .read
+        .agents
+        .page(&wave, &r_cl, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(cl_page.thread.runner_kind(), RunnerKind::Claude);
+    assert!(cl_page.events.iter().any(|e| {
+        matches!(&e.kind, AgentEventKind::AssistantText { text } if text == "Claude ready")
+    }));
+    let cx_page = h
+        .router
+        .read
+        .agents
+        .page(&wave, &r_cx_ref, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(cx_page.thread.runner_kind(), RunnerKind::Codex);
+    assert!(matches!(cx_page.activity, Activity::Refused { .. }));
+
+    // check_live reports missing process on unknown thread after simulated restart.
+    let ghost = HostThreadId::parse("codex:w-ghost:worker:a1").unwrap();
+    let probe = CodexHost(h.codex.clone()).check_live(&ghost).await.unwrap();
+    assert!(matches!(
+        probe,
+        Some(rex_wave_api::wave::Observation::Activity {
+            activity: Activity::Errored { .. },
+            ..
+        })
+    ));
+
+    h.claude.shutdown().await;
+    h.codex.shutdown().await;
+}
+
+#[tokio::test]
+async fn claude_second_turn_crash_without_result_reports_errored() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let claude_script = r#"#!/usr/bin/env python3
+import json, sys
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+_ = json.loads(sys.stdin.readline())
+emit({"type": "system", "subtype": "init", "session_id": "s_crash"})
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Turn 1 ok"}]}})
+emit({"type": "result", "subtype": "success", "is_error": False, "session_id": "s_crash"})
+_ = json.loads(sys.stdin.readline())
+sys.stderr.write("fatal panic on turn 2\n")
+sys.stderr.flush()
+sys.exit(2)
+"#;
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-claude-crash", claude_script);
+    let noop_codex =
+        write_executable_script(script_dir.path(), "mock-codex", "#!/bin/sh\nexit 1\n");
+    let h = TestHarness::new(claude_bin, noop_codex).await;
+
+    let wave = WaveSlug::parse("w-cl-crash").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    let spec = WaveSpec {
+        slug: wave.clone(),
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        goal: Body::parse("Verify mid-turn crash after successful turn 1").unwrap(),
+        defaults: AgentSpec {
+            provider: ProviderId::parse("claude:claude-code").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::Full,
+            workspace: Workspace::ProjectDefault,
+        },
+        output_dir: None,
+        workers: vec![WorkerSpec {
+            role: role.clone(),
+            brief: Body::parse("Turn 1").unwrap(),
+            agent: None,
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        }],
+    };
+
+    h.operator
+        .call(WaveStart { spec, idem: None })
+        .await
+        .unwrap();
+
+    h.wait_wave(&wave, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveTell {
+            wave: wave.clone(),
+            role: role.clone(),
+            body: Body::parse("Turn 2 triggers crash").unwrap(),
+            mode: SteerDeliveryMode::Auto,
+        })
+        .await
+        .unwrap();
+
+    let snap = h
+        .wait_wave(&wave, |s| {
+            matches!(
+                worker_phase(s, &role),
+                Some(WorkerPhase::Live {
+                    activity: Activity::Errored { error },
+                    ..
+                }) if error.contains("fatal panic on turn 2")
+            )
+        })
+        .await;
+    assert_eq!(snap.counts.errored, 1);
+
+    h.claude.shutdown().await;
+}

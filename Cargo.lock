@@ -1476,6 +1476,7 @@ dependencies = [
  "rex-wave-fs",
  "rex-wave-mailbridge",
  "rex-wave-mcp",
+ "rex-wave-native",
  "rex-wave-notify",
  "rex-wave-rooms",
  "rex-wave-runtime",
@@ -1594,6 +1595,29 @@ dependencies = [
  "rex-wave-runtime",
  "rex-wave-store",
  "rquickjs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "rex-wave-native"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rex-wave-api",
+ "rex-wave-board",
+ "rex-wave-fs",
+ "rex-wave-mailbridge",
+ "rex-wave-notify",
+ "rex-wave-rooms",
+ "rex-wave-runtime",
+ "rex-wave-store",
+ "rex-wave-transport",
+ "rex-wave-waves",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

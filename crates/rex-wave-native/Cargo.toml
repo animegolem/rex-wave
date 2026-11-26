@@ -1,0 +1,32 @@
+[package]
+name = "rex-wave-native"
+description = "Pure-Rust native Claude (stream-json) and Codex (app-server) AgentHost and AgentFeed runners."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rex-wave-api.workspace = true
+rex-wave-fs.workspace = true
+rex-wave-runtime.workspace = true
+rex-wave-transport.workspace = true
+rex-wave-waves.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+rex-wave-board.workspace = true
+rex-wave-mailbridge.workspace = true
+rex-wave-notify.workspace = true
+rex-wave-rooms.workspace = true
+rex-wave-store.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
