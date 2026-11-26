@@ -936,9 +936,15 @@ fn is_foldable(node: &SidebarNode) -> bool {
         )
 }
 
-/// Compact provider badge: `claude-code` -> `claude`, `acp-opencode` -> `opencode`.
+/// Compact provider badge: `bb:claude-code` -> `claude`, `t3:claudeAgent` -> `claude`,
+/// `acp-opencode` -> `opencode`.
 pub fn provider_badge(provider: &str) -> &str {
-    let p = provider.strip_prefix("acp-").unwrap_or(provider);
+    let stripped = rex_wave_api::RunnerKind::strip_provider_prefix(provider)
+        .map_or(provider, |(_, rest)| rest);
+    let p = stripped.strip_prefix("acp-").unwrap_or(stripped);
+    if p.eq_ignore_ascii_case("claudeAgent") {
+        return "claude";
+    }
     p.strip_suffix("-code").unwrap_or(p)
 }
 

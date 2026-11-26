@@ -4328,6 +4328,9 @@ pub struct BbBridge {
     fallback_active_waits: std::sync::Mutex<FallbackWaitTable>,
     reconcile_lock: tokio::sync::Mutex<()>,
     mirror_lock: tokio::sync::Mutex<()>,
+    connected: std::sync::atomic::AtomicBool,
+    connected_tx: watch::Sender<bool>,
+    connected_rx: watch::Receiver<bool>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -4360,6 +4363,14 @@ impl BbBridge {
     ) -> Arc<Self> {
         *self.config_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
         self
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn watch_connected(&self) -> watch::Receiver<bool> {
+        self.connected_rx.clone()
     }
 
     fn default_runner(&self) -> RunnerKind {
@@ -4434,6 +4445,7 @@ impl BbBridge {
         code_runner: Option<CodeRunner>,
     ) -> Arc<Self> {
         let (project_names_tx, project_names_rx) = watch::channel(Arc::new(BTreeMap::new()));
+        let (connected_tx, connected_rx) = watch::channel(false);
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<InboundSignal>();
         let bridge = Arc::new(BbBridge {
             cfg,
@@ -4451,6 +4463,9 @@ impl BbBridge {
             fallback_active_waits: std::sync::Mutex::new(FallbackWaitTable::default()),
             reconcile_lock: tokio::sync::Mutex::new(()),
             mirror_lock: tokio::sync::Mutex::new(()),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            connected_tx,
+            connected_rx,
             project_names_tx,
             project_names_rx,
         });
@@ -4756,6 +4771,9 @@ impl BbBridge {
             return;
         }
         let Ok(conn_id) = conn_rx.await else { return };
+        self.connected
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.connected_tx.send(true);
 
         // Dedicated reader task keeps frame parsing out of `select!` so partial frames are never dropped.
         let (in_tx, mut in_rx) = mpsc::channel::<ws::WsInbound>(64);
@@ -4802,6 +4820,9 @@ impl BbBridge {
         }
 
         reader_task.abort();
+        self.connected
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.connected_tx.send(false);
         let _ = self.owner.send(OwnerMsg::Disconnected { conn_id });
     }
 
@@ -11799,7 +11820,14 @@ mod tests {
             }],
         };
 
-        let started = op.call(WaveStart { spec, idem: None }).await.unwrap();
+        let started = op
+            .call(WaveStart {
+                spec,
+                idem: None,
+                config_defaults: Default::default(),
+            })
+            .await
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -12627,6 +12655,7 @@ mod tests {
                     ],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -13151,7 +13180,13 @@ mod tests {
                 },
             ],
         };
-        op.call(WaveStart { spec, idem: None }).await.unwrap();
+        op.call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
         sys.call(WaveObserve {
             wave: wave.clone(),
             role: ref_role.clone(),
@@ -13387,6 +13422,7 @@ mod tests {
                         }],
                     },
                     idem: None,
+                    config_defaults: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -13851,6 +13887,7 @@ mod tests {
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -14050,6 +14087,7 @@ mod tests {
                     }],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -14688,6 +14726,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15132,6 +15171,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15245,6 +15285,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15443,6 +15484,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -15627,6 +15669,7 @@ mod tests {
                     }],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -16093,6 +16136,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -16323,6 +16367,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -16836,6 +16881,7 @@ mod tests {
                         .collect(),
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -19380,6 +19426,7 @@ mod tests {
                     ],
                 },
                 idem: None,
+                config_defaults: Default::default(),
             })
             .await
             .unwrap();
@@ -19681,6 +19728,7 @@ mod tests {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -19865,6 +19913,7 @@ mod tests {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();

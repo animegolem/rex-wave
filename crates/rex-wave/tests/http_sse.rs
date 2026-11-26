@@ -1119,6 +1119,7 @@ async fn http_disconnect_cancels_worker_wait_and_restores_working() {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();

@@ -2,12 +2,19 @@
 //! (`Bb`, `T3`, `Acp`, `Claude`, `Codex`) over `Arc<dyn AgentHost>`.
 
 use crate::{AgentHost, BoxFut, HostError, SpawnRequest};
-use rex_wave_api::config::{HarnessProvider, RexConfig};
+use rex_wave_api::config::{HarnessProvider, RexConfig, WorkspaceStrategy};
 use rex_wave_api::room::Body;
-use rex_wave_api::wave::{AgentSpec, InteractionResolution, Observation, SteerDeliveryMode};
-use rex_wave_api::{HostInteractionId, HostThreadId, ProviderId, RunnerKind};
+use rex_wave_api::wave::{
+    AgentSpec, BaseBranch, InteractionResolution, Observation, SteerDeliveryMode,
+    WaveConfigDefaults, Workspace,
+};
+use rex_wave_api::{
+    ApiError, HostInteractionId, HostThreadId, InvalidId, ProviderId, RoleName, RunnerKind,
+    WaveCommand, WaveSlug, WireReply,
+};
+use rex_wave_runtime::{DecideCtx, Service};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,12 +140,155 @@ pub fn route_thread(thread: &HostThreadId) -> RunnerKind {
     thread.runner_kind()
 }
 
+/// Resolves and stamps `<runner>:<provider>` plus `[harnesses.<slot>]` defaults
+/// onto `agent` so they are durably recorded in `StreamId::Wave`.
+pub fn resolve_agent_spec_for_wave(
+    agent: &mut AgentSpec,
+    default_runner: RunnerKind,
+    cfg: Option<&RexConfig>,
+    defaults_mask: WaveConfigDefaults,
+    allow_account_default: bool,
+) -> Result<(RunnerKind, bool), ApiError> {
+    let mut account_applied = false;
+    if let Some(c) = cfg
+        && let Some(prof) = c.harnesses.for_provider_id(&agent.provider)
+    {
+        if agent.model.is_none() {
+            agent.model = prof.model.clone();
+        }
+        if agent.reasoning.is_none() {
+            agent.reasoning = prof.reasoning.clone();
+        }
+        if allow_account_default && agent.account.is_none() && prof.account.is_some() {
+            agent.account = prof.account.clone();
+            account_applied = true;
+        }
+        if defaults_mask.permission
+            && let Some(p) = prof.permission
+        {
+            agent.permission = p;
+        }
+        if defaults_mask.workspace
+            && let Some(w) = prof.workspace
+        {
+            agent.workspace = match w {
+                WorkspaceStrategy::ProjectDefault => Workspace::ProjectDefault,
+                WorkspaceStrategy::ManagedWorktree => Workspace::ManagedWorktree {
+                    base: BaseBranch::Default,
+                },
+            };
+        }
+    }
+
+    let routed =
+        route_provider_with_config(&agent.provider, default_runner, cfg).map_err(|msg| {
+            ApiError::Invalid(InvalidId {
+                what: "provider".into(),
+                reason: msg.to_string(),
+            })
+        })?;
+    let pinned_provider = ProviderId::parse(format!(
+        "{}:{}",
+        routed.target.as_str(),
+        routed.provider.as_str()
+    ))
+    .map_err(ApiError::Invalid)?;
+    agent.provider = pinned_provider;
+    Ok((routed.target, account_applied))
+}
+
+/// Service wrapper around `Registry<Waves>` that resolves runner routes and
+/// `[harnesses.<slot>]` defaults once at `WaveStart` / `WaveAddWorker` time so
+/// the chosen runner and effective `AgentSpec` are durably journaled in `StreamId::Wave`.
+pub struct WaveService {
+    inner: Arc<dyn Service<WaveCommand>>,
+    default_runner: RunnerKind,
+    config_rx: Option<watch::Receiver<RexConfig>>,
+}
+
+impl WaveService {
+    pub fn new(
+        inner: Arc<dyn Service<WaveCommand>>,
+        default_runner: RunnerKind,
+        config_rx: Option<watch::Receiver<RexConfig>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            default_runner,
+            config_rx,
+        })
+    }
+}
+
+impl Service<WaveCommand> for WaveService {
+    fn dispatch(
+        &self,
+        mut cmd: WaveCommand,
+        ctx: DecideCtx,
+    ) -> BoxFut<'_, Result<WireReply, ApiError>> {
+        let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+        let prep_res: Result<(), ApiError> = (|| {
+            match &mut cmd {
+                WaveCommand::WaveStart(ws) => {
+                    let mask = ws.config_defaults;
+                    let _ = resolve_agent_spec_for_wave(
+                        &mut ws.spec.defaults,
+                        self.default_runner,
+                        cfg.as_ref(),
+                        mask,
+                        true,
+                    )?;
+                    let default_acct = ws.spec.defaults.account.clone();
+                    for w in &mut ws.spec.workers {
+                        let mut agent = w.agent.clone().unwrap_or_else(|| ws.spec.defaults.clone());
+                        let _ = resolve_agent_spec_for_wave(
+                            &mut agent,
+                            self.default_runner,
+                            cfg.as_ref(),
+                            mask,
+                            true,
+                        )?;
+                        if agent.account.is_none() {
+                            agent.account = default_acct.clone();
+                        }
+                        w.agent = Some(agent);
+                    }
+                }
+                WaveCommand::WaveAddWorker(wa) => {
+                    if let Some(ref mut agent) = wa.worker.agent {
+                        let caller_had_account = agent.account.is_some();
+                        let (_, applied_acct) = resolve_agent_spec_for_wave(
+                            agent,
+                            self.default_runner,
+                            cfg.as_ref(),
+                            wa.config_defaults,
+                            !caller_had_account,
+                        )?;
+                        if applied_acct {
+                            wa.config_defaults.account_from_config = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        Box::pin(async move {
+            prep_res?;
+            self.inner.dispatch(cmd, ctx).await
+        })
+    }
+}
+
+type PinnedAttemptKey = (WaveSlug, RoleName, u32);
+
 /// N-way `AgentHost` multiplexer backed by `Arc<dyn AgentHost>` slots per [`RunnerKind`].
 #[derive(Clone)]
 pub struct HostRouter {
     hosts: BTreeMap<RunnerKind, Arc<dyn AgentHost>>,
     default_runner: RunnerKind,
     config_rx: Option<watch::Receiver<RexConfig>>,
+    pinned_attempts: Arc<Mutex<BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)>>>,
 }
 
 impl HostRouter {
@@ -147,6 +297,7 @@ impl HostRouter {
             hosts: BTreeMap::new(),
             default_runner,
             config_rx: None,
+            pinned_attempts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -158,6 +309,7 @@ impl HostRouter {
             hosts: entries.into_iter().collect(),
             default_runner,
             config_rx: None,
+            pinned_attempts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -189,25 +341,48 @@ impl HostRouter {
 
 impl AgentHost for HostRouter {
     fn spawn(&self, mut req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
-        let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
-        if let Some(ref c) = cfg {
-            apply_harness_defaults(&mut req.agent, c);
-        }
-        let routed =
-            route_provider_with_config(&req.agent.provider, self.default_runner, cfg.as_ref());
+        let key = (req.wave.clone(), req.role.clone(), req.attempt);
+        let resolved: Result<(RunnerKind, AgentSpec), HostError> = {
+            let mut pinned = self
+                .pinned_attempts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = pinned.get(&key).cloned() {
+                Ok(existing)
+            } else {
+                let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+                let mut effective_agent = req.agent.clone();
+                match route_provider_with_config(
+                    &effective_agent.provider,
+                    self.default_runner,
+                    cfg.as_ref(),
+                ) {
+                    Ok(routed) => {
+                        effective_agent.provider = routed.provider;
+                        let pair = (routed.target, effective_agent);
+                        pinned.insert(key, pair.clone());
+                        Ok(pair)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
         Box::pin(async move {
-            let routed = routed?;
-            let is_bare_antigravity = routed.target == RunnerKind::T3
-                && routed.provider.as_str().eq_ignore_ascii_case("antigravity");
-            req.agent.provider = routed.provider;
-            match self.hosts.get(&routed.target) {
+            let (target, effective_agent) = resolved?;
+            let is_bare_antigravity = target == RunnerKind::T3
+                && effective_agent
+                    .provider
+                    .as_str()
+                    .eq_ignore_ascii_case("antigravity");
+            req.agent = effective_agent;
+            match self.hosts.get(&target) {
                 Some(host) => host.spawn(req).await,
                 None if is_bare_antigravity => Err(HostError::Rejected(
                     "provider 'antigravity' requires T3 Code, but no T3 host is configured".into(),
                 )),
-                None => Err(HostError::Unreachable(format!(
+                None => Err(HostError::Rejected(format!(
                     "{} host is not configured",
-                    routed.target.display_name()
+                    target.display_name()
                 ))),
             }
         })
@@ -290,6 +465,7 @@ impl AgentHost for HostRouter {
 mod tests {
     use super::*;
     use crate::wave_room;
+    use rex_wave_api::config::RunnerRoute;
     use rex_wave_api::wave::{AgentSpec, PermissionMode, Workspace};
     use rex_wave_api::{ProjectId, RoleName, WaveSlug};
     use std::sync::Mutex;
@@ -489,12 +665,8 @@ mod tests {
 
         let wave = WaveSlug::parse("w-cfg").unwrap();
         let proj = ProjectId::parse("/workspace/demo").unwrap();
-        let mk = |role: &str, prov: &str, model: Option<&str>| SpawnRequest {
-            wave: wave.clone(),
-            role: RoleName::parse(role).unwrap(),
-            attempt: 1,
-            project: proj.clone(),
-            agent: AgentSpec {
+        let mk = |role: &str, prov: &str, model: Option<&str>| {
+            let mut agent = AgentSpec {
                 provider: ProviderId::parse(prov).unwrap(),
                 model: model.map(|m| ModelId::parse(m).unwrap()),
                 account: None,
@@ -502,18 +674,36 @@ mod tests {
                 service_tier: None,
                 permission: PermissionMode::Full,
                 workspace: Workspace::ProjectDefault,
-            },
-            room: wave_room(&wave, &proj),
-            prompt: Body::parse("go").unwrap(),
-            title: "[w-cfg] @r".into(),
-            run_stamp: "w-cfg:r:a1".into(),
-            output_dir: None,
-            writes: Vec::new(),
-            return_schema: None,
+            };
+            let cur_cfg = cfg_tx.borrow().clone();
+            resolve_agent_spec_for_wave(
+                &mut agent,
+                RunnerKind::Bb,
+                Some(&cur_cfg),
+                WaveConfigDefaults::default(),
+                true,
+            )
+            .unwrap();
+            SpawnRequest {
+                wave: wave.clone(),
+                role: RoleName::parse(role).unwrap(),
+                attempt: 1,
+                project: proj.clone(),
+                agent,
+                room: wave_room(&wave, &proj),
+                prompt: Body::parse("go").unwrap(),
+                title: "[w-cfg] @r".into(),
+                run_stamp: "w-cfg:r:a1".into(),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            }
         };
 
         // Before config updates, codex follows daemon default (Bb) with no harness defaults.
-        let t0 = router.spawn(mk("r0", "codex", None)).await.unwrap();
+        let r0_req = mk("r0", "codex", None);
+        assert_eq!(r0_req.agent.provider.as_str(), "bb:codex");
+        let t0 = router.spawn(r0_req.clone()).await.unwrap();
         assert_eq!(t0.runner_kind(), RunnerKind::Bb);
 
         // Live-update config via watch channel without restarting the router.
@@ -539,12 +729,18 @@ mod tests {
             .unwrap();
         assert_eq!(t2.runner_kind(), RunnerKind::T3);
 
-        // Explicit runner prefix still overrides config.
+        // Explicit runner prefix still overrides config and resolves codex harness defaults.
         let t3 = router.spawn(mk("r3", "bb:codex", None)).await.unwrap();
         assert_eq!(t3.runner_kind(), RunnerKind::Bb);
 
+        // Respawning r0 (attempt=2) after config changed preserves its journaled route and model=None.
+        let mut r0_respawn = r0_req;
+        r0_respawn.attempt = 2;
+        let t0_a2 = router.spawn(r0_respawn).await.unwrap();
+        assert_eq!(t0_a2.runner_kind(), RunnerKind::Bb);
+
         let log = captured.lock().unwrap();
-        assert_eq!(log.len(), 4);
+        assert_eq!(log.len(), 5);
         assert_eq!(log[0].0, RunnerKind::Bb);
         assert_eq!(log[0].1.model, None);
 
@@ -568,6 +764,155 @@ mod tests {
         assert_eq!(
             log[3].1.model.as_ref().map(ModelId::as_str),
             Some("gpt-6.2-codex")
+        );
+
+        assert_eq!(log[4].0, RunnerKind::Bb);
+        assert_eq!(log[4].1.model, None);
+    }
+
+    #[tokio::test]
+    async fn retry_same_attempt_after_lost_reply_and_route_change_stays_on_first_runner() {
+        struct FlakyBbHost {
+            calls: Arc<Mutex<Vec<(u32, String)>>>,
+        }
+        impl AgentHost for FlakyBbHost {
+            fn spawn(&self, req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
+                let n = {
+                    let mut g = self.calls.lock().unwrap();
+                    g.push((req.attempt, req.agent.provider.as_str().to_owned()));
+                    g.len()
+                };
+                let tid = HostThreadId::parse(format!("th_bb_{}:{}", req.wave, req.role)).unwrap();
+                Box::pin(async move {
+                    if n == 1 {
+                        Err(HostError::Unreachable("lost spawn reply".into()))
+                    } else {
+                        Ok(tid)
+                    }
+                })
+            }
+            fn tell(
+                &self,
+                _t: &HostThreadId,
+                _b: &Body,
+                _m: SteerDeliveryMode,
+            ) -> BoxFut<'_, Result<(), HostError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn resolve(
+                &self,
+                _t: &HostThreadId,
+                _i: &HostInteractionId,
+                _r: &InteractionResolution,
+            ) -> BoxFut<'_, Result<(), HostError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn retire(&self, _t: &HostThreadId) -> BoxFut<'_, Result<(), HostError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let bb_calls = Arc::new(Mutex::new(Vec::new()));
+        let t3_seen = Arc::new(Mutex::new(Vec::new()));
+        let (cfg_tx, cfg_rx) = watch::channel(RexConfig::default());
+        let router = HostRouter::new(RunnerKind::Bb)
+            .with_config_watch(cfg_rx)
+            .with_host(
+                RunnerKind::Bb,
+                FlakyBbHost {
+                    calls: bb_calls.clone(),
+                },
+            )
+            .with_host(
+                RunnerKind::T3,
+                StubHost {
+                    kind: RunnerKind::T3,
+                    seen: t3_seen.clone(),
+                },
+            );
+
+        let wave = WaveSlug::parse("w-retry").unwrap();
+        let proj = ProjectId::parse("/tmp/proj").unwrap();
+        let mk_req = |attempt: u32| SpawnRequest {
+            wave: wave.clone(),
+            project: proj.clone(),
+            role: RoleName::parse("worker").unwrap(),
+            attempt,
+            agent: AgentSpec {
+                provider: ProviderId::parse("codex").unwrap(),
+                model: None,
+                account: None,
+                reasoning: None,
+                service_tier: None,
+                permission: PermissionMode::Full,
+                workspace: Workspace::ProjectDefault,
+            },
+            room: wave_room(&wave, &proj),
+            prompt: Body::parse("go").unwrap(),
+            title: "[w-retry] @worker".into(),
+            run_stamp: format!("w-retry:worker:attempt-{attempt}:1"),
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        };
+
+        assert!(matches!(
+            router.spawn(mk_req(1)).await,
+            Err(HostError::Unreachable(_))
+        ));
+
+        let mut switched = RexConfig::default();
+        switched.runners.codex = Some(RunnerRoute::T3);
+        cfg_tx.send_replace(switched);
+
+        let retried = router.spawn(mk_req(1)).await.unwrap();
+        assert_eq!(retried.runner_kind(), RunnerKind::Bb);
+        assert_eq!(bb_calls.lock().unwrap().len(), 2);
+        assert!(
+            t3_seen.lock().unwrap().is_empty(),
+            "attempt 1 retry must not cross over to T3"
+        );
+
+        let next_attempt = router.spawn(mk_req(2)).await.unwrap();
+        assert_eq!(next_attempt.runner_kind(), RunnerKind::T3);
+        assert_eq!(t3_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unregistered_runner_returns_rejected_so_conductor_fails_fast() {
+        let mut cfg = RexConfig::default();
+        cfg.runners.codex = Some(RunnerRoute::Native);
+        let (_tx, rx) = watch::channel(cfg);
+        let router = HostRouter::new(RunnerKind::Bb).with_config_watch(rx);
+        let wave = WaveSlug::parse("w-missing").unwrap();
+        let proj = ProjectId::parse("/tmp/proj").unwrap();
+        let res = router
+            .spawn(SpawnRequest {
+                wave: wave.clone(),
+                project: proj.clone(),
+                role: RoleName::parse("dev").unwrap(),
+                attempt: 1,
+                agent: AgentSpec {
+                    provider: ProviderId::parse("codex").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::Full,
+                    workspace: Workspace::ProjectDefault,
+                },
+                room: wave_room(&wave, &proj),
+                prompt: Body::parse("go").unwrap(),
+                title: "[w-missing] @dev".into(),
+                run_stamp: "w-missing:dev:attempt-1:1".into(),
+                output_dir: None,
+                writes: Vec::new(),
+                return_schema: None,
+            })
+            .await;
+        assert!(
+            matches!(res, Err(HostError::Rejected(_))),
+            "expected Rejected for unregistered host, got {res:?}"
         );
     }
 }

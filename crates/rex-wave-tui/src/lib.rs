@@ -342,6 +342,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             frame,
         } => {
             mark_connected(model, &mut effects, true, false);
+            let mut should_refresh_settings = false;
             match frame {
                 Frame::StageFocused { generation, .. } => {
                     if generation >= model.active_generation {
@@ -353,14 +354,32 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                     if generation >= model.active_generation {
                         model.active_generation = generation;
                         model.has_focused_watch = true;
+                        if matches!(model.stage, Stage::Settings(_))
+                            && let Frame::Committed(ref env) = *inner
+                            && matches!(env.stream, StreamId::Presence | StreamId::Config)
+                        {
+                            should_refresh_settings = true;
+                        }
                         model.stage.apply(&inner);
                         sync_agent_ctx_from_stage(model);
                     }
                 }
                 other => {
+                    if matches!(model.stage, Stage::Settings(_))
+                        && let Frame::Committed(ref env) = other
+                        && matches!(env.stream, StreamId::Presence | StreamId::Config)
+                    {
+                        should_refresh_settings = true;
+                    }
                     model.stage.apply(&other);
                     sync_agent_ctx_from_stage(model);
                 }
+            }
+            if should_refresh_settings {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
+                });
             }
         }
         Msg::Frame { .. } => {
@@ -1184,6 +1203,9 @@ fn submit_composer(model: &mut Model, effects: &mut Vec<Effect>) {
     model.focus = Pane::Stage;
     let trimmed = raw.trim();
     if let ComposerTarget::ConfigKey { key } = target {
+        if let Stage::Settings(s) = &mut model.stage {
+            s.pending_draft = (!trimmed.is_empty()).then(|| raw.clone());
+        }
         let value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
         effects.push(Effect::Call {
             tag: ReplyTag::UserCommand,
@@ -1277,6 +1299,18 @@ fn handle_reply(
             };
         }
         (ReplyTag::StageInitial(_), Err(_)) => {}
+        (ReplyTag::UserCommand, Err(err)) => {
+            let msg = err.to_string();
+            if let Stage::Settings(existing) = &mut model.stage {
+                existing.status_banner = Some(format!("Error: {msg}"));
+                if let Some(draft) = existing.pending_draft.take()
+                    && existing.composer.as_str().is_empty()
+                {
+                    existing.composer.insert_str(&draft);
+                }
+            }
+            model.last_error = Some(msg);
+        }
         (_, Err(err)) => {
             model.last_error = Some(err.to_string());
         }
@@ -1305,6 +1339,7 @@ fn handle_reply(
         }
         (ReplyTag::UserCommand, Ok(WireReply::ConfigSet(snap))) => {
             if let Stage::Settings(existing) = &mut model.stage {
+                existing.pending_draft = None;
                 existing.update_snapshot(snap);
                 if existing.status_banner.is_none() {
                     existing.status_banner = Some("Saved".to_owned());

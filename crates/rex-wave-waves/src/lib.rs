@@ -5,8 +5,8 @@ pub mod workspace;
 
 pub use rex_wave_runtime::BoxFut;
 pub use router::{
-    HostRouter, RoutedProvider, apply_harness_defaults, route_provider, route_provider_with_config,
-    route_thread,
+    HostRouter, RoutedProvider, WaveService, apply_harness_defaults, route_provider,
+    route_provider_with_config, route_thread,
 };
 pub use workspace::{
     BbProjectLocation, ProjectWorkspaceLocation, default_bb_data_dir, expand_tilde,
@@ -357,6 +357,9 @@ struct WorkerRecord {
 }
 
 fn is_foreign_runner_thread(provider: &ProviderId, obs_th: &BbThreadId) -> bool {
+    if let Some((expected_runner, _)) = RunnerKind::strip_provider_prefix(provider.as_str()) {
+        return obs_th.runner_kind() != expected_runner;
+    }
     let is_t3 = obs_th.as_str().starts_with("t3:");
     let prov = provider.as_str();
     (is_t3 && matches!(prov, "pi" | "cursor")) || (!is_t3 && prov == "antigravity")
@@ -535,6 +538,7 @@ impl Decider for Waves {
                     .clone()
                     .unwrap_or_else(|| spec.defaults.clone());
                 if matches!(ctx.by(), Principal::Worker { .. })
+                    && !c.config_defaults.account_from_config
                     && let Some(req_acct) = agent.account.as_deref()
                     && Some(req_acct) != spec.defaults.account.as_deref()
                 {
@@ -2267,6 +2271,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -2283,6 +2288,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -2297,7 +2303,8 @@ mod tests {
                 op.clone(),
                 WaveCommand::WaveStart(WaveStart {
                     spec: conflicting,
-                    idem: None
+                    idem: None,
+                    config_defaults: Default::default()
                 })
             ),
             Err(ApiError::Conflict { .. })
@@ -2325,6 +2332,7 @@ mod tests {
                             writes: Vec::new(),
                             return_schema: None,
                         },
+                        config_defaults: Default::default(),
                     }),
                 ),
                 Err(ApiError::Denied { .. })
@@ -2363,6 +2371,7 @@ mod tests {
                             writes: Vec::new(),
                             return_schema: None,
                         },
+                        config_defaults: Default::default(),
                     }),
                 ),
                 Err(ApiError::Denied { .. })
@@ -2391,6 +2400,7 @@ mod tests {
                     writes: Vec::new(),
                     return_schema: None,
                 },
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -2515,6 +2525,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -3042,6 +3053,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -3218,6 +3230,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         let wave = WaveSlug::parse("auth-v2").unwrap();
@@ -3310,6 +3323,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -3342,6 +3356,7 @@ mod tests {
                 writes: Vec::new(),
                 return_schema: None,
             },
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
@@ -3427,6 +3442,7 @@ mod tests {
         block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         let mut author_briefs = 0;
@@ -3491,6 +3507,7 @@ mod tests {
         let started = block_on(op.call(WaveStart {
             spec: sample_spec(),
             idem: None,
+            config_defaults: Default::default(),
         }))
         .unwrap();
         drain_conductor_allow_err(&mut conductor, &sys_conductor, &bus);
@@ -3670,6 +3687,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: spec.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -3843,6 +3861,7 @@ mod tests {
                     writes: Vec::new(),
                     return_schema: None,
                 },
+                config_defaults: Default::default(),
             }),
         )
         .unwrap_err();
@@ -3940,6 +3959,7 @@ mod tests {
                 WaveCommand::WaveStart(WaveStart {
                     spec: bad_wave,
                     idem: None,
+                    config_defaults: Default::default(),
                 }),
             ),
             Err(ApiError::Invalid(_))
@@ -3956,6 +3976,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: overlap,
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap_err();
@@ -3979,6 +4000,7 @@ mod tests {
             WaveCommand::WaveStart(WaveStart {
                 spec: good.clone(),
                 idem: None,
+                config_defaults: Default::default(),
             }),
         )
         .unwrap();
@@ -3997,6 +4019,7 @@ mod tests {
                     writes: vec![PathBuf::from("./src/auth.rs")],
                     return_schema: None,
                 },
+                config_defaults: Default::default(),
             }),
         )
         .unwrap_err();
@@ -4021,6 +4044,7 @@ mod tests {
                 WaveCommand::WaveStart(WaveStart {
                     spec: bad_schema,
                     idem: None,
+                    config_defaults: Default::default(),
                 }),
             ),
             Err(ApiError::Invalid(_))
@@ -4058,7 +4082,12 @@ mod tests {
             &sys_conductor,
         ))
         .unwrap();
-        block_on(op.call(WaveStart { spec, idem: None })).unwrap();
+        block_on(op.call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        }))
+        .unwrap();
         drain_conductor(&mut conductor, &sys_conductor, &bus);
 
         let reqs = host.spawn_requests.lock().unwrap().clone();

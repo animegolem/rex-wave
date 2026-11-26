@@ -38,6 +38,16 @@ pub enum PermissionMode {
     Full,
 }
 
+fn default_agent_permission() -> PermissionMode {
+    PermissionMode::AcceptEdits
+}
+
+fn default_agent_workspace() -> Workspace {
+    Workspace::ManagedWorktree {
+        base: BaseBranch::Default,
+    }
+}
+
 /// Which BB provider/model runs a worker. Any provider BB has configured.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentSpec {
@@ -51,7 +61,9 @@ pub struct AgentSpec {
     pub reasoning: Option<String>,
     #[serde(default)]
     pub service_tier: Option<String>,
+    #[serde(default = "default_agent_permission")]
     pub permission: PermissionMode,
+    #[serde(default = "default_agent_workspace")]
     pub workspace: Workspace,
 }
 
@@ -1136,17 +1148,113 @@ impl WaveObserved {
     };
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+/// Flags indicating which `AgentSpec` fields were omitted by the caller so the
+/// daemon's `WaveService` can populate them from `[harnesses.<slot>]` before
+/// recording `StreamId::Wave`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaveConfigDefaults {
+    #[serde(default)]
+    pub permission: bool,
+    #[serde(default)]
+    pub workspace: bool,
+    #[serde(default)]
+    pub account_from_config: bool,
+}
+
+impl WaveConfigDefaults {
+    pub fn is_empty(&self) -> bool {
+        !self.permission && !self.workspace && !self.account_from_config
+    }
+}
+
+fn detect_json_omissions(agent_val: Option<&serde_json::Value>) -> (bool, bool) {
+    let Some(obj) = agent_val.and_then(|v| v.as_object()) else {
+        return (true, true);
+    };
+    (
+        !obj.contains_key("permission"),
+        !obj.contains_key("workspace"),
+    )
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct WaveStart {
     pub spec: WaveSpec,
     #[serde(default)]
     pub idem: Option<IdemKey>,
+    #[serde(default, skip_serializing_if = "WaveConfigDefaults::is_empty")]
+    #[schemars(skip)]
+    pub config_defaults: WaveConfigDefaults,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for WaveStart {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let has_explicit_mask = raw
+            .as_object()
+            .is_some_and(|o| o.contains_key("config_defaults"));
+        #[derive(Deserialize)]
+        struct Helper {
+            spec: WaveSpec,
+            #[serde(default)]
+            idem: Option<IdemKey>,
+            #[serde(default)]
+            config_defaults: WaveConfigDefaults,
+        }
+        let mut h: Helper =
+            serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        if !has_explicit_mask {
+            let defaults_val = raw.get("spec").and_then(|s| s.get("defaults"));
+            let (omitted_perm, omitted_ws) = detect_json_omissions(defaults_val);
+            h.config_defaults.permission = omitted_perm;
+            h.config_defaults.workspace = omitted_ws;
+        }
+        Ok(WaveStart {
+            spec: h.spec,
+            idem: h.idem,
+            config_defaults: h.config_defaults,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct WaveAddWorker {
     pub wave: WaveSlug,
     pub worker: WorkerSpec,
+    #[serde(default, skip_serializing_if = "WaveConfigDefaults::is_empty")]
+    #[schemars(skip)]
+    pub config_defaults: WaveConfigDefaults,
+}
+
+impl<'de> Deserialize<'de> for WaveAddWorker {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let has_explicit_mask = raw
+            .as_object()
+            .is_some_and(|o| o.contains_key("config_defaults"));
+        #[derive(Deserialize)]
+        struct Helper {
+            wave: WaveSlug,
+            worker: WorkerSpec,
+            #[serde(default)]
+            config_defaults: WaveConfigDefaults,
+        }
+        let mut h: Helper =
+            serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        if !has_explicit_mask
+            && let Some(agent_val) = raw.get("worker").and_then(|w| w.get("agent"))
+            && !agent_val.is_null()
+        {
+            let (omitted_perm, omitted_ws) = detect_json_omissions(Some(agent_val));
+            h.config_defaults.permission = omitted_perm;
+            h.config_defaults.workspace = omitted_ws;
+        }
+        Ok(WaveAddWorker {
+            wave: h.wave,
+            worker: h.worker,
+            config_defaults: h.config_defaults,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

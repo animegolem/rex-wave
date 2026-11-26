@@ -3177,7 +3177,8 @@
               ]
             },
             "permission": {
-              "$ref": "#/$defs/PermissionMode"
+              "$ref": "#/$defs/PermissionMode",
+              "default": "accept-edits"
             },
             "provider": {
               "description": "provider",
@@ -3198,13 +3199,17 @@
               ]
             },
             "workspace": {
-              "$ref": "#/$defs/Workspace"
+              "$ref": "#/$defs/Workspace",
+              "default": {
+                "base": {
+                  "kind": "default"
+                },
+                "workspace": "managed_worktree"
+              }
             }
           },
           "required": [
-            "provider",
-            "permission",
-            "workspace"
+            "provider"
           ],
           "type": "object"
         },

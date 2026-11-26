@@ -908,6 +908,7 @@ async fn full_t3_lifecycle_discovery_401_refresh_approval_mirror_and_retire() {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -1768,6 +1769,7 @@ async fn reconnect_after_ws_drop_mints_fresh_ticket_and_resumes_observations() {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -2269,6 +2271,7 @@ async fn idle_mirror_skips_when_worker_already_posted_to_wave_room() {
                 }],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -2571,6 +2574,7 @@ async fn item_only_projection_attributes_direct_post_to_matching_turn_only() {
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -3018,6 +3022,7 @@ async fn t3_bridge_respects_bb_default_runner_on_requested_and_ignores_retiring_
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -3228,6 +3233,7 @@ async fn t3_explicit_shell_item_count_and_projection_outage_suppress_refused_dra
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -3577,6 +3583,7 @@ async fn t3_run_id_item_only_ahead_item_count_and_unattributed_outage_preserve_g
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -3928,6 +3935,7 @@ async fn t3_ahead_hold_across_stale_completion_chained_refusals_and_run_metadata
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .unwrap();
@@ -4324,8 +4332,7 @@ async fn t3_chained_empty_projection_outage_run_id_item_only_recovery_and_legacy
                     },
                 ],
             },
-            idem: None,
-        })
+            idem: None, config_defaults: Default::default(), })
         .await
         .unwrap();
 
@@ -4713,8 +4720,7 @@ async fn t3_double_outage_partial_replay_run_id_only_item_projection_and_index_z
                     },
                 ],
             },
-            idem: None,
-        })
+            idem: None, config_defaults: Default::default(), })
         .await
         .unwrap();
 
@@ -5119,8 +5125,7 @@ async fn t3_matched_run_preserves_other_run_ticket_and_single_ticket_budget_pres
                     },
                 ],
             },
-            idem: None,
-        })
+            idem: None, config_defaults: Default::default(), })
         .await
         .unwrap();
 
@@ -5471,8 +5476,7 @@ async fn t3_causal_pre_ticket_bound_run_anchor_promotion_and_anonymous_to_run_re
                     },
                 ],
             },
-            idem: None,
-        })
+            idem: None, config_defaults: Default::default(), })
         .await
         .unwrap();
 
@@ -5899,8 +5903,7 @@ async fn t3_ordinary_completion_causal_bound_prefixed_anon_refinement_and_failed
                     },
                 ],
             },
-            idem: None,
-        })
+            idem: None, config_defaults: Default::default(), })
         .await
         .unwrap();
 
@@ -6364,8 +6367,7 @@ async fn t3_single_refusal_append_retry_and_named_outage_repeat_before_and_after
                     },
                 ],
             },
-            idem: None,
-        })
+            idem: None, config_defaults: Default::default(), })
         .await
         .unwrap();
 

@@ -18,7 +18,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table};
 
 pub const CONFIG_FILE_MAX_BYTES: u64 = 256 * 1024;
 const CONFIG_SYNC_STATE_FILE: &str = "config-sync.json";
@@ -72,14 +72,14 @@ pub fn daemon_config_file_path_from(
         }
         return Some(p.to_path_buf());
     }
+    if has_socket_override {
+        return Some(state_dir.join("config.toml"));
+    }
     if let Some(x) = xdg.filter(|v| !v.is_empty()) {
         let p = Path::new(x);
         if p.is_absolute() {
             return Some(p.join("rex-wave/config.toml"));
         }
-    }
-    if has_socket_override {
-        return Some(state_dir.join("config.toml"));
     }
     if let Some(h) = home.filter(|v| !v.is_empty()) {
         let p = Path::new(h);
@@ -136,15 +136,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictRunnersToml {
-    #[serde(default)]
+    #[serde(default, alias = "default")]
     default_runner: Option<RunnerRoute>,
-    #[serde(default)]
+    #[serde(default, alias = "claude-code", alias = "claudeAgent")]
     claude: Option<RunnerRoute>,
     #[serde(default)]
     codex: Option<RunnerRoute>,
-    #[serde(default)]
+    #[serde(default, alias = "antigravity")]
     agy: Option<RunnerRoute>,
-    #[serde(default)]
+    #[serde(default, alias = "open-code")]
     opencode: Option<RunnerRoute>,
 }
 
@@ -181,13 +181,13 @@ impl From<StrictHarnessProfileToml> for rex_wave_api::config::HarnessProfile {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictHarnessesToml {
-    #[serde(default)]
+    #[serde(default, alias = "claude-code", alias = "claudeAgent")]
     claude: Option<StrictHarnessProfileToml>,
     #[serde(default)]
     codex: Option<StrictHarnessProfileToml>,
-    #[serde(default)]
+    #[serde(default, alias = "antigravity")]
     agy: Option<StrictHarnessProfileToml>,
-    #[serde(default)]
+    #[serde(default, alias = "open-code")]
     opencode: Option<StrictHarnessProfileToml>,
 }
 
@@ -283,12 +283,41 @@ pub fn load_config_toml(path: &Path) -> Result<Option<(RexConfig, String, String
 fn set_or_remove_str(table: &mut Table, key: &str, val: Option<&str>) {
     match val {
         Some(v) => {
-            table[key] = value(v);
+            if table.get(key).and_then(Item::as_str) == Some(v) {
+                return;
+            }
+            let mut next_val = toml_edit::Value::from(v);
+            if let Some(existing_val) = table.get(key).and_then(Item::as_value) {
+                *next_val.decor_mut() = existing_val.decor().clone();
+            }
+            table[key] = Item::Value(next_val);
         }
         None => {
             table.remove(key);
         }
     }
+}
+
+fn set_bool_preserving_decor(table: &mut Table, key: &str, val: bool) {
+    if table.get(key).and_then(Item::as_bool) == Some(val) {
+        return;
+    }
+    let mut next_val = toml_edit::Value::from(val);
+    if let Some(existing_val) = table.get(key).and_then(Item::as_value) {
+        *next_val.decor_mut() = existing_val.decor().clone();
+    }
+    table[key] = Item::Value(next_val);
+}
+
+fn set_i64_preserving_decor(table: &mut Table, key: &str, val: i64) {
+    if table.get(key).and_then(Item::as_integer) == Some(val) {
+        return;
+    }
+    let mut next_val = toml_edit::Value::from(val);
+    if let Some(existing_val) = table.get(key).and_then(Item::as_value) {
+        *next_val.decor_mut() = existing_val.decor().clone();
+    }
+    table[key] = Item::Value(next_val);
 }
 
 fn ensure_subtable<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
@@ -300,8 +329,8 @@ fn ensure_subtable<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
     parent[key].as_table_mut().expect("table just inserted")
 }
 
-/// Updates `existing_toml` in place via `toml_edit::DocumentMut` so operator comments
-/// and unrelated formatting survive programmatic updates.
+/// Updates `existing_toml` in place via `toml_edit::DocumentMut` so operator comments,
+/// inline value decorations, and unrelated formatting survive programmatic updates.
 pub fn render_config_toml_preserving_comments(
     existing_toml: Option<&str>,
     cfg: &RexConfig,
@@ -363,7 +392,7 @@ pub fn render_config_toml_preserving_comments(
     {
         let mail = ensure_subtable(doc.as_table_mut(), "mail");
         mail.set_implicit(false);
-        mail["export_enabled"] = value(cfg.mail.export_enabled);
+        set_bool_preserving_decor(mail, "export_enabled", cfg.mail.export_enabled);
         set_or_remove_str(
             mail,
             "mirror_dir",
@@ -379,8 +408,16 @@ pub fn render_config_toml_preserving_comments(
             "couriers_dir",
             cfg.mail.couriers_dir.as_deref().and_then(Path::to_str),
         );
-        mail["hub_owner_seat"] = value(cfg.mail.hub_owner_seat.as_str());
-        mail["reconnect_grace_ms"] = value(cfg.mail.reconnect_grace_ms as i64);
+        set_or_remove_str(
+            mail,
+            "hub_owner_seat",
+            Some(cfg.mail.hub_owner_seat.as_str()),
+        );
+        set_i64_preserving_decor(
+            mail,
+            "reconnect_grace_ms",
+            cfg.mail.reconnect_grace_ms as i64,
+        );
         set_or_remove_str(mail, "toast_cmd", cfg.mail.toast_cmd.as_deref());
     }
 
@@ -434,8 +471,8 @@ pub fn validate_config_protected_roots(
     Ok(())
 }
 
-/// Writes `config.toml` atomically (`0600`, `O_NOFOLLOW`), creating missing parent
-/// config directories (`~/.config/rex-wave`) with mode `0700`.
+/// Writes `config.toml` atomically (`0600`, `O_NOFOLLOW`, `sync_parent = true`), creating
+/// missing parent config directories (`~/.config/rex-wave`) with mode `0700`.
 pub fn write_config_toml_atomic(path: &Path, cfg: &RexConfig) -> Result<String, String> {
     let existing = match rex_wave_fs::read_regular_bounded(path, CONFIG_FILE_MAX_BYTES) {
         Ok(b) => std::str::from_utf8(&b).ok().map(str::to_owned),
@@ -443,6 +480,14 @@ pub fn write_config_toml_atomic(path: &Path, cfg: &RexConfig) -> Result<String, 
         Err(e) => return Err(format!("read existing {}: {e}", path.display())),
     };
     let rendered = render_config_toml_preserving_comments(existing.as_deref(), cfg);
+    if rendered.len() as u64 > CONFIG_FILE_MAX_BYTES {
+        return Err(format!(
+            "rendered {} ({} bytes) exceeds {} byte limit",
+            path.display(),
+            rendered.len(),
+            CONFIG_FILE_MAX_BYTES
+        ));
+    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -450,7 +495,7 @@ pub fn write_config_toml_atomic(path: &Path, cfg: &RexConfig) -> Result<String, 
         rex_wave_fs::create_missing_private_dir(parent)
             .map_err(|e| format!("create config dir {}: {e}", parent.display()))?;
     }
-    rex_wave_fs::write_atomic_path(path, rendered.as_bytes(), 0o600, false)
+    rex_wave_fs::write_atomic_path(path, rendered.as_bytes(), 0o600, true)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(sha256_hex(rendered.as_bytes()))
 }
@@ -468,7 +513,7 @@ fn save_sync_marker(state_dir: &Path, seq: Seq, sha256: &str) -> Result<(), Stri
         sha256: sha256.to_owned(),
     };
     let bytes = serde_json::to_vec(&marker).map_err(|e| e.to_string())?;
-    rex_wave_fs::write_atomic_path(&path, &bytes, 0o600, false)
+    rex_wave_fs::write_atomic_path(&path, &bytes, 0o600, true)
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -509,12 +554,16 @@ pub fn scan_couriers_dir(dir: &Path) -> Vec<CourierHealthStatus> {
     out
 }
 
+pub type LivenessProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 pub struct TomlConfigHook {
     config_path: Option<PathBuf>,
     state_dir: PathBuf,
     daemon_default_runner: RunnerRoute,
     bb_configured: bool,
     t3_configured: bool,
+    bb_live: OnceLock<LivenessProbe>,
+    t3_live: OnceLock<LivenessProbe>,
     presence_svc: OnceLock<Arc<dyn Service<PresenceCommand>>>,
 }
 
@@ -532,12 +581,27 @@ impl TomlConfigHook {
             daemon_default_runner,
             bb_configured,
             t3_configured,
+            bb_live: OnceLock::new(),
+            t3_live: OnceLock::new(),
             presence_svc: OnceLock::new(),
         })
     }
 
     pub fn bind_presence(&self, svc: Arc<dyn Service<PresenceCommand>>) {
         let _ = self.presence_svc.set(svc);
+    }
+
+    pub fn bind_runner_liveness(
+        &self,
+        bb_live: Option<LivenessProbe>,
+        t3_live: Option<LivenessProbe>,
+    ) {
+        if let Some(p) = bb_live {
+            let _ = self.bb_live.set(p);
+        }
+        if let Some(p) = t3_live {
+            let _ = self.t3_live.set(p);
+        }
     }
 
     pub fn config_path(&self) -> Option<&Path> {
@@ -551,15 +615,64 @@ impl ConfigHook for TomlConfigHook {
             principal: "config".into(),
             action: format!("load protected-roots: {e}"),
         })?;
-        validate_config_protected_roots(next, &protection)
+        validate_config_protected_roots(next, &protection)?;
+
+        if let Some(ref path) = self.config_path {
+            let existing = match rex_wave_fs::read_regular_bounded(path, CONFIG_FILE_MAX_BYTES) {
+                Ok(b) => {
+                    let disk_sha = sha256_hex(&b);
+                    if let Some(marker) = load_sync_marker(&self.state_dir)
+                        && marker.sha256 != disk_sha
+                    {
+                        let disk_matches_next = std::str::from_utf8(&b)
+                            .ok()
+                            .and_then(|s| parse_config_toml(s).ok())
+                            .is_some_and(|d| &d == next);
+                        if !disk_matches_next {
+                            return Err(ApiError::conflict(format!(
+                                "{} was modified externally while daemon is running; restart daemon to import external edits",
+                                path.display()
+                            )));
+                        }
+                    }
+                    std::str::from_utf8(&b).ok().map(str::to_owned)
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(ApiError::Invalid(InvalidId {
+                        what: "config.toml".into(),
+                        reason: format!("read existing {}: {e}", path.display()),
+                    }));
+                }
+            };
+            let rendered = render_config_toml_preserving_comments(existing.as_deref(), next);
+            if rendered.len() as u64 > CONFIG_FILE_MAX_BYTES {
+                return Err(ApiError::Invalid(InvalidId {
+                    what: "config.toml".into(),
+                    reason: format!(
+                        "rendered config.toml ({} bytes) exceeds {} byte limit",
+                        rendered.len(),
+                        CONFIG_FILE_MAX_BYTES
+                    ),
+                }));
+            }
+        }
+        Ok(())
     }
 
     fn on_committed(&self, head: Seq, config: &RexConfig) -> BoxFut<'_, Result<(), ApiError>> {
         let cfg = config.clone();
+        let path_opt = self.config_path.clone();
+        let state_dir = self.state_dir.clone();
         Box::pin(async move {
-            if let Some(ref path) = self.config_path {
-                let sha = write_config_toml_atomic(path, &cfg).map_err(ApiError::Internal)?;
-                save_sync_marker(&self.state_dir, head, &sha).map_err(ApiError::Internal)?;
+            if let Some(path) = path_opt {
+                tokio::task::spawn_blocking(move || {
+                    let sha = write_config_toml_atomic(&path, &cfg).map_err(ApiError::Internal)?;
+                    save_sync_marker(&state_dir, head, &sha).map_err(ApiError::Internal)?;
+                    Ok::<(), ApiError>(())
+                })
+                .await
+                .map_err(|e| ApiError::Internal(format!("config sync task join: {e}")))??;
             }
             Ok(())
         })
@@ -577,6 +690,16 @@ impl ConfigHook for TomlConfigHook {
 
             let mut down_bb: Option<String> = None;
             let mut down_t3: Option<String> = None;
+            if let Some(probe) = self.bb_live.get()
+                && !probe()
+            {
+                down_bb = Some("disconnected".into());
+            }
+            if let Some(probe) = self.t3_live.get()
+                && !probe()
+            {
+                down_t3 = Some("disconnected".into());
+            }
             if let Some(presence) = self.presence_svc.get()
                 && let Ok(WireReply::PresenceList(psnap)) = presence
                     .dispatch(
@@ -591,10 +714,10 @@ impl ConfigHook for TomlConfigHook {
             {
                 for kind in psnap.down_transports {
                     match kind {
-                        TransportKind::BbThread => {
+                        TransportKind::BbThread if down_bb.is_none() => {
                             down_bb = Some("bridge offline".into());
                         }
-                        TransportKind::T3Thread => {
+                        TransportKind::T3Thread if down_t3.is_none() => {
                             down_t3 = Some("bridge offline".into());
                         }
                         _ => {}
@@ -639,30 +762,36 @@ impl ConfigHook for TomlConfigHook {
 }
 
 /// Reconciles `StreamId::Config` in `journal` with `config_path` at daemon startup:
-/// - If `config.toml` was hand-edited while the daemon was down (`disk_sha != marker.sha256`),
-///   validates it (including `protected-roots`) and commits `ConfigSyncFile` to `StreamId::Config`.
-/// - If the daemon previously crashed between committing `StreamId::Config` (`journal_head > marker.seq`)
-///   and writing `config.toml` (`disk_sha == marker.sha256` or missing file), exports the committed
-///   journal config atomically to `config.toml`.
+/// - Selects the active startup candidate first (importing an offline-edited `config.toml`
+///   even if `protected-roots` was tightened since the previous run, so offline file repairs work!).
+/// - Validates the chosen candidate against `protected-roots` on EVERY return path (including
+///   `--config ""` when file sync is disabled).
+/// - Note: deleting `config.toml` while `StreamId::Config` has committed entries re-exports
+///   the journaled configuration back to `config.toml` (use `config unset` or edit keys to clear).
 pub async fn reconcile_startup_config(
     journal: &Journal,
     svc: &ConfigService,
     config_path: Option<&Path>,
     state_dir: &Path,
 ) -> Result<RexConfig, String> {
-    let Some(path) = config_path else {
-        return Ok(svc.current());
-    };
+    let protection = load_protected_roots().map_err(|e| format!("load protected-roots: {e}"))?;
     let (journal_head, journal_cfg) = rex_wave_runtime::replay_config_from_journal(journal)
         .map_err(|e| format!("replay config stream: {e}"))?;
+
+    let Some(path) = config_path else {
+        validate_config_protected_roots(&journal_cfg, &protection).map_err(|e| e.to_string())?;
+        return Ok(journal_cfg);
+    };
+
     let marker = load_sync_marker(state_dir);
     let disk = load_config_toml(path)?;
 
-    let protection = load_protected_roots().map_err(|e| format!("load protected-roots: {e}"))?;
-    validate_config_protected_roots(&journal_cfg, &protection).map_err(|e| e.to_string())?;
-
     match (journal_head, disk, marker) {
-        (Seq(0), None, _) => Ok(journal_cfg),
+        (Seq(0), None, _) => {
+            validate_config_protected_roots(&journal_cfg, &protection)
+                .map_err(|e| e.to_string())?;
+            Ok(journal_cfg)
+        }
         (Seq(0), Some((disk_cfg, disk_sha, _)), _) => {
             validate_config_protected_roots(&disk_cfg, &protection).map_err(|e| e.to_string())?;
             let reply = svc
@@ -680,12 +809,16 @@ pub async fn reconcile_startup_config(
             Ok(svc.current())
         }
         (jhead, None, _) => {
+            validate_config_protected_roots(&journal_cfg, &protection)
+                .map_err(|e| e.to_string())?;
             let sha = write_config_toml_atomic(path, &journal_cfg)?;
             save_sync_marker(state_dir, jhead, &sha)?;
             Ok(journal_cfg)
         }
         (jhead, Some((disk_cfg, disk_sha, _)), maybe_marker) => {
             if disk_cfg == journal_cfg {
+                validate_config_protected_roots(&journal_cfg, &protection)
+                    .map_err(|e| e.to_string())?;
                 save_sync_marker(state_dir, jhead, &disk_sha)?;
                 return Ok(journal_cfg);
             }
@@ -694,11 +827,13 @@ pub async fn reconcile_startup_config(
                 .is_some_and(|m| m.sha256 == disk_sha && jhead.0 > m.seq);
             if file_was_unedited {
                 // Crashed after SQLite commit and before config.toml export: finish the export.
+                validate_config_protected_roots(&journal_cfg, &protection)
+                    .map_err(|e| e.to_string())?;
                 let sha = write_config_toml_atomic(path, &journal_cfg)?;
                 save_sync_marker(state_dir, jhead, &sha)?;
                 Ok(journal_cfg)
             } else {
-                // Operator modified config.toml externally while stopped: import into journal.
+                // Operator modified config.toml externally while stopped: validate and import disk_cfg.
                 validate_config_protected_roots(&disk_cfg, &protection)
                     .map_err(|e| e.to_string())?;
                 let reply = svc

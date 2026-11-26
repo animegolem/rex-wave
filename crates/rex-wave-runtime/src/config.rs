@@ -84,6 +84,7 @@ impl Decider for ConfigDecider {
             effective_default_runner: state.config.runners.default_runner,
             runners_health: Vec::new(),
             couriers_health: Vec::new(),
+            persist_error: None,
         };
         match cmd {
             ConfigCommand::ConfigShow(_) => WireReply::ConfigShow(mk_snapshot()),
@@ -225,9 +226,22 @@ impl Service<ConfigCommand> for ConfigService {
                             if snap.head > *last_seq {
                                 self.tx.send_replace(snap.config.clone());
                                 if let Some(ref hook) = self.hook {
-                                    hook.on_committed(snap.head, &snap.config).await?;
+                                    match hook.on_committed(snap.head, &snap.config).await {
+                                        Ok(()) => {
+                                            *last_seq = snap.head;
+                                        }
+                                        Err(err) => {
+                                            let msg = err.to_string();
+                                            eprintln!(
+                                                "rex-wave config: committed seq #{} to journal, but config.toml sync failed: {msg}",
+                                                snap.head.0
+                                            );
+                                            snap.persist_error = Some(msg);
+                                        }
+                                    }
+                                } else {
+                                    *last_seq = snap.head;
                                 }
-                                *last_seq = snap.head;
                             }
                             drop(last_seq);
                             if let Some(ref hook) = self.hook {

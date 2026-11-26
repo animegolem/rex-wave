@@ -982,11 +982,20 @@ struct UpdateTaskPayload {
     idem: Option<IdemKey>,
 }
 
+fn deserialize_explicit_opt_str<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
+}
+
 #[derive(Deserialize)]
 struct SetConfigPayload {
     key: String,
+    #[serde(default, deserialize_with = "deserialize_explicit_opt_str")]
+    value: Option<Option<String>>,
     #[serde(default)]
-    value: Option<String>,
+    unset: bool,
     #[serde(default, alias = "id")]
     idem: Option<IdemKey>,
 }
@@ -1122,11 +1131,27 @@ async fn dispatch_json_route(
             }
         }
         Route::ConfigSet => {
+            rex_wave_api::authorize(Audience::Operator, &principal)
+                .map_err(|e| mask_err(e, "config"))?;
             let payload: SetConfigPayload = parse_json_body(&req.body)?;
+            let value = if payload.unset {
+                None
+            } else {
+                match payload.value {
+                    Some(v) => v,
+                    None => {
+                        return Err(HttpError::new(
+                            "400 Bad Request",
+                            "invalid",
+                            "missing 'value' field (pass null or \"unset\": true to clear)",
+                        ));
+                    }
+                }
+            };
             let snap = client
                 .call(ConfigSet {
                     key: payload.key,
-                    value: payload.value,
+                    value,
                     idem: payload.idem,
                 })
                 .await

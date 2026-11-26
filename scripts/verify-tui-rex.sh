@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="${HOME:-}/.local/bin:${HOME:-}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="${HOME:-}/.local/bin:${HOME:-}/.cargo/bin:/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -1084,8 +1084,8 @@ while (( $(now_ms) < CFG_DEADLINE )); do
 done
 [[ "$CFG_DEFAULT" == "t3" ]] || fail "expected runners.default_runner=t3 after cycling twice in Settings, got '$CFG_DEFAULT'"
 "$REX_WAVE_BIN" --socket "$SOCK" --json config show > "$EVIDENCE_DIR/config-show.json"
-[[ -s "$CONFIG_DIR/rex-wave/config.toml" ]] || fail "expected $CONFIG_DIR/rex-wave/config.toml to be written by Settings update"
-assert_contains "$(cat "$CONFIG_DIR/rex-wave/config.toml")" 'default_runner = "t3"' "config.toml synced with cycled default_runner"
+[[ -s "$SCRATCH_DIR/config.toml" ]] || fail "expected $SCRATCH_DIR/config.toml to be written by Settings update"
+assert_contains "$(cat "$SCRATCH_DIR/config.toml")" 'default_runner = "t3"' "config.toml synced with cycled default_runner"
 record_step "settings-cycled"
 
 printf '==> Journey 8: Clean TUI quit [q] and OSC 7501 clear\n'

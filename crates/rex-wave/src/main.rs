@@ -1619,6 +1619,11 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                     workers: parsed_workers,
                 },
                 idem: None,
+                config_defaults: rex_wave_api::wave::WaveConfigDefaults {
+                    permission: permission.is_none(),
+                    workspace: workspace.is_none(),
+                    account_from_config: false,
+                },
             }))
         }
         WaveCmd::AddWorker {
@@ -1650,6 +1655,11 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
             Ok(WireCommand::WaveAddWorker(WaveAddWorker {
                 wave,
                 worker: spec,
+                config_defaults: rex_wave_api::wave::WaveConfigDefaults {
+                    permission: permission.is_none(),
+                    workspace: workspace.is_none(),
+                    account_from_config: false,
+                },
             }))
         }
         WaveCmd::Approve {
@@ -2669,6 +2679,9 @@ fn print_reply(reply: &WireReply, as_json: bool) {
                     })
                     .collect();
                 println!("  couriers: {}", parts.join("  "));
+            }
+            if let Some(ref perr) = snap.persist_error {
+                println!("  persist_error: {perr}");
             }
             for spec in SETTINGS_FIELDS {
                 let val = snap.config.get_key(spec.key).ok().flatten();
@@ -4053,63 +4066,7 @@ async fn execute_remote<C: Client>(
         .await;
     }
 
-    let mut wire = to_command_for(cmd, client.me())?;
-    if let Cmd::Wave(
-        WaveCmd::Start {
-            permission,
-            workspace,
-            ..
-        }
-        | WaveCmd::AddWorker {
-            permission,
-            workspace,
-            ..
-        },
-    ) = cmd
-        && (permission.is_none() || workspace.is_none())
-        && let Ok(snap) = client.call(rex_wave_api::config::ConfigShow {}).await
-    {
-        let apply_cli_cfg = |agent: &mut AgentSpec| {
-            let Some(prof) = snap.config.harnesses.for_provider_id(&agent.provider) else {
-                return;
-            };
-            if permission.is_none()
-                && let Some(p) = prof.permission
-            {
-                agent.permission = p;
-            }
-            if workspace.is_none()
-                && let Some(w) = prof.workspace
-            {
-                agent.workspace = match w {
-                    rex_wave_api::config::WorkspaceStrategy::ProjectDefault => {
-                        Workspace::ProjectDefault
-                    }
-                    rex_wave_api::config::WorkspaceStrategy::ManagedWorktree => {
-                        Workspace::ManagedWorktree {
-                            base: BaseBranch::Default,
-                        }
-                    }
-                };
-            }
-        };
-        match &mut wire {
-            WireCommand::WaveStart(ws) => {
-                apply_cli_cfg(&mut ws.spec.defaults);
-                for worker in &mut ws.spec.workers {
-                    if let Some(ref mut agent) = worker.agent {
-                        apply_cli_cfg(agent);
-                    }
-                }
-            }
-            WireCommand::WaveAddWorker(wa) => {
-                if let Some(ref mut agent) = wa.worker.agent {
-                    apply_cli_cfg(agent);
-                }
-            }
-            _ => {}
-        }
-    }
+    let wire = to_command_for(cmd, client.me())?;
     let read_user_cursor = match &wire {
         WireCommand::Wait(w) => w.cursor.clone(),
         _ => None,

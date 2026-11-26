@@ -621,6 +621,13 @@ fn validate_config_path(what: &str, p: &std::path::Path) -> Result<PathBuf, Inva
             reason: "path must be 1..=1024 printable chars".into(),
         });
     }
+    let is_tilde = trimmed == "~" || trimmed.starts_with("~/");
+    if !trimmed.starts_with('/') && !is_tilde {
+        return Err(InvalidId {
+            what: what.into(),
+            reason: format!("path `{trimmed}` must be absolute (`/…`) or home-relative (`~/…`)"),
+        });
+    }
     let mut out = PathBuf::new();
     for comp in std::path::Path::new(trimmed).components() {
         match comp {
@@ -645,6 +652,11 @@ fn validate_config_path(what: &str, p: &std::path::Path) -> Result<PathBuf, Inva
         });
     }
     Ok(out)
+}
+
+/// Returns `true` when changing `key` requires restarting the daemon for live reactors to adopt it.
+pub fn is_restart_only_config_key(key: &str) -> bool {
+    matches!(key, "mail.reconnect_grace_ms" | "mail.hub_owner_seat")
 }
 
 fn parse_runner_route_opt(
@@ -1067,6 +1079,8 @@ pub struct ConfigSnapshot {
     pub runners_health: Vec<RunnerHealthStatus>,
     #[serde(default)]
     pub couriers_health: Vec<CourierHealthStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1132,8 +1146,20 @@ mod tests {
         );
 
         assert!(
-            cfg.set_key("mail.mirror_dir", Some("../escape")).is_err(),
+            cfg.set_key("mail.mirror_dir", Some("/tmp/../escape"))
+                .is_err(),
             "parent traversal must be rejected"
+        );
+        assert!(
+            cfg.set_key("mail.mirror_dir", Some("relative/mirror"))
+                .is_err(),
+            "relative config paths must be rejected"
+        );
+        cfg.set_key("mail.mirror_dir", Some("~/mail-mirror"))
+            .unwrap();
+        assert_eq!(
+            cfg.get_key("mail.mirror_dir").unwrap(),
+            Some("~/mail-mirror".into())
         );
         assert!(
             cfg.set_key("mail.reconnect_grace_ms", Some("0")).is_err(),

@@ -2121,6 +2121,108 @@ async fn settings_stage_supports_hotkey_cycling_inline_composer_reset_and_live_e
         );
     }
 
+    // Stale `Event::Config` (`seq <= head`) and stale `ConfigSet` reply (`head < current`) must be ignored.
+    let mut stale_cfg = RexConfig::default();
+    stale_cfg.runners.default_runner = Some(RunnerRoute::Bb);
+    let stale_env = Envelope {
+        stream: StreamId::Config,
+        seq: Seq(10),
+        at: UnixMs(1_700_000_000_001),
+        by: client.me().clone(),
+        event: Event::Config(ConfigEvent::Updated {
+            key: "runners.default_runner".into(),
+            value: Some("bb".into()),
+            config: Box::new(stale_cfg.clone()),
+        }),
+    };
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Stage,
+            frame: Frame::Committed(stale_env),
+        },
+    );
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Ok(WireReply::ConfigSet(rex_wave_api::config::ConfigSnapshot {
+                head: Seq(10),
+                config: stale_cfg,
+                config_path: None,
+                effective_default_runner: Some(RunnerRoute::Bb),
+                runners_health: Vec::new(),
+                couriers_health: Vec::new(),
+                persist_error: None,
+            })),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.snapshot.head, Seq(42));
+        assert!(s.snapshot.config.mail.export_enabled);
+        assert_eq!(s.snapshot.config.runners.default_runner, None);
+    }
+
+    // Restart-only keys annotate the banner with `(restart required)`.
+    let mut grace_cfg = RexConfig::default();
+    grace_cfg.mail.reconnect_grace_ms = 5000;
+    let grace_env = Envelope {
+        stream: StreamId::Config,
+        seq: Seq(43),
+        at: UnixMs(1_700_000_000_002),
+        by: client.me().clone(),
+        event: Event::Config(ConfigEvent::Updated {
+            key: "mail.reconnect_grace_ms".into(),
+            value: Some("5000".into()),
+            config: Box::new(grace_cfg),
+        }),
+    };
+    let _ = update(
+        &mut model,
+        Msg::Frame {
+            watch: WatchSlot::Stage,
+            frame: Frame::Committed(grace_env),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.snapshot.head, Seq(43));
+        assert_eq!(
+            s.status_banner.as_deref(),
+            Some("Saved mail.reconnect_grace_ms = 5000 (restart required)")
+        );
+    }
+
+    // Failed ConfigKey submission preserves the typed draft and updates status_banner.
+    model.composer_target = Some(ComposerTarget::ConfigKey {
+        key: "mail.mirror_dir".into(),
+    });
+    model.focus = Pane::Composer;
+    if let Stage::Settings(ref mut s) = model.stage {
+        let _ = s.composer.take();
+        s.composer.insert_str("relative/bad/path");
+    }
+    let _ = update(&mut model, Msg::Action(Action::Submit));
+    let _ = update(
+        &mut model,
+        Msg::Reply {
+            tag: ReplyTag::UserCommand,
+            result: Err(rex_wave_api::ApiError::Invalid(rex_wave_api::InvalidId {
+                what: "mail.mirror_dir".into(),
+                reason: "must be absolute".into(),
+            })),
+        },
+    );
+    if let Stage::Settings(ref s) = model.stage {
+        assert_eq!(s.composer.as_str(), "relative/bad/path");
+        assert!(
+            s.status_banner
+                .as_deref()
+                .is_some_and(|b| b.starts_with("Error:")),
+            "unexpected status_banner: {:?}",
+            s.status_banner
+        );
+    }
+
     // `h` (`Move(Dir::Left)`) returns focus to Sidebar.
     let _ = update(&mut model, Msg::Action(Action::Move(Dir::Left)));
     assert_eq!(model.focus, Pane::Sidebar);

@@ -554,6 +554,7 @@ pub struct SettingsView {
     pub base_default_runner: Option<RunnerRoute>,
     pub selected: usize,
     pub composer: Composer,
+    pub pending_draft: Option<String>,
     pub scroll: ScrollState,
     pub status_banner: Option<String>,
     pub layout: RefCell<Vec<ItemSpan>>,
@@ -566,24 +567,43 @@ impl SettingsView {
         } else {
             None
         };
+        let status_banner = snapshot
+            .persist_error
+            .as_ref()
+            .map(|perr| format!("Warning: journal saved, file sync failed: {perr}"));
         Self {
             snapshot,
             base_default_runner,
             selected: 0,
             composer: Composer::new(),
+            pending_draft: None,
             scroll: ScrollState::top(),
-            status_banner: None,
+            status_banner,
             layout: RefCell::new(Vec::new()),
         }
     }
 
     pub fn update_snapshot(&mut self, snapshot: ConfigSnapshot) {
+        if snapshot.head < self.snapshot.head {
+            return;
+        }
         if snapshot.config.runners.default_runner.is_none()
             && snapshot.effective_default_runner.is_some()
         {
             self.base_default_runner = snapshot.effective_default_runner;
         }
-        self.snapshot = snapshot;
+        if let Some(ref perr) = snapshot.persist_error {
+            self.status_banner = Some(format!("Warning: journal saved, file sync failed: {perr}"));
+        }
+        if snapshot.head == self.snapshot.head {
+            self.snapshot.config_path = snapshot.config_path;
+            self.snapshot.effective_default_runner = snapshot.effective_default_runner;
+            self.snapshot.runners_health = snapshot.runners_health;
+            self.snapshot.couriers_health = snapshot.couriers_health;
+            self.snapshot.persist_error = snapshot.persist_error;
+        } else {
+            self.snapshot = snapshot;
+        }
         self.selected = self.selected.min(SETTINGS_FIELDS.len().saturating_sub(1));
     }
 
@@ -690,7 +710,10 @@ impl Stage {
             }
             (Stage::Settings(view), Frame::Committed(env)) => {
                 if let Event::Config(ev) = &env.event {
-                    view.snapshot.head = view.snapshot.head.max(env.seq);
+                    if env.seq <= view.snapshot.head {
+                        return;
+                    }
+                    view.snapshot.head = env.seq;
                     view.snapshot.config = ev.config().clone();
                     view.snapshot.effective_default_runner = view
                         .snapshot
@@ -701,7 +724,12 @@ impl Stage {
                     match ev {
                         ConfigEvent::Updated { key, value, .. } => {
                             let shown = value.as_deref().unwrap_or("default");
-                            view.status_banner = Some(format!("Saved {key} = {shown}"));
+                            let suffix = if rex_wave_api::config::is_restart_only_config_key(key) {
+                                " (restart required)"
+                            } else {
+                                ""
+                            };
+                            view.status_banner = Some(format!("Saved {key} = {shown}{suffix}"));
                         }
                         ConfigEvent::SyncedFromFile { .. } => {
                             view.status_banner = Some("Reloaded from config.toml".to_owned());
@@ -2214,15 +2242,23 @@ fn render_settings(
         let bg = if is_sel { SEL_BG } else { Color::Reset };
         let raw_val = view.snapshot.config.get_key(spec.key).ok().flatten();
         let (val_display, val_color) = match raw_val {
-            Some(v) => {
-                let col = match spec.kind {
-                    SettingFieldKind::Bool if v == "true" => C_MINT,
-                    SettingFieldKind::Bool => C_DIM,
-                    SettingFieldKind::RunnerRoute { .. } => C_MINT,
-                    _ => Color::White,
-                };
-                (v, col)
-            }
+            Some(v) => match spec.kind {
+                SettingFieldKind::Bool if v == "true" => (v, C_MINT),
+                SettingFieldKind::Bool => (v, C_DIM),
+                SettingFieldKind::RunnerRoute { .. } => {
+                    let unconfigured = view
+                        .snapshot
+                        .runners_health
+                        .iter()
+                        .any(|rh| rh.runner.as_str() == v && !rh.configured);
+                    if unconfigured {
+                        (format!("{v} (unconfigured)"), C_AMBER)
+                    } else {
+                        (v, C_MINT)
+                    }
+                }
+                _ => (v, Color::White),
+            },
             None => match spec.kind {
                 SettingFieldKind::RunnerRoute { .. } => {
                     if spec.key == "runners.default_runner"

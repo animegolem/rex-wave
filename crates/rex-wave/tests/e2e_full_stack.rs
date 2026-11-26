@@ -612,6 +612,7 @@ async fn full_stack_daemon_wave_mcp_codemode_inbox_mail_wakebell_and_tui_e2e() {
                 ],
             },
             idem: None,
+            config_defaults: Default::default(),
         })
         .await
         .expect("wave_start succeeded");

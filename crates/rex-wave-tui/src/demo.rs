@@ -670,6 +670,7 @@ impl DemoState {
                 refused: 0,
                 degraded: false,
             }],
+            persist_error: None,
         }
     }
 

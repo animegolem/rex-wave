@@ -91,8 +91,8 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub http: Option<SocketAddr>,
     /// `MailUnrung` reconnect grace window in milliseconds (tests shorten it).
-    #[arg(long, default_value_t = rex_wave_notify::RECONNECT_GRACE_MS, hide = true)]
-    pub herald_grace_ms: u64,
+    #[arg(long, hide = true)]
+    pub herald_grace_ms: Option<u64>,
 }
 
 pub fn default_t3_home() -> Option<PathBuf> {
@@ -532,7 +532,7 @@ fn journal_thread_resolver(journal: Journal) -> ThreadIdResolver {
 
 pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(), String> {
     let operator = SeatName::parse(&args.operator).map_err(|e| e.to_string())?;
-    if args.herald_grace_ms == 0 {
+    if args.herald_grace_ms == Some(0) {
         return Err("--herald-grace-ms must be positive".into());
     }
     let house =
@@ -640,6 +640,18 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     };
 
     let t3_bridge = t3_cfg.map(|cfg| T3Bridge::new(cfg.with_config_watch(config_svc.subscribe())));
+    config_hook.bind_runner_liveness(
+        bb_bridge.as_ref().map(|b| {
+            let b = b.clone();
+            Arc::new(move || b.connected()) as _
+        }),
+        t3_bridge.as_ref().map(|t| {
+            let t = t.clone();
+            Arc::new(move || t.connected()) as _
+        }),
+    );
+    let bb_conn_rx = bb_bridge.as_ref().map(|b| b.watch_connected());
+    let t3_conn_rx = t3_bridge.as_ref().map(|t| t.watch_connected());
 
     let mut feed_entries: Vec<(RunnerKind, Arc<dyn AgentFeed>)> = Vec::new();
     if let Some(ref t) = t3_bridge {
@@ -658,7 +670,11 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let router = Arc::new(Router {
         room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-        wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+        wave: rex_wave_waves::WaveService::new(
+            Registry::<Waves>::new(journal.clone(), hub.clone()),
+            default_target,
+            Some(config_svc.subscribe()),
+        ),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
@@ -693,11 +709,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         WaveConductor::new(host_router),
         system(SystemPart::WaveConductor),
     );
-    let effective_herald_grace_ms = if args.herald_grace_ms == rex_wave_notify::RECONNECT_GRACE_MS {
-        reconciled_cfg.mail.reconnect_grace_ms
-    } else {
-        args.herald_grace_ms
-    };
+    let effective_herald_grace_ms = args
+        .herald_grace_ms
+        .unwrap_or(reconciled_cfg.mail.reconnect_grace_ms);
     let herald = Herald::with_grace(Duration::from_millis(effective_herald_grace_ms))
         .with_operator_surface_seat(presence.house().operator_seat.clone());
     let herald_handle = herald.handle();
@@ -707,6 +721,35 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
+    let mut bridge_health_tasks = Vec::new();
+    for (transport, label, rx_opt) in [
+        (
+            rex_wave_api::presence::TransportKind::BbThread,
+            "BB",
+            bb_conn_rx,
+        ),
+        (
+            rex_wave_api::presence::TransportKind::T3Thread,
+            "T3 Code",
+            t3_conn_rx,
+        ),
+    ] {
+        if let Some(mut rx) = rx_opt {
+            let mon = system(SystemPart::PresenceMonitor);
+            bridge_health_tasks.push(tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let live = *rx.borrow_and_update();
+                    let _ = mon
+                        .call(rex_wave_api::presence::PresenceTransportHealth {
+                            transport,
+                            down: !live,
+                            detail: (!live).then(|| format!("{label} bridge disconnected")),
+                        })
+                        .await;
+                }
+            }));
+        }
+    }
     let sink_task = tokio::spawn(rex_wave_mailbridge::serve_wake_bell_sink(
         args.wake_bell,
         system(SystemPart::WakeBell),
@@ -761,6 +804,9 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     herald_grace_task.abort();
     bell_task.abort();
     presence_disconnect_task.abort();
+    for t in bridge_health_tasks {
+        t.abort();
+    }
     if let Some(t) = bb_task {
         t.abort();
     }
@@ -847,7 +893,7 @@ mod tests {
             operator: "ops".into(),
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
-            herald_grace_ms: 100,
+            herald_grace_ms: Some(100),
         };
         assert!(run(bad_args, Some(sock.clone())).await.is_err());
         assert!(!sock.exists(), "failed start must not leave socket file");
@@ -875,7 +921,7 @@ mod tests {
             operator: "intruder".into(),
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
-            herald_grace_ms: 100,
+            herald_grace_ms: Some(100),
         };
         let second_err = run(second_args, Some(sock.clone())).await.unwrap_err();
         assert!(
@@ -925,7 +971,7 @@ mod tests {
             operator: "owner".into(),
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
-            herald_grace_ms: 100,
+            herald_grace_ms: Some(100),
         };
         let err = run(args, Some(sock)).await.unwrap_err();
         assert!(

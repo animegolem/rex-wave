@@ -155,7 +155,7 @@ fn cli_config_show_get_set_unset_preserves_toml_comments_and_0600_mode() {
 
     std::fs::write(
         &cfg_path,
-        "# Operator top comment\n\n[runners]\n# Keep per-provider note\nclaude = \"t3\"\n",
+        "# Operator top comment\n\n[runners]\n# Keep per-provider note\nclaude = \"t3\" # Keep inline billing note\ncodex = \"bb\" # Unchanged inline note\n",
     )
     .unwrap();
 
@@ -168,7 +168,7 @@ fn cli_config_show_get_set_unset_preserves_toml_comments_and_0600_mode() {
     std::fs::write(&plain_courier, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&plain_courier, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let _daemon = spawn_test_daemon(&dir.0, &sock, &[]);
+    let _daemon = spawn_test_daemon(&dir.0, &sock, &["--config", cfg_path.to_str().unwrap()]);
 
     let show_out = rex_wave_at(&sock)
         .args([
@@ -191,6 +191,16 @@ fn cli_config_show_get_set_unset_preserves_toml_comments_and_0600_mode() {
     assert_eq!(
         show_json["value"]["config_path"],
         cfg_path.to_str().unwrap()
+    );
+    let runners = show_json["value"]["runners_health"].as_array().unwrap();
+    let bb_health = runners
+        .iter()
+        .find(|r| r["runner"] == "bb")
+        .expect("bb runner health entry");
+    assert_eq!(bb_health["configured"], true);
+    assert_eq!(
+        bb_health["healthy"], false,
+        "disconnected BB bridge on closed port must report healthy=false"
     );
     let couriers = show_json["value"]["couriers_health"].as_array().unwrap();
     assert_eq!(couriers.len(), 2);
@@ -250,6 +260,14 @@ fn cli_config_show_get_set_unset_preserves_toml_comments_and_0600_mode() {
     assert!(
         raw_toml.contains("# Keep per-provider note"),
         "inline section comment lost:\n{raw_toml}"
+    );
+    assert!(
+        raw_toml.contains("# Keep inline billing note"),
+        "inline comment lost on key:\n{raw_toml}"
+    );
+    assert!(
+        raw_toml.contains("# Unchanged inline note"),
+        "inline comment lost on unchanged key:\n{raw_toml}"
     );
     assert!(raw_toml.contains("default_runner = \"t3\""));
     assert!(raw_toml.contains("model = \"claude-opus-5-5\""));
@@ -478,10 +496,34 @@ fn protected_roots_rejects_mail_mirror_and_drop_dir_on_set_and_startup() {
     let cfg_dir = config_home(&dir.0).join("rex-wave");
     let roots_file = cfg_dir.join("protected-roots");
     std::fs::write(&roots_file, format!("{}\n", guarded.display())).unwrap();
-    let cfg_path = cfg_dir.join("config.toml");
+    // Global XDG config.toml exists, but `--socket` daemons must isolate to `<state_dir>/config.toml`.
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[runners]\ncodex = \"native\"\n",
+    )
+    .unwrap();
+    let cfg_path = dir.0.join("config.toml");
 
     {
         let _daemon = spawn_test_daemon(&dir.0, &sock, &[]);
+
+        let iso_show = rex_wave_at(&sock)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "--json",
+                "config",
+                "show",
+            ])
+            .output()
+            .unwrap();
+        assert!(iso_show.status.success());
+        let iso_json: Value = serde_json::from_slice(&iso_show.stdout).unwrap();
+        assert_eq!(iso_json["value"]["config_path"], cfg_path.to_str().unwrap());
+        assert!(
+            iso_json["value"]["config"]["runners"]["codex"].is_null(),
+            "--socket daemon must not import global XDG_CONFIG_HOME config.toml"
+        );
 
         for key in ["mail.mirror_dir", "mail.drop_dir"] {
             let target = guarded.join("sub");
@@ -636,6 +678,60 @@ fn protected_roots_rejects_mail_mirror_and_drop_dir_on_set_and_startup() {
         assert_eq!(w2_agent["workspace"]["workspace"], "managed_worktree");
     }
 
+    // Tighten `protected-roots` to include `safe_mirror` (which is still committed in SQLite),
+    // repair `config.toml` offline to remove `mirror_dir` and `drop_dir`, and verify daemon boots!
+    let _ = std::fs::remove_file(&sock);
+    std::fs::write(
+        &roots_file,
+        format!("{}\n{}\n", guarded.display(), safe_mirror.display()),
+    )
+    .unwrap();
+    std::fs::write(&cfg_path, "[runners]\ndefault_runner = \"bb\"\n").unwrap();
+    {
+        let _repaired = spawn_test_daemon(&dir.0, &sock, &[]);
+        let repaired_show = rex_wave_at(&sock)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "--json",
+                "config",
+                "show",
+            ])
+            .output()
+            .unwrap();
+        assert!(repaired_show.status.success());
+        let rep_json: Value = serde_json::from_slice(&repaired_show.stdout).unwrap();
+        assert!(rep_json["value"]["config"]["mail"]["mirror_dir"].is_null());
+    }
+
+    // Verify rendered `config.toml` byte-limit check rejects oversized writes BEFORE journal commit.
+    let _ = std::fs::remove_file(&sock);
+    let pad_len = (CONFIG_FILE_MAX_BYTES as usize) - 48;
+    let near_limit = format!(
+        "# {}\n[runners]\ndefault_runner = \"bb\"\n",
+        "x".repeat(pad_len)
+    );
+    assert!(near_limit.len() < CONFIG_FILE_MAX_BYTES as usize);
+    std::fs::write(&cfg_path, &near_limit).unwrap();
+    {
+        let _daemon = spawn_test_daemon(&dir.0, &sock, &[]);
+        let over_out = rex_wave_at(&sock)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "config",
+                "set",
+                "harnesses.claude.model",
+                "claude-opus-5-5-very-long-model-identifier-exceeding-32-bytes",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !over_out.status.success(),
+            "oversized rendered config.toml must be rejected before commit"
+        );
+    }
+
     // Wait briefly for socket cleanup then inject a protected path into config.toml
     // and verify daemon startup refuses to boot.
     let _ = std::fs::remove_file(&sock);
@@ -684,9 +780,15 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
     let hub = Hub::new(128);
     let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
     let config_svc = ConfigService::new(journal.clone(), hub.clone()).unwrap();
+    let wave_svc = rex_wave_waves::WaveService::new(
+        Registry::<rex_wave_waves::Waves>::new(journal.clone(), hub.clone()),
+        RunnerKind::Bb,
+        Some(config_svc.subscribe()),
+    );
 
     let router = Arc::new(Router {
         config: config_svc,
+        wave: wave_svc,
         ..Router::unavailable_with(Arc::new(ReadSide {
             journal,
             hub,
@@ -864,6 +966,8 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
                 "/api/config",
                 Some(r#"{"key":"runners.default_runner","value":"bb"}"#),
             ),
+            ("POST", "/v1/config", Some("not valid json {{{")),
+            ("PATCH", "/api/config", Some(r#"{"unknown_field":123}"#)),
             ("POST", "/v1/call/config_show", Some("{}")),
             (
                 "POST",
@@ -889,7 +993,7 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
 
     // Confirm local in-process Seat client also gets Denied on StreamId::Config.
     let seat_local = LocalClient::new(
-        router,
+        router.clone(),
         Principal::Seat {
             seat: SeatName::parse("alice").unwrap(),
         },
@@ -898,6 +1002,133 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
         seat_local.call(ConfigShow {}).await,
         Err(ApiError::Denied { .. })
     ));
+
+    // Verify a live `Worker` principal invoking `wave add-worker` over UDS inherits
+    // configured `[harnesses.claude]` defaults even though `ConfigShow` is denied to workers.
+    for (k, v) in [
+        ("harnesses.claude.permission", "full"),
+        ("harnesses.claude.workspace", "project-default"),
+        ("harnesses.claude.account", "team-claude"),
+    ] {
+        op_client
+            .call(ConfigSet {
+                key: k.into(),
+                value: Some(v.into()),
+                idem: None,
+            })
+            .await
+            .unwrap();
+    }
+    let proj_dir = dir.0.join("w1-proj");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    op_client
+        .call(rex_wave_api::wave::WaveStart {
+            spec: rex_wave_api::wave::WaveSpec {
+                slug: WaveSlug::parse("w1").unwrap(),
+                project: ProjectId::parse(proj_dir.to_str().unwrap()).unwrap(),
+                goal: rex_wave_api::room::Body::parse("test worker add defaults").unwrap(),
+                output_dir: None,
+                defaults: rex_wave_api::wave::AgentSpec {
+                    provider: ProviderId::parse("claude").unwrap(),
+                    model: None,
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: rex_wave_api::wave::PermissionMode::AcceptEdits,
+                    workspace: rex_wave_api::wave::Workspace::ManagedWorktree {
+                        base: rex_wave_api::wave::BaseBranch::Default,
+                    },
+                },
+                workers: vec![rex_wave_api::wave::WorkerSpec {
+                    role: RoleName::parse("dev").unwrap(),
+                    brief: rex_wave_api::room::Body::parse("lead").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: rex_wave_api::wave::WaveConfigDefaults {
+                permission: true,
+                workspace: true,
+                account_from_config: false,
+            },
+        })
+        .await
+        .unwrap();
+    let sys_conductor = LocalClient::new(
+        router,
+        Principal::System {
+            part: SystemPart::WaveConductor,
+        },
+    );
+    sys_conductor
+        .call(rex_wave_api::wave::WaveObserve {
+            wave: WaveSlug::parse("w1").unwrap(),
+            role: RoleName::parse("dev").unwrap(),
+            observation: rex_wave_api::wave::Observation::Spawned {
+                attempt: 1,
+                thread: HostThreadId::parse("th_bb_dev").unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let worker_tok2 = mint_worker_token(
+        &sock,
+        &WaveSlug::parse("w1").unwrap(),
+        &RoleName::parse("dev").unwrap(),
+        None,
+    )
+    .unwrap();
+    let sock_for_cli = sock.clone();
+    let add_out = tokio::task::spawn_blocking(move || {
+        rex_wave_at(&sock_for_cli)
+            .args([
+                "--socket",
+                sock_for_cli.to_str().unwrap(),
+                "--token",
+                &worker_tok2,
+                "--json",
+                "wave",
+                "add-worker",
+                "w1",
+                "helper=claude",
+                "--brief",
+                "assist",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        add_out.status.success(),
+        "live worker wave add-worker failed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let view = op_client
+        .call(rex_wave_api::wave::WaveView {
+            wave: WaveSlug::parse("w1").unwrap(),
+        })
+        .await
+        .unwrap();
+    let (_, helper_spec, _) = view
+        .workers
+        .iter()
+        .find(|(r, _, _)| r.as_str() == "helper")
+        .expect("helper worker added");
+    assert_eq!(helper_spec.provider.as_str(), "t3:claudeAgent");
+    assert_eq!(
+        helper_spec.permission,
+        rex_wave_api::wave::PermissionMode::Full
+    );
+    assert_eq!(
+        helper_spec.workspace,
+        rex_wave_api::wave::Workspace::ProjectDefault
+    );
+    assert_eq!(helper_spec.account.as_deref(), Some("team-claude"));
 
     uds_task.abort();
     http_task.abort();

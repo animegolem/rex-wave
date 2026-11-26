@@ -78,7 +78,7 @@ impl StageTarget {
                 role: role.clone(),
             },
             StageTarget::Settings => Interest::Streams {
-                streams: vec![StreamId::Config],
+                streams: vec![StreamId::Config, StreamId::Presence],
             },
         }
     }
