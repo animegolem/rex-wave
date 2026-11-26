@@ -14,8 +14,8 @@ use rex_wave_api::{
     mail::{LetterPriority, MailAck, MailCheck, MailPromote, MailReconcile, MailSearch, MailSend},
     notify::InboxList,
     presence::{
-        LivenessMode, PresenceBind, PresenceClaim, PresenceHeartbeat, PresenceList,
-        PresenceResolve, PresenceSetStatus, PresenceUnbind, RESIDENT_MANIFEST_SCHEMA,
+        LivenessMode, PresenceBind, PresenceClaim, PresenceConfirmCanary, PresenceHeartbeat,
+        PresenceList, PresenceResolve, PresenceSetStatus, PresenceUnbind, RESIDENT_MANIFEST_SCHEMA,
         ResidentManifest, SeatStatus, TransportEndpoint, VerificationKind, WorkClass,
     },
     read::{Read, Wait},
@@ -776,6 +776,9 @@ pub enum PresenceCmd {
         seat: Option<String>,
         #[arg(long)]
         incarnation: Option<String>,
+        /// Optional machine identifier owning this binding (`OneMachineRings`).
+        #[arg(long = "machine-id")]
+        machine_id: Option<String>,
         #[arg(long)]
         lane: Option<String>,
         /// Bind from a Claude session JSON file (omit value to inspect `~/.claude/sessions/<pid>.json`).
@@ -803,16 +806,31 @@ pub enum PresenceCmd {
         takeover: bool,
         #[arg(long)]
         allow_fork: bool,
+        /// Start in `pending_canary` until confirmed from inside the session via `presence confirm-canary`.
+        #[arg(long = "require-canary")]
+        require_canary: bool,
         /// Optional explicit mail horizon watermark override (Unix milliseconds).
         #[arg(long = "mail-horizon")]
         mail_horizon: Option<u64>,
         #[arg(long = "id", alias = "idem")]
         idem: Option<String>,
     },
+    /// Confirm a pending canary token from inside the claimed session to promote it to `live`.
+    #[command(name = "confirm-canary")]
+    ConfirmCanary {
+        #[arg(long)]
+        seat: Option<String>,
+        #[arg(long)]
+        incarnation: String,
+        #[arg(long)]
+        token: String,
+    },
     /// Bind a UDS socket-lifetime presence session and block until interrupted.
     Hold {
         #[arg(long)]
         seat: Option<String>,
+        #[arg(long = "machine-id")]
+        machine_id: Option<String>,
         #[arg(long)]
         lane: Option<String>,
         #[arg(long)]
@@ -2324,6 +2342,7 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
         PresenceCmd::Bind {
             seat,
             incarnation,
+            machine_id,
             lane,
             from_claude_session,
             claude_pid,
@@ -2337,6 +2356,7 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
             ttl_ms,
             takeover,
             allow_fork,
+            require_canary,
             mail_horizon,
             idem,
         } => {
@@ -2394,12 +2414,14 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
                     Some(raw) => Some(IncarnationId::parse(raw.clone())?),
                     None => None,
                 },
+                machine_id: machine_id.clone(),
                 lane: lane.clone(),
                 endpoint,
                 liveness,
                 ttl_ms: resolve_ttl_ms(ttl.as_ref(), *ttl_ms)?,
                 takeover: *takeover,
                 allow_fork: *allow_fork,
+                require_canary: *require_canary,
                 mail_horizon_at: mail_horizon.map(UnixMs),
                 idem: match idem {
                     Some(k) => Some(IdemKey::parse(k.clone())?),
@@ -2407,6 +2429,15 @@ fn presence_to_command(cmd: &PresenceCmd, me: &Principal) -> Result<WireCommand,
                 },
             }))
         }
+        PresenceCmd::ConfirmCanary {
+            seat,
+            incarnation,
+            token,
+        } => Ok(WireCommand::PresenceConfirmCanary(PresenceConfirmCanary {
+            seat: resolve_seat_arg(seat.as_ref(), me)?,
+            incarnation_id: IncarnationId::parse(incarnation.clone())?,
+            token: token.clone(),
+        })),
         PresenceCmd::Hold { .. } => Err(invalid(
             "presence hold",
             "handled interactively via long-lived UDS session",
@@ -2837,9 +2868,21 @@ fn print_reply(reply: &WireReply, as_json: bool) {
         WireReply::PresenceClaim(rec) | WireReply::PresenceSetStatus(rec) => {
             println!("seat @{} ({:?})", rec.seat, rec.status);
         }
-        WireReply::PresenceBind(b) | WireReply::PresenceHeartbeat(b) => {
+        WireReply::PresenceBind(b)
+        | WireReply::PresenceConfirmCanary(b)
+        | WireReply::PresenceHeartbeat(b) => {
+            let machine_part = b
+                .machine_id
+                .as_deref()
+                .map(|m| format!(" machine={m}"))
+                .unwrap_or_default();
+            let canary_part = if b.status == rex_wave_api::presence::BindingStatus::PendingCanary {
+                " canary=pending"
+            } else {
+                ""
+            };
             println!(
-                "bound @{} incarnation={} epoch={} status={:?}",
+                "bound @{} incarnation={} epoch={} status={:?}{machine_part}{canary_part}",
                 b.seat, b.incarnation_id, b.epoch, b.status
             );
         }
@@ -2921,6 +2964,19 @@ fn print_reply(reply: &WireReply, as_json: bool) {
             }
             if let Some(ref perr) = snap.persist_error {
                 println!("  persist_error: {perr}");
+            }
+            if !snap.mail_failures.is_empty() {
+                println!("  mail_failures ({}):", snap.mail_failures.len());
+                for f in &snap.mail_failures {
+                    println!(
+                        "    {} @{} via {} ({}) owner=@{}",
+                        f.kind.as_str(),
+                        f.seat,
+                        f.courier,
+                        f.reason,
+                        f.hub_owner_seat
+                    );
+                }
             }
             for spec in SETTINGS_FIELDS {
                 let val = snap.config.get_key(spec.key).ok().flatten();
@@ -4136,6 +4192,7 @@ async fn execute_task_show<C: Client>(
 async fn execute_presence_hold(
     client: &RemoteClient,
     seat: Option<&String>,
+    machine_id: Option<&String>,
     lane: Option<&String>,
     incarnation: Option<&String>,
     takeover: bool,
@@ -4151,6 +4208,7 @@ async fn execute_presence_hold(
                 Some(raw) => Some(IncarnationId::parse(raw.clone())?),
                 None => None,
             },
+            machine_id: machine_id.cloned(),
             lane: lane.cloned(),
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 0,
@@ -4160,6 +4218,7 @@ async fn execute_presence_hold(
             ttl_ms: None,
             takeover,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: mail_horizon.map(UnixMs),
             idem: None,
         })
@@ -4189,6 +4248,7 @@ async fn execute_presence_hold(
                             .call(PresenceBind {
                                 seat: seat_name.clone(),
                                 incarnation_id: Some(binding.incarnation_id.clone()),
+                                machine_id: machine_id.cloned(),
                                 lane: lane.cloned(),
                                 endpoint: TransportEndpoint::UdsSession {
                                     conn_id: 0,
@@ -4198,6 +4258,7 @@ async fn execute_presence_hold(
                                 ttl_ms: None,
                                 takeover: false,
                                 allow_fork: false,
+                                require_canary: false,
                                 mail_horizon_at: None,
                                 idem: None,
                             })
@@ -4775,6 +4836,7 @@ async fn main() -> ExitCode {
         }
         Cmd::Presence(PresenceCmd::Hold {
             seat,
+            machine_id,
             lane,
             incarnation,
             takeover,
@@ -4786,6 +4848,7 @@ async fn main() -> ExitCode {
                     execute_presence_hold(
                         &client,
                         seat.as_ref(),
+                        machine_id.as_ref(),
                         lane.as_ref(),
                         incarnation.as_ref(),
                         takeover,
@@ -5504,6 +5567,42 @@ mod tests {
         execute_remote(&client, &status_cli.cmd, true)
             .await
             .unwrap();
+
+        let canary_bind_cli = parse_cli(&[
+            "rex-wave",
+            "presence",
+            "bind",
+            "--seat",
+            "bob",
+            "--t3-thread",
+            "thr-42",
+            "--machine-id",
+            "workstation-a",
+            "--require-canary",
+        ]);
+        let WireCommand::PresenceBind(pb) = to_command(&canary_bind_cli.cmd).unwrap() else {
+            panic!("expected PresenceBind");
+        };
+        assert_eq!(pb.machine_id.as_deref(), Some("workstation-a"));
+        assert!(pb.require_canary);
+
+        let confirm_cli = parse_cli(&[
+            "rex-wave",
+            "presence",
+            "confirm-canary",
+            "--seat",
+            "bob",
+            "--incarnation",
+            "inc-bob-1",
+            "--token",
+            "rwc_0123456789abcdef0123456789abcdef",
+        ]);
+        let WireCommand::PresenceConfirmCanary(cc) = to_command(&confirm_cli.cmd).unwrap() else {
+            panic!("expected PresenceConfirmCanary");
+        };
+        assert_eq!(cc.seat.as_str(), "bob");
+        assert_eq!(cc.incarnation_id.as_str(), "inc-bob-1");
+        assert_eq!(cc.token, "rwc_0123456789abcdef0123456789abcdef");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -987,8 +987,24 @@ pub struct CommittedAckRecord {
     pub at: UnixMs,
 }
 
+/// Default consecutive `"unknown"` outcomes before a courier adapter is marked degraded (`MailMachines.tla` `K`).
+pub const DEFAULT_COURIER_DEGRADED_THRESHOLD: u32 = 3;
+const MAX_STORED_DELIVERY_FAILURES: usize = 200;
+
+/// Per-courier counters folded deterministically from `MailEvent::RingAttempted`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CourierCounterState {
+    pub rung: u64,
+    pub unknown: u64,
+    pub refused: u64,
+    pub consecutive_unknown: u32,
+    pub degraded: bool,
+    pub seat_consecutive_unknown: BTreeMap<SeatName, u32>,
+    pub degraded_seats: BTreeSet<SeatName>,
+}
+
 /// Deterministic in-memory projection of `StreamId::Mail` used by `MailBridge`,
-/// startup `reconcile`, offline `rebuild`, and `MailStore.tla` conformance checks.
+/// startup `reconcile`, offline `rebuild`, `CourierHub`, and conformance checks.
 #[derive(Clone, Debug, Default)]
 pub struct MailState {
     pub messages: BTreeMap<Sha256Hex, CommittedMailEntry>,
@@ -1005,6 +1021,15 @@ pub struct MailState {
     pub room_post_seqs: BTreeMap<(RoomId, Sha256Hex), Seq>,
     pub failed_room_projections: HashSet<(RoomId, Sha256Hex)>,
     pub seen_wakes: HashSet<WakeId>,
+    /// `(seat, sha256)` pairs already rung (`Rung` or `Unknown` both count as rung
+    /// per `MailMachines.tla` `NoDoubleRing`).
+    pub rung_keys: BTreeSet<(SeatName, Sha256Hex)>,
+    /// `(seat, sha256)` pairs terminated by loud delivery failure (`Refused` or `GiveUp`).
+    pub failed_keys: BTreeSet<(SeatName, Sha256Hex)>,
+    /// Live per-courier delivery counters & degradation state.
+    pub courier_stats: BTreeMap<String, CourierCounterState>,
+    /// Recent loud delivery failures (`refused`, `give_up`, `adapter_degraded`).
+    pub delivery_failures: Vec<MailDeliveryFailure>,
 }
 
 fn derive_ack_seat(
@@ -1236,6 +1261,92 @@ impl MailState {
                             by_b.push(key);
                         }
                     }
+                }
+            }
+            Event::Mail(MailEvent::RingAttempted {
+                courier,
+                seat,
+                sha256s,
+                is_canary,
+                outcome,
+                ..
+            }) => {
+                if !*is_canary && outcome.counts_as_rung() {
+                    for sha in sha256s {
+                        self.rung_keys.insert((seat.clone(), sha.clone()));
+                    }
+                }
+                let stats = self.courier_stats.entry(courier.clone()).or_default();
+                match outcome {
+                    CourierOutcome::Rung => {
+                        stats.rung = stats.rung.saturating_add(1);
+                        stats.consecutive_unknown = 0;
+                        stats.seat_consecutive_unknown.insert(seat.clone(), 0);
+                        stats.degraded_seats.remove(seat);
+                        stats.degraded = !stats.degraded_seats.is_empty();
+                    }
+                    CourierOutcome::Unknown => {
+                        stats.unknown = stats.unknown.saturating_add(1);
+                        stats.consecutive_unknown = stats.consecutive_unknown.saturating_add(1);
+                        let seat_streak = stats
+                            .seat_consecutive_unknown
+                            .entry(seat.clone())
+                            .or_insert(0);
+                        *seat_streak = seat_streak.saturating_add(1);
+                        if *seat_streak >= DEFAULT_COURIER_DEGRADED_THRESHOLD {
+                            stats.degraded_seats.insert(seat.clone());
+                        }
+                        if stats.consecutive_unknown >= DEFAULT_COURIER_DEGRADED_THRESHOLD
+                            || !stats.degraded_seats.is_empty()
+                        {
+                            stats.degraded = true;
+                        }
+                    }
+                    CourierOutcome::Refused => {
+                        stats.refused = stats.refused.saturating_add(1);
+                    }
+                    CourierOutcome::Deferred => {}
+                }
+            }
+            Event::Mail(MailEvent::DeliveryFailed {
+                kind,
+                courier,
+                seat,
+                incarnation_id,
+                sha256s,
+                sender_seat,
+                hub_owner_seat,
+                reason,
+                detail,
+            }) => {
+                if matches!(
+                    kind,
+                    DeliveryFailureKind::Refused | DeliveryFailureKind::GiveUp
+                ) {
+                    for sha in sha256s {
+                        self.failed_keys.insert((seat.clone(), sha.clone()));
+                    }
+                }
+                if *kind == DeliveryFailureKind::AdapterDegraded {
+                    let stats = self.courier_stats.entry(courier.clone()).or_default();
+                    stats.degraded = true;
+                }
+                self.delivery_failures.push(MailDeliveryFailure {
+                    seq: env.seq,
+                    at: env.at,
+                    kind: *kind,
+                    courier: courier.clone(),
+                    seat: seat.clone(),
+                    incarnation_id: incarnation_id.clone(),
+                    sha256s: sha256s.clone(),
+                    sender_seat: sender_seat.clone(),
+                    hub_owner_seat: hub_owner_seat.clone(),
+                    reason: reason.clone(),
+                    detail: detail.clone(),
+                });
+                if self.delivery_failures.len() > MAX_STORED_DELIVERY_FAILURES {
+                    let drop_n = self.delivery_failures.len() - MAX_STORED_DELIVERY_FAILURES;
+                    self.delivery_failures.drain(0..drop_n);
                 }
             }
             Event::Mail(MailEvent::BellRang { .. }) => {}
@@ -1487,7 +1598,9 @@ impl MailState {
     }
 
     /// Computes delivery notices for recipients of unacked letters sent by `sender`
-    /// who are unregistered, dormant, retired, or offline in `presence`.
+    /// who are unregistered, dormant, retired, or offline in `presence`, plus any
+    /// recorded loud courier delivery failures affecting `sender` (as original sender
+    /// or as `hub_owner_seat`).
     pub fn sender_delivery_notices_for(
         &self,
         sender: &SeatName,
@@ -1514,7 +1627,88 @@ impl MailState {
                 }
             }
         }
-        delivery_notices_for_seats(pending_recipients.iter(), presence, now)
+        let mut out = delivery_notices_for_seats(pending_recipients.iter(), presence, now);
+        let mut seen_failures = BTreeSet::new();
+        for failure in self.delivery_failures.iter().rev() {
+            let relevant_as_sender = failure.sender_seat.as_ref() == Some(sender)
+                && (failure.sha256s.is_empty()
+                    || failure
+                        .sha256s
+                        .iter()
+                        .any(|sha| !self.acked.contains(&(failure.seat.clone(), sha.clone()))));
+            let relevant_as_owner = &failure.hub_owner_seat == sender;
+            if !relevant_as_sender && !relevant_as_owner {
+                continue;
+            }
+            let status = failure.kind.as_str().to_owned();
+            let detail_suffix = failure
+                .detail
+                .as_deref()
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| format!(" ({})", d.trim()))
+                .unwrap_or_default();
+            let notice = format!(
+                "delivery to @{} failed ({} via {}): {}{}",
+                failure.seat, status, failure.courier, failure.reason, detail_suffix
+            );
+            if seen_failures.insert((failure.seat.clone(), status.clone(), notice.clone())) {
+                out.push(MailDeliveryNotice {
+                    seat: failure.seat.clone(),
+                    status,
+                    notice,
+                });
+            }
+        }
+        out
+    }
+
+    /// Combines discovered `couriers.d/` executable entries with live journal counters.
+    pub fn courier_health_list(
+        &self,
+        discovered: &[(String, bool)],
+    ) -> Vec<rex_wave_api::config::CourierHealthStatus> {
+        let mut by_name: BTreeMap<String, rex_wave_api::config::CourierHealthStatus> =
+            BTreeMap::new();
+        for (name, executable) in discovered {
+            by_name.insert(
+                name.clone(),
+                rex_wave_api::config::CourierHealthStatus {
+                    name: name.clone(),
+                    executable: *executable,
+                    rung: 0,
+                    unknown: 0,
+                    refused: 0,
+                    degraded: false,
+                },
+            );
+        }
+        for (name, stats) in &self.courier_stats {
+            let entry = by_name.entry(name.clone()).or_insert_with(|| {
+                rex_wave_api::config::CourierHealthStatus {
+                    name: name.clone(),
+                    executable: false,
+                    rung: 0,
+                    unknown: 0,
+                    refused: 0,
+                    degraded: false,
+                }
+            });
+            entry.rung = stats.rung;
+            entry.unknown = stats.unknown;
+            entry.refused = stats.refused;
+            entry.degraded = stats.degraded;
+        }
+        by_name.into_values().collect()
+    }
+
+    /// Returns the most recent loud delivery failures (newest first), bounded to `limit`.
+    pub fn recent_failures(&self, limit: usize) -> Vec<MailDeliveryFailure> {
+        self.delivery_failures
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Looks up the projected room `Seq` of a parent message referenced by

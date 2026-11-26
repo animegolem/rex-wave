@@ -495,6 +495,10 @@ impl Sidebar {
                 let badge_fg =
                     if row.key == NodeKey::Inbox && row.node.glyph == Some(Glyph::Blocked) {
                         C_AMBER
+                    } else if row.key == NodeKey::Settings
+                        && row.node.tag.as_deref().is_some_and(|t| t.contains('✕'))
+                    {
+                        C_ROSE
                     } else {
                         C_ACCENT
                     };
@@ -759,12 +763,29 @@ pub fn build_with_ctx(
         children: Vec::new(),
     };
 
+    let mh = overview.mail_health;
+    let settings_tag = if mh.degraded_couriers > 0 && mh.failed_deliveries > 0 {
+        Some(format!(
+            "✕ {} mail · {} deg",
+            mh.failed_deliveries, mh.degraded_couriers
+        ))
+    } else if mh.degraded_couriers > 0 {
+        Some(format!("✕ {} deg", mh.degraded_couriers))
+    } else if mh.failed_deliveries > 0 {
+        Some(format!("✕ {} mail", mh.failed_deliveries))
+    } else {
+        None
+    };
+    let settings_badge = {
+        let total = mh.failed_deliveries.saturating_add(mh.degraded_couriers);
+        (total > 0).then_some(total)
+    };
     let settings = SidebarNode {
         key: NodeKey::Settings,
         label: "⚙ Settings".to_owned(),
-        badge: None,
+        badge: settings_badge,
         glyph: None,
-        tag: None,
+        tag: settings_tag,
         archived: false,
         children: Vec::new(),
     };

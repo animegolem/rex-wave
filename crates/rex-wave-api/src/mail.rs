@@ -2,7 +2,7 @@
 //! promoted from rooms, and wake-bell ingress. NON-PROD sandbox only; the
 //! sandbox guard lives in `rex-wave-mailbridge::SandboxRoot`.
 
-use crate::id::{IdemKey, SeatName, Seq, SeqRange, Sha256Hex, UnixMs};
+use crate::id::{IdemKey, IncarnationId, SeatName, Seq, SeqRange, Sha256Hex, UnixMs};
 use crate::room::RoomId;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
@@ -514,6 +514,111 @@ pub struct MailWakeBell {
     pub fired_at: String,
 }
 
+/// Outcome reported by a `couriers.d/` output adapter (`MailMachines.tla`).
+/// `Unknown` counts as rung (`counts_as_rung() == true`) so the same `(seat, sha256)`
+/// is never rung twice after an ambiguous timeout or non-zero exit.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CourierOutcome {
+    Rung,
+    Deferred,
+    Refused,
+    Unknown,
+}
+
+impl CourierOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CourierOutcome::Rung => "rung",
+            CourierOutcome::Deferred => "deferred",
+            CourierOutcome::Refused => "refused",
+            CourierOutcome::Unknown => "unknown",
+        }
+    }
+
+    pub const fn counts_as_rung(self) -> bool {
+        matches!(self, CourierOutcome::Rung | CourierOutcome::Unknown)
+    }
+}
+
+/// Classification for loud mail delivery failures escalated to `hub_owner_seat` and sender.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryFailureKind {
+    Refused,
+    GiveUp,
+    AdapterDegraded,
+}
+
+impl DeliveryFailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DeliveryFailureKind::Refused => "refused",
+            DeliveryFailureKind::GiveUp => "give_up",
+            DeliveryFailureKind::AdapterDegraded => "adapter_degraded",
+        }
+    }
+}
+
+/// Durable record of a loud delivery failure or courier degradation surfaced passively in
+/// `ConfigSnapshot` / `⚙ Settings` and reported to `hub_owner_seat` and sender.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MailDeliveryFailure {
+    pub seq: Seq,
+    pub at: UnixMs,
+    pub kind: DeliveryFailureKind,
+    pub courier: String,
+    pub seat: SeatName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<IncarnationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sha256s: Vec<Sha256Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_seat: Option<SeatName>,
+    pub hub_owner_seat: SeatName,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// System command issued by `SystemPart::CourierHub` to record a courier ring outcome
+/// and optional loud delivery failure in `StreamId::Mail`.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MailRecordRing {
+    pub courier: String,
+    pub seat: SeatName,
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<IncarnationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sha256s: Vec<Sha256Hex>,
+    #[serde(default)]
+    pub is_canary: bool,
+    pub outcome: CourierOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_seat: Option<SeatName>,
+    pub hub_owner_seat: SeatName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<DeliveryFailureKind>,
+}
+
+/// Reply returned by [`MailRecordRing`] reporting the authoritative post-commit
+/// consecutive-unknown streak and degradation state for the courier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MailRingRecorded {
+    pub consecutive_unknown: u32,
+    pub degraded: bool,
+    pub degraded_newly_triggered: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MailEvent {
@@ -560,5 +665,38 @@ pub enum MailEvent {
     PathHeadUpdated {
         path: PathBuf,
         sha256: Sha256Hex,
+    },
+    /// Durable courier ring attempt keyed by `(seat, sha256)` (`MailMachines.tla`).
+    RingAttempted {
+        courier: String,
+        seat: SeatName,
+        machine_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation_id: Option<IncarnationId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sha256s: Vec<Sha256Hex>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_canary: bool,
+        outcome: CourierOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Loud mail delivery failure (`refused`, `give_up`, or `adapter_degraded`).
+    DeliveryFailed {
+        kind: DeliveryFailureKind,
+        courier: String,
+        seat: SeatName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation_id: Option<IncarnationId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sha256s: Vec<Sha256Hex>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_seat: Option<SeatName>,
+        hub_owner_seat: SeatName,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }

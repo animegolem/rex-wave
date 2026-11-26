@@ -117,6 +117,90 @@ Configuration keys (in `config.toml` or `rex-wave config set`):
 - `mail.export_enabled` (`true` | `false`): toggle mirror export without affecting SQLite commits.
 - `mail.mirror_dir`: optional mirror root override (checked against `protected-roots`).
 - `mail.drop_dir`: optional external drop folder scanned for hand-dropped `.md` files and consumed into `<mirror>` + SQLite after durable commit.
+- `mail.couriers_dir`: optional directory containing executable output adapters (defaults to `<config_dir>/couriers.d/`).
+- `mail.hub_owner_seat`: seat notified loudly on courier refusals, give-ups, and `AdapterDegraded` events (default `postmaster`).
+
+## Executable `couriers.d/` Adapters (`specs/mail/MailMachines.tla`)
+
+`rex-wave daemon` runs the `CourierHub` reactor to push body-blind wake notifications to seats bound on the local machine (`OneMachineRings`).
+
+### Adapter Discovery & Isolation
+
+- Adapters live as regular executable (`0755`) files directly inside `mail.couriers_dir` (or `<config_dir>/couriers.d/`).
+- Every adapter is verified with `O_NOFOLLOW` regular-file checks and `protected-roots` before spawning (symlinks and directories are rejected).
+- Each invocation spawns in its own process group (`process_group(0)`), enforces a router timeout (`10 s` default), and reaps the entire process group with `SIGTERM` followed by `SIGKILL` on timeout.
+- Endpoint mapping:
+  - `TransportEndpoint::T3Thread` -> `couriers.d/t3-thread`
+  - `TransportEndpoint::ClaudeSession` -> `couriers.d/claude-session`
+  - `TransportEndpoint::BbThread` -> `couriers.d/bb-thread`
+  - `TransportEndpoint::OperatorToast` -> `couriers.d/macos-toast`
+  - `TransportEndpoint::UdsSession { client: "codex-app-server" | "codex" }` -> `couriers.d/codex-app-server`
+  - `TransportEndpoint::SelfWatcher` (`own_knocker`) -> none (ages unacked mail without invoking external push couriers)
+
+Executable reference scripts are shipped in `examples/couriers.d/`: `t3-thread`, `claude-session`, `codex-app-server`, `bb-thread`, and `macos-toast`.
+
+### Body-Blind Wire Protocol
+
+`CourierHub` writes one JSON `DeliveryClaim` object to adapter `stdin` (never raw letter bodies):
+
+```json
+{
+  "schema": 1,
+  "seat": "bob",
+  "machine_id": "workstation-a",
+  "incarnation_id": "inc-bob-1",
+  "endpoint": { "transport": "t3_thread", "thread_id": "thr-42" },
+  "referents": [
+    {
+      "sha256": "...",
+      "id": "1795261554000-alice-to-bob-a1b2c3d4",
+      "from": "alice",
+      "subject": "Design sign-off",
+      "path": "mail/1795261554000-alice-to-bob-a1b2c3d4.md",
+      "priority": "normal",
+      "created_at_ms": 1795261554000
+    }
+  ],
+  "canary_token": null
+}
+```
+
+The adapter writes one JSON outcome object to `stdout`:
+
+```json
+{ "outcome": "rung" | "deferred" | "refused" | "unknown", "reason": "optional", "detail": "optional" }
+```
+
+- **`rung`:** Marks each `(seat, sha256)` rung in `StreamId::Mail` (`NoDoubleRing`) and resets the adapter's consecutive-unknown counter to `0`.
+- **`unknown` (including non-zero exit, malformed stdout, or timeout):** Counts as rung on `(seat, sha256)` so an ambiguous delivery is **never** double-rung. After `K = 3` consecutive `unknown` outcomes, the courier is marked `degraded = true` and `AdapterDegraded` is escalated to `mail.hub_owner_seat` (`DegradedLoud`).
+- **`deferred`:** Retried up to `MaxTries` (`5` default) before loud `give_up` escalation.
+- **`refused` (first occurrence, e.g. `reason: "address-gone"` or `"name-shared"`):** Immediately expires the dead binding (`BindingStatus::Expired`) with **zero retries**, records `MailEvent::DeliveryFailed`, and escalates loudly to `mail.hub_owner_seat` and the original sender seat (visible in `rex-wave mail check` for the sender and in `rex-wave config show`).
+
+### Operator Attention Rule & Passive TUI Indicator
+
+Courier refusals (`address-gone`), `give_up` failures, and `AdapterDegraded` alerts **never** ring, toast, or raise unread/blocking inbox cards on the human `Operator` principal. Instead:
+
+- Failure notices and `NotifyKind::MailDeliveryFailed` inbox entries go exclusively to `mail.hub_owner_seat` and the original sender seat.
+- `rex-wave tui` displays a passive, non-interrupting clickable indicator on `⚙ Settings` (`SidebarTreeSnapshot.mail_health`) without affecting `InboxBadge` or `OSC 7501`. Clicking `⚙ Settings` (or pressing `,`) opens the Settings view displaying live courier counters and the `Mail Delivery Failures` log.
+
+## Canary-Gated Routes (`specs/mail/MailHub.tla`)
+
+Sessions can self-claim a route behind a canary confirmation gate so normal mail never rings an unverified or forked destination (`RightSeat`, `NoFalseGiveUp`):
+
+```sh
+# 1. Bind in pending_canary state (mints a 128-bit canary token):
+rex-wave presence bind --seat bob --t3-thread thr-42 --require-canary
+
+# 2. CourierHub dispatches a body-blind canary DeliveryClaim (referents: [], canary_token: "rwc_...")
+#    to the candidate endpoint; normal mail waits until confirmation.
+
+# 3. Confirm from inside the claimed session to promote PendingCanary -> Live:
+rex-wave presence confirm-canary --seat bob --incarnation <incarnation-id> --token <canary-token>
+```
+
+## Multi-Machine Ownership (`OneMachineRings`)
+
+Each daemon resolves a `machine_id` (`--machine-id` / `REX_WAVE_MACHINE_ID`, defaulting to host short name). `SeatBinding` records its owning `machine_id`, and `CourierHub` only rings bindings owned by the local machine. Cross-machine route tables merge deterministically via `(claimed_at, machine_id)` last-writer-wins ordering alongside commutative union sync on content-addressed messages and ACKs, while local `UdsSession` disconnects (`presence hold` exit) drop the local binding immediately.
 
 ## Loopback HTTP API (`rex-wave daemon --http 127.0.0.1:<port>`)
 

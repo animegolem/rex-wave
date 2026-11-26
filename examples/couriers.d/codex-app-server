@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Reference couriers.d/ adapter for Codex App Server sessions.
+
+Protocol:
+  - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
+    Letter bodies are never included.
+  - Writes one JSON reply object on stdout:
+      {"outcome": "rung" | "deferred" | "refused" | "unknown", ...}
+
+Environment overrides:
+  - CODEX_APP_SERVER_URL           Base HTTP origin (default: http://127.0.0.1:39200).
+  - CODEX_APP_SERVER_TOKEN         Optional bearer token.
+  - CODEX_APP_SERVER_TIMEOUT_SECS  HTTP timeout in seconds (default: 6).
+  - REX_WAVE_COURIER_DRY_RUN=1     Validate payload and emit {"outcome":"rung"}.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
+    payload: dict[str, object] = {"outcome": outcome}
+    if reason:
+        payload["reason"] = reason
+    if detail:
+        payload["detail"] = detail
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def format_nudge(claim: dict) -> str:
+    seat = claim.get("seat", "unknown")
+    incarnation = claim.get("incarnation_id", "unknown")
+    canary = claim.get("canary_token")
+    if canary:
+        return (
+            f"[rex-wave canary] Confirm session for @{seat} ({incarnation}):\n"
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --token {canary}"
+        )
+    refs = claim.get("referents") or []
+    lines = [f"[rex-wave mail] {len(refs)} letter(s) waiting for @{seat}:"]
+    for ref in refs[:8]:
+        sha16 = str(ref.get("sha256", ""))[:16]
+        lines.append(
+            f"- {sha16} from @{ref.get('from', 'unknown')}: {ref.get('subject', '(no subject)')}"
+        )
+    lines.append(f"Run `rex-wave mail check --seat {seat}`.")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    try:
+        claim = json.load(sys.stdin)
+    except Exception as err:
+        return emit("unknown", "invalid-claim", str(err))
+
+    if claim.get("schema") != 1:
+        return emit("refused", "unsupported-schema", f"schema={claim.get('schema')}")
+
+    incarnation = str(claim.get("incarnation_id") or "").strip()
+    if not incarnation:
+        return emit("refused", "address-gone", "missing incarnation_id")
+
+    if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
+        return emit("rung", detail="dry-run")
+
+    base_url = os.environ.get("CODEX_APP_SERVER_URL", "http://127.0.0.1:39200").rstrip("/")
+    token = os.environ.get("CODEX_APP_SERVER_TOKEN", "").strip()
+    timeout = float(os.environ.get("CODEX_APP_SERVER_TIMEOUT_SECS", "6"))
+
+    body = json.dumps(
+        {
+            "seat": claim.get("seat"),
+            "incarnation_id": incarnation,
+            "message": format_nudge(claim),
+            "mode": "auto",
+        }
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    encoded_inc = urllib.parse.quote(incarnation, safe="")
+    url = f"{base_url}/api/v1/sessions/{encoded_inc}/nudge"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                return emit("rung")
+            return emit("unknown", f"http-{resp.status}")
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace").strip()[:240]
+        if err.code in (404, 410):
+            return emit("refused", "address-gone", detail or f"session {incarnation} not found")
+        if err.code in (409, 429, 503):
+            return emit("deferred", f"http-{err.code}", detail or "session busy")
+        return emit("unknown", f"http-{err.code}", detail or str(err))
+    except urllib.error.URLError as err:
+        return emit("deferred", "server-unreachable", str(err.reason))
+    except TimeoutError:
+        return emit("unknown", "timeout", "codex-app-server request timed out")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

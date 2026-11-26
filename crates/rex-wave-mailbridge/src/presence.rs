@@ -13,8 +13,93 @@ use std::process::Command;
 /// when `PresenceBind.ttl_ms` or `PresenceHeartbeat.ttl_ms` is omitted.
 pub const DEFAULT_LEASE_TTL_MS: u64 = 600_000;
 
+/// Fallback machine identifier used when neither `REX_WAVE_MACHINE_ID` nor the
+/// host name resolves to a non-empty valid identifier.
+pub const DEFAULT_MACHINE_ID: &str = "local";
+
 /// Threshold distinguishing real Unix-epoch timestamps from synthetic unit-test clocks.
 const REAL_EPOCH_FLOOR_MS: u64 = 1_500_000_000_000;
+
+/// Sanitizes an arbitrary host or env string into a bounded machine identifier
+/// (`1..=64` ASCII `[A-Za-z0-9._-]`).
+pub fn sanitize_machine_id(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+            if out.len() >= 64 {
+                break;
+            }
+        }
+    }
+    let trimmed = out.trim_matches(|c| c == '.' || c == '-');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Resolves the local machine identifier (`REX_WAVE_MACHINE_ID`, then `HOSTNAME`,
+/// then `hostname -s`, falling back to [`DEFAULT_MACHINE_ID`]).
+pub fn default_machine_id() -> String {
+    if let Ok(env_id) = std::env::var("REX_WAVE_MACHINE_ID")
+        && let Some(clean) = sanitize_machine_id(&env_id)
+    {
+        return clean;
+    }
+    if let Ok(env_host) = std::env::var("HOSTNAME")
+        && let Some(clean) = sanitize_machine_id(&env_host)
+    {
+        return clean;
+    }
+    if let Ok(out) = Command::new("hostname").arg("-s").output()
+        && out.status.success()
+        && let Ok(text) = String::from_utf8(out.stdout)
+        && let Some(clean) = sanitize_machine_id(&text)
+    {
+        return clean;
+    }
+    DEFAULT_MACHINE_ID.to_owned()
+}
+
+fn validate_machine_id(raw: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(invalid(
+            "machine_id",
+            "must be 1..=64 printable non-whitespace characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn mint_canary_token() -> Result<String, ApiError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| ApiError::Internal(format!("mint canary token: {e}")))?;
+    let mut out = String::with_capacity(4 + 32);
+    out.push_str("rwc_");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    Ok(out)
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 /// Collapses ASCII whitespace runs so single-digit day padding (`Nov  6` vs
 /// `Nov 6`) compares identically across `ps` and Claude session files.
@@ -304,12 +389,14 @@ impl ClaudeSessionFile {
         Ok(PresenceBind {
             seat,
             incarnation_id: None,
+            machine_id: None,
             lane,
             endpoint,
             liveness: LivenessMode::ProcessAndLease,
             ttl_ms,
             takeover,
             allow_fork,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         })
@@ -985,6 +1072,8 @@ pub fn sender_delivery_notice(
 /// Chooses the target live binding for a delivery to `seat`, honoring
 /// `in_reply_to` incarnation affinity first, then explicit `lane`, then the
 /// default lane, then the highest binding epoch.
+///
+/// Never selects [`BindingStatus::PendingCanary`] bindings (`RightSeat` / `MailHub.tla`).
 pub fn select_binding_for_delivery<'a>(
     state: &'a PresenceState,
     seat: &SeatName,
@@ -993,7 +1082,23 @@ pub fn select_binding_for_delivery<'a>(
     affinity: &IncarnationAffinity,
     now: UnixMs,
 ) -> Option<&'a SeatBinding> {
-    let live = state.live_bindings_for(seat, None, now);
+    select_binding_for_delivery_on_machine(state, seat, lane, in_reply_to, affinity, None, now)
+}
+
+/// Machine-scoped variant of [`select_binding_for_delivery`] enforcing `MailMachines.tla`
+/// `OneMachineRings`: when `local_machine_id` is `Some(m)`, only bindings whose `machine_id`
+/// matches `m` (or legacy pre-PR-33 bindings with `machine_id: None`) are eligible.
+/// Never selects [`BindingStatus::PendingCanary`] bindings.
+pub fn select_binding_for_delivery_on_machine<'a>(
+    state: &'a PresenceState,
+    seat: &SeatName,
+    lane: Option<&str>,
+    in_reply_to: Option<&str>,
+    affinity: &IncarnationAffinity,
+    local_machine_id: Option<&str>,
+    now: UnixMs,
+) -> Option<&'a SeatBinding> {
+    let live = state.live_bindings_for_machine(seat, None, local_machine_id, now);
     if live.is_empty() {
         return None;
     }
@@ -1202,11 +1307,13 @@ fn binding_is_live_at(binding: &SeatBinding, now: UnixMs) -> bool {
 }
 
 /// Materialized projection of `StreamId::Presence`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PresenceState {
     /// Read-only deployment config consulted by the decider; `evolve` never
     /// touches it and it is not derived from the journal.
     house: HouseProfile,
+    /// Local machine identifier stamped on bindings that omit `machine_id`.
+    local_machine_id: String,
     head: Seq,
     latest_at: UnixMs,
     seats: BTreeMap<SeatName, SeatRecord>,
@@ -1219,6 +1326,25 @@ pub struct PresenceState {
     down_transport_details: BTreeMap<TransportKind, Option<String>>,
 }
 
+impl Default for PresenceState {
+    fn default() -> Self {
+        Self {
+            house: HouseProfile::default(),
+            local_machine_id: DEFAULT_MACHINE_ID.to_owned(),
+            head: Seq::ORIGIN,
+            latest_at: UnixMs(0),
+            seats: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            max_epoch: BTreeMap::new(),
+            last_live_at: BTreeMap::new(),
+            last_drop: BTreeMap::new(),
+            ever_bound: BTreeSet::new(),
+            down_transports: BTreeSet::new(),
+            down_transport_details: BTreeMap::new(),
+        }
+    }
+}
+
 impl PresenceState {
     /// Empty state carrying an explicit [`HouseProfile`] (the decider's only
     /// source of operator-surface identity).
@@ -1227,6 +1353,18 @@ impl PresenceState {
             house,
             ..Self::default()
         }
+    }
+
+    pub fn with_machine_id(mut self, machine_id: impl Into<String>) -> Self {
+        let raw = machine_id.into();
+        if let Some(clean) = sanitize_machine_id(&raw) {
+            self.local_machine_id = clean;
+        }
+        self
+    }
+
+    pub fn local_machine_id(&self) -> &str {
+        &self.local_machine_id
     }
 
     pub fn house(&self) -> &HouseProfile {
@@ -1262,6 +1400,18 @@ impl PresenceState {
         lane: Option<&str>,
         now: UnixMs,
     ) -> Vec<&SeatBinding> {
+        self.live_bindings_for_machine(seat, lane, None, now)
+    }
+
+    /// Returns all currently [`BindingStatus::Live`] bindings for `seat` (never
+    /// [`BindingStatus::PendingCanary`]), optionally filtered by `lane` and `machine_id`.
+    pub fn live_bindings_for_machine(
+        &self,
+        seat: &SeatName,
+        lane: Option<&str>,
+        machine_id: Option<&str>,
+        now: UnixMs,
+    ) -> Vec<&SeatBinding> {
         let Some(map) = self.bindings.get(seat) else {
             return Vec::new();
         };
@@ -1271,9 +1421,37 @@ impl PresenceState {
                 binding_is_live_at(b, now)
                     && !self.down_transports.contains(&b.endpoint.kind())
                     && lane.is_none_or(|want| b.lane.as_deref() == Some(want))
+                    && machine_id.is_none_or(|want| {
+                        b.machine_id.as_deref().is_none_or(|actual| actual == want)
+                    })
             })
             .collect();
         out.sort_by_key(|b| (std::cmp::Reverse(b.epoch), b.incarnation_id.clone()));
+        out
+    }
+
+    /// Returns unexpired [`BindingStatus::PendingCanary`] bindings owned by `machine_id`
+    /// so `CourierHub` can dispatch one-shot canary confirmation rings locally.
+    pub fn pending_canary_bindings_for_machine(
+        &self,
+        machine_id: &str,
+        now: UnixMs,
+    ) -> Vec<&SeatBinding> {
+        let mut out = Vec::new();
+        for map in self.bindings.values() {
+            for b in map.values() {
+                if b.status == BindingStatus::PendingCanary
+                    && b.expires_at.is_none_or(|exp| exp > now)
+                    && !self.down_transports.contains(&b.endpoint.kind())
+                    && b.machine_id
+                        .as_deref()
+                        .is_none_or(|actual| actual == machine_id)
+                {
+                    out.push(b);
+                }
+            }
+        }
+        out.sort_by_key(|b| (b.seat.clone(), b.epoch, b.incarnation_id.clone()));
         out
     }
 
@@ -1335,7 +1513,7 @@ impl PresenceState {
         let mut out = Vec::new();
         for (seat, map) in &self.bindings {
             for b in map.values() {
-                if b.status != BindingStatus::Live {
+                if !matches!(b.status, BindingStatus::Live | BindingStatus::PendingCanary) {
                     continue;
                 }
                 if let Some(exp) = b.expires_at
@@ -1376,12 +1554,17 @@ impl PresenceState {
 
     fn effective_binding_view(&self, binding: &SeatBinding, now: UnixMs) -> SeatBinding {
         let mut out = binding.clone();
+        out.canary_token = None;
         if out.status == BindingStatus::Live {
             if self.down_transports.contains(&out.endpoint.kind()) {
                 out.status = BindingStatus::TransportDown;
             } else if out.expires_at.is_some_and(|exp| exp <= now) {
                 out.status = BindingStatus::Expired;
             }
+        } else if out.status == BindingStatus::PendingCanary
+            && out.expires_at.is_some_and(|exp| exp <= now)
+        {
+            out.status = BindingStatus::Expired;
         }
         out
     }
@@ -1559,9 +1742,19 @@ impl PresenceState {
 /// `Decider` is static, so the [`HouseProfile`] held here reaches `decide`
 /// through the seeded [`PresenceState`] ([`Presence::registry`]); `decide`
 /// itself never reads disk.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Presence {
     house: HouseProfile,
+    local_machine_id: String,
+}
+
+impl Default for Presence {
+    fn default() -> Self {
+        Self {
+            house: HouseProfile::default(),
+            local_machine_id: DEFAULT_MACHINE_ID.to_owned(),
+        }
+    }
 }
 
 impl Presence {
@@ -1572,16 +1765,32 @@ impl Presence {
 
     /// A decider configured with an explicit, already-loaded [`HouseProfile`].
     pub fn with_house_profile(house: HouseProfile) -> Self {
-        Self { house }
+        Self {
+            house,
+            local_machine_id: DEFAULT_MACHINE_ID.to_owned(),
+        }
+    }
+
+    pub fn with_machine_id(mut self, machine_id: impl Into<String>) -> Self {
+        let raw = machine_id.into();
+        if let Some(clean) = sanitize_machine_id(&raw) {
+            self.local_machine_id = clean;
+        }
+        self
     }
 
     pub fn house(&self) -> &HouseProfile {
         &self.house
     }
 
+    pub fn local_machine_id(&self) -> &str {
+        &self.local_machine_id
+    }
+
     /// The empty state every Presence stream actor folds its journal into.
     pub fn initial_state(&self) -> PresenceState {
         PresenceState::with_house_profile(self.house.clone())
+            .with_machine_id(self.local_machine_id.clone())
     }
 
     /// A Presence registry whose actors (including rehydrated ones) are seeded
@@ -1613,6 +1822,7 @@ impl Presence {
             PresenceCommand::PresenceClaim(c) => Self::decide_claim(state, c, ctx),
             PresenceCommand::PresenceSetStatus(c) => Self::decide_set_status(state, c, ctx),
             PresenceCommand::PresenceBind(c) => Self::decide_bind(state, c, ctx, is_proc_alive),
+            PresenceCommand::PresenceConfirmCanary(c) => Self::decide_confirm_canary(state, c, ctx),
             PresenceCommand::PresenceHeartbeat(c) => Self::decide_heartbeat(state, c, ctx),
             PresenceCommand::PresenceUnbind(c) => Self::decide_unbind(state, c, ctx),
             PresenceCommand::PresenceExpire(c) => Self::decide_expire(state, c, ctx),
@@ -1761,7 +1971,12 @@ impl Presence {
             });
             if let Some(old_bindings) = state.bindings.get(old_seat) {
                 for b in old_bindings.values() {
-                    if matches!(b.status, BindingStatus::Live | BindingStatus::TransportDown) {
+                    if matches!(
+                        b.status,
+                        BindingStatus::PendingCanary
+                            | BindingStatus::Live
+                            | BindingStatus::TransportDown
+                    ) {
                         events.push(PresenceEvent::Unbound {
                             seat: old_seat.clone(),
                             incarnation_id: b.incarnation_id.clone(),
@@ -1953,7 +2168,12 @@ impl Presence {
             && let Some(bindings) = state.bindings.get(&c.seat)
         {
             for b in bindings.values() {
-                if matches!(b.status, BindingStatus::Live | BindingStatus::TransportDown) {
+                if matches!(
+                    b.status,
+                    BindingStatus::PendingCanary
+                        | BindingStatus::Live
+                        | BindingStatus::TransportDown
+                ) {
                     events.push(PresenceEvent::Unbound {
                         seat: c.seat.clone(),
                         incarnation_id: b.incarnation_id.clone(),
@@ -1988,6 +2208,10 @@ impl Presence {
         }
         validate_endpoint(&c.endpoint, c.allow_fork)?;
         let lane = normalize_lane(&c.lane)?;
+        let machine_id = match &c.machine_id {
+            Some(m) => Some(validate_machine_id(m)?),
+            None => Some(state.local_machine_id.clone()),
+        };
         if c.ttl_ms == Some(0) {
             return Err(invalid("ttl_ms", "ttl_ms must be positive"));
         }
@@ -2036,10 +2260,22 @@ impl Presence {
 
         if let Some(existing_bindings) = state.bindings.get(&c.seat) {
             for b in existing_bindings.values() {
-                if !matches!(b.status, BindingStatus::Live | BindingStatus::TransportDown) {
+                if !matches!(
+                    b.status,
+                    BindingStatus::PendingCanary
+                        | BindingStatus::Live
+                        | BindingStatus::TransportDown
+                ) {
                     continue;
                 }
                 if b.lane != lane {
+                    continue;
+                }
+
+                // Unconfirmed canary bindings on the same (seat, lane) are freely superseded
+                // when a new bind arrives so retries never deadlock.
+                if b.status == BindingStatus::PendingCanary {
+                    superseded.push(b.incarnation_id.clone());
                     continue;
                 }
 
@@ -2097,7 +2333,7 @@ impl Presence {
 
         let (incarnation_id, epoch) =
             if let Some((existing_id, existing_epoch, same_endpoint)) = refresh_target {
-                let epoch = if same_endpoint {
+                let epoch = if same_endpoint && !c.require_canary {
                     existing_epoch
                 } else {
                     state.next_epoch(&c.seat)
@@ -2112,10 +2348,12 @@ impl Presence {
                 (id, next_epoch)
             };
 
-        let status = if state.down_transports.contains(&c.endpoint.kind()) {
-            BindingStatus::TransportDown
+        let (status, canary_token) = if c.require_canary {
+            (BindingStatus::PendingCanary, Some(mint_canary_token()?))
+        } else if state.down_transports.contains(&c.endpoint.kind()) {
+            (BindingStatus::TransportDown, None)
         } else {
-            BindingStatus::Live
+            (BindingStatus::Live, None)
         };
 
         let effective_horizon = c
@@ -2159,11 +2397,13 @@ impl Presence {
             seat: c.seat.clone(),
             incarnation_id,
             epoch,
+            machine_id,
             lane,
             endpoint: c.endpoint.clone(),
             liveness: c.liveness,
             bound_at: ctx.at(),
             expires_at,
+            canary_token,
             status,
         };
         events.push(PresenceEvent::Bound {
@@ -2171,6 +2411,62 @@ impl Presence {
             superseded,
         });
         Ok(events)
+    }
+
+    fn decide_confirm_canary(
+        state: &PresenceState,
+        c: &PresenceConfirmCanary,
+        ctx: &DecideCtx,
+    ) -> Result<Vec<PresenceEvent>, ApiError> {
+        let existing_seat = state.seats.get(&c.seat);
+        if !can_manage_seat(ctx.by(), &c.seat, existing_seat) {
+            return Err(ApiError::Denied {
+                principal: ctx.by().to_string(),
+                action: format!("confirm canary for seat '{}'", c.seat),
+            });
+        }
+        let Some(binding) = state
+            .bindings
+            .get(&c.seat)
+            .and_then(|m| m.get(&c.incarnation_id))
+        else {
+            return Err(ApiError::NotFound {
+                what: format!("binding '{}/{}'", c.seat, c.incarnation_id),
+            });
+        };
+        if binding.status != BindingStatus::PendingCanary {
+            return Err(ApiError::conflict(format!(
+                "binding '{}/{}' is {:?}, not pending_canary",
+                c.seat, c.incarnation_id, binding.status
+            )));
+        }
+        if binding.expires_at.is_some_and(|exp| exp <= ctx.at()) {
+            return Err(ApiError::conflict(format!(
+                "binding '{}/{}' canary lease already expired; rebind",
+                c.seat, c.incarnation_id
+            )));
+        }
+        let provided = c.token.trim();
+        let Some(expected) = binding.canary_token.as_deref() else {
+            return Err(ApiError::conflict(format!(
+                "binding '{}/{}' has no pending canary token",
+                c.seat, c.incarnation_id
+            )));
+        };
+        if provided.is_empty() || !ct_eq(provided.as_bytes(), expected.as_bytes()) {
+            return Err(ApiError::Denied {
+                principal: ctx.by().to_string(),
+                action: format!(
+                    "confirm canary for '{}/{}' (token mismatch)",
+                    c.seat, c.incarnation_id
+                ),
+            });
+        }
+        Ok(vec![PresenceEvent::CanaryConfirmed {
+            seat: c.seat.clone(),
+            incarnation_id: c.incarnation_id.clone(),
+            epoch: binding.epoch,
+        }])
     }
 
     fn decide_heartbeat(
@@ -2199,7 +2495,7 @@ impl Presence {
         };
         if !matches!(
             binding.status,
-            BindingStatus::Live | BindingStatus::TransportDown
+            BindingStatus::PendingCanary | BindingStatus::Live | BindingStatus::TransportDown
         ) {
             return Err(ApiError::conflict(format!(
                 "binding '{}/{}' is {:?} and cannot be heartbeated",
@@ -2395,6 +2691,30 @@ impl Decider for Presence {
                     state.last_drop.remove(&seat);
                 }
             }
+            PresenceEvent::CanaryConfirmed {
+                seat,
+                incarnation_id,
+                epoch,
+            } => {
+                if let Some(binding) = state
+                    .bindings
+                    .get_mut(seat)
+                    .and_then(|m| m.get_mut(incarnation_id))
+                    && binding.epoch == *epoch
+                    && binding.status == BindingStatus::PendingCanary
+                {
+                    binding.canary_token = None;
+                    binding.status = if state.down_transports.contains(&binding.endpoint.kind()) {
+                        BindingStatus::TransportDown
+                    } else {
+                        BindingStatus::Live
+                    };
+                    if binding.status == BindingStatus::Live {
+                        state.last_live_at.insert(seat.clone(), meta.at);
+                        state.last_drop.remove(seat);
+                    }
+                }
+            }
             PresenceEvent::Heartbeated {
                 seat,
                 incarnation_id,
@@ -2497,7 +2817,7 @@ impl Decider for Presence {
                 WireReply::PresenceSetStatus(record)
             }
             PresenceCommand::PresenceBind(c) => {
-                let binding = committed
+                let mut binding = committed
                     .iter()
                     .rev()
                     .find_map(|e| match &e.event {
@@ -2513,15 +2833,27 @@ impl Decider for Presence {
                             .cloned()
                     })
                     .expect("bound seat binding exists");
+                binding.canary_token = None;
                 WireReply::PresenceBind(binding)
             }
+            PresenceCommand::PresenceConfirmCanary(c) => {
+                let mut binding = state
+                    .bindings
+                    .get(&c.seat)
+                    .and_then(|m| m.get(&c.incarnation_id))
+                    .cloned()
+                    .expect("confirmed canary binding exists");
+                binding.canary_token = None;
+                WireReply::PresenceConfirmCanary(binding)
+            }
             PresenceCommand::PresenceHeartbeat(c) => {
-                let binding = state
+                let mut binding = state
                     .bindings
                     .get(&c.seat)
                     .and_then(|m| m.get(&c.incarnation_id))
                     .cloned()
                     .expect("heartbeated binding exists");
+                binding.canary_token = None;
                 WireReply::PresenceHeartbeat(binding)
             }
             PresenceCommand::PresenceUnbind(_) => WireReply::PresenceUnbind(Ack),

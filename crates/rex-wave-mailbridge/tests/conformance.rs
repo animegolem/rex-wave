@@ -214,12 +214,14 @@ proptest! {
                         PresenceCommand::PresenceBind(PresenceBind {
                             seat: seat.clone(),
                             incarnation_id: Some(inc.clone()),
+                            machine_id: None,
                             lane,
                             endpoint: endpoint.clone(),
                             liveness: LivenessMode::SocketLifetime,
                             ttl_ms: None,
                             takeover,
                             allow_fork: false,
+                            require_canary: false,
                             mail_horizon_at: None,
                             idem: None,
                         }),
@@ -270,12 +272,14 @@ proptest! {
                         PresenceCommand::PresenceBind(PresenceBind {
                             seat: seat.clone(),
                             incarnation_id: Some(inc),
+                            machine_id: None,
                             lane: None,
                             endpoint: endpoint.clone(),
                             liveness: LivenessMode::ProcessAndLease,
                             ttl_ms: Some(ttl_ms),
                             takeover,
                             allow_fork: false,
+                            require_canary: false,
                             mail_horizon_at: None,
                             idem: None,
                         }),
@@ -414,6 +418,7 @@ proptest! {
                         PresenceCommand::PresenceBind(PresenceBind {
                             seat: operator_seat.clone(),
                             incarnation_id: None,
+                            machine_id: None,
                             lane: None,
                             endpoint: TransportEndpoint::UdsSession {
                                 conn_id: 99,
@@ -423,6 +428,7 @@ proptest! {
                             ttl_ms: None,
                             takeover: false,
                             allow_fork: false,
+                            require_canary: false,
                             mail_horizon_at: None,
                             idem: None,
                         }),
@@ -638,6 +644,7 @@ proptest! {
                             PresenceCommand::PresenceBind(PresenceBind {
                                 seat: alice.clone(),
                                 incarnation_id: Some(inc.clone()),
+                                machine_id: None,
                                 lane: None,
                                 endpoint: TransportEndpoint::UdsSession {
                                     conn_id: 1,
@@ -647,6 +654,7 @@ proptest! {
                                 ttl_ms: None,
                                 takeover: true,
                                 allow_fork: false,
+                                require_canary: false,
                                 mail_horizon_at: Some(UnixMs(1_795_259_000_000)),
                                 idem: None,
                             }),
@@ -818,6 +826,7 @@ fn busy_deadline_loud_give_up_transitions_defer_to_raise_unrung() {
         PresenceCommand::PresenceBind(PresenceBind {
             seat: alice.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-1").expect("inc")),
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 1,
@@ -827,6 +836,7 @@ fn busy_deadline_loud_give_up_transitions_defer_to_raise_unrung() {
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: Some(UnixMs(1_795_259_000_000)),
             idem: None,
         }),
@@ -913,6 +923,7 @@ fn pre_deadline_in_flight_heartbeat_and_multi_lane_bindings_match_tla() {
         PresenceCommand::PresenceBind(PresenceBind {
             seat: alice.clone(),
             incarnation_id: Some(inc1.clone()),
+            machine_id: None,
             lane: Some("lane-a".into()),
             endpoint: TransportEndpoint::ClaudeSession {
                 pid: 5001,
@@ -928,6 +939,7 @@ fn pre_deadline_in_flight_heartbeat_and_multi_lane_bindings_match_tla() {
             ttl_ms: Some(200),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -945,6 +957,7 @@ fn pre_deadline_in_flight_heartbeat_and_multi_lane_bindings_match_tla() {
         PresenceCommand::PresenceBind(PresenceBind {
             seat: alice.clone(),
             incarnation_id: Some(inc2.clone()),
+            machine_id: None,
             lane: Some("lane-b".into()),
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 2,
@@ -954,6 +967,7 @@ fn pre_deadline_in_flight_heartbeat_and_multi_lane_bindings_match_tla() {
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),

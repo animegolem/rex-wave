@@ -214,18 +214,20 @@ commands! {
         InboxRaise    -> Ack       : "inbox_raise",     System,   true,  "Herald files a notification into one principal's inbox.";
     }
     Mail(MailCommand) {
-        MailPromote   -> LetterRef           : "promote_to_letter", Member,   true,  "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).";
-        MailAck       -> MailAcked           : "mail_ack",          Member,   true,  "ACK a mail message or sandbox letter by exact sha256 or relative path (idempotent per seat+sha256).";
-        MailWakeBell  -> Ack                 : "mail_wake_bell",    System,   true,  "wake-bell Sink ingress: deliver a scheduled prompt into a seat's DM.";
-        MailSend      -> MailSent            : "mail_send",         Member,   true,  "Send a content-addressed (sha256) dissolved mail message committed durably to SQLite before mirror export.";
-        MailCheck     -> MailCheckView       : "mail_check",        Member,   false, "Fast check returning unread/unacked mail for a seat plus sender delivery notices.";
-        MailSearch    -> MailSearchView      : "mail_search",       Member,   false, "Full-text (SQLite FTS5) search across content-addressed mail messages.";
-        MailReconcile -> MailReconcileReport : "mail_reconcile",    Operator, true,  "Reconcile SQLite mail messages and acks with mirror blobs, working tree, acks.jsonl, and drop folder.";
+        MailPromote    -> LetterRef           : "promote_to_letter", Member,   true,  "Bank a room range as a canon letter in the NON-PROD sandbox (bank before announce).";
+        MailAck        -> MailAcked           : "mail_ack",          Member,   true,  "ACK a mail message or sandbox letter by exact sha256 or relative path (idempotent per seat+sha256).";
+        MailWakeBell   -> Ack                 : "mail_wake_bell",    System,   true,  "wake-bell Sink ingress: deliver a scheduled prompt into a seat's DM.";
+        MailSend       -> MailSent            : "mail_send",         Member,   true,  "Send a content-addressed (sha256) dissolved mail message committed durably to SQLite before mirror export.";
+        MailCheck      -> MailCheckView       : "mail_check",        Member,   false, "Fast check returning unread/unacked mail for a seat plus sender delivery notices.";
+        MailSearch     -> MailSearchView      : "mail_search",       Member,   false, "Full-text (SQLite FTS5) search across content-addressed mail messages.";
+        MailReconcile  -> MailReconcileReport : "mail_reconcile",    Operator, true,  "Reconcile SQLite mail messages and acks with mirror blobs, working tree, acks.jsonl, and drop folder.";
+        MailRecordRing -> MailRingRecorded    : "mail_record_ring",  System,   true,  "CourierHub records a courier ring outcome and optional delivery failure in StreamId::Mail.";
     }
     Presence(PresenceCommand) {
         PresenceClaim           -> SeatRecord         : "presence_claim",            Member, true,  "Claim or update durable seat metadata (role, projects, aliases, status) with provenance.";
         PresenceSetStatus       -> SeatRecord         : "presence_set_status",       Member, true,  "Transition a seat between active, dormant, and retired with provenance.";
         PresenceBind            -> SeatBinding        : "presence_bind",             Member, true,  "Bind an ephemeral live session endpoint to a seat.";
+        PresenceConfirmCanary   -> SeatBinding        : "presence_confirm_canary",   Member, true,  "Confirm a pending canary token from inside the claimed session to promote the binding to Live.";
         PresenceHeartbeat       -> SeatBinding        : "presence_heartbeat",        Member, true,  "Renew the TTL lease on an active seat binding.";
         PresenceUnbind          -> Ack                : "presence_unbind",           Member, true,  "Unbind an active seat session incarnation.";
         PresenceExpire          -> Ack                : "presence_expire",           System, true,  "PresenceMonitor expires a dead or lapsed seat binding.";

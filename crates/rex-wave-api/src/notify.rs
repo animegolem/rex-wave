@@ -99,6 +99,15 @@ pub enum NotifyKind {
         #[serde(default)]
         detail: String,
     },
+    /// Loud mail delivery failure (`refused`, `give_up`, or `adapter_degraded`) escalated to
+    /// `hub_owner_seat` and sender seat only (never raised to human `Operator`).
+    MailDeliveryFailed {
+        failure_kind: crate::mail::DeliveryFailureKind,
+        courier: String,
+        seat: SeatName,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 /// A button on a card. `run` is sent verbatim through `Client::call_wire`.

@@ -321,6 +321,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
         .call(PresenceBind {
             seat: SeatName::parse("eve").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::SelfWatcher {
                 harness: "codex".into(),
@@ -332,6 +333,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
             ttl_ms: Some(30_000),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: Some(IdemKey::parse("bind-eve-1").unwrap()),
         })
@@ -381,6 +383,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
         .call(PresenceBind {
             seat: SeatName::parse("eve").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 1,
@@ -390,6 +393,7 @@ async fn presence_decider_round_trips_through_registry_with_provenance_and_idemp
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         })
@@ -519,6 +523,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         PresenceCommand::PresenceBind(PresenceBind {
             seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: claude_endpoint(
                 child_pid,
@@ -532,6 +537,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -552,6 +558,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         PresenceCommand::PresenceBind(PresenceBind {
             seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: claude_endpoint(
                 child_pid,
@@ -565,6 +572,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -590,6 +598,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         PresenceCommand::PresenceBind(PresenceBind {
             seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: claude_endpoint(
                 my_pid,
@@ -603,6 +612,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -630,6 +640,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         PresenceCommand::PresenceBind(PresenceBind {
             seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: claude_endpoint(
                 my_pid,
@@ -643,6 +654,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             ttl_ms: Some(600_000),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -667,6 +679,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
         PresenceCommand::PresenceBind(PresenceBind {
             seat: SeatName::parse("carol").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: claude_endpoint(
                 second_pid,
@@ -680,6 +693,7 @@ fn claude_session_hook_parser_and_real_ps_process_liveness_enforce_carol_rules()
             ttl_ms: Some(600_000),
             takeover: true,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -762,6 +776,7 @@ fn gate1_case_01_seat_stale_six_days() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: dave.clone(),
                 incarnation_id: Some(IncarnationId::parse("inc-dave-dead").unwrap()),
+                machine_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
                     4242,
@@ -775,6 +790,7 @@ fn gate1_case_01_seat_stale_six_days() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -953,6 +969,7 @@ fn gate1_case_03_two_tables_one_name() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: carbon.clone(),
                 incarnation_id: None,
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::UdsSession {
                     conn_id: 99,
@@ -962,6 +979,7 @@ fn gate1_case_03_two_tables_one_name() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1058,6 +1076,7 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: carol.clone(),
                 incarnation_id: None,
+                machine_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
                     8195,
@@ -1071,6 +1090,7 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1087,6 +1107,7 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: frank.clone(),
                 incarnation_id: None,
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::BbThread {
                     thread_id: BbThreadId::parse("th_frank_1").unwrap(),
@@ -1095,6 +1116,7 @@ fn gate1_case_05_ring_types_into_a_live_turn() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1161,6 +1183,7 @@ fn gate1_case_06_a_transport_dies() {
                 PresenceCommand::PresenceBind(PresenceBind {
                     seat: seat.clone(),
                     incarnation_id: Some(IncarnationId::parse(format!("inc-{seat}")).unwrap()),
+                    machine_id: None,
                     lane: None,
                     endpoint: TransportEndpoint::BbThread {
                         thread_id: BbThreadId::parse(tid).unwrap(),
@@ -1169,6 +1192,7 @@ fn gate1_case_06_a_transport_dies() {
                     ttl_ms: None,
                     takeover: false,
                     allow_fork: false,
+                    require_canary: false,
                     mail_horizon_at: None,
                     idem: None,
                 }),
@@ -1292,6 +1316,7 @@ fn gate1_case_07_two_seats_one_name() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: peggy.clone(),
                 incarnation_id: None,
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::UdsSession {
                     conn_id: 77,
@@ -1301,6 +1326,7 @@ fn gate1_case_07_two_seats_one_name() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1464,6 +1490,7 @@ fn gate1_case_08_session_names_drift() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: dave.clone(),
                 incarnation_id: Some(IncarnationId::parse("inc-dave-main").unwrap()),
+                machine_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
                     41001,
@@ -1477,6 +1504,7 @@ fn gate1_case_08_session_names_drift() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1492,6 +1520,7 @@ fn gate1_case_08_session_names_drift() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: dave.clone(),
                 incarnation_id: None,
+                machine_id: None,
                 lane: None,
                 endpoint: claude_endpoint(
                     41001,
@@ -1505,6 +1534,7 @@ fn gate1_case_08_session_names_drift() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1520,6 +1550,7 @@ fn gate1_case_08_session_names_drift() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: dave.clone(),
                 incarnation_id: Some(IncarnationId::parse("inc-dave-2d").unwrap()),
+                machine_id: None,
                 lane: Some("2d".into()),
                 endpoint: claude_endpoint(
                     41002,
@@ -1533,6 +1564,7 @@ fn gate1_case_08_session_names_drift() {
                 ttl_ms: Some(600_000),
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1581,6 +1613,7 @@ fn gate1_case_09_own_watcher_liveness() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: blake.clone(),
                 incarnation_id: Some(IncarnationId::parse("inc-blake-lease").unwrap()),
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::SelfWatcher {
                     harness: "codex-cron".into(),
@@ -1592,6 +1625,7 @@ fn gate1_case_09_own_watcher_liveness() {
                 ttl_ms: Some(900_000),
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -1787,6 +1821,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
             PresenceCommand::PresenceBind(PresenceBind {
                 seat: s,
                 incarnation_id: None,
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::UdsSession {
                     conn_id,
@@ -1796,6 +1831,7 @@ fn gate1_all_6_friction_rows_edge_cases_and_sandbox_ack_matching() {
                 ttl_ms: None,
                 takeover: false,
                 allow_fork: false,
+                require_canary: false,
                 mail_horizon_at: None,
                 idem: None,
             }),
@@ -2101,6 +2137,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
         PresenceCommand::PresenceBind(PresenceBind {
             seat: SeatName::parse("lucas").unwrap(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 1,
@@ -2110,6 +2147,7 @@ fn gate2_shadow_scorer_and_opt_in_interchange_smoke() {
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -2493,6 +2531,7 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
         PresenceCommand::PresenceBind(PresenceBind {
             seat: carol.clone(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 5,
@@ -2502,6 +2541,7 @@ fn pr20_q1_seed_records_from_interchange_covers_roster_routes_and_canonical_alia
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -2566,6 +2606,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
         PresenceCommand::PresenceBind(PresenceBind {
             seat: carol.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-1").unwrap()),
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 1,
@@ -2575,6 +2616,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -2595,6 +2637,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
         PresenceCommand::PresenceBind(PresenceBind {
             seat: carol.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-2").unwrap()),
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 2,
@@ -2604,6 +2647,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
             ttl_ms: None,
             takeover: true,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -2684,6 +2728,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
         PresenceCommand::PresenceBind(PresenceBind {
             seat: carol.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-3").unwrap()),
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 3,
@@ -2693,6 +2738,7 @@ fn pr20_q2_first_bind_mail_horizon_skips_pre_horizon_history_and_allows_override
             ttl_ms: None,
             takeover: true,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: Some(UnixMs(25_000)),
             idem: None,
         }),
@@ -2723,6 +2769,7 @@ fn pr20_q3_operator_structural_guard_and_non_seat_pseudo_target_classification()
         PresenceCommand::PresenceBind(PresenceBind {
             seat: operator.clone(),
             incarnation_id: None,
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::OperatorToast {
                 command: "mail-operator.sh".into(),
@@ -2731,6 +2778,7 @@ fn pr20_q3_operator_structural_guard_and_non_seat_pseudo_target_classification()
             ttl_ms: Some(60_000),
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),
@@ -3047,6 +3095,7 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
         PresenceCommand::PresenceBind(PresenceBind {
             seat: frank.clone(),
             incarnation_id: Some(IncarnationId::parse("inc-frank-1").unwrap()),
+            machine_id: None,
             lane: None,
             endpoint: TransportEndpoint::UdsSession {
                 conn_id: 9,
@@ -3056,6 +3105,7 @@ fn pr20_reply_prefix_and_date_only_letters_are_never_falsely_dropped_by_horizon(
             ttl_ms: None,
             takeover: false,
             allow_fork: false,
+            require_canary: false,
             mail_horizon_at: None,
             idem: None,
         }),

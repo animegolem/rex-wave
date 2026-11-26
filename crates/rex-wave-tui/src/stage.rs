@@ -2218,6 +2218,13 @@ fn render_settings(
             ));
         }
     }
+    if !view.snapshot.mail_failures.is_empty() {
+        courier_spans.push(Span::styled("  ·  ", Style::default().fg(C_DIM)));
+        courier_spans.push(Span::styled(
+            format!("✕ {} failure(s)", view.snapshot.mail_failures.len()),
+            Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
+        ));
+    }
     Paragraph::new(Line::from(courier_spans)).render(
         Rect::new(header_area.x, header_area.y + 2, header_area.width, 1),
         buf,
@@ -2237,9 +2244,64 @@ fn render_settings(
     let val_w = 18usize.min((list_area.width as usize).saturating_sub(key_w + 6).max(8));
 
     let mut rows: Vec<(Option<usize>, Line<'static>)> =
-        Vec::with_capacity(SETTINGS_FIELDS.len() + 8);
+        Vec::with_capacity(SETTINGS_FIELDS.len() + view.snapshot.mail_failures.len() + 10);
     let mut spans: Vec<ItemSpan> = Vec::with_capacity(SETTINGS_FIELDS.len());
     let mut last_section: Option<&'static str> = None;
+
+    if !view.snapshot.mail_failures.is_empty() {
+        rows.push((
+            None,
+            Line::from(vec![
+                Span::styled(" ── ", Style::default().fg(C_PANEL_IDLE)),
+                Span::styled(
+                    format!(
+                        "Mail Delivery Failures ({})",
+                        view.snapshot.mail_failures.len()
+                    ),
+                    Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ──", Style::default().fg(C_PANEL_IDLE)),
+            ]),
+        ));
+        let max_w = list_area.width.saturating_sub(4) as usize;
+        for f in view.snapshot.mail_failures.iter().take(12) {
+            let scrub = |s: &str| -> String {
+                s.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect()
+            };
+            let detail_part = f
+                .detail
+                .as_deref()
+                .map(scrub)
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| format!(" · {}", d.trim()))
+                .unwrap_or_default();
+            let line_text = format!(
+                "{} @{} via {} ({}){}  [owner=@{}]",
+                f.kind.as_str(),
+                f.seat,
+                scrub(&f.courier),
+                scrub(&f.reason),
+                detail_part,
+                f.hub_owner_seat
+            );
+            rows.push((
+                None,
+                Line::from(vec![
+                    Span::styled(
+                        "  ✕ ",
+                        Style::default().fg(C_ROSE).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_chars(&line_text, max_w),
+                        Style::default().fg(C_TEXT),
+                    ),
+                ]),
+            ));
+        }
+        rows.push((None, Line::from("")));
+    }
 
     for (idx, spec) in SETTINGS_FIELDS.iter().enumerate() {
         if last_section != Some(spec.section) {
@@ -2779,7 +2841,8 @@ fn card_tone(kind: &NotifyKind) -> CardTone {
         NotifyKind::Mention { .. } | NotifyKind::DirectMessage { .. } => CardTone::Mention,
         NotifyKind::Mail { .. }
         | NotifyKind::LetterBanked { .. }
-        | NotifyKind::MailUnrung { .. } => CardTone::Mail,
+        | NotifyKind::MailUnrung { .. }
+        | NotifyKind::MailDeliveryFailed { .. } => CardTone::Mail,
         NotifyKind::WaveFinished { .. }
         | NotifyKind::CardAssigned { .. }
         | NotifyKind::Reminder { .. }
@@ -2803,6 +2866,7 @@ pub(crate) fn kind_label(kind: &NotifyKind) -> &'static str {
         NotifyKind::MailUnrung { .. } => "UNRUNG",
         NotifyKind::TransportDown { .. } => "TRANSPORT",
         NotifyKind::OrgConflict { .. } => "ORG",
+        NotifyKind::MailDeliveryFailed { .. } => "DELIVERY",
     }
 }
 

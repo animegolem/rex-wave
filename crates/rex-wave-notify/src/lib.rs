@@ -305,6 +305,7 @@ pub fn rank(kind: &NotifyKind, age_ms: u64) -> Rank {
         NotifyKind::Mention { .. } => 6_000,
         NotifyKind::WorkerStuck { .. } => 5_000,
         NotifyKind::TransportDown { .. } => 5_500,
+        NotifyKind::MailDeliveryFailed { .. } => 5_200,
         NotifyKind::OrgConflict { .. } => 4_800,
         NotifyKind::LetterBanked { .. } | NotifyKind::Mail { .. } => 4_500,
         NotifyKind::MailUnrung { .. } => 4_200,
@@ -380,6 +381,7 @@ pub struct HeraldView {
     seat_status: BTreeMap<SeatName, presence::SeatStatus>,
     seat_mail_horizon: BTreeMap<SeatName, UnixMs>,
     live_bindings: BTreeMap<SeatName, BTreeMap<IncarnationId, presence::SeatBinding>>,
+    pending_canary_bindings: BTreeMap<SeatName, BTreeMap<IncarnationId, presence::SeatBinding>>,
     ever_bound: BTreeSet<SeatName>,
     last_bound_at: BTreeMap<SeatName, UnixMs>,
     last_drop: BTreeMap<SeatName, DropRecord>,
@@ -388,6 +390,7 @@ pub struct HeraldView {
     unrung_mail: BTreeMap<SeatName, BTreeMap<Sha256Hex, PendingLetter>>,
     acked_mail: BTreeSet<(SeatName, Sha256Hex)>,
     mail_meta_by_sha: BTreeMap<Sha256Hex, (String, PathBuf, bool)>,
+    failed_mail: BTreeSet<(SeatName, Sha256Hex)>,
     raised_mail_unrung: BTreeMap<SeatName, RaisedMailUnrungState>,
     persisted_inbox_by_id: BTreeMap<(Principal, NotificationId), String>,
     persisted_inbox_dedupes: BTreeSet<(Principal, String)>,
@@ -582,14 +585,20 @@ impl HeraldView {
                 } => {
                     let seat = binding.seat.clone();
                     let seat_bindings = self.live_bindings.entry(seat.clone()).or_default();
+                    let pending_canaries = self
+                        .pending_canary_bindings
+                        .entry(seat.clone())
+                        .or_default();
                     for old_id in superseded {
                         seat_bindings.remove(old_id);
+                        pending_canaries.remove(old_id);
                     }
                     self.ever_bound.insert(seat.clone());
                     if matches!(
                         binding.status,
                         presence::BindingStatus::Live | presence::BindingStatus::TransportDown
                     ) {
+                        pending_canaries.remove(&binding.incarnation_id);
                         seat_bindings.insert(binding.incarnation_id.clone(), binding.clone());
                         if binding.status == presence::BindingStatus::Live
                             && !self.down_transports.contains(&binding.endpoint.kind())
@@ -600,10 +609,47 @@ impl HeraldView {
                                 .and_modify(|prev| *prev = (*prev).max(entry.at))
                                 .or_insert(entry.at);
                         }
+                    } else if binding.status == presence::BindingStatus::PendingCanary {
+                        seat_bindings.remove(&binding.incarnation_id);
+                        pending_canaries.insert(binding.incarnation_id.clone(), binding.clone());
                     } else {
                         seat_bindings.remove(&binding.incarnation_id);
+                        pending_canaries.remove(&binding.incarnation_id);
                     }
                     check_seats.insert(seat);
+                }
+                presence::PresenceEvent::CanaryConfirmed {
+                    seat,
+                    incarnation_id,
+                    epoch,
+                } => {
+                    if let Some(mut binding) = self
+                        .pending_canary_bindings
+                        .get_mut(seat)
+                        .and_then(|m| m.remove(incarnation_id))
+                        && binding.epoch == *epoch
+                    {
+                        binding.canary_token = None;
+                        binding.status = if self.down_transports.contains(&binding.endpoint.kind())
+                        {
+                            presence::BindingStatus::TransportDown
+                        } else {
+                            presence::BindingStatus::Live
+                        };
+                        let became_live = binding.status == presence::BindingStatus::Live;
+                        self.live_bindings
+                            .entry(seat.clone())
+                            .or_default()
+                            .insert(incarnation_id.clone(), binding);
+                        if became_live {
+                            self.last_drop.remove(seat);
+                            self.last_bound_at
+                                .entry(seat.clone())
+                                .and_modify(|prev| *prev = (*prev).max(entry.at))
+                                .or_insert(entry.at);
+                        }
+                    }
+                    check_seats.insert(seat.clone());
                 }
                 presence::PresenceEvent::Heartbeated {
                     seat,
@@ -617,6 +663,13 @@ impl HeraldView {
                     {
                         binding.expires_at = *expires_at;
                     }
+                    if let Some(binding) = self
+                        .pending_canary_bindings
+                        .get_mut(seat)
+                        .and_then(|m| m.get_mut(incarnation_id))
+                    {
+                        binding.expires_at = *expires_at;
+                    }
                 }
                 presence::PresenceEvent::Unbound {
                     seat,
@@ -624,6 +677,9 @@ impl HeraldView {
                     status,
                     ..
                 } => {
+                    if let Some(map) = self.pending_canary_bindings.get_mut(seat) {
+                        map.remove(incarnation_id);
+                    }
                     let dropped = self
                         .live_bindings
                         .get_mut(seat)
@@ -631,7 +687,7 @@ impl HeraldView {
                     let reconnectable = dropped.as_ref().is_some_and(|b| {
                         *status == presence::BindingStatus::Unbound && is_reconnectable_binding(b)
                     });
-                    if !self.has_live_binding(seat, entry.at) {
+                    if dropped.is_some() && !self.has_live_binding(seat, entry.at) {
                         self.last_drop.insert(
                             seat.clone(),
                             DropRecord {
@@ -727,7 +783,13 @@ impl HeraldView {
                     mutated_after_ack,
                     ..
                 } => {
-                    let non_ringable = *mutated_after_ack || message.receipt_only;
+                    let is_system_courier_notice = entry.by
+                        == (Principal::System {
+                            part: SystemPart::CourierHub,
+                        })
+                        && message.from == "system/courier_hub";
+                    let non_ringable =
+                        *mutated_after_ack || message.receipt_only || is_system_courier_notice;
                     let sender_norm = message
                         .from
                         .trim()
@@ -738,7 +800,8 @@ impl HeraldView {
                         (sender_norm.clone(), message.path.clone(), non_ringable),
                     );
                     // MailStore.tla EditNeverRingable: post-ack edits, receipt-only messages,
-                    // and sender self-copies never become ringable or trigger MailUnrung alerts.
+                    // sender self-copies, and system courier-hub failure notices never trigger
+                    // Operator MailUnrung alerts.
                     if !non_ringable {
                         for seat in message.to.iter().chain(message.cc.iter()) {
                             if seat.as_str() == sender_norm {
@@ -797,7 +860,31 @@ impl HeraldView {
                         check_seats.insert(seat);
                     }
                 }
-                mail::MailEvent::BellRang { .. } => {}
+                mail::MailEvent::DeliveryFailed {
+                    kind,
+                    seat,
+                    sha256s,
+                    ..
+                } => {
+                    // Loud courier failures escalate to hub_owner_seat + sender and appear
+                    // passively in the TUI, never raising Operator MailUnrung cards.
+                    if matches!(
+                        kind,
+                        mail::DeliveryFailureKind::Refused | mail::DeliveryFailureKind::GiveUp
+                    ) {
+                        for sha in sha256s {
+                            self.failed_mail.insert((seat.clone(), sha.clone()));
+                            if let Some(map) = self.pending_mail.get_mut(seat) {
+                                map.remove(sha);
+                            }
+                            if let Some(map) = self.unrung_mail.get_mut(seat) {
+                                map.remove(sha);
+                            }
+                        }
+                        check_seats.insert(seat.clone());
+                    }
+                }
+                mail::MailEvent::RingAttempted { .. } | mail::MailEvent::BellRang { .. } => {}
             },
             (StreamId::Inbox { owner }, Event::Inbox(ev)) => match ev {
                 InboxEvent::Raised { id, draft, .. } | InboxEvent::Updated { id, draft, .. } => {
@@ -921,7 +1008,9 @@ impl HeraldView {
         at: UnixMs,
         track_unrung: bool,
     ) {
-        if self.acked_mail.contains(&(seat.clone(), sha256.clone())) {
+        if self.acked_mail.contains(&(seat.clone(), sha256.clone()))
+            || self.failed_mail.contains(&(seat.clone(), sha256.clone()))
+        {
             return;
         }
         if self
@@ -1656,7 +1745,9 @@ pub fn classify(entry: &Envelope, view: &HeraldView) -> Vec<(Principal, Notifica
             | mail::MailEvent::Acked { .. }
             | mail::MailEvent::MessageCommitted { .. }
             | mail::MailEvent::RecipientsAdded { .. }
-            | mail::MailEvent::PathHeadUpdated { .. } => {}
+            | mail::MailEvent::PathHeadUpdated { .. }
+            | mail::MailEvent::RingAttempted { .. }
+            | mail::MailEvent::DeliveryFailed { .. } => {}
         },
 
         _ => {}
@@ -1757,6 +1848,20 @@ fn kinds_equal(a: &NotifyKind, b: &NotifyKind) -> bool {
                 detail: d2,
             },
         ) => p1 == p2 && o1 == o2 && d1 == d2,
+        (
+            NotifyKind::MailDeliveryFailed {
+                failure_kind: k1,
+                courier: c1,
+                seat: s1,
+                reason: r1,
+            },
+            NotifyKind::MailDeliveryFailed {
+                failure_kind: k2,
+                courier: c2,
+                seat: s2,
+                reason: r2,
+            },
+        ) => k1 == k2 && c1 == c2 && s1 == s2 && r1 == r2,
         _ => false,
     }
 }
@@ -1813,6 +1918,14 @@ impl Decider for Inbox {
     ) -> Result<Vec<InboxEvent>, ApiError> {
         match cmd {
             InboxCommand::InboxRaise(c) => {
+                // Structural Operator attention guard: mail delivery failures and
+                // courier degradations escalate to hub_owner_seat/sender and surface
+                // passively in TUI Settings, never raising interrupting Operator cards.
+                if matches!(c.draft.kind, NotifyKind::MailDeliveryFailed { .. })
+                    && c.to.is_operator()
+                {
+                    return Ok(vec![]);
+                }
                 let is_resolved_interaction =
                     matches!(c.draft.kind, NotifyKind::Interaction { .. })
                         && c.draft.actions.is_empty();

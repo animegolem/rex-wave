@@ -170,6 +170,9 @@ pub(crate) struct World {
     archived_projects: BTreeSet<BbProjectId>,
     archived_waves: BTreeSet<WaveSlug>,
     archived_rooms: BTreeSet<RoomId>,
+    mail_failed_deliveries: u32,
+    courier_unknown_streak: BTreeMap<String, u32>,
+    degraded_couriers: BTreeSet<String>,
     cursor: Cursor,
 }
 
@@ -398,6 +401,35 @@ impl World {
                     },
                 }
             }
+            (StreamId::Mail, Event::Mail(ev)) => match ev {
+                rex_wave_api::mail::MailEvent::RingAttempted {
+                    courier, outcome, ..
+                } => match outcome {
+                    rex_wave_api::mail::CourierOutcome::Rung => {
+                        self.courier_unknown_streak.insert(courier.clone(), 0);
+                        self.degraded_couriers.remove(courier);
+                    }
+                    rex_wave_api::mail::CourierOutcome::Unknown => {
+                        let streak = self
+                            .courier_unknown_streak
+                            .entry(courier.clone())
+                            .or_insert(0);
+                        *streak = streak.saturating_add(1);
+                        if *streak >= 3 {
+                            self.degraded_couriers.insert(courier.clone());
+                        }
+                    }
+                    rex_wave_api::mail::CourierOutcome::Deferred
+                    | rex_wave_api::mail::CourierOutcome::Refused => {}
+                },
+                rex_wave_api::mail::MailEvent::DeliveryFailed { kind, courier, .. } => {
+                    self.mail_failed_deliveries = self.mail_failed_deliveries.saturating_add(1);
+                    if *kind == rex_wave_api::mail::DeliveryFailureKind::AdapterDegraded {
+                        self.degraded_couriers.insert(courier.clone());
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         true
@@ -592,6 +624,10 @@ impl World {
             channels,
             direct_messages,
             osc7501,
+            mail_health: MailHealthBadge {
+                failed_deliveries: self.mail_failed_deliveries,
+                degraded_couriers: self.degraded_couriers.len() as u32,
+            },
             cursor: self.cursor.clone(),
         }
     }

@@ -1512,6 +1512,7 @@ fn sample_uds_binding(seat: &str, inc: &str, at: UnixMs) -> SeatBinding {
         seat: SeatName::parse(seat).unwrap(),
         incarnation_id: IncarnationId::parse(inc).unwrap(),
         epoch: 1,
+        machine_id: None,
         lane: None,
         endpoint: TransportEndpoint::UdsSession {
             conn_id: 7,
@@ -1520,6 +1521,7 @@ fn sample_uds_binding(seat: &str, inc: &str, at: UnixMs) -> SeatBinding {
         liveness: LivenessMode::SocketLifetime,
         bound_at: at,
         expires_at: None,
+        canary_token: None,
         status: BindingStatus::Live,
     }
 }
@@ -2323,6 +2325,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 seat: lucas.clone(),
                 incarnation_id: IncarnationId::parse("inc-lucas-1").unwrap(),
                 epoch: 1,
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::BbThread {
                     thread_id: BbThreadId::parse("th_lucas").unwrap(),
@@ -2330,6 +2333,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 liveness: LivenessMode::SocketLifetime,
                 bound_at: UnixMs(1_500),
                 expires_at: None,
+                canary_token: None,
                 status: BindingStatus::TransportDown,
             },
             superseded: Vec::new(),
@@ -2385,6 +2389,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 seat: blake.clone(),
                 incarnation_id: IncarnationId::parse("inc-blake-1").unwrap(),
                 epoch: 1,
+                machine_id: None,
                 lane: None,
                 endpoint: TransportEndpoint::SelfWatcher {
                     harness: "codex".into(),
@@ -2395,6 +2400,7 @@ async fn herald_handle_flushes_15s_grace_with_zero_further_entries_and_suppresse
                 liveness: LivenessMode::LeaseOnly,
                 bound_at: UnixMs(1_000),
                 expires_at: Some(UnixMs(5_000)),
+                canary_token: None,
                 status: BindingStatus::Live,
             },
             superseded: Vec::new(),

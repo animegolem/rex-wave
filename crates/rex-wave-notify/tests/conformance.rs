@@ -377,6 +377,7 @@ proptest! {
                                     seat: alice_seat.clone(),
                                     incarnation_id: inc.clone(),
                                     epoch: u64::from(letter_idx) + 1,
+                                    machine_id: None,
                                     lane: None,
                                     endpoint: TransportEndpoint::UdsSession {
                                         conn_id: 1,
@@ -387,6 +388,7 @@ proptest! {
                                         1_795_260_000_000 + u64::from(letter_idx) * 100,
                                     ),
                                     expires_at: None,
+                                    canary_token: None,
                                     status: BindingStatus::Live,
                                 },
                                 superseded: Vec::new(),
@@ -641,6 +643,7 @@ async fn herald_mail_unrung_grace_window_suppresses_within_grace_and_resolves_on
                         seat: alice_seat.clone(),
                         incarnation_id: inc.clone(),
                         epoch: 1,
+                        machine_id: None,
                         lane: None,
                         endpoint: TransportEndpoint::UdsSession {
                             conn_id: 1,
@@ -649,6 +652,7 @@ async fn herald_mail_unrung_grace_window_suppresses_within_grace_and_resolves_on
                         liveness: LivenessMode::SocketLifetime,
                         bound_at: UnixMs(1_500),
                         expires_at: None,
+                        canary_token: None,
                         status: BindingStatus::Live,
                     },
                     superseded: Vec::new(),

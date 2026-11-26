@@ -16,7 +16,10 @@ use rex_wave_api::wave::{Observation, WaveEvent};
 use rex_wave_api::*;
 use rex_wave_bb::{BbBridge, BbHost, BridgeConfig};
 use rex_wave_board::Board;
-use rex_wave_mailbridge::{BellCourier, MailBridge, Presence, SandboxRoot};
+use rex_wave_mailbridge::{
+    BellCourier, CourierHub, CourierHubConfig, CourierHubHandle, MailBridge, Presence, SandboxRoot,
+    default_machine_id, sanitize_machine_id,
+};
 use rex_wave_native::{
     ClaudeBridge, ClaudeFeed, ClaudeHost, ClaudeRunnerConfig, CodexBridge, CodexFeed, CodexHost,
     CodexRunnerConfig,
@@ -92,6 +95,9 @@ pub struct DaemonArgs {
     /// Operator seat name bound to peer-UID sessions and unauthenticated loopback HTTP.
     #[arg(long, env = "REX_WAVE_OPERATOR", default_value = "owner")]
     pub operator: String,
+    /// Local machine identifier stamped on presence bindings (`OneMachineRings`).
+    #[arg(long, env = "REX_WAVE_MACHINE_ID")]
+    pub machine_id: Option<String>,
     /// Loopback HTTP listener for `wake-bell` `/sink` delivery.
     #[arg(long, default_value = "127.0.0.1:7781")]
     pub wake_bell: SocketAddr,
@@ -412,7 +418,7 @@ async fn unbind_uds_sessions(monitor: &LocalClient, scope: UdsUnbindScope<'_>) {
         for binding in seat_view.bindings {
             if !matches!(
                 binding.status,
-                BindingStatus::Live | BindingStatus::TransportDown
+                BindingStatus::PendingCanary | BindingStatus::Live | BindingStatus::TransportDown
             ) {
                 continue;
             }
@@ -502,6 +508,19 @@ fn spawn_presence_disconnect_worker(
     })
 }
 
+fn spawn_courier_hub_sweeper(
+    handle: CourierHubHandle,
+    client: LocalClient,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            handle.sweep(&client).await;
+        }
+    })
+}
+
 fn spawn_mail_reconcile_poller(mail: Arc<MailBridge>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -573,7 +592,12 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     }
     let house =
         rex_wave_mailbridge::load_house_profile().map_err(|e| format!("house profile: {e}"))?;
-    let presence = Presence::with_house_profile(house);
+    let local_machine_id = args
+        .machine_id
+        .as_deref()
+        .and_then(sanitize_machine_id)
+        .unwrap_or_else(default_machine_id);
+    let presence = Presence::with_house_profile(house).with_machine_id(local_machine_id.clone());
     let sock_path = resolve_socket_path(socket_override.as_deref());
     let state_dir = state_dir_for(&sock_path);
     let journal_path = args
@@ -759,6 +783,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             .with_house_profile(presence.house().clone())
             .with_drop_quiet_ms(2_000),
     );
+    config_hook.bind_mail_bridge(mail_bridge.clone());
     match mail_bridge.reconcile().await {
         Ok(report) => {
             if report.files_ingested > 0
@@ -840,6 +865,17 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let herald_task = spawn_reactor(herald, herald_client.clone());
     let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client);
     let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
+    let default_couriers_dir = crate::config_file::default_config_file_path(None)
+        .and_then(|p| p.parent().map(|dir| dir.join("couriers.d")));
+    let courier_cfg =
+        CourierHubConfig::new(local_machine_id, presence.house().clone(), operator.clone())
+            .with_config_path(config_path.clone())
+            .with_default_couriers_dir(default_couriers_dir);
+    let courier_hub = CourierHub::new(courier_cfg, config_svc.subscribe());
+    let courier_hub_handle = courier_hub.handle();
+    let courier_client = system(SystemPart::CourierHub);
+    let courier_hub_task = spawn_reactor(courier_hub, courier_client.clone());
+    let courier_sweep_task = spawn_courier_hub_sweeper(courier_hub_handle, courier_client);
     let mail_reconcile_task = spawn_mail_reconcile_poller(mail_bridge);
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
@@ -952,6 +988,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     herald_task.abort();
     herald_grace_task.abort();
     bell_task.abort();
+    courier_hub_task.abort();
+    courier_sweep_task.abort();
     mail_reconcile_task.abort();
     presence_disconnect_task.abort();
     for t in bridge_health_tasks {
@@ -1047,6 +1085,7 @@ mod tests {
             t3_url: None,
             t3_token: None,
             operator: "ops".into(),
+            machine_id: None,
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
             herald_grace_ms: Some(100),
@@ -1075,6 +1114,7 @@ mod tests {
             t3_url: None,
             t3_token: None,
             operator: "intruder".into(),
+            machine_id: None,
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
             herald_grace_ms: Some(100),
@@ -1125,6 +1165,7 @@ mod tests {
             t3_url: None,
             t3_token: None,
             operator: "owner".into(),
+            machine_id: None,
             wake_bell: "127.0.0.1:0".parse().unwrap(),
             http: None,
             herald_grace_ms: Some(100),

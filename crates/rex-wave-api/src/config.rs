@@ -1081,6 +1081,8 @@ pub struct ConfigSnapshot {
     pub couriers_health: Vec<CourierHealthStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_error: Option<String>,
+    #[serde(default)]
+    pub mail_failures: Vec<crate::mail::MailDeliveryFailure>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

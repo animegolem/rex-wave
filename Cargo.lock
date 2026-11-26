@@ -1573,12 +1573,15 @@ name = "rex-wave-mailbridge"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "getrandom 0.3.4",
  "proptest",
  "rex-wave-api",
  "rex-wave-fs",
+ "rex-wave-notify",
  "rex-wave-rooms",
  "rex-wave-runtime",
  "rex-wave-store",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

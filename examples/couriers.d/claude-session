@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Reference couriers.d/ adapter for pinned Claude Code sessions (`TransportEndpoint::ClaudeSession`).
+
+Safety guarantees enforced before delivering any body-blind nudge:
+  1. Fork exclusion: sessions whose display_name contains '⑂' or whose kind is not
+     'interactive' / 'bg' are immediately refused.
+  2. BELL_GUARD=1 exclusion: defers cleanly without ringing when BELL_GUARD=1 is set.
+  3. Pinned sessionId verification: reads `$CLAUDE_SESSIONS_DIR/<pid>.json` (default
+     `~/.claude/sessions/<pid>.json`) and refuses `address-gone` if the PID is dead,
+     the session file or messaging socket disappeared, or `sessionId` rotated.
+  4. `name-shared` refusal: scans sibling live session files and refuses `name-shared`
+     when multiple live sessions claim the same display name with different session IDs
+     and the binding relies on a derived/ambiguous name.
+
+Protocol:
+  - Reads one body-blind DeliveryClaim JSON object on stdin (schema == 1).
+  - Writes one JSON reply object on stdout:
+      {"outcome": "rung" | "deferred" | "refused" | "unknown", ...}
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import socket
+import stat
+import sys
+from pathlib import Path
+
+
+FORK_MARKER = "\u2442"  # '⑂'
+ALLOWED_KINDS = {"interactive", "bg"}
+
+
+def emit(outcome: str, reason: str | None = None, detail: str | None = None) -> int:
+    payload: dict[str, object] = {"outcome": outcome}
+    if reason:
+        payload["reason"] = reason
+    if detail:
+        payload["detail"] = detail
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def sessions_dir() -> Path:
+    override = os.environ.get("CLAUDE_SESSIONS_DIR", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".claude" / "sessions"
+
+
+def load_json_regular(path: Path) -> dict | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except OSError:
+        return None
+    except ValueError:
+        return None
+
+
+def find_name_collision(sdir: Path, display_name: str, expected_session_id: str) -> str | None:
+    if not display_name or not sdir.is_dir():
+        return None
+    for entry in sdir.iterdir():
+        if entry.suffix != ".json":
+            continue
+        meta = load_json_regular(entry)
+        if not meta:
+            continue
+        other_sid = str(meta.get("sessionId") or meta.get("session_id") or "").strip()
+        other_name = str(meta.get("name") or meta.get("displayName") or "").strip()
+        try:
+            other_pid = int(meta.get("pid") or 0)
+        except (TypeError, ValueError):
+            other_pid = 0
+        if (
+            other_sid
+            and other_sid != expected_session_id
+            and other_name == display_name
+            and pid_alive(other_pid)
+        ):
+            return other_sid
+    return None
+
+
+def format_nudge(claim: dict) -> dict:
+    seat = claim.get("seat", "unknown")
+    incarnation = claim.get("incarnation_id", "unknown")
+    canary = claim.get("canary_token")
+    if canary:
+        text = (
+            f"[rex-wave canary] Confirm route for @{seat} ({incarnation}): "
+            f"rex-wave presence confirm-canary --seat {seat} --incarnation {incarnation} --token {canary}"
+        )
+    else:
+        refs = claim.get("referents") or []
+        parts = [
+            f"{str(r.get('sha256', ''))[:16]} from @{r.get('from', 'unknown')}: {r.get('subject', '')}"
+            for r in refs[:5]
+        ]
+        summary = "; ".join(parts)
+        text = f"[rex-wave mail] {len(refs)} letter(s) for @{seat}: {summary}. Run `rex-wave mail check --seat {seat}`."
+    return {
+        "schema": 1,
+        "type": "rex_wave_nudge",
+        "seat": seat,
+        "incarnation_id": incarnation,
+        "text": text,
+    }
+
+
+def main() -> int:
+    try:
+        claim = json.load(sys.stdin)
+    except Exception as err:
+        return emit("unknown", "invalid-claim", str(err))
+
+    if claim.get("schema") != 1:
+        return emit("refused", "unsupported-schema", f"schema={claim.get('schema')}")
+
+    if os.environ.get("BELL_GUARD") == "1":
+        return emit("deferred", "bell-guard", "BELL_GUARD=1 suppresses Claude session rings")
+
+    endpoint = claim.get("endpoint") or {}
+    if endpoint.get("transport") != "claude_session":
+        return emit("refused", "wrong-transport", f"expected claude_session, got {endpoint.get('transport')}")
+
+    kind = str(endpoint.get("kind") or "").strip()
+    if kind not in ALLOWED_KINDS:
+        return emit("refused", "disallowed-kind", f"session kind '{kind}' is excluded")
+
+    display_name = str(endpoint.get("display_name") or "").strip()
+    if FORK_MARKER in display_name:
+        return emit("refused", "fork-session", f"fork marker '{FORK_MARKER}' excluded")
+
+    try:
+        pid = int(endpoint.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    session_id = str(endpoint.get("session_id") or "").strip()
+    raw_sock = str(endpoint.get("messaging_socket") or "").strip()
+    sock_path = Path(raw_sock)
+    if pid <= 0 or not session_id or not raw_sock:
+        return emit("refused", "address-gone", "incomplete Claude session binding")
+
+    if not pid_alive(pid):
+        return emit("refused", "address-gone", f"pid {pid} is no longer alive")
+
+    sdir = sessions_dir()
+    session_file = sdir / f"{pid}.json"
+    meta = load_json_regular(session_file)
+    if meta is not None:
+        if meta.get("bellGuard") is True or str(meta.get("BELL_GUARD", "")) == "1":
+            return emit("deferred", "bell-guard", "session metadata sets BELL_GUARD=1")
+        live_sid = str(meta.get("sessionId") or meta.get("session_id") or "").strip()
+        if live_sid and live_sid != session_id:
+            return emit(
+                "refused",
+                "address-gone",
+                f"pinned sessionId mismatch (claimed={session_id}, live={live_sid})",
+            )
+        live_name = str(meta.get("name") or meta.get("displayName") or display_name).strip()
+        if FORK_MARKER in live_name:
+            return emit("refused", "fork-session", "live session display name contains fork marker")
+        if live_name:
+            collision = find_name_collision(sdir, live_name, session_id)
+            if collision is not None:
+                return emit(
+                    "refused",
+                    "name-shared",
+                    f"display name '{live_name}' shared with live sessionId {collision}",
+                )
+    elif os.environ.get("CLAUDE_REQUIRE_SESSION_FILE", "1") == "1":
+        return emit("refused", "address-gone", f"session file {session_file} missing")
+
+    if os.environ.get("REX_WAVE_COURIER_DRY_RUN") == "1":
+        return emit("rung", detail="dry-run")
+
+    try:
+        st = os.lstat(sock_path)
+    except OSError:
+        return emit("refused", "address-gone", f"messaging socket {sock_path} missing")
+    if not stat.S_ISSOCK(st.st_mode):
+        return emit("refused", "address-gone", f"{sock_path} is not a Unix socket")
+
+    payload_bytes = (json.dumps(format_nudge(claim), separators=(",", ":")) + "\n").encode("utf-8")
+    timeout = float(os.environ.get("CLAUDE_SOCKET_TIMEOUT_SECS", "4"))
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sent = False
+    try:
+        sock.connect(str(sock_path))
+        sock.sendall(payload_bytes)
+        sent = True
+        return emit("rung")
+    except OSError as err:
+        if sent:
+            return emit("unknown", "socket-io-after-send", str(err))
+        if err.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTSOCK):
+            return emit("refused", "address-gone", f"socket unreachable: {err}")
+        if err.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return emit("deferred", "busy", str(err))
+        return emit("unknown", "socket-error", str(err))
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

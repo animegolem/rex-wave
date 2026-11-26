@@ -457,6 +457,7 @@ pub enum SystemPart {
     BbBridge,
     T3Bridge,
     MailBridge,
+    CourierHub,
     WakeBell,
     PresenceMonitor,
     ConfigSync,

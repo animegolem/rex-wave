@@ -724,6 +724,7 @@ pub struct TomlConfigHook {
     bb_live: OnceLock<LivenessProbe>,
     t3_live: OnceLock<LivenessProbe>,
     presence_svc: OnceLock<Arc<dyn Service<PresenceCommand>>>,
+    mail_bridge: OnceLock<Arc<rex_wave_mailbridge::MailBridge>>,
 }
 
 impl TomlConfigHook {
@@ -745,6 +746,7 @@ impl TomlConfigHook {
             bb_live: OnceLock::new(),
             t3_live: OnceLock::new(),
             presence_svc: OnceLock::new(),
+            mail_bridge: OnceLock::new(),
         })
     }
 
@@ -763,6 +765,10 @@ impl TomlConfigHook {
         if let Some(p) = t3_live {
             let _ = self.t3_live.set(p);
         }
+    }
+
+    pub fn bind_mail_bridge(&self, mail: Arc<rex_wave_mailbridge::MailBridge>) {
+        let _ = self.mail_bridge.set(mail);
     }
 
     pub fn config_path(&self) -> Option<&Path> {
@@ -987,8 +993,23 @@ impl ConfigHook for TomlConfigHook {
                 native_acp_runner_health(&snap.config),
             ];
 
-            if let Some(cdir) = effective_couriers_dir(&snap.config, self.config_path.as_deref()) {
-                snap.couriers_health = scan_couriers_dir(&cdir);
+            let discovered_health =
+                match effective_couriers_dir(&snap.config, self.config_path.as_deref()) {
+                    Some(cdir) => scan_couriers_dir(&cdir),
+                    None => Vec::new(),
+                };
+            if let Some(mail) = self.mail_bridge.get() {
+                let discovered_pairs: Vec<(String, bool)> = discovered_health
+                    .iter()
+                    .map(|c| (c.name.clone(), c.executable))
+                    .collect();
+                let (merged_health, failures) = mail
+                    .courier_health_and_failures(&discovered_pairs, 50)
+                    .await;
+                snap.couriers_health = merged_health;
+                snap.mail_failures = failures;
+            } else {
+                snap.couriers_health = discovered_health;
             }
         })
     }

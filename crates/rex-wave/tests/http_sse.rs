@@ -614,6 +614,7 @@ impl Service<PresenceCommand> for StubPresence {
                 seat: SeatName::parse("sam").unwrap(),
                 incarnation_id: IncarnationId::parse("inc_1").unwrap(),
                 epoch: 1,
+                machine_id: Some("local".into()),
                 lane: None,
                 endpoint: TransportEndpoint::SelfWatcher {
                     harness: "codex".into(),
@@ -624,6 +625,7 @@ impl Service<PresenceCommand> for StubPresence {
                 liveness: LivenessMode::LeaseOnly,
                 bound_at: UnixMs(10),
                 expires_at: Some(UnixMs(900_010)),
+                canary_token: None,
                 status: BindingStatus::Live,
             };
             match cmd {

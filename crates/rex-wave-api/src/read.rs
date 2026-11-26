@@ -308,8 +308,18 @@ pub struct SidebarTreeSnapshot {
     pub channels: Vec<ChannelLeaf>,
     pub direct_messages: Vec<DmLeaf>,
     pub osc7501: Osc7501Status,
+    /// Passive, non-interrupting mail delivery failure & courier degradation badge
+    /// rendered on the Settings row without affecting `inbox` or `osc7501`.
+    #[serde(default)]
+    pub mail_health: MailHealthBadge,
     /// Journal heads the snapshot reflects.
     pub cursor: Cursor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MailHealthBadge {
+    pub failed_deliveries: u32,
+    pub degraded_couriers: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

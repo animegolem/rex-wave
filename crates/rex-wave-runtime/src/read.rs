@@ -205,6 +205,17 @@ impl PreparedWait {
     }
 }
 
+fn redact_envelope_for_viewer(viewer: &Principal, mut env: Envelope) -> Envelope {
+    if !matches!(viewer, Principal::System { .. })
+        && let Event::Presence(rex_wave_api::presence::PresenceEvent::Bound {
+            ref mut binding, ..
+        }) = env.event
+    {
+        binding.canary_token = None;
+    }
+    env
+}
+
 fn is_own_wait_bookkeeping(viewer: &Principal, env: &Envelope) -> bool {
     let Principal::Worker { wave, role } = viewer else {
         return false;
@@ -690,7 +701,15 @@ impl ReadSide {
                             if env.seq == cur.next() {
                                 seen.insert(env.stream.clone(), env.seq);
                                 cursor.advance(&env.stream, env.seq);
-                                if filter.matches(&viewer, &env, &journal, &sidebar) && tx.send(Ok(Frame::Committed((*env).clone()))).await.is_err() {
+                                if filter.matches(&viewer, &env, &journal, &sidebar)
+                                    && tx
+                                        .send(Ok(Frame::Committed(redact_envelope_for_viewer(
+                                            &viewer,
+                                            (*env).clone(),
+                                        ))))
+                                        .await
+                                        .is_err()
+                                {
                                     break;
                                 }
                             } else if !replay_stream(&journal, &sidebar, &env.stream, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
@@ -1083,7 +1102,12 @@ async fn replay_stream(
             seen.insert(stream.clone(), env.seq);
             cursor.advance(stream, env.seq);
             if filter.matches(viewer, &env, journal, sidebar)
-                && tx.send(Ok(Frame::Committed(env))).await.is_err()
+                && tx
+                    .send(Ok(Frame::Committed(redact_envelope_for_viewer(
+                        viewer, env,
+                    ))))
+                    .await
+                    .is_err()
             {
                 return false;
             }
@@ -1485,10 +1509,13 @@ impl Service<ReadCommand> for ReadSide {
                         r.after
                     };
                     let limit = r.limit.unwrap_or(200).clamp(1, 1000) as usize;
-                    let entries = self
+                    let entries: Vec<Envelope> = self
                         .journal
                         .read(&target_stream, after, limit)
-                        .map_err(store_error)?;
+                        .map_err(store_error)?
+                        .into_iter()
+                        .map(|e| redact_envelope_for_viewer(ctx.by(), e))
+                        .collect();
                     let total_count = (head.0.saturating_sub(after.0) as usize).max(entries.len());
                     let truncated = entries.len() < total_count;
                     let last = entries.last().map_or(after, |e| e.seq);
