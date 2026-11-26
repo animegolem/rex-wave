@@ -45,10 +45,80 @@ REX_BIN = os.environ["MOCK_REX_WAVE_BIN"]
 PROJECT = os.environ["MOCK_PROJECT_ID"]
 
 assert len(sys.argv) >= 2 and sys.argv[1] == "app-server", f"unexpected argv: {sys.argv}"
-assert any("mcp_servers.rex-wave.command=" in a for a in sys.argv[2:]), f"missing mcp -c: {sys.argv}"
 assert os.environ.get("REX_WAVE_BB_TOKEN") is None, "daemon BB token leaked"
 assert os.environ.get("REX_WAVE_T3_TOKEN") is None, "daemon T3 token leaked"
 assert os.environ.get("REX_WAVE_OPERATOR") is None, "daemon operator leaked"
+
+# Parse `-c mcp_servers.rex-wave.*` overrides and verify Codex MCP env filtering works end-to-end.
+mcp_cfg = {}
+argv = sys.argv[2:]
+i = 0
+while i < len(argv):
+    if argv[i] == "-c" and i + 1 < len(argv):
+        kv = argv[i + 1]
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            mcp_cfg[k] = json.loads(v)
+        i += 2
+    else:
+        i += 1
+
+mcp_cmd = mcp_cfg["mcp_servers.rex-wave.command"]
+mcp_args = mcp_cfg["mcp_servers.rex-wave.args"]
+mcp_env_vars = mcp_cfg["mcp_servers.rex-wave.env_vars"]
+assert "REX_WAVE_TOKEN" in mcp_env_vars, f"missing REX_WAVE_TOKEN in env_vars: {mcp_env_vars}"
+
+def call_mcp_with_filtered_env():
+    # Mirror real Codex 0.172.0 MCP subprocess env filtering: pass ONLY base OS env + listed env_vars.
+    filtered_env = {}
+    for base_key in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT"):
+        if base_key in os.environ:
+            filtered_env[base_key] = os.environ[base_key]
+    for allowed_key in mcp_env_vars:
+        if allowed_key in os.environ:
+            filtered_env[allowed_key] = os.environ[allowed_key]
+
+    proc = subprocess.Popen(
+        [mcp_cmd, *mcp_args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=filtered_env,
+        text=True,
+    )
+    reqs = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "codex-mcp-check", "version": "1.0"},
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "room_post",
+                "arguments": {
+                    "room": {
+                        "ref": "channel",
+                        "scope": {"scope": "project", "project": PROJECT},
+                        "name": "wave-native-e2e",
+                    },
+                    "body": "hello from native codex worker",
+                },
+            },
+        },
+    ]
+    out, err = proc.communicate("".join(json.dumps(r) + "\n" for r in reqs), timeout=10)
+    assert proc.returncode == 0, f"mcp --stdio exited {proc.returncode}: {err}"
+    replies = [json.loads(l) for l in out.splitlines() if l.strip()]
+    tool_reply = next(r for r in replies if r.get("id") == 2)
+    assert not tool_reply["result"].get("isError", False), f"mcp tool failed: {tool_reply}"
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -63,16 +133,13 @@ for raw in sys.stdin:
     rid = msg.get("id")
     if m == "initialize":
         send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "mock-codex"}})
+    elif m == "account/read":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"account": {"type": "chatgpt", "email": "ops@example.com"}, "requiresOpenaiAuth": True}})
     elif m == "thread/start":
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": "daemon_cx_1"}, "model": "gpt-6.1-sol"}})
     elif m == "turn/start":
         send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": "t1", "status": "inProgress"}}})
-        res = subprocess.run(
-            [REX_BIN, "post", f"#{PROJECT}/wave-native-e2e", "hello from native codex worker"],
-            capture_output=True,
-            text=True,
-        )
-        assert res.returncode == 0, f"codex worker post failed: {res.stderr}"
+        call_mcp_with_filtered_env()
         send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": "daemon_cx_1", "turnId": "t1", "itemId": "am1", "delta": "Codex posted"}})
         send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "daemon_cx_1", "turn": {"id": "t1", "status": "completed"}}})
 "##;

@@ -1,34 +1,51 @@
 //! Workspace resolution for native runners (`ProjectDefault`, `ExistingPath`, `ManagedWorktree`).
 
+use crate::common::scrub_daemon_env;
 use rex_wave_api::wave::{BaseBranch, Workspace};
+use rex_wave_api::{RoleName, WaveSlug};
+use rex_wave_fs::EntryKind;
 use rex_wave_waves::{HostError, SpawnRequest, expand_tilde, resolve_project_workspace_location};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::process::Command;
 
 static WORKTREE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+const OWNER_MARKER_FILE: &str = "rex-wave-owner.json";
 
-const SCRUBBED_GIT_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_PREFIX",
-    "GIT_CEILING_DIRECTORIES",
-];
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct WorktreeOwnerMarker {
+    wave: String,
+    role: String,
+}
 
+/// Builds a scrubbed `git` subprocess command rooted at `dir` with repository hooks disabled
+/// (`core.hooksPath=/dev/null`) so daemon-owned worktree operations never leak daemon
+/// credentials or execute untrusted repository hooks before the worker starts.
 fn git_in(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
-    for key in SCRUBBED_GIT_ENV {
-        cmd.env_remove(key);
-    }
-    cmd.arg("-C").arg(dir);
+    scrub_daemon_env(&mut cmd);
+    cmd.args(["-c", "core.hooksPath=/dev/null"])
+        .arg("-C")
+        .arg(dir);
     cmd
 }
 
-/// Resolves the working directory for `req`, provisioning `<project>/.worktrees/rex-wave-<wave>-<role>`
+fn ensure_real_dir(path: &Path, label: &str) -> Result<(), HostError> {
+    if rex_wave_fs::entry_exists(path) {
+        if rex_wave_fs::entry_kind(path).ok() != Some(EntryKind::Dir) {
+            return Err(HostError::Rejected(format!(
+                "{label} {} is not a regular non-symlink directory",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    std::fs::create_dir(path)
+        .map_err(|e| HostError::Rejected(format!("create {label} {}: {e}", path.display())))
+}
+
+/// Resolves the working directory for `req`, provisioning `<project>/.worktrees/rex-wave/<wave>/<role>`
 /// when `Workspace::ManagedWorktree` is requested inside a Git repository.
 pub async fn resolve_worker_workspace(
     req: &SpawnRequest,
@@ -84,23 +101,23 @@ async fn ensure_managed_worktree(
         .await;
 
     let worktrees_parent = project_root.join(".worktrees");
-    std::fs::create_dir_all(&worktrees_parent).map_err(|e| {
-        HostError::Rejected(format!(
-            "create worktrees parent {}: {e}",
-            worktrees_parent.display()
-        ))
-    })?;
+    ensure_real_dir(&worktrees_parent, "worktrees directory")?;
+    let rex_root = worktrees_parent.join("rex-wave");
+    ensure_real_dir(&rex_root, "rex-wave worktrees directory")?;
+    let wave_dir = rex_root.join(req.wave.as_str());
+    ensure_real_dir(&wave_dir, "wave worktrees directory")?;
 
-    let wt_path = worktrees_parent.join(format!("rex-wave-{}-{}", req.wave, req.role));
-    if is_registered_worktree_for(project_root, &wt_path).await {
+    let wt_path = wave_dir.join(req.role.as_str());
+    if is_registered_worktree_for(project_root, &wt_path, &req.wave, &req.role).await {
         let resolved = rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
         return Ok(resolved);
     }
     if rex_wave_fs::entry_exists(&wt_path) {
         return Err(HostError::Rejected(format!(
-            "managed worktree path {} already exists and is not a registered git worktree of {}",
+            "managed worktree path {} already exists and is not a registered git worktree owned by @{}/{}",
             wt_path.display(),
-            project_root.display()
+            req.wave,
+            req.role
         )));
     }
 
@@ -129,33 +146,55 @@ async fn ensure_managed_worktree(
         .await
         .map_err(|e| HostError::Unreachable(format!("run git worktree add: {e}")))?;
 
-    if out.status.success() {
-        let resolved = rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
-        return Ok(resolved);
-    }
-
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    if stderr.to_ascii_lowercase().contains("already exists") {
-        let retry = git_in(project_root)
-            .args(["worktree", "add", "--detach"])
-            .arg(&wt_path)
-            .arg(base_ref)
-            .output()
-            .await
-            .map_err(|e| HostError::Unreachable(format!("run git worktree add --detach: {e}")))?;
-        if retry.status.success() {
-            let resolved = rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
-            return Ok(resolved);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        if stderr.to_ascii_lowercase().contains("already exists") {
+            let retry = git_in(project_root)
+                .args(["worktree", "add", "--detach"])
+                .arg(&wt_path)
+                .arg(base_ref)
+                .output()
+                .await
+                .map_err(|e| {
+                    HostError::Unreachable(format!("run git worktree add --detach: {e}"))
+                })?;
+            if !retry.status.success() {
+                let retry_err = String::from_utf8_lossy(&retry.stderr).trim().to_owned();
+                return Err(HostError::Rejected(format!(
+                    "git worktree add failed: {retry_err}"
+                )));
+            }
+        } else {
+            return Err(HostError::Rejected(format!(
+                "git worktree add failed: {stderr}"
+            )));
         }
-        let retry_err = String::from_utf8_lossy(&retry.stderr).trim().to_owned();
-        return Err(HostError::Rejected(format!(
-            "git worktree add failed: {retry_err}"
-        )));
     }
 
-    Err(HostError::Rejected(format!(
-        "git worktree add failed: {stderr}"
-    )))
+    write_owner_marker(&wt_path, &req.wave, &req.role).await?;
+    let resolved = rex_wave_fs::canonicalize_existing_prefix(&wt_path).unwrap_or(wt_path);
+    Ok(resolved)
+}
+
+async fn write_owner_marker(
+    wt_path: &Path,
+    wave: &WaveSlug,
+    role: &RoleName,
+) -> Result<(), HostError> {
+    let Some(wt_git_dir) = git_rev_parse_path(wt_path, "--git-dir").await else {
+        return Err(HostError::Rejected(format!(
+            "failed resolving worktree git-dir for {}",
+            wt_path.display()
+        )));
+    };
+    let marker = WorktreeOwnerMarker {
+        wave: wave.as_str().to_owned(),
+        role: role.as_str().to_owned(),
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|e| HostError::Rejected(format!("encode marker: {e}")))?;
+    rex_wave_fs::write_atomic_path(&wt_git_dir.join(OWNER_MARKER_FILE), &bytes, 0o600, false)
+        .map_err(|e| HostError::Rejected(format!("write worktree owner marker: {e}")))
 }
 
 async fn is_git_work_tree(dir: &Path) -> bool {
@@ -183,11 +222,16 @@ async fn git_rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     Some(rex_wave_fs::canonicalize_existing_prefix(&joined).unwrap_or(joined))
 }
 
-async fn is_registered_worktree_for(project_root: &Path, wt_path: &Path) -> bool {
-    if rex_wave_fs::entry_kind(wt_path).ok() != Some(rex_wave_fs::EntryKind::Dir) {
+async fn is_registered_worktree_for(
+    project_root: &Path,
+    wt_path: &Path,
+    wave: &WaveSlug,
+    role: &RoleName,
+) -> bool {
+    if rex_wave_fs::entry_kind(wt_path).ok() != Some(EntryKind::Dir) {
         return false;
     }
-    if rex_wave_fs::entry_kind(&wt_path.join(".git")).ok() != Some(rex_wave_fs::EntryKind::File) {
+    if rex_wave_fs::entry_kind(&wt_path.join(".git")).ok() != Some(EntryKind::File) {
         return false;
     }
     let Ok(canon_proj) = rex_wave_fs::canonicalize_existing_prefix(project_root) else {
@@ -212,6 +256,20 @@ async fn is_registered_worktree_for(project_root: &Path, wt_path: &Path) -> bool
         return false;
     };
     if proj_common != wt_common {
+        return false;
+    }
+    let Some(wt_git_dir) = git_rev_parse_path(wt_path, "--git-dir").await else {
+        return false;
+    };
+    let Ok(marker_bytes) =
+        rex_wave_fs::read_regular_bounded(&wt_git_dir.join(OWNER_MARKER_FILE), 4096)
+    else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<WorktreeOwnerMarker>(&marker_bytes) else {
+        return false;
+    };
+    if marker.wave != wave.as_str() || marker.role != role.as_str() {
         return false;
     }
     let Ok(out) = git_in(project_root)

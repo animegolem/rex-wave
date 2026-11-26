@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-const MAX_RETAINED_EVENTS: usize = 8192;
+const MAX_RETAINED_EVENTS: usize = 16_384;
 const MAX_ARCHIVED_EVENTS: usize = 256;
 pub const MAX_ARCHIVED_WORKERS: usize = 256;
 pub const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -33,8 +33,8 @@ pub const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_BROADCAST_CAPACITY: usize = 256;
 const LIVE_CHANNEL_CAPACITY: usize = 128;
 
-/// Daemon-scoped credentials, nested CLI markers, and git hook overrides scrubbed
-/// from native worker child processes so workers run with least privilege.
+/// Daemon-scoped credentials, nested CLI markers, and git hook/config overrides scrubbed
+/// from native worker child processes and daemon-owned git commands.
 pub const SCRUBBED_DAEMON_ENV: &[&str] = &[
     "REX_WAVE_BB_TOKEN",
     "REX_WAVE_T3_TOKEN",
@@ -64,11 +64,24 @@ pub const SCRUBBED_DAEMON_ENV: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_PREFIX",
     "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
 ];
 
 pub fn scrub_daemon_env(cmd: &mut tokio::process::Command) {
     for key in SCRUBBED_DAEMON_ENV {
         cmd.env_remove(key);
+    }
+    for (k, _) in std::env::vars_os() {
+        if let Some(s) = k.to_str()
+            && (s.starts_with("GIT_CONFIG_KEY_") || s.starts_with("GIT_CONFIG_VALUE_"))
+        {
+            cmd.env_remove(s);
+        }
     }
 }
 
@@ -253,6 +266,7 @@ impl<W> WorkerRegistry<W> {
         attempt: u32,
         worker: Arc<W>,
     ) {
+        self.archived_order.retain(|t| t != &thread);
         self.by_thread.insert(thread, worker.clone());
         let key = (wave, role);
         let replace = self

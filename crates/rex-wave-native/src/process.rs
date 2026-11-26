@@ -1,6 +1,7 @@
-//! Safe process-group spawn and single-use bounded SIGTERM -> SIGKILL reaping via `rustix`.
+//! Safe process-group spawn and cancellation-safe single-use SIGTERM -> SIGKILL reaping via `rustix`.
 
 use rex_wave_waves::HostError;
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -26,6 +27,24 @@ pub fn claim_pgid_slot(slot: &PgidSlot) -> Option<i32> {
 pub fn claim_and_kill_pgid(slot: &PgidSlot) {
     if let Some(pgid) = claim_pgid_slot(slot) {
         kill_process_group_now(Some(pgid));
+    }
+}
+
+/// Ensures a claimed PGID still receives `SIGKILL` if `terminate_process_group`
+/// is cancelled mid-await during its grace window.
+struct ForceKillOnDrop(Option<i32>);
+
+impl ForceKillOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ForceKillOnDrop {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            kill_process_group_now(Some(pgid));
+        }
     }
 }
 
@@ -72,15 +91,25 @@ impl Drop for LiveChild {
     }
 }
 
+fn classify_spawn_io_error(err: io::Error) -> HostError {
+    match err.kind() {
+        io::ErrorKind::WouldBlock
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::OutOfMemory => {
+            HostError::Unreachable(format!("spawn native worker process: {err}"))
+        }
+        _ => HostError::Rejected(format!("spawn native worker process: {err}")),
+    }
+}
+
 /// Spawns `cmd` in its own process group (`pgid == pid`) so `retire` can reap
 /// the worker together with any grandchildren it spawned.
 pub fn spawn_in_process_group(cmd: &mut Command) -> Result<(Child, Option<i32>), HostError> {
     #[cfg(unix)]
     cmd.process_group(0);
     cmd.kill_on_drop(true);
-    let child = cmd
-        .spawn()
-        .map_err(|e| HostError::Unreachable(format!("spawn native worker process: {e}")))?;
+    let child = cmd.spawn().map_err(classify_spawn_io_error)?;
     let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
     Ok((child, pgid))
 }
@@ -124,9 +153,11 @@ pub fn kill_process_group_now(pgid: Option<i32>) {
 
 /// Claims `live`'s single-use PGID, terminates the process group
 /// (`SIGTERM` -> `grace` -> `SIGKILL`), and reaps `live.child`.
+/// If cancelled mid-grace, `ForceKillOnDrop` immediately sends `SIGKILL`.
 pub async fn terminate_process_group(live: &mut LiveChild, grace: Duration) {
     let deadline = Instant::now() + grace;
     let claimed_pgid = live.claim_pgid();
+    let mut kill_guard = ForceKillOnDrop(claimed_pgid);
 
     #[cfg(unix)]
     if let Some(pgid) = claimed_pgid {
@@ -161,6 +192,8 @@ pub async fn terminate_process_group(live: &mut LiveChild, grace: Duration) {
             }
         }
     }
+
+    kill_guard.disarm();
 }
 
 /// Drains `stderr` in a background task and returns up to the last `max_bytes` UTF-8 tail.

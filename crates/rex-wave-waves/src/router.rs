@@ -121,7 +121,13 @@ pub fn route_provider_with_config(
             Some(rex_wave_api::config::RunnerRoute::Native) => RunnerKind::Acp,
             Some(rex_wave_api::config::RunnerRoute::T3)
             | Some(rex_wave_api::config::RunnerRoute::Bb) => RunnerKind::T3,
-            None if default_runner == RunnerKind::Acp => RunnerKind::Acp,
+            None if matches!(
+                default_runner,
+                RunnerKind::Acp | RunnerKind::Claude | RunnerKind::Codex
+            ) =>
+            {
+                RunnerKind::Acp
+            }
             None => RunnerKind::T3,
         };
         return Ok(RoutedProvider {

@@ -740,7 +740,7 @@ else:
         invocations[0]["socket"].as_str(),
         Some(h.socket_path.to_string_lossy().as_ref())
     );
-    let expected_wt_suffix = ".worktrees/rex-wave-w-claude-author";
+    let expected_wt_suffix = ".worktrees/rex-wave/w-claude/author";
     assert!(
         invocations[0]["cwd"]
             .as_str()
@@ -978,9 +978,19 @@ for raw in sys.stdin:
     params = msg.get("params") or {{}}
 
     if method == "initialize":
-        send({{"jsonrpc": "2.0", "id": req_id, "result": {{"userAgent": "mock-codex", "account": "acct-codex"}}}})
+        send({{"jsonrpc": "2.0", "id": req_id, "result": {{"userAgent": "mock-codex"}}}})
     elif method == "initialized":
         pass
+    elif method == "account/read":
+        assert params.get("refreshToken") is False
+        send({{
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {{
+                "account": {{"type": "chatgpt", "email": "acct-codex", "planType": "pro"}},
+                "requiresOpenaiAuth": True
+            }}
+        }})
     elif method == "thread/start":
         assert params.get("approvalPolicy") == "on-request"
         assert params.get("sandbox") == "workspace-write"
@@ -1369,7 +1379,7 @@ for raw in sys.stdin:
         entries[0]["cwd"]
             .as_str()
             .unwrap()
-            .ends_with(".worktrees/rex-wave-w-codex-author")
+            .ends_with(".worktrees/rex-wave/w-codex/author")
     );
     assert_eq!(entries[0]["token"].as_str(), Some(token.as_str()));
     assert_eq!(
@@ -1382,6 +1392,7 @@ for raw in sys.stdin:
         .collect();
     assert!(methods.contains(&"initialize"));
     assert!(methods.contains(&"initialized"));
+    assert!(methods.contains(&"account/read"));
     assert!(methods.contains(&"thread/start"));
     assert!(methods.contains(&"turn/start"));
     assert!(methods.contains(&"turn/steer"));
@@ -1438,6 +1449,8 @@ for raw in sys.stdin:
     p = msg.get("params") or {}
     if m == "initialize":
         send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif m == "account/read":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"account": {"type": "apiKey"}, "requiresOpenaiAuth": False}})
     elif m == "thread/start":
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": "cx_mix"}, "model": "gpt-6.1-sol"}})
     elif m == "turn/start":
@@ -1877,7 +1890,7 @@ while True:
     );
 
     // 3. Pre-existing non-worktree directory under .worktrees/ must be rejected, not reused.
-    let rogue_wt = h.project_dir.join(".worktrees/rex-wave-w-rogue-author");
+    let rogue_wt = h.project_dir.join(".worktrees/rex-wave/w-rogue/author");
     std::fs::create_dir_all(&rogue_wt).unwrap();
     std::fs::write(rogue_wt.join(".git"), "not a real worktree\n").unwrap();
     let rogue_req = rex_wave_waves::SpawnRequest {
@@ -1917,6 +1930,387 @@ while True:
             .contains("not a registered git worktree"),
         "unexpected rogue worktree error: {rogue_err}"
     );
+
+    h.claude.shutdown().await;
+    h.codex.shutdown().await;
+}
+
+#[tokio::test]
+async fn round2_worktree_collision_hook_scrub_overlapping_approvals_and_wire_ordered_turns() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let claude_log = script_dir.path().join("r2_claude.jsonl");
+    let codex_log = script_dir.path().join("r2_codex.jsonl");
+
+    // Claude mock: logs cwd, emits two overlapping can_use_tool control_requests on wave alpha-beta,
+    // and completes immediately on wave alpha.
+    let claude_script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, sys
+
+with open({claude_log:?}, "a") as f:
+    f.write(json.dumps({{"cwd": os.getcwd(), "tid": os.environ.get("REX_WAVE_WORKER_THREAD_ID")}}) + "\n")
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+first = json.loads(sys.stdin.readline())
+text = first["message"]["content"][0]["text"]
+tid = os.environ.get("REX_WAVE_WORKER_THREAD_ID", "")
+
+if "alpha-beta" in tid:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_ab"}})
+    emit({{
+        "type": "control_request",
+        "request_id": "perm_a",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo a"}}}}
+    }})
+    emit({{
+        "type": "control_request",
+        "request_id": "perm_b",
+        "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{"command": "echo b"}}}}
+    }})
+    r1 = json.loads(sys.stdin.readline())
+    assert r1["response"]["request_id"] == "perm_a"
+    assert r1["response"]["response"]["behavior"] == "allow"
+    r2 = json.loads(sys.stdin.readline())
+    assert r2["response"]["request_id"] == "perm_b"
+    assert r2["response"]["response"]["behavior"] == "allow"
+    emit({{"type": "result", "subtype": "success", "is_error": False, "session_id": "s_ab"}})
+else:
+    emit({{"type": "system", "subtype": "init", "session_id": "s_a"}})
+    emit({{"type": "result", "subtype": "success", "is_error": False, "session_id": "s_a"}})
+"#,
+        claude_log = claude_log.to_string_lossy()
+    );
+
+    // Codex mock:
+    // - Turn 1: flushes turn/start response + turn/started + turn/completed in one batch!
+    // - Turn 2: blocks on approval `gate_t2` until resolved, then emits turn/completed.
+    // - Turn 3: dispatched automatically from QueueIfActive queue once Turn 2 completes!
+    let codex_script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def log_ev(obj):
+    with open({codex_log:?}, "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+def send_batch(objs):
+    sys.stdout.write("".join(json.dumps(o) + "\n" for o in objs))
+    sys.stdout.flush()
+
+turn_n = 0
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    log_ev(msg)
+    m = msg.get("method")
+    rid = msg.get("id")
+    p = msg.get("params") or {{}}
+
+    if m == "initialize":
+        send_batch([{{"jsonrpc": "2.0", "id": rid, "result": {{}}}}])
+    elif m == "account/read":
+        send_batch([{{"jsonrpc": "2.0", "id": rid, "result": {{"account": {{"type": "apiKey"}}, "requiresOpenaiAuth": False}}}}])
+    elif m == "thread/start":
+        send_batch([{{"jsonrpc": "2.0", "id": rid, "result": {{"thread": {{"id": "cx_r2"}}, "model": "gpt-6.1-sol"}}}}])
+    elif m == "turn/start":
+        turn_n += 1
+        tid = f"t_{{turn_n}}"
+        if turn_n == 1:
+            send_batch([
+                {{"jsonrpc": "2.0", "id": rid, "result": {{"turn": {{"id": tid, "status": "inProgress"}}}}}},
+                {{"jsonrpc": "2.0", "method": "turn/started", "params": {{"threadId": "cx_r2", "turn": {{"id": tid, "status": "inProgress"}}}}}},
+                {{"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {{"threadId": "cx_r2", "turnId": tid, "itemId": "m1", "delta": "fast turn 1"}}}},
+                {{"jsonrpc": "2.0", "method": "turn/completed", "params": {{"threadId": "cx_r2", "turn": {{"id": tid, "status": "completed"}}}}}},
+            ])
+        elif turn_n == 2:
+            send_batch([
+                {{"jsonrpc": "2.0", "id": rid, "result": {{"turn": {{"id": tid, "status": "inProgress"}}}}}},
+                {{"jsonrpc": "2.0", "method": "turn/started", "params": {{"threadId": "cx_r2", "turn": {{"id": tid, "status": "inProgress"}}}}}},
+                {{"jsonrpc": "2.0", "id": 777, "method": "item/commandExecution/requestApproval", "params": {{"threadId": "cx_r2", "turnId": tid, "itemId": "gate_t2", "command": "true"}}}},
+            ])
+        elif turn_n == 3:
+            assert "queued turn 3" in p["input"][0]["text"]
+            send_batch([
+                {{"jsonrpc": "2.0", "id": rid, "result": {{"turn": {{"id": tid, "status": "inProgress"}}}}}},
+                {{"jsonrpc": "2.0", "method": "turn/started", "params": {{"threadId": "cx_r2", "turn": {{"id": tid, "status": "inProgress"}}}}}},
+                {{"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {{"threadId": "cx_r2", "turnId": tid, "itemId": "m3", "delta": "ran queued turn 3"}}}},
+                {{"jsonrpc": "2.0", "method": "turn/completed", "params": {{"threadId": "cx_r2", "turn": {{"id": tid, "status": "completed"}}}}}},
+            ])
+    elif m is None and rid == 777:
+        send_batch([
+            {{"jsonrpc": "2.0", "method": "turn/completed", "params": {{"threadId": "cx_r2", "turn": {{"id": "t_2", "status": "completed"}}}}}},
+        ])
+    elif m == "turn/steer":
+        raise AssertionError("QueueIfActive must not emit turn/steer")
+"#,
+        codex_log = codex_log.to_string_lossy()
+    );
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-cl-r2", &claude_script);
+    let codex_bin = write_executable_script(script_dir.path(), "mock-cx-r2", &codex_script);
+    let h = TestHarness::new(claude_bin, codex_bin).await;
+
+    // Install a malicious post-checkout hook in the project repo; core.hooksPath=/dev/null must suppress it.
+    let hook_marker = script_dir.path().join("hook_executed");
+    let hooks_dir = h.project_dir.join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    write_executable_script(
+        &hooks_dir,
+        "post-checkout",
+        &format!("#!/bin/sh\necho pwned > {}\n", hook_marker.display()),
+    );
+
+    // 1. Spawn colliding hyphenated (alpha-beta, gamma) and (alpha, beta-gamma) managed worktrees.
+    let w_ab = WaveSlug::parse("alpha-beta").unwrap();
+    let r_g = RoleName::parse("gamma").unwrap();
+    let w_a = WaveSlug::parse("alpha").unwrap();
+    let r_bg = RoleName::parse("beta-gamma").unwrap();
+
+    for (w, r) in [(&w_ab, &r_g), (&w_a, &r_bg)] {
+        h.operator
+            .call(WaveStart {
+                spec: WaveSpec {
+                    slug: w.clone(),
+                    project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                    goal: Body::parse("Verify injective worktrees and hook suppression").unwrap(),
+                    defaults: AgentSpec {
+                        provider: ProviderId::parse("claude-code").unwrap(),
+                        model: None,
+                        account: None,
+                        reasoning: None,
+                        service_tier: None,
+                        permission: PermissionMode::AcceptEdits,
+                        workspace: Workspace::ManagedWorktree {
+                            base: BaseBranch::Default,
+                        },
+                    },
+                    output_dir: None,
+                    workers: vec![WorkerSpec {
+                        role: r.clone(),
+                        brief: Body::parse("check").unwrap(),
+                        agent: None,
+                        output_dir: None,
+                        writes: Vec::new(),
+                        return_schema: None,
+                    }],
+                },
+                idem: None,
+                config_defaults: Default::default(),
+            })
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        !hook_marker.exists(),
+        "managed worktree creation must disable repository git hooks"
+    );
+
+    // Wait for alpha/beta-gamma Idle and alpha-beta/gamma Blocked on perm_a first.
+    h.wait_wave(&w_a, |s| {
+        matches!(
+            worker_phase(s, &r_bg),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    h.wait_wave(&w_ab, |s| {
+        matches!(
+            worker_phase(s, &r_g),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "perm_a"
+        )
+    })
+    .await;
+
+    // Resolve perm_a -> must immediately surface queued perm_b!
+    h.operator
+        .call(WaveResolve {
+            wave: w_ab.clone(),
+            role: r_g.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("perm_a").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_ab, |s| {
+        matches!(
+            worker_phase(s, &r_g),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "perm_b"
+        )
+    })
+    .await;
+
+    h.operator
+        .call(WaveResolve {
+            wave: w_ab.clone(),
+            role: r_g.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("perm_b").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&w_ab, |s| {
+        matches!(
+            worker_phase(s, &r_g),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    let cl_lines: Vec<serde_json::Value> = rex_wave_fs::read_regular_string(&claude_log, 32 * 1024)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(cl_lines.len(), 2);
+    let cwds: Vec<&str> = cl_lines
+        .iter()
+        .map(|v| v["cwd"].as_str().unwrap())
+        .collect();
+    assert!(
+        cwds.iter()
+            .any(|c| c.ends_with(".worktrees/rex-wave/alpha-beta/gamma"))
+    );
+    assert!(
+        cwds.iter()
+            .any(|c| c.ends_with(".worktrees/rex-wave/alpha/beta-gamma"))
+    );
+    assert_ne!(cwds[0], cwds[1]);
+
+    // 2. Codex batched turn/start+turn/completed wire ordering + QueueIfActive queueing.
+    let w_cx = WaveSlug::parse("codex-order").unwrap();
+    let r_cx = RoleName::parse("worker").unwrap();
+    h.operator
+        .call(WaveStart {
+            spec: WaveSpec {
+                slug: w_cx.clone(),
+                project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+                goal: Body::parse("Verify wire-ordered turn state and QueueIfActive").unwrap(),
+                defaults: AgentSpec {
+                    provider: ProviderId::parse("codex").unwrap(),
+                    model: Some(ModelId::parse("gpt-6.1-sol").unwrap()),
+                    account: None,
+                    reasoning: None,
+                    service_tier: None,
+                    permission: PermissionMode::AcceptEdits,
+                    workspace: Workspace::ProjectDefault,
+                },
+                output_dir: None,
+                workers: vec![WorkerSpec {
+                    role: r_cx.clone(),
+                    brief: Body::parse("turn 1").unwrap(),
+                    agent: None,
+                    output_dir: None,
+                    writes: Vec::new(),
+                    return_schema: None,
+                }],
+            },
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    // Wait for batched Turn 1 to reach Idle.
+    h.wait_wave(&w_cx, |s| {
+        matches!(
+            worker_phase(s, &r_cx),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // SteerDeliveryMode::Start must succeed because active_turn_id was cleared in wire order!
+    h.operator
+        .call(WaveTell {
+            wave: w_cx.clone(),
+            role: r_cx.clone(),
+            body: Body::parse("start turn 2").unwrap(),
+            mode: SteerDeliveryMode::Start,
+        })
+        .await
+        .expect("Start must succeed after batched turn/completed");
+
+    // Wait until Turn 2 blocks on gate_t2.
+    h.wait_wave(&w_cx, |s| {
+        matches!(
+            worker_phase(s, &r_cx),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "gate_t2"
+        )
+    })
+    .await;
+
+    // Queue Turn 3 behind active Turn 2 using QueueIfActive.
+    h.operator
+        .call(WaveTell {
+            wave: w_cx.clone(),
+            role: r_cx.clone(),
+            body: Body::parse("queued turn 3").unwrap(),
+            mode: SteerDeliveryMode::QueueIfActive,
+        })
+        .await
+        .unwrap();
+
+    // Unblock Turn 2 -> Turn 2 completes -> queued Turn 3 auto-dispatches and completes!
+    h.operator
+        .call(WaveResolve {
+            wave: w_cx.clone(),
+            role: r_cx.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("gate_t2").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    h.wait_page(&w_cx, &r_cx, |p| {
+        p.events.iter().any(|e| {
+            matches!(&e.kind, AgentEventKind::AssistantText { text } if text == "ran queued turn 3")
+        })
+    })
+    .await;
+
+    h.wait_wave(&w_cx, |s| {
+        matches!(
+            worker_phase(s, &r_cx),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
 
     h.claude.shutdown().await;
     h.codex.shutdown().await;

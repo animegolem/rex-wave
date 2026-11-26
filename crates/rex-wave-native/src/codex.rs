@@ -2,10 +2,10 @@
 
 use crate::common::{
     BoundedLine, ErasedBackend, MAX_STDOUT_LINE_BYTES, ObserverItem, StdinLine, ThreadEventLog,
-    WorkerRegistry, flush_observer, format_thread_id, has_non_empty_granted_permissions,
-    parse_prefixed_thread_id, provision_native_worker_token, read_bounded_line,
-    reject_non_empty_granted_permissions, revoke_native_worker_token, scrub_daemon_env,
-    spawn_stdin_writer, spawn_worker_observer, truncate_summary, write_stdin_line,
+    WorkerRegistry, flush_observer, format_thread_id, parse_prefixed_thread_id,
+    provision_native_worker_token, read_bounded_line, reject_non_empty_granted_permissions,
+    revoke_native_worker_token, scrub_daemon_env, spawn_stdin_writer, spawn_worker_observer,
+    truncate_summary, write_stdin_line,
 };
 use crate::process::{
     DEFAULT_RETIRE_GRACE, LiveChild, PgidSlot, claim_and_kill_pgid, new_pgid_slot,
@@ -31,11 +31,11 @@ use rex_wave_runtime::{AgentFeed, BoxFut, BridgeBackend, Router};
 use rex_wave_transport::WORKER_THREAD_ENV;
 use rex_wave_waves::{AgentHost, HostError, SpawnRequest, expand_tilde};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::process::Command;
@@ -169,6 +169,10 @@ pub fn build_codex_args(cfg: &CodexRunnerConfig) -> Vec<String> {
         args.push(format!(
             "mcp_servers.rex-wave.args=[\"--socket\", {sock_lit}, \"mcp\", \"--stdio\"]"
         ));
+        args.push("-c".to_owned());
+        args.push(format!(
+            "mcp_servers.rex-wave.env_vars=[\"REX_WAVE_TOKEN\", \"REX_WAVE_SOCKET\", \"{WORKER_THREAD_ENV}\", \"BELL_GUARD\"]"
+        ));
     }
     args.extend(cfg.extra_args.iter().cloned());
     args
@@ -206,14 +210,44 @@ fn is_codex_policy_error_info(raw: &str) -> bool {
     ) || is_refusal_stop_reason(&lower)
 }
 
+pub fn extract_codex_account_identity(account_read_res: &Value) -> Option<String> {
+    let acct = account_read_res.get("account")?;
+    if let Some(obj) = acct.as_object() {
+        let acct_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        if acct_type == "chatgpt" {
+            if let Some(email) = obj
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(email.to_owned());
+            }
+            if let Some(ws) = obj
+                .get("workspaceName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(ws.to_owned());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// Parses `ThreadTokenUsage` preferring `last` (current context window occupancy)
+/// over cumulative `total`, and splits `cachedInputTokens` / `reasoningOutputTokens`
+/// out of `inputTokens` / `outputTokens` so categories never double-count.
 pub fn parse_codex_token_usage(params: &Value) -> Option<ThreadContextUsage> {
     let tu = params.get("tokenUsage").unwrap_or(params);
     if !tu.is_object() {
         return None;
     }
     let breakdown = tu
-        .get("total")
-        .or_else(|| tu.get("last"))
+        .get("last")
+        .or_else(|| tu.get("total"))
         .filter(|v| v.is_object())
         .unwrap_or(tu);
 
@@ -237,14 +271,17 @@ pub fn parse_codex_token_usage(params: &Value) -> Option<ThreadContextUsage> {
         .or_else(|| breakdown.get("reasoning_output_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+
+    let uncached_input = input.saturating_sub(cached);
+    let visible_output = output.saturating_sub(reasoning);
     let total = breakdown
         .get("totalTokens")
         .or_else(|| breakdown.get("total_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or_else(|| {
-            input
+            uncached_input
                 .saturating_add(cached)
-                .saturating_add(output)
+                .saturating_add(visible_output)
                 .saturating_add(reasoning)
         });
 
@@ -255,12 +292,12 @@ pub fn parse_codex_token_usage(params: &Value) -> Option<ThreadContextUsage> {
         .unwrap_or(0);
 
     let mut categories = Vec::new();
-    if input > 0 {
+    if uncached_input > 0 {
         categories.push(ContextCategory {
             id: "input".into(),
             label: "Input".into(),
             kind: ContextCategoryKind::Used,
-            tokens: input,
+            tokens: uncached_input,
         });
     }
     if cached > 0 {
@@ -271,12 +308,12 @@ pub fn parse_codex_token_usage(params: &Value) -> Option<ThreadContextUsage> {
             tokens: cached,
         });
     }
-    if output > 0 {
+    if visible_output > 0 {
         categories.push(ContextCategory {
             id: "output".into(),
             label: "Output".into(),
             kind: ContextCategoryKind::Used,
-            tokens: output,
+            tokens: visible_output,
         });
     }
     if reasoning > 0 {
@@ -438,7 +475,9 @@ pub fn parse_codex_approval_request(
 
 fn encode_codex_granted_profile(gp: &GrantedPermissions) -> Value {
     let mut out = Map::new();
-    if let Some(ref fs) = gp.file_system {
+    if let Some(ref fs) = gp.file_system
+        && (!fs.read.is_empty() || !fs.write.is_empty())
+    {
         out.insert(
             "fileSystem".into(),
             json!({
@@ -453,6 +492,169 @@ fn encode_codex_granted_profile(gp: &GrantedPermissions) -> Value {
         out.insert("network".into(), json!({ "enabled": enabled }));
     }
     Value::Object(out)
+}
+
+fn collect_offered_fs_paths(fs_obj: &Map<String, Value>, mode: &str) -> HashSet<String> {
+    let mut allowed = HashSet::new();
+    if let Some(arr) = fs_obj.get(mode).and_then(Value::as_array) {
+        for item in arr.iter().filter_map(Value::as_str) {
+            allowed.insert(item.to_owned());
+        }
+    }
+    if let Some(entries) = fs_obj.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            let access = entry.get("access").and_then(Value::as_str).unwrap_or("");
+            let covers = (mode == "read" && matches!(access, "read" | "write" | "readWrite"))
+                || (mode == "write" && matches!(access, "write" | "readWrite"));
+            if covers
+                && let Some(path_val) = entry.get("path")
+                && let Some(s) = path_val
+                    .as_str()
+                    .or_else(|| path_val.get("path").and_then(Value::as_str))
+            {
+                allowed.insert(s.to_owned());
+            }
+        }
+    }
+    allowed
+}
+
+fn validate_codex_grant_subset(
+    gp: &GrantedPermissions,
+    requested_permissions: Option<&Value>,
+) -> Result<(), HostError> {
+    let Some(req_obj) = requested_permissions.and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if let Some(ref net) = gp.network
+        && net.enabled == Some(true)
+    {
+        let req_net_enabled = req_obj
+            .get("network")
+            .and_then(Value::as_object)
+            .and_then(|n| n.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !req_net_enabled {
+            return Err(HostError::Rejected(
+                "granted_permissions enables network access that was not requested by Codex".into(),
+            ));
+        }
+    }
+    if let Some(ref fs) = gp.file_system
+        && (!fs.read.is_empty() || !fs.write.is_empty())
+    {
+        let Some(req_fs) = req_obj.get("fileSystem").and_then(Value::as_object) else {
+            return Err(HostError::Rejected(
+                "granted_permissions grants filesystem paths when Codex requested none".into(),
+            ));
+        };
+        let offered_read = collect_offered_fs_paths(req_fs, "read");
+        let offered_write = collect_offered_fs_paths(req_fs, "write");
+        for r in &fs.read {
+            if !offered_read.contains(r) && !offered_write.contains(r) {
+                return Err(HostError::Rejected(format!(
+                    "granted_permissions read path '{r}' was not requested by Codex"
+                )));
+            }
+        }
+        for w in &fs.write {
+            if !offered_write.contains(w) {
+                return Err(HostError::Rejected(format!(
+                    "granted_permissions write path '{w}' was not requested by Codex"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_codex_request_answer(method: &str, value: &Value) -> Result<Value, HostError> {
+    let Some(obj) = value.as_object() else {
+        return Err(HostError::Rejected(format!(
+            "Codex {method} RequestAnswer must be a JSON object"
+        )));
+    };
+    match method {
+        "item/commandExecution/requestApproval" => {
+            let Some(dec) = obj.get("decision") else {
+                return Err(HostError::Rejected(
+                    "Codex item/commandExecution/requestApproval RequestAnswer requires 'decision'"
+                        .into(),
+                ));
+            };
+            let valid = dec
+                .as_str()
+                .is_some_and(|s| matches!(s, "accept" | "acceptForSession" | "decline" | "cancel"))
+                || dec.as_object().is_some_and(|d| {
+                    d.contains_key("acceptWithExecpolicyAmendment")
+                        || d.contains_key("applyNetworkPolicyAmendment")
+                });
+            if !valid {
+                return Err(HostError::Rejected(
+                    "invalid 'decision' in Codex item/commandExecution/requestApproval RequestAnswer"
+                        .into(),
+                ));
+            }
+            Ok(value.clone())
+        }
+        "item/fileChange/requestApproval" => {
+            let valid = obj
+                .get("decision")
+                .and_then(Value::as_str)
+                .is_some_and(|s| matches!(s, "accept" | "acceptForSession" | "decline" | "cancel"));
+            if !valid {
+                return Err(HostError::Rejected(
+                    "Codex item/fileChange/requestApproval RequestAnswer requires 'decision' in accept|acceptForSession|decline|cancel"
+                        .into(),
+                ));
+            }
+            Ok(value.clone())
+        }
+        "item/permissions/requestApproval" => {
+            if !obj.get("permissions").is_some_and(Value::is_object) {
+                return Err(HostError::Rejected(
+                    "Codex item/permissions/requestApproval RequestAnswer requires object field 'permissions'"
+                        .into(),
+                ));
+            }
+            if let Some(scope) = obj.get("scope")
+                && !scope
+                    .as_str()
+                    .is_some_and(|s| matches!(s, "turn" | "session"))
+            {
+                return Err(HostError::Rejected(
+                    "Codex item/permissions/requestApproval RequestAnswer 'scope' must be 'turn' or 'session'"
+                        .into(),
+                ));
+            }
+            Ok(value.clone())
+        }
+        "item/tool/requestUserInput" => {
+            let Some(answers) = obj.get("answers").and_then(Value::as_object) else {
+                return Err(HostError::Rejected(
+                    "Codex item/tool/requestUserInput RequestAnswer requires object field 'answers'"
+                        .into(),
+                ));
+            };
+            for v in answers.values() {
+                let valid = v
+                    .get("answers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| arr.iter().all(Value::is_string));
+                if !valid {
+                    return Err(HostError::Rejected(
+                        "Codex item/tool/requestUserInput RequestAnswer entries must have string array 'answers'"
+                            .into(),
+                    ));
+                }
+            }
+            Ok(value.clone())
+        }
+        other => Err(HostError::Rejected(format!(
+            "unsupported Codex approval method {other}"
+        ))),
+    }
 }
 
 pub fn encode_codex_approval_result(
@@ -484,12 +686,7 @@ pub fn encode_codex_approval_result_with_request(
                 }
                 InteractionResolution::Deny => Ok(json!({ "decision": "decline" })),
                 InteractionResolution::RequestAnswer { value } => {
-                    if !value.is_object() {
-                        return Err(HostError::Rejected(format!(
-                            "Codex {method} RequestAnswer must be a JSON object"
-                        )));
-                    }
-                    Ok(value.clone())
+                    validate_codex_request_answer(method, value)
                 }
                 _ => Err(HostError::Rejected(format!(
                     "Codex {method} supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
@@ -500,10 +697,12 @@ pub fn encode_codex_approval_result_with_request(
             InteractionResolution::AllowOnce {
                 granted_permissions,
             } => {
-                let perms = if has_non_empty_granted_permissions(granted_permissions.as_ref()) {
-                    encode_codex_granted_profile(granted_permissions.as_ref().unwrap())
-                } else {
-                    requested_permissions
+                let perms = match granted_permissions {
+                    Some(gp) => {
+                        validate_codex_grant_subset(gp, requested_permissions)?;
+                        encode_codex_granted_profile(gp)
+                    }
+                    None => requested_permissions
                         .filter(|v| v.is_object())
                         .cloned()
                         .ok_or_else(|| {
@@ -511,7 +710,7 @@ pub fn encode_codex_approval_result_with_request(
                                 "Codex item/permissions/requestApproval requires granted_permissions or an offered permission profile"
                                     .into(),
                             )
-                        })?
+                        })?,
                 };
                 Ok(json!({
                     "permissions": perms,
@@ -521,10 +720,12 @@ pub fn encode_codex_approval_result_with_request(
             InteractionResolution::AllowForSession {
                 granted_permissions,
             } => {
-                let perms = if has_non_empty_granted_permissions(granted_permissions.as_ref()) {
-                    encode_codex_granted_profile(granted_permissions.as_ref().unwrap())
-                } else {
-                    requested_permissions
+                let perms = match granted_permissions {
+                    Some(gp) => {
+                        validate_codex_grant_subset(gp, requested_permissions)?;
+                        encode_codex_granted_profile(gp)
+                    }
+                    None => requested_permissions
                         .filter(|v| v.is_object())
                         .cloned()
                         .ok_or_else(|| {
@@ -532,7 +733,7 @@ pub fn encode_codex_approval_result_with_request(
                                 "Codex item/permissions/requestApproval requires granted_permissions or an offered permission profile"
                                     .into(),
                             )
-                        })?
+                        })?,
                 };
                 Ok(json!({
                     "permissions": perms,
@@ -541,13 +742,7 @@ pub fn encode_codex_approval_result_with_request(
             }
             InteractionResolution::Deny => Ok(json!({ "permissions": {} })),
             InteractionResolution::RequestAnswer { value } => {
-                if !value.is_object() {
-                    return Err(HostError::Rejected(
-                        "Codex item/permissions/requestApproval RequestAnswer must be a JSON object"
-                            .into(),
-                    ));
-                }
-                Ok(value.clone())
+                validate_codex_request_answer(method, value)
             }
             _ => Err(HostError::Rejected(
                 "Codex item/permissions/requestApproval supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
@@ -572,13 +767,7 @@ pub fn encode_codex_approval_result_with_request(
                 Ok(json!({ "answers": Value::Object(map) }))
             }
             InteractionResolution::RequestAnswer { value } => {
-                if !value.is_object() {
-                    return Err(HostError::Rejected(
-                        "Codex item/tool/requestUserInput RequestAnswer must be a JSON object"
-                            .into(),
-                    ));
-                }
-                Ok(value.clone())
+                validate_codex_request_answer(method, value)
             }
             _ => Err(HostError::Rejected(
                 "Codex item/tool/requestUserInput requires UserAnswer or RequestAnswer".into(),
@@ -655,10 +844,25 @@ pub fn classify_codex_turn(params: &Value, prior_error: Option<&Value>) -> Activ
     Activity::Idle
 }
 
+#[derive(Clone)]
 struct PendingCodexApproval {
+    interaction: PendingInteraction,
     rpc_id: Value,
     method: String,
     requested_permissions: Option<Value>,
+}
+
+/// Wire-ordered per-worker turn state updated synchronously from the stdout reader
+/// so batched `turn/start` response + `turn/started` + `turn/completed` frames never
+/// leave a completed turn marked active.
+#[derive(Default)]
+struct CodexTurnState {
+    in_flight: bool,
+    active_turn_id: Option<String>,
+    started_turns: HashSet<String>,
+    completed_turns: HashSet<String>,
+    turn_start_rpc_ids: HashSet<u64>,
+    queued_turns: VecDeque<String>,
 }
 
 struct CodexWorkerState {
@@ -670,16 +874,16 @@ struct CodexWorkerState {
     observer: mpsc::UnboundedSender<ObserverItem>,
     retiring: AtomicBool,
     retired: AtomicBool,
+    process_dead: AtomicBool,
     next_rpc_id: AtomicU64,
     codex_thread_id: Mutex<Option<String>>,
-    active_turn_id: Mutex<Option<String>>,
-    started_turns: Mutex<HashSet<String>>,
+    turn_state: Mutex<CodexTurnState>,
     streamed_items: Mutex<HashSet<String>>,
     last_error: Mutex<Option<Value>>,
     stdin_tx: Mutex<Option<mpsc::UnboundedSender<StdinLine>>>,
     live_child: tokio::sync::Mutex<Option<LiveChild>>,
     pending_rpc: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
-    pending_approvals: Mutex<HashMap<HostInteractionId, PendingCodexApproval>>,
+    pending_approvals: Mutex<VecDeque<PendingCodexApproval>>,
     turn_lock: tokio::sync::Mutex<()>,
 }
 
@@ -688,8 +892,13 @@ impl CodexWorkerState {
         let (host_seq, settled_seq) = {
             let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
             log.activity = activity.clone();
-            if !matches!(activity, Activity::Blocked { .. }) {
-                log.pending = None;
+            match &activity {
+                Activity::Blocked { interaction } => {
+                    log.pending = Some(interaction.clone());
+                }
+                _ => {
+                    log.pending = None;
+                }
             }
             let hseq = log.next_host_seq();
             let sseq = include_settled.then(|| log.last_event_seq()).flatten();
@@ -713,6 +922,13 @@ impl CodexWorkerState {
         timeout: Duration,
     ) -> Result<Value, HostError> {
         let id = self.next_rpc_id.fetch_add(1, Ordering::Relaxed);
+        if method == "turn/start" {
+            self.turn_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .turn_start_rpc_ids
+                .insert(id);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut pending = self.pending_rpc.lock().unwrap_or_else(|e| e.into_inner());
@@ -733,6 +949,13 @@ impl CodexWorkerState {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .ok_or_else(|| {
+                if method == "turn/start" {
+                    self.turn_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .turn_start_rpc_ids
+                        .remove(&id);
+                }
                 self.pending_rpc
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -741,6 +964,13 @@ impl CodexWorkerState {
             })?;
 
         if let Err(err) = write_stdin_line(&stdin_tx, payload, "Codex").await {
+            if method == "turn/start" {
+                self.turn_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .turn_start_rpc_ids
+                    .remove(&id);
+            }
             self.pending_rpc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -759,6 +989,13 @@ impl CodexWorkerState {
                 "Codex process closed while awaiting {method}"
             ))),
             Err(_) => {
+                if method == "turn/start" {
+                    self.turn_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .turn_start_rpc_ids
+                        .remove(&id);
+                }
                 self.pending_rpc
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -853,6 +1090,7 @@ impl Drop for CodexSpawnGuard {
 /// Core bridge managing native Codex `app-server` worker child processes.
 pub struct CodexBridge {
     cfg: CodexRunnerConfig,
+    self_weak: Weak<Self>,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
     registry: Mutex<WorkerRegistry<CodexWorkerState>>,
     spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
@@ -860,8 +1098,9 @@ pub struct CodexBridge {
 
 impl CodexBridge {
     pub fn new(cfg: CodexRunnerConfig) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|weak| Self {
             cfg,
+            self_weak: weak.clone(),
             backend: OnceLock::new(),
             registry: Mutex::new(WorkerRegistry::default()),
             spawn_locks: Mutex::new(HashMap::new()),
@@ -989,16 +1228,16 @@ impl CodexBridge {
             observer,
             retiring: AtomicBool::new(false),
             retired: AtomicBool::new(false),
+            process_dead: AtomicBool::new(false),
             next_rpc_id: AtomicU64::new(1),
             codex_thread_id: Mutex::new(None),
-            active_turn_id: Mutex::new(None),
-            started_turns: Mutex::new(HashSet::new()),
+            turn_state: Mutex::new(CodexTurnState::default()),
             streamed_items: Mutex::new(HashSet::new()),
             last_error: Mutex::new(None),
             stdin_tx: Mutex::new(Some(stdin_tx)),
             live_child: tokio::sync::Mutex::new(Some(live)),
             pending_rpc: Mutex::new(HashMap::new()),
-            pending_approvals: Mutex::new(HashMap::new()),
+            pending_approvals: Mutex::new(VecDeque::new()),
             turn_lock: tokio::sync::Mutex::new(()),
         });
 
@@ -1011,14 +1250,16 @@ impl CodexBridge {
         };
 
         let reader_worker = worker.clone();
+        let weak_bridge = self.self_weak.clone();
         tokio::spawn(async move {
-            run_codex_stdout_reader(reader_worker, stdout, stderr_task, pgid_slot).await;
+            run_codex_stdout_reader(weak_bridge, reader_worker, stdout, stderr_task, pgid_slot)
+                .await;
         });
 
         let handshake_res = self.run_codex_handshake(&worker, &cwd, &req).await;
         if let Err(err) = handshake_res {
-            cleanup_guard.disarm();
             worker.retiring.store(true, Ordering::Release);
+            revoke_native_worker_token(self.cfg.state_dir.as_deref(), &thread);
             worker.fail_all_pending_rpc("Codex handshake failed");
             worker
                 .stdin_tx
@@ -1028,7 +1269,7 @@ impl CodexBridge {
             if let Some(mut live) = worker.live_child.lock().await.take() {
                 terminate_process_group(&mut live, self.cfg.retire_grace).await;
             }
-            revoke_native_worker_token(self.cfg.state_dir.as_deref(), &thread);
+            cleanup_guard.disarm();
             return Err(err);
         }
 
@@ -1053,7 +1294,7 @@ impl CodexBridge {
         cwd: &std::path::Path,
         req: &SpawnRequest,
     ) -> Result<(), HostError> {
-        let init_res = worker
+        worker
             .rpc_call(
                 "initialize",
                 json!({
@@ -1067,6 +1308,17 @@ impl CodexBridge {
             .await?;
 
         worker.rpc_notify("initialized", json!({})).await?;
+
+        // Probe account identity via `account/read`; non-fatal when unimplemented or API-key backed.
+        let actual_account = worker
+            .rpc_call(
+                "account/read",
+                json!({ "refreshToken": false }),
+                self.cfg.rpc_timeout,
+            )
+            .await
+            .ok()
+            .and_then(|res| extract_codex_account_identity(&res));
 
         let (approval_policy, sandbox) = codex_approval_and_sandbox(req.agent.permission);
         let mut thread_params = Map::new();
@@ -1121,15 +1373,6 @@ impl CodexBridge {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .and_then(|s| ModelId::parse(s).ok());
-        let actual_account = thread_res
-            .get("account")
-            .or_else(|| thread_res.get("accountEmail"))
-            .or_else(|| init_res.get("account"))
-            .or_else(|| init_res.get("accountEmail"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
         if actual_model.is_some() || actual_account.is_some() {
             let _ = worker
                 .observer
@@ -1157,43 +1400,77 @@ impl CodexBridge {
         }
 
         {
+            let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+            ts.in_flight = true;
+        }
+        {
             let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
             log.push_event(AgentEventKind::UserMessage {
                 text: req.prompt.as_str().to_owned(),
             });
         }
 
-        let turn_res = worker
+        if let Err(err) = worker
             .rpc_call(
                 "turn/start",
                 Value::Object(turn_params),
                 self.cfg.rpc_timeout,
             )
-            .await?;
-
-        if let Some(turn_id) = turn_res
-            .get("turn")
-            .and_then(|t| t.get("id"))
-            .or_else(|| turn_res.get("turnId"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .await
         {
-            *worker
-                .active_turn_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(turn_id.to_owned());
-            if worker
-                .started_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(turn_id.to_owned())
+            let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+            ts.in_flight = false;
+            ts.active_turn_id = None;
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    async fn start_codex_turn_now(
+        &self,
+        worker: &Arc<CodexWorkerState>,
+        codex_tid: String,
+        prompt_text: &str,
+    ) -> Result<(), HostError> {
+        let mut params = Map::new();
+        params.insert("threadId".into(), Value::String(codex_tid));
+        params.insert(
+            "input".into(),
+            json!([{ "type": "text", "text": prompt_text }]),
+        );
+        if let Some(effort) = worker.req.agent.reasoning.as_deref().map(str::trim)
+            && !effort.is_empty()
+        {
+            params.insert("effort".into(), Value::String(effort.to_owned()));
+        }
+
+        {
+            let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
+            log.push_event(AgentEventKind::UserMessage {
+                text: prompt_text.to_owned(),
+            });
+        }
+        // Emit Working before turn/start so a fast turn/completed strictly follows it in host_seq.
+        worker.emit_activity(Activity::Working, false);
+
+        if let Err(err) = worker
+            .rpc_call("turn/start", Value::Object(params), self.cfg.rpc_timeout)
+            .await
+        {
             {
-                worker
-                    .log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_event(AgentEventKind::TurnStarted);
+                let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+                ts.in_flight = false;
+                ts.active_turn_id = None;
+                ts.queued_turns.clear();
             }
+            worker.emit_activity(
+                Activity::Errored {
+                    error: err.to_string(),
+                },
+                false,
+            );
+            return Err(err);
         }
 
         Ok(())
@@ -1228,19 +1505,36 @@ impl CodexBridge {
                 HostError::Rejected(format!("Codex thread {thread} has no active session"))
             })?;
 
-        let active_turn = worker
-            .active_turn_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let steer_target = {
+            let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+            if ts.in_flight {
+                match mode {
+                    SteerDeliveryMode::Start => {
+                        return Err(HostError::Rejected(format!(
+                            "Codex thread {thread} already has an active turn; use Steer or Auto"
+                        )));
+                    }
+                    SteerDeliveryMode::Auto | SteerDeliveryMode::QueueIfActive => {
+                        ts.queued_turns.push_back(body.as_str().to_owned());
+                        return Ok(());
+                    }
+                    SteerDeliveryMode::Steer | SteerDeliveryMode::SteerIfActive => {
+                        match ts.active_turn_id.clone() {
+                            Some(tid) => Some(tid),
+                            None => {
+                                ts.queued_turns.push_back(body.as_str().to_owned());
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            } else {
+                ts.in_flight = true;
+                None
+            }
+        };
 
-        if mode == SteerDeliveryMode::Start && active_turn.is_some() {
-            return Err(HostError::Rejected(format!(
-                "Codex thread {thread} already has an active turn; use Steer or Auto"
-            )));
-        }
-
-        if let Some(expected_turn_id) = active_turn {
+        if let Some(expected_turn_id) = steer_target {
             let steer_res = worker
                 .rpc_call(
                     "turn/steer",
@@ -1263,80 +1557,27 @@ impl CodexBridge {
                         });
                     return Ok(());
                 }
-                Err(HostError::Rejected(_))
-                    if matches!(
-                        mode,
-                        SteerDeliveryMode::Auto
-                            | SteerDeliveryMode::SteerIfActive
-                            | SteerDeliveryMode::QueueIfActive
-                    ) => {}
+                Err(HostError::Rejected(_)) if mode == SteerDeliveryMode::SteerIfActive => {
+                    let should_start = {
+                        let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+                        if ts.in_flight {
+                            ts.queued_turns.push_back(body.as_str().to_owned());
+                            false
+                        } else {
+                            ts.in_flight = true;
+                            true
+                        }
+                    };
+                    if !should_start {
+                        return Ok(());
+                    }
+                }
                 Err(err) => return Err(err),
             }
         }
 
-        let mut params = Map::new();
-        params.insert("threadId".into(), Value::String(codex_tid));
-        params.insert(
-            "input".into(),
-            json!([{ "type": "text", "text": body.as_str() }]),
-        );
-        if let Some(effort) = worker.req.agent.reasoning.as_deref().map(str::trim)
-            && !effort.is_empty()
-        {
-            params.insert("effort".into(), Value::String(effort.to_owned()));
-        }
-
-        {
-            let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
-            log.push_event(AgentEventKind::UserMessage {
-                text: body.as_str().to_owned(),
-            });
-        }
-        // Emit Working before turn/start so a fast turn/completed strictly follows it in host_seq.
-        worker.emit_activity(Activity::Working, false);
-
-        let turn_res = match worker
-            .rpc_call("turn/start", Value::Object(params), self.cfg.rpc_timeout)
+        self.start_codex_turn_now(&worker, codex_tid, body.as_str())
             .await
-        {
-            Ok(res) => res,
-            Err(err) => {
-                worker.emit_activity(
-                    Activity::Errored {
-                        error: err.to_string(),
-                    },
-                    false,
-                );
-                return Err(err);
-            }
-        };
-
-        if let Some(turn_id) = turn_res
-            .get("turn")
-            .and_then(|t| t.get("id"))
-            .or_else(|| turn_res.get("turnId"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            *worker
-                .active_turn_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(turn_id.to_owned());
-            if worker
-                .started_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(turn_id.to_owned())
-            {
-                worker
-                    .log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_event(AgentEventKind::TurnStarted);
-            }
-        }
-
-        Ok(())
     }
 
     fn validate_resolve_worker(
@@ -1374,17 +1615,23 @@ impl CodexBridge {
                 .pending_approvals
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let pending = approvals.get(interaction).ok_or_else(|| {
-                HostError::Rejected(format!(
-                    "no pending Codex approval {interaction} on {thread}"
-                ))
-            })?;
+            let Some(front) = approvals.front() else {
+                return Err(HostError::Rejected(format!(
+                    "no pending Codex approval on {thread}"
+                )));
+            };
+            if &front.interaction.id != interaction {
+                return Err(HostError::Rejected(format!(
+                    "Codex thread {thread} is blocked on {}, not {interaction}",
+                    front.interaction.id
+                )));
+            }
             let encoded = encode_codex_approval_result_with_request(
-                &pending.method,
+                &front.method,
                 resolution,
-                pending.requested_permissions.as_ref(),
+                front.requested_permissions.as_ref(),
             )?;
-            (pending.rpc_id.clone(), encoded)
+            (front.rpc_id.clone(), encoded)
         };
 
         Ok((worker, rpc_id, result))
@@ -1396,16 +1643,71 @@ impl CodexBridge {
         interaction: &HostInteractionId,
         resolution: &InteractionResolution,
     ) -> Result<(), HostError> {
-        let (worker, rpc_id, result) =
-            self.validate_resolve_worker(thread, interaction, resolution)?;
-
-        worker
-            .pending_approvals
+        let worker = self
+            .registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(interaction);
-        // Emit Working before sending approval response so turn/completed strictly follows it.
-        worker.emit_activity(Activity::Working, false);
+            .get_thread(thread)
+            .ok_or_else(|| HostError::Rejected(format!("unknown Codex thread {thread}")))?;
+
+        if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
+            return Err(HostError::Rejected(format!(
+                "Codex thread {thread} is retired"
+            )));
+        }
+
+        if worker
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return Err(HostError::Unreachable(format!(
+                "Codex thread {thread} stdin closed"
+            )));
+        }
+
+        let (rpc_id, result, next_blocked) = {
+            let mut approvals = worker
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(front) = approvals.front() else {
+                return Err(HostError::Rejected(format!(
+                    "no pending Codex approval on {thread}"
+                )));
+            };
+            if &front.interaction.id != interaction {
+                return Err(HostError::Rejected(format!(
+                    "Codex thread {thread} is blocked on {}, not {interaction}",
+                    front.interaction.id
+                )));
+            }
+            let encoded = encode_codex_approval_result_with_request(
+                &front.method,
+                resolution,
+                front.requested_permissions.as_ref(),
+            )?;
+            let rpc_id = front.rpc_id.clone();
+            approvals.pop_front();
+            let next = approvals.front().map(|p| p.interaction.clone());
+            (rpc_id, encoded, next)
+        };
+
+        // Emit next Blocked or Working before sending approval response so turn/completed strictly follows it.
+        match next_blocked {
+            Some(next_interaction) => {
+                worker.emit_activity(
+                    Activity::Blocked {
+                        interaction: next_interaction,
+                    },
+                    false,
+                );
+            }
+            None => {
+                worker.emit_activity(Activity::Working, false);
+            }
+        }
         worker.rpc_respond(rpc_id, result).await?;
         Ok(())
     }
@@ -1434,11 +1736,12 @@ impl CodexBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let turn_id = worker
-            .active_turn_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let turn_id = {
+            let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+            ts.in_flight = false;
+            ts.queued_turns.clear();
+            ts.active_turn_id.take()
+        };
 
         if let (Some(ctid), Some(tid)) = (codex_tid, turn_id) {
             let _ = worker
@@ -1508,6 +1811,16 @@ impl CodexBridge {
                 thread.clone(),
                 Some(w.attempt),
             ))),
+            Some(w) if w.process_dead.load(Ordering::Acquire) => {
+                Ok(Some(Observation::activity_with_bounds(
+                    Activity::Errored {
+                        error: "native Codex app-server process exited".into(),
+                    },
+                    thread.clone(),
+                    None,
+                    Vec::new(),
+                )))
+            }
             Some(_) => Ok(None),
             None => {
                 revoke_native_worker_token(self.cfg.state_dir.as_deref(), thread);
@@ -1540,6 +1853,7 @@ impl CodexBridge {
 }
 
 async fn run_codex_stdout_reader(
+    weak_bridge: Weak<CodexBridge>,
     worker: Arc<CodexWorkerState>,
     stdout: tokio::process::ChildStdout,
     stderr_task: tokio::task::JoinHandle<String>,
@@ -1560,7 +1874,7 @@ async fn run_codex_stdout_reader(
                 let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
-                handle_codex_message(&worker, &val);
+                handle_codex_message(&weak_bridge, &worker, &val);
             }
             BoundedLine::Oversized(total) => {
                 worker
@@ -1586,6 +1900,7 @@ async fn run_codex_stdout_reader(
         return;
     }
 
+    worker.process_dead.store(true, Ordering::Release);
     worker
         .stdin_tx
         .lock()
@@ -1611,16 +1926,22 @@ async fn run_codex_stdout_reader(
         return;
     }
 
+    let had_in_flight_or_queued = {
+        let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+        let active = ts.in_flight || ts.active_turn_id.is_some() || !ts.queued_turns.is_empty();
+        ts.in_flight = false;
+        ts.active_turn_id = None;
+        ts.queued_turns.clear();
+        active
+    };
+
     let already_terminal = {
         let log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
-        matches!(
-            log.activity,
-            Activity::Refused { .. } | Activity::Errored { .. } | Activity::Idle
-        ) && worker
-            .active_turn_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none()
+        !had_in_flight_or_queued
+            && matches!(
+                log.activity,
+                Activity::Refused { .. } | Activity::Errored { .. } | Activity::Idle
+            )
     };
     if already_terminal {
         return;
@@ -1644,30 +1965,85 @@ async fn run_codex_stdout_reader(
     worker.emit_activity(act, true);
 }
 
-fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
+fn record_turn_started_wire_ordered(
+    worker: &Arc<CodexWorkerState>,
+    turn_id: &str,
+    status: Option<&str>,
+) {
+    let push_started = {
+        let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+        if ts.completed_turns.contains(turn_id) {
+            return;
+        }
+        let terminal = status.is_some_and(|s| matches!(s, "completed" | "failed" | "interrupted"));
+        if !terminal {
+            ts.in_flight = true;
+            ts.active_turn_id = Some(turn_id.to_owned());
+        }
+        ts.started_turns.insert(turn_id.to_owned())
+    };
+    if push_started {
+        worker
+            .log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_event(AgentEventKind::TurnStarted);
+    }
+}
+
+fn handle_codex_message(
+    weak_bridge: &Weak<CodexBridge>,
+    worker: &Arc<CodexWorkerState>,
+    val: &Value,
+) {
     let has_method = val.get("method").and_then(|v| v.as_str()).is_some();
     let has_id = val.get("id").is_some_and(|v| !v.is_null());
 
     // Response to a client->server JSON-RPC request.
     if has_id && !has_method {
-        if let Some(id_num) = val.get("id").and_then(|v| v.as_u64())
-            && let Some(tx) = worker
+        if let Some(id_num) = val.get("id").and_then(|v| v.as_u64()) {
+            let was_turn_start = worker
+                .turn_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .turn_start_rpc_ids
+                .remove(&id_num);
+
+            if was_turn_start
+                && val.get("error").is_none_or(Value::is_null)
+                && let Some(res) = val.get("result")
+                && let Some(turn_id) = res
+                    .get("turn")
+                    .and_then(|t| t.get("id"))
+                    .or_else(|| res.get("turnId"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                let status = res
+                    .get("turn")
+                    .and_then(|t| t.get("status"))
+                    .and_then(Value::as_str);
+                record_turn_started_wire_ordered(worker, turn_id, status);
+            }
+
+            if let Some(tx) = worker
                 .pending_rpc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id_num)
-        {
-            if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
-                let msg = err
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| err.to_string());
-                let _ = tx.send(Err(msg));
-            } else if let Some(res) = val.get("result") {
-                let _ = tx.send(Ok(res.clone()));
-            } else {
-                let _ = tx.send(Err("malformed JSON-RPC response missing result".into()));
+            {
+                if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
+                    let msg = err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| err.to_string());
+                    let _ = tx.send(Err(msg));
+                } else if let Some(res) = val.get("result") {
+                    let _ = tx.send(Ok(res.clone()));
+                } else {
+                    let _ = tx.send(Err("malformed JSON-RPC response missing result".into()));
+                }
             }
         }
         return;
@@ -1685,26 +2061,29 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
             let requested_permissions = (method == "item/permissions/requestApproval")
                 .then(|| params.get("permissions").cloned())
                 .flatten();
-            worker
-                .pending_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    interaction.id.clone(),
-                    PendingCodexApproval {
-                        rpc_id,
-                        method: method.to_owned(),
-                        requested_permissions,
-                    },
-                );
+            let publish_now = {
+                let mut approvals = worker
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let was_empty = approvals.is_empty();
+                approvals.push_back(PendingCodexApproval {
+                    interaction: interaction.clone(),
+                    rpc_id,
+                    method: method.to_owned(),
+                    requested_permissions,
+                });
+                was_empty
+            };
             {
                 let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
-                log.pending = Some(interaction.clone());
                 log.push_event(AgentEventKind::Other {
                     bb_type: format!("approval_request: {}", interaction.summary),
                 });
             }
-            worker.emit_activity(Activity::Blocked { interaction }, false);
+            if publish_now {
+                worker.emit_activity(Activity::Blocked { interaction }, false);
+            }
         } else if let Some(tx) = worker
             .stdin_tx
             .lock()
@@ -1728,34 +2107,52 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
 
     // Server->client JSON-RPC notification.
     match method {
+        "serverRequest/resolved" => {
+            let Some(req_id) = params.get("requestId") else {
+                return;
+            };
+            let next_state = {
+                let mut approvals = worker
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let was_front = approvals.front().is_some_and(|p| &p.rpc_id == req_id);
+                approvals.retain(|p| &p.rpc_id != req_id);
+                was_front.then(|| approvals.front().map(|p| p.interaction.clone()))
+            };
+            if let Some(maybe_next) = next_state {
+                match maybe_next {
+                    Some(next_interaction) => {
+                        worker.emit_activity(
+                            Activity::Blocked {
+                                interaction: next_interaction,
+                            },
+                            false,
+                        );
+                    }
+                    None => {
+                        worker.emit_activity(Activity::Working, false);
+                    }
+                }
+            }
+        }
         "turn/started" => {
-            let turn_id = params
+            if let Some(tid) = params
                 .get("turn")
                 .and_then(|t| t.get("id"))
                 .or_else(|| params.get("turnId"))
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            if let Some(tid) = turn_id {
-                *worker
-                    .active_turn_id
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(tid.to_owned());
-                if worker
-                    .started_turns
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(tid.to_owned())
-                {
-                    worker
-                        .log
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_event(AgentEventKind::TurnStarted);
-                }
+                .filter(|s| !s.is_empty())
+            {
+                let status = params
+                    .get("turn")
+                    .and_then(|t| t.get("status"))
+                    .and_then(Value::as_str);
+                record_turn_started_wire_ordered(worker, tid, status);
             }
             let needs_working = {
                 let log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
-                !matches!(log.activity, Activity::Working)
+                !matches!(log.activity, Activity::Working | Activity::Blocked { .. })
             };
             if needs_working {
                 worker.emit_activity(Activity::Working, false);
@@ -1839,10 +2236,20 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
             }
         }
         "turn/completed" => {
-            *worker
-                .active_turn_id
+            worker
+                .pending_approvals
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+
+            let completed_tid = params
+                .get("turn")
+                .and_then(|t| t.get("id"))
+                .or_else(|| params.get("turnId"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+
             let prior_err = worker
                 .last_error
                 .lock()
@@ -1854,6 +2261,50 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
                 log.push_event(AgentEventKind::TurnEnded);
             }
             let activity = classify_codex_turn(params, prior_err.as_ref());
+
+            let next_queued = {
+                let mut ts = worker.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref tid) = completed_tid {
+                    ts.completed_turns.insert(tid.clone());
+                    if ts.active_turn_id.as_deref() == Some(tid.as_str()) {
+                        ts.active_turn_id = None;
+                    }
+                } else {
+                    ts.active_turn_id = None;
+                }
+                if !worker.retiring.load(Ordering::Acquire)
+                    && matches!(activity, Activity::Idle)
+                    && let Some(next) = ts.queued_turns.pop_front()
+                {
+                    ts.in_flight = true;
+                    Some(next)
+                } else {
+                    ts.in_flight = false;
+                    if !matches!(activity, Activity::Idle) {
+                        ts.queued_turns.clear();
+                    }
+                    None
+                }
+            };
+
+            if let Some(next_prompt) = next_queued
+                && let Some(bridge) = weak_bridge.upgrade()
+                && let Some(codex_tid) = worker
+                    .codex_thread_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            {
+                let w = worker.clone();
+                tokio::spawn(async move {
+                    let _guard = w.turn_lock.lock().await;
+                    let _ = bridge
+                        .start_codex_turn_now(&w, codex_tid, &next_prompt)
+                        .await;
+                });
+                return;
+            }
+
             worker.emit_activity(activity, true);
         }
         _ => {}
@@ -2129,7 +2580,7 @@ impl AgentFeed for CodexFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rex_wave_api::wave::NetworkGrant;
+    use rex_wave_api::wave::{FileSystemGrant, NetworkGrant};
 
     #[test]
     fn codex_approval_and_turn_classification_match_schema() {
@@ -2161,6 +2612,14 @@ mod tests {
             .unwrap(),
             json!({"decision": "accept"})
         );
+        assert!(
+            encode_codex_approval_result(
+                "item/commandExecution/requestApproval",
+                &InteractionResolution::RequestAnswer { value: json!({}) },
+            )
+            .is_err(),
+            "empty RequestAnswer object must be rejected"
+        );
         assert_eq!(
             encode_codex_approval_result(
                 "item/fileChange/requestApproval",
@@ -2182,7 +2641,26 @@ mod tests {
             .unwrap(),
             json!({"permissions": {"network": {"enabled": true}}, "scope": "session"})
         );
+        // Explicitly empty granted_permissions must NOT widen back to offered_perms.
         assert_eq!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::AllowOnce {
+                    granted_permissions: Some(GrantedPermissions {
+                        file_system: Some(FileSystemGrant {
+                            read: Vec::new(),
+                            write: Vec::new(),
+                        }),
+                        network: None,
+                    }),
+                },
+                Some(&offered_perms),
+            )
+            .unwrap(),
+            json!({"permissions": {}, "scope": "turn"})
+        );
+        // Granting unrequested network permission must be rejected.
+        assert!(
             encode_codex_approval_result_with_request(
                 "item/permissions/requestApproval",
                 &InteractionResolution::AllowOnce {
@@ -2193,10 +2671,9 @@ mod tests {
                         }),
                     }),
                 },
-                None,
+                Some(&json!({"network": {"enabled": false}})),
             )
-            .unwrap(),
-            json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"})
+            .is_err()
         );
         assert_eq!(
             encode_codex_approval_result_with_request(
@@ -2216,6 +2693,54 @@ mod tests {
         assert!(
             args.iter()
                 .any(|a| a.starts_with("mcp_servers.rex-wave.command="))
+        );
+        assert!(args.iter().any(
+            |a| a.starts_with("mcp_servers.rex-wave.env_vars=") && a.contains("REX_WAVE_TOKEN")
+        ));
+
+        // Token usage prefers `last` occupancy over cumulative `total` and avoids double-counting.
+        let usage = parse_codex_token_usage(&json!({
+            "tokenUsage": {
+                "modelContextWindow": 200000,
+                "total": {
+                    "inputTokens": 250000,
+                    "cachedInputTokens": 100000,
+                    "outputTokens": 50000,
+                    "reasoningOutputTokens": 10000,
+                    "totalTokens": 300000
+                },
+                "last": {
+                    "inputTokens": 10000,
+                    "cachedInputTokens": 4000,
+                    "outputTokens": 2000,
+                    "reasoningOutputTokens": 500,
+                    "totalTokens": 12000
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(usage.used_tokens, 12_000);
+        let cat_sum: u64 = usage
+            .categories
+            .iter()
+            .filter(|c| c.id != "free")
+            .map(|c| c.tokens)
+            .sum();
+        assert_eq!(cat_sum, 12_000);
+
+        assert_eq!(
+            extract_codex_account_identity(&json!({
+                "account": {"type": "chatgpt", "email": "dev@example.com", "planType": "pro"},
+                "requiresOpenaiAuth": true
+            })),
+            Some("dev@example.com".into())
+        );
+        assert_eq!(
+            extract_codex_account_identity(&json!({
+                "account": {"type": "apiKey"},
+                "requiresOpenaiAuth": true
+            })),
+            None
         );
 
         assert!(matches!(
