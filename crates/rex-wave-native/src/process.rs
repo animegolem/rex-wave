@@ -1,6 +1,7 @@
-//! Safe process-group spawn and bounded SIGTERM -> SIGKILL reaping via `rustix`.
+//! Safe process-group spawn and single-use bounded SIGTERM -> SIGKILL reaping via `rustix`.
 
 use rex_wave_waves::HostError;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, Command};
@@ -9,23 +10,50 @@ pub const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(2);
 const POLL_STEP: Duration = Duration::from_millis(20);
 const POST_KILL_WAIT: Duration = Duration::from_millis(500);
 
-/// Tracks a spawned child process and its process-group ID, sending `SIGKILL`
-/// to the process group on drop if the worker was never explicitly reaped.
+/// Single-use process-group ownership slot shared across the worker state,
+/// active `LiveChild`, and any cancellation/drop guard so at most one cleanup
+/// path can claim and signal the numeric PGID.
+pub type PgidSlot = Arc<Mutex<Option<i32>>>;
+
+pub fn new_pgid_slot(pgid: Option<i32>) -> PgidSlot {
+    Arc::new(Mutex::new(pgid))
+}
+
+pub fn claim_pgid_slot(slot: &PgidSlot) -> Option<i32> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+pub fn claim_and_kill_pgid(slot: &PgidSlot) {
+    if let Some(pgid) = claim_pgid_slot(slot) {
+        kill_process_group_now(Some(pgid));
+    }
+}
+
+/// Tracks a spawned child process and its shared single-use [`PgidSlot`],
+/// sending `SIGKILL` to the process group on drop if no caller claimed it yet.
 pub struct LiveChild {
     pub child: Child,
-    pub pgid: Option<i32>,
+    pub pgid_slot: PgidSlot,
     pub generation: u64,
     reaped: bool,
 }
 
 impl LiveChild {
     pub fn new(child: Child, pgid: Option<i32>, generation: u64) -> Self {
+        Self::with_slot(child, new_pgid_slot(pgid), generation)
+    }
+
+    pub fn with_slot(child: Child, pgid_slot: PgidSlot, generation: u64) -> Self {
         Self {
             child,
-            pgid,
+            pgid_slot,
             generation,
             reaped: false,
         }
+    }
+
+    pub fn claim_pgid(&self) -> Option<i32> {
+        claim_pgid_slot(&self.pgid_slot)
     }
 
     pub fn mark_reaped(&mut self) {
@@ -35,8 +63,10 @@ impl LiveChild {
 
 impl Drop for LiveChild {
     fn drop(&mut self) {
+        if let Some(pgid) = self.claim_pgid() {
+            kill_process_group_now(Some(pgid));
+        }
         if !self.reaped {
-            kill_process_group_now(self.pgid);
             let _ = self.child.start_kill();
         }
     }
@@ -92,12 +122,14 @@ pub fn kill_process_group_now(pgid: Option<i32>) {
     let _ = pgid;
 }
 
-/// Terminates the process group (`SIGTERM` -> `grace` -> `SIGKILL`) and reaps `live.child`.
+/// Claims `live`'s single-use PGID, terminates the process group
+/// (`SIGTERM` -> `grace` -> `SIGKILL`), and reaps `live.child`.
 pub async fn terminate_process_group(live: &mut LiveChild, grace: Duration) {
     let deadline = Instant::now() + grace;
+    let claimed_pgid = live.claim_pgid();
 
     #[cfg(unix)]
-    if let Some(pgid) = live.pgid {
+    if let Some(pgid) = claimed_pgid {
         let _ = signal_process_group(pgid, rustix::process::Signal::TERM);
     }
 
@@ -110,14 +142,14 @@ pub async fn terminate_process_group(live: &mut LiveChild, grace: Duration) {
     };
 
     if !leader_exited {
-        kill_process_group_now(live.pgid);
+        kill_process_group_now(claimed_pgid);
         let _ = live.child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), live.child.wait()).await;
         live.mark_reaped();
     }
 
     #[cfg(unix)]
-    if let Some(pgid) = live.pgid {
+    if let Some(pgid) = claimed_pgid {
         while process_group_alive(pgid) && Instant::now() < deadline {
             tokio::time::sleep(POLL_STEP).await;
         }

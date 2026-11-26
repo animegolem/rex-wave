@@ -468,7 +468,10 @@ impl AgentInspector {
     }
 
     fn coalesces_assistant_deltas(&self) -> bool {
-        self.page.thread.runner_kind() == rex_wave_api::RunnerKind::Acp
+        matches!(
+            self.page.thread.runner_kind(),
+            rex_wave_api::RunnerKind::Acp | rex_wave_api::RunnerKind::Codex
+        )
     }
 
     /// Returns events with consecutive ACP `agent_message_chunk` items coalesced

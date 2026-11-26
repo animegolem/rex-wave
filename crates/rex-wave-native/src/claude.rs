@@ -1,15 +1,19 @@
 //! Native Claude Code `stream-json` runner (`ClaudeBridge`, `ClaudeHost`, `ClaudeFeed`).
 
 use crate::common::{
-    ErasedBackend, ObserverItem, ThreadEventLog, flush_observer, format_thread_id,
-    parse_prefixed_thread_id, provision_native_worker_token, revoke_native_worker_token,
-    spawn_worker_observer, truncate_summary,
+    BoundedLine, ErasedBackend, MAX_STDOUT_LINE_BYTES, ObserverItem, StdinLine, ThreadEventLog,
+    WorkerRegistry, flush_observer, format_thread_id, parse_prefixed_thread_id,
+    provision_native_worker_token, read_bounded_line, reject_non_empty_granted_permissions,
+    revoke_native_worker_token, scrub_daemon_env, spawn_stdin_writer, spawn_worker_observer,
+    truncate_summary, write_stdin_line,
 };
 use crate::process::{
-    DEFAULT_RETIRE_GRACE, LiveChild, spawn_in_process_group, spawn_stderr_drainer,
-    terminate_process_group,
+    DEFAULT_RETIRE_GRACE, LiveChild, PgidSlot, claim_and_kill_pgid, new_pgid_slot,
+    spawn_in_process_group, spawn_stderr_drainer, terminate_process_group,
 };
 use crate::workspace::resolve_worker_workspace;
+use futures_util::future::join_all;
+use rex_wave_api::config::RexConfig;
 use rex_wave_api::read::{
     AgentEventKind, ContextCategory, ContextCategoryKind, ThreadContextUsage, ThreadPageView,
 };
@@ -24,7 +28,7 @@ use rex_wave_api::{
 };
 use rex_wave_runtime::{AgentFeed, BoxFut, BridgeBackend, Router};
 use rex_wave_transport::WORKER_THREAD_ENV;
-use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
+use rex_wave_waves::{AgentHost, HostError, SpawnRequest, expand_tilde};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,12 +36,12 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::BufReader;
+use tokio::process::Command;
+use tokio::sync::{mpsc, watch};
 
 pub const CLAUDE_BIN_ENV: &str = "REX_WAVE_CLAUDE_BIN";
-const MAX_STDERR_BYTES: usize = 4096;
+const MAX_STDERR_BYTES: usize = 8192;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeRunnerConfig {
@@ -50,6 +54,7 @@ pub struct ClaudeRunnerConfig {
     pub retire_grace: Duration,
     pub system_principal: Principal,
     pub extra_args: Vec<String>,
+    pub config_rx: Option<watch::Receiver<RexConfig>>,
 }
 
 impl Default for ClaudeRunnerConfig {
@@ -76,6 +81,7 @@ impl ClaudeRunnerConfig {
                 part: SystemPart::WaveConductor,
             },
             extra_args: Vec::new(),
+            config_rx: None,
         }
     }
 
@@ -122,6 +128,27 @@ impl ClaudeRunnerConfig {
     pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
         self.extra_args = args;
         self
+    }
+
+    pub fn with_config_watch(mut self, rx: watch::Receiver<RexConfig>) -> Self {
+        self.config_rx = Some(rx);
+        self
+    }
+
+    pub fn effective_bin(&self) -> PathBuf {
+        if let Some(ref rx) = self.config_rx
+            && let Some(raw) = rx
+                .borrow()
+                .harnesses
+                .claude
+                .binary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return expand_tilde(raw);
+        }
+        self.bin.clone()
     }
 }
 
@@ -226,6 +253,21 @@ pub fn encode_claude_user_turn(text: &str) -> String {
     .to_string()
 }
 
+fn filter_session_permission_suggestions(permission_suggestions: Option<&Value>) -> Vec<Value> {
+    let Some(arr) = permission_suggestions.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|entry| {
+            entry
+                .get("destination")
+                .and_then(Value::as_str)
+                .is_none_or(|d| d.trim().eq_ignore_ascii_case("session"))
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn encode_claude_control_response(
     request_id: &str,
     resolution: &InteractionResolution,
@@ -233,7 +275,13 @@ pub fn encode_claude_control_response(
     permission_suggestions: Option<&Value>,
 ) -> Result<String, HostError> {
     let inner = match resolution {
-        InteractionResolution::AllowOnce { .. } => {
+        InteractionResolution::AllowOnce {
+            granted_permissions,
+        } => {
+            reject_non_empty_granted_permissions(
+                granted_permissions.as_ref(),
+                "Claude stream-json",
+            )?;
             let input_obj = if orig_input.is_object() {
                 orig_input.clone()
             } else {
@@ -244,7 +292,20 @@ pub fn encode_claude_control_response(
                 "updatedInput": input_obj,
             })
         }
-        InteractionResolution::AllowForSession { .. } => {
+        InteractionResolution::AllowForSession {
+            granted_permissions,
+        } => {
+            reject_non_empty_granted_permissions(
+                granted_permissions.as_ref(),
+                "Claude stream-json",
+            )?;
+            let session_suggestions = filter_session_permission_suggestions(permission_suggestions);
+            if session_suggestions.is_empty() {
+                return Err(HostError::Rejected(
+                    "Claude control_request did not offer session-scoped permission_suggestions; use AllowOnce or Deny"
+                        .into(),
+                ));
+            }
             let input_obj = if orig_input.is_object() {
                 orig_input.clone()
             } else {
@@ -253,9 +314,10 @@ pub fn encode_claude_control_response(
             let mut obj = Map::new();
             obj.insert("behavior".into(), Value::String("allow".into()));
             obj.insert("updatedInput".into(), input_obj);
-            if let Some(sugg) = permission_suggestions.filter(|v| v.is_array()) {
-                obj.insert("updatedPermissions".into(), sugg.clone());
-            }
+            obj.insert(
+                "updatedPermissions".into(),
+                Value::Array(session_suggestions),
+            );
             Value::Object(obj)
         }
         InteractionResolution::Deny => json!({
@@ -263,14 +325,12 @@ pub fn encode_claude_control_response(
             "message": "Denied by operator",
         }),
         InteractionResolution::RequestAnswer { value } => {
-            if value.is_object() {
-                value.clone()
-            } else {
-                json!({
-                    "behavior": "allow",
-                    "updatedInput": {},
-                })
+            if !value.is_object() {
+                return Err(HostError::Rejected(
+                    "Claude stream-json RequestAnswer payload must be a JSON object".into(),
+                ));
             }
+            value.clone()
         }
         InteractionResolution::UserAnswer { .. }
         | InteractionResolution::PluginSubmitted { .. } => {
@@ -290,6 +350,18 @@ pub fn encode_claude_control_response(
         }
     })
     .to_string())
+}
+
+fn encode_claude_control_error(request_id: &str, message: &str) -> String {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": message,
+        }
+    })
+    .to_string()
 }
 
 pub fn parse_claude_usage(val: &Value) -> Option<ThreadContextUsage> {
@@ -519,40 +591,6 @@ fn extract_tool_result_summary(content: Option<&Value>) -> String {
     truncate_summary(&val.to_string(), 240)
 }
 
-type StdinLine = (String, oneshot::Sender<Result<(), String>>);
-
-fn spawn_stdin_writer(mut stdin: ChildStdin) -> mpsc::UnboundedSender<StdinLine> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<StdinLine>();
-    tokio::spawn(async move {
-        while let Some((line, reply)) = rx.recv().await {
-            let mut payload = line.into_bytes();
-            payload.push(b'\n');
-            let res = match stdin.write_all(&payload).await {
-                Ok(()) => stdin.flush().await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            let failed = res.is_err();
-            let _ = reply.send(res);
-            if failed {
-                break;
-            }
-        }
-    });
-    tx
-}
-
-async fn write_stdin_line(
-    tx: &mpsc::UnboundedSender<StdinLine>,
-    line: String,
-) -> Result<(), String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send((line, reply_tx))
-        .map_err(|_| "Claude stdin writer closed".to_owned())?;
-    reply_rx
-        .await
-        .map_err(|_| "Claude stdin writer dropped before flushing".to_owned())?
-}
-
 struct PendingClaudeControl {
     orig_input: Value,
     permission_suggestions: Option<Value>,
@@ -563,6 +601,7 @@ struct ClaudeWorkerState {
     attempt: u32,
     req: SpawnRequest,
     cwd: PathBuf,
+    state_dir: Option<PathBuf>,
     worker_token: Option<String>,
     log: Arc<Mutex<ThreadEventLog>>,
     observer: mpsc::UnboundedSender<ObserverItem>,
@@ -637,12 +676,42 @@ impl ClaudeWorkerState {
     }
 }
 
+struct ClaudeSpawnGuard {
+    state_dir: Option<PathBuf>,
+    thread: HostThreadId,
+    worker: Arc<ClaudeWorkerState>,
+    pgid_slot: PgidSlot,
+    armed: bool,
+}
+
+impl ClaudeSpawnGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClaudeSpawnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.worker.retiring.store(true, Ordering::Release);
+        self.worker
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        claim_and_kill_pgid(&self.pgid_slot);
+        revoke_native_worker_token(self.state_dir.as_deref(), &self.thread);
+    }
+}
+
 /// Core bridge managing native Claude `stream-json` worker child processes.
 pub struct ClaudeBridge {
     cfg: ClaudeRunnerConfig,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
-    workers_by_thread: Mutex<HashMap<HostThreadId, Arc<ClaudeWorkerState>>>,
-    workers_by_role: Mutex<HashMap<(WaveSlug, RoleName), Arc<ClaudeWorkerState>>>,
+    registry: Mutex<WorkerRegistry<ClaudeWorkerState>>,
+    spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ClaudeBridge {
@@ -650,8 +719,8 @@ impl ClaudeBridge {
         Arc::new(Self {
             cfg,
             backend: OnceLock::new(),
-            workers_by_thread: Mutex::new(HashMap::new()),
-            workers_by_role: Mutex::new(HashMap::new()),
+            registry: Mutex::new(WorkerRegistry::default()),
+            spawn_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -667,33 +736,37 @@ impl ClaudeBridge {
         self.attach_backend(router);
     }
 
-    /// Gracefully terminates all live Claude worker process groups and revokes their tokens.
+    fn thread_spawn_lock(&self, thread: &HostThreadId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.spawn_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(thread.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Gracefully terminates all live Claude worker process groups concurrently and revokes their tokens.
     pub async fn shutdown(&self) {
-        let threads: Vec<HostThreadId> = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.keys().cloned().collect()
-        };
-        for tid in threads {
-            let _ = self.retire_worker(&tid).await;
-        }
+        let threads = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .all_threads();
+        join_all(threads.iter().map(|tid| self.retire_worker(tid))).await;
     }
 
     fn spawn_process_for_worker(
         &self,
         worker: &Arc<ClaudeWorkerState>,
         resume_session_id: Option<&str>,
-    ) -> Result<(LiveChild, mpsc::UnboundedSender<StdinLine>), HostError> {
+    ) -> Result<(LiveChild, PgidSlot, mpsc::UnboundedSender<StdinLine>), HostError> {
         let args = build_claude_args(&self.cfg, &worker.req, resume_session_id);
-        let mut cmd = Command::new(&self.cfg.bin);
+        let mut cmd = Command::new(self.cfg.effective_bin());
+        scrub_daemon_env(&mut cmd);
         cmd.args(&args)
             .current_dir(&worker.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_remove("T3CODE_THREAD_ID")
             .env("BELL_GUARD", "1")
             .env(WORKER_THREAD_ENV, worker.thread.as_str());
 
@@ -705,39 +778,43 @@ impl ClaudeBridge {
         }
 
         let (mut child, pgid) = spawn_in_process_group(&mut cmd)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HostError::Unreachable("Claude child stdin pipe unavailable".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HostError::Unreachable("Claude child stdout pipe unavailable".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| HostError::Unreachable("Claude child stderr pipe unavailable".into()))?;
-
+        let pgid_slot = new_pgid_slot(pgid);
         let generation = worker.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let stdin_tx = spawn_stdin_writer(stdin);
+        let stdin_opt = child.stdin.take();
+        let stdout_opt = child.stdout.take();
+        let stderr_opt = child.stderr.take();
+        let live = LiveChild::with_slot(child, pgid_slot.clone(), generation);
+
+        let (Some(stdin), Some(stdout), Some(stderr)) = (stdin_opt, stdout_opt, stderr_opt) else {
+            drop(live);
+            return Err(HostError::Unreachable(
+                "Claude child stdio pipes unavailable".into(),
+            ));
+        };
+
+        let stdin_tx = spawn_stdin_writer(stdin, "Claude");
         let stderr_task = spawn_stderr_drainer(stderr, MAX_STDERR_BYTES);
 
         let reader_worker = worker.clone();
+        let reader_pgid = pgid_slot.clone();
         tokio::spawn(async move {
-            run_claude_stdout_reader(reader_worker, stdout, stderr_task, generation).await;
+            run_claude_stdout_reader(reader_worker, stdout, stderr_task, generation, reader_pgid)
+                .await;
         });
 
-        Ok((LiveChild::new(child, pgid, generation), stdin_tx))
+        Ok((live, pgid_slot, stdin_tx))
     }
 
     async fn spawn_worker(&self, req: SpawnRequest) -> Result<HostThreadId, HostError> {
         let thread = claude_thread_id(&req.wave, &req.role, req.attempt)?;
+        let spawn_lock = self.thread_spawn_lock(&thread);
+        let _spawn_guard = spawn_lock.lock().await;
+
         if let Some(existing) = self
-            .workers_by_thread
+            .registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&thread)
-            .cloned()
+            .get_thread(&thread)
             && !existing.retiring.load(Ordering::Acquire)
             && !existing.retired.load(Ordering::Acquire)
         {
@@ -774,6 +851,7 @@ impl ClaudeBridge {
             attempt: req.attempt,
             req,
             cwd,
+            state_dir: self.cfg.state_dir.clone(),
             worker_token,
             log,
             observer,
@@ -791,12 +869,20 @@ impl ClaudeBridge {
             turn_lock: tokio::sync::Mutex::new(()),
         });
 
-        let (mut live, stdin_tx) = match self.spawn_process_for_worker(&worker, None) {
-            Ok(pair) => pair,
+        let (mut live, pgid_slot, stdin_tx) = match self.spawn_process_for_worker(&worker, None) {
+            Ok(triple) => triple,
             Err(err) => {
                 revoke_native_worker_token(self.cfg.state_dir.as_deref(), &thread);
                 return Err(err);
             }
+        };
+
+        let mut cleanup_guard = ClaudeSpawnGuard {
+            state_dir: self.cfg.state_dir.clone(),
+            thread: thread.clone(),
+            worker: worker.clone(),
+            pgid_slot,
+            armed: true,
         };
 
         let generation = live.generation;
@@ -812,9 +898,14 @@ impl ClaudeBridge {
             log.push_event(AgentEventKind::TurnStarted);
         }
 
-        if let Err(err) =
-            write_stdin_line(&stdin_tx, encode_claude_user_turn(&initial_prompt)).await
+        if let Err(err) = write_stdin_line(
+            &stdin_tx,
+            encode_claude_user_turn(&initial_prompt),
+            "Claude",
+        )
+        .await
         {
+            cleanup_guard.disarm();
             worker.retiring.store(true, Ordering::Release);
             drop(stdin_tx);
             worker
@@ -835,19 +926,16 @@ impl ClaudeBridge {
         }
 
         {
-            let mut by_thread = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            by_thread.insert(thread.clone(), worker.clone());
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.insert_live(
+                thread.clone(),
+                worker.req.wave.clone(),
+                worker.req.role.clone(),
+                worker.attempt,
+                worker,
+            );
         }
-        {
-            let mut by_role = self
-                .workers_by_role
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            by_role.insert((worker.req.wave.clone(), worker.req.role.clone()), worker);
-        }
+        cleanup_guard.disarm();
 
         Ok(thread)
     }
@@ -856,21 +944,24 @@ impl ClaudeBridge {
         &self,
         thread: &HostThreadId,
         body: &Body,
-        _mode: SteerDeliveryMode,
+        mode: SteerDeliveryMode,
     ) -> Result<(), HostError> {
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        }
-        .ok_or_else(|| HostError::Rejected(format!("unknown Claude thread {thread}")))?;
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread)
+            .ok_or_else(|| HostError::Rejected(format!("unknown Claude thread {thread}")))?;
 
         let _turn_guard = worker.turn_lock.lock().await;
         if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
             return Err(HostError::Rejected(format!(
                 "Claude thread {thread} is retired"
+            )));
+        }
+        if mode == SteerDeliveryMode::Start && worker.turn_in_flight.load(Ordering::Acquire) {
+            return Err(HostError::Rejected(format!(
+                "Claude thread {thread} already has an active turn; use Steer or Auto"
             )));
         }
 
@@ -907,7 +998,9 @@ impl ClaudeBridge {
 
         let mut sent = false;
         if let Some(tx) = existing_stdin
-            && write_stdin_line(&tx, prompt_line.clone()).await.is_ok()
+            && write_stdin_line(&tx, prompt_line.clone(), "Claude")
+                .await
+                .is_ok()
         {
             sent = true;
         }
@@ -930,7 +1023,6 @@ impl ClaudeBridge {
                 }
             };
 
-            // Reap any stale child handle before spawning the resumed session.
             if let Some(mut old_live) = worker.live_child.lock().await.take() {
                 terminate_process_group(&mut old_live, Duration::from_millis(200)).await;
             }
@@ -942,9 +1034,9 @@ impl ClaudeBridge {
                 )));
             }
 
-            let (mut new_live, new_stdin) =
+            let (mut new_live, _pgid_slot, new_stdin) =
                 match self.spawn_process_for_worker(&worker, Some(&session_id)) {
-                    Ok(pair) => pair,
+                    Ok(triple) => triple,
                     Err(err) => {
                         worker.turn_in_flight.store(false, Ordering::Release);
                         worker.emit_activity(
@@ -975,7 +1067,7 @@ impl ClaudeBridge {
                 }
                 *child_guard = Some(new_live);
             }
-            if let Err(err) = write_stdin_line(&new_stdin, prompt_line).await {
+            if let Err(err) = write_stdin_line(&new_stdin, prompt_line, "Claude").await {
                 let msg = format!("write resumed prompt to Claude stdin: {err}");
                 worker.turn_in_flight.store(false, Ordering::Release);
                 worker.emit_activity(Activity::Errored { error: msg.clone() }, false);
@@ -995,24 +1087,33 @@ impl ClaudeBridge {
         Ok(())
     }
 
-    async fn resolve_worker(
+    fn validate_resolve_worker(
         &self,
         thread: &HostThreadId,
         interaction: &HostInteractionId,
         resolution: &InteractionResolution,
-    ) -> Result<(), HostError> {
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        }
-        .ok_or_else(|| HostError::Rejected(format!("unknown Claude thread {thread}")))?;
+    ) -> Result<(Arc<ClaudeWorkerState>, String), HostError> {
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread)
+            .ok_or_else(|| HostError::Rejected(format!("unknown Claude thread {thread}")))?;
 
         if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
             return Err(HostError::Rejected(format!(
                 "Claude thread {thread} is retired"
+            )));
+        }
+
+        if worker
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return Err(HostError::Unreachable(format!(
+                "Claude thread {thread} stdin is closed"
             )));
         }
 
@@ -1034,6 +1135,18 @@ impl ClaudeBridge {
             )?
         };
 
+        Ok((worker, response_line))
+    }
+
+    async fn resolve_worker(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> Result<(), HostError> {
+        let (worker, response_line) =
+            self.validate_resolve_worker(thread, interaction, resolution)?;
+
         let stdin_tx = worker
             .stdin_tx
             .lock()
@@ -1052,7 +1165,7 @@ impl ClaudeBridge {
         // Emit Working before unblocking the child so subsequent result observations strictly follow it.
         worker.emit_activity(Activity::Working, false);
 
-        write_stdin_line(&stdin_tx, response_line)
+        write_stdin_line(&stdin_tx, response_line, "Claude")
             .await
             .map_err(|e| HostError::Unreachable(format!("write Claude control_response: {e}")))?;
 
@@ -1062,15 +1175,17 @@ impl ClaudeBridge {
     async fn retire_worker(&self, thread: &HostThreadId) -> Result<(), HostError> {
         revoke_native_worker_token(self.cfg.state_dir.as_deref(), thread);
 
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        };
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread);
 
         let Some(worker) = worker else {
+            self.spawn_locks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(thread);
             return Ok(());
         };
 
@@ -1092,8 +1207,18 @@ impl ClaudeBridge {
 
         {
             let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
-            log.pending = None;
+            log.trim_archived();
         }
+        {
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.mark_archived(thread, |w| {
+                (w.req.wave.clone(), w.req.role.clone(), w.attempt)
+            });
+        }
+        self.spawn_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(thread);
 
         if !worker.retired.swap(true, Ordering::AcqRel) {
             let _ = worker
@@ -1112,13 +1237,11 @@ impl ClaudeBridge {
         &self,
         thread: &HostThreadId,
     ) -> Result<Option<Observation>, HostError> {
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        };
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread);
         match worker {
             Some(w) if w.retired.load(Ordering::Acquire) => Ok(Some(Observation::archived_for(
                 thread.clone(),
@@ -1144,11 +1267,10 @@ impl ClaudeBridge {
         wave: &WaveSlug,
         role: &RoleName,
     ) -> Result<Arc<Mutex<ThreadEventLog>>, ApiError> {
-        let map = self
-            .workers_by_role
+        self.registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.get(&(wave.clone(), role.clone()))
+            .unwrap_or_else(|e| e.into_inner())
+            .get_role(wave, role)
             .map(|w| w.log.clone())
             .ok_or_else(|| ApiError::NotFound {
                 what: format!("Claude worker @{wave}/{role}"),
@@ -1161,19 +1283,36 @@ async fn run_claude_stdout_reader(
     stdout: tokio::process::ChildStdout,
     stderr_task: tokio::task::JoinHandle<String>,
     generation: u64,
+    pgid_slot: PgidSlot,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut scratch = Vec::with_capacity(4096);
     let mut prior_refusal: Option<String> = None;
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    while let Ok(Some(item)) =
+        read_bounded_line(&mut reader, &mut scratch, MAX_STDOUT_LINE_BYTES).await
+    {
+        match item {
+            BoundedLine::Line(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                handle_claude_line(&worker, &val, &mut prior_refusal);
+            }
+            BoundedLine::Oversized(total) => {
+                worker
+                    .log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_event(AgentEventKind::Other {
+                        bb_type: format!("oversized_stdout_line_dropped: {total} bytes"),
+                    });
+            }
         }
-        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        handle_claude_line(&worker, &val, &mut prior_refusal);
     }
 
     let stderr_tail = tokio::time::timeout(Duration::from_millis(500), stderr_task)
@@ -1202,8 +1341,10 @@ async fn run_claude_stdout_reader(
                     .ok()
                     .and_then(|r| r.ok());
                 live.mark_reaped();
+                claim_and_kill_pgid(&pgid_slot);
                 st
             } else {
+                claim_and_kill_pgid(&pgid_slot);
                 None
             }
         } else {
@@ -1213,6 +1354,15 @@ async fn run_claude_stdout_reader(
 
     if worker.retiring.load(Ordering::Acquire) {
         return;
+    }
+
+    let can_resume = worker
+        .session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if !can_resume {
+        revoke_native_worker_token(worker.state_dir.as_deref(), &worker.thread);
     }
 
     let mid_turn = worker.turn_in_flight.swap(false, Ordering::AcqRel);
@@ -1402,9 +1552,35 @@ fn handle_claude_line(
             let req_obj = val.get("request").unwrap_or(val);
             let subtype = req_obj.get("subtype").and_then(|v| v.as_str());
             if subtype != Some("can_use_tool") && req_obj.get("tool_name").is_none() {
+                if let Some(tx) = worker
+                    .stdin_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|(_, tx)| tx.clone())
+                {
+                    let err_line = encode_claude_control_error(
+                        req_id_raw,
+                        "unsupported control_request subtype",
+                    );
+                    let (reply_tx, _) = tokio::sync::oneshot::channel();
+                    let _ = tx.send((err_line, reply_tx));
+                }
                 return;
             }
             let Ok(interaction_id) = HostInteractionId::parse(req_id_raw) else {
+                if let Some(tx) = worker
+                    .stdin_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|(_, tx)| tx.clone())
+                {
+                    let err_line =
+                        encode_claude_control_error(req_id_raw, "invalid control request_id");
+                    let (reply_tx, _) = tokio::sync::oneshot::channel();
+                    let _ = tx.send((err_line, reply_tx));
+                }
                 return;
             };
             let tool_name = req_obj
@@ -1498,6 +1674,19 @@ impl AgentHost for ClaudeHost {
         Box::pin(async move { bridge.tell_worker(&thread, &body, mode).await })
     }
 
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        let res = self
+            .0
+            .validate_resolve_worker(thread, interaction, resolution)
+            .map(|_| ());
+        Box::pin(async move { res })
+    }
+
     fn resolve(
         &self,
         thread: &HostThreadId,
@@ -1577,7 +1766,7 @@ impl AgentFeed for ClaudeFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rex_wave_api::wave::{AgentSpec, Workspace};
+    use rex_wave_api::wave::{AgentSpec, FileSystemGrant, GrantedPermissions, Workspace};
     use rex_wave_api::{ProjectId, ProviderId};
 
     fn sample_req(permission: PermissionMode) -> SpawnRequest {
@@ -1633,6 +1822,80 @@ mod tests {
                 .any(|w| w == ["--permission-mode", "bypassPermissions"])
         );
         assert!(!full_args.iter().any(|a| a == "--permission-prompt-tool"));
+    }
+
+    #[test]
+    fn claude_control_response_enforces_session_scope_and_granted_permissions() {
+        let input = json!({"command": "cargo check"});
+        assert!(
+            encode_claude_control_response(
+                "r1",
+                &InteractionResolution::AllowForSession {
+                    granted_permissions: None
+                },
+                &input,
+                None,
+            )
+            .is_err(),
+            "AllowForSession must fail when no session suggestions were offered"
+        );
+
+        let persistent_only = json!([{"type": "addRules", "destination": "userSettings"}]);
+        assert!(
+            encode_claude_control_response(
+                "r1",
+                &InteractionResolution::AllowForSession {
+                    granted_permissions: None
+                },
+                &input,
+                Some(&persistent_only),
+            )
+            .is_err(),
+            "AllowForSession must not widen to userSettings"
+        );
+
+        let mixed = json!([
+            {"type": "addRules", "destination": "userSettings"},
+            {"type": "addRules", "destination": "session"}
+        ]);
+        let ok_session: Value = serde_json::from_str(
+            &encode_claude_control_response(
+                "r1",
+                &InteractionResolution::AllowForSession {
+                    granted_permissions: None,
+                },
+                &input,
+                Some(&mixed),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ok_session["response"]["response"]["updatedPermissions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let custom_gp = GrantedPermissions {
+            file_system: Some(FileSystemGrant {
+                read: vec!["/etc".into()],
+                write: Vec::new(),
+            }),
+            network: None,
+        };
+        assert!(
+            encode_claude_control_response(
+                "r1",
+                &InteractionResolution::AllowOnce {
+                    granted_permissions: Some(custom_gp),
+                },
+                &input,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -140,6 +140,20 @@ pub fn route_provider_with_config(
         });
     }
 
+    if matches!(
+        default_runner,
+        RunnerKind::Acp | RunnerKind::Claude | RunnerKind::Codex
+    ) && let Some(slot) = HarnessProvider::parse_slot(raw)
+    {
+        let target = rex_wave_api::config::RunnerRoute::Native
+            .resolve_for_provider(slot.slug())
+            .map_err(HostError::Rejected)?;
+        return Ok(RoutedProvider {
+            target,
+            provider: normalize_provider_for_target(raw, target)?,
+        });
+    }
+
     Ok(RoutedProvider {
         target: default_runner,
         provider: normalize_provider_for_target(raw, default_runner)?,

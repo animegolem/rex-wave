@@ -1,22 +1,27 @@
 //! Native Codex `app-server` stdio JSON-RPC 2.0 runner (`CodexBridge`, `CodexHost`, `CodexFeed`).
 
 use crate::common::{
-    ErasedBackend, ObserverItem, ThreadEventLog, flush_observer, format_thread_id,
-    parse_prefixed_thread_id, provision_native_worker_token, revoke_native_worker_token,
-    spawn_worker_observer, truncate_summary,
+    BoundedLine, ErasedBackend, MAX_STDOUT_LINE_BYTES, ObserverItem, StdinLine, ThreadEventLog,
+    WorkerRegistry, flush_observer, format_thread_id, has_non_empty_granted_permissions,
+    parse_prefixed_thread_id, provision_native_worker_token, read_bounded_line,
+    reject_non_empty_granted_permissions, revoke_native_worker_token, scrub_daemon_env,
+    spawn_stdin_writer, spawn_worker_observer, truncate_summary, write_stdin_line,
 };
 use crate::process::{
-    DEFAULT_RETIRE_GRACE, LiveChild, spawn_in_process_group, spawn_stderr_drainer,
-    terminate_process_group,
+    DEFAULT_RETIRE_GRACE, LiveChild, PgidSlot, claim_and_kill_pgid, new_pgid_slot,
+    spawn_in_process_group, spawn_stderr_drainer, terminate_process_group,
 };
 use crate::workspace::resolve_worker_workspace;
+use futures_util::future::join_all;
+use rex_wave_api::config::RexConfig;
 use rex_wave_api::read::{
     AgentEventKind, ContextCategory, ContextCategoryKind, ThreadContextUsage, ThreadPageView,
 };
 use rex_wave_api::room::Body;
 use rex_wave_api::wave::{
-    Activity, InteractionKind, InteractionResolution, Observation, PendingInteraction,
-    PermissionMode, Question, SteerDeliveryMode, is_refusal_error_text, is_refusal_stop_reason,
+    Activity, GrantedPermissions, InteractionKind, InteractionResolution, Observation,
+    PendingInteraction, PermissionMode, Question, SteerDeliveryMode, is_refusal_error_text,
+    is_refusal_stop_reason,
 };
 use rex_wave_api::{
     ApiError, CODEX_THREAD_PREFIX, FrameStream, HostInteractionId, HostSeq, HostThreadId, ModelId,
@@ -24,7 +29,7 @@ use rex_wave_api::{
 };
 use rex_wave_runtime::{AgentFeed, BoxFut, BridgeBackend, Router};
 use rex_wave_transport::WORKER_THREAD_ENV;
-use rex_wave_waves::{AgentHost, HostError, SpawnRequest};
+use rex_wave_waves::{AgentHost, HostError, SpawnRequest, expand_tilde};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,25 +37,27 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::BufReader;
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub const CODEX_BIN_ENV: &str = "REX_WAVE_CODEX_BIN";
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERRUPT_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_STDERR_BYTES: usize = 4096;
+const MAX_STDERR_BYTES: usize = 8192;
 
 #[derive(Clone, Debug)]
 pub struct CodexRunnerConfig {
     pub bin: PathBuf,
     pub state_dir: Option<PathBuf>,
     pub socket_path: Option<PathBuf>,
+    pub rex_wave_bin: Option<PathBuf>,
     pub bb_data_dir: Option<PathBuf>,
     pub retire_grace: Duration,
     pub rpc_timeout: Duration,
     pub system_principal: Principal,
     pub extra_args: Vec<String>,
+    pub config_rx: Option<watch::Receiver<RexConfig>>,
 }
 
 impl Default for CodexRunnerConfig {
@@ -69,6 +76,7 @@ impl CodexRunnerConfig {
             bin,
             state_dir: None,
             socket_path: None,
+            rex_wave_bin: None,
             bb_data_dir: rex_wave_waves::default_bb_data_dir(),
             retire_grace: DEFAULT_RETIRE_GRACE,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
@@ -76,6 +84,7 @@ impl CodexRunnerConfig {
                 part: SystemPart::WaveConductor,
             },
             extra_args: Vec::new(),
+            config_rx: None,
         }
     }
 
@@ -91,6 +100,11 @@ impl CodexRunnerConfig {
 
     pub fn with_socket_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.socket_path = Some(path.into());
+        self
+    }
+
+    pub fn with_rex_wave_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.rex_wave_bin = Some(bin.into());
         self
     }
 
@@ -118,6 +132,46 @@ impl CodexRunnerConfig {
         self.extra_args = args;
         self
     }
+
+    pub fn with_config_watch(mut self, rx: watch::Receiver<RexConfig>) -> Self {
+        self.config_rx = Some(rx);
+        self
+    }
+
+    pub fn effective_bin(&self) -> PathBuf {
+        if let Some(ref rx) = self.config_rx
+            && let Some(raw) = rx
+                .borrow()
+                .harnesses
+                .codex
+                .binary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return expand_tilde(raw);
+        }
+        self.bin.clone()
+    }
+}
+
+pub fn build_codex_args(cfg: &CodexRunnerConfig) -> Vec<String> {
+    let mut args = vec!["app-server".to_owned()];
+    if let (Some(bin), Some(sock)) = (&cfg.rex_wave_bin, &cfg.socket_path)
+        && let (Ok(cmd_lit), Ok(sock_lit)) = (
+            serde_json::to_string(&bin.to_string_lossy()),
+            serde_json::to_string(&sock.to_string_lossy()),
+        )
+    {
+        args.push("-c".to_owned());
+        args.push(format!("mcp_servers.rex-wave.command={cmd_lit}"));
+        args.push("-c".to_owned());
+        args.push(format!(
+            "mcp_servers.rex-wave.args=[\"--socket\", {sock_lit}, \"mcp\", \"--stdio\"]"
+        ));
+    }
+    args.extend(cfg.extra_args.iter().cloned());
+    args
 }
 
 pub fn codex_thread_id(
@@ -382,23 +436,123 @@ pub fn parse_codex_approval_request(
     }
 }
 
+fn encode_codex_granted_profile(gp: &GrantedPermissions) -> Value {
+    let mut out = Map::new();
+    if let Some(ref fs) = gp.file_system {
+        out.insert(
+            "fileSystem".into(),
+            json!({
+                "read": fs.read,
+                "write": fs.write,
+            }),
+        );
+    }
+    if let Some(ref net) = gp.network
+        && let Some(enabled) = net.enabled
+    {
+        out.insert("network".into(), json!({ "enabled": enabled }));
+    }
+    Value::Object(out)
+}
+
 pub fn encode_codex_approval_result(
     method: &str,
     resolution: &InteractionResolution,
 ) -> Result<Value, HostError> {
+    encode_codex_approval_result_with_request(method, resolution, None)
+}
+
+pub fn encode_codex_approval_result_with_request(
+    method: &str,
+    resolution: &InteractionResolution,
+    requested_permissions: Option<&Value>,
+) -> Result<Value, HostError> {
     match method {
-        "item/commandExecution/requestApproval"
-        | "item/fileChange/requestApproval"
-        | "item/permissions/requestApproval" => match resolution {
-            InteractionResolution::AllowOnce { .. } => Ok(json!({ "decision": "accept" })),
-            InteractionResolution::AllowForSession { .. } => {
-                Ok(json!({ "decision": "acceptForSession" }))
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            match resolution {
+                InteractionResolution::AllowOnce {
+                    granted_permissions,
+                } => {
+                    reject_non_empty_granted_permissions(granted_permissions.as_ref(), method)?;
+                    Ok(json!({ "decision": "accept" }))
+                }
+                InteractionResolution::AllowForSession {
+                    granted_permissions,
+                } => {
+                    reject_non_empty_granted_permissions(granted_permissions.as_ref(), method)?;
+                    Ok(json!({ "decision": "acceptForSession" }))
+                }
+                InteractionResolution::Deny => Ok(json!({ "decision": "decline" })),
+                InteractionResolution::RequestAnswer { value } => {
+                    if !value.is_object() {
+                        return Err(HostError::Rejected(format!(
+                            "Codex {method} RequestAnswer must be a JSON object"
+                        )));
+                    }
+                    Ok(value.clone())
+                }
+                _ => Err(HostError::Rejected(format!(
+                    "Codex {method} supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
+                ))),
             }
-            InteractionResolution::Deny => Ok(json!({ "decision": "decline" })),
-            InteractionResolution::RequestAnswer { value } => Ok(value.clone()),
-            _ => Err(HostError::Rejected(format!(
-                "Codex {method} supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
-            ))),
+        }
+        "item/permissions/requestApproval" => match resolution {
+            InteractionResolution::AllowOnce {
+                granted_permissions,
+            } => {
+                let perms = if has_non_empty_granted_permissions(granted_permissions.as_ref()) {
+                    encode_codex_granted_profile(granted_permissions.as_ref().unwrap())
+                } else {
+                    requested_permissions
+                        .filter(|v| v.is_object())
+                        .cloned()
+                        .ok_or_else(|| {
+                            HostError::Rejected(
+                                "Codex item/permissions/requestApproval requires granted_permissions or an offered permission profile"
+                                    .into(),
+                            )
+                        })?
+                };
+                Ok(json!({
+                    "permissions": perms,
+                    "scope": "turn",
+                }))
+            }
+            InteractionResolution::AllowForSession {
+                granted_permissions,
+            } => {
+                let perms = if has_non_empty_granted_permissions(granted_permissions.as_ref()) {
+                    encode_codex_granted_profile(granted_permissions.as_ref().unwrap())
+                } else {
+                    requested_permissions
+                        .filter(|v| v.is_object())
+                        .cloned()
+                        .ok_or_else(|| {
+                            HostError::Rejected(
+                                "Codex item/permissions/requestApproval requires granted_permissions or an offered permission profile"
+                                    .into(),
+                            )
+                        })?
+                };
+                Ok(json!({
+                    "permissions": perms,
+                    "scope": "session",
+                }))
+            }
+            InteractionResolution::Deny => Ok(json!({ "permissions": {} })),
+            InteractionResolution::RequestAnswer { value } => {
+                if !value.is_object() {
+                    return Err(HostError::Rejected(
+                        "Codex item/permissions/requestApproval RequestAnswer must be a JSON object"
+                            .into(),
+                    ));
+                }
+                Ok(value.clone())
+            }
+            _ => Err(HostError::Rejected(
+                "Codex item/permissions/requestApproval supports AllowOnce, AllowForSession, Deny, or RequestAnswer"
+                    .into(),
+            )),
         },
         "item/tool/requestUserInput" => match resolution {
             InteractionResolution::UserAnswer { answers } => {
@@ -417,7 +571,15 @@ pub fn encode_codex_approval_result(
                 }
                 Ok(json!({ "answers": Value::Object(map) }))
             }
-            InteractionResolution::RequestAnswer { value } => Ok(value.clone()),
+            InteractionResolution::RequestAnswer { value } => {
+                if !value.is_object() {
+                    return Err(HostError::Rejected(
+                        "Codex item/tool/requestUserInput RequestAnswer must be a JSON object"
+                            .into(),
+                    ));
+                }
+                Ok(value.clone())
+            }
             _ => Err(HostError::Rejected(
                 "Codex item/tool/requestUserInput requires UserAnswer or RequestAnswer".into(),
             )),
@@ -493,49 +655,17 @@ pub fn classify_codex_turn(params: &Value, prior_error: Option<&Value>) -> Activ
     Activity::Idle
 }
 
-type StdinLine = (String, oneshot::Sender<Result<(), String>>);
-
-fn spawn_stdin_writer(mut stdin: ChildStdin) -> mpsc::UnboundedSender<StdinLine> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<StdinLine>();
-    tokio::spawn(async move {
-        while let Some((line, reply)) = rx.recv().await {
-            let mut payload = line.into_bytes();
-            payload.push(b'\n');
-            let res = match stdin.write_all(&payload).await {
-                Ok(()) => stdin.flush().await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            let failed = res.is_err();
-            let _ = reply.send(res);
-            if failed {
-                break;
-            }
-        }
-    });
-    tx
-}
-
-async fn write_stdin_line(
-    tx: &mpsc::UnboundedSender<StdinLine>,
-    line: String,
-) -> Result<(), String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send((line, reply_tx))
-        .map_err(|_| "Codex stdin writer closed".to_owned())?;
-    reply_rx
-        .await
-        .map_err(|_| "Codex stdin writer dropped before flushing".to_owned())?
-}
-
 struct PendingCodexApproval {
     rpc_id: Value,
     method: String,
+    requested_permissions: Option<Value>,
 }
 
 struct CodexWorkerState {
     thread: HostThreadId,
     attempt: u32,
     req: SpawnRequest,
+    state_dir: Option<PathBuf>,
     log: Arc<Mutex<ThreadEventLog>>,
     observer: mpsc::UnboundedSender<ObserverItem>,
     retiring: AtomicBool,
@@ -550,6 +680,7 @@ struct CodexWorkerState {
     live_child: tokio::sync::Mutex<Option<LiveChild>>,
     pending_rpc: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     pending_approvals: Mutex<HashMap<HostInteractionId, PendingCodexApproval>>,
+    turn_lock: tokio::sync::Mutex<()>,
 }
 
 impl CodexWorkerState {
@@ -609,7 +740,7 @@ impl CodexWorkerState {
                 HostError::Unreachable(format!("Codex thread {} stdin closed", self.thread))
             })?;
 
-        if let Err(err) = write_stdin_line(&stdin_tx, payload).await {
+        if let Err(err) = write_stdin_line(&stdin_tx, payload, "Codex").await {
             self.pending_rpc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -655,7 +786,7 @@ impl CodexWorkerState {
             .ok_or_else(|| {
                 HostError::Unreachable(format!("Codex thread {} stdin closed", self.thread))
             })?;
-        write_stdin_line(&stdin_tx, payload)
+        write_stdin_line(&stdin_tx, payload, "Codex")
             .await
             .map_err(|e| HostError::Unreachable(format!("send Codex notification {method}: {e}")))
     }
@@ -675,7 +806,7 @@ impl CodexWorkerState {
             .ok_or_else(|| {
                 HostError::Unreachable(format!("Codex thread {} stdin closed", self.thread))
             })?;
-        write_stdin_line(&stdin_tx, payload)
+        write_stdin_line(&stdin_tx, payload, "Codex")
             .await
             .map_err(|e| HostError::Unreachable(format!("send Codex approval response: {e}")))
     }
@@ -688,12 +819,43 @@ impl CodexWorkerState {
     }
 }
 
+struct CodexSpawnGuard {
+    state_dir: Option<PathBuf>,
+    thread: HostThreadId,
+    worker: Arc<CodexWorkerState>,
+    pgid_slot: PgidSlot,
+    armed: bool,
+}
+
+impl CodexSpawnGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CodexSpawnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.worker.retiring.store(true, Ordering::Release);
+        self.worker.fail_all_pending_rpc("Codex handshake aborted");
+        self.worker
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        claim_and_kill_pgid(&self.pgid_slot);
+        revoke_native_worker_token(self.state_dir.as_deref(), &self.thread);
+    }
+}
+
 /// Core bridge managing native Codex `app-server` worker child processes.
 pub struct CodexBridge {
     cfg: CodexRunnerConfig,
     backend: OnceLock<Arc<dyn ErasedBackend>>,
-    workers_by_thread: Mutex<HashMap<HostThreadId, Arc<CodexWorkerState>>>,
-    workers_by_role: Mutex<HashMap<(WaveSlug, RoleName), Arc<CodexWorkerState>>>,
+    registry: Mutex<WorkerRegistry<CodexWorkerState>>,
+    spawn_locks: Mutex<HashMap<HostThreadId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl CodexBridge {
@@ -701,8 +863,8 @@ impl CodexBridge {
         Arc::new(Self {
             cfg,
             backend: OnceLock::new(),
-            workers_by_thread: Mutex::new(HashMap::new()),
-            workers_by_role: Mutex::new(HashMap::new()),
+            registry: Mutex::new(WorkerRegistry::default()),
+            spawn_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -718,27 +880,34 @@ impl CodexBridge {
         self.attach_backend(router);
     }
 
+    fn thread_spawn_lock(&self, thread: &HostThreadId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.spawn_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(thread.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Gracefully terminates all live Codex worker process groups concurrently and revokes their tokens.
     pub async fn shutdown(&self) {
-        let threads: Vec<HostThreadId> = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.keys().cloned().collect()
-        };
-        for tid in threads {
-            let _ = self.retire_worker(&tid).await;
-        }
+        let threads = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .all_threads();
+        join_all(threads.iter().map(|tid| self.retire_worker(tid))).await;
     }
 
     async fn spawn_worker(&self, req: SpawnRequest) -> Result<HostThreadId, HostError> {
         let thread = codex_thread_id(&req.wave, &req.role, req.attempt)?;
+        let spawn_lock = self.thread_spawn_lock(&thread);
+        let _spawn_guard = spawn_lock.lock().await;
+
         if let Some(existing) = self
-            .workers_by_thread
+            .registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&thread)
-            .cloned()
+            .get_thread(&thread)
             && !existing.retiring.load(Ordering::Acquire)
             && !existing.retired.load(Ordering::Acquire)
         {
@@ -754,14 +923,14 @@ impl CodexBridge {
         )?;
         let worker_token = provisioned.map(|p| p.token);
 
-        let mut cmd = Command::new(&self.cfg.bin);
-        cmd.arg("app-server")
-            .args(&self.cfg.extra_args)
+        let args = build_codex_args(&self.cfg);
+        let mut cmd = Command::new(self.cfg.effective_bin());
+        scrub_daemon_env(&mut cmd);
+        cmd.args(&args)
             .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_remove("T3CODE_THREAD_ID")
             .env("BELL_GUARD", "1")
             .env(WORKER_THREAD_ENV, thread.as_str());
 
@@ -779,19 +948,19 @@ impl CodexBridge {
                 return Err(err);
             }
         };
+        let pgid_slot = new_pgid_slot(pgid);
+        let stdin_opt = child.stdin.take();
+        let stdout_opt = child.stdout.take();
+        let stderr_opt = child.stderr.take();
+        let live = LiveChild::with_slot(child, pgid_slot.clone(), 1);
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HostError::Unreachable("Codex child stdin pipe unavailable".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HostError::Unreachable("Codex child stdout pipe unavailable".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| HostError::Unreachable("Codex child stderr pipe unavailable".into()))?;
+        let (Some(stdin), Some(stdout), Some(stderr)) = (stdin_opt, stdout_opt, stderr_opt) else {
+            drop(live);
+            revoke_native_worker_token(self.cfg.state_dir.as_deref(), &thread);
+            return Err(HostError::Unreachable(
+                "Codex child stdio pipes unavailable".into(),
+            ));
+        };
 
         let log = Arc::new(Mutex::new(ThreadEventLog::new(
             thread.clone(),
@@ -808,13 +977,14 @@ impl CodexBridge {
             req.attempt,
         );
 
-        let stdin_tx = spawn_stdin_writer(stdin);
+        let stdin_tx = spawn_stdin_writer(stdin, "Codex");
         let stderr_task = spawn_stderr_drainer(stderr, MAX_STDERR_BYTES);
 
         let worker = Arc::new(CodexWorkerState {
             thread: thread.clone(),
             attempt: req.attempt,
             req: req.clone(),
+            state_dir: self.cfg.state_dir.clone(),
             log,
             observer,
             retiring: AtomicBool::new(false),
@@ -826,19 +996,30 @@ impl CodexBridge {
             streamed_items: Mutex::new(HashSet::new()),
             last_error: Mutex::new(None),
             stdin_tx: Mutex::new(Some(stdin_tx)),
-            live_child: tokio::sync::Mutex::new(Some(LiveChild::new(child, pgid, 1))),
+            live_child: tokio::sync::Mutex::new(Some(live)),
             pending_rpc: Mutex::new(HashMap::new()),
             pending_approvals: Mutex::new(HashMap::new()),
+            turn_lock: tokio::sync::Mutex::new(()),
         });
+
+        let mut cleanup_guard = CodexSpawnGuard {
+            state_dir: self.cfg.state_dir.clone(),
+            thread: thread.clone(),
+            worker: worker.clone(),
+            pgid_slot: pgid_slot.clone(),
+            armed: true,
+        };
 
         let reader_worker = worker.clone();
         tokio::spawn(async move {
-            run_codex_stdout_reader(reader_worker, stdout, stderr_task).await;
+            run_codex_stdout_reader(reader_worker, stdout, stderr_task, pgid_slot).await;
         });
 
         let handshake_res = self.run_codex_handshake(&worker, &cwd, &req).await;
         if let Err(err) = handshake_res {
+            cleanup_guard.disarm();
             worker.retiring.store(true, Ordering::Release);
+            worker.fail_all_pending_rpc("Codex handshake failed");
             worker
                 .stdin_tx
                 .lock()
@@ -852,19 +1033,16 @@ impl CodexBridge {
         }
 
         {
-            let mut by_thread = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            by_thread.insert(thread.clone(), worker.clone());
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.insert_live(
+                thread.clone(),
+                req.wave.clone(),
+                req.role.clone(),
+                req.attempt,
+                worker,
+            );
         }
-        {
-            let mut by_role = self
-                .workers_by_role
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            by_role.insert((req.wave.clone(), req.role.clone()), worker);
-        }
+        cleanup_guard.disarm();
 
         Ok(thread)
     }
@@ -1027,15 +1205,14 @@ impl CodexBridge {
         body: &Body,
         mode: SteerDeliveryMode,
     ) -> Result<(), HostError> {
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        }
-        .ok_or_else(|| HostError::Rejected(format!("unknown Codex thread {thread}")))?;
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread)
+            .ok_or_else(|| HostError::Rejected(format!("unknown Codex thread {thread}")))?;
 
+        let _turn_guard = worker.turn_lock.lock().await;
         if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
             return Err(HostError::Rejected(format!(
                 "Codex thread {thread} is retired"
@@ -1057,12 +1234,13 @@ impl CodexBridge {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        let wants_steer = matches!(
-            mode,
-            SteerDeliveryMode::Steer | SteerDeliveryMode::SteerIfActive
-        );
+        if mode == SteerDeliveryMode::Start && active_turn.is_some() {
+            return Err(HostError::Rejected(format!(
+                "Codex thread {thread} already has an active turn; use Steer or Auto"
+            )));
+        }
 
-        if wants_steer && let Some(expected_turn_id) = active_turn {
+        if let Some(expected_turn_id) = active_turn {
             let steer_res = worker
                 .rpc_call(
                     "turn/steer",
@@ -1085,7 +1263,13 @@ impl CodexBridge {
                         });
                     return Ok(());
                 }
-                Err(HostError::Rejected(_)) if mode == SteerDeliveryMode::SteerIfActive => {}
+                Err(HostError::Rejected(_))
+                    if matches!(
+                        mode,
+                        SteerDeliveryMode::Auto
+                            | SteerDeliveryMode::SteerIfActive
+                            | SteerDeliveryMode::QueueIfActive
+                    ) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -1155,24 +1339,33 @@ impl CodexBridge {
         Ok(())
     }
 
-    async fn resolve_worker(
+    fn validate_resolve_worker(
         &self,
         thread: &HostThreadId,
         interaction: &HostInteractionId,
         resolution: &InteractionResolution,
-    ) -> Result<(), HostError> {
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        }
-        .ok_or_else(|| HostError::Rejected(format!("unknown Codex thread {thread}")))?;
+    ) -> Result<(Arc<CodexWorkerState>, Value, Value), HostError> {
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread)
+            .ok_or_else(|| HostError::Rejected(format!("unknown Codex thread {thread}")))?;
 
         if worker.retiring.load(Ordering::Acquire) || worker.retired.load(Ordering::Acquire) {
             return Err(HostError::Rejected(format!(
                 "Codex thread {thread} is retired"
+            )));
+        }
+
+        if worker
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return Err(HostError::Unreachable(format!(
+                "Codex thread {thread} stdin closed"
             )));
         }
 
@@ -1186,9 +1379,25 @@ impl CodexBridge {
                     "no pending Codex approval {interaction} on {thread}"
                 ))
             })?;
-            let encoded = encode_codex_approval_result(&pending.method, resolution)?;
+            let encoded = encode_codex_approval_result_with_request(
+                &pending.method,
+                resolution,
+                pending.requested_permissions.as_ref(),
+            )?;
             (pending.rpc_id.clone(), encoded)
         };
+
+        Ok((worker, rpc_id, result))
+    }
+
+    async fn resolve_worker(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> Result<(), HostError> {
+        let (worker, rpc_id, result) =
+            self.validate_resolve_worker(thread, interaction, resolution)?;
 
         worker
             .pending_approvals
@@ -1204,15 +1413,17 @@ impl CodexBridge {
     async fn retire_worker(&self, thread: &HostThreadId) -> Result<(), HostError> {
         revoke_native_worker_token(self.cfg.state_dir.as_deref(), thread);
 
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        };
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread);
 
         let Some(worker) = worker else {
+            self.spawn_locks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(thread);
             return Ok(());
         };
 
@@ -1257,8 +1468,18 @@ impl CodexBridge {
 
         {
             let mut log = worker.log.lock().unwrap_or_else(|e| e.into_inner());
-            log.pending = None;
+            log.trim_archived();
         }
+        {
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.mark_archived(thread, |w| {
+                (w.req.wave.clone(), w.req.role.clone(), w.attempt)
+            });
+        }
+        self.spawn_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(thread);
 
         if !worker.retired.swap(true, Ordering::AcqRel) {
             let _ = worker
@@ -1277,13 +1498,11 @@ impl CodexBridge {
         &self,
         thread: &HostThreadId,
     ) -> Result<Option<Observation>, HostError> {
-        let worker = {
-            let map = self
-                .workers_by_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(thread).cloned()
-        };
+        let worker = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_thread(thread);
         match worker {
             Some(w) if w.retired.load(Ordering::Acquire) => Ok(Some(Observation::archived_for(
                 thread.clone(),
@@ -1309,11 +1528,10 @@ impl CodexBridge {
         wave: &WaveSlug,
         role: &RoleName,
     ) -> Result<Arc<Mutex<ThreadEventLog>>, ApiError> {
-        let map = self
-            .workers_by_role
+        self.registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.get(&(wave.clone(), role.clone()))
+            .unwrap_or_else(|e| e.into_inner())
+            .get_role(wave, role)
             .map(|w| w.log.clone())
             .ok_or_else(|| ApiError::NotFound {
                 what: format!("Codex worker @{wave}/{role}"),
@@ -1325,17 +1543,35 @@ async fn run_codex_stdout_reader(
     worker: Arc<CodexWorkerState>,
     stdout: tokio::process::ChildStdout,
     stderr_task: tokio::task::JoinHandle<String>,
+    pgid_slot: PgidSlot,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    let mut reader = BufReader::new(stdout);
+    let mut scratch = Vec::with_capacity(4096);
+
+    while let Ok(Some(item)) =
+        read_bounded_line(&mut reader, &mut scratch, MAX_STDOUT_LINE_BYTES).await
+    {
+        match item {
+            BoundedLine::Line(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                handle_codex_message(&worker, &val);
+            }
+            BoundedLine::Oversized(total) => {
+                worker
+                    .log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_event(AgentEventKind::Other {
+                        bb_type: format!("oversized_stdout_line_dropped: {total} bytes"),
+                    });
+            }
         }
-        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        handle_codex_message(&worker, &val);
     }
 
     let stderr_tail = tokio::time::timeout(Duration::from_millis(500), stderr_task)
@@ -1355,6 +1591,8 @@ async fn run_codex_stdout_reader(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
+    // Codex app-server has no post-exit session resume; revoke its bearer token and reap its group.
+    revoke_native_worker_token(worker.state_dir.as_deref(), &worker.thread);
 
     let exit_status = if let Some(mut live) = worker.live_child.lock().await.take() {
         let st = tokio::time::timeout(Duration::from_secs(2), live.child.wait())
@@ -1362,8 +1600,10 @@ async fn run_codex_stdout_reader(
             .ok()
             .and_then(|r| r.ok());
         live.mark_reaped();
+        claim_and_kill_pgid(&pgid_slot);
         st
     } else {
+        claim_and_kill_pgid(&pgid_slot);
         None
     };
 
@@ -1424,9 +1664,10 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
                     .map(str::to_owned)
                     .unwrap_or_else(|| err.to_string());
                 let _ = tx.send(Err(msg));
+            } else if let Some(res) = val.get("result") {
+                let _ = tx.send(Ok(res.clone()));
             } else {
-                let res = val.get("result").cloned().unwrap_or(Value::Null);
-                let _ = tx.send(Ok(res));
+                let _ = tx.send(Err("malformed JSON-RPC response missing result".into()));
             }
         }
         return;
@@ -1441,6 +1682,9 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
     if has_id {
         let rpc_id = val.get("id").cloned().unwrap_or(Value::Null);
         if let Some(interaction) = parse_codex_approval_request(&rpc_id, method, params) {
+            let requested_permissions = (method == "item/permissions/requestApproval")
+                .then(|| params.get("permissions").cloned())
+                .flatten();
             worker
                 .pending_approvals
                 .lock()
@@ -1450,6 +1694,7 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
                     PendingCodexApproval {
                         rpc_id,
                         method: method.to_owned(),
+                        requested_permissions,
                     },
                 );
             {
@@ -1460,6 +1705,23 @@ fn handle_codex_message(worker: &Arc<CodexWorkerState>, val: &Value) {
                 });
             }
             worker.emit_activity(Activity::Blocked { interaction }, false);
+        } else if let Some(tx) = worker
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            let err_payload = json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("unsupported server request method '{method}'"),
+                }
+            })
+            .to_string();
+            let (reply_tx, _) = oneshot::channel();
+            let _ = tx.send((err_payload, reply_tx));
         }
         return;
     }
@@ -1775,6 +2037,19 @@ impl AgentHost for CodexHost {
         Box::pin(async move { bridge.tell_worker(&thread, &body, mode).await })
     }
 
+    fn validate_resolve(
+        &self,
+        thread: &HostThreadId,
+        interaction: &HostInteractionId,
+        resolution: &InteractionResolution,
+    ) -> BoxFut<'_, Result<(), HostError>> {
+        let res = self
+            .0
+            .validate_resolve_worker(thread, interaction, resolution)
+            .map(|_| ());
+        Box::pin(async move { res })
+    }
+
     fn resolve(
         &self,
         thread: &HostThreadId,
@@ -1854,6 +2129,7 @@ impl AgentFeed for CodexFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rex_wave_api::wave::NetworkGrant;
 
     #[test]
     fn codex_approval_and_turn_classification_match_schema() {
@@ -1892,6 +2168,54 @@ mod tests {
             )
             .unwrap(),
             json!({"decision": "decline"})
+        );
+
+        let offered_perms = json!({"network": {"enabled": true}});
+        assert_eq!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::AllowForSession {
+                    granted_permissions: None,
+                },
+                Some(&offered_perms),
+            )
+            .unwrap(),
+            json!({"permissions": {"network": {"enabled": true}}, "scope": "session"})
+        );
+        assert_eq!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::AllowOnce {
+                    granted_permissions: Some(GrantedPermissions {
+                        file_system: None,
+                        network: Some(NetworkGrant {
+                            enabled: Some(true),
+                        }),
+                    }),
+                },
+                None,
+            )
+            .unwrap(),
+            json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"})
+        );
+        assert_eq!(
+            encode_codex_approval_result_with_request(
+                "item/permissions/requestApproval",
+                &InteractionResolution::Deny,
+                Some(&offered_perms),
+            )
+            .unwrap(),
+            json!({"permissions": {}})
+        );
+
+        let cfg = CodexRunnerConfig::from_env()
+            .with_socket_path("/tmp/rw.sock")
+            .with_rex_wave_bin("/usr/local/bin/rex-wave");
+        let args = build_codex_args(&cfg);
+        assert_eq!(args.first().map(String::as_str), Some("app-server"));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("mcp_servers.rex-wave.command="))
         );
 
         assert!(matches!(

@@ -583,49 +583,88 @@ fn is_program_resolvable(raw: &str) -> bool {
     std::env::split_paths(&path_os).any(|dir| is_executable_file_path(&dir.join(trimmed)))
 }
 
-fn native_acp_runner_health(cfg: &RexConfig) -> RunnerHealthStatus {
-    let explicit_agy = cfg
-        .harnesses
-        .agy
-        .binary
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            std::env::var(rex_wave_acp::ENV_ACP_AGY_BIN)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        });
-    let explicit_oc = cfg
-        .harnesses
-        .opencode
-        .binary
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            std::env::var(rex_wave_acp::ENV_ACP_OPENCODE_BIN)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        });
-    let has_explicit = explicit_agy.is_some() || explicit_oc.is_some();
-    let agy_bin = explicit_agy.unwrap_or_else(|| "agy".to_owned());
-    let opencode_bin = explicit_oc.unwrap_or_else(|| "opencode".to_owned());
+fn resolve_harness_bin(
+    explicit_cfg: Option<&str>,
+    env_key: &str,
+    default_name: &str,
+) -> (String, bool) {
+    if let Some(cfg_bin) = explicit_cfg.map(str::trim).filter(|s| !s.is_empty()) {
+        return (cfg_bin.to_owned(), true);
+    }
+    if let Ok(env_bin) = std::env::var(env_key) {
+        let trimmed = env_bin.trim();
+        if !trimmed.is_empty() {
+            return (trimmed.to_owned(), true);
+        }
+    }
+    (default_name.to_owned(), false)
+}
 
-    let agy_ok = is_program_resolvable(&agy_bin);
-    let oc_ok = is_program_resolvable(&opencode_bin);
-    let healthy = agy_ok || oc_ok;
+fn native_acp_runner_health(cfg: &RexConfig) -> RunnerHealthStatus {
+    let probes = [
+        (
+            "claude",
+            resolve_harness_bin(
+                cfg.harnesses.claude.binary.as_deref(),
+                rex_wave_native::CLAUDE_BIN_ENV,
+                "claude",
+            ),
+        ),
+        (
+            "codex",
+            resolve_harness_bin(
+                cfg.harnesses.codex.binary.as_deref(),
+                rex_wave_native::CODEX_BIN_ENV,
+                "codex",
+            ),
+        ),
+        (
+            "agy",
+            resolve_harness_bin(
+                cfg.harnesses.agy.binary.as_deref(),
+                rex_wave_acp::ENV_ACP_AGY_BIN,
+                "agy",
+            ),
+        ),
+        (
+            "opencode",
+            resolve_harness_bin(
+                cfg.harnesses.opencode.binary.as_deref(),
+                rex_wave_acp::ENV_ACP_OPENCODE_BIN,
+                "opencode",
+            ),
+        ),
+    ];
+
+    let mut ready = Vec::new();
+    let mut has_explicit = false;
+    let mut bad_explicit = Vec::new();
+    for (label, (bin, explicit)) in &probes {
+        has_explicit |= *explicit;
+        if is_program_resolvable(bin) {
+            ready.push(*label);
+        } else if *explicit {
+            bad_explicit.push(*label);
+        }
+    }
+
+    let healthy = !ready.is_empty();
     let configured = has_explicit || healthy;
-    let detail = match (agy_ok, oc_ok, has_explicit) {
-        (true, true, _) => Some("ACP ready (agy, opencode)".into()),
-        (true, false, _) => Some("ACP ready (agy; opencode not found)".into()),
-        (false, true, _) => Some("ACP ready (opencode; agy not found)".into()),
-        (false, false, true) => Some("configured ACP binary is not executable".into()),
-        (false, false, false) => Some("no agy or opencode executable found".into()),
+    let detail = if healthy && bad_explicit.is_empty() {
+        Some(format!("native ready ({})", ready.join(", ")))
+    } else if healthy {
+        Some(format!(
+            "native ready ({}); missing configured: {}",
+            ready.join(", "),
+            bad_explicit.join(", ")
+        ))
+    } else if has_explicit {
+        Some(format!(
+            "configured native binary is not executable ({})",
+            bad_explicit.join(", ")
+        ))
+    } else {
+        Some("no claude, codex, agy, or opencode executable found".into())
     };
     RunnerHealthStatus {
         runner: RunnerRoute::Native,

@@ -13,12 +13,13 @@ pub use claude::{
     parse_claude_usage,
 };
 pub use codex::{
-    CODEX_BIN_ENV, CodexBridge, CodexFeed, CodexHost, CodexRunnerConfig, classify_codex_turn,
-    codex_approval_and_sandbox, codex_thread_id, encode_codex_approval_result,
+    CODEX_BIN_ENV, CodexBridge, CodexFeed, CodexHost, CodexRunnerConfig, build_codex_args,
+    classify_codex_turn, codex_approval_and_sandbox, codex_thread_id, encode_codex_approval_result,
     parse_codex_approval_request, parse_codex_thread_id, parse_codex_token_usage,
 };
+pub use common::SCRUBBED_DAEMON_ENV;
 pub use process::{
-    DEFAULT_RETIRE_GRACE, LiveChild, kill_process_group_now, process_group_alive,
+    DEFAULT_RETIRE_GRACE, LiveChild, PgidSlot, kill_process_group_now, process_group_alive,
     spawn_in_process_group, terminate_process_group,
 };
 pub use workspace::resolve_worker_workspace;

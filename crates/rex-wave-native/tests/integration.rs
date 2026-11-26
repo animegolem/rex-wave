@@ -19,8 +19,8 @@ use rex_wave_native::{
 use rex_wave_notify::Inbox;
 use rex_wave_rooms::Rooms;
 use rex_wave_runtime::{
-    AgentFeed, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router, SidebarProjection,
-    ThreadIdResolver, spawn_reactor,
+    AgentFeed, ConfigService, FeedRouter, Hub, LocalClient, ReadSide, Registry, Router,
+    SidebarProjection, ThreadIdResolver, spawn_reactor,
 };
 use rex_wave_store::Journal;
 use rex_wave_transport::read_worker_token_file;
@@ -137,9 +137,17 @@ impl TestHarness {
             .with_thread_resolver(thread_resolver),
         );
 
+        let config_svc = ConfigService::new(journal.clone(), hub.clone()).unwrap();
+        let wave_svc = rex_wave_waves::WaveService::new(
+            Registry::<Waves>::new(journal.clone(), hub.clone()),
+            RunnerKind::Claude,
+            Some(config_svc.subscribe()),
+        )
+        .with_state_dir(state_dir.clone());
+
         let router = Arc::new(Router {
             room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
-            wave: Registry::<Waves>::new(journal.clone(), hub.clone()),
+            wave: wave_svc.clone(),
             board: Registry::<Board>::new(journal.clone(), hub.clone()),
             inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
             mail: Arc::new(MailBridge::with_hub(
@@ -149,6 +157,7 @@ impl TestHarness {
                 hub.clone(),
             )),
             presence: Presence::new().registry(journal.clone(), hub.clone()),
+            config: config_svc,
             read: Arc::new(ReadSide {
                 journal,
                 hub,
@@ -160,9 +169,12 @@ impl TestHarness {
         claude.attach_router(router.clone());
         codex.attach_router(router.clone());
 
-        let host_router = HostRouter::new(RunnerKind::Claude)
-            .with_host(RunnerKind::Claude, ClaudeHost(claude.clone()))
-            .with_host(RunnerKind::Codex, CodexHost(codex.clone()));
+        let host_router = Arc::new(
+            HostRouter::new(RunnerKind::Claude)
+                .with_host(RunnerKind::Claude, ClaudeHost(claude.clone()))
+                .with_host(RunnerKind::Codex, CodexHost(codex.clone())),
+        );
+        wave_svc.bind_host(host_router.clone());
 
         let conductor = spawn_reactor(
             WaveConductor::new(host_router),
@@ -233,12 +245,20 @@ impl TestHarness {
 
 fn init_git_repo(dir: &Path) {
     let run = |args: &[&str]| {
-        let out = StdCommand::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
+        let mut cmd = StdCommand::new("git");
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            cmd.env_remove(key);
+        }
+        let out = cmd.arg("-C").arg(dir).args(args).output().unwrap();
         assert!(
             out.status.success(),
             "git {:?} failed: {}",
@@ -477,7 +497,11 @@ else:
     };
 
     h.operator
-        .call(WaveStart { spec, idem: None })
+        .call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
         .await
         .unwrap();
 
@@ -825,7 +849,11 @@ elif "ERROR_ME" in text:
     };
 
     h.operator
-        .call(WaveStart { spec, idem: None })
+        .call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
         .await
         .unwrap();
 
@@ -1146,7 +1174,11 @@ for raw in sys.stdin:
     };
 
     h.operator
-        .call(WaveStart { spec, idem: None })
+        .call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
         .await
         .unwrap();
 
@@ -1507,7 +1539,11 @@ for raw in sys.stdin:
     };
 
     h.operator
-        .call(WaveStart { spec, idem: None })
+        .call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
         .await
         .unwrap();
 
@@ -1626,7 +1662,11 @@ sys.exit(2)
     };
 
     h.operator
-        .call(WaveStart { spec, idem: None })
+        .call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
         .await
         .unwrap();
 
@@ -1665,4 +1705,219 @@ sys.exit(2)
     assert_eq!(snap.counts.errored, 1);
 
     h.claude.shutdown().await;
+}
+
+#[tokio::test]
+async fn validate_resolve_preserves_blocked_interaction_and_handshake_abort_cleans_up() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let claude_script = r#"#!/usr/bin/env python3
+import json, sys
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+_ = json.loads(sys.stdin.readline())
+emit({"type": "system", "subtype": "init", "session_id": "s_val"})
+emit({"type": "control_request", "request_id": "p_val", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "echo hi"}}})
+ctrl = json.loads(sys.stdin.readline())
+assert ctrl["response"]["response"]["behavior"] == "allow"
+emit({"type": "result", "subtype": "success", "is_error": False, "session_id": "s_val"})
+"#;
+
+    let hang_pid_file = script_dir.path().join("hang_codex.pid");
+    let codex_hang_script = format!(
+        r#"#!/usr/bin/env python3
+import os, signal, subprocess, sys, time
+gc = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
+with open({hang_pid:?}, "w") as f:
+    f.write(str(gc.pid) + "\n")
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+"#,
+        hang_pid = hang_pid_file.to_string_lossy()
+    );
+
+    let claude_bin = write_executable_script(script_dir.path(), "mock-claude-val", claude_script);
+    let codex_bin =
+        write_executable_script(script_dir.path(), "mock-codex-hang", &codex_hang_script);
+    let h = TestHarness::new(claude_bin, codex_bin).await;
+
+    // 1. Unsupported AllowForSession (when Claude offered no session permission_suggestions)
+    // must be rejected pre-commit so a subsequent AllowOnce succeeds cleanly.
+    let wave = WaveSlug::parse("w-val").unwrap();
+    let role = RoleName::parse("author").unwrap();
+    let spec = WaveSpec {
+        slug: wave.clone(),
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        goal: Body::parse("Verify pre-commit validate_resolve and handshake cancellation").unwrap(),
+        defaults: AgentSpec {
+            provider: ProviderId::parse("claude-code").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::AcceptEdits,
+            workspace: Workspace::ProjectDefault,
+        },
+        output_dir: None,
+        workers: vec![WorkerSpec {
+            role: role.clone(),
+            brief: Body::parse("Run echo").unwrap(),
+            agent: None,
+            output_dir: None,
+            writes: Vec::new(),
+            return_schema: None,
+        }],
+    };
+    h.operator
+        .call(WaveStart {
+            spec,
+            idem: None,
+            config_defaults: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    h.wait_wave(&wave, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Blocked { interaction },
+                ..
+            }) if interaction.id.as_str() == "p_val"
+        )
+    })
+    .await;
+
+    let bad_res = h
+        .operator
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("p_val").unwrap(),
+            resolution: InteractionResolution::AllowForSession {
+                granted_permissions: None,
+            },
+        })
+        .await;
+    assert!(bad_res.is_err(), "unsupported AllowForSession must fail");
+
+    h.operator
+        .call(WaveResolve {
+            wave: wave.clone(),
+            role: role.clone(),
+            interaction: rex_wave_api::HostInteractionId::parse("p_val").unwrap(),
+            resolution: InteractionResolution::AllowOnce {
+                granted_permissions: None,
+            },
+        })
+        .await
+        .expect("subsequent AllowOnce must succeed because interaction stayed open");
+
+    h.wait_wave(&wave, |s| {
+        matches!(
+            worker_phase(s, &role),
+            Some(WorkerPhase::Live {
+                activity: Activity::Idle,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // 2. Dropping Codex spawn mid-handshake must reap the SIGTERM-ignoring grandchild and unlink token.
+    let abort_wave = WaveSlug::parse("w-abort").unwrap();
+    let abort_role = RoleName::parse("hanging").unwrap();
+    let abort_req = rex_wave_waves::SpawnRequest {
+        wave: abort_wave.clone(),
+        role: abort_role.clone(),
+        attempt: 1,
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        agent: AgentSpec {
+            provider: ProviderId::parse("codex").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::Full,
+            workspace: Workspace::ProjectDefault,
+        },
+        room: rex_wave_waves::wave_room(
+            &abort_wave,
+            &ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        ),
+        prompt: Body::parse("hang").unwrap(),
+        title: "[w-abort] @hanging".into(),
+        run_stamp: "w-abort:hanging:a1".into(),
+        output_dir: None,
+        writes: Vec::new(),
+        return_schema: None,
+    };
+
+    let codex_host = CodexHost(h.codex.clone());
+    let mut spawn_fut = Box::pin(codex_host.spawn(abort_req));
+    let _ = tokio::time::timeout(Duration::from_millis(250), &mut spawn_fut).await;
+    let hang_gc_pid = wait_for_pid_file(&hang_pid_file);
+    assert!(process_alive(hang_gc_pid));
+    drop(spawn_fut);
+
+    let abort_tid = HostThreadId::parse("codex:w-abort:hanging:a1").unwrap();
+    assert_eq!(
+        read_worker_token_file(&h.state_dir, abort_tid.as_str()).unwrap(),
+        None,
+        "dropped Codex spawn must unlink worker token"
+    );
+    let kill_deadline = Instant::now() + Duration::from_secs(3);
+    while process_alive(hang_gc_pid) && Instant::now() < kill_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !process_alive(hang_gc_pid),
+        "dropped Codex spawn must SIGKILL process group"
+    );
+
+    // 3. Pre-existing non-worktree directory under .worktrees/ must be rejected, not reused.
+    let rogue_wt = h.project_dir.join(".worktrees/rex-wave-w-rogue-author");
+    std::fs::create_dir_all(&rogue_wt).unwrap();
+    std::fs::write(rogue_wt.join(".git"), "not a real worktree\n").unwrap();
+    let rogue_req = rex_wave_waves::SpawnRequest {
+        wave: WaveSlug::parse("w-rogue").unwrap(),
+        role: RoleName::parse("author").unwrap(),
+        attempt: 1,
+        project: ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        agent: AgentSpec {
+            provider: ProviderId::parse("claude-code").unwrap(),
+            model: None,
+            account: None,
+            reasoning: None,
+            service_tier: None,
+            permission: PermissionMode::Full,
+            workspace: Workspace::ManagedWorktree {
+                base: BaseBranch::Default,
+            },
+        },
+        room: rex_wave_waves::wave_room(
+            &WaveSlug::parse("w-rogue").unwrap(),
+            &ProjectId::parse(h.project_dir.to_string_lossy()).unwrap(),
+        ),
+        prompt: Body::parse("hi").unwrap(),
+        title: "[w-rogue] @author".into(),
+        run_stamp: "w-rogue:author:a1".into(),
+        output_dir: None,
+        writes: Vec::new(),
+        return_schema: None,
+    };
+    let rogue_err = ClaudeHost(h.claude.clone())
+        .spawn(rogue_req)
+        .await
+        .unwrap_err();
+    assert!(
+        rogue_err
+            .to_string()
+            .contains("not a registered git worktree"),
+        "unexpected rogue worktree error: {rogue_err}"
+    );
+
+    h.claude.shutdown().await;
+    h.codex.shutdown().await;
 }
