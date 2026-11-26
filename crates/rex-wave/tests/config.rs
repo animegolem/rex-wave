@@ -1052,7 +1052,7 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
             config_defaults: rex_wave_api::wave::WaveConfigDefaults {
                 permission: true,
                 workspace: true,
-                account_from_config: false,
+                ..Default::default()
             },
         })
         .await
@@ -1130,6 +1130,443 @@ async fn non_operator_denied_on_uds_and_masked_404_on_http_while_operator_round_
     );
     assert_eq!(helper_spec.account.as_deref(), Some("team-claude"));
 
+    // Negative authz regression: a live Worker sending forged `"config_defaults":{"account_from_config":true}`
+    // with an explicit overriding `agent.account` MUST still be rejected with `ApiError::Denied`.
+    let forged_cmd: rex_wave_api::wave::WaveAddWorker = serde_json::from_value(json!({
+        "wave": "w1",
+        "worker": {
+            "role": "rogue",
+            "brief": "try forged billing override",
+            "agent": {
+                "provider": "claude",
+                "account": "forged-billing"
+            }
+        },
+        "config_defaults": {
+            "account_from_config": true
+        }
+    }))
+    .unwrap();
+    assert!(
+        !forged_cmd.config_defaults.account_from_config,
+        "account_from_config must never deserialize as true from wire JSON"
+    );
+    let worker_uds = RemoteClient::connect(
+        Endpoint::Unix(sock.clone()),
+        Credential::Token {
+            token: mint_worker_token(
+                &sock,
+                &WaveSlug::parse("w1").unwrap(),
+                &RoleName::parse("dev").unwrap(),
+                None,
+            )
+            .unwrap(),
+        },
+        "worker-forged",
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            worker_uds.call(forged_cmd).await,
+            Err(ApiError::Denied { .. })
+        ),
+        "forged worker account override must be denied"
+    );
+
+    // Per-worker `WaveStart` JSON omission mask + cross-provider account isolation + idempotent retry:
+    // - `spec.defaults` omits `permission` and `workspace` (inheriting `harnesses.claude` = full / project_default / team-claude).
+    // - `workers[0]` (`restricted=claude`) explicitly specifies `accept-edits` + `managed_worktree` -> preserved!
+    // - `workers[1]` (`coder=codex`) omits `account` -> does NOT borrow `team-claude` from Claude defaults!
+    let ws_json = json!({
+        "spec": {
+            "slug": "w-masks",
+            "project": proj_dir.to_str().unwrap(),
+            "goal": "per-worker omission masks",
+            "defaults": {
+                "provider": "claude"
+            },
+            "workers": [
+                {
+                    "role": "restricted",
+                    "brief": "keep explicit restriction",
+                    "agent": {
+                        "provider": "claude",
+                        "permission": "accept-edits",
+                        "workspace": {
+                            "workspace": "managed_worktree",
+                            "base": { "kind": "default" }
+                        }
+                    }
+                },
+                {
+                    "role": "coder",
+                    "brief": "different provider slot",
+                    "agent": {
+                        "provider": "codex"
+                    }
+                }
+            ]
+        }
+    });
+    let ws_cmd1: rex_wave_api::wave::WaveStart = serde_json::from_value(ws_json.clone()).unwrap();
+    op_client.call(ws_cmd1).await.unwrap();
+
+    // Flip `runners.codex` and retry the IDENTICAL `WaveStart` request -> idempotent `Ok`, not `Conflict`!
+    op_client
+        .call(ConfigSet {
+            key: "runners.codex".into(),
+            value: Some("bb".into()),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    let ws_cmd2: rex_wave_api::wave::WaveStart = serde_json::from_value(ws_json).unwrap();
+    let retry_started = op_client.call(ws_cmd2).await.unwrap();
+    assert_eq!(retry_started.wave.as_str(), "w-masks");
+
+    let masks_view = op_client
+        .call(rex_wave_api::wave::WaveView {
+            wave: WaveSlug::parse("w-masks").unwrap(),
+        })
+        .await
+        .unwrap();
+    let (_, restricted_spec, _) = masks_view
+        .workers
+        .iter()
+        .find(|(r, _, _)| r.as_str() == "restricted")
+        .unwrap();
+    assert_eq!(
+        restricted_spec.permission,
+        rex_wave_api::wave::PermissionMode::AcceptEdits
+    );
+    assert!(matches!(
+        restricted_spec.workspace,
+        rex_wave_api::wave::Workspace::ManagedWorktree { .. }
+    ));
+    assert_eq!(restricted_spec.account.as_deref(), Some("team-claude"));
+
+    let (_, coder_spec, _) = masks_view
+        .workers
+        .iter()
+        .find(|(r, _, _)| r.as_str() == "coder")
+        .unwrap();
+    assert_eq!(coder_spec.account, None);
+
     uds_task.abort();
     http_task.abort();
+}
+
+#[tokio::test]
+async fn cancelled_writer_cannot_overwrite_newer_export_and_persist_error_sticks_on_show() {
+    use rex_wave_api::config::ConfigSnapshot;
+    use rex_wave_runtime::{BoxFut, ConfigHook};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    struct ControlledHook {
+        pause_seq1: Arc<Notify>,
+        entered_seq1: Arc<Notify>,
+        fail_next: Arc<AtomicBool>,
+        exported: Arc<std::sync::Mutex<Vec<(u64, Option<RunnerRoute>)>>>,
+    }
+
+    impl ConfigHook for ControlledHook {
+        fn validate_candidate<'a>(
+            &'a self,
+            _current: &'a RexConfig,
+            _next: &'a RexConfig,
+            _will_export: bool,
+        ) -> BoxFut<'a, Result<(), ApiError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_committed(&self, head: Seq, config: &RexConfig) -> BoxFut<'_, Result<(), ApiError>> {
+            let runner = config.runners.default_runner;
+            let entered = self.entered_seq1.clone();
+            let pause = self.pause_seq1.clone();
+            let fail = self.fail_next.swap(false, Ordering::AcqRel);
+            let exported = self.exported.clone();
+            Box::pin(async move {
+                if head == Seq(1) {
+                    entered.notify_waiters();
+                    pause.notified().await;
+                }
+                if fail {
+                    return Err(ApiError::Internal("simulated marker write error".into()));
+                }
+                exported.lock().unwrap().push((head.0, runner));
+                Ok(())
+            })
+        }
+
+        fn augment_snapshot<'a>(&'a self, _snap: &'a mut ConfigSnapshot) -> BoxFut<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    let entered_seq1 = Arc::new(Notify::new());
+    let pause_seq1 = Arc::new(Notify::new());
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let exported = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook = Arc::new(ControlledHook {
+        pause_seq1: pause_seq1.clone(),
+        entered_seq1: entered_seq1.clone(),
+        fail_next: fail_next.clone(),
+        exported: exported.clone(),
+    });
+
+    let journal = Journal::in_memory().unwrap();
+    let hub = Hub::new(64);
+    let sidebar = SidebarProjection::spawn(journal.clone(), hub.clone());
+    let svc = ConfigService::with_hook(journal.clone(), hub.clone(), Some(hook)).unwrap();
+    let op = Principal::Operator {
+        seat: SeatName::parse("owner").unwrap(),
+    };
+    let client = LocalClient::new(
+        Arc::new(Router {
+            config: svc,
+            ..Router::unavailable_with(Arc::new(ReadSide {
+                journal,
+                hub,
+                sidebar,
+                agents: Arc::new(NoAgentFeed),
+            }))
+        }),
+        op,
+    );
+
+    // Start seq 1 (`bb`), wait until it enters `on_committed`, then cancel its caller future!
+    let entered_waiter = entered_seq1.notified();
+    let c1 = client.clone();
+    let mut call1 = tokio::spawn(async move {
+        c1.call(ConfigSet {
+            key: "runners.default_runner".into(),
+            value: Some("bb".into()),
+            idem: None,
+        })
+        .await
+    });
+    entered_waiter.await;
+    call1.abort();
+    let _ = (&mut call1).await;
+
+    // Launch seq 2 (`t3`) while seq 1 is still paused inside `on_committed`, then release seq 1.
+    let c2 = client.clone();
+    let call2 = tokio::spawn(async move {
+        c2.call(ConfigSet {
+            key: "runners.default_runner".into(),
+            value: Some("t3".into()),
+            idem: None,
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    pause_seq1.notify_waiters();
+
+    let snap = call2.await.unwrap().unwrap();
+    assert_eq!(snap.head, Seq(2));
+    assert_eq!(snap.config.runners.default_runner, Some(RunnerRoute::T3));
+
+    let writes = exported.lock().unwrap().clone();
+    assert_eq!(
+        writes,
+        vec![(1, Some(RunnerRoute::Bb)), (2, Some(RunnerRoute::T3))],
+        "seq 1 export must complete strictly before seq 2 export"
+    );
+
+    // Force an export failure on seq 3 -> verify `persist_error` sticks on subsequent `ConfigShow`
+    // and clears once seq 4 exports cleanly.
+    fail_next.store(true, Ordering::Release);
+    let snap3 = client
+        .call(ConfigSet {
+            key: "mail.export_enabled".into(),
+            value: Some("true".into()),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert!(snap3.persist_error.is_some());
+
+    let snap_show = client.call(ConfigShow {}).await.unwrap();
+    assert!(
+        snap_show.persist_error.is_some(),
+        "ConfigShow must retain persist_error until export catches up"
+    );
+
+    let snap4 = client
+        .call(ConfigSet {
+            key: "mail.export_enabled".into(),
+            value: Some("false".into()),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    assert!(snap4.persist_error.is_none());
+
+    let snap_show4 = client.call(ConfigShow {}).await.unwrap();
+    assert!(snap_show4.persist_error.is_none());
+}
+
+#[test]
+fn alias_migration_external_creation_guard_startup_near_limit_tilde_couriers_and_initial_down() {
+    let dir = fresh_dir("cfg-r3");
+
+    // 1. Daemon started with NO config.toml: creating config.toml externally while running
+    //    must block unrelated CLI sets instead of silently overwriting the external file.
+    let sock1 = dir.0.join("d1/daemon.sock");
+    std::fs::create_dir_all(sock1.parent().unwrap()).unwrap();
+    let cfg1 = dir.0.join("d1/config.toml");
+    {
+        let _d1 = spawn_test_daemon(&dir.0, &sock1, &[]);
+        // Also verify initial PresenceList marks disconnected BB transport down!
+        let pres_out = rex_wave_at(&sock1)
+            .args([
+                "--socket",
+                sock1.to_str().unwrap(),
+                "--json",
+                "presence",
+                "list",
+            ])
+            .output()
+            .unwrap();
+        assert!(pres_out.status.success());
+        let pres_json: Value = serde_json::from_slice(&pres_out.stdout).unwrap();
+        assert!(
+            pres_json["value"]["down_transports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "bb_thread"),
+            "disconnected BB bridge at startup must publish bb_thread in down_transports: {pres_json}"
+        );
+
+        // External creation of config.toml while daemon is running.
+        std::fs::write(&cfg1, "[harnesses.codex]\nmodel = \"gpt-external\"\n").unwrap();
+        let conflict_set = rex_wave_at(&sock1)
+            .args([
+                "--socket",
+                sock1.to_str().unwrap(),
+                "config",
+                "set",
+                "mail.export_enabled",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !conflict_set.status.success(),
+            "first live external config.toml creation must not be overwritten"
+        );
+        assert!(
+            rex_wave_fs::read_regular_string(&cfg1, CONFIG_FILE_MAX_BYTES)
+                .unwrap()
+                .contains("gpt-external")
+        );
+    }
+
+    // 2. Accepted TOML aliases (`[runners] default = "t3"` and `[harnesses.antigravity]`)
+    //    migrate cleanly on unrelated updates without producing duplicate keys on restart,
+    //    and `~/my-couriers` tilde paths expand before scanning!
+    let sock2 = dir.0.join("d2/daemon.sock");
+    std::fs::create_dir_all(sock2.parent().unwrap()).unwrap();
+    let cfg2 = dir.0.join("d2/config.toml");
+    let home_couriers = dir.0.join("home/my-couriers");
+    std::fs::create_dir_all(&home_couriers).unwrap();
+    let tilde_adapter = home_couriers.join("tilde-bell");
+    std::fs::write(&tilde_adapter, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tilde_adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::write(
+        &cfg2,
+        "[runners]\ndefault = \"t3\" # alias comment\n\n[harnesses.antigravity]\nmodel = \"gemini-4-neon\"\n",
+    )
+    .unwrap();
+    {
+        let _d2 = spawn_test_daemon(&dir.0, &sock2, &[]);
+        for (k, v) in [
+            ("mail.export_enabled", "true"),
+            ("mail.couriers_dir", "~/my-couriers"),
+        ] {
+            let out = rex_wave_at(&sock2)
+                .args(["--socket", sock2.to_str().unwrap(), "config", "set", k, v])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "set {k}={v} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let show2 = rex_wave_at(&sock2)
+            .args([
+                "--socket",
+                sock2.to_str().unwrap(),
+                "--json",
+                "config",
+                "show",
+            ])
+            .output()
+            .unwrap();
+        let show2_json: Value = serde_json::from_slice(&show2.stdout).unwrap();
+        assert_eq!(
+            show2_json["value"]["couriers_health"][0]["name"],
+            "tilde-bell"
+        );
+    }
+    let _ = std::fs::remove_file(&sock2);
+    {
+        // Restart d2 -> must boot cleanly without duplicate field errors!
+        let _d2_restarted = spawn_test_daemon(&dir.0, &sock2, &[]);
+        let show_after = rex_wave_at(&sock2)
+            .args([
+                "--socket",
+                sock2.to_str().unwrap(),
+                "--json",
+                "config",
+                "show",
+            ])
+            .output()
+            .unwrap();
+        assert!(show_after.status.success());
+        let after_json: Value = serde_json::from_slice(&show_after.stdout).unwrap();
+        assert_eq!(
+            after_json["value"]["config"]["runners"]["default_runner"],
+            "t3"
+        );
+        assert_eq!(
+            after_json["value"]["config"]["harnesses"]["agy"]["model"],
+            "gemini-4-neon"
+        );
+    }
+
+    // 3. Startup import (`ConfigSyncFile`) of a valid 262,140-byte file whose hypothetical
+    //    re-rendered form would exceed 262,144 bytes succeeds because import performs no export.
+    let sock3 = dir.0.join("d3/daemon.sock");
+    std::fs::create_dir_all(sock3.parent().unwrap()).unwrap();
+    let cfg3 = dir.0.join("d3/config.toml");
+    let body3 = "[runners]\ndefault = \"t3\"\n";
+    let pad3 = (CONFIG_FILE_MAX_BYTES as usize) - body3.len() - 4;
+    let valid_near_limit = format!("# {}\n{body3}", "y".repeat(pad3));
+    assert!(valid_near_limit.len() <= CONFIG_FILE_MAX_BYTES as usize);
+    std::fs::write(&cfg3, valid_near_limit).unwrap();
+    {
+        let _d3 = spawn_test_daemon(&dir.0, &sock3, &[]);
+        let show3 = rex_wave_at(&sock3)
+            .args([
+                "--socket",
+                sock3.to_str().unwrap(),
+                "--json",
+                "config",
+                "show",
+            ])
+            .output()
+            .unwrap();
+        assert!(show3.status.success());
+        let s3_json: Value = serde_json::from_slice(&show3.stdout).unwrap();
+        assert_eq!(
+            s3_json["value"]["config"]["runners"]["default_runner"],
+            "t3"
+        );
+    }
 }

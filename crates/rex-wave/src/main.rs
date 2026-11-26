@@ -1622,7 +1622,7 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                 config_defaults: rex_wave_api::wave::WaveConfigDefaults {
                     permission: permission.is_none(),
                     workspace: workspace.is_none(),
-                    account_from_config: false,
+                    ..Default::default()
                 },
             }))
         }
@@ -1658,7 +1658,7 @@ fn wave_to_command(cmd: &WaveCmd) -> Result<WireCommand, ApiError> {
                 config_defaults: rex_wave_api::wave::WaveConfigDefaults {
                     permission: permission.is_none(),
                     workspace: workspace.is_none(),
-                    account_from_config: false,
+                    ..Default::default()
                 },
             }))
         }

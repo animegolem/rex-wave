@@ -172,6 +172,7 @@ pub enum Msg {
         result: Result<WireReply, ApiError>,
     },
     HoverSettled(NodeKey),
+    SettingsPoll,
     Resize {
         cols: u16,
         rows: u16,
@@ -325,6 +326,16 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 retarget_if_changed(model, target, &mut effects);
             }
         }
+        Msg::SettingsPoll => {
+            if matches!(model.stage, Stage::Settings(_))
+                && model.connection == ConnectionState::Connected
+            {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
+                });
+            }
+        }
         Msg::Frame {
             watch: WatchSlot::Tree,
             frame: Frame::Sidebar(snap),
@@ -356,7 +367,13 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                         model.has_focused_watch = true;
                         if matches!(model.stage, Stage::Settings(_))
                             && let Frame::Committed(ref env) = *inner
-                            && matches!(env.stream, StreamId::Presence | StreamId::Config)
+                            && matches!(
+                                &env.event,
+                                Event::Config(_)
+                                    | Event::Presence(
+                                        presence::PresenceEvent::TransportHealthChanged { .. }
+                                    )
+                            )
                         {
                             should_refresh_settings = true;
                         }
@@ -367,7 +384,13 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 other => {
                     if matches!(model.stage, Stage::Settings(_))
                         && let Frame::Committed(ref env) = other
-                        && matches!(env.stream, StreamId::Presence | StreamId::Config)
+                        && matches!(
+                            &env.event,
+                            Event::Config(_)
+                                | Event::Presence(
+                                    presence::PresenceEvent::TransportHealthChanged { .. }
+                                )
+                        )
                     {
                         should_refresh_settings = true;
                     }
@@ -1165,6 +1188,11 @@ fn handle_accelerator(model: &mut Model, key_ch: char, effects: &mut Vec<Effect>
                         value: None,
                         idem: None,
                     }),
+                });
+            } else if key_ch == 'r' {
+                effects.push(Effect::Call {
+                    tag: ReplyTag::StageInitial(model.stage_req_seq),
+                    cmd: WireCommand::ConfigShow(rex_wave_api::config::ConfigShow {}),
                 });
             }
         }
@@ -2135,6 +2163,7 @@ async fn run_loop<C: Client + Clone + 'static>(
             m = poll_watch_slot(&mut tree_watch, WatchSlot::Tree) => Some(m),
             m = poll_watch_slot(&mut stage_watch, WatchSlot::Stage) => Some(m),
             key = wait_hover(&mut hover_deadline) => Some(Msg::HoverSettled(key)),
+            () = wait_settings_poll(matches!(model.stage, Stage::Settings(_)) && model.connection == ConnectionState::Connected) => Some(Msg::SettingsPoll),
         };
 
         if let Some(msg) = incoming {
@@ -2238,5 +2267,13 @@ async fn wait_hover(hover: &mut Option<(tokio::time::Instant, NodeKey)>) -> Node
             k
         }
         None => std::future::pending().await,
+    }
+}
+
+async fn wait_settings_poll(enabled: bool) {
+    if enabled {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    } else {
+        std::future::pending().await
     }
 }

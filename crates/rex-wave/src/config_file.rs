@@ -26,7 +26,8 @@ const CONFIG_SYNC_STATE_FILE: &str = "config-sync.json";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SyncMarker {
     seq: u64,
-    sha256: String,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 /// Resolves the operator `config.toml` path:
@@ -114,7 +115,7 @@ pub fn default_config_file_path(explicit: Option<&Path>) -> Option<PathBuf> {
 
 pub fn effective_couriers_dir(cfg: &RexConfig, config_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(ref d) = cfg.mail.couriers_dir {
-        return Some(d.clone());
+        return Some(rex_wave_waves::expand_tilde(&d.to_string_lossy()));
     }
     config_path
         .and_then(Path::parent)
@@ -329,6 +330,39 @@ fn ensure_subtable<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
     parent[key].as_table_mut().expect("table just inserted")
 }
 
+fn migrate_alias_key(table: &mut Table, canon: &str, aliases: &[&str]) {
+    let mut migrated: Option<Item> = None;
+    for alias in aliases {
+        if let Some(item) = table.remove(alias)
+            && migrated.is_none()
+        {
+            migrated = Some(item);
+        }
+    }
+    if !table.contains_key(canon)
+        && let Some(item) = migrated
+    {
+        table.insert(canon, item);
+    }
+}
+
+fn migrate_alias_subtable(parent: &mut Table, canon: &str, aliases: &[&str]) {
+    let mut migrated: Option<Item> = None;
+    for alias in aliases {
+        if let Some(item) = parent.remove(alias)
+            && item.is_table()
+            && migrated.is_none()
+        {
+            migrated = Some(item);
+        }
+    }
+    if !parent.contains_key(canon)
+        && let Some(item) = migrated
+    {
+        parent.insert(canon, item);
+    }
+}
+
 /// Updates `existing_toml` in place via `toml_edit::DocumentMut` so operator comments,
 /// inline value decorations, and unrelated formatting survive programmatic updates.
 pub fn render_config_toml_preserving_comments(
@@ -346,6 +380,10 @@ pub fn render_config_toml_preserving_comments(
     {
         let runners = ensure_subtable(doc.as_table_mut(), "runners");
         runners.set_implicit(false);
+        migrate_alias_key(runners, "default_runner", &["default"]);
+        migrate_alias_key(runners, "claude", &["claude-code", "claudeAgent"]);
+        migrate_alias_key(runners, "agy", &["antigravity"]);
+        migrate_alias_key(runners, "opencode", &["open-code"]);
         set_or_remove_str(
             runners,
             "default_runner",
@@ -367,6 +405,9 @@ pub fn render_config_toml_preserving_comments(
 
     {
         let harnesses = ensure_subtable(doc.as_table_mut(), "harnesses");
+        migrate_alias_subtable(harnesses, "claude", &["claude-code", "claudeAgent"]);
+        migrate_alias_subtable(harnesses, "agy", &["antigravity"]);
+        migrate_alias_subtable(harnesses, "opencode", &["open-code"]);
         for slot in HarnessProvider::ALL {
             let prof = cfg.harnesses.profile(slot);
             if prof.is_empty() {
@@ -506,15 +547,19 @@ fn load_sync_marker(state_dir: &Path) -> Option<SyncMarker> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save_sync_marker(state_dir: &Path, seq: Seq, sha256: &str) -> Result<(), String> {
+fn save_sync_marker_opt(state_dir: &Path, seq: Seq, sha256: Option<&str>) -> Result<(), String> {
     let path = state_dir.join(CONFIG_SYNC_STATE_FILE);
     let marker = SyncMarker {
         seq: seq.0,
-        sha256: sha256.to_owned(),
+        sha256: sha256.map(str::to_owned),
     };
     let bytes = serde_json::to_vec(&marker).map_err(|e| e.to_string())?;
     rex_wave_fs::write_atomic_path(&path, &bytes, 0o600, true)
         .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn save_sync_marker(state_dir: &Path, seq: Seq, sha256: &str) -> Result<(), String> {
+    save_sync_marker_opt(state_dir, seq, Some(sha256))
 }
 
 /// Scans `couriers.d/` without following symlinks to report discovered courier adapters.
@@ -562,6 +607,7 @@ pub struct TomlConfigHook {
     daemon_default_runner: RunnerRoute,
     bb_configured: bool,
     t3_configured: bool,
+    last_exported_sha: Arc<std::sync::Mutex<Option<Option<String>>>>,
     bb_live: OnceLock<LivenessProbe>,
     t3_live: OnceLock<LivenessProbe>,
     presence_svc: OnceLock<Arc<dyn Service<PresenceCommand>>>,
@@ -581,6 +627,7 @@ impl TomlConfigHook {
             daemon_default_runner,
             bb_configured,
             t3_configured,
+            last_exported_sha: Arc::new(std::sync::Mutex::new(None)),
             bb_live: OnceLock::new(),
             t3_live: OnceLock::new(),
             presence_svc: OnceLock::new(),
@@ -610,64 +657,104 @@ impl TomlConfigHook {
 }
 
 impl ConfigHook for TomlConfigHook {
-    fn validate_candidate(&self, next: &RexConfig) -> Result<(), ApiError> {
-        let protection = load_protected_roots().map_err(|e| ApiError::Denied {
-            principal: "config".into(),
-            action: format!("load protected-roots: {e}"),
-        })?;
-        validate_config_protected_roots(next, &protection)?;
+    fn validate_candidate<'a>(
+        &'a self,
+        current: &'a RexConfig,
+        next: &'a RexConfig,
+        will_export: bool,
+    ) -> BoxFut<'a, Result<(), ApiError>> {
+        let cur = current.clone();
+        let nxt = next.clone();
+        let path_opt = self.config_path.clone();
+        let state_dir = self.state_dir.clone();
+        let last_exported_sha = self.last_exported_sha.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let protection = load_protected_roots().map_err(|e| ApiError::Denied {
+                    principal: "config".into(),
+                    action: format!("load protected-roots: {e}"),
+                })?;
+                validate_config_protected_roots(&nxt, &protection)?;
 
-        if let Some(ref path) = self.config_path {
-            let existing = match rex_wave_fs::read_regular_bounded(path, CONFIG_FILE_MAX_BYTES) {
-                Ok(b) => {
-                    let disk_sha = sha256_hex(&b);
-                    if let Some(marker) = load_sync_marker(&self.state_dir)
-                        && marker.sha256 != disk_sha
-                    {
-                        let disk_matches_next = std::str::from_utf8(&b)
-                            .ok()
-                            .and_then(|s| parse_config_toml(s).ok())
-                            .is_some_and(|d| &d == next);
-                        if !disk_matches_next {
-                            return Err(ApiError::conflict(format!(
-                                "{} was modified externally while daemon is running; restart daemon to import external edits",
-                                path.display()
-                            )));
+                if will_export && let Some(ref path) = path_opt {
+                    let expected_opt = last_exported_sha
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        .or_else(|| load_sync_marker(&state_dir).map(|m| m.sha256));
+
+                    let existing = match rex_wave_fs::read_regular_bounded(
+                        path,
+                        CONFIG_FILE_MAX_BYTES,
+                    ) {
+                        Ok(b) => {
+                            let disk_sha = sha256_hex(&b);
+                            if let Some(ref exp) = expected_opt
+                                && exp.as_deref() != Some(disk_sha.as_str())
+                            {
+                                let disk_matches_known = std::str::from_utf8(&b)
+                                    .ok()
+                                    .and_then(|s| parse_config_toml(s).ok())
+                                    .is_some_and(|d| d == cur || d == nxt);
+                                if !disk_matches_known {
+                                    return Err(ApiError::conflict(format!(
+                                        "{} was modified externally while daemon is running; restart daemon to import external edits",
+                                        path.display()
+                                    )));
+                                }
+                            }
+                            std::str::from_utf8(&b).ok().map(str::to_owned)
                         }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(ApiError::Invalid(InvalidId {
+                                what: "config.toml".into(),
+                                reason: format!("read existing {}: {e}", path.display()),
+                            }));
+                        }
+                    };
+                    let rendered =
+                        render_config_toml_preserving_comments(existing.as_deref(), &nxt);
+                    if rendered.len() as u64 > CONFIG_FILE_MAX_BYTES {
+                        return Err(ApiError::Invalid(InvalidId {
+                            what: "config.toml".into(),
+                            reason: format!(
+                                "rendered config.toml ({} bytes) exceeds {} byte limit",
+                                rendered.len(),
+                                CONFIG_FILE_MAX_BYTES
+                            ),
+                        }));
                     }
-                    std::str::from_utf8(&b).ok().map(str::to_owned)
+                    let round_tripped = parse_config_toml(&rendered).map_err(|reason| {
+                        ApiError::Invalid(InvalidId {
+                            what: "config.toml".into(),
+                            reason: format!("rendered TOML failed strict parse: {reason}"),
+                        })
+                    })?;
+                    if round_tripped != nxt {
+                        return Err(ApiError::Internal(
+                            "rendered config.toml round-trip mismatch".into(),
+                        ));
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(ApiError::Invalid(InvalidId {
-                        what: "config.toml".into(),
-                        reason: format!("read existing {}: {e}", path.display()),
-                    }));
-                }
-            };
-            let rendered = render_config_toml_preserving_comments(existing.as_deref(), next);
-            if rendered.len() as u64 > CONFIG_FILE_MAX_BYTES {
-                return Err(ApiError::Invalid(InvalidId {
-                    what: "config.toml".into(),
-                    reason: format!(
-                        "rendered config.toml ({} bytes) exceeds {} byte limit",
-                        rendered.len(),
-                        CONFIG_FILE_MAX_BYTES
-                    ),
-                }));
-            }
-        }
-        Ok(())
+                Ok::<(), ApiError>(())
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("config validate task join: {e}")))?
+        })
     }
 
     fn on_committed(&self, head: Seq, config: &RexConfig) -> BoxFut<'_, Result<(), ApiError>> {
         let cfg = config.clone();
         let path_opt = self.config_path.clone();
         let state_dir = self.state_dir.clone();
+        let last_exported_sha = self.last_exported_sha.clone();
         Box::pin(async move {
             if let Some(path) = path_opt {
                 tokio::task::spawn_blocking(move || {
                     let sha = write_config_toml_atomic(&path, &cfg).map_err(ApiError::Internal)?;
+                    *last_exported_sha.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Some(sha.clone()));
                     save_sync_marker(&state_dir, head, &sha).map_err(ApiError::Internal)?;
                     Ok::<(), ApiError>(())
                 })
@@ -790,6 +877,7 @@ pub async fn reconcile_startup_config(
         (Seq(0), None, _) => {
             validate_config_protected_roots(&journal_cfg, &protection)
                 .map_err(|e| e.to_string())?;
+            save_sync_marker_opt(state_dir, Seq(0), None)?;
             Ok(journal_cfg)
         }
         (Seq(0), Some((disk_cfg, disk_sha, _)), _) => {
@@ -824,7 +912,7 @@ pub async fn reconcile_startup_config(
             }
             let file_was_unedited = maybe_marker
                 .as_ref()
-                .is_some_and(|m| m.sha256 == disk_sha && jhead.0 > m.seq);
+                .is_some_and(|m| m.sha256.as_deref() == Some(disk_sha.as_str()) && jhead.0 > m.seq);
             if file_was_unedited {
                 // Crashed after SQLite commit and before config.toml export: finish the export.
                 validate_config_protected_roots(&journal_cfg, &protection)

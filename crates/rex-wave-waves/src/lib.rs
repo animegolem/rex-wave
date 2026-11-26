@@ -409,6 +409,20 @@ impl WaveState {
     }
 }
 
+fn shares_provider_slot(a: &ProviderId, b: &ProviderId) -> bool {
+    let clean_a = rex_wave_api::RunnerKind::strip_provider_prefix(a.as_str())
+        .map_or(a.as_str(), |(_, rest)| rest);
+    let clean_b = rex_wave_api::RunnerKind::strip_provider_prefix(b.as_str())
+        .map_or(b.as_str(), |(_, rest)| rest);
+    match (
+        rex_wave_api::config::HarnessProvider::parse_slot(clean_a),
+        rex_wave_api::config::HarnessProvider::parse_slot(clean_b),
+    ) {
+        (Some(sa), Some(sb)) => sa == sb,
+        _ => clean_a.eq_ignore_ascii_case(clean_b),
+    }
+}
+
 impl Decider for Waves {
     type State = WaveState;
     type Cmd = WaveCommand;
@@ -489,7 +503,9 @@ impl Decider for Waves {
                 });
                 for (w, (output_dir, writes)) in c.spec.workers.iter().zip(resolved_workers) {
                     let mut agent = w.agent.clone().unwrap_or_else(|| c.spec.defaults.clone());
-                    if agent.account.is_none() {
+                    if agent.account.is_none()
+                        && shares_provider_slot(&agent.provider, &c.spec.defaults.provider)
+                    {
                         agent.account = c.spec.defaults.account.clone();
                     }
                     events.push(WaveEvent::WorkerRequested {
@@ -547,7 +563,9 @@ impl Decider for Waves {
                         action: format!("override wave paying account in wave {}", c.wave),
                     });
                 }
-                if agent.account.is_none() {
+                if agent.account.is_none()
+                    && shares_provider_slot(&agent.provider, &spec.defaults.provider)
+                {
                     agent.account = spec.defaults.account.clone();
                 }
                 Ok(vec![WaveEvent::WorkerRequested {

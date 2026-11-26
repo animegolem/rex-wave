@@ -674,7 +674,8 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
             Registry::<Waves>::new(journal.clone(), hub.clone()),
             default_target,
             Some(config_svc.subscribe()),
-        ),
+        )
+        .with_state_dir(state_dir.clone()),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
         mail: Arc::new(MailBridge::with_hub(
@@ -695,6 +696,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
 
     let host_router = HostRouter::new(default_target)
         .with_config_watch(config_svc.subscribe())
+        .with_pin_store(state_dir.join("router-pins.json"))
         .with_optional_host(
             RunnerKind::Bb,
             bb_bridge.as_ref().map(|b| BbHost(b.clone())),
@@ -737,6 +739,16 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
         if let Some(mut rx) = rx_opt {
             let mon = system(SystemPart::PresenceMonitor);
             bridge_health_tasks.push(tokio::spawn(async move {
+                let init_live = *rx.borrow_and_update();
+                if !init_live {
+                    let _ = mon
+                        .call(rex_wave_api::presence::PresenceTransportHealth {
+                            transport,
+                            down: true,
+                            detail: Some(format!("{label} bridge disconnected")),
+                        })
+                        .await;
+                }
                 while rx.changed().await.is_ok() {
                     let live = *rx.borrow_and_update();
                     let _ = mon

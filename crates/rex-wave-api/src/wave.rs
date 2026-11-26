@@ -1151,19 +1151,21 @@ impl WaveObserved {
 /// Flags indicating which `AgentSpec` fields were omitted by the caller so the
 /// daemon's `WaveService` can populate them from `[harnesses.<slot>]` before
 /// recording `StreamId::Wave`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaveConfigDefaults {
     #[serde(default)]
     pub permission: bool,
     #[serde(default)]
     pub workspace: bool,
-    #[serde(default)]
+    #[serde(skip)]
     pub account_from_config: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_masks: Vec<(bool, bool)>,
 }
 
 impl WaveConfigDefaults {
     pub fn is_empty(&self) -> bool {
-        !self.permission && !self.workspace && !self.account_from_config
+        !self.permission && !self.workspace && self.worker_masks.is_empty()
     }
 }
 
@@ -1203,11 +1205,31 @@ impl<'de> Deserialize<'de> for WaveStart {
         }
         let mut h: Helper =
             serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        h.config_defaults.account_from_config = false;
         if !has_explicit_mask {
             let defaults_val = raw.get("spec").and_then(|s| s.get("defaults"));
             let (omitted_perm, omitted_ws) = detect_json_omissions(defaults_val);
             h.config_defaults.permission = omitted_perm;
             h.config_defaults.workspace = omitted_ws;
+
+            let mut worker_masks = Vec::with_capacity(h.spec.workers.len());
+            if let Some(workers_arr) = raw
+                .get("spec")
+                .and_then(|s| s.get("workers"))
+                .and_then(|w| w.as_array())
+            {
+                for w_val in workers_arr {
+                    if let Some(agent_val) = w_val.get("agent")
+                        && !agent_val.is_null()
+                    {
+                        worker_masks.push(detect_json_omissions(Some(agent_val)));
+                    } else {
+                        worker_masks
+                            .push((h.config_defaults.permission, h.config_defaults.workspace));
+                    }
+                }
+            }
+            h.config_defaults.worker_masks = worker_masks;
         }
         Ok(WaveStart {
             spec: h.spec,
@@ -1241,6 +1263,8 @@ impl<'de> Deserialize<'de> for WaveAddWorker {
         }
         let mut h: Helper =
             serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        h.config_defaults.account_from_config = false;
+        h.config_defaults.worker_masks.clear();
         if !has_explicit_mask
             && let Some(agent_val) = raw.get("worker").and_then(|w| w.get("agent"))
             && !agent_val.is_null()

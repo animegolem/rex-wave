@@ -809,6 +809,7 @@ pub struct T3Bridge {
     token_minter: Option<WorkerTokenMinter>,
     mirror_lock: tokio::sync::Mutex<()>,
     cmd_nonce: AtomicU64,
+    pinned_models: std::sync::Mutex<HashMap<(WaveSlug, RoleName, u32), String>>,
     project_names_tx: watch::Sender<Arc<BTreeMap<BbProjectId, String>>>,
     project_names_rx: watch::Receiver<Arc<BTreeMap<BbProjectId, String>>>,
 }
@@ -829,6 +830,7 @@ impl T3Bridge {
             token_minter,
             mirror_lock: tokio::sync::Mutex::new(()),
             cmd_nonce: AtomicU64::new(1),
+            pinned_models: std::sync::Mutex::new(HashMap::new()),
             project_names_tx,
             project_names_rx,
         });
@@ -3633,27 +3635,46 @@ impl T3Bridge {
 
     async fn resolve_model_for_spawn(
         &self,
+        attempt_key: &(WaveSlug, RoleName, u32),
         provider_instance: &str,
         explicit: Option<&ModelId>,
     ) -> Result<String, HostError> {
         if let Some(m) = explicit {
             return Ok(m.as_str().to_owned());
         }
-        if let Some(ref rx) = self.cfg.config_rx
+        if let Some(existing) = self
+            .pinned_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(attempt_key)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        let resolved = if let Some(ref rx) = self.cfg.config_rx
             && let Some(slot) = rex_wave_api::config::HarnessProvider::parse_slot(provider_instance)
             && let Some(ref m) = rx.borrow().harnesses.profile(slot).model
         {
-            return Ok(m.as_str().to_owned());
+            m.as_str().to_owned()
+        } else if let Some(def) = self.cfg.default_models.get(provider_instance) {
+            def.clone()
+        } else {
+            let config = self.rpc.call("server.getConfig", json!({})).await?;
+            default_model_from_server_config(&config, provider_instance).ok_or_else(|| {
+                HostError::Rejected(format!(
+                    "no model specified for T3 provider '{provider_instance}' and server.getConfig listed none"
+                ))
+            })?
+        };
+        let mut pinned = self.pinned_models.lock().unwrap_or_else(|e| e.into_inner());
+        if pinned.len() >= 1024
+            && !pinned.contains_key(attempt_key)
+            && let Some(first_key) = pinned.keys().next().cloned()
+        {
+            pinned.remove(&first_key);
         }
-        if let Some(def) = self.cfg.default_models.get(provider_instance) {
-            return Ok(def.clone());
-        }
-        let config = self.rpc.call("server.getConfig", json!({})).await?;
-        default_model_from_server_config(&config, provider_instance).ok_or_else(|| {
-            HostError::Rejected(format!(
-                "no model specified for T3 provider '{provider_instance}' and server.getConfig listed none"
-            ))
-        })
+        pinned.insert(attempt_key.clone(), resolved.clone());
+        Ok(resolved)
     }
 
     async fn spawn_worker_thread(&self, req: SpawnRequest) -> Result<BbThreadId, HostError> {
@@ -3668,8 +3689,9 @@ impl T3Bridge {
             self.upsert_project_name(req.project.as_str(), &resolved_project.title);
         }
 
+        let attempt_key = (req.wave.clone(), req.role.clone(), req.attempt);
         let model = self
-            .resolve_model_for_spawn(&provider_instance, req.agent.model.as_ref())
+            .resolve_model_for_spawn(&attempt_key, &provider_instance, req.agent.model.as_ref())
             .await?;
 
         // Provision the worker token before launch so T3's process sees it immediately on startup.

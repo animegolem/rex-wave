@@ -5,8 +5,8 @@ use crate::{AgentHost, BoxFut, HostError, SpawnRequest};
 use rex_wave_api::config::{HarnessProvider, RexConfig, WorkspaceStrategy};
 use rex_wave_api::room::Body;
 use rex_wave_api::wave::{
-    AgentSpec, BaseBranch, InteractionResolution, Observation, SteerDeliveryMode,
-    WaveConfigDefaults, Workspace,
+    AgentSpec, BaseBranch, InteractionResolution, Observation, SteerDeliveryMode, WaveSpec,
+    Workspace,
 };
 use rex_wave_api::{
     ApiError, HostInteractionId, HostThreadId, InvalidId, ProviderId, RoleName, RunnerKind,
@@ -14,6 +14,7 @@ use rex_wave_api::{
 };
 use rex_wave_runtime::{DecideCtx, Service};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -146,7 +147,7 @@ pub fn resolve_agent_spec_for_wave(
     agent: &mut AgentSpec,
     default_runner: RunnerKind,
     cfg: Option<&RexConfig>,
-    defaults_mask: WaveConfigDefaults,
+    (omitted_perm, omitted_ws): (bool, bool),
     allow_account_default: bool,
 ) -> Result<(RunnerKind, bool), ApiError> {
     let mut account_applied = false;
@@ -163,14 +164,10 @@ pub fn resolve_agent_spec_for_wave(
             agent.account = prof.account.clone();
             account_applied = true;
         }
-        if defaults_mask.permission
-            && let Some(p) = prof.permission
-        {
+        if omitted_perm && let Some(p) = prof.permission {
             agent.permission = p;
         }
-        if defaults_mask.workspace
-            && let Some(w) = prof.workspace
-        {
+        if omitted_ws && let Some(w) = prof.workspace {
             agent.workspace = match w {
                 WorkspaceStrategy::ProjectDefault => Workspace::ProjectDefault,
                 WorkspaceStrategy::ManagedWorktree => Workspace::ManagedWorktree {
@@ -197,6 +194,35 @@ pub fn resolve_agent_spec_for_wave(
     Ok((routed.target, account_applied))
 }
 
+fn provider_slot_of(provider: &ProviderId) -> Option<HarnessProvider> {
+    let clean = RunnerKind::strip_provider_prefix(provider.as_str())
+        .map_or_else(|| provider.as_str(), |(_, rest)| rest);
+    HarnessProvider::parse_slot(clean)
+}
+
+fn load_wave_request_specs(path: &Path) -> BTreeMap<WaveSlug, (String, WaveSpec)> {
+    let Ok(bytes) = rex_wave_fs::read_regular_bounded(path, 4 * 1024 * 1024) else {
+        return BTreeMap::new();
+    };
+    let Ok(entries) = serde_json::from_slice::<Vec<(WaveSlug, String, WaveSpec)>>(&bytes) else {
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .map(|(w, raw_json, resolved_spec)| (w, (raw_json, resolved_spec)))
+        .collect()
+}
+
+fn save_wave_request_specs(path: &Path, map: &BTreeMap<WaveSlug, (String, WaveSpec)>) {
+    let entries: Vec<(WaveSlug, String, WaveSpec)> = map
+        .iter()
+        .map(|(w, (raw_json, resolved_spec))| (w.clone(), raw_json.clone(), resolved_spec.clone()))
+        .collect();
+    if let Ok(bytes) = serde_json::to_vec(&entries) {
+        let _ = rex_wave_fs::write_atomic_path(path, &bytes, 0o600, false);
+    }
+}
+
 /// Service wrapper around `Registry<Waves>` that resolves runner routes and
 /// `[harnesses.<slot>]` defaults once at `WaveStart` / `WaveAddWorker` time so
 /// the chosen runner and effective `AgentSpec` are durably journaled in `StreamId::Wave`.
@@ -204,6 +230,8 @@ pub struct WaveService {
     inner: Arc<dyn Service<WaveCommand>>,
     default_runner: RunnerKind,
     config_rx: Option<watch::Receiver<RexConfig>>,
+    spec_store_path: Option<PathBuf>,
+    requested_specs: Arc<Mutex<BTreeMap<WaveSlug, (String, WaveSpec)>>>,
 }
 
 impl WaveService {
@@ -216,6 +244,20 @@ impl WaveService {
             inner,
             default_runner,
             config_rx,
+            spec_store_path: None,
+            requested_specs: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub fn with_state_dir(self: Arc<Self>, state_dir: PathBuf) -> Arc<Self> {
+        let spec_path = state_dir.join("wave-request-specs.json");
+        let loaded = load_wave_request_specs(&spec_path);
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            default_runner: self.default_runner,
+            config_rx: self.config_rx.clone(),
+            spec_store_path: Some(spec_path),
+            requested_specs: Arc::new(Mutex::new(loaded)),
         })
     }
 }
@@ -227,60 +269,134 @@ impl Service<WaveCommand> for WaveService {
         ctx: DecideCtx,
     ) -> BoxFut<'_, Result<WireReply, ApiError>> {
         let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+        let mut record_started: Option<(WaveSlug, String, WaveSpec)> = None;
         let prep_res: Result<(), ApiError> = (|| {
             match &mut cmd {
                 WaveCommand::WaveStart(ws) => {
-                    let mask = ws.config_defaults;
+                    ws.config_defaults.account_from_config = false;
+                    let raw_json = serde_json::to_string(&ws.spec).unwrap_or_default();
+                    if let Some((prev_raw, prev_resolved)) = self
+                        .requested_specs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&ws.spec.slug)
+                        .cloned()
+                        && prev_raw == raw_json
+                    {
+                        ws.spec = prev_resolved;
+                        return Ok(());
+                    }
+
+                    let defaults_mask =
+                        (ws.config_defaults.permission, ws.config_defaults.workspace);
+                    let caller_defaults_had_account = ws.spec.defaults.account.is_some();
+                    let defaults_slot = provider_slot_of(&ws.spec.defaults.provider);
                     let _ = resolve_agent_spec_for_wave(
                         &mut ws.spec.defaults,
                         self.default_runner,
                         cfg.as_ref(),
-                        mask,
+                        defaults_mask,
                         true,
                     )?;
                     let default_acct = ws.spec.defaults.account.clone();
-                    for w in &mut ws.spec.workers {
-                        let mut agent = w.agent.clone().unwrap_or_else(|| ws.spec.defaults.clone());
-                        let _ = resolve_agent_spec_for_wave(
-                            &mut agent,
-                            self.default_runner,
-                            cfg.as_ref(),
-                            mask,
-                            true,
-                        )?;
-                        if agent.account.is_none() {
-                            agent.account = default_acct.clone();
+                    for (idx, w) in ws.spec.workers.iter_mut().enumerate() {
+                        if let Some(mut agent) = w.agent.take() {
+                            let w_mask = ws
+                                .config_defaults
+                                .worker_masks
+                                .get(idx)
+                                .copied()
+                                .unwrap_or(defaults_mask);
+                            let worker_slot = provider_slot_of(&agent.provider);
+                            let _ = resolve_agent_spec_for_wave(
+                                &mut agent,
+                                self.default_runner,
+                                cfg.as_ref(),
+                                w_mask,
+                                true,
+                            )?;
+                            if agent.account.is_none()
+                                && (caller_defaults_had_account
+                                    || (defaults_slot.is_some() && defaults_slot == worker_slot))
+                            {
+                                agent.account = default_acct.clone();
+                            }
+                            w.agent = Some(agent);
+                        } else {
+                            w.agent = Some(ws.spec.defaults.clone());
                         }
-                        w.agent = Some(agent);
                     }
+                    record_started = Some((ws.spec.slug.clone(), raw_json, ws.spec.clone()));
                 }
                 WaveCommand::WaveAddWorker(wa) => {
+                    wa.config_defaults.account_from_config = false;
                     if let Some(ref mut agent) = wa.worker.agent {
                         let caller_had_account = agent.account.is_some();
+                        let mask = (wa.config_defaults.permission, wa.config_defaults.workspace);
                         let (_, applied_acct) = resolve_agent_spec_for_wave(
                             agent,
                             self.default_runner,
                             cfg.as_ref(),
-                            wa.config_defaults,
+                            mask,
                             !caller_had_account,
                         )?;
-                        if applied_acct {
-                            wa.config_defaults.account_from_config = true;
-                        }
+                        wa.config_defaults.account_from_config = applied_acct;
                     }
                 }
                 _ => {}
             }
             Ok(())
         })();
+        let requested_specs = self.requested_specs.clone();
+        let spec_store_path = self.spec_store_path.clone();
         Box::pin(async move {
             prep_res?;
-            self.inner.dispatch(cmd, ctx).await
+            let reply = self.inner.dispatch(cmd, ctx).await?;
+            if let Some((slug, raw_json, resolved_spec)) = record_started {
+                let mut map = requested_specs.lock().unwrap_or_else(|e| e.into_inner());
+                if !map.contains_key(&slug) {
+                    if map.len() >= 2048
+                        && let Some(first) = map.keys().next().cloned()
+                    {
+                        map.remove(&first);
+                    }
+                    map.insert(slug, (raw_json, resolved_spec));
+                    if let Some(ref path) = spec_store_path {
+                        save_wave_request_specs(path, &map);
+                    }
+                }
+            }
+            Ok(reply)
         })
     }
 }
 
 type PinnedAttemptKey = (WaveSlug, RoleName, u32);
+
+type PinnedRouterRow = (WaveSlug, RoleName, u32, RunnerKind, AgentSpec);
+
+fn load_router_pins(path: &Path) -> BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)> {
+    let Ok(bytes) = rex_wave_fs::read_regular_bounded(path, 2 * 1024 * 1024) else {
+        return BTreeMap::new();
+    };
+    let Ok(entries) = serde_json::from_slice::<Vec<PinnedRouterRow>>(&bytes) else {
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .map(|(w, r, a, runner, agent)| ((w, r, a), (runner, agent)))
+        .collect()
+}
+
+fn save_router_pins(path: &Path, map: &BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)>) {
+    let entries: Vec<PinnedRouterRow> = map
+        .iter()
+        .map(|((w, r, a), (runner, agent))| (w.clone(), r.clone(), *a, *runner, agent.clone()))
+        .collect();
+    if let Ok(bytes) = serde_json::to_vec(&entries) {
+        let _ = rex_wave_fs::write_atomic_path(path, &bytes, 0o600, false);
+    }
+}
 
 /// N-way `AgentHost` multiplexer backed by `Arc<dyn AgentHost>` slots per [`RunnerKind`].
 #[derive(Clone)]
@@ -288,6 +404,7 @@ pub struct HostRouter {
     hosts: BTreeMap<RunnerKind, Arc<dyn AgentHost>>,
     default_runner: RunnerKind,
     config_rx: Option<watch::Receiver<RexConfig>>,
+    pin_store: Option<PathBuf>,
     pinned_attempts: Arc<Mutex<BTreeMap<PinnedAttemptKey, (RunnerKind, AgentSpec)>>>,
 }
 
@@ -297,6 +414,7 @@ impl HostRouter {
             hosts: BTreeMap::new(),
             default_runner,
             config_rx: None,
+            pin_store: None,
             pinned_attempts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -309,12 +427,20 @@ impl HostRouter {
             hosts: entries.into_iter().collect(),
             default_runner,
             config_rx: None,
+            pin_store: None,
             pinned_attempts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
     pub fn with_config_watch(mut self, rx: watch::Receiver<RexConfig>) -> Self {
         self.config_rx = Some(rx);
+        self
+    }
+
+    pub fn with_pin_store(mut self, path: PathBuf) -> Self {
+        let loaded = load_router_pins(&path);
+        self.pin_store = Some(path);
+        self.pinned_attempts = Arc::new(Mutex::new(loaded));
         self
     }
 
@@ -341,32 +467,48 @@ impl HostRouter {
 
 impl AgentHost for HostRouter {
     fn spawn(&self, mut req: SpawnRequest) -> BoxFut<'_, Result<HostThreadId, HostError>> {
-        let key = (req.wave.clone(), req.role.clone(), req.attempt);
-        let resolved: Result<(RunnerKind, AgentSpec), HostError> = {
-            let mut pinned = self
-                .pinned_attempts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = pinned.get(&key).cloned() {
-                Ok(existing)
-            } else {
-                let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+        let resolved: Result<(RunnerKind, AgentSpec), HostError> =
+            if RunnerKind::strip_provider_prefix(req.agent.provider.as_str()).is_some() {
                 let mut effective_agent = req.agent.clone();
-                match route_provider_with_config(
-                    &effective_agent.provider,
-                    self.default_runner,
-                    cfg.as_ref(),
-                ) {
-                    Ok(routed) => {
+                route_provider_with_config(&effective_agent.provider, self.default_runner, None)
+                    .map(|routed| {
                         effective_agent.provider = routed.provider;
-                        let pair = (routed.target, effective_agent);
-                        pinned.insert(key, pair.clone());
-                        Ok(pair)
+                        (routed.target, effective_agent)
+                    })
+            } else {
+                let key = (req.wave.clone(), req.role.clone(), req.attempt);
+                let mut pinned = self
+                    .pinned_attempts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(existing) = pinned.get(&key).cloned() {
+                    Ok(existing)
+                } else {
+                    let cfg = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+                    let mut effective_agent = req.agent.clone();
+                    match route_provider_with_config(
+                        &effective_agent.provider,
+                        self.default_runner,
+                        cfg.as_ref(),
+                    ) {
+                        Ok(routed) => {
+                            effective_agent.provider = routed.provider;
+                            let pair = (routed.target, effective_agent);
+                            if pinned.len() >= 1024
+                                && let Some(first) = pinned.keys().next().cloned()
+                            {
+                                pinned.remove(&first);
+                            }
+                            pinned.insert(key, pair.clone());
+                            if let Some(ref path) = self.pin_store {
+                                save_router_pins(path, &pinned);
+                            }
+                            Ok(pair)
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 }
-            }
-        };
+            };
         Box::pin(async move {
             let (target, effective_agent) = resolved?;
             let is_bare_antigravity = target == RunnerKind::T3
@@ -680,7 +822,7 @@ mod tests {
                 &mut agent,
                 RunnerKind::Bb,
                 Some(&cur_cfg),
-                WaveConfigDefaults::default(),
+                (false, false),
                 true,
             )
             .unwrap();
@@ -814,22 +956,28 @@ mod tests {
 
         let bb_calls = Arc::new(Mutex::new(Vec::new()));
         let t3_seen = Arc::new(Mutex::new(Vec::new()));
+        let pin_dir = tempfile::tempdir().unwrap();
+        let pin_path = pin_dir.path().join("router-pins.json");
         let (cfg_tx, cfg_rx) = watch::channel(RexConfig::default());
-        let router = HostRouter::new(RunnerKind::Bb)
-            .with_config_watch(cfg_rx)
-            .with_host(
-                RunnerKind::Bb,
-                FlakyBbHost {
-                    calls: bb_calls.clone(),
-                },
-            )
-            .with_host(
-                RunnerKind::T3,
-                StubHost {
-                    kind: RunnerKind::T3,
-                    seen: t3_seen.clone(),
-                },
-            );
+        let mk_router = || {
+            HostRouter::new(RunnerKind::Bb)
+                .with_config_watch(cfg_rx.clone())
+                .with_pin_store(pin_path.clone())
+                .with_host(
+                    RunnerKind::Bb,
+                    FlakyBbHost {
+                        calls: bb_calls.clone(),
+                    },
+                )
+                .with_host(
+                    RunnerKind::T3,
+                    StubHost {
+                        kind: RunnerKind::T3,
+                        seen: t3_seen.clone(),
+                    },
+                )
+        };
+        let router = mk_router();
 
         let wave = WaveSlug::parse("w-retry").unwrap();
         let proj = ProjectId::parse("/tmp/proj").unwrap();
@@ -865,15 +1013,18 @@ mod tests {
         switched.runners.codex = Some(RunnerRoute::T3);
         cfg_tx.send_replace(switched);
 
-        let retried = router.spawn(mk_req(1)).await.unwrap();
+        // Recreate a brand-new HostRouter (simulating daemon restart) after config flipped to T3;
+        // `router-pins.json` keeps the legacy bare-provider attempt=1 pinned to BB.
+        let restarted_router = mk_router();
+        let retried = restarted_router.spawn(mk_req(1)).await.unwrap();
         assert_eq!(retried.runner_kind(), RunnerKind::Bb);
         assert_eq!(bb_calls.lock().unwrap().len(), 2);
         assert!(
             t3_seen.lock().unwrap().is_empty(),
-            "attempt 1 retry must not cross over to T3"
+            "attempt 1 retry across restart must not cross over to T3"
         );
 
-        let next_attempt = router.spawn(mk_req(2)).await.unwrap();
+        let next_attempt = restarted_router.spawn(mk_req(2)).await.unwrap();
         assert_eq!(next_attempt.runner_kind(), RunnerKind::T3);
         assert_eq!(t3_seen.lock().unwrap().len(), 1);
     }
