@@ -171,6 +171,26 @@
                 "wave"
               ],
               "type": "object"
+            },
+            {
+              "description": "`#mail-<slug>-<hash16>`: created by the mail bridge with fixed participant roster.",
+              "properties": {
+                "audience": {
+                  "items": {
+                    "$ref": "#/$defs/Principal"
+                  },
+                  "type": "array"
+                },
+                "origin": {
+                  "const": "mail",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "audience"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -4513,26 +4533,191 @@
     "name": "promote_to_letter"
   },
   {
-    "description": "ACK a sandbox letter by its exact sha256.",
+    "description": "ACK a mail message or sandbox letter by exact sha256 or relative path (idempotent per seat+sha256).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seat": {
+          "description": "seat",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "sha256": {
           "description": "sha256",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "required": [
-        "path",
-        "sha256"
-      ],
       "title": "MailAck",
       "type": "object"
     },
     "name": "mail_ack"
+  },
+  {
+    "description": "Send a content-addressed (sha256) dissolved mail message committed durably to SQLite before mirror export.",
+    "inputSchema": {
+      "$defs": {
+        "LetterPriority": {
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            "blocking"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Send a dissolved content-addressed (`sha256`) mail message. Commits durably\nto SQLite FIRST, then projects into a 1:1 DM or multi-seat channel and\nexports atomically to `<mirror>/objects/<sha256>.md` and `<mirror>/mail/<slug>.md`.",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "cc": {
+          "items": {
+            "description": "seat",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "from": {
+          "description": "seat",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idem": {
+          "description": "idempotency key",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "in_reply_to": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "$ref": "#/$defs/LetterPriority",
+          "default": "normal"
+        },
+        "refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "to": {
+          "items": {
+            "description": "seat",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "topic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wait_export": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "to",
+        "subject",
+        "body"
+      ],
+      "title": "MailSend",
+      "type": "object"
+    },
+    "name": "mail_send"
+  },
+  {
+    "description": "Fast check returning unread/unacked mail for a seat plus sender delivery notices.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "include_all": {
+          "default": false,
+          "type": "boolean"
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "seat": {
+          "description": "seat",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "MailCheck",
+      "type": "object"
+    },
+    "name": "mail_check"
+  },
+  {
+    "description": "Full-text (SQLite FTS5) search across content-addressed mail messages.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "type": "string"
+        },
+        "seat": {
+          "description": "seat",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "MailSearch",
+      "type": "object"
+    },
+    "name": "mail_search"
   },
   {
     "description": "Claim or update durable seat metadata (role, projects, aliases, status) with provenance.",

@@ -9,16 +9,22 @@
 #![allow(clippy::disallowed_methods)]
 
 use proptest::prelude::*;
+use rex_wave_api::mail::*;
 use rex_wave_api::presence::*;
 use rex_wave_api::*;
 use rex_wave_mailbridge::{
-    AliasMap, DeferReason, IncarnationAffinity, LetterCandidate, Presence, PresenceState,
-    ReadOnlyInterchange, RetryEntry, RetryState, RingDecision, RingPolicy, ShadowWatchTracker,
-    TimeBasis, decide_mail_rings_for_seat, parse_acks_jsonl, run_shadow_pass,
+    AliasMap, DeferReason, IncarnationAffinity, LetterCandidate, MailBridge, MailState, Presence,
+    PresenceState, Protection, ReadOnlyInterchange, RetryEntry, RetryState, RingDecision,
+    RingPolicy, SandboxRoot, ShadowWatchTracker, TimeBasis, decide_mail_rings_for_seat,
+    parse_acks_jsonl, rebuild_mail_from_mirror, run_shadow_pass, scan_object_blobs,
+    scan_working_tree_dir,
 };
-use rex_wave_runtime::{DecideCtx, Decider, EntryMeta};
+use rex_wave_runtime::{DecideCtx, Decider, EntryMeta, Service};
+use rex_wave_store::Journal;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::PathBuf;
 
 fn sha_of(bytes: &[u8]) -> Sha256Hex {
     let mut h = Sha256::new();
@@ -999,4 +1005,332 @@ fn pre_deadline_in_flight_heartbeat_and_multi_lane_bindings_match_tla() {
         .find(|b| b.incarnation_id == inc1)
         .unwrap();
     assert_eq!(b1.expires_at, Some(UnixMs(1_450)));
+}
+
+#[derive(Clone, Debug)]
+enum MailStoreAction {
+    Send { slot: u8, skip_export_crash: bool },
+    Drop { slot: u8 },
+    Ack { slot: u8, skip_export_crash: bool },
+    EditAfterAck { slot: u8, rev: u8 },
+    Crash,
+    Restart,
+    Reconcile,
+}
+
+fn mail_store_action_strategy() -> impl Strategy<Value = MailStoreAction> {
+    prop_oneof![
+        (0u8..4, any::<bool>()).prop_map(|(slot, skip_export_crash)| MailStoreAction::Send {
+            slot,
+            skip_export_crash,
+        }),
+        (0u8..4).prop_map(|slot| MailStoreAction::Drop { slot }),
+        (0u8..4, any::<bool>()).prop_map(|(slot, skip_export_crash)| MailStoreAction::Ack {
+            slot,
+            skip_export_crash,
+        }),
+        (0u8..4, 1u8..=3).prop_map(|(slot, rev)| MailStoreAction::EditAfterAck { slot, rev }),
+        Just(MailStoreAction::Crash),
+        Just(MailStoreAction::Restart),
+        Just(MailStoreAction::Reconcile),
+    ]
+}
+
+fn open_test_mail_bridge(
+    sandbox: &SandboxRoot,
+    journal_path: &std::path::Path,
+    drop_dir: PathBuf,
+) -> (Journal, MailBridge) {
+    let journal = Journal::open(journal_path).expect("open journal");
+    let writer = journal.claim(StreamId::Mail).expect("claim mail stream");
+    let bridge =
+        MailBridge::new(sandbox.clone(), journal.clone(), writer).with_drop_dir(Some(drop_dir));
+    (journal, bridge)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 24,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// Direct state-machine conformance suite for `specs/mail/MailStore.tla`
+    /// verifying `DurableSend`, `SingleHashPerPath`, `EditNeverRingable`, and
+    /// `RebuildParity` across `Send`, `Drop`, `EditAfterAck`, `Crash`,
+    /// `Restart`, `Reconcile`, and `Ack`.
+    #[test]
+    fn proptest_mail_store_conformance_matches_tla_invariants(
+        actions in prop::collection::vec(mail_store_action_strategy(), 3..18)
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async move {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mirror_dir = tmp.path().join("mirror");
+            let drop_dir = tmp.path().join("drop");
+            let journal_path = tmp.path().join("journal.sqlite3");
+            let rebuild_journal_path = tmp.path().join("rebuilt.sqlite3");
+            fs::create_dir_all(&mirror_dir).expect("mkdir mirror");
+            fs::create_dir_all(&drop_dir).expect("mkdir drop");
+            fs::write(mirror_dir.join(".rex-wave-sandbox"), b"test\n").expect("marker");
+
+            let protection = Protection::default();
+            let sandbox = SandboxRoot::verify_with(&mirror_dir, &protection).expect("sandbox");
+            let alice = SeatName::parse("alice").expect("alice");
+            let bob = SeatName::parse("bob").expect("bob");
+            let aliases = AliasMap::empty();
+
+            let mut up = true;
+            let mut reconciled = true;
+            let mut live: Option<(Journal, MailBridge)> = Some(open_test_mail_bridge(
+                &sandbox,
+                &journal_path,
+                drop_dir.clone(),
+            ));
+
+            let mut used_slots: BTreeSet<u8> = BTreeSet::new();
+            let mut slot_path: BTreeMap<u8, PathBuf> = BTreeMap::new();
+            let mut slot_orig_sha: BTreeMap<u8, Sha256Hex> = BTreeMap::new();
+            let mut sent_shas: BTreeSet<Sha256Hex> = BTreeSet::new();
+            let mut edit_target_shas: BTreeSet<Sha256Hex> = BTreeSet::new();
+            let mut step_ms = 1_795_500_000_000u64;
+
+            for action in actions {
+                step_ms += 100;
+                match action {
+                    MailStoreAction::Send {
+                        slot,
+                        skip_export_crash,
+                    } => {
+                        if up && reconciled && !used_slots.contains(&slot) {
+                            let (_, bridge) = live.as_ref().expect("hub up");
+                            bridge.set_export_enabled(!skip_export_crash);
+                            let ctx = DecideCtx::for_test(
+                                Principal::Seat {
+                                    seat: alice.clone(),
+                                },
+                                UnixMs(step_ms),
+                            );
+                            let reply = bridge
+                                .dispatch(
+                                    MailCommand::MailSend(MailSend {
+                                        to: vec![bob.clone()],
+                                        cc: Vec::new(),
+                                        subject: format!("Slot {slot}"),
+                                        body: format!("Original body for slot {slot}"),
+                                        from: Some(alice.clone()),
+                                        priority: LetterPriority::Normal,
+                                        topic: Some(format!("slot-{slot}")),
+                                        in_reply_to: None,
+                                        refs: Vec::new(),
+                                        wait_export: !skip_export_crash,
+                                        idem: None,
+                                    }),
+                                    ctx,
+                                )
+                                .await
+                                .expect("mail send succeeds");
+                            let WireReply::MailSend(sent) = reply else {
+                                unreachable!("MailSend reply");
+                            };
+                            used_slots.insert(slot);
+                            slot_path.insert(slot, sent.path);
+                            slot_orig_sha.insert(slot, sent.sha256.clone());
+                            sent_shas.insert(sent.sha256);
+
+                            if skip_export_crash {
+                                // Simulated crash immediately after SQLite commit, before export!
+                                live = None;
+                                up = false;
+                                reconciled = false;
+                            } else {
+                                bridge.set_export_enabled(true);
+                            }
+                        }
+                    }
+                    MailStoreAction::Drop { slot } => {
+                        // Drop works whether the hub is up OR down!
+                        if !used_slots.contains(&slot) {
+                            let fname = format!("{step_ms}-alice-to-bob-drop-{slot}.md");
+                            let body = format!(
+                                "---\nid: {step_ms}-alice-to-bob-drop-{slot}\nfrom: alice\nto: bob\nsubject: Drop {slot}\n---\n\nDropped body {slot}\n"
+                            );
+                            let bytes = body.into_bytes();
+                            let sha = sha_of(&bytes);
+                            fs::write(drop_dir.join(&fname), &bytes).expect("write drop");
+                            used_slots.insert(slot);
+                            slot_path.insert(slot, PathBuf::from(format!("mail/{fname}")));
+                            slot_orig_sha.insert(slot, sha.clone());
+                            sent_shas.insert(sha);
+                        }
+                    }
+                    MailStoreAction::Ack {
+                        slot,
+                        skip_export_crash,
+                    } => {
+                        if up && let Some(sha) = slot_orig_sha.get(&slot).cloned() {
+                            let (_, bridge) = live.as_ref().expect("hub up");
+                            let snap = bridge.mail_state_snapshot().await;
+                            if snap.ringable_for_seat(&bob).contains(&sha) {
+                                bridge.set_export_enabled(!skip_export_crash);
+                                let ctx = DecideCtx::for_test(
+                                    Principal::Seat { seat: bob.clone() },
+                                    UnixMs(step_ms),
+                                );
+                                let _ = bridge
+                                    .dispatch(
+                                        MailCommand::MailAck(MailAck {
+                                            path: None,
+                                            sha256: Some(sha),
+                                            seat: Some(bob.clone()),
+                                            note: Some("acked".into()),
+                                        }),
+                                        ctx,
+                                    )
+                                    .await
+                                    .expect("ringable mail ack succeeds");
+                                if skip_export_crash {
+                                    live = None;
+                                    up = false;
+                                    reconciled = false;
+                                } else {
+                                    bridge.set_export_enabled(true);
+                                }
+                            }
+                        }
+                    }
+                    MailStoreAction::EditAfterAck { slot, rev } => {
+                        if let (Some(rel_path), Some(orig_sha)) =
+                            (slot_path.get(&slot), slot_orig_sha.get(&slot))
+                        {
+                            let abs = mirror_dir.join(rel_path);
+                            if abs.is_file() {
+                                let acks_raw = fs::read_to_string(mirror_dir.join("state/acks.jsonl"))
+                                    .unwrap_or_default();
+                                let idx = parse_acks_jsonl(&acks_raw, &aliases).index();
+                                let cur_bytes = fs::read(&abs).expect("read working tree");
+                                if idx.is_acked_by_digest("bob", orig_sha, &aliases)
+                                    && sha_of(&cur_bytes) == *orig_sha
+                                {
+                                    let edited = format!(
+                                        "---\nfrom: alice\nto: bob\nsubject: Slot {slot}\n---\n\nEdited post-ack rev={rev}\n"
+                                    )
+                                    .into_bytes();
+                                    let edited_sha = sha_of(&edited);
+                                    fs::write(&abs, &edited).expect("edit working tree in place");
+                                    edit_target_shas.insert(edited_sha);
+                                }
+                            }
+                        }
+                    }
+                    MailStoreAction::Crash => {
+                        if up {
+                            live = None;
+                            up = false;
+                            reconciled = false;
+                        }
+                    }
+                    MailStoreAction::Restart => {
+                        if !up {
+                            live = Some(open_test_mail_bridge(
+                                &sandbox,
+                                &journal_path,
+                                drop_dir.clone(),
+                            ));
+                            up = true;
+                            reconciled = false;
+                        }
+                    }
+                    MailStoreAction::Reconcile => {
+                        if up {
+                            let (_, bridge) = live.as_ref().expect("hub up");
+                            bridge.set_export_enabled(true);
+                            bridge.reconcile().await.expect("reconcile succeeds");
+                            reconciled = true;
+                        }
+                    }
+                }
+
+                // Check MailStore.tla invariants after every step:
+                let disk_blobs: BTreeSet<Sha256Hex> = scan_object_blobs(&mirror_dir)
+                    .expect("scan blobs")
+                    .into_iter()
+                    .map(|(s, _, _)| s)
+                    .collect();
+                let disk_working =
+                    scan_working_tree_dir(&mirror_dir, &aliases, false).expect("scan working");
+                let disk_drops =
+                    scan_working_tree_dir(&drop_dir, &aliases, true).expect("scan drop");
+
+                // SingleHashPerPath: every working-tree path holds at most one hash.
+                let mut seen_paths = BTreeSet::new();
+                for f in &disk_working {
+                    prop_assert!(
+                        seen_paths.insert(f.rel_path.clone()),
+                        "SingleHashPerPath violated for {}",
+                        f.rel_path
+                    );
+                }
+
+                let db_state = if let Some((_, ref bridge)) = live {
+                    bridge.mail_state_snapshot().await
+                } else {
+                    let j = Journal::open(&journal_path).expect("inspect journal while down");
+                    MailState::from_journal(&j).expect("replay state")
+                };
+
+                // DurableSend: every sent/dropped message exists in db ∪ drop ∪ mirror.
+                let mut all_durable: BTreeSet<Sha256Hex> = db_state.db_set();
+                all_durable.extend(disk_blobs.iter().cloned());
+                all_durable.extend(disk_working.iter().map(|f| f.sha256.clone()));
+                all_durable.extend(disk_drops.iter().map(|f| f.sha256.clone()));
+                for s in &sent_shas {
+                    prop_assert!(
+                        all_durable.contains(s),
+                        "DurableSend violated: missing hash {s}"
+                    );
+                }
+
+                // EditNeverRingable: no post-ack edited hash may ever be ringable!
+                let ringable_bob = db_state.ringable_for_seat(&bob);
+                for edit_sha in &edit_target_shas {
+                    prop_assert!(
+                        !ringable_bob.contains(edit_sha),
+                        "EditNeverRingable violated: post-ack edit {edit_sha} became ringable!"
+                    );
+                }
+            }
+
+            // Bring hub up and reach Quiescent via startup Reconcile, then verify RebuildParity!
+            if !up {
+                live = Some(open_test_mail_bridge(
+                    &sandbox,
+                    &journal_path,
+                    drop_dir.clone(),
+                ));
+            }
+            let (_, bridge) = live.as_ref().expect("hub up");
+            bridge.set_export_enabled(true);
+            bridge.reconcile().await.expect("final reconcile");
+            let final_state = bridge.mail_state_snapshot().await;
+            drop(live);
+
+            // Delete rebuilt target if any and rebuild strictly from mirror alone.
+            let _ = fs::remove_file(&rebuild_journal_path);
+            rebuild_mail_from_mirror(&mirror_dir, &rebuild_journal_path, &aliases, &protection)
+                .expect("offline lossless rebuild");
+            let rebuilt_journal = Journal::open(&rebuild_journal_path).expect("open rebuilt");
+            let rebuilt_state = MailState::from_journal(&rebuilt_journal).expect("replay rebuilt");
+
+            // MailStore.tla RebuildParity: db = RebuiltDb /\ acked = RebuiltAcked /\ flagged = RebuiltFlags
+            prop_assert_eq!(final_state.db_set(), rebuilt_state.db_set());
+            prop_assert_eq!(final_state.acked, rebuilt_state.acked);
+            prop_assert_eq!(final_state.flagged_shas, rebuilt_state.flagged_shas);
+            Ok(())
+        })?;
+    }
 }

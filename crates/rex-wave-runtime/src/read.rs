@@ -75,8 +75,10 @@ impl AgentFeed for NoAgentFeed {
     }
 }
 
-/// Stream-level read privacy: a principal's inbox is theirs alone, and a DM is
-/// only for its two members.
+/// Stream-level read privacy: a principal's inbox is theirs alone, a DM is
+/// only for its two members, `StreamId::Mail` and `StreamId::Config` are
+/// restricted to operator/system, and `#mail-*` channels require membership
+/// (checked via [`can_read_in`]).
 pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
     if viewer.is_operator_or_system() {
         return Ok(());
@@ -86,12 +88,12 @@ pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
         StreamId::Room {
             room: RoomId::Direct { pair },
         } => pair.other_for_viewer(viewer).is_some(),
+        StreamId::Room { room } if room.is_mail_channel() => false,
         StreamId::Room { .. }
         | StreamId::Wave { .. }
         | StreamId::Board { .. }
-        | StreamId::Mail
         | StreamId::Presence => true,
-        StreamId::Config => false,
+        StreamId::Mail | StreamId::Config => false,
     };
     if allowed {
         Ok(())
@@ -101,6 +103,42 @@ pub fn can_read(viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
             action: format!("read {stream:?}"),
         })
     }
+}
+
+/// Membership-aware stream read authorization, checking durable/sidebar room
+/// membership for participant-scoped `#mail-*` channels.
+pub fn can_read_in(
+    viewer: &Principal,
+    stream: &StreamId,
+    journal: &Journal,
+    sidebar: Option<&SidebarProjection>,
+) -> Result<(), ApiError> {
+    if viewer.is_operator_or_system() {
+        return Ok(());
+    }
+    if let StreamId::Room { room } = stream
+        && room.is_mail_channel()
+    {
+        if matches!(viewer, Principal::Worker { .. }) {
+            return Err(ApiError::Denied {
+                principal: viewer.to_string(),
+                action: format!("read {stream:?}"),
+            });
+        }
+        let is_member = match sidebar {
+            Some(sb) => sb.is_member_caught_up(journal, room, viewer),
+            None => crate::sidebar::is_room_member_in_journal(journal, room, viewer),
+        };
+        return if is_member {
+            Ok(())
+        } else {
+            Err(ApiError::Denied {
+                principal: viewer.to_string(),
+                action: format!("read {stream:?}"),
+            })
+        };
+    }
+    can_read(viewer, stream)
 }
 
 /// Maps `ApiError::Denied` to `ApiError::NotFound` so external/HTTP callers
@@ -122,6 +160,18 @@ pub fn can_read_visible(
     resource: impl Into<String>,
 ) -> Result<(), ApiError> {
     can_read(viewer, stream).map_err(|err| mask_unauthorized_as_not_found(err, resource))
+}
+
+/// Membership-aware variant of [`can_read_visible`] for external/HTTP callers.
+pub fn can_read_visible_in(
+    viewer: &Principal,
+    stream: &StreamId,
+    journal: &Journal,
+    sidebar: Option<&SidebarProjection>,
+    resource: impl Into<String>,
+) -> Result<(), ApiError> {
+    can_read_in(viewer, stream, journal, sidebar)
+        .map_err(|err| mask_unauthorized_as_not_found(err, resource))
 }
 
 /// True when every required `key=value` label is present in `actual`.
@@ -406,6 +456,10 @@ impl ReadSide {
         }
     }
 
+    fn can_viewer_read(&self, viewer: &Principal, stream: &StreamId) -> Result<(), ApiError> {
+        can_read_in(viewer, stream, &self.journal, Some(&self.sidebar))
+    }
+
     fn sanitize_and_remap_cursor(
         &self,
         viewer: &Principal,
@@ -414,7 +468,7 @@ impl ReadSide {
     ) -> Result<Cursor, ApiError> {
         let mut store_err: Option<ApiError> = None;
         let out = from.filter_map_streams(|s| {
-            if can_read(viewer, s).is_err() {
+            if self.can_viewer_read(viewer, s).is_err() {
                 return None;
             }
             let mapped = if remap_dm_cursor {
@@ -430,7 +484,7 @@ impl ReadSide {
             } else {
                 s.clone()
             };
-            if can_read(viewer, &mapped).is_err() {
+            if self.can_viewer_read(viewer, &mapped).is_err() {
                 return None;
             }
             Some(mapped)
@@ -475,7 +529,7 @@ impl ReadSide {
             Some(streams) => {
                 let readable: Vec<StreamId> = streams
                     .iter()
-                    .filter(|s| can_read(&viewer, s).is_ok())
+                    .filter(|s| self.can_viewer_read(&viewer, s).is_ok())
                     .cloned()
                     .collect();
                 self.journal
@@ -508,7 +562,7 @@ impl ReadSide {
                 let mut waves = BTreeSet::new();
                 for s in &raw_candidates {
                     if let StreamId::Wave { wave } = s
-                        && can_read(&viewer, s).is_ok()
+                        && self.can_viewer_read(&viewer, s).is_ok()
                         && !from.lists(s)
                     {
                         let first = self.journal.read(s, Seq::ORIGIN, 1).map_err(store_error)?;
@@ -528,12 +582,12 @@ impl ReadSide {
 
         let mut candidates = Vec::with_capacity(raw_candidates.len());
         for s in raw_candidates {
-            if can_read(&viewer, &s).is_err() {
+            if self.can_viewer_read(&viewer, &s).is_err() {
                 continue;
             }
             let start = start_seq_scoped(&from, &initial, &snap_project_waves, &s);
             filter.seed_stream(&self.journal, &s, start)?;
-            if !filter.considers_stream(&viewer, &s) {
+            if !filter.considers_stream(&viewer, &s, &self.journal, &self.sidebar) {
                 continue;
             }
             candidates.push((s, start));
@@ -577,6 +631,7 @@ impl ReadSide {
         }
 
         let journal = self.journal.clone();
+        let sidebar = self.sidebar.clone();
         let task_baseline = baseline.clone();
         let (tx, stream) = frame_channel(WATCH_BUFFER);
         tokio::spawn(async move {
@@ -591,6 +646,7 @@ impl ReadSide {
                 }
                 if !replay_stream(
                     &journal,
+                    &sidebar,
                     &s,
                     &viewer,
                     &mut filter,
@@ -620,11 +676,11 @@ impl ReadSide {
                     () = tx.closed() => break,
                     item = tap.recv() => match item {
                         Ok(env) => {
-                            if can_read(&viewer, &env.stream).is_err() {
+                            if can_read_in(&viewer, &env.stream, &journal, Some(&sidebar)).is_err() {
                                 continue;
                             }
                             filter.observe(&env);
-                            if !filter.considers_stream(&viewer, &env.stream) {
+                            if !filter.considers_stream(&viewer, &env.stream, &journal, &sidebar) {
                                 continue;
                             }
                             let cur = *seen.entry(env.stream.clone()).or_insert_with(|| start_seq_scoped(&from, &initial, &snap_project_waves, &env.stream));
@@ -634,10 +690,10 @@ impl ReadSide {
                             if env.seq == cur.next() {
                                 seen.insert(env.stream.clone(), env.seq);
                                 cursor.advance(&env.stream, env.seq);
-                                if filter.matches(&viewer, &env) && tx.send(Ok(Frame::Committed((*env).clone()))).await.is_err() {
+                                if filter.matches(&viewer, &env, &journal, &sidebar) && tx.send(Ok(Frame::Committed((*env).clone()))).await.is_err() {
                                     break;
                                 }
-                            } else if !replay_stream(&journal, &env.stream, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
+                            } else if !replay_stream(&journal, &sidebar, &env.stream, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
                                 break;
                             }
                         }
@@ -646,7 +702,7 @@ impl ReadSide {
                                 Some(exact) => {
                                     let readable: Vec<StreamId> = exact
                                         .iter()
-                                        .filter(|s| can_read(&viewer, s).is_ok())
+                                        .filter(|s| can_read_in(&viewer, s, &journal, Some(&sidebar)).is_ok())
                                         .cloned()
                                         .collect();
                                     match journal.heads(&readable) {
@@ -666,7 +722,7 @@ impl ReadSide {
                                 },
                             };
                             for (s, head) in streams {
-                                if can_read(&viewer, &s).is_err() {
+                                if can_read_in(&viewer, &s, &journal, Some(&sidebar)).is_err() {
                                     continue;
                                 }
                                 let cur = *seen.entry(s.clone()).or_insert_with(|| start_seq_scoped(&from, &initial, &snap_project_waves, &s));
@@ -674,10 +730,10 @@ impl ReadSide {
                                     let _ = tx.send(Err(e)).await;
                                     return;
                                 }
-                                if !filter.considers_stream(&viewer, &s) {
+                                if !filter.considers_stream(&viewer, &s, &journal, &sidebar) {
                                     continue;
                                 }
-                                if cur < head && !replay_stream(&journal, &s, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
+                                if cur < head && !replay_stream(&journal, &sidebar, &s, &viewer, &mut filter, &mut seen, &mut cursor, &tx).await {
                                     return;
                                 }
                             }
@@ -713,7 +769,7 @@ impl ReadSide {
         if let Some(ref c) = req.cursor {
             let mut out = self.sanitize_and_remap_cursor(viewer, c, remap_dm_cursor)?;
             if let Some(ref target) = target_stream
-                && can_read(viewer, target).is_ok()
+                && self.can_viewer_read(viewer, target).is_ok()
             {
                 if let Some(since) = req.since {
                     out.advance(target, since);
@@ -733,7 +789,7 @@ impl ReadSide {
             } else {
                 Cursor::default()
             };
-            if can_read(viewer, &target).is_ok() {
+            if self.can_viewer_read(viewer, &target).is_ok() {
                 return Ok(base.with(target, since));
             }
             return Ok(base);
@@ -764,7 +820,7 @@ impl ReadSide {
             Interest::Room { room } | Interest::RoomFiltered { room, .. } => {
                 let id = self.resolve_room_ref(room, worker).ok()?;
                 let stream = StreamId::Room { room: id.clone() };
-                can_read(worker, &stream).ok()?;
+                self.can_viewer_read(worker, &stream).ok()?;
                 let mapped = if matches!(room, rex_wave_api::room::RoomRef::Dm { .. }) {
                     self.sanitize_and_remap_cursor(worker, &effective, true)
                         .ok()?
@@ -775,7 +831,7 @@ impl ReadSide {
             }
             Interest::Streams { streams } => {
                 for s in streams {
-                    can_read(worker, s).ok()?;
+                    self.can_viewer_read(worker, s).ok()?;
                 }
                 if streams.len() == 1
                     && let StreamId::Room { room } = &streams[0]
@@ -999,8 +1055,10 @@ fn start_seq_scoped(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn replay_stream(
     journal: &Journal,
+    sidebar: &SidebarProjection,
     stream: &StreamId,
     viewer: &Principal,
     filter: &mut Filter,
@@ -1024,7 +1082,9 @@ async fn replay_stream(
             filter.observe(&env);
             seen.insert(stream.clone(), env.seq);
             cursor.advance(stream, env.seq);
-            if filter.matches(viewer, &env) && tx.send(Ok(Frame::Committed(env))).await.is_err() {
+            if filter.matches(viewer, &env, journal, sidebar)
+                && tx.send(Ok(Frame::Committed(env))).await.is_err()
+            {
                 return false;
             }
         }
@@ -1072,7 +1132,7 @@ impl Filter {
         match interest {
             Interest::Streams { streams } => {
                 for s in &streams {
-                    can_read(viewer, s)?;
+                    can_read_in(viewer, s, journal, Some(&sidebar))?;
                 }
                 Ok(Filter::Exact(streams.into_iter().collect()))
             }
@@ -1080,14 +1140,14 @@ impl Filter {
                 let s = StreamId::Room {
                     room: resolve_ref(&room)?,
                 };
-                can_read(viewer, &s)?;
+                can_read_in(viewer, &s, journal, Some(&sidebar))?;
                 Ok(Filter::Exact(BTreeSet::from([s])))
             }
             Interest::RoomFiltered { room, re, labels } => {
                 let s = StreamId::Room {
                     room: resolve_ref(&room)?,
                 };
-                can_read(viewer, &s)?;
+                can_read_in(viewer, &s, journal, Some(&sidebar))?;
                 Ok(Filter::RoomFiltered {
                     stream: s,
                     re,
@@ -1266,8 +1326,14 @@ impl Filter {
         }
     }
 
-    fn considers_stream(&self, viewer: &Principal, stream: &StreamId) -> bool {
-        if can_read(viewer, stream).is_err() {
+    fn considers_stream(
+        &self,
+        viewer: &Principal,
+        stream: &StreamId,
+        journal: &Journal,
+        sidebar: &SidebarProjection,
+    ) -> bool {
+        if can_read_in(viewer, stream, journal, Some(sidebar)).is_err() {
             return false;
         }
         match self {
@@ -1294,8 +1360,14 @@ impl Filter {
         }
     }
 
-    fn matches(&self, viewer: &Principal, env: &Envelope) -> bool {
-        if !self.considers_stream(viewer, &env.stream) {
+    fn matches(
+        &self,
+        viewer: &Principal,
+        env: &Envelope,
+        journal: &Journal,
+        sidebar: &SidebarProjection,
+    ) -> bool {
+        if !self.considers_stream(viewer, &env.stream, journal, sidebar) {
             return false;
         }
         match self {
@@ -1392,7 +1464,7 @@ impl Service<ReadCommand> for ReadSide {
                         },
                         None => r.stream,
                     };
-                    can_read(ctx.by(), &target_stream)?;
+                    self.can_viewer_read(ctx.by(), &target_stream)?;
                     let head = self.journal.head(&target_stream).map_err(store_error)?;
                     let remap_dm_cursor =
                         matches!(&r.room, Some(rex_wave_api::room::RoomRef::Dm { .. }));

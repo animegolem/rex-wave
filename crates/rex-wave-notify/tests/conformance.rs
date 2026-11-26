@@ -440,7 +440,12 @@ proptest! {
                             push_env(
                                 StreamId::Mail,
                                 alice.clone(),
-                                Event::Mail(MailEvent::Acked { path: rel, sha256: sha }),
+                                Event::Mail(MailEvent::Acked {
+                                    path: rel,
+                                    sha256: sha,
+                                    seat: None,
+                                    note: None,
+                                }),
                                 50,
                             );
                         }
@@ -768,6 +773,8 @@ async fn herald_mail_unrung_grace_window_suppresses_within_grace_and_resolves_on
                 event: Event::Mail(MailEvent::Acked {
                     path: rel,
                     sha256: sha,
+                    seat: None,
+                    note: None,
                 }),
             }),
             &herald_client,
@@ -896,6 +903,8 @@ async fn persisted_mail_unrung_card_resolves_on_cold_replay_when_ack_committed_b
         event: Event::Mail(MailEvent::Acked {
             path: rel,
             sha256: sha,
+            seat: None,
+            note: None,
         }),
     };
     let mut cold_herald = Herald::with_grace(Duration::from_millis(15_000));

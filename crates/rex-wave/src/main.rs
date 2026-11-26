@@ -11,7 +11,7 @@ use rex_wave_api::{
         CardUpsert, LaneName, Priority, Title,
     },
     config::{ConfigGet, ConfigSet, ConfigShow, SETTINGS_FIELDS},
-    mail::{LetterPriority, MailPromote},
+    mail::{LetterPriority, MailAck, MailCheck, MailPromote, MailReconcile, MailSearch, MailSend},
     notify::InboxList,
     presence::{
         LivenessMode, PresenceBind, PresenceClaim, PresenceHeartbeat, PresenceList,
@@ -36,9 +36,10 @@ use rex_wave_board::task_org::{
 };
 use rex_wave_mailbridge::{
     AliasMap, IncarnationAffinity, Presence, PresenceState, ReadOnlyInterchange, RetryState,
-    RingPolicy, ShadowWatchTracker, check_gate1_fixtures_with_profile,
+    RingPolicy, SandboxError, ShadowWatchTracker, check_gate1_fixtures_with_profile,
     compare_shadow_with_mailwatch_seen, extract_shadow_aliases, load_claude_session_file,
-    load_house_profile, parse_acks_jsonl, parse_claude_session_json, parse_mailwatch_seen_sources,
+    load_house_profile, load_protected_roots, migrate_verify_interchange, parse_acks_jsonl,
+    parse_claude_session_json, parse_mailwatch_seen_sources, rebuild_mail_from_mirror,
     run_shadow_pass, score_shadow_jsonl, seed_records_from_interchange_with_options,
 };
 use rex_wave_mcp::McpServer;
@@ -50,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+const EXIT_REFUSED: u8 = 2;
 const EXIT_CONFLICT: u8 = 3;
 const EXIT_TIMEOUT: u8 = 124;
 
@@ -174,7 +176,7 @@ pub enum Cmd {
     /// Manage durable seat records and ephemeral session bindings.
     #[command(subcommand)]
     Presence(PresenceCmd),
-    /// Run the read-only shadow mail reactor and Gate 2 shadow scorer.
+    /// Send, check, acknowledge, search, reconcile, rebuild, or verify content-addressed mail.
     #[command(subcommand)]
     Mail(MailCmd),
     /// Inspect or update operator configuration (`~/.config/rex-wave/config.toml`).
@@ -580,6 +582,103 @@ pub enum ConfigCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum MailCmd {
+    /// Send an immutable content-addressed (`sha256`) letter, dissolved into DMs/threads and mirrored to Markdown.
+    Send {
+        /// Recipient seat(s) (repeat `--to` for multi-seat mail threads).
+        #[arg(long = "to", required = true)]
+        to: Vec<String>,
+        /// Optional CC seat(s).
+        #[arg(long = "cc")]
+        cc: Vec<String>,
+        /// Letter subject line.
+        #[arg(long)]
+        subject: String,
+        /// Inline Markdown body (`-` reads stdin).
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Path to a Markdown body file.
+        #[arg(long = "body-file", conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        /// Optional sender seat (Operator/System may override; Seats may only name themselves).
+        #[arg(long)]
+        from: Option<String>,
+        /// Letter priority (`low`, `normal`, `high`, or `blocking`).
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        /// Parent message `sha256` or letter `id` for threading.
+        #[arg(long = "in-reply-to")]
+        in_reply_to: Option<String>,
+        /// Optional topic slug (used for filename and multi-seat thread channel name).
+        #[arg(long)]
+        topic: Option<String>,
+        /// Optional reference identifiers (`refs` YAML header).
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        /// Wait until mirror `.md` and blob export finishes before returning.
+        #[arg(long = "wait-export")]
+        wait_export: bool,
+        /// Optional caller idempotency key for safe send retries.
+        #[arg(long = "id", alias = "idem")]
+        idem: Option<String>,
+    },
+    /// Fast unread mail check for a seat, plus delivery notices for dormant/unregistered recipients.
+    Check {
+        /// Target seat (defaults to caller seat; non-Operator seats may only check themselves).
+        #[arg(long)]
+        seat: Option<String>,
+        /// Include already-acknowledged and flagged letters.
+        #[arg(long)]
+        all: bool,
+        /// Maximum number of summaries to return.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Acknowledge a mail message by exact `sha256` hex or relative letter path (idempotent).
+    Ack {
+        /// Message `sha256` (64 hex chars) or relative letter path.
+        target: String,
+        /// Explicit seat to record the ACK under (Operator/System only for other seats).
+        #[arg(long)]
+        seat: Option<String>,
+        /// Optional explicit `sha256` hex when `target` is a path.
+        #[arg(long)]
+        sha256: Option<String>,
+        /// Optional short receipt note.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Full-text search across committed mail using SQLite FTS5.
+    Search {
+        /// FTS5 query string.
+        query: String,
+        /// Scope results to a seat (non-Operator seats are always scoped to themselves).
+        #[arg(long)]
+        seat: Option<String>,
+        /// Maximum number of ranked hits to return.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Run a live reconciliation sweep between the SQLite journal and mirror/drop folders.
+    Reconcile,
+    /// Offline lossless rebuild of `journal.sqlite3` from a mirror directory (`objects/*.md` + working tree + `state/acks.jsonl`).
+    Rebuild {
+        /// Mirror directory to read from (opened read-only).
+        #[arg(long = "from")]
+        from: PathBuf,
+        /// Target SQLite journal path to rebuild into (parent verified against `protected-roots`).
+        #[arg(long)]
+        journal: PathBuf,
+    },
+    /// Read-only migration + delete-journal + lossless-rebuild parity verifier over an interchange folder.
+    #[command(name = "migrate-verify")]
+    MigrateVerify {
+        /// Interchange root directory (opened strictly read-only).
+        #[arg(long)]
+        interchange: PathBuf,
+        /// Optional temporary workspace directory outside `protected-roots` and `--interchange` (auto-created and cleaned up when omitted).
+        #[arg(long = "work-dir")]
+        work_dir: Option<PathBuf>,
+    },
     /// Run the structurally read-only shadow mail reactor over an interchange folder.
     Shadow {
         /// Interchange root directory (opened read-only).
@@ -796,6 +895,7 @@ pub enum PresenceCmd {
 #[derive(Debug)]
 enum CliError {
     Api(ApiError),
+    Refused(String),
     ConflictValue {
         summary: String,
         payload: serde_json::Value,
@@ -804,8 +904,12 @@ enum CliError {
 }
 
 impl CliError {
-    fn exit_code(&self) -> ExitCode {
+    fn exit_code(&self, is_mail_cmd: bool) -> ExitCode {
         match self {
+            CliError::Refused(_) => ExitCode::from(EXIT_REFUSED),
+            CliError::Api(ApiError::Denied { .. } | ApiError::Invalid(_)) if is_mail_cmd => {
+                ExitCode::from(EXIT_REFUSED)
+            }
             CliError::Api(ApiError::Conflict { .. }) | CliError::ConflictValue { .. } => {
                 ExitCode::from(EXIT_CONFLICT)
             }
@@ -1482,11 +1586,11 @@ pub fn to_command_for(cmd: &Cmd, me: &Principal) -> Result<WireCommand, ApiError
         Cmd::Tasks(task_cmd) => task_to_command(task_cmd, me),
         Cmd::Presence(pres_cmd) => presence_to_command(pres_cmd, me),
         Cmd::Config(cfg_cmd) => config_to_command(cfg_cmd),
+        Cmd::Mail(mail_cmd) => mail_to_command(mail_cmd),
         Cmd::Daemon(_)
         | Cmd::Tui { .. }
         | Cmd::Mcp { .. }
         | Cmd::Token(_)
-        | Cmd::Mail(_)
         | Cmd::Watch { .. }
         | Cmd::Schema { .. } => Err(invalid(
             "command",
@@ -2372,6 +2476,141 @@ fn config_to_command(cmd: &ConfigCmd) -> Result<WireCommand, ApiError> {
     }
 }
 
+fn read_mail_body_source(
+    inline: Option<&String>,
+    file: Option<&PathBuf>,
+) -> Result<String, ApiError> {
+    match (inline, file) {
+        (Some(raw), _) if raw == "-" => {
+            let mut buf = String::new();
+            let mut stdin = std::io::stdin().take(MAX_CLI_INPUT_BYTES);
+            stdin
+                .read_to_string(&mut buf)
+                .map_err(|e| invalid("body", format!("failed reading stdin: {e}")))?;
+            if buf.is_empty() {
+                return Err(invalid("body", "mail body from stdin must not be empty"));
+            }
+            Ok(buf)
+        }
+        (Some(raw), _) => Ok(raw.clone()),
+        (None, Some(path)) => read_cli_text(path).map_err(|e| {
+            invalid(
+                "body-file",
+                format!("failed reading {}: {e}", path.display()),
+            )
+        }),
+        (None, None) => Err(invalid(
+            "body",
+            "provide --body <text> or --body-file <path>",
+        )),
+    }
+}
+
+fn mail_to_command(cmd: &MailCmd) -> Result<WireCommand, ApiError> {
+    match cmd {
+        MailCmd::Send {
+            to,
+            cc,
+            subject,
+            body,
+            body_file,
+            from,
+            priority,
+            in_reply_to,
+            topic,
+            refs,
+            wait_export,
+            idem,
+        } => {
+            if to.is_empty() {
+                return Err(invalid("to", "specify at least one --to <seat>"));
+            }
+            let parsed_to: Vec<SeatName> = to
+                .iter()
+                .map(|s| SeatName::parse(s.strip_prefix('@').unwrap_or(s)))
+                .collect::<Result<_, _>>()?;
+            let parsed_cc: Vec<SeatName> = cc
+                .iter()
+                .map(|s| SeatName::parse(s.strip_prefix('@').unwrap_or(s)))
+                .collect::<Result<_, _>>()?;
+            let parsed_from = match from {
+                Some(s) => Some(SeatName::parse(s.strip_prefix('@').unwrap_or(s))?),
+                None => None,
+            };
+            let body_text = read_mail_body_source(body.as_ref(), body_file.as_ref())?;
+            Ok(WireCommand::MailSend(MailSend {
+                to: parsed_to,
+                cc: parsed_cc,
+                subject: subject.clone(),
+                body: body_text,
+                from: parsed_from,
+                priority: parse_letter_priority(priority)?,
+                topic: topic.clone(),
+                in_reply_to: in_reply_to.clone(),
+                refs: refs.clone(),
+                wait_export: *wait_export,
+                idem: idem.as_deref().map(IdemKey::parse).transpose()?,
+            }))
+        }
+        MailCmd::Check { seat, all, limit } => Ok(WireCommand::MailCheck(MailCheck {
+            seat: match seat {
+                Some(s) => Some(SeatName::parse(s.strip_prefix('@').unwrap_or(s))?),
+                None => None,
+            },
+            include_all: *all,
+            limit: *limit,
+        })),
+        MailCmd::Ack {
+            target,
+            seat,
+            sha256,
+            note,
+        } => {
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                return Err(invalid("target", "target sha256 or path must not be empty"));
+            }
+            let explicit_sha = match sha256 {
+                Some(raw) => Some(Sha256Hex::parse(raw.trim().to_ascii_lowercase())?),
+                None => None,
+            };
+            let (parsed_path, parsed_sha) = if explicit_sha.is_some() {
+                (Some(PathBuf::from(trimmed)), explicit_sha)
+            } else if let Ok(sha) = Sha256Hex::parse(trimmed.to_ascii_lowercase()) {
+                (None, Some(sha))
+            } else {
+                (Some(PathBuf::from(trimmed)), None)
+            };
+            let parsed_seat = match seat {
+                Some(s) => Some(SeatName::parse(s.strip_prefix('@').unwrap_or(s))?),
+                None => None,
+            };
+            Ok(WireCommand::MailAck(MailAck {
+                path: parsed_path,
+                sha256: parsed_sha,
+                seat: parsed_seat,
+                note: note.clone(),
+            }))
+        }
+        MailCmd::Search { query, seat, limit } => Ok(WireCommand::MailSearch(MailSearch {
+            query: query.clone(),
+            seat: match seat {
+                Some(s) => Some(SeatName::parse(s.strip_prefix('@').unwrap_or(s))?),
+                None => None,
+            },
+            limit: *limit,
+        })),
+        MailCmd::Reconcile => Ok(WireCommand::MailReconcile(MailReconcile {})),
+        MailCmd::Rebuild { .. }
+        | MailCmd::MigrateVerify { .. }
+        | MailCmd::Shadow { .. }
+        | MailCmd::Score { .. } => Err(invalid(
+            "mail",
+            "handled locally rather than via single WireCommand",
+        )),
+    }
+}
+
 fn parse_watch_target(
     target: &str,
     since: u64,
@@ -2839,6 +3078,94 @@ fn print_reply(reply: &WireReply, as_json: bool) {
                 letter.wake_id.0
             )
         }
+        WireReply::MailSend(sent) => {
+            let dup = if sent.replayed { " replayed=true" } else { "" };
+            let room_str = sent
+                .room
+                .as_ref()
+                .map(|r| format!(" room={r:?}"))
+                .unwrap_or_default();
+            println!(
+                "sent {} (sha256={}, exported={}{dup}{room_str})",
+                sent.path.display(),
+                sent.sha256,
+                sent.exported
+            );
+            for notice in &sent.delivery_notices {
+                println!(
+                    "  notice @{}: {} ({})",
+                    notice.seat, notice.status, notice.notice
+                );
+            }
+        }
+        WireReply::MailCheck(view) => {
+            println!(
+                "mail @{} ({} unread, {} shown of {}):",
+                view.seat,
+                view.unread_count,
+                view.messages.len(),
+                view.total_count
+            );
+            for msg in &view.messages {
+                let state = if msg.mutated_after_ack {
+                    "flagged"
+                } else if msg.acked {
+                    "acked"
+                } else {
+                    "unread"
+                };
+                println!(
+                    "  [{}] {} from=@{} {} ({})",
+                    state,
+                    msg.sha16,
+                    msg.from,
+                    msg.subject,
+                    msg.path.display()
+                );
+            }
+            for notice in &view.delivery_notices {
+                println!(
+                    "  delivery-notice @{}: {} ({})",
+                    notice.seat, notice.status, notice.notice
+                );
+            }
+        }
+        WireReply::MailAck(acked) => {
+            let path_str = acked
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| acked.sha256.as_str()[..16].to_owned());
+            println!(
+                "acked {} (seat=@{}, sha256={}, already_acked={}, exported={})",
+                path_str, acked.seat, acked.sha256, acked.already_acked, acked.exported
+            );
+        }
+        WireReply::MailSearch(res) => {
+            println!("mail search '{}' ({} hit(s)):", res.query, res.hits.len());
+            for hit in &res.hits {
+                println!(
+                    "  {} from=@{} {} [{}] -- {}",
+                    hit.sha16,
+                    hit.from,
+                    hit.subject,
+                    hit.path.display(),
+                    hit.snippet
+                );
+            }
+        }
+        WireReply::MailReconcile(rep) => {
+            println!(
+                "mail reconcile: ingested={} acks_in={} blobs_out={} letters_out={} acks_out={} drop_consumed={} flagged={}",
+                rep.files_ingested,
+                rep.acks_ingested,
+                rep.blobs_exported,
+                rep.working_tree_exported,
+                rep.acks_exported,
+                rep.drop_files_consumed,
+                rep.mutated_after_ack_flagged,
+            );
+        }
         WireReply::Read(page) | WireReply::Wait(page) => {
             if page.timed_out && page.entries.is_empty() {
                 println!("timed out (0 new entries)");
@@ -2906,6 +3233,16 @@ fn print_error(err: &CliError, as_json: bool) {
                 );
             }
         }
+        CliError::Refused(msg) if as_json => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "error": "refused",
+                    "detail": msg,
+                })
+            );
+        }
+        CliError::Refused(msg) => eprintln!("error: refused: {msg}"),
         CliError::Api(api_err) => eprintln!("error: {api_err}"),
         CliError::Msg(msg) => eprintln!("error: {msg}"),
     }
@@ -3176,8 +3513,8 @@ fn format_outside_shadow_err(
     err: rex_wave_fs::OutsideError,
 ) -> CliError {
     use rex_wave_fs::OutsideError;
-    CliError::Msg(match err {
-        OutsideError::Inside(_, ref root) => format!(
+    match err {
+        OutsideError::Inside(_, ref root) => CliError::Refused(format!(
             "refusing to write shadow output {} inside read-only interchange {}",
             out.display(),
             if root.as_os_str().is_empty() {
@@ -3185,17 +3522,17 @@ fn format_outside_shadow_err(
             } else {
                 root.display()
             }
-        ),
-        OutsideError::Symlink(_) => format!(
+        )),
+        OutsideError::Symlink(_) => CliError::Refused(format!(
             "refusing to write shadow output through symlink {}",
             out.display()
-        ),
-        OutsideError::ParentDir(_) => format!(
+        )),
+        OutsideError::ParentDir(_) => CliError::Refused(format!(
             "refusing shadow output {} containing '..' parent traversal",
             out.display()
-        ),
-        other => format!("shadow output {}: {other}", out.display()),
-    })
+        )),
+        other => CliError::Msg(format!("shadow output {}: {other}", out.display())),
+    }
 }
 
 /// Read-only verification that shadow output `out` resolves outside
@@ -3479,6 +3816,140 @@ async fn execute_mail_shadow(
             _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
             () = tokio::time::sleep(sleep_dur) => {}
         }
+    }
+}
+
+fn map_sandbox_error(context: &str, err: SandboxError) -> CliError {
+    match err {
+        SandboxError::Production(_) | SandboxError::Config(_) | SandboxError::Unmarked(_) => {
+            CliError::Refused(format!("{context}: {err}"))
+        }
+        SandboxError::Io(msg) => CliError::Msg(format!("{context}: {msg}")),
+    }
+}
+
+fn build_offline_alias_map(interchange: Option<&Path>) -> AliasMap {
+    let house = load_house_profile().unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (canon, aliases) in &house.aliases {
+        pairs.push((canon.as_str().to_owned(), canon.as_str().to_owned()));
+        for alias in aliases {
+            pairs.push((alias.as_str().to_owned(), canon.as_str().to_owned()));
+        }
+    }
+    if let Some(dir) = interchange
+        && let Ok(plan) = seed_records_from_interchange_with_options(dir, None, &house)
+    {
+        for claim in plan.claims {
+            let canon = claim.seat.as_str().to_owned();
+            pairs.push((canon.clone(), canon.clone()));
+            for alias in claim.aliases {
+                pairs.push((alias.as_str().to_owned(), canon.clone()));
+            }
+        }
+    }
+    AliasMap::from_pairs(pairs.iter().map(|(a, c)| (a.as_str(), c.as_str())))
+        .with_operator_seat(house.operator_seat)
+}
+
+fn execute_mail_rebuild(from: &Path, journal: &Path, as_json: bool) -> Result<ExitCode, CliError> {
+    let protection = load_protected_roots().map_err(|e| map_sandbox_error("mail rebuild", e))?;
+    let aliases = build_offline_alias_map(Some(from));
+    let report = rebuild_mail_from_mirror(from, journal, &aliases, &protection)
+        .map_err(|e| map_sandbox_error("mail rebuild", e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("rebuild report json")
+        );
+    } else {
+        println!(
+            "mail rebuild: messages={} acks={} flagged={} dm_rooms={} thread_channels={} fts={} journal={}",
+            report.messages_rebuilt,
+            report.acks_rebuilt,
+            report.mutated_after_ack_flagged,
+            report.dm_rooms_projected,
+            report.thread_channels_projected,
+            report.fts_indexed,
+            report.journal_path.display()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn create_exclusive_cli_temp_dir(prefix: &str) -> Result<PathBuf, CliError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let ts = rex_wave_runtime::now().0;
+    for attempt in 0u32..256 {
+        let cand = base.join(format!("{prefix}-{pid}-{ts}-{attempt}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&cand) {
+            Ok(()) => return Ok(cand),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(CliError::Msg(format!(
+                    "create temporary work directory {}: {e}",
+                    cand.display()
+                )));
+            }
+        }
+    }
+    Err(CliError::Msg(
+        "failed to allocate exclusive temporary work directory".into(),
+    ))
+}
+
+fn execute_mail_migrate_verify(
+    interchange: &Path,
+    work_dir: Option<&Path>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
+    let protection =
+        load_protected_roots().map_err(|e| map_sandbox_error("mail migrate-verify", e))?;
+    let aliases = build_offline_alias_map(Some(interchange));
+    let (target_work, cleanup_temp) = match work_dir {
+        Some(dir) => (dir.to_path_buf(), false),
+        None => (
+            create_exclusive_cli_temp_dir("rex-wave-migrate-verify")?,
+            true,
+        ),
+    };
+    let result = migrate_verify_interchange(interchange, &target_work, &aliases, &protection)
+        .map_err(|e| map_sandbox_error("mail migrate-verify", e));
+    if cleanup_temp {
+        let _ = std::fs::remove_dir_all(&target_work);
+    }
+    let report = result?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("migrate-verify report json")
+        );
+    } else {
+        println!(
+            "mail migrate-verify: scanned={} unique_sha256={} duplicates={} imported_acks={} flagged={} dm_rooms={} channels={} rebuilt_msgs={} rebuilt_acks={} blob_parity={}/{} wt_parity={}/{} fts_hits={} parity_ok={}",
+            report.source_files_scanned,
+            report.unique_sha256_count,
+            report.duplicate_content_copies,
+            report.imported_acks,
+            report.imported_mutated_after_ack,
+            report.imported_dm_rooms,
+            report.imported_thread_channels,
+            report.rebuilt_messages,
+            report.rebuilt_acks,
+            report.blob_parity_count,
+            report.unique_sha256_count,
+            report.working_tree_parity_count,
+            report.expected_working_tree_count,
+            report.fts_sample_query_hits,
+            report.parity_ok,
+        );
+    }
+    if report.parity_ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
     }
 }
 
@@ -4108,6 +4579,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let sock_path = daemon::resolve_socket_path(cli.socket.as_deref());
     let endpoint = Endpoint::Unix(sock_path.clone());
+    let is_mail_cmd = matches!(cli.cmd, Cmd::Mail(_));
 
     let outcome: Result<ExitCode, CliError> = match cli.cmd {
         Cmd::Daemon(args) => {
@@ -4210,6 +4682,13 @@ async fn main() -> ExitCode {
             },
             Err(e) => Err(CliError::Api(e)),
         },
+        Cmd::Mail(MailCmd::Rebuild { from, journal }) => {
+            execute_mail_rebuild(&from, &journal, cli.json)
+        }
+        Cmd::Mail(MailCmd::MigrateVerify {
+            interchange,
+            work_dir,
+        }) => execute_mail_migrate_verify(&interchange, work_dir.as_deref(), cli.json),
         Cmd::Mail(MailCmd::Shadow {
             interchange,
             out,
@@ -4243,6 +4722,19 @@ async fn main() -> ExitCode {
             &mailwatch_seen,
             cli.json,
         ),
+        mail_remote @ Cmd::Mail(_) => {
+            let res = match resolve_cli_credential(&sock_path, cli.token.as_deref()) {
+                Ok(cred) => match RemoteClient::connect(endpoint, cred, "cli-mail").await {
+                    Ok(client) => execute_remote(&client, &mail_remote, cli.json).await,
+                    Err(e) => Err(CliError::Api(e)),
+                },
+                Err(e) => Err(CliError::Msg(e)),
+            };
+            res.map_err(|err| match err {
+                CliError::Api(ApiError::Conflict { detail, .. }) => CliError::Refused(detail),
+                other => other,
+            })
+        }
         Cmd::Schema { bb } => {
             let out = if bb {
                 rex_wave_bb::bb_tool_catalog()
@@ -4361,7 +4853,7 @@ async fn main() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             print_error(&err, cli.json);
-            err.exit_code()
+            err.exit_code(is_mail_cmd)
         }
     }
 }

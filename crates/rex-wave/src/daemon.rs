@@ -502,6 +502,32 @@ fn spawn_presence_disconnect_worker(
     })
 }
 
+fn spawn_mail_reconcile_poller(mail: Arc<MailBridge>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+        let mut err_streak: u32 = 0;
+        loop {
+            let sleep_dur = if err_streak == 0 {
+                POLL_INTERVAL
+            } else {
+                let shift = err_streak.saturating_sub(1).min(4);
+                Duration::from_secs(5u64.saturating_mul(1u64 << shift)).min(MAX_BACKOFF)
+            };
+            tokio::time::sleep(sleep_dur).await;
+            match mail.reconcile().await {
+                Ok(_) => err_streak = 0,
+                Err(err) => {
+                    if err_streak == 0 {
+                        eprintln!("rex-wave daemon: periodic mail reconcile failed: {err}");
+                    }
+                    err_streak = err_streak.saturating_add(1);
+                }
+            }
+        }
+    })
+}
+
 fn journal_thread_resolver(journal: Journal) -> ThreadIdResolver {
     Arc::new(move |wave: &WaveSlug, role: &RoleName| {
         let journal = journal.clone();
@@ -724,17 +750,49 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     )
     .with_state_dir(state_dir.clone());
 
+    let room_svc = Registry::<Rooms>::new(journal.clone(), hub.clone());
+    let mail_bridge = Arc::new(
+        MailBridge::open_with_hub(sandbox.clone(), journal.clone(), mail_writer, hub.clone())
+            .map_err(|e| format!("init mail bridge: {e}"))?
+            .with_room_service(room_svc.clone())
+            .with_config_watch(config_svc.subscribe())
+            .with_house_profile(presence.house().clone())
+            .with_drop_quiet_ms(2_000),
+    );
+    match mail_bridge.reconcile().await {
+        Ok(report) => {
+            if report.files_ingested > 0
+                || report.acks_ingested > 0
+                || report.blobs_exported > 0
+                || report.working_tree_exported > 0
+                || report.acks_exported > 0
+            {
+                eprintln!(
+                    "rex-wave daemon: startup mail reconcile (ingested={} acks_in={} blobs_out={} letters_out={} acks_out={} drop_consumed={} flagged={})",
+                    report.files_ingested,
+                    report.acks_ingested,
+                    report.blobs_exported,
+                    report.working_tree_exported,
+                    report.acks_exported,
+                    report.drop_files_consumed,
+                    report.mutated_after_ack_flagged,
+                );
+            }
+        }
+        Err(ApiError::Denied { action, .. }) => {
+            return Err(format!("startup mail reconcile refused: {action}"));
+        }
+        Err(err) => {
+            eprintln!("rex-wave daemon: startup mail reconcile warning (will retry): {err}");
+        }
+    }
+
     let router = Arc::new(Router {
-        room: Registry::<Rooms>::new(journal.clone(), hub.clone()),
+        room: room_svc,
         wave: wave_svc.clone(),
         board: Registry::<Board>::new(journal.clone(), hub.clone()),
         inbox: Registry::<Inbox>::new(journal.clone(), hub.clone()),
-        mail: Arc::new(MailBridge::with_hub(
-            sandbox.clone(),
-            journal.clone(),
-            mail_writer,
-            hub.clone(),
-        )),
+        mail: mail_bridge.clone(),
         presence: presence_svc,
         config: config_svc.clone(),
         read: Arc::new(ReadSide {
@@ -782,6 +840,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     let herald_task = spawn_reactor(herald, herald_client.clone());
     let herald_grace_task = spawn_herald_grace_timer(herald_handle, herald_client);
     let bell_task = spawn_reactor(BellCourier::new(sandbox), system(SystemPart::WakeBell));
+    let mail_reconcile_task = spawn_mail_reconcile_poller(mail_bridge);
     let bb_task = bb_bridge.map(|b| tokio::spawn(b.run(router.clone())));
     let t3_task = t3_bridge.map(|t| tokio::spawn(t.run(router.clone())));
     let acp_task = tokio::spawn(acp_bridge.clone().run(router.clone()));
@@ -893,6 +952,7 @@ pub async fn run(args: DaemonArgs, socket_override: Option<PathBuf>) -> Result<(
     herald_task.abort();
     herald_grace_task.abort();
     bell_task.abort();
+    mail_reconcile_task.abort();
     presence_disconnect_task.abort();
     for t in bridge_health_tasks {
         t.abort();

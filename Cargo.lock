@@ -1572,6 +1572,7 @@ dependencies = [
 name = "rex-wave-mailbridge"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "proptest",
  "rex-wave-api",
  "rex-wave-fs",

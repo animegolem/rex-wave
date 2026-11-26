@@ -46,8 +46,8 @@ pub use feed_router::{FeedRouter, ThreadIdResolver, fallback_parked_room_and_sin
 pub use hub::Hub;
 pub use reactor::{Reactor, spawn_reactor};
 pub use read::{
-    AgentFeed, NoAgentFeed, ReadSide, can_read, can_read_visible, frame_channel,
-    labeled_event_matches, labels_match, mask_unauthorized_as_not_found,
+    AgentFeed, NoAgentFeed, ReadSide, can_read, can_read_in, can_read_visible, can_read_visible_in,
+    frame_channel, labeled_event_matches, labels_match, mask_unauthorized_as_not_found,
 };
 pub use router::{BridgeBackend, LocalClient, Remote, Router, Session, Unavailable, authorize};
 pub use sidebar::SidebarProjection;
@@ -79,6 +79,12 @@ impl DecideCtx {
             by: Principal::System { part },
             at: now(),
         }
+    }
+
+    /// Reconstructs an already-authenticated context when replaying a committed
+    /// journal action into a secondary projection stream after a crash.
+    pub fn for_internal_replay(by: Principal, at: UnixMs) -> Self {
+        Self { by, at }
     }
 
     /// A context for driving a decider directly in a test. Compiled out of
@@ -117,6 +123,15 @@ pub trait Decider: Send + Sync + 'static {
     fn address(cmd: &Self::Cmd, ctx: &DecideCtx) -> Result<StreamId, ApiError>;
     /// Idempotency key carried by the command, if any.
     fn idem(cmd: &Self::Cmd) -> Option<IdemKey>;
+    /// Authorize an idempotent replay before [`Registry`] returns a cached
+    /// `IdemKey` reply without invoking [`Self::decide`].
+    fn authorize_replay(
+        _state: &Self::State,
+        _cmd: &Self::Cmd,
+        _ctx: &DecideCtx,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
     /// Policy: validate against current state and emit events. No I/O.
     /// Returning no events is how read-only commands (views) work.
     fn decide(

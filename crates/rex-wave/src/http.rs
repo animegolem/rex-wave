@@ -9,6 +9,7 @@ use rex_wave_api::board::{Priority, Title};
 use rex_wave_api::config::{ConfigGet, ConfigSet, ConfigShow};
 use rex_wave_api::http_guard::{is_json_content_type, strip_bearer};
 pub use rex_wave_api::http_guard::{is_loopback_host, is_matching_loopback_origin};
+use rex_wave_api::mail::{LetterPriority, MailAck, MailCheck, MailSearch, MailSend};
 use rex_wave_api::notify::{InboxAck, InboxList};
 use rex_wave_api::presence::{PresenceList, PresenceResolve};
 use rex_wave_api::read::{Page, Read, Sidebar, Wait};
@@ -17,7 +18,9 @@ use rex_wave_api::room::{
     TaskSpec, TaskStatus, TaskTransition, TaskUpdate,
 };
 use rex_wave_api::*;
-use rex_wave_runtime::{LocalClient, Router, can_read_visible, mask_unauthorized_as_not_found};
+use rex_wave_runtime::{
+    LocalClient, Router, can_read_visible, can_read_visible_in, mask_unauthorized_as_not_found,
+};
 use rex_wave_transport::{Authenticator, Credential};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -156,6 +159,9 @@ enum Route {
     Inbox,
     InboxAck,
     Presence,
+    MailGet,
+    MailPost,
+    MailAck,
     ConfigGet,
     ConfigSet,
     Events,
@@ -647,6 +653,9 @@ fn match_route(method: HttpMethod, raw_path: &str) -> Result<Route, HttpError> {
         (HttpMethod::Get, ["v1", "inbox"]) => Ok(Route::Inbox),
         (HttpMethod::Post, ["v1", "inbox", "ack"]) => Ok(Route::InboxAck),
         (HttpMethod::Get, ["v1", "presence"]) => Ok(Route::Presence),
+        (HttpMethod::Get, ["v1", "mail"]) => Ok(Route::MailGet),
+        (HttpMethod::Post, ["v1", "mail"]) => Ok(Route::MailPost),
+        (HttpMethod::Post, ["v1", "mail", "ack"]) => Ok(Route::MailAck),
         (HttpMethod::Get, ["v1", "config"] | ["api", "config"]) => Ok(Route::ConfigGet),
         (HttpMethod::Post | HttpMethod::Patch, ["v1", "config"] | ["api", "config"]) => {
             Ok(Route::ConfigSet)
@@ -894,11 +903,13 @@ fn check_room_visible(
         .read
         .resolve_room_ref(room_ref, principal)
         .map_err(HttpError::from_api)?;
-    can_read_visible(
+    can_read_visible_in(
         principal,
         &StreamId::Room {
             room: room_id.clone(),
         },
+        &router.read.journal,
+        Some(&router.read.sidebar),
         format!("room {raw_label}"),
     )
     .map_err(HttpError::from_api)?;
@@ -998,6 +1009,43 @@ struct SetConfigPayload {
     unset: bool,
     #[serde(default, alias = "id")]
     idem: Option<IdemKey>,
+}
+
+#[derive(Deserialize)]
+struct SendMailPayload {
+    to: Vec<SeatName>,
+    #[serde(default)]
+    cc: Vec<SeatName>,
+    subject: String,
+    body: String,
+    #[serde(default)]
+    from: Option<SeatName>,
+    #[serde(default)]
+    priority: LetterPriority,
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    in_reply_to: Option<String>,
+    #[serde(default)]
+    refs: Vec<String>,
+    #[serde(default)]
+    wait_export: bool,
+    #[serde(default, alias = "id")]
+    idem: Option<IdemKey>,
+}
+
+#[derive(Deserialize, Default)]
+struct AckMailPayload {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    sha256: Option<Sha256Hex>,
+    #[serde(default)]
+    seat: Option<SeatName>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 async fn dispatch_json_route(
@@ -1112,6 +1160,103 @@ async fn dispatch_json_route(
                 .await
                 .map_err(|e| mask_err(e, "presence"))?;
             Ok(("200 OK", to_json_value(&snap)?))
+        }
+        Route::MailGet => {
+            let seat = match req.query_param("seat") {
+                Some(raw) => Some(
+                    SeatName::parse(raw.strip_prefix('@').unwrap_or(raw))
+                        .map_err(|e| HttpError::from_api(e.into()))?,
+                ),
+                None => None,
+            };
+            let limit =
+                match req.query_param("limit") {
+                    Some(raw) => Some(raw.parse::<u32>().map_err(|_| {
+                        HttpError::new("400 Bad Request", "invalid", "invalid limit")
+                    })?),
+                    None => None,
+                };
+            if let Some(q) = req.query_param("q").or_else(|| req.query_param("query")) {
+                let view = client
+                    .call(MailSearch {
+                        query: q.to_owned(),
+                        seat,
+                        limit,
+                    })
+                    .await
+                    .map_err(|e| mask_err(e, "mail"))?;
+                return Ok(("200 OK", to_json_value(&view)?));
+            }
+            let include_all = match req
+                .query_param("all")
+                .or_else(|| req.query_param("include_all"))
+            {
+                Some(v) => parse_bool_query(v)?,
+                None => false,
+            };
+            let view = client
+                .call(MailCheck {
+                    seat,
+                    include_all,
+                    limit,
+                })
+                .await
+                .map_err(|e| mask_err(e, "mail"))?;
+            Ok(("200 OK", to_json_value(&view)?))
+        }
+        Route::MailPost => {
+            let payload: SendMailPayload = parse_json_body(&req.body)?;
+            let sent = client
+                .call(MailSend {
+                    to: payload.to,
+                    cc: payload.cc,
+                    subject: payload.subject,
+                    body: payload.body,
+                    from: payload.from,
+                    priority: payload.priority,
+                    topic: payload.topic,
+                    in_reply_to: payload.in_reply_to,
+                    refs: payload.refs,
+                    wait_export: payload.wait_export,
+                    idem: payload.idem,
+                })
+                .await
+                .map_err(|e| mask_err(e, "mail"))?;
+            let status = if sent.replayed {
+                "200 OK"
+            } else {
+                "201 Created"
+            };
+            Ok((status, to_json_value(&sent)?))
+        }
+        Route::MailAck => {
+            let payload: AckMailPayload = parse_json_body(&req.body)?;
+            let mut path = payload.path;
+            let mut sha256 = payload.sha256;
+            if let Some(target) = payload
+                .target
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if sha256.is_none()
+                    && let Ok(parsed_sha) = Sha256Hex::parse(target.to_ascii_lowercase())
+                {
+                    sha256 = Some(parsed_sha);
+                } else if path.is_none() {
+                    path = Some(std::path::PathBuf::from(target));
+                }
+            }
+            let acked = client
+                .call(MailAck {
+                    path,
+                    sha256,
+                    seat: payload.seat,
+                    note: payload.note,
+                })
+                .await
+                .map_err(|e| mask_err(e, "mail"))?;
+            Ok(("200 OK", to_json_value(&acked)?))
         }
         Route::ConfigGet => {
             if let Some(key) = req.query_param("key") {
@@ -1393,7 +1538,14 @@ async fn dispatch_json_route(
                     },
                     None => r.stream.clone(),
                 };
-                can_read_visible(&principal, &target_stream, &tool).map_err(HttpError::from_api)?;
+                can_read_visible_in(
+                    &principal,
+                    &target_stream,
+                    &router.read.journal,
+                    Some(&router.read.sidebar),
+                    &tool,
+                )
+                .map_err(HttpError::from_api)?;
             }
             if let WireCommand::PresenceBind(ref b) = cmd
                 && matches!(
@@ -1449,7 +1601,14 @@ fn parse_sse_interest_and_cursor(
         }
     } else if let Some(stream_raw) = req.query_param("stream") {
         let stream = parse_sse_stream_param(stream_raw).map_err(HttpError::from_api)?;
-        can_read_visible(principal, &stream, "stream").map_err(HttpError::from_api)?;
+        can_read_visible_in(
+            principal,
+            &stream,
+            &router.read.journal,
+            Some(&router.read.sidebar),
+            "stream",
+        )
+        .map_err(HttpError::from_api)?;
         single_stream = Some(stream.clone());
         Interest::Streams {
             streams: vec![stream],

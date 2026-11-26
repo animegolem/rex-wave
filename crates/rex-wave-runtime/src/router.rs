@@ -128,6 +128,15 @@ fn resolve_room_cmd(
     };
     let allow_legacy_fallback = matches!(slot, RoomRef::Dm { .. });
     let resolved = slot.resolve(by)?;
+    if let rex_wave_api::room::RoomId::Direct { pair } = &resolved
+        && !pair.contains(by)
+        && !by.is_operator_or_system()
+    {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: "access direct message room".into(),
+        });
+    }
     let target = match read
         .journal
         .resolve_dm_room_with_idem(resolved, by, idem.as_ref(), allow_legacy_fallback)

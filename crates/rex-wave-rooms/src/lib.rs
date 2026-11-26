@@ -70,6 +70,14 @@ pub struct RoomState {
 }
 
 impl RoomState {
+    pub fn is_opened(&self) -> bool {
+        self.opened.is_some()
+    }
+
+    pub fn member_principals(&self) -> impl Iterator<Item = &Principal> {
+        self.members.values()
+    }
+
     fn has_member(&self, who: &Principal) -> bool {
         self.members.values().any(|p| p == who)
     }
@@ -521,6 +529,30 @@ fn ensure_wave_name_policy(
             action: format!("open reserved wave channel #{name} without wave origin"),
         });
     }
+    if id.is_mail_channel() && !by.is_operator_or_system() {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: "open reserved mail channel without system or operator authority".into(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_private_room_read_access(
+    state: &RoomState,
+    id: &RoomId,
+    by: &Principal,
+    action: &str,
+) -> Result<(), ApiError> {
+    if let RoomId::Direct { pair } = id {
+        ensure_dm_access(pair, by)?;
+    }
+    if id.is_mail_channel() && !state.has_member(by) && !by.is_operator_or_system() {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("{action} in private mail channel without membership"),
+        });
+    }
     Ok(())
 }
 
@@ -538,6 +570,12 @@ fn ensure_existing_room_write_access(
             what: format!("room {id:?}"),
         });
     };
+    if id.is_mail_channel() && !state.has_member(by) && !by.is_operator_or_system() {
+        return Err(ApiError::Denied {
+            principal: by.to_string(),
+            action: format!("{action} in private mail channel without membership"),
+        });
+    }
     if let RoomOrigin::Wave { wave } = origin {
         let allowed = state.has_member(by) || by.is_operator_or_system();
         if !allowed {
@@ -623,6 +661,49 @@ impl Decider for Rooms {
         cmd.effective_idem()
     }
 
+    fn authorize_replay(
+        state: &RoomState,
+        cmd: &RoomCommand,
+        ctx: &DecideCtx,
+    ) -> Result<(), ApiError> {
+        let room_ref = match cmd {
+            RoomCommand::RoomEnsure(c) => &c.room,
+            RoomCommand::RoomPost(c) => &c.room,
+            RoomCommand::RoomJoin(c) => &c.room,
+            RoomCommand::RoomLeave(c) => &c.room,
+            RoomCommand::RoomLabel(c) => &c.room,
+            RoomCommand::TaskClaim(c) => &c.room,
+            RoomCommand::TaskHeartbeat(c) => &c.room,
+            RoomCommand::TaskTransition(c) => &c.room,
+            RoomCommand::TaskUpdate(c) => &c.room,
+            RoomCommand::RoomTasks(c) => &c.room,
+        };
+        let id = room_ref.resolve(ctx.by())?;
+        ensure_private_room_read_access(state, &id, ctx.by(), "replay command")?;
+        if let Some((_, RoomOrigin::Wave { wave })) = &state.opened {
+            let allowed = match cmd {
+                RoomCommand::RoomEnsure(c) if c.topic.is_none() => true,
+                RoomCommand::RoomTasks(_) => true,
+                RoomCommand::RoomJoin(_) => {
+                    state.has_member(ctx.by())
+                        || ctx.by().is_operator_or_system()
+                        || matches!(ctx.by(), Principal::Worker { wave: w, .. } if w == wave)
+                        || state.opener.as_ref() == Some(ctx.by())
+                }
+                _ => state.has_member(ctx.by()) || ctx.by().is_operator_or_system(),
+            };
+            if !allowed {
+                return Err(ApiError::Denied {
+                    principal: ctx.by().to_string(),
+                    action: format!("replay command in wave room #wave-{wave} without membership"),
+                });
+            }
+        } else if state.opened.is_none() {
+            ensure_wave_name_policy(&id, &RoomOrigin::Manual, ctx.by())?;
+        }
+        Ok(())
+    }
+
     fn decide(
         state: &RoomState,
         cmd: &RoomCommand,
@@ -649,11 +730,26 @@ impl Decider for Rooms {
                         }));
                     }
                 }
+                if matches!(c.origin, Some(RoomOrigin::Mail { .. })) {
+                    if !ctx.by().is_operator_or_system() {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: "create mail channel".into(),
+                        });
+                    }
+                    if matches!(id, RoomId::Direct { .. }) {
+                        return Err(ApiError::Invalid(InvalidId {
+                            what: "room origin".into(),
+                            reason: "direct message rooms cannot have mail channel origin".into(),
+                        }));
+                    }
+                }
                 if let RoomId::Direct { pair } = &id {
                     ensure_dm_access(pair, ctx.by())?;
                 }
 
                 if let Some((_, existing_origin)) = &state.opened {
+                    ensure_private_room_read_access(state, &id, ctx.by(), "ensure room")?;
                     if let Some(req_origin) = &c.origin
                         && req_origin != existing_origin
                     {
@@ -664,6 +760,7 @@ impl Decider for Rooms {
                     if let Some(topic) = &c.topic
                         && state.topic.as_ref() != Some(topic)
                     {
+                        ensure_existing_room_write_access(state, &id, ctx.by(), "set room topic")?;
                         return Ok(vec![RoomEvent::TopicSet {
                             topic: topic.clone(),
                         }]);
@@ -711,6 +808,15 @@ impl Decider for Rooms {
                     .map_or(&RoomOrigin::Manual, |(_, o)| o);
 
                 if target == *ctx.by() {
+                    if id.is_mail_channel()
+                        && !ctx.by().is_operator_or_system()
+                        && !state.has_member(ctx.by())
+                    {
+                        return Err(ApiError::Denied {
+                            principal: ctx.by().to_string(),
+                            action: "self-join private mail channel".into(),
+                        });
+                    }
                     if let RoomOrigin::Wave { wave } = origin {
                         let allowed = ctx.by().is_operator_or_system()
                             || matches!(ctx.by(), Principal::Worker { wave: w, .. } if w == wave)
@@ -724,14 +830,26 @@ impl Decider for Rooms {
                         }
                     }
                 } else {
-                    let can_invite =
-                        ctx.by().is_operator_or_system() || state.opener.as_ref() == Some(ctx.by());
+                    let can_invite = if id.is_mail_channel()
+                        || matches!(origin, RoomOrigin::Mail { .. })
+                    {
+                        ctx.by().is_operator_or_system()
+                    } else {
+                        ctx.by().is_operator_or_system() || state.opener.as_ref() == Some(ctx.by())
+                    };
                     if !can_invite {
                         return Err(ApiError::Denied {
                             principal: ctx.by().to_string(),
                             action: "join another principal to room".into(),
                         });
                     }
+                }
+                if let RoomOrigin::Mail { audience } = origin
+                    && !audience.contains(&target)
+                {
+                    return Err(ApiError::conflict(
+                        "private mail channel membership is fixed to its audience",
+                    ));
                 }
 
                 let mut events = Vec::new();
@@ -776,7 +894,23 @@ impl Decider for Rooms {
             RoomCommand::RoomLeave(c) => {
                 let id = c.room.resolve(ctx.by())?;
                 if matches!(id, RoomId::Direct { .. }) {
+                    ensure_dm_access(
+                        match &id {
+                            RoomId::Direct { pair } => pair,
+                            _ => unreachable!(),
+                        },
+                        ctx.by(),
+                    )?;
                     return Err(ApiError::conflict("cannot leave a direct message room"));
+                }
+                if id.is_mail_channel()
+                    || matches!(state.opened, Some((_, RoomOrigin::Mail { .. })))
+                {
+                    ensure_private_room_read_access(state, &id, ctx.by(), "leave room")?;
+                    return Err(ApiError::conflict("cannot leave a private mail channel"));
+                }
+                if state.opened.is_some() {
+                    ensure_existing_room_write_access(state, &id, ctx.by(), "leave room")?;
                 }
                 if !state.has_member(ctx.by()) {
                     return Err(ApiError::conflict(format!(
@@ -826,7 +960,22 @@ impl Decider for Rooms {
                                 });
                             }
                         }
-                        Some(RoomOrigin::Manual) => {
+                        Some(RoomOrigin::Manual) | Some(RoomOrigin::Mail { .. }) => {
+                            let is_private_mail = id.is_mail_channel()
+                                || matches!(
+                                    state.opened.as_ref().map(|(_, o)| o),
+                                    Some(RoomOrigin::Mail { .. })
+                                );
+                            if is_private_mail
+                                && !state.has_member(ctx.by())
+                                && !ctx.by().is_operator_or_system()
+                            {
+                                return Err(ApiError::Denied {
+                                    principal: ctx.by().to_string(),
+                                    action: "post to private mail channel without membership"
+                                        .into(),
+                                });
+                            }
                             if !members.values().any(|p| p == ctx.by())
                                 && !matches!(ctx.by(), Principal::System { .. })
                             {
@@ -1336,9 +1485,7 @@ impl Decider for Rooms {
 
             RoomCommand::RoomTasks(c) => {
                 let id = c.room.resolve(ctx.by())?;
-                if let RoomId::Direct { pair } = &id {
-                    ensure_dm_access(pair, ctx.by())?;
-                }
+                ensure_private_room_read_access(state, &id, ctx.by(), "list tasks")?;
                 if state.opened.is_none() {
                     return Err(ApiError::NotFound {
                         what: format!("room {id:?}"),

@@ -1122,8 +1122,29 @@ impl Client for DemoClient {
                         item,
                     })
                 }
-                WireCommand::MailAck(_) => WireReply::MailAck(Ack),
+                WireCommand::MailAck(req) => WireReply::MailAck(rex_wave_api::mail::MailAcked {
+                    sha256: req
+                        .sha256
+                        .unwrap_or_else(|| Sha256Hex::parse("a".repeat(64)).expect("sha256")),
+                    path: Some(
+                        req.path
+                            .unwrap_or_else(|| std::path::PathBuf::from("mail/demo.md")),
+                    ),
+                    seat: req
+                        .seat
+                        .unwrap_or_else(|| SeatName::parse("owner").expect("seat")),
+                    already_acked: false,
+                    exported: false,
+                }),
                 WireCommand::MailWakeBell(_) => WireReply::MailWakeBell(Ack),
+                WireCommand::MailSend(_)
+                | WireCommand::MailCheck(_)
+                | WireCommand::MailSearch(_)
+                | WireCommand::MailReconcile(_) => {
+                    return Err(ApiError::Unavailable {
+                        family: Family::Mail,
+                    });
+                }
                 WireCommand::InboxRaise(_) => WireReply::InboxRaise(Ack),
                 WireCommand::SetArchived(sa) => {
                     match sa.target {

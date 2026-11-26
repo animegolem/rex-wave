@@ -432,6 +432,20 @@ impl ReadOnlyInterchange {
     /// Scans `mail/*.md`, `to-*/*.md`, and root-level letter `*.md` files using
     /// only `read_dir` and `fs::read`.
     pub fn scan_letters(&self, aliases: &AliasMap) -> Result<Vec<ScannedLetter>, SandboxError> {
+        Ok(self
+            .scan_letters_raw(aliases)?
+            .into_iter()
+            .map(|(letter, _bytes)| letter)
+            .collect())
+    }
+
+    /// Scans `mail/*.md`, `to-*/*.md`, and root-level letter `*.md` files using
+    /// only bounded `O_NOFOLLOW` reads, returning each parsed [`ScannedLetter`]
+    /// paired with its exact untouched raw bytes.
+    pub fn scan_letters_raw(
+        &self,
+        aliases: &AliasMap,
+    ) -> Result<Vec<(ScannedLetter, Vec<u8>)>, SandboxError> {
         let mut letters = Vec::new();
         let top = fs::read_dir(&self.root).map_err(|e| SandboxError::Io(e.to_string()))?;
         let mut dirs: Vec<(String, PathBuf)> = Vec::new();
@@ -465,8 +479,8 @@ impl ReadOnlyInterchange {
         root_files.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (name, path) in root_files {
-            if let Ok(letter) = read_scanned_letter(&path, &name, None, aliases) {
-                letters.push(letter);
+            if let Ok(pair) = read_scanned_letter_raw(&path, &name, None, aliases) {
+                letters.push(pair);
             }
         }
 
@@ -505,13 +519,14 @@ impl ReadOnlyInterchange {
             files.sort_by(|a, b| a.0.cmp(&b.0));
             for (fname, fpath) in files {
                 let rel = format!("{dir_name}/{fname}");
-                if let Ok(letter) = read_scanned_letter(&fpath, &rel, box_seat.as_ref(), aliases) {
-                    letters.push(letter);
+                if let Ok(pair) = read_scanned_letter_raw(&fpath, &rel, box_seat.as_ref(), aliases)
+                {
+                    letters.push(pair);
                 }
             }
         }
 
-        letters.sort_by(|a, b| (&a.rel_path, &a.sha256).cmp(&(&b.rel_path, &b.sha256)));
+        letters.sort_by(|a, b| (&a.0.rel_path, &a.0.sha256).cmp(&(&b.0.rel_path, &b.0.sha256)));
         Ok(letters)
     }
 }
@@ -608,12 +623,12 @@ fn parse_shadow_frontmatter(text: &str) -> ShadowFrontmatter {
     fm
 }
 
-fn read_scanned_letter(
+fn read_scanned_letter_raw(
     path: &Path,
     rel_path: &str,
     box_seat: Option<&SeatName>,
     aliases: &AliasMap,
-) -> Result<ScannedLetter, SandboxError> {
+) -> Result<(ScannedLetter, Vec<u8>), SandboxError> {
     let bytes = rex_wave_fs::read_regular_bounded(path, MAX_LETTER_BYTES)
         .map_err(|e| SandboxError::Io(e.to_string()))?;
     let sha256 = sha256_bytes(&bytes);
@@ -661,20 +676,23 @@ fn read_scanned_letter(
         }
     }
 
-    Ok(ScannedLetter {
-        rel_path: rel_path.to_owned(),
-        sha256,
-        sha16,
-        from: fm.from,
-        recipients: recipients.into_iter().collect(),
-        subject: fm.subject,
-        letter_id: fm.id,
-        in_reply_to: fm.in_reply_to,
-        receipt_only: fm.receipt_only,
-        seen_at: parsed_time.ts,
-        time_basis: parsed_time.basis,
-        date_only: parsed_time.date_only,
-    })
+    Ok((
+        ScannedLetter {
+            rel_path: rel_path.to_owned(),
+            sha256,
+            sha16,
+            from: fm.from,
+            recipients: recipients.into_iter().collect(),
+            subject: fm.subject,
+            letter_id: fm.id,
+            in_reply_to: fm.in_reply_to,
+            receipt_only: fm.receipt_only,
+            seen_at: parsed_time.ts,
+            time_basis: parsed_time.basis,
+            date_only: parsed_time.date_only,
+        },
+        bytes,
+    ))
 }
 
 /// Pure input describing one banked letter candidate for one recipient seat.

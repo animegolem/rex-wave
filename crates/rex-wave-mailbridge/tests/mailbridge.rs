@@ -658,29 +658,26 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
 
     let wrong_sha = Sha256Hex::parse("0".repeat(64)).unwrap();
     let bad_ack = owner
-        .call(MailAck {
-            path: letter.path.clone(),
-            sha256: wrong_sha,
-        })
+        .call(MailAck::for_path_and_sha(letter.path.clone(), wrong_sha))
         .await
         .unwrap_err();
     assert!(matches!(bad_ack, ApiError::Conflict { .. }));
     assert!(!sandbox.path().join("state/acks.jsonl").exists());
 
     let wrong_seat_ack = nora
-        .call(MailAck {
-            path: letter.path.clone(),
-            sha256: letter.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            letter.path.clone(),
+            letter.sha256.clone(),
+        ))
         .await
         .unwrap_err();
     assert!(matches!(wrong_seat_ack, ApiError::Denied { .. }));
 
     let traversal_ack = owner
-        .call(MailAck {
-            path: PathBuf::from("../outside.md"),
-            sha256: letter.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            PathBuf::from("../outside.md"),
+            letter.sha256.clone(),
+        ))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -689,17 +686,17 @@ async fn promote_banks_before_announce_enforces_box_monotone_confines_symlinks_a
     ));
 
     owner
-        .call(MailAck {
-            path: letter.path.clone(),
-            sha256: letter.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            letter.path.clone(),
+            letter.sha256.clone(),
+        ))
         .await
         .unwrap();
     owner
-        .call(MailAck {
-            path: letter.path.clone(),
-            sha256: letter.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            letter.path.clone(),
+            letter.sha256.clone(),
+        ))
         .await
         .unwrap();
 
@@ -1000,10 +997,10 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
     // 1. Corrupt oversized line without newline fails closed.
     fs::write(&acks_path, vec![b'a'; 2 * 1024 * 1024]).unwrap();
     let ack_err = alice
-        .call(MailAck {
-            path: ok_ref.path.clone(),
-            sha256: ok_ref.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            ok_ref.path.clone(),
+            ok_ref.sha256.clone(),
+        ))
         .await
         .unwrap_err();
     assert!(matches!(ack_err, ApiError::Internal(_)), "got {ack_err:?}");
@@ -1011,10 +1008,10 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
 
     fs::write(&acks_path, b"{\"truncated\":\n").unwrap();
     let bad_json_err = alice
-        .call(MailAck {
-            path: ok_ref.path.clone(),
-            sha256: ok_ref.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            ok_ref.path.clone(),
+            ok_ref.sha256.clone(),
+        ))
         .await
         .unwrap_err();
     assert!(
@@ -1025,10 +1022,10 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
 
     fs::write(&acks_path, b"{\"truncated\":").unwrap();
     let bad_tail_err = alice
-        .call(MailAck {
-            path: ok_ref.path.clone(),
-            sha256: ok_ref.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            ok_ref.path.clone(),
+            ok_ref.sha256.clone(),
+        ))
         .await
         .unwrap_err();
     assert!(
@@ -1040,10 +1037,10 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
     // 3. Invalid UTF-8 line fails closed without appending.
     fs::write(&acks_path, [0xff, 0xfe, b'\n']).unwrap();
     let bad_utf8_err = alice
-        .call(MailAck {
-            path: ok_ref.path.clone(),
-            sha256: ok_ref.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            ok_ref.path.clone(),
+            ok_ref.sha256.clone(),
+        ))
         .await
         .unwrap_err();
     assert!(
@@ -1056,10 +1053,10 @@ async fn promote_refuses_letters_exceeding_read_limit_and_ack_propagates_ledger_
     let prior_unterminated = b"{\"schema\":1,\"seat\":\"sam\",\"path\":\"to-sam/other.md\",\"sha256_full\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
     fs::write(&acks_path, prior_unterminated).unwrap();
     alice
-        .call(MailAck {
-            path: ok_ref.path.clone(),
-            sha256: ok_ref.sha256.clone(),
-        })
+        .call(MailAck::for_path_and_sha(
+            ok_ref.path.clone(),
+            ok_ref.sha256.clone(),
+        ))
         .await
         .unwrap();
     let merged_text = fs::read_to_string(&acks_path).unwrap();
