@@ -4717,13 +4717,64 @@ async fn round3_205_unreconciled_failures_survive_restart_and_pre_spawn_preserve
         .await
         .unwrap();
 
-    // Also send a letter to `unrouted` (no binding at all) -> hits `GiveUp` after `max_defer_tries = 2`!
+    alice
+        .call(MailSend {
+            to: vec![seat("neverbound")],
+            cc: vec![],
+            subject: "Mailbox-only / never-bound archive mail".into(),
+            body: "Must never enter no-route give-up".into(),
+            from: None,
+            priority: LetterPriority::Normal,
+            topic: Some("mailbox-only".into()),
+            in_reply_to: None,
+            refs: vec![],
+            wait_export: false,
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    let unrouted = LocalClient::new(
+        router.clone(),
+        Principal::Seat {
+            seat: seat("unrouted"),
+        },
+    );
+    unrouted
+        .call(PresenceBind {
+            seat: seat("unrouted"),
+            incarnation_id: Some(inc("inc-unrouted-1")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::T3Thread {
+                thread_id: T3ThreadId::parse("thr-unrouted-old").unwrap(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: false,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+    unrouted
+        .call(PresenceUnbind {
+            seat: seat("unrouted"),
+            incarnation_id: inc("inc-unrouted-1"),
+            expected_epoch: None,
+            reason: Some("went offline".into()),
+        })
+        .await
+        .unwrap();
+
     alice
         .call(MailSend {
             to: vec![seat("unrouted")],
             cc: vec![],
-            subject: "No route bounded retry".into(),
-            body: "Should give up after 2 tries".into(),
+            subject: "No route bounded retry then rebind delivery".into(),
+            body: "Gives up while offline, then still pushes when unrouted rebinds!".into(),
             from: None,
             priority: LetterPriority::Normal,
             topic: Some("no-route".into()),
@@ -4746,6 +4797,42 @@ async fn round3_205_unreconciled_failures_survive_restart_and_pre_spawn_preserve
                 .iter()
                 .any(|f| f.seat == seat("unrouted") && f.kind == DeliveryFailureKind::GiveUp);
             carol_gave_up && unrouted_gave_up
+        }
+    })
+    .await;
+
+    let (_, check_failures) = mail_bridge.courier_health_and_failures(&[], 50).await;
+    assert!(
+        !check_failures.iter().any(|f| f.seat == seat("neverbound")),
+        "never-bound / mailbox-only seats must never receive no-route GiveUp notices"
+    );
+
+    unrouted
+        .call(PresenceBind {
+            seat: seat("unrouted"),
+            incarnation_id: Some(inc("inc-unrouted-2")),
+            machine_id: Some("node-a".into()),
+            lane: None,
+            endpoint: TransportEndpoint::T3Thread {
+                thread_id: T3ThreadId::parse("thr-unrouted-live").unwrap(),
+            },
+            liveness: LivenessMode::LeaseOnly,
+            ttl_ms: Some(300_000),
+            takeover: true,
+            allow_fork: false,
+            require_canary: false,
+            mail_horizon_at: Some(UnixMs(0)),
+            idem: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for(Duration::from_secs(3), || {
+        let p = t3_log.clone();
+        async move {
+            read_text(&p)
+                .map(|s| s.lines().count() == 2)
+                .unwrap_or(false)
         }
     })
     .await;

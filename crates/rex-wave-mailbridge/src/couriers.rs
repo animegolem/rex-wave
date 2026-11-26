@@ -1447,6 +1447,9 @@ fn fold_presence_into_hub_state(st: &mut CourierHubState, pe: &PresenceEvent) {
                     .remove(&(binding.seat.clone(), old_inc.clone()));
             }
             if binding.status == BindingStatus::Live {
+                st.fenced_refused_epochs.retain(|(s, inc, ep)| {
+                    !(s == &binding.seat && inc == &binding.incarnation_id && *ep <= binding.epoch)
+                });
                 st.optimistic_no_route_due
                     .retain(|(s, _), _| s != &binding.seat);
             }
@@ -1454,8 +1457,10 @@ fn fold_presence_into_hub_state(st: &mut CourierHubState, pe: &PresenceEvent) {
         PresenceEvent::CanaryConfirmed {
             seat,
             incarnation_id,
-            ..
+            epoch,
         } => {
+            st.fenced_refused_epochs
+                .remove(&(seat.clone(), incarnation_id.clone(), *epoch));
             st.optimistic_canary_rung
                 .retain(|(s, inc, _)| !(s == seat && inc == incarnation_id));
             st.optimistic_canary_due
@@ -2180,9 +2185,13 @@ impl CourierHubInner {
                         None => {
                             if global_winner.is_some() || !couriers_dir_exists {
                                 SeatSweepStep::None
-                            } else {
-                                let horizon =
-                                    st.presence.seat(&seat).and_then(|r| r.mail_horizon_at);
+                            } else if let Some(horizon) =
+                                st.presence.no_route_retry_horizon_on_machine(
+                                    &seat,
+                                    &self.cfg.local_machine_id,
+                                )
+                            {
+                                let current_seat_epoch = st.presence.current_epoch(&seat);
                                 let ringable_shas = st.mail.ringable_for_seat(&seat);
                                 let mut no_route_ready: Vec<CommittedMailEntry> = Vec::new();
                                 for sha in ringable_shas {
@@ -2191,7 +2200,11 @@ impl CourierHubInner {
                                     }
                                     let k = (seat.clone(), sha.clone());
                                     if st.mail.rung_keys.contains(&k)
-                                        || st.mail.has_any_failure_for_seat(&seat, &sha)
+                                        || st.mail.is_failed_for_no_route(
+                                            &seat,
+                                            current_seat_epoch,
+                                            &sha,
+                                        )
                                         || st.mail.has_inflight_for(&seat, &sha)
                                     {
                                         continue;
@@ -2229,7 +2242,7 @@ impl CourierHubInner {
                                         })
                                         && entry.message.from == COURIER_HUB_SENDER_ADDRESS;
                                     if is_courier_system_notice
-                                        || horizon.is_some_and(|h| entry.message.created_at < h)
+                                        || entry.message.created_at < horizon
                                     {
                                         continue;
                                     }
@@ -2241,6 +2254,8 @@ impl CourierHubInner {
                                     no_route_ready.sort_by_key(|e| (e.message.created_at, e.seq));
                                     SeatSweepStep::NoRouteEntries(no_route_ready)
                                 }
+                            } else {
+                                SeatSweepStep::None
                             }
                         }
                         Some(binding) => {
@@ -2510,6 +2525,24 @@ impl CourierHubInner {
                 }
             }
         }
+        if failure_kind.is_some()
+            && self
+                .authoritative_seat_bindings(client, &binding.seat)
+                .await
+                .is_some_and(|bs| {
+                    bs.iter().any(|b| {
+                        b.incarnation_id == binding.incarnation_id
+                            && b.epoch == binding.epoch
+                            && b.status == BindingStatus::Live
+                    })
+                })
+        {
+            self.state.lock().await.fenced_refused_epochs.remove(&(
+                binding.seat.clone(),
+                binding.incarnation_id.clone(),
+                binding.epoch,
+            ));
+        }
         scheduled_due
     }
 
@@ -2616,6 +2649,15 @@ impl CourierHubInner {
         hub_owner_seat: &SeatName,
         client: &LocalClient,
     ) -> Option<UnixMs> {
+        let now_done = rex_wave_runtime::now();
+        let auth_bindings = self.authoritative_seat_bindings(client, seat).await?;
+        if auth_bindings.iter().any(|b| {
+            b.status == BindingStatus::Live && b.expires_at.is_none_or(|exp| exp > now_done)
+        }) {
+            return None;
+        }
+        let seat_epoch = auth_bindings.iter().map(|b| b.epoch).max().unwrap_or(0);
+
         let max_tries = self.cfg.effective_max_defer_tries(current_cfg);
         let all_shas: Vec<Sha256Hex> = entries.iter().map(|e| e.message.sha256.clone()).collect();
         let sender_groups = group_entries_by_sender(entries);
@@ -2623,7 +2665,6 @@ impl CourierHubInner {
 
         let mut given_up_entries: Vec<CommittedMailEntry> = Vec::new();
         let mut earliest_due: Option<UnixMs> = None;
-        let now_done = rex_wave_runtime::now();
         {
             let mut st = self.state.lock().await;
             for entry in entries {
@@ -2637,7 +2678,7 @@ impl CourierHubInner {
                 if next_tries >= max_tries {
                     st.optimistic_no_route_due
                         .insert(k.clone(), UnixMs(u64::MAX));
-                    st.mail.failed_keys.insert(k);
+                    st.mail.failed_keys.insert(k, Some(seat_epoch));
                     given_up_entries.push(entry.clone());
                 } else {
                     let due = self.cfg.backoff_due_at(current_cfg, now_done, next_tries);
@@ -2669,7 +2710,7 @@ impl CourierHubInner {
                 seat: seat.clone(),
                 machine_id: self.cfg.local_machine_id.clone(),
                 incarnation_id: None,
-                expected_epoch: None,
+                expected_epoch: Some(seat_epoch),
                 sha256s: all_shas,
                 is_canary: false,
                 pre_spawn: true,
@@ -2834,6 +2875,24 @@ impl CourierHubInner {
                     self.mark_failure_reconciled(f, client).await;
                 }
             }
+        }
+        if failure_kind.is_some()
+            && self
+                .authoritative_seat_bindings(client, &binding.seat)
+                .await
+                .is_some_and(|bs| {
+                    bs.iter().any(|b| {
+                        b.incarnation_id == binding.incarnation_id
+                            && b.epoch == binding.epoch
+                            && b.status == BindingStatus::Live
+                    })
+                })
+        {
+            self.state.lock().await.fenced_refused_epochs.remove(&(
+                binding.seat.clone(),
+                binding.incarnation_id.clone(),
+                binding.epoch,
+            ));
         }
 
         scheduled_due

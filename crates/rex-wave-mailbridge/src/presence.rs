@@ -1507,6 +1507,29 @@ impl PresenceState {
         self.ever_bound.contains(seat)
     }
 
+    pub fn current_epoch(&self, seat: &SeatName) -> u64 {
+        self.max_epoch.get(seat).copied().unwrap_or(0)
+    }
+
+    pub fn no_route_retry_horizon_on_machine(
+        &self,
+        seat: &SeatName,
+        machine_id: &str,
+    ) -> Option<UnixMs> {
+        let rec = self.seats.get(seat)?;
+        if rec.status != SeatStatus::Active {
+            return None;
+        }
+        let horizon = rec.mail_horizon_at?;
+        let has_local_courier_route = self.bindings.get(seat).is_some_and(|m| {
+            m.values().any(|b| {
+                b.machine_id.as_deref().unwrap_or(&self.local_machine_id) == machine_id
+                    && crate::couriers::resolve_adapter_name(&b.endpoint).is_some()
+            })
+        });
+        has_local_courier_route.then_some(horizon)
+    }
+
     pub fn is_transport_down(&self, kind: TransportKind) -> bool {
         self.down_transports.contains(&kind)
     }

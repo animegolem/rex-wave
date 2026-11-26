@@ -1049,8 +1049,8 @@ pub struct MailState {
     /// `(seat, sha256)` pairs already rung (`Rung` or `Unknown` both count as rung
     /// per `MailMachines.tla` `NoDoubleRing`).
     pub rung_keys: BTreeSet<(SeatName, Sha256Hex)>,
-    /// Unscoped `(seat, sha256)` failures when no `IncarnationId` was associated.
-    pub failed_keys: BTreeSet<(SeatName, Sha256Hex)>,
+    /// Unscoped `(seat, sha256) -> expected_epoch` failures recorded while no live route existed.
+    pub failed_keys: BTreeMap<(SeatName, Sha256Hex), Option<u64>>,
     /// Incarnation- and epoch-scoped `(seat, incarnation_id, expected_epoch, sha256)` failures
     /// so a refusal or give-up on a dead session never suppresses delivery on a later rebound
     /// session or a reconnected session reusing the same `incarnation_id` under a fresh epoch.
@@ -1390,6 +1390,7 @@ impl MailState {
                             for sha in sha256s {
                                 let k = (seat.clone(), sha.clone());
                                 self.rung_keys.insert(k.clone());
+                                self.failed_keys.remove(&k);
                                 self.defer_state.remove(&k);
                                 self.no_route_defer_state.remove(&k);
                             }
@@ -1413,6 +1414,7 @@ impl MailState {
                             for sha in sha256s {
                                 let k = (seat.clone(), sha.clone());
                                 self.rung_keys.insert(k.clone());
+                                self.failed_keys.remove(&k);
                                 self.defer_state.remove(&k);
                                 self.no_route_defer_state.remove(&k);
                             }
@@ -1511,7 +1513,7 @@ impl MailState {
                             let k = (seat.clone(), sha.clone());
                             self.defer_state.remove(&k);
                             self.no_route_defer_state.remove(&k);
-                            self.failed_keys.insert(k);
+                            self.failed_keys.insert(k, *expected_epoch);
                         }
                     }
                 }
@@ -1588,8 +1590,8 @@ impl MailState {
         epoch: Option<u64>,
         sha: &Sha256Hex,
     ) -> bool {
-        self.failed_keys.contains(&(seat.clone(), sha.clone()))
-            || incarnation_id.is_some_and(|inc| {
+        match incarnation_id {
+            Some(inc) => {
                 self.failed_incarnation_keys.contains(&(
                     seat.clone(),
                     inc.clone(),
@@ -1603,13 +1605,20 @@ impl MailState {
                         sha.clone(),
                     ))
                 })
-            })
+            }
+            None => self.failed_keys.contains_key(&(seat.clone(), sha.clone())),
+        }
     }
 
-    /// Returns `true` when any prior failure (`Refused` or `GiveUp`) has already been
-    /// escalated for `(seat, sha)` across any incarnation or unscoped route.
-    pub fn has_any_failure_for_seat(&self, seat: &SeatName, sha: &Sha256Hex) -> bool {
-        self.failed_keys.contains(&(seat.clone(), sha.clone()))
+    pub fn is_failed_for_no_route(
+        &self,
+        seat: &SeatName,
+        current_seat_epoch: u64,
+        sha: &Sha256Hex,
+    ) -> bool {
+        self.failed_keys
+            .get(&(seat.clone(), sha.clone()))
+            .is_some_and(|ep| ep.is_none_or(|failed_ep| current_seat_epoch <= failed_ep))
             || self
                 .failed_incarnation_keys
                 .iter()
